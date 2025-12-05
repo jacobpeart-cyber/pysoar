@@ -1,0 +1,164 @@
+# PySOAR Docker Compose
+# Development environment with all services
+
+version: '3.8'
+
+services:
+  # Main API Application
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: pysoar-api
+    ports:
+      - "8000:8000"
+    environment:
+      - APP_ENV=development
+      - DATABASE_URL=postgresql+asyncpg://pysoar:pysoar@postgres:5432/pysoar
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+    env_file:
+      - .env
+    volumes:
+      - ./src:/app/src:ro
+      - ./alembic:/app/alembic:ro
+      - pysoar-uploads:/app/uploads
+      - pysoar-logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - pysoar-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # Celery Worker for background tasks
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: pysoar-worker
+    command: celery -A src.workers.celery_app worker --loglevel=info --concurrency=2
+    environment:
+      - APP_ENV=development
+      - DATABASE_URL=postgresql+asyncpg://pysoar:pysoar@postgres:5432/pysoar
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+    env_file:
+      - .env
+    volumes:
+      - ./src:/app/src:ro
+      - pysoar-uploads:/app/uploads
+      - pysoar-logs:/app/logs
+    depends_on:
+      - api
+      - redis
+    networks:
+      - pysoar-network
+    restart: unless-stopped
+
+  # Celery Beat for scheduled tasks
+  scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: pysoar-scheduler
+    command: celery -A src.workers.celery_app beat --loglevel=info
+    environment:
+      - APP_ENV=development
+      - DATABASE_URL=postgresql+asyncpg://pysoar:pysoar@postgres:5432/pysoar
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+    env_file:
+      - .env
+    volumes:
+      - ./src:/app/src:ro
+    depends_on:
+      - worker
+    networks:
+      - pysoar-network
+    restart: unless-stopped
+
+  # Flower - Celery monitoring
+  flower:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: pysoar-flower
+    command: celery -A src.workers.celery_app flower --port=5555
+    ports:
+      - "5555:5555"
+    environment:
+      - CELERY_BROKER_URL=redis://redis:6379/1
+    depends_on:
+      - worker
+    networks:
+      - pysoar-network
+    restart: unless-stopped
+
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: pysoar-postgres
+    environment:
+      - POSTGRES_USER=pysoar
+      - POSTGRES_PASSWORD=pysoar
+      - POSTGRES_DB=pysoar
+    ports:
+      - "5432:5432"
+    volumes:
+      - pysoar-postgres:/var/lib/postgresql/data
+    networks:
+      - pysoar-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pysoar -d pysoar"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Redis Cache & Message Broker
+  redis:
+    image: redis:7-alpine
+    container_name: pysoar-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - pysoar-redis:/data
+    networks:
+      - pysoar-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+
+networks:
+  pysoar-network:
+    driver: bridge
+
+volumes:
+  pysoar-postgres:
+    driver: local
+  pysoar-redis:
+    driver: local
+  pysoar-uploads:
+    driver: local
+  pysoar-logs:
+    driver: local

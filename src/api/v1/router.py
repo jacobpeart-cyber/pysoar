@@ -1,0 +1,16 @@
+"""API v1 router aggregating all endpoint routers"""
+
+from fastapi import APIRouter
+
+from src.api.v1.endpoints import alerts, auth, health, incidents, iocs, playbooks, users
+
+api_router = APIRouter()
+
+# Include all endpoint routers
+api_router.include_router(health.router)
+api_router.include_router(auth.router)
+api_router.include_router(users.router)
+api_router.include_router(alerts.router)
+api_router.include_router(incidents.router)
+api_router.include_router(playbooks.router)
+api_router.include_router(iocs.router)
