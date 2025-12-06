@@ -151,7 +151,9 @@ async def create_incident(
     await db.flush()
     await db.refresh(incident)
 
-    return IncidentResponse.model_validate(incident)
+    response = IncidentResponse.model_validate(incident)
+    response.alert_count = len(incident_data.alert_ids) if incident_data.alert_ids else 0
+    return response
 
 
 @router.get("/stats", response_model=IncidentStats)

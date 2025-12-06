@@ -129,7 +129,3 @@ class Incident(BaseModel):
 
     def __repr__(self) -> str:
         return f"<Incident {self.id}: {self.title[:50]}>"
-
-    @property
-    def alert_count(self) -> int:
-        return len(self.alerts)
