@@ -74,6 +74,18 @@ async def get_current_admin_user(
     return current_user
 
 
+async def get_current_superuser(
+    current_user: Annotated[User, Depends(get_current_user)],
+) -> User:
+    """Get the current user if they are a superuser"""
+    if not current_user.is_superuser and not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Superuser access required",
+        )
+    return current_user
+
+
 async def get_optional_user(
     credentials: Annotated[Optional[HTTPAuthorizationCredentials], Depends(security)],
     db: Annotated[AsyncSession, Depends(get_db)],

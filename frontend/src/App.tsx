@@ -1,15 +1,22 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { AuthProvider, useAuth } from './contexts/AuthContext'
+import { ThemeProvider } from './contexts/ThemeContext'
 import Layout from './components/Layout'
 import Login from './pages/Login'
 import Dashboard from './pages/Dashboard'
 import Alerts from './pages/Alerts'
+import AlertDetail from './pages/AlertDetail'
 import Incidents from './pages/Incidents'
+import IncidentDetail from './pages/IncidentDetail'
 import IOCs from './pages/IOCs'
 import Users from './pages/Users'
 import Playbooks from './pages/Playbooks'
 import Assets from './pages/Assets'
+import Settings from './pages/Settings'
+import AuditLogs from './pages/AuditLogs'
+import Profile from './pages/Profile'
+import Reports from './pages/Reports'
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -77,11 +84,17 @@ function AppRoutes() {
       >
         <Route index element={<Dashboard />} />
         <Route path="alerts" element={<Alerts />} />
+        <Route path="alerts/:id" element={<AlertDetail />} />
         <Route path="incidents" element={<Incidents />} />
+        <Route path="incidents/:id" element={<IncidentDetail />} />
         <Route path="iocs" element={<IOCs />} />
         <Route path="playbooks" element={<Playbooks />} />
         <Route path="assets" element={<Assets />} />
         <Route path="users" element={<Users />} />
+        <Route path="settings" element={<Settings />} />
+        <Route path="audit" element={<AuditLogs />} />
+        <Route path="profile" element={<Profile />} />
+        <Route path="reports" element={<Reports />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
@@ -91,11 +104,13 @@ function AppRoutes() {
 function App() {
   return (
     <QueryClientProvider client={queryClient}>
-      <BrowserRouter>
-        <AuthProvider>
-          <AppRoutes />
-        </AuthProvider>
-      </BrowserRouter>
+      <ThemeProvider>
+        <BrowserRouter>
+          <AuthProvider>
+            <AppRoutes />
+          </AuthProvider>
+        </BrowserRouter>
+      </ThemeProvider>
     </QueryClientProvider>
   )
 }
