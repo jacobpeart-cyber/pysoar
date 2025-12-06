@@ -6,16 +6,19 @@ import {
   FileWarning,
   Crosshair,
   Users,
-  Settings,
   LogOut,
   Menu,
   X,
   LayoutDashboard,
   Zap,
   Server,
+  Wifi,
+  WifiOff,
 } from 'lucide-react';
 import { useState } from 'react';
 import clsx from 'clsx';
+import { useWebSocket } from '../hooks/useWebSocket';
+import NotificationToast from './NotificationToast';
 
 const navigation = [
   { name: 'Dashboard', href: '/', icon: LayoutDashboard },
@@ -32,6 +35,7 @@ export default function Layout() {
   const location = useLocation();
   const navigate = useNavigate();
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const { isConnected } = useWebSocket();
 
   const handleLogout = () => {
     logout();
@@ -127,6 +131,22 @@ export default function Layout() {
             </button>
             <div className="flex-1" />
             <div className="flex items-center space-x-4">
+              <div
+                className={clsx(
+                  'flex items-center gap-1 px-2 py-1 rounded-full text-xs',
+                  isConnected
+                    ? 'bg-green-100 text-green-700'
+                    : 'bg-gray-100 text-gray-500'
+                )}
+                title={isConnected ? 'Real-time updates active' : 'Connecting...'}
+              >
+                {isConnected ? (
+                  <Wifi className="w-3 h-3" />
+                ) : (
+                  <WifiOff className="w-3 h-3" />
+                )}
+                <span>{isConnected ? 'Live' : 'Offline'}</span>
+              </div>
               <span className="text-sm text-gray-500">
                 {new Date().toLocaleDateString('en-US', {
                   weekday: 'long',
@@ -144,6 +164,9 @@ export default function Layout() {
           <Outlet />
         </main>
       </div>
+
+      {/* Real-time notifications */}
+      <NotificationToast />
     </div>
   );
 }

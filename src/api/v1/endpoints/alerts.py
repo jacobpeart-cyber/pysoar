@@ -5,11 +5,12 @@ import math
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DatabaseSession
+from src.core.database import async_session_factory
 from src.models.alert import Alert, AlertSeverity, AlertStatus
 from src.schemas.alert import (
     AlertBulkAction,
@@ -19,8 +20,24 @@ from src.schemas.alert import (
     AlertStats,
     AlertUpdate,
 )
+from src.services.alert_correlation import process_new_alert
+from src.services.websocket_manager import notify_new_alert, create_notification_callback
 
 router = APIRouter(prefix="/alerts", tags=["Alerts"])
+
+
+async def process_alert_correlation(alert_id: str):
+    """Background task to process alert through correlation rules"""
+    async with async_session_factory() as db:
+        try:
+            result = await db.execute(select(Alert).where(Alert.id == alert_id))
+            alert = result.scalar_one_or_none()
+            if alert:
+                notify_callback = create_notification_callback("incidents")
+                await process_new_alert(db, alert, notify_callback)
+                await db.commit()
+        except Exception:
+            await db.rollback()
 
 
 async def get_alert_or_404(db: AsyncSession, alert_id: str) -> Alert:
@@ -109,6 +126,7 @@ async def create_alert(
     alert_data: AlertCreate,
     current_user: CurrentUser,
     db: DatabaseSession,
+    background_tasks: BackgroundTasks,
 ):
     """Create a new alert"""
     alert = Alert(
@@ -138,7 +156,15 @@ async def create_alert(
     await db.flush()
     await db.refresh(alert)
 
-    return AlertResponse.model_validate(alert)
+    response = AlertResponse.model_validate(alert)
+
+    # Send WebSocket notification
+    background_tasks.add_task(notify_new_alert, response.model_dump())
+
+    # Process through correlation rules (may create incident)
+    background_tasks.add_task(process_alert_correlation, alert.id)
+
+    return response
 
 
 @router.get("/stats", response_model=AlertStats)

@@ -4,11 +4,12 @@ import json
 import math
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import AdminUser, CurrentUser, DatabaseSession
+from src.core.database import async_session_factory
 from src.models.playbook import (
     ExecutionStatus,
     Playbook,
@@ -24,8 +25,23 @@ from src.schemas.playbook import (
     PlaybookResponse,
     PlaybookUpdate,
 )
+from src.services.playbook_engine import PlaybookEngine
+from src.services.websocket_manager import create_notification_callback
 
 router = APIRouter(prefix="/playbooks", tags=["Playbooks"])
+
+
+async def run_playbook_execution(execution_id: str):
+    """Background task to run playbook execution"""
+    async with async_session_factory() as db:
+        try:
+            engine = PlaybookEngine(db)
+            notify_callback = create_notification_callback("playbooks")
+            await engine.execute(execution_id, notify_callback)
+            await db.commit()
+        except Exception as e:
+            await db.rollback()
+            raise e
 
 
 async def get_playbook_or_404(db: AsyncSession, playbook_id: str) -> Playbook:
@@ -214,6 +230,7 @@ async def execute_playbook(
     execute_data: PlaybookExecuteRequest,
     current_user: CurrentUser,
     db: DatabaseSession,
+    background_tasks: BackgroundTasks,
 ):
     """Execute a playbook"""
     playbook = await get_playbook_or_404(db, playbook_id)
@@ -246,8 +263,8 @@ async def execute_playbook(
     await db.flush()
     await db.refresh(execution)
 
-    # In production, this would trigger a Celery task
-    # For now, we just create the execution record
+    # Schedule background execution
+    background_tasks.add_task(run_playbook_execution, execution.id)
 
     return PlaybookExecutionResponse(
         id=execution.id,

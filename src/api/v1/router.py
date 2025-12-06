@@ -2,7 +2,7 @@
 
 from fastapi import APIRouter
 
-from src.api.v1.endpoints import alerts, assets, auth, health, incidents, iocs, playbooks, users
+from src.api.v1.endpoints import alerts, assets, auth, health, incidents, iocs, playbooks, users, websocket
 
 api_router = APIRouter()
 
@@ -15,3 +15,4 @@ api_router.include_router(incidents.router)
 api_router.include_router(playbooks.router)
 api_router.include_router(iocs.router)
 api_router.include_router(assets.router)
+api_router.include_router(websocket.router)
