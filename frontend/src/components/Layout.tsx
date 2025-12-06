@@ -11,6 +11,8 @@ import {
   Menu,
   X,
   LayoutDashboard,
+  Zap,
+  Server,
 } from 'lucide-react';
 import { useState } from 'react';
 import clsx from 'clsx';
@@ -20,6 +22,8 @@ const navigation = [
   { name: 'Alerts', href: '/alerts', icon: AlertTriangle },
   { name: 'Incidents', href: '/incidents', icon: FileWarning },
   { name: 'IOCs', href: '/iocs', icon: Crosshair },
+  { name: 'Playbooks', href: '/playbooks', icon: Zap },
+  { name: 'Assets', href: '/assets', icon: Server },
   { name: 'Users', href: '/users', icon: Users },
 ];
 

@@ -8,6 +8,8 @@ import Alerts from './pages/Alerts'
 import Incidents from './pages/Incidents'
 import IOCs from './pages/IOCs'
 import Users from './pages/Users'
+import Playbooks from './pages/Playbooks'
+import Assets from './pages/Assets'
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -77,6 +79,8 @@ function AppRoutes() {
         <Route path="alerts" element={<Alerts />} />
         <Route path="incidents" element={<Incidents />} />
         <Route path="iocs" element={<IOCs />} />
+        <Route path="playbooks" element={<Playbooks />} />
+        <Route path="assets" element={<Assets />} />
         <Route path="users" element={<Users />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
