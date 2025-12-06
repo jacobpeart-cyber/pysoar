@@ -1,9 +1,9 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
 
 body {
-  @apply bg-gray-50 text-gray-900 min-h-screen;
+  background-color: rgb(249 250 251);
+  color: rgb(17 24 39);
+  min-height: 100vh;
   margin: 0;
 }
 
@@ -14,13 +14,14 @@ body {
 }
 
 ::-webkit-scrollbar-track {
-  @apply bg-gray-100;
+  background-color: rgb(243 244 246);
 }
 
 ::-webkit-scrollbar-thumb {
-  @apply bg-gray-300 rounded-full;
+  background-color: rgb(209 213 219);
+  border-radius: 9999px;
 }
 
 ::-webkit-scrollbar-thumb:hover {
-  @apply bg-gray-400;
+  background-color: rgb(156 163 175);
 }
