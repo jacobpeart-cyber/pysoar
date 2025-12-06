@@ -2,29 +2,33 @@
 
 **Security Orchestration, Automation and Response Platform**
 
-PySOAR is a modern, Python-based SOAR platform designed to help security teams automate incident response, manage alerts, and integrate with threat intelligence sources.
+PySOAR is a modern, full-stack SOAR platform with a Python/FastAPI backend and React/TypeScript frontend. Designed to help security teams automate incident response, manage alerts, and integrate with threat intelligence sources.
 
 ## Features
 
+- **Modern Web UI**: React + TypeScript + Tailwind CSS frontend with responsive dashboard
 - **Alert Management**: Ingest, triage, and manage security alerts from multiple sources
 - **Incident Response**: Create and track security incidents with full lifecycle management
 - **Playbook Automation**: Build and execute automated response playbooks
 - **Threat Intelligence**: Integrate with VirusTotal, AbuseIPDB, Shodan, GreyNoise, and more
 - **IOC Management**: Track and enrich Indicators of Compromise
 - **Asset Inventory**: Maintain an inventory of your assets for context enrichment
+- **User Management**: Admin dashboard for managing users and roles
 - **Audit Logging**: Full audit trail of all actions for compliance
 - **RESTful API**: Complete API for integration with other tools
 - **Role-Based Access**: Admin, Analyst, and Viewer roles
+- **JWT Authentication**: Secure token-based authentication
 
 ## Quick Start
 
 ### Prerequisites
 
 - Python 3.11+
+- Node.js 18+ (for frontend)
 - Redis (for Celery task queue)
 - PostgreSQL (optional, SQLite for development)
 
-### Installation
+### Backend Installation
 
 ```bash
 # Clone the repository
@@ -42,14 +46,45 @@ pip install -r requirements.txt
 cp .env.example .env
 # Edit .env with your configuration
 
-# Run database migrations
-alembic upgrade head
-
-# Start the application
+# Start the backend server
 python -m src.main
 ```
 
 The API will be available at `http://localhost:8000` with interactive docs at `/api/v1/docs`.
+
+### Frontend Installation
+
+```bash
+# Navigate to frontend directory
+cd frontend
+
+# Install dependencies
+npm install
+
+# Start the development server
+npm run dev
+```
+
+The frontend will be available at `http://localhost:5173`.
+
+### Running Both Services
+
+For development, run both the backend and frontend in separate terminals:
+
+**Terminal 1 - Backend:**
+```bash
+cd pysoar
+venv\Scripts\activate  # On Windows
+python -m src.main
+```
+
+**Terminal 2 - Frontend:**
+```bash
+cd pysoar/frontend
+npm run dev
+```
+
+Then open `http://localhost:5173` in your browser.
 
 ### Docker Setup
 
@@ -101,21 +136,49 @@ curl http://localhost:8000/api/v1/alerts \
 
 ```
 pysoar/
-├── src/
-│   ├── api/              # FastAPI routes and endpoints
+├── src/                     # Backend (Python/FastAPI)
+│   ├── api/                 # FastAPI routes and endpoints
 │   │   └── v1/
 │   │       └── endpoints/
-│   ├── core/             # Core configuration and utilities
-│   ├── integrations/     # Threat intelligence integrations
-│   ├── models/           # SQLAlchemy database models
-│   ├── playbooks/        # Playbook engine and actions
-│   ├── schemas/          # Pydantic request/response schemas
-│   ├── services/         # Business logic services
-│   └── workers/          # Celery background tasks
-├── tests/                # Test suite
-├── alembic/              # Database migrations
-└── docker-compose.yml    # Docker orchestration
+│   ├── core/                # Core configuration and utilities
+│   ├── integrations/        # Threat intelligence integrations
+│   ├── models/              # SQLAlchemy database models
+│   ├── playbooks/           # Playbook engine and actions
+│   ├── schemas/             # Pydantic request/response schemas
+│   ├── services/            # Business logic services
+│   └── workers/             # Celery background tasks
+├── frontend/                # Frontend (React/TypeScript)
+│   ├── src/
+│   │   ├── components/      # Reusable UI components
+│   │   ├── contexts/        # React context providers
+│   │   ├── lib/             # API client and utilities
+│   │   └── pages/           # Page components
+│   ├── package.json
+│   └── vite.config.ts
+├── tests/                   # Test suite
+├── alembic/                 # Database migrations
+└── docker-compose.yml       # Docker orchestration
 ```
+
+## Frontend Stack
+
+- **React 18**: Modern React with hooks
+- **TypeScript**: Type-safe development
+- **Vite**: Fast build tool and dev server
+- **Tailwind CSS v4**: Utility-first CSS framework
+- **React Router**: Client-side routing
+- **Axios**: HTTP client for API calls
+
+### Frontend Pages
+
+| Page | Description |
+|------|-------------|
+| `/login` | Authentication page |
+| `/` | Dashboard with stats overview |
+| `/alerts` | Alert management and triage |
+| `/incidents` | Incident tracking and response |
+| `/iocs` | IOC management |
+| `/users` | User administration (admin only) |
 
 ## Playbook Actions
 

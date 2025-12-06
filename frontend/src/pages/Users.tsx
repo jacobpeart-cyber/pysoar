@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
-import { usersApi, User } from '../lib/api'
+import { usersApi } from '../lib/api'
+import type { User } from '../lib/types'
 import {
   Plus,
   Search,

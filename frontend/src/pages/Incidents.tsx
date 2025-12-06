@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
-import { incidentsApi, alertsApi, Incident, Alert } from '../lib/api'
+import { incidentsApi, alertsApi } from '../lib/api'
+import type { Incident, Alert } from '../lib/types'
 import {
   Plus,
   Search,

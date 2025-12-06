@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
-import { iocsApi, IOC } from '../lib/api'
+import { iocsApi } from '../lib/api'
+import type { IOC } from '../lib/types'
 import {
   Plus,
   Search,
