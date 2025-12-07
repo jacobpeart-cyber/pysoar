@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from src.models.user import User
     from src.models.alert import Alert
     from src.models.playbook import PlaybookExecution
+    from src.models.case import CaseNote, CaseAttachment, CaseTimeline, Task
 
 
 class IncidentSeverity(str, Enum):
@@ -125,6 +126,28 @@ class Incident(BaseModel):
     playbook_executions: Mapped[list["PlaybookExecution"]] = relationship(
         "PlaybookExecution",
         back_populates="incident",
+    )
+
+    # Case management relationships
+    notes: Mapped[list["CaseNote"]] = relationship(
+        "CaseNote",
+        back_populates="incident",
+        cascade="all, delete-orphan",
+    )
+    attachments: Mapped[list["CaseAttachment"]] = relationship(
+        "CaseAttachment",
+        back_populates="incident",
+        cascade="all, delete-orphan",
+    )
+    timeline: Mapped[list["CaseTimeline"]] = relationship(
+        "CaseTimeline",
+        back_populates="incident",
+        cascade="all, delete-orphan",
+    )
+    tasks: Mapped[list["Task"]] = relationship(
+        "Task",
+        back_populates="incident",
+        cascade="all, delete-orphan",
     )
 
     def __repr__(self) -> str:

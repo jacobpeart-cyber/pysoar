@@ -1,0 +1,57 @@
+version: '3.8'
+
+# Development override for docker-compose
+# Usage: docker-compose -f docker-compose.yml -f docker-compose.dev.yml up
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      - ./src:/app/src:ro
+    environment:
+      - LOG_LEVEL=DEBUG
+      - DEBUG=true
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:80"
+
+  db:
+    ports:
+      - "5432:5432"
+
+  redis:
+    ports:
+      - "6379:6379"
+
+  # Development tools
+  adminer:
+    image: adminer
+    container_name: pysoar-adminer
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    networks:
+      - pysoar-network
+    depends_on:
+      - db
+
+  redis-commander:
+    image: rediscommander/redis-commander:latest
+    container_name: pysoar-redis-commander
+    restart: unless-stopped
+    environment:
+      - REDIS_HOSTS=local:redis:6379
+    ports:
+      - "8081:8081"
+    networks:
+      - pysoar-network
+    depends_on:
+      - redis

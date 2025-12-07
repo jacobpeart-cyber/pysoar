@@ -2,7 +2,21 @@
 
 from fastapi import APIRouter
 
-from src.api.v1.endpoints import alerts, assets, auth, health, incidents, iocs, playbooks, users, websocket, settings, audit
+from src.api.v1.endpoints import (
+    alerts,
+    api_keys,
+    assets,
+    audit,
+    auth,
+    health,
+    incidents,
+    iocs,
+    metrics,
+    playbooks,
+    settings,
+    users,
+    websocket,
+)
 
 api_router = APIRouter()
 
@@ -18,3 +32,5 @@ api_router.include_router(assets.router)
 api_router.include_router(websocket.router)
 api_router.include_router(settings.router)
 api_router.include_router(audit.router)
+api_router.include_router(metrics.router, prefix="/metrics", tags=["metrics"])
+api_router.include_router(api_keys.router, prefix="/api-keys", tags=["api-keys"])
