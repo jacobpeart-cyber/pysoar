@@ -8,6 +8,9 @@ from src.models.playbook import Playbook, PlaybookExecution
 from src.models.ioc import IOC
 from src.models.asset import Asset
 from src.models.audit import AuditLog
+from src.models.case import CaseNote, CaseAttachment, CaseTimeline, Task
+from src.models.organization import Organization, OrganizationMember, Team, TeamMember
+from src.models.api_key import APIKey
 
 __all__ = [
     "Base",
@@ -19,4 +22,13 @@ __all__ = [
     "IOC",
     "Asset",
     "AuditLog",
+    "CaseNote",
+    "CaseAttachment",
+    "CaseTimeline",
+    "Task",
+    "Organization",
+    "OrganizationMember",
+    "Team",
+    "TeamMember",
+    "APIKey",
 ]

@@ -17,6 +17,10 @@ import Settings from './pages/Settings'
 import AuditLogs from './pages/AuditLogs'
 import Profile from './pages/Profile'
 import Reports from './pages/Reports'
+import ApiKeys from './pages/ApiKeys'
+import Analytics from './pages/Analytics'
+import Organizations from './pages/Organizations'
+import ThreatIntel from './pages/ThreatIntel'
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -95,6 +99,10 @@ function AppRoutes() {
         <Route path="audit" element={<AuditLogs />} />
         <Route path="profile" element={<Profile />} />
         <Route path="reports" element={<Reports />} />
+        <Route path="api-keys" element={<ApiKeys />} />
+        <Route path="analytics" element={<Analytics />} />
+        <Route path="organizations" element={<Organizations />} />
+        <Route path="threat-intel" element={<ThreatIntel />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>

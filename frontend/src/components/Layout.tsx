@@ -21,6 +21,10 @@ import {
   Sun,
   Moon,
   User,
+  Key,
+  Building2,
+  TrendingUp,
+  Globe,
 } from 'lucide-react';
 import { useState } from 'react';
 import clsx from 'clsx';
@@ -32,13 +36,17 @@ const navigation = [
   { name: 'Alerts', href: '/alerts', icon: AlertTriangle },
   { name: 'Incidents', href: '/incidents', icon: FileWarning },
   { name: 'IOCs', href: '/iocs', icon: Crosshair },
+  { name: 'Threat Intel', href: '/threat-intel', icon: Globe },
   { name: 'Playbooks', href: '/playbooks', icon: Zap },
   { name: 'Assets', href: '/assets', icon: Server },
+  { name: 'Analytics', href: '/analytics', icon: TrendingUp },
   { name: 'Reports', href: '/reports', icon: BarChart3 },
 ];
 
 const adminNavigation = [
   { name: 'Users', href: '/users', icon: Users },
+  { name: 'Organizations', href: '/organizations', icon: Building2 },
+  { name: 'API Keys', href: '/api-keys', icon: Key },
   { name: 'Audit Logs', href: '/audit', icon: FileText },
   { name: 'Settings', href: '/settings', icon: Settings },
 ];
