@@ -1,0 +1,218 @@
+# PySOAR Production Docker Compose
+# Use: docker-compose -f docker-compose.prod.yml up -d
+
+version: '3.8'
+
+services:
+  # Nginx Reverse Proxy with SSL
+  nginx:
+    image: nginx:alpine
+    container_name: pysoar-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
+      - ./frontend/dist:/usr/share/nginx/html:ro
+    depends_on:
+      - api
+    networks:
+      - pysoar-network
+    restart: always
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Main API Application
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: pysoar-api
+    expose:
+      - "8000"
+    environment:
+      - APP_ENV=production
+      - DEBUG=false
+      - DATABASE_URL=postgresql+asyncpg://pysoar:${POSTGRES_PASSWORD}@postgres:5432/pysoar
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+    env_file:
+      - .env.production
+    volumes:
+      - pysoar-uploads:/app/uploads
+      - pysoar-logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - pysoar-network
+    restart: always
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+  # Celery Worker for background tasks
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: pysoar-worker
+    command: celery -A src.workers.celery_app worker --loglevel=info --concurrency=4
+    environment:
+      - APP_ENV=production
+      - DATABASE_URL=postgresql+asyncpg://pysoar:${POSTGRES_PASSWORD}@postgres:5432/pysoar
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+    env_file:
+      - .env.production
+    volumes:
+      - pysoar-uploads:/app/uploads
+      - pysoar-logs:/app/logs
+    depends_on:
+      - api
+      - redis
+    networks:
+      - pysoar-network
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+
+  # Celery Beat for scheduled tasks
+  scheduler:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: pysoar-scheduler
+    command: celery -A src.workers.celery_app beat --loglevel=info
+    environment:
+      - APP_ENV=production
+      - DATABASE_URL=postgresql+asyncpg://pysoar:${POSTGRES_PASSWORD}@postgres:5432/pysoar
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+    env_file:
+      - .env.production
+    depends_on:
+      - worker
+    networks:
+      - pysoar-network
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: pysoar-postgres
+    environment:
+      - POSTGRES_USER=pysoar
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=pysoar
+    volumes:
+      - pysoar-postgres:/var/lib/postgresql/data
+      - ./backups:/backups
+    networks:
+      - pysoar-network
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pysoar -d pysoar"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+
+  # Redis Cache & Message Broker
+  redis:
+    image: redis:7-alpine
+    container_name: pysoar-redis
+    volumes:
+      - pysoar-redis:/data
+    networks:
+      - pysoar-network
+    restart: always
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+
+  # Database Backup Service
+  backup:
+    image: postgres:15-alpine
+    container_name: pysoar-backup
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_USER=pysoar
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=pysoar
+    volumes:
+      - ./backups:/backups
+    networks:
+      - pysoar-network
+    entrypoint: |
+      /bin/sh -c "
+        while true; do
+          echo 'Starting database backup...'
+          PGPASSWORD=\$$POSTGRES_PASSWORD pg_dump -h postgres -U pysoar pysoar | gzip > /backups/pysoar_\$$(date +%Y%m%d_%H%M%S).sql.gz
+          echo 'Backup completed. Cleaning old backups...'
+          find /backups -name '*.sql.gz' -mtime +7 -delete
+          echo 'Sleeping for 24 hours...'
+          sleep 86400
+        done
+      "
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: always
+
+networks:
+  pysoar-network:
+    driver: bridge
+
+volumes:
+  pysoar-postgres:
+    driver: local
+  pysoar-redis:
+    driver: local
+  pysoar-uploads:
+    driver: local
+  pysoar-logs:
+    driver: local

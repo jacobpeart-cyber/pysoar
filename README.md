@@ -6,27 +6,62 @@ PySOAR is a modern, full-stack SOAR platform with a Python/FastAPI backend and R
 
 ## Features
 
-- **Modern Web UI**: React + TypeScript + Tailwind CSS frontend with responsive dashboard
+### Core Capabilities
 - **Alert Management**: Ingest, triage, and manage security alerts from multiple sources
 - **Incident Response**: Create and track security incidents with full lifecycle management
+- **Case Management**: Notes, tasks, timeline, and file attachments for incidents
 - **Playbook Automation**: Build and execute automated response playbooks
-- **Threat Intelligence**: Integrate with VirusTotal, AbuseIPDB, Shodan, GreyNoise, and more
 - **IOC Management**: Track and enrich Indicators of Compromise
-- **Asset Inventory**: Maintain an inventory of your assets for context enrichment
-- **User Management**: Admin dashboard for managing users and roles
-- **Audit Logging**: Full audit trail of all actions for compliance
-- **RESTful API**: Complete API for integration with other tools
-- **Role-Based Access**: Admin, Analyst, and Viewer roles
-- **JWT Authentication**: Secure token-based authentication
+
+### Threat Intelligence
+- **Multi-source Lookup**: Query VirusTotal, AbuseIPDB, Shodan, GreyNoise, MISP
+- **Threat Feed Integration**: Subscribe to and manage threat intelligence feeds
+- **IOC Database**: Centralized repository for all threat indicators
+- **Automated Enrichment**: Auto-enrich alerts and incidents with threat intel
+
+### Integrations
+- **SIEM**: Elasticsearch, Splunk
+- **Notifications**: Slack, PagerDuty, Microsoft Teams, Email (SMTP)
+- **Threat Intel**: VirusTotal, AbuseIPDB, Shodan, GreyNoise, MISP, Cortex
+- **Analysis**: Cortex for observable analysis
+
+### Administration
+- **User Management**: RBAC with admin, analyst, and viewer roles
+- **Organizations & Teams**: Multi-tenant support with team-based access
+- **API Keys**: Generate and manage API keys for programmatic access
+- **Audit Logging**: Complete audit trail of all user actions
+- **Dark Mode**: Full dark mode support across the UI
+
+### Analytics & Reporting
+- **Real-time Dashboard**: Live metrics and KPIs
+- **Analytics**: Alert trends, severity distribution, top sources
+- **Reports**: Generate and export security reports
+- **WebSocket Updates**: Real-time notifications and updates
+
+## Tech Stack
+
+### Backend
+- **Framework**: FastAPI (Python 3.11+)
+- **Database**: SQLite (development) / PostgreSQL (production)
+- **ORM**: SQLAlchemy 2.0 with async support
+- **Authentication**: JWT tokens with bcrypt password hashing
+- **WebSocket**: Real-time updates and notifications
+
+### Frontend
+- **Framework**: React 18 with TypeScript
+- **Build Tool**: Vite
+- **Styling**: TailwindCSS v4 with dark mode
+- **State Management**: React Query (TanStack Query)
+- **Routing**: React Router v6
+- **Icons**: Lucide React
 
 ## Quick Start
 
 ### Prerequisites
 
 - Python 3.11+
-- Node.js 18+ (for frontend)
-- Redis (for Celery task queue)
-- PostgreSQL (optional, SQLite for development)
+- Node.js 18+
+- npm or yarn
 
 ### Backend Installation
 
@@ -50,7 +85,7 @@ cp .env.example .env
 python -m src.main
 ```
 
-The API will be available at `http://localhost:8000` with interactive docs at `/api/v1/docs`.
+The API will be available at `http://localhost:8000` with interactive docs at `/docs`.
 
 ### Frontend Installation
 
@@ -67,33 +102,21 @@ npm run dev
 
 The frontend will be available at `http://localhost:5173`.
 
-### Running Both Services
+### Default Login
 
-For development, run both the backend and frontend in separate terminals:
+- **Email**: admin@pysoar.local
+- **Password**: admin123
 
-**Terminal 1 - Backend:**
-```bash
-cd pysoar
-venv\Scripts\activate  # On Windows
-python -m src.main
-```
+**Important**: Change the default password after first login!
 
-**Terminal 2 - Frontend:**
-```bash
-cd pysoar/frontend
-npm run dev
-```
-
-Then open `http://localhost:5173` in your browser.
-
-### Docker Setup
+### Docker Deployment
 
 ```bash
 # Build and start all services
 docker-compose up -d
 
 # View logs
-docker-compose logs -f api
+docker-compose logs -f
 
 # Stop services
 docker-compose down
@@ -106,18 +129,20 @@ Key environment variables (see `.env.example` for full list):
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `DATABASE_URL` | Database connection string | SQLite (dev) |
-| `REDIS_URL` | Redis connection string | localhost:6379 |
+| `SECRET_KEY` | Application secret key | Change in production! |
 | `JWT_SECRET_KEY` | Secret key for JWT tokens | Change in production! |
+| `SMTP_HOST` | SMTP server for emails | Optional |
 | `VIRUSTOTAL_API_KEY` | VirusTotal API key | Optional |
 | `ABUSEIPDB_API_KEY` | AbuseIPDB API key | Optional |
 | `SHODAN_API_KEY` | Shodan API key | Optional |
+| `SLACK_WEBHOOK_URL` | Slack webhook for notifications | Optional |
 
 ## API Documentation
 
 Once running, access the interactive API documentation:
 
-- **Swagger UI**: http://localhost:8000/api/v1/docs
-- **ReDoc**: http://localhost:8000/api/v1/redoc
+- **Swagger UI**: http://localhost:8000/docs
+- **ReDoc**: http://localhost:8000/redoc
 
 ### Authentication
 
@@ -125,78 +150,102 @@ Once running, access the interactive API documentation:
 # Login to get tokens
 curl -X POST http://localhost:8000/api/v1/auth/login \
   -H "Content-Type: application/json" \
-  -d '{"email": "admin@pysoar.local", "password": "changeme123"}'
+  -d '{"email": "admin@pysoar.local", "password": "admin123"}'
 
 # Use the access token for authenticated requests
 curl http://localhost:8000/api/v1/alerts \
   -H "Authorization: Bearer <access_token>"
 ```
 
-## Architecture
+### Main Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /api/v1/health` | Health check |
+| `POST /api/v1/auth/login` | User login |
+| `GET /api/v1/alerts` | List alerts |
+| `GET /api/v1/incidents` | List incidents |
+| `GET /api/v1/incidents/{id}/notes` | Get incident notes |
+| `GET /api/v1/incidents/{id}/tasks` | Get incident tasks |
+| `GET /api/v1/incidents/{id}/timeline` | Get incident timeline |
+| `GET /api/v1/iocs` | List IOCs |
+| `GET /api/v1/playbooks` | List playbooks |
+| `GET /api/v1/assets` | List assets |
+| `GET /api/v1/threat-intel/lookup` | Lookup IOC |
+| `GET /api/v1/organizations` | List organizations |
+| `GET /api/v1/api-keys` | List API keys |
+| `GET /api/v1/settings` | Get settings |
+| `GET /api/v1/audit` | Audit logs |
+| `GET /api/v1/metrics` | System metrics |
+
+## Project Structure
 
 ```
 pysoar/
 ├── src/                     # Backend (Python/FastAPI)
-│   ├── api/                 # FastAPI routes and endpoints
+│   ├── api/                 # API routes and endpoints
 │   │   └── v1/
 │   │       └── endpoints/
-│   ├── core/                # Core configuration and utilities
-│   ├── integrations/        # Threat intelligence integrations
-│   ├── models/              # SQLAlchemy database models
-│   ├── playbooks/           # Playbook engine and actions
-│   ├── schemas/             # Pydantic request/response schemas
-│   ├── services/            # Business logic services
-│   └── workers/             # Celery background tasks
+│   │           ├── alerts.py
+│   │           ├── incidents.py
+│   │           ├── case_management.py
+│   │           ├── organizations.py
+│   │           ├── api_keys.py
+│   │           └── ...
+│   ├── core/                # Core configuration
+│   │   ├── config.py
+│   │   ├── security.py
+│   │   └── database.py
+│   ├── integrations/        # External integrations
+│   ├── models/              # SQLAlchemy models
+│   ├── schemas/             # Pydantic schemas
+│   ├── services/            # Business logic
+│   └── main.py              # Application entry
 ├── frontend/                # Frontend (React/TypeScript)
 │   ├── src/
-│   │   ├── components/      # Reusable UI components
-│   │   ├── contexts/        # React context providers
-│   │   ├── lib/             # API client and utilities
+│   │   ├── components/      # Reusable components
+│   │   ├── contexts/        # React contexts
+│   │   ├── hooks/           # Custom hooks
+│   │   ├── lib/             # API client
 │   │   └── pages/           # Page components
-│   ├── package.json
-│   └── vite.config.ts
+│   │       ├── Dashboard.tsx
+│   │       ├── Alerts.tsx
+│   │       ├── Incidents.tsx
+│   │       ├── ThreatIntel.tsx
+│   │       ├── Organizations.tsx
+│   │       ├── ApiKeys.tsx
+│   │       ├── Analytics.tsx
+│   │       └── ...
+│   └── package.json
 ├── tests/                   # Test suite
-├── alembic/                 # Database migrations
-└── docker-compose.yml       # Docker orchestration
+├── docker-compose.yml       # Docker orchestration
+├── Dockerfile               # Backend container
+└── requirements.txt         # Python dependencies
 ```
 
-## Frontend Stack
+## Frontend Pages
 
-- **React 18**: Modern React with hooks
-- **TypeScript**: Type-safe development
-- **Vite**: Fast build tool and dev server
-- **Tailwind CSS v4**: Utility-first CSS framework
-- **React Router**: Client-side routing
-- **Axios**: HTTP client for API calls
+| Route | Page | Description |
+|-------|------|-------------|
+| `/` | Dashboard | Overview with metrics and recent activity |
+| `/alerts` | Alerts | Alert management and triage |
+| `/alerts/:id` | Alert Detail | Single alert view with enrichment |
+| `/incidents` | Incidents | Incident list and management |
+| `/incidents/:id` | Incident Detail | Case management with notes, tasks, timeline |
+| `/iocs` | IOCs | IOC management |
+| `/threat-intel` | Threat Intel | IOC lookup and threat feeds |
+| `/playbooks` | Playbooks | Playbook management |
+| `/assets` | Assets | Asset inventory |
+| `/analytics` | Analytics | Metrics and trends |
+| `/reports` | Reports | Report generation |
+| `/users` | Users | User management (admin) |
+| `/organizations` | Organizations | Org/team management (admin) |
+| `/api-keys` | API Keys | API key management |
+| `/settings` | Settings | System configuration |
+| `/audit` | Audit Logs | Audit trail (admin) |
+| `/profile` | Profile | User profile |
 
-### Frontend Pages
-
-| Page | Description |
-|------|-------------|
-| `/login` | Authentication page |
-| `/` | Dashboard with stats overview |
-| `/alerts` | Alert management and triage |
-| `/incidents` | Incident tracking and response |
-| `/iocs` | IOC management |
-| `/users` | User administration (admin only) |
-
-## Playbook Actions
-
-Available actions for playbook automation:
-
-| Action | Description |
-|--------|-------------|
-| `enrich_ip` | Enrich IP address with threat intelligence |
-| `enrich_domain` | Enrich domain with threat intelligence |
-| `enrich_hash` | Enrich file hash with threat intelligence |
-| `send_notification` | Send notification via email/Slack/Teams |
-| `update_alert` | Update alert status or fields |
-| `create_incident` | Create a new incident |
-| `run_script` | Execute a predefined script |
-| `conditional` | Branch based on conditions |
-| `wait` | Pause execution |
-
-### Example Playbook
+## Playbook Example
 
 ```json
 {
@@ -211,11 +260,10 @@ Available actions for playbook automation:
       "id": "enrich",
       "name": "Enrich Source IP",
       "action": "enrich_ip",
-      "parameters": {},
-      "on_success": "check_malicious"
+      "parameters": {}
     },
     {
-      "id": "check_malicious",
+      "id": "check",
       "name": "Check if Malicious",
       "action": "conditional",
       "parameters": {
@@ -223,8 +271,7 @@ Available actions for playbook automation:
         "operator": "equals",
         "value": true
       },
-      "on_success": "notify",
-      "on_failure": null
+      "on_success": "notify"
     },
     {
       "id": "notify",
@@ -245,43 +292,32 @@ Available actions for playbook automation:
 
 ```bash
 # Run all tests
-pytest
+pytest tests/ -v
 
 # Run with coverage
-pytest --cov=src --cov-report=html
-
-# Run specific test file
-pytest tests/unit/test_auth.py
+pytest tests/ --cov=src --cov-report=html
 ```
 
 ### Code Quality
 
 ```bash
 # Format code
-black src tests
+black src/
+ruff check src/
 
-# Sort imports
-isort src tests
-
-# Lint
-flake8 src tests
-
-# Type checking
-mypy src
+# Frontend
+cd frontend && npm run lint
 ```
 
-### Running Celery Workers
+## Security Considerations
 
-```bash
-# Start worker
-celery -A src.workers.celery_app worker --loglevel=info
-
-# Start beat scheduler
-celery -A src.workers.celery_app beat --loglevel=info
-
-# Start Flower monitoring
-celery -A src.workers.celery_app flower --port=5555
-```
+- All passwords hashed with bcrypt
+- JWT tokens with configurable expiration
+- API keys hashed, never stored plain text
+- RBAC enforced at API and UI level
+- Audit logging for sensitive operations
+- Input validation on all endpoints
+- CORS configured for production
 
 ## Contributing
 
@@ -293,10 +329,11 @@ celery -A src.workers.celery_app flower --port=5555
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
 ## Acknowledgments
 
 - Built with [FastAPI](https://fastapi.tiangolo.com/)
-- Task queue powered by [Celery](https://celeryproject.org/)
+- Frontend powered by [React](https://reactjs.org/) and [Vite](https://vitejs.dev/)
+- Styled with [TailwindCSS](https://tailwindcss.com/)
 - Database ORM by [SQLAlchemy](https://www.sqlalchemy.org/)

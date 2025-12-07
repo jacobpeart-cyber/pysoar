@@ -16,8 +16,14 @@ import {
   ChevronRight,
   Plus,
   Link as LinkIcon,
+  MessageSquare,
+  Paperclip,
+  ListTodo,
+  History,
+  Send,
+  Pin,
 } from 'lucide-react';
-import { incidentsApi, alertsApi, playbooksApi } from '../lib/api';
+import { incidentsApi, alertsApi, playbooksApi, api } from '../lib/api';
 import type { Incident, Alert, Playbook } from '../lib/types';
 import clsx from 'clsx';
 
@@ -37,12 +43,45 @@ const statusColors = {
   closed: 'bg-gray-100 text-gray-700',
 };
 
+interface CaseNote {
+  id: string;
+  content: string;
+  note_type: string;
+  is_pinned: boolean;
+  author: { full_name: string; email: string };
+  created_at: string;
+}
+
+interface CaseTask {
+  id: string;
+  title: string;
+  description: string;
+  status: string;
+  priority: number;
+  due_date: string | null;
+  assignee: { full_name: string } | null;
+  created_at: string;
+}
+
+interface TimelineEvent {
+  id: string;
+  event_type: string;
+  title: string;
+  description: string;
+  old_value: string | null;
+  new_value: string | null;
+  actor: { full_name: string } | null;
+  created_at: string;
+}
+
 export default function IncidentDetail() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [showPlaybookModal, setShowPlaybookModal] = useState(false);
   const [showAddAlertModal, setShowAddAlertModal] = useState(false);
+  const [caseTab, setCaseTab] = useState<'notes' | 'tasks' | 'timeline' | 'attachments'>('notes');
+  const [newNote, setNewNote] = useState('');
 
   const { data: incident, isLoading } = useQuery<Incident>({
     queryKey: ['incident', id],
@@ -206,27 +245,181 @@ export default function IncidentDetail() {
             )}
           </div>
 
-          {/* Timeline */}
-          <div className="bg-white rounded-lg border border-gray-200 p-6">
-            <h2 className="text-lg font-semibold text-gray-900 mb-4">Timeline</h2>
-            <div className="space-y-4">
-              <div className="flex items-start gap-4">
-                <div className="w-8 h-8 rounded-full bg-red-100 flex items-center justify-center flex-shrink-0">
-                  <FileWarning className="w-4 h-4 text-red-600" />
-                </div>
-                <div>
-                  <p className="text-sm font-medium text-gray-900">Incident Created</p>
-                  <p className="text-sm text-gray-500">{formatDate(incident.created_at)}</p>
-                </div>
-              </div>
-              {incident.updated_at !== incident.created_at && (
-                <div className="flex items-start gap-4">
-                  <div className="w-8 h-8 rounded-full bg-yellow-100 flex items-center justify-center flex-shrink-0">
-                    <Edit className="w-4 h-4 text-yellow-600" />
+          {/* Case Management */}
+          <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700">
+            {/* Tabs */}
+            <div className="border-b border-gray-200 dark:border-gray-700 px-6">
+              <nav className="flex gap-6">
+                <button
+                  onClick={() => setCaseTab('notes')}
+                  className={clsx(
+                    'py-4 text-sm font-medium border-b-2 transition-colors flex items-center gap-2',
+                    caseTab === 'notes'
+                      ? 'border-blue-500 text-blue-600 dark:text-blue-400'
+                      : 'border-transparent text-gray-500 hover:text-gray-700'
+                  )}
+                >
+                  <MessageSquare className="w-4 h-4" />
+                  Notes
+                </button>
+                <button
+                  onClick={() => setCaseTab('tasks')}
+                  className={clsx(
+                    'py-4 text-sm font-medium border-b-2 transition-colors flex items-center gap-2',
+                    caseTab === 'tasks'
+                      ? 'border-blue-500 text-blue-600 dark:text-blue-400'
+                      : 'border-transparent text-gray-500 hover:text-gray-700'
+                  )}
+                >
+                  <ListTodo className="w-4 h-4" />
+                  Tasks
+                </button>
+                <button
+                  onClick={() => setCaseTab('timeline')}
+                  className={clsx(
+                    'py-4 text-sm font-medium border-b-2 transition-colors flex items-center gap-2',
+                    caseTab === 'timeline'
+                      ? 'border-blue-500 text-blue-600 dark:text-blue-400'
+                      : 'border-transparent text-gray-500 hover:text-gray-700'
+                  )}
+                >
+                  <History className="w-4 h-4" />
+                  Timeline
+                </button>
+                <button
+                  onClick={() => setCaseTab('attachments')}
+                  className={clsx(
+                    'py-4 text-sm font-medium border-b-2 transition-colors flex items-center gap-2',
+                    caseTab === 'attachments'
+                      ? 'border-blue-500 text-blue-600 dark:text-blue-400'
+                      : 'border-transparent text-gray-500 hover:text-gray-700'
+                  )}
+                >
+                  <Paperclip className="w-4 h-4" />
+                  Attachments
+                </button>
+              </nav>
+            </div>
+
+            {/* Tab Content */}
+            <div className="p-6">
+              {caseTab === 'notes' && (
+                <div className="space-y-4">
+                  {/* Add Note Form */}
+                  <div className="flex gap-3">
+                    <textarea
+                      value={newNote}
+                      onChange={(e) => setNewNote(e.target.value)}
+                      placeholder="Add a note..."
+                      rows={2}
+                      className="flex-1 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
+                    />
+                    <button
+                      disabled={!newNote.trim()}
+                      className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 self-end"
+                    >
+                      <Send className="w-4 h-4" />
+                    </button>
                   </div>
-                  <div>
-                    <p className="text-sm font-medium text-gray-900">Last Updated</p>
-                    <p className="text-sm text-gray-500">{formatDate(incident.updated_at)}</p>
+
+                  {/* Notes List */}
+                  <div className="space-y-3 mt-4">
+                    <div className="p-4 bg-gray-50 dark:bg-gray-700/50 rounded-lg">
+                      <div className="flex items-start justify-between">
+                        <div className="flex items-center gap-2">
+                          <div className="w-8 h-8 rounded-full bg-blue-100 dark:bg-blue-900/30 flex items-center justify-center">
+                            <span className="text-sm font-medium text-blue-600 dark:text-blue-400">A</span>
+                          </div>
+                          <div>
+                            <p className="text-sm font-medium text-gray-900 dark:text-white">Admin User</p>
+                            <p className="text-xs text-gray-500">Investigation started</p>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <button className="text-gray-400 hover:text-yellow-500">
+                            <Pin className="w-4 h-4" />
+                          </button>
+                          <span className="text-xs text-gray-500">{formatDate(incident.created_at)}</span>
+                        </div>
+                      </div>
+                      <p className="mt-2 text-sm text-gray-600 dark:text-gray-300">
+                        Initial triage complete. Escalating to security team for further analysis.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {caseTab === 'tasks' && (
+                <div className="space-y-4">
+                  <div className="flex justify-between items-center">
+                    <h3 className="font-medium text-gray-900 dark:text-white">Tasks</h3>
+                    <button className="flex items-center gap-1 text-sm text-blue-600 hover:text-blue-700">
+                      <Plus className="w-4 h-4" />
+                      Add Task
+                    </button>
+                  </div>
+
+                  {/* Task List */}
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-3 p-3 bg-gray-50 dark:bg-gray-700/50 rounded-lg">
+                      <input type="checkbox" className="rounded border-gray-300 text-blue-600" />
+                      <div className="flex-1">
+                        <p className="text-sm font-medium text-gray-900 dark:text-white">Collect forensic evidence</p>
+                        <p className="text-xs text-gray-500">Due: Not set</p>
+                      </div>
+                      <span className="px-2 py-1 text-xs bg-yellow-100 text-yellow-700 rounded">Pending</span>
+                    </div>
+                    <div className="flex items-center gap-3 p-3 bg-gray-50 dark:bg-gray-700/50 rounded-lg">
+                      <input type="checkbox" className="rounded border-gray-300 text-blue-600" />
+                      <div className="flex-1">
+                        <p className="text-sm font-medium text-gray-900 dark:text-white">Notify affected users</p>
+                        <p className="text-xs text-gray-500">Due: Not set</p>
+                      </div>
+                      <span className="px-2 py-1 text-xs bg-yellow-100 text-yellow-700 rounded">Pending</span>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {caseTab === 'timeline' && (
+                <div className="space-y-4">
+                  <div className="flex items-start gap-4">
+                    <div className="w-8 h-8 rounded-full bg-red-100 flex items-center justify-center flex-shrink-0">
+                      <FileWarning className="w-4 h-4 text-red-600" />
+                    </div>
+                    <div>
+                      <p className="text-sm font-medium text-gray-900 dark:text-white">Incident Created</p>
+                      <p className="text-sm text-gray-500">{formatDate(incident.created_at)}</p>
+                    </div>
+                  </div>
+                  {incident.updated_at !== incident.created_at && (
+                    <div className="flex items-start gap-4">
+                      <div className="w-8 h-8 rounded-full bg-yellow-100 flex items-center justify-center flex-shrink-0">
+                        <Edit className="w-4 h-4 text-yellow-600" />
+                      </div>
+                      <div>
+                        <p className="text-sm font-medium text-gray-900 dark:text-white">Last Updated</p>
+                        <p className="text-sm text-gray-500">{formatDate(incident.updated_at)}</p>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {caseTab === 'attachments' && (
+                <div className="space-y-4">
+                  <div className="flex justify-between items-center">
+                    <h3 className="font-medium text-gray-900 dark:text-white">Attachments</h3>
+                    <button className="flex items-center gap-1 text-sm text-blue-600 hover:text-blue-700">
+                      <Plus className="w-4 h-4" />
+                      Upload File
+                    </button>
+                  </div>
+                  <div className="text-center py-8 text-gray-500">
+                    <Paperclip className="w-8 h-8 mx-auto mb-2 text-gray-300" />
+                    <p>No attachments yet</p>
+                    <p className="text-xs mt-1">Upload evidence, logs, or other relevant files</p>
                   </div>
                 </div>
               )}
