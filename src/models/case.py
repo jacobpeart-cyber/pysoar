@@ -152,7 +152,7 @@ class CaseTimeline(BaseModel):
     new_value: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     # Additional data (JSON)
-    metadata: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    event_metadata: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     # Relationships
     incident_id: Mapped[str] = mapped_column(
