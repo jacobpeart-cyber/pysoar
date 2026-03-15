@@ -1,0 +1,18 @@
+#! api-pysoar-uploads-persistentVolumeClaim.yaml
+# Generated code, do not edit
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+    name: api-pysoar-uploads
+    namespace: pysoar
+    labels:
+        com.docker.compose.service: api
+        com.docker.compose.volume: pysoar-uploads
+spec:
+    accessModes:
+        # TODO would need to check which services use this volume
+        - ReadWriteOnce
+    volumeMode: Filesystem
+    resources:
+        requests:
+            storage: 100Mi

@@ -1,0 +1,9 @@
+#! api-pysoar-uploads-persistentVolumeClaim.yaml
+# Generated code, do not edit
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+    name: api-pysoar-uploads
+    namespace: pysoar
+spec:
+    storageClassName: "hostpath" # see docker/desktop-storage-provisioner

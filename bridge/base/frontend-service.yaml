@@ -1,0 +1,21 @@
+#! frontend-service.yaml
+# Generated code, do not edit
+apiVersion: v1
+kind: Service
+metadata:
+    name: frontend-published
+    namespace: pysoar
+    labels:
+        com.docker.compose.project: pysoar
+        com.docker.compose.service: frontend
+spec:
+    selector:
+        com.docker.compose.project: pysoar
+        com.docker.compose.service: frontend
+    ports:
+        - name: frontend-80
+          port: 80
+          protocol: TCP
+          targetPort: frontend-80
+
+# check if there is at least one published port

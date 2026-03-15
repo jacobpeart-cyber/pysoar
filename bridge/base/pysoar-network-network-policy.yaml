@@ -1,0 +1,24 @@
+#! pysoar-network-network-policy.yaml
+# Generated code, do not edit
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+    name: pysoar-network-network-policy
+    namespace: pysoar
+spec:
+    podSelector:
+        matchLabels:
+            com.docker.compose.network.pysoar-network: "true"
+    policyTypes:
+        - Ingress
+        - Egress
+    ingress:
+        - from:
+            - podSelector:
+                matchLabels:
+                    com.docker.compose.network.pysoar-network: "true"
+    egress:
+        - to:
+            - podSelector:
+                matchLabels:
+                    com.docker.compose.network.pysoar-network: "true"

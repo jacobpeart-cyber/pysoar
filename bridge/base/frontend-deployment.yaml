@@ -1,0 +1,39 @@
+#! frontend-deployment.yaml
+# Generated code, do not edit
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+    name: frontend
+    namespace: pysoar
+    labels:
+        com.docker.compose.project: pysoar
+        com.docker.compose.service: frontend
+spec:
+    replicas: 1
+    selector:
+        matchLabels:
+            com.docker.compose.project: pysoar
+            com.docker.compose.service: frontend
+    strategy:
+        type: Recreate
+    template:
+        metadata:
+            labels:
+                com.docker.compose.project: pysoar
+                com.docker.compose.service: frontend
+                com.docker.compose.network.pysoar-network: "true"
+        spec:
+            restartPolicy: unless-stopped
+            containers:
+                - name: pysoar-frontend
+                  image: pysoar-frontend
+                  imagePullPolicy: IfNotPresent
+                  livenessProbe:
+                    exec:
+                        command: ['wget --no-verbose --tries=1 --spider http://localhost/']
+                    periodSeconds: 30
+                    timeoutSeconds: 10
+                    failureThreshold: 3
+                  ports:
+                    - name: frontend-80
+                      containerPort: 80

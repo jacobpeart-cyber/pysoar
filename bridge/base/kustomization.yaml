@@ -1,0 +1,36 @@
+#! kustomization.yaml
+# Generated code, do not edit
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+    - 0-pysoar-namespace.yaml
+    - api-C:\Users\jacob\pysoar\alembic-persistentVolumeClaim.yaml
+    - api-C:\Users\jacob\pysoar\src-persistentVolumeClaim.yaml
+    - api-deployment.yaml
+    - api-expose.yaml
+    - api-pysoar-logs-persistentVolumeClaim.yaml
+    - api-pysoar-uploads-persistentVolumeClaim.yaml
+    - api-service.yaml
+    - flower-deployment.yaml
+    - flower-expose.yaml
+    - flower-service.yaml
+    - frontend-deployment.yaml
+    - frontend-expose.yaml
+    - frontend-service.yaml
+    - postgres-deployment.yaml
+    - postgres-expose.yaml
+    - postgres-pysoar-postgres-persistentVolumeClaim.yaml
+    - postgres-service.yaml
+    - pysoar-network-network-policy.yaml
+    - redis-deployment.yaml
+    - redis-expose.yaml
+    - redis-pysoar-redis-persistentVolumeClaim.yaml
+    - redis-service.yaml
+    - scheduler-C:\Users\jacob\pysoar\src-persistentVolumeClaim.yaml
+    - scheduler-deployment.yaml
+    - scheduler-expose.yaml
+    - worker-C:\Users\jacob\pysoar\src-persistentVolumeClaim.yaml
+    - worker-deployment.yaml
+    - worker-expose.yaml
+    - worker-pysoar-logs-persistentVolumeClaim.yaml
+    - worker-pysoar-uploads-persistentVolumeClaim.yaml

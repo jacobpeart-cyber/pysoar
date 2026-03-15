@@ -1,0 +1,18 @@
+#! api-C:\Users\jacob\pysoar\src-persistentVolumeClaim.yaml
+# Generated code, do not edit
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+    name: api-c--users-jacob-pysoar-src
+    namespace: pysoar
+    labels:
+        com.docker.compose.service: api
+        com.docker.compose.volume: C:\Users\jacob\pysoar\src
+spec:
+    accessModes:
+        # TODO would need to check which services use this volume
+        - ReadOnlyMany
+    volumeMode: Filesystem
+    resources:
+        requests:
+            storage: 100Mi

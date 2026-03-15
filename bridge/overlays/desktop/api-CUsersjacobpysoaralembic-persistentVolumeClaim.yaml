@@ -1,0 +1,9 @@
+#! api-C:\Users\jacob\pysoar\alembic-persistentVolumeClaim.yaml
+# Generated code, do not edit
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+    name: api-c--users-jacob-pysoar-alembic
+    namespace: pysoar
+spec:
+    storageClassName: "hostpath" # see docker/desktop-storage-provisioner
