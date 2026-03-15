@@ -1,0 +1,44 @@
+#! flower-deployment.yaml
+# Generated code, do not edit
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+    name: flower
+    namespace: pysoar
+    labels:
+        com.docker.compose.project: pysoar
+        com.docker.compose.service: flower
+spec:
+    replicas: 1
+    selector:
+        matchLabels:
+            com.docker.compose.project: pysoar
+            com.docker.compose.service: flower
+    strategy:
+        type: Recreate
+    template:
+        metadata:
+            labels:
+                com.docker.compose.project: pysoar
+                com.docker.compose.service: flower
+                com.docker.compose.network.pysoar-network: "true"
+        spec:
+            restartPolicy: unless-stopped
+            containers:
+                - name: pysoar-flower
+                  image: pysoar-flower
+                  imagePullPolicy: IfNotPresent
+                  args:
+                    - celery
+                    - -A
+                    - src.workers.celery_app
+                    - flower
+                    - --port=5555
+                  env:
+                    - name: CELERY_BROKER_URL
+                      value: "redis://redis:6379/1"
+                  ports:
+                    - name: flower-8000
+                      containerPort: 8000
+                    - name: flower-5555
+                      containerPort: 5555

@@ -3,7 +3,8 @@
     "allow": [
       "Bash(curl:*)",
       "Bash(npm install:*)",
-      "Bash(npx tailwindcss:*)"
+      "Bash(npx tailwindcss:*)",
+      "Bash(pip install:*)"
     ],
     "deny": [],
     "ask": []

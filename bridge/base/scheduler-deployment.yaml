@@ -1,0 +1,133 @@
+#! scheduler-deployment.yaml
+# Generated code, do not edit
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+    name: scheduler
+    namespace: pysoar
+    labels:
+        com.docker.compose.project: pysoar
+        com.docker.compose.service: scheduler
+spec:
+    replicas: 1
+    selector:
+        matchLabels:
+            com.docker.compose.project: pysoar
+            com.docker.compose.service: scheduler
+    strategy:
+        type: Recreate
+    template:
+        metadata:
+            labels:
+                com.docker.compose.project: pysoar
+                com.docker.compose.service: scheduler
+                com.docker.compose.network.pysoar-network: "true"
+        spec:
+            restartPolicy: unless-stopped
+            containers:
+                - name: pysoar-scheduler
+                  image: pysoar-scheduler
+                  imagePullPolicy: IfNotPresent
+                  args:
+                    - celery
+                    - -A
+                    - src.workers.celery_app
+                    - beat
+                    - --loglevel=info
+                  env:
+                    - name: ABUSEIPDB_API_KEY
+                      value: ""
+                    - name: ACCESS_TOKEN_EXPIRE_MINUTES
+                      value: "30"
+                    - name: APP_ENV
+                      value: "development"
+                    - name: APP_NAME
+                      value: "PySOAR"
+                    - name: AWS_ACCESS_KEY_ID
+                      value: ""
+                    - name: AWS_REGION
+                      value: "us-east-1"
+                    - name: AWS_SECRET_ACCESS_KEY
+                      value: ""
+                    - name: CELERY_BROKER_URL
+                      value: "redis://redis:6379/1"
+                    - name: CELERY_RESULT_BACKEND
+                      value: "redis://redis:6379/2"
+                    - name: CORS_ORIGINS
+                      value: "[\"http://localhost:3000\",\"http://localhost:8000\",\"http://localhost:5173\",\"http://localhost:5174\",\"http://localhost:5175\",\"http://localhost:5176\",\"http://localhost:5177\"]"
+                    - name: DATABASE_URL
+                      value: "postgresql+asyncpg://pysoar:pysoar@postgres:5432/pysoar"
+                    - name: DEBUG
+                      value: "true"
+                    - name: ELASTICSEARCH_API_KEY
+                      value: ""
+                    - name: ELASTICSEARCH_URL
+                      value: ""
+                    - name: FIRST_ADMIN_EMAIL
+                      value: "jacobspeart@gmail.com"
+                    - name: FIRST_ADMIN_PASSWORD
+                      value: "Miamiheat03!"
+                    - name: GREYNOISE_API_KEY
+                      value: ""
+                    - name: HIBP_API_KEY
+                      value: ""
+                    - name: HOST
+                      value: "0.0.0.0"
+                    - name: JWT_ALGORITHM
+                      value: "HS256"
+                    - name: JWT_SECRET_KEY
+                      value: "your-jwt-secret-key-change-in-production"
+                    - name: LOG_FORMAT
+                      value: "json"
+                    - name: LOG_LEVEL
+                      value: "INFO"
+                    - name: PORT
+                      value: "8000"
+                    - name: RATE_LIMIT_PER_MINUTE
+                      value: "60"
+                    - name: REDIS_URL
+                      value: "redis://redis:6379/0"
+                    - name: REFRESH_TOKEN_EXPIRE_DAYS
+                      value: "7"
+                    - name: SECRET_KEY
+                      value: "your-super-secret-key-change-in-production"
+                    - name: SHODAN_API_KEY
+                      value: ""
+                    - name: SLACK_WEBHOOK_URL
+                      value: ""
+                    - name: SMTP_FROM
+                      value: "noreply@pysoar.local"
+                    - name: SMTP_HOST
+                      value: "smtp.gmail.com"
+                    - name: SMTP_PASSWORD
+                      value: ""
+                    - name: SMTP_PORT
+                      value: "587"
+                    - name: SMTP_TLS
+                      value: "true"
+                    - name: SMTP_USER
+                      value: ""
+                    - name: SPLUNK_HOST
+                      value: ""
+                    - name: SPLUNK_TOKEN
+                      value: ""
+                    - name: TEAMS_WEBHOOK_URL
+                      value: ""
+                    - name: URLSCAN_API_KEY
+                      value: ""
+                    - name: VIRUSTOTAL_API_KEY
+                      value: ""
+                    - name: WORKERS
+                      value: "1"
+                  ports:
+                    - name: scheduler-8000
+                      containerPort: 8000
+                  volumeMounts:
+                    - name: app-src
+                      mountPath: /app/src
+                      readOnly: true
+            volumes:
+                - name: app-src
+                  hostPath:
+                    path: C:\Users\jacob\pysoar\src
+                  readOnly: true
