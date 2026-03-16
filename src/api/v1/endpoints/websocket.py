@@ -17,7 +17,7 @@ async def get_user_from_token(token: str) -> Optional[str]:
     try:
         payload = jwt.decode(
             token,
-            settings.secret_key,
+            settings.jwt_secret_key,
             algorithms=["HS256"],
         )
         user_id: str = payload.get("sub")
