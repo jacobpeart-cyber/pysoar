@@ -33,7 +33,6 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - APP_ENV=development
       - DATABASE_URL=postgresql+asyncpg://pysoar:pysoar@postgres:5432/pysoar
       - REDIS_URL=redis://redis:6379/0
       - CELERY_BROKER_URL=redis://redis:6379/1
@@ -69,7 +68,6 @@ services:
     container_name: pysoar-worker
     command: celery -A src.workers.celery_app worker --loglevel=info --concurrency=2
     environment:
-      - APP_ENV=development
       - DATABASE_URL=postgresql+asyncpg://pysoar:pysoar@postgres:5432/pysoar
       - REDIS_URL=redis://redis:6379/0
       - CELERY_BROKER_URL=redis://redis:6379/1
@@ -96,7 +94,6 @@ services:
     container_name: pysoar-scheduler
     command: celery -A src.workers.celery_app beat --loglevel=info
     environment:
-      - APP_ENV=development
       - DATABASE_URL=postgresql+asyncpg://pysoar:pysoar@postgres:5432/pysoar
       - REDIS_URL=redis://redis:6379/0
       - CELERY_BROKER_URL=redis://redis:6379/1
