@@ -20,6 +20,8 @@ eggs/
 .eggs/
 lib/
 lib64/
+# Exception: frontend source lib is not a virtualenv
+!frontend/src/lib/
 parts/
 sdist/
 var/
