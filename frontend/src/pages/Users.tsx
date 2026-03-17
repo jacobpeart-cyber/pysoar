@@ -38,8 +38,8 @@ export default function Users() {
     setLoading(true)
     try {
       const response = await usersApi.list({ page, size: pageSize })
-      setUsers(response.data.items)
-      setTotal(response.data.total)
+      setUsers(response.items)
+      setTotal(response.total)
     } catch (error) {
       console.error('Failed to fetch users:', error)
     } finally {

@@ -56,8 +56,8 @@ export default function IOCs() {
       if (typeFilter) params.ioc_type = typeFilter
       if (threatLevelFilter) params.threat_level = threatLevelFilter
       const response = await iocsApi.list(params)
-      setIocs(response.data.items)
-      setTotal(response.data.total)
+      setIocs(response.items)
+      setTotal(response.total)
     } catch (error) {
       console.error('Failed to fetch IOCs:', error)
     } finally {

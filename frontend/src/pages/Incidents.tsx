@@ -54,8 +54,8 @@ export default function Incidents() {
       if (statusFilter) params.status = statusFilter
       if (severityFilter) params.severity = severityFilter
       const response = await incidentsApi.list(params)
-      setIncidents(response.data.items)
-      setTotal(response.data.total)
+      setIncidents(response.items)
+      setTotal(response.total)
     } catch (error) {
       console.error('Failed to fetch incidents:', error)
     } finally {
@@ -66,7 +66,7 @@ export default function Incidents() {
   const fetchAvailableAlerts = async () => {
     try {
       const response = await alertsApi.list({ size: 100 })
-      setAvailableAlerts(response.data.items)
+      setAvailableAlerts(response.items)
     } catch (error) {
       console.error('Failed to fetch alerts:', error)
     }
