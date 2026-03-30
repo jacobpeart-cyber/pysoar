@@ -9,7 +9,7 @@ Data Processing Activities, and Privacy Incidents.
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
-from sqlalchemy import (
+from sqlalchemy import (, Boolean, ForeignKey, Index, Integer, String, Text, UniqueConstraint
     Boolean,
     ForeignKey,
     Integer,
