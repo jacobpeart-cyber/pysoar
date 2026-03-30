@@ -10,7 +10,7 @@ import {
   Loader2,
   FileText,
   Image,
-  LogSquare,
+  Square,
   Settings,
   Eye,
   Trash2,
@@ -311,7 +311,7 @@ function DashboardTab({
         <KPICard
           label="Audit Events (24h)"
           value={data?.auditEventsCount || 0}
-          icon={LogSquare}
+          icon={Square}
           color="blue"
         />
         <KPICard
@@ -663,7 +663,7 @@ function EvidenceTab({
     const icons: Record<string, React.ComponentType> = {
       document: FileText,
       screenshot: Image,
-      log: LogSquare,
+      log: Square,
       config: Settings,
       scan: Shield,
     };
