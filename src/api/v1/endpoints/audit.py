@@ -7,7 +7,7 @@ from sqlalchemy import select, func, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from src.api.deps import get_current_superuser, get_db
+from src.api.deps import DatabaseSession, get_current_superuser, get_db
 from src.models.audit import AuditLog
 from src.models.user import User
 from src.schemas.audit import AuditLogResponse, AuditLogListResponse

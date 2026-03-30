@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 from typing import List, Optional, Dict, Any
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query
+from src.api.deps import CurrentUser, DatabaseSession
 from sqlalchemy import select, and_, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
