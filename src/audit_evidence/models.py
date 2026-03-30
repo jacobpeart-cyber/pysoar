@@ -7,7 +7,7 @@ and automated collection rules for compliance audit support.
 
 from datetime import datetime
 from typing import Any, Optional
-from sqlalchemy import (
+from sqlalchemy import (, Boolean, DateTime, ForeignKey, Index, Integer, JSON, String, Text
     String,
     Integer,
     Text,

@@ -3,7 +3,7 @@
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
-from sqlalchemy import (
+from sqlalchemy import (, Boolean, Float, ForeignKey, Integer, String, Text
     Boolean,
     Float,
     ForeignKey,

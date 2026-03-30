@@ -7,7 +7,7 @@ security findings, and runtime anomaly detection.
 
 from datetime import datetime
 from typing import List, Dict, Any, Optional
-from sqlalchemy import (
+from sqlalchemy import (, Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
     String,
     Integer,
     Float,

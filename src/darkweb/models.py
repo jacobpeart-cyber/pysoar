@@ -7,7 +7,7 @@ Includes monitoring configurations, findings, credential leaks, and brand threat
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
-from sqlalchemy import ForeignKey, Integer, String, Text, Index
+from sqlalchemy import ForeignKey, Index, Integer, JSON, String, Text
 from sqlalchemy.dialects.postgresql import JSON
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
