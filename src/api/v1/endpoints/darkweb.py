@@ -46,6 +46,7 @@ from src.schemas.darkweb import (
     DarkWebFindingCreate,
     DarkWebFindingDetailResponse,
     DarkWebFindingListResponse,
+    DarkWebFindingResponse,
     DarkWebFindingUpdate,
     DarkWebMonitorCreate,
     DarkWebMonitorListResponse,
