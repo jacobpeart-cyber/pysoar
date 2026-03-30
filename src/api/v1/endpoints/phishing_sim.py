@@ -11,7 +11,8 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import CurrentUser, DatabaseSession
+from src.api.deps import CurrentUser, DatabaseSession, get_current_active_user
+from src.core.database import get_db
 from src.core.logging import get_logger
 from src.phishing_sim.engine import (
     AwarenessScorer,
@@ -74,7 +75,7 @@ training_manager = TrainingManager()
 async def create_template(
     request: PhishingTemplateCreateRequest,
     db: AsyncSession = Depends(get_db),
-    current_user=Depends(get_current_user),
+    current_user=Depends(get_current_active_user),
 ):
     """Create a new phishing template."""
     try:
@@ -182,7 +183,7 @@ async def update_template(
     template_id: UUID,
     request: PhishingTemplateUpdateRequest,
     db: AsyncSession = Depends(get_db),
-    current_user=Depends(get_current_user),
+    current_user=Depends(get_current_active_user),
 ):
     """Update a phishing template."""
     try:
@@ -299,7 +300,7 @@ async def get_template_effectiveness(
 async def create_target_group(
     request: TargetGroupCreateRequest,
     db: AsyncSession = Depends(get_db),
-    current_user=Depends(get_current_user),
+    current_user=Depends(get_current_active_user),
 ):
     """Create a new target group."""
     try:
@@ -374,7 +375,7 @@ async def update_target_group(
     group_id: UUID,
     request: TargetGroupUpdateRequest,
     db: AsyncSession = Depends(get_db),
-    current_user=Depends(get_current_user),
+    current_user=Depends(get_current_active_user),
 ):
     """Update a target group."""
     try:
@@ -400,7 +401,7 @@ async def update_target_group(
 async def delete_target_group(
     group_id: UUID,
     db: AsyncSession = Depends(get_db),
-    current_user=Depends(get_current_user),
+    current_user=Depends(get_current_active_user),
 ):
     """Delete a target group."""
     try:
@@ -435,7 +436,7 @@ async def delete_target_group(
 async def create_campaign(
     request: PhishingCampaignCreateRequest,
     db: AsyncSession = Depends(get_db),
-    current_user=Depends(get_current_user),
+    current_user=Depends(get_current_active_user),
 ):
     """Create a new phishing campaign in draft status."""
     try:
@@ -542,7 +543,7 @@ async def update_campaign(
     campaign_id: UUID,
     request: PhishingCampaignUpdateRequest,
     db: AsyncSession = Depends(get_db),
-    current_user=Depends(get_current_user),
+    current_user=Depends(get_current_active_user),
 ):
     """Update campaign configuration (only in draft status)."""
     try:
@@ -585,7 +586,7 @@ async def launch_campaign(
     campaign_id: UUID,
     request: CampaignLaunchRequest,
     db: AsyncSession = Depends(get_db),
-    current_user=Depends(get_current_user),
+    current_user=Depends(get_current_active_user),
 ):
     """Launch a campaign - begin email distribution."""
     try:
@@ -613,7 +614,7 @@ async def launch_campaign(
 async def pause_campaign(
     campaign_id: UUID,
     db: AsyncSession = Depends(get_db),
-    current_user=Depends(get_current_user),
+    current_user=Depends(get_current_active_user),
 ):
     """Pause an active campaign."""
     try:
@@ -635,7 +636,7 @@ async def pause_campaign(
 async def resume_campaign(
     campaign_id: UUID,
     db: AsyncSession = Depends(get_db),
-    current_user=Depends(get_current_user),
+    current_user=Depends(get_current_active_user),
 ):
     """Resume a paused campaign."""
     try:
@@ -657,7 +658,7 @@ async def resume_campaign(
 async def end_campaign(
     campaign_id: UUID,
     db: AsyncSession = Depends(get_db),
-    current_user=Depends(get_current_user),
+    current_user=Depends(get_current_active_user),
 ):
     """End a campaign and calculate final metrics."""
     try:
@@ -680,7 +681,7 @@ async def clone_campaign(
     campaign_id: UUID,
     db: AsyncSession = Depends(get_db),
     new_name: str = Query(...),
-    current_user=Depends(get_current_user),
+    current_user=Depends(get_current_active_user),
 ):
     """Clone an existing campaign."""
     try:
@@ -710,7 +711,7 @@ async def schedule_campaign(
     campaign_id: UUID,
     request: CampaignScheduleRequest,
     db: AsyncSession = Depends(get_db),
-    current_user=Depends(get_current_user),
+    current_user=Depends(get_current_active_user),
 ):
     """Schedule a campaign to launch at specific time."""
     try:
@@ -995,7 +996,7 @@ async def assign_training(
     request: TrainingAssignmentRequest,
     db: AsyncSession = Depends(get_db),
     user_name: str = Query(...),
-    current_user=Depends(get_current_user),
+    current_user=Depends(get_current_active_user),
 ):
     """Assign training modules to a user."""
     try:
