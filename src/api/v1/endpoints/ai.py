@@ -88,7 +88,7 @@ async def natural_language_query(request: NLQueryRequest, current_user: CurrentU
         raise HTTPException(status_code=500, detail="Query processing failed")
 
 
-@router.get("/queries", response_model=None[QueryHistoryResponse], summary="Query history")
+@router.get("/queries", response_model=list[QueryHistoryResponse], summary="Query history")
 async def query_history(
     current_user: CurrentUser = None,
     limit: Annotated[int, Query(ge=1, le=100)] = 10,
@@ -454,7 +454,7 @@ async def anomaly_statistics(current_user: CurrentUser = None):
 
 # Threat Prediction Endpoints
 
-@router.get("/predictions", response_model=None[ThreatPredictionResponse], summary="List predictions")
+@router.get("/predictions", response_model=list[ThreatPredictionResponse], summary="List predictions")
 async def list_threat_predictions(
     current_user: CurrentUser = None,
     entity_type: str | None = None,
@@ -541,7 +541,7 @@ async def prediction_dashboard(current_user: CurrentUser = None):
 
 # ML Model Endpoints
 
-@router.get("/models", response_model=None[MLModelResponse], summary="List ML models")
+@router.get("/models", response_model=list[MLModelResponse], summary="List ML models")
 async def list_models(current_user: CurrentUser = None):
     """List all ML models."""
     logger.info("Listing ML models")

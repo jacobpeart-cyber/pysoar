@@ -534,7 +534,7 @@ async def validate_rule(
 # ============================================================================
 
 
-@router.get("/correlations", response_model=None[CorrelationEventResponse])
+@router.get("/correlations", response_model=list[CorrelationEventResponse])
 async def list_correlations(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
@@ -597,7 +597,7 @@ async def update_correlation_status(
 # ============================================================================
 
 
-@router.get("/sources", response_model=None[DataSourceResponse])
+@router.get("/sources", response_model=list[DataSourceResponse])
 async def list_sources(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,

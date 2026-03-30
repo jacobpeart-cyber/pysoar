@@ -287,7 +287,7 @@ async def create_component(
     return component
 
 
-@router.get("/{model_id}/components", response_model=None[ComponentResponse])
+@router.get("/{model_id}/components", response_model=list[ComponentResponse])
 async def list_components(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,

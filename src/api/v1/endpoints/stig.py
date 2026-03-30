@@ -47,7 +47,7 @@ router = APIRouter(prefix="/stig", tags=["stig"])
 # ============================================================================
 
 
-@router.get("/benchmarks", response_model=None[BenchmarkListResponse])
+@router.get("/benchmarks", response_model=list[BenchmarkListResponse])
 async def list_benchmarks(
     db: AsyncSession = Depends(get_db),
     user=Depends(get_current_active_user),
@@ -92,7 +92,7 @@ async def get_benchmark(
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
 
 
-@router.get("/benchmarks/{benchmark_id}/rules", response_model=None[STIGRuleResponse])
+@router.get("/benchmarks/{benchmark_id}/rules", response_model=list[STIGRuleResponse])
 async def list_benchmark_rules(
     benchmark_id: str,
     db: AsyncSession = Depends(get_db),
@@ -129,7 +129,7 @@ async def list_benchmark_rules(
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
 
 
-@router.get("/rules/search", response_model=None[RuleSearchResponse])
+@router.get("/rules/search", response_model=list[RuleSearchResponse])
 async def search_rules(
     db: AsyncSession = Depends(get_db),
     q: str = Query(..., min_length=1),
@@ -194,7 +194,7 @@ async def launch_scan(
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
 
 
-@router.post("/scans/fleet", response_model=None[dict])
+@router.post("/scans/fleet", response_model=list[dict])
 async def launch_fleet_scan(
     request: ScanFleetRequest,
     db: AsyncSession = Depends(get_db),
@@ -214,7 +214,7 @@ async def launch_fleet_scan(
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
 
 
-@router.get("/scans", response_model=None[STIGScanResultResponse])
+@router.get("/scans", response_model=list[STIGScanResultResponse])
 async def list_scans(
     db: AsyncSession = Depends(get_db),
     user=Depends(get_current_active_user),
@@ -414,7 +414,7 @@ async def generate_arf_report(
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
 
 
-@router.get("/scap/profiles", response_model=None[SCAPProfileResponse])
+@router.get("/scap/profiles", response_model=list[SCAPProfileResponse])
 async def list_scap_profiles(
     db: AsyncSession = Depends(get_db),
     user=Depends(get_current_active_user),

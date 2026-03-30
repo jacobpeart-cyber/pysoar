@@ -403,7 +403,7 @@ async def record_sighting(
     )
 
 
-@router.get("/indicators/{indicator_id}/sightings", response_model=None[IndicatorSightingResponse], operation_id="get_indicator_sightings")
+@router.get("/indicators/{indicator_id}/sightings", response_model=list[IndicatorSightingResponse], operation_id="get_indicator_sightings")
 async def get_indicator_sightings(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,

@@ -592,7 +592,7 @@ async def escalate_finding(
 # ============================================================================
 
 
-@router.get("/templates", response_model=None[HuntTemplateResponse])
+@router.get("/templates", response_model=list[HuntTemplateResponse])
 async def list_templates(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,

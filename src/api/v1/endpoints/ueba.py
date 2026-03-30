@@ -44,7 +44,7 @@ router = APIRouter(prefix="/ueba", tags=["ueba"])
 
 @router.get(
     "/entities",
-    response_model=None[EntityProfileResponse],
+    response_model=list[EntityProfileResponse],
     summary="List entities",
     description="List user and entity profiles with filtering"
 )
@@ -226,7 +226,7 @@ async def get_peer_comparison(
 
 @router.get(
     "/alerts",
-    response_model=None[UEBARiskAlertResponse],
+    response_model=list[UEBARiskAlertResponse],
     summary="List UEBA alerts",
     description="List risk alerts with filtering"
 )
@@ -402,7 +402,7 @@ async def ingest_batch(
 
 @router.get(
     "/events",
-    response_model=None[BehaviorEventResponse],
+    response_model=list[BehaviorEventResponse],
     summary="Search behavior events",
     description="Search and filter behavior events"
 )
@@ -442,7 +442,7 @@ async def search_events(
 
 @router.get(
     "/peer-groups",
-    response_model=None[PeerGroupResponse],
+    response_model=list[PeerGroupResponse],
     summary="List peer groups",
     description="List all peer groups"
 )
@@ -511,7 +511,7 @@ async def get_peer_group(
 
 @router.post(
     "/peer-groups/auto-cluster",
-    response_model=None[PeerGroupResponse],
+    response_model=list[PeerGroupResponse],
     summary="Auto-cluster peers",
     description="Trigger automatic peer clustering"
 )
@@ -533,7 +533,7 @@ async def trigger_auto_cluster(
 
 @router.get(
     "/baselines/{entity_id}",
-    response_model=None[BehaviorBaselineResponse],
+    response_model=list[BehaviorBaselineResponse],
     summary="Get entity baselines",
     description="Retrieve behavior baselines for entity"
 )

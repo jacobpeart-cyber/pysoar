@@ -65,7 +65,7 @@ class APIKeyUpdate(BaseModel):
     is_active: Optional[bool] = None
 
 
-@router.get("", response_model=None[APIKeyResponse])
+@router.get("", response_model=list[APIKeyResponse])
 async def list_api_keys(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
@@ -220,7 +220,7 @@ async def regenerate_api_key(
     return response
 
 
-@router.get("/permissions/available", response_model=None[str])
+@router.get("/permissions/available", response_model=list[str])
 async def list_available_permissions(
     current_user: CurrentUser = None,
 ):
@@ -229,7 +229,7 @@ async def list_available_permissions(
 
 
 # Admin endpoints
-@router.get("/admin/all", response_model=None[APIKeyResponse])
+@router.get("/admin/all", response_model=list[APIKeyResponse])
 async def list_all_api_keys(
     db: DatabaseSession = None,
     admin_user: User = Depends(get_current_admin_user),

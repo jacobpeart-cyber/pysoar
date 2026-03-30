@@ -398,7 +398,7 @@ async def pin_message(
     return {"status": "pinned", "message_id": message_id}
 
 
-@router.get("/rooms/{room_id}/messages/search", response_model=None[WarRoomMessageResponse])
+@router.get("/rooms/{room_id}/messages/search", response_model=list[WarRoomMessageResponse])
 async def search_messages(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,

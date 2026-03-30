@@ -117,7 +117,7 @@ async def create_template(
         )
 
 
-@router.get("/templates", response_model=None[PhishingTemplateResponse])
+@router.get("/templates", response_model=list[PhishingTemplateResponse])
 async def list_templates(
     db: AsyncSession = Depends(get_db),
     category: str | None = Query(None),
@@ -330,7 +330,7 @@ async def create_target_group(
         )
 
 
-@router.get("/target-groups", response_model=None[TargetGroupResponse])
+@router.get("/target-groups", response_model=list[TargetGroupResponse])
 async def list_target_groups(
     db: AsyncSession = Depends(get_db),
     department: str | None = Query(None),
@@ -470,7 +470,7 @@ async def create_campaign(
         )
 
 
-@router.get("/campaigns", response_model=None[PhishingCampaignResponse])
+@router.get("/campaigns", response_model=list[PhishingCampaignResponse])
 async def list_campaigns(
     db: AsyncSession = Depends(get_db),
     status_filter: str | None = Query(None, alias="status"),
@@ -581,7 +581,7 @@ async def update_campaign(
         )
 
 
-@router.post("/campaigns/{campaign_id}/launch", response_model=None[str, Any])
+@router.post("/campaigns/{campaign_id}/launch", response_model=list[str, Any])
 async def launch_campaign(
     campaign_id: UUID,
     request: CampaignLaunchRequest,
@@ -610,7 +610,7 @@ async def launch_campaign(
         )
 
 
-@router.post("/campaigns/{campaign_id}/pause", response_model=None[str, Any])
+@router.post("/campaigns/{campaign_id}/pause", response_model=list[str, Any])
 async def pause_campaign(
     campaign_id: UUID,
     db: AsyncSession = Depends(get_db),
@@ -632,7 +632,7 @@ async def pause_campaign(
         )
 
 
-@router.post("/campaigns/{campaign_id}/resume", response_model=None[str, Any])
+@router.post("/campaigns/{campaign_id}/resume", response_model=list[str, Any])
 async def resume_campaign(
     campaign_id: UUID,
     db: AsyncSession = Depends(get_db),
@@ -654,7 +654,7 @@ async def resume_campaign(
         )
 
 
-@router.post("/campaigns/{campaign_id}/end", response_model=None[str, Any])
+@router.post("/campaigns/{campaign_id}/end", response_model=list[str, Any])
 async def end_campaign(
     campaign_id: UUID,
     db: AsyncSession = Depends(get_db),
@@ -706,7 +706,7 @@ async def clone_campaign(
         )
 
 
-@router.post("/campaigns/{campaign_id}/schedule", response_model=None[str, Any])
+@router.post("/campaigns/{campaign_id}/schedule", response_model=list[str, Any])
 async def schedule_campaign(
     campaign_id: UUID,
     request: CampaignScheduleRequest,
@@ -735,7 +735,7 @@ async def schedule_campaign(
         )
 
 
-@router.get("/campaigns/{campaign_id}/results", response_model=None[str, Any])
+@router.get("/campaigns/{campaign_id}/results", response_model=list[str, Any])
 async def get_campaign_results(
     campaign_id: UUID,
     db: AsyncSession = Depends(get_db),
@@ -801,7 +801,7 @@ async def record_event(
         )
 
 
-@router.get("/campaigns/{campaign_id}/events", response_model=None[CampaignEventResponse])
+@router.get("/campaigns/{campaign_id}/events", response_model=list[CampaignEventResponse])
 async def list_campaign_events(
     campaign_id: UUID,
     db: AsyncSession = Depends(get_db),
@@ -831,7 +831,7 @@ async def list_campaign_events(
         )
 
 
-@router.get("/campaigns/{campaign_id}/events/timeline", response_model=None[dict[str, Any]])
+@router.get("/campaigns/{campaign_id}/events/timeline", response_model=list[dict[str, Any]])
 async def get_event_timeline(
     campaign_id: UUID,
     db: AsyncSession = Depends(get_db),
@@ -922,7 +922,7 @@ async def calculate_user_score(
         )
 
 
-@router.get("/awareness-scores/department/{department}", response_model=None[str, Any])
+@router.get("/awareness-scores/department/{department}", response_model=list[str, Any])
 async def get_department_scores(
     department: str,
     db: AsyncSession = Depends(get_db),
@@ -941,7 +941,7 @@ async def get_department_scores(
         )
 
 
-@router.get("/awareness-scores/high-risk", response_model=None[SecurityAwarenessScoreResponse])
+@router.get("/awareness-scores/high-risk", response_model=list[SecurityAwarenessScoreResponse])
 async def get_high_risk_users(
     db: AsyncSession = Depends(get_db),
     threshold: int = Query(40, ge=0, le=100),
@@ -965,7 +965,7 @@ async def get_high_risk_users(
 # ============================================================================
 
 
-@router.get("/training/modules", response_model=None[TrainingModuleResponse])
+@router.get("/training/modules", response_model=list[TrainingModuleResponse])
 async def list_training_modules(db: AsyncSession = Depends(get_db)):
     """Get available training modules."""
     try:
@@ -990,7 +990,7 @@ async def list_training_modules(db: AsyncSession = Depends(get_db)):
         )
 
 
-@router.post("/training/{user_email}/assign", response_model=None[str, Any])
+@router.post("/training/{user_email}/assign", response_model=list[str, Any])
 async def assign_training(
     user_email: str,
     request: TrainingAssignmentRequest,
@@ -1025,7 +1025,7 @@ async def assign_training(
         )
 
 
-@router.post("/training/{user_email}/track-completion", response_model=None[str, Any])
+@router.post("/training/{user_email}/track-completion", response_model=list[str, Any])
 async def track_training_completion(
     user_email: str,
     request: TrainingCompletionRequest,
@@ -1161,7 +1161,7 @@ async def get_dashboard(
         )
 
 
-@router.get("/reports/risk", response_model=None[str, Any])
+@router.get("/reports/risk", response_model=list[str, Any])
 async def get_risk_report(db: AsyncSession = Depends(get_db)):
     """Generate comprehensive risk assessment report."""
     try:

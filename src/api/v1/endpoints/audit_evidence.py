@@ -83,7 +83,7 @@ async def log_audit_event(
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
 
 
-@router.post("/audit/search", response_model=None[AuditTrailResponse])
+@router.post("/audit/search", response_model=list[AuditTrailResponse])
 async def search_audit_trail(
     request: AuditSearchRequest,
     db: AsyncSession = Depends(get_db),
@@ -148,7 +148,7 @@ async def export_audit_trail(
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
 
 
-@router.get("/audit/suspicious-activity", response_model=None[dict])
+@router.get("/audit/suspicious-activity", response_model=list[dict])
 async def detect_suspicious_activity(
     db: AsyncSession = Depends(get_db),
     actor_id: str = Query(...),
@@ -228,7 +228,7 @@ async def verify_evidence_integrity(
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
 
 
-@router.get("/evidence/list", response_model=None[dict])
+@router.get("/evidence/list", response_model=list[dict])
 async def list_evidence_items(
     db: AsyncSession = Depends(get_db),
     user=Depends(get_current_active_user),
@@ -283,7 +283,7 @@ async def create_evidence_package(
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
 
 
-@router.get("/packages", response_model=None[EvidencePackageResponse])
+@router.get("/packages", response_model=list[EvidencePackageResponse])
 async def list_evidence_packages(
     db: AsyncSession = Depends(get_db),
     user=Depends(get_current_active_user),
@@ -546,7 +546,7 @@ async def create_evidence_rule(
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
 
 
-@router.get("/rules", response_model=None[AutomatedEvidenceRuleResponse])
+@router.get("/rules", response_model=list[AutomatedEvidenceRuleResponse])
 async def list_evidence_rules(
     db: AsyncSession = Depends(get_db),
     user=Depends(get_current_active_user),

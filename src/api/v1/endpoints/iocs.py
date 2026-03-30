@@ -289,7 +289,7 @@ async def delete_ioc(
     await db.flush()
 
 
-@router.post("/search", response_model=None[IOCResponse])
+@router.post("/search", response_model=list[IOCResponse])
 async def search_ioc(
     search_data: IOCSearchRequest,
     current_user: CurrentUser = None,
