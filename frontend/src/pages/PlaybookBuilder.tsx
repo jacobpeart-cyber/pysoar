@@ -1,30 +1,12 @@
-'use client';
+import React from 'react';
 
-import React, { useState } from 'react';
-import {
-  Workflow,
-  Play,
-  Pause,
-  CheckCircle,
-  Layout,
-  Edit2,
-  Copy,
-  Trash2,
-  Clock,
-  BarChart3,
-  X,
-  Plus,
-} from 'lucide-react';
-import {
-  BarChart,
-  Bar,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Tooltip,
-  ResponsiveContainer,
-} from 'recharts';
-import clsx from 'clsx';
-import { playbookApi } from '../api/endpoints';
+function PlaybookBuilder() {
+  return (
+    <div className="p-6">
+      <h1 className="text-2xl font-bold mb-4">Playbook Builder</h1>
+      <p className="text-gray-600">Visual playbook builder - coming soon.</p>
+    </div>
+  );
+}
 
 export default PlaybookBuilder;
