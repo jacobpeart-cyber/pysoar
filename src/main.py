@@ -17,8 +17,8 @@ from src.core.config import settings
 from src.core.database import close_db, init_db
 from src.core.exceptions import PySOARException
 from src.core.logging import get_logger, setup_logging
-from src.core.middleware import AuditLoggingMiddleware
-from src.core.secrets import init_encryption
+from src.core.middleware import RequestLoggingMiddleware as AuditLoggingMiddleware
+from src.core.encryption import init_encryption
 from src.services.user_service import UserService
 
 logger = get_logger(__name__)
