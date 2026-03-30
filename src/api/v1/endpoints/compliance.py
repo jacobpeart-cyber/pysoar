@@ -428,9 +428,9 @@ async def run_control_assessment(
 
 @router.get("/controls/cross-map")
 async def cross_map_controls(
+    db: AsyncSession = Depends(get_db),
     source_framework_id: str = Query(...),
     target_framework_id: str = Query(...),
-    db: AsyncSession = Depends(get_db),
     user=Depends(get_current_user),
 ):
     """Get cross-framework control mapping."""
@@ -656,10 +656,10 @@ async def upload_evidence(
     control_id_ref: str,
     evidence_type: str,
     title: str,
+    db: AsyncSession = Depends(get_db),
     description: Optional[str] = None,
     content: Optional[str] = None,
     file_path: Optional[str] = None,
-    db: AsyncSession = Depends(get_db),
     user=Depends(get_current_user),
 ):
     """Upload compliance evidence."""

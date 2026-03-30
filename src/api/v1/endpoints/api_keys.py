@@ -243,9 +243,9 @@ async def list_all_api_keys(
 
 
 async def _get_user_api_key(
-    db: AsyncSession,
     key_id: str,
     user: User,
+    db: AsyncSession,
 ) -> APIKey:
     """Get an API key, ensuring it belongs to the user (or user is admin)"""
     result = await db.execute(select(APIKey).where(APIKey.id == key_id))

@@ -189,10 +189,10 @@ async def get_incident_or_404(db: AsyncSession, incident_id: str) -> Incident:
 
 
 async def add_timeline_event(
-    db: AsyncSession,
     incident_id: str,
     event_type: str,
     title: str,
+    db: AsyncSession,
     actor_id: Optional[str] = None,
     description: Optional[str] = None,
     old_value: Optional[str] = None,

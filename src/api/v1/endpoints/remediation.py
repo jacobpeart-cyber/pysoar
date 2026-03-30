@@ -107,12 +107,12 @@ async def create_policy(
 
 @router.get("/policies", response_model=List[RemediationPolicyResponse])
 async def list_policies(
+    db: AsyncSession = Depends(get_db),
     policy_type: Optional[str] = Query(None),
     trigger_type: Optional[str] = Query(None),
     enabled_only: bool = Query(default=True),
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, ge=1, le=500),
-    db: AsyncSession = Depends(get_db),
     current_user = Depends(get_current_user),
 ):
     """List remediation policies with optional filtering."""
@@ -243,10 +243,10 @@ async def list_builtin_policies(
 
 @router.get("/actions", response_model=List[RemediationActionResponse])
 async def list_actions(
+    db: AsyncSession = Depends(get_db),
     action_type: Optional[str] = Query(None),
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, ge=1, le=500),
-    db: AsyncSession = Depends(get_db),
     current_user = Depends(get_current_user),
 ):
     """List available remediation actions."""
@@ -332,12 +332,12 @@ async def test_action(
 
 @router.get("/executions", response_model=List[RemediationExecutionResponse])
 async def list_executions(
+    db: AsyncSession = Depends(get_db),
     status: Optional[str] = Query(None),
     trigger_source: Optional[str] = Query(None),
     days: int = Query(default=7, ge=1, le=90),
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, ge=1, le=500),
-    db: AsyncSession = Depends(get_db),
     current_user = Depends(get_current_user),
 ):
     """List remediation executions."""
@@ -613,10 +613,10 @@ async def quick_quarantine_file(
 
 @router.get("/playbooks", response_model=List[RemediationPlaybookResponse])
 async def list_playbooks(
+    db: AsyncSession = Depends(get_db),
     playbook_type: Optional[str] = Query(None),
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, ge=1, le=500),
-    db: AsyncSession = Depends(get_db),
     current_user = Depends(get_current_user),
 ):
     """List remediation playbooks."""
@@ -721,8 +721,8 @@ async def execute_playbook(
 
 @router.get("/integrations", response_model=List[RemediationIntegrationResponse])
 async def list_integrations(
-    integration_type: Optional[str] = Query(None),
     db: AsyncSession = Depends(get_db),
+    integration_type: Optional[str] = Query(None),
     current_user = Depends(get_current_user),
 ):
     """List remediation integrations."""
@@ -827,8 +827,8 @@ async def get_integration_health(
 
 @router.get("/dashboard", response_model=RemediationDashboardStats)
 async def get_dashboard_stats(
-    days: int = Query(default=7, ge=1, le=90),
     db: AsyncSession = Depends(get_db),
+    days: int = Query(default=7, ge=1, le=90),
     current_user = Depends(get_current_user),
 ):
     """Get remediation dashboard statistics."""
@@ -868,8 +868,8 @@ async def get_dashboard_stats(
 
 @router.get("/timeline", response_model=RemediationTimelineResponse)
 async def get_remediation_timeline(
-    days: int = Query(default=7, ge=1, le=90),
     db: AsyncSession = Depends(get_db),
+    days: int = Query(default=7, ge=1, le=90),
     current_user = Depends(get_current_user),
 ):
     """Get recent remediation timeline."""
@@ -895,8 +895,8 @@ async def get_remediation_timeline(
 
 @router.get("/effectiveness", response_model=EffectivenessMetrics)
 async def get_effectiveness_metrics(
-    days: int = Query(default=7, ge=1, le=90),
     db: AsyncSession = Depends(get_db),
+    days: int = Query(default=7, ge=1, le=90),
     current_user = Depends(get_current_user),
 ):
     """Get remediation effectiveness metrics."""

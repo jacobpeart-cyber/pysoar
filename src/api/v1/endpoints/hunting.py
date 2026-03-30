@@ -826,9 +826,9 @@ async def publish_notebook(
 @router.get("/notebooks/{notebook_id}/export", response_model=dict)
 async def export_notebook(
     notebook_id: str,
-    format: str = Query("json", regex="^(json|markdown|html)$"),
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
+    format: str = Query("json", regex="^(json|markdown|html)$"),
 ):
     """Export a notebook in the specified format"""
     # Note: In a real implementation, this would use the NotebookService

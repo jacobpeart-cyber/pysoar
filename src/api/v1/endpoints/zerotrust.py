@@ -161,11 +161,11 @@ async def continuous_session_evaluation(
 
 @router.get("/decisions", response_model=dict[str, Any])
 async def list_access_decisions(
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
     decision_filter: str = Query(None, description="allow, deny, challenge, step_up, isolate"),
-    db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ) -> dict[str, Any]:
     """List access decisions (audit trail)"""
     logger.info("api_list_access_decisions", skip=skip, limit=limit)
@@ -253,11 +253,11 @@ async def create_policy(
 
 @router.get("/policies", response_model=dict[str, Any])
 async def list_policies(
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
     enabled_only: bool = Query(True),
-    db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ) -> dict[str, Any]:
     """List Zero Trust policies"""
     query = select(ZeroTrustPolicy).where(
@@ -427,11 +427,11 @@ async def test_policy(
 
 @router.get("/devices", response_model=dict[str, Any])
 async def list_devices(
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
     trust_level: str = Query(None, description="trusted, conditional, untrusted, blocked"),
-    db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ) -> dict[str, Any]:
     """List devices with trust scores"""
     query = select(DeviceTrustProfile).where(
@@ -578,10 +578,10 @@ async def create_segment(
 
 @router.get("/segments", response_model=dict[str, Any])
 async def list_segments(
-    skip: int = Query(0, ge=0),
-    limit: int = Query(20, ge=1, le=100),
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
 ) -> dict[str, Any]:
     """List micro-segments"""
     query = select(MicroSegment).where(
@@ -775,9 +775,9 @@ async def initiate_verification(
 @router.post("/step-up/{session_id}", response_model=dict[str, Any])
 async def step_up_authentication(
     session_id: str,
-    required_level: str = Query(..., description="mfa, biometric, password"),
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
+    required_level: str = Query(..., description="mfa, biometric, password"),
 ) -> dict[str, Any]:
     """Initiate step-up authentication"""
     auth_engine = ContinuousAuthEngine(db, current_user.organization_id)
@@ -787,11 +787,11 @@ async def step_up_authentication(
 
 @router.get("/verifications", response_model=dict[str, Any])
 async def list_verifications(
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     user_id: str = Query(None),
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
-    db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ) -> dict[str, Any]:
     """Get verification history"""
     query = select(IdentityVerification).where(

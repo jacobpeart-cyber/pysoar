@@ -131,9 +131,9 @@ async def get_vendor_or_404(db: AsyncSession, vendor_id: str) -> VendorAssessmen
 
 @router.post("/sboms/generate", response_model=SBOMResponse)
 async def generate_sbom(
+    sbom_create: SBOMCreate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    sbom_create: SBOMCreate,
 ):
     """Generate new SBOM for application"""
     sbom = SBOM(
@@ -149,9 +149,9 @@ async def generate_sbom(
 
 @router.post("/sboms/import", response_model=SBOMResponse)
 async def import_sbom(
+    import_request: SBOMImportRequest,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    import_request: SBOMImportRequest,
 ):
     """Import SBOM from file or content"""
     generator = SBOMGenerator()
@@ -191,10 +191,10 @@ async def import_sbom(
 
 @router.post("/sboms/{sbom_id}/export")
 async def export_sbom(
+    export_request: SBOMExportRequest,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     sbom_id: str = Path(...),
-    export_request: SBOMExportRequest,
 ):
     """Export SBOM in specified format"""
     sbom = await get_sbom_or_404(db, sbom_id)
@@ -292,10 +292,10 @@ async def get_sbom(
 
 @router.patch("/sboms/{sbom_id}", response_model=SBOMResponse)
 async def update_sbom(
+    sbom_update: SBOMUpdate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     sbom_id: str = Path(...),
-    sbom_update: SBOMUpdate,
 ):
     """Update SBOM"""
     sbom = await get_sbom_or_404(db, sbom_id)
@@ -314,9 +314,9 @@ async def update_sbom(
 
 @router.post("/sboms/compare")
 async def compare_sboms(
+    comparison_request: SBOMComparisonRequest,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    comparison_request: SBOMComparisonRequest,
 ):
     """Compare two SBOM versions"""
     sbom1 = await get_sbom_or_404(db, comparison_request.sbom_id_1)
@@ -340,9 +340,9 @@ async def compare_sboms(
 
 @router.post("/components", response_model=SoftwareComponentResponse)
 async def create_component(
+    component_create: SoftwareComponentCreate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    component_create: SoftwareComponentCreate,
 ):
     """Create software component"""
     component = SoftwareComponent(
@@ -420,10 +420,10 @@ async def get_component(
 
 @router.patch("/components/{component_id}", response_model=SoftwareComponentResponse)
 async def update_component(
+    component_update: SoftwareComponentUpdate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     component_id: str = Path(...),
-    component_update: SoftwareComponentUpdate,
 ):
     """Update component"""
     component = await get_component_or_404(db, component_id)
@@ -505,9 +505,9 @@ async def get_component_vulnerabilities(
 
 @router.post("/risks", response_model=SupplyChainRiskResponse)
 async def create_risk(
+    risk_create: SupplyChainRiskCreate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    risk_create: SupplyChainRiskCreate,
 ):
     """Create supply chain risk record"""
     risk = SupplyChainRisk(
@@ -582,10 +582,10 @@ async def get_risk(
 
 @router.patch("/risks/{risk_id}", response_model=SupplyChainRiskResponse)
 async def update_risk(
+    risk_update: SupplyChainRiskUpdate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     risk_id: str = Path(...),
-    risk_update: SupplyChainRiskUpdate,
 ):
     """Update risk status and remediation"""
     risk = await get_risk_or_404(db, risk_id)
@@ -607,9 +607,9 @@ async def update_risk(
 
 @router.post("/vendors", response_model=VendorAssessmentResponse)
 async def create_vendor(
+    vendor_create: VendorAssessmentCreate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    vendor_create: VendorAssessmentCreate,
 ):
     """Create vendor assessment"""
     vendor = VendorAssessment(
@@ -681,10 +681,10 @@ async def get_vendor(
 
 @router.patch("/vendors/{vendor_id}", response_model=VendorAssessmentResponse)
 async def update_vendor(
+    vendor_update: VendorAssessmentUpdate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     vendor_id: str = Path(...),
-    vendor_update: VendorAssessmentUpdate,
 ):
     """Update vendor assessment"""
     vendor = await get_vendor_or_404(db, vendor_id)

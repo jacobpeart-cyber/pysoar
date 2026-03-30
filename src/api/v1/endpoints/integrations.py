@@ -55,8 +55,8 @@ executor = ActionExecutor()
 
 # Helper functions
 async def get_installed_integration_or_404(
-    db: AsyncSession,
     integration_id: str,
+    db: AsyncSession,
 ) -> InstalledIntegration:
     """Get installed integration by ID or raise 404"""
     result = await db.execute(
@@ -74,8 +74,8 @@ async def get_installed_integration_or_404(
 
 
 async def get_action_or_404(
-    db: AsyncSession,
     action_id: str,
+    db: AsyncSession,
 ) -> IntegrationAction:
     """Get action by ID or raise 404"""
     result = await db.execute(
@@ -193,9 +193,9 @@ async def get_connector_details(
 # Installed integrations endpoints
 @router.post("/install", response_model=InstalledIntegrationResponse, status_code=status.HTTP_201_CREATED)
 async def install_connector(
+    request: IntegrationInstallRequest,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    request: IntegrationInstallRequest,
 ):
     """Install a connector"""
     # Validate connector exists
@@ -357,10 +357,10 @@ async def get_installed_integration(
 
 @router.patch("/installed/{integration_id}", response_model=InstalledIntegrationResponse)
 async def update_installed_integration(
+    request: InstalledIntegrationUpdate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     integration_id: str = Path(...),
-    request: InstalledIntegrationUpdate,
 ):
     """Update installed integration configuration"""
     integration = await get_installed_integration_or_404(db, integration_id)
@@ -583,11 +583,11 @@ async def list_integration_actions(
     status_code=status.HTTP_202_ACCEPTED,
 )
 async def execute_action(
+    request: ActionExecutionRequest,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     integration_id: str = Path(...),
     action_id: str = Path(...),
-    request: ActionExecutionRequest,
 ):
     """Execute an integration action"""
     integration = await get_installed_integration_or_404(db, integration_id)
@@ -728,10 +728,10 @@ async def get_execution_history(
     status_code=status.HTTP_201_CREATED,
 )
 async def register_webhook(
+    request: WebhookRegisterRequest,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     integration_id: str = Path(...),
-    request: WebhookRegisterRequest,
 ):
     """Register webhook for integration"""
     integration = await get_installed_integration_or_404(db, integration_id)

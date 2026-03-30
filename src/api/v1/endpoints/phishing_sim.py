@@ -678,8 +678,8 @@ async def end_campaign(
 @router.post("/campaigns/{campaign_id}/clone", response_model=PhishingCampaignResponse)
 async def clone_campaign(
     campaign_id: UUID,
-    new_name: str = Query(...),
     db: AsyncSession = Depends(get_db),
+    new_name: str = Query(...),
     current_user=Depends(get_current_user),
 ):
     """Clone an existing campaign."""
@@ -833,8 +833,8 @@ async def list_campaign_events(
 @router.get("/campaigns/{campaign_id}/events/timeline", response_model=list[dict[str, Any]])
 async def get_event_timeline(
     campaign_id: UUID,
-    target_email: str | None = Query(None),
     db: AsyncSession = Depends(get_db),
+    target_email: str | None = Query(None),
 ):
     """Get event timeline for campaign or specific target."""
     try:
@@ -889,9 +889,9 @@ async def get_user_awareness_score(
 async def calculate_user_score(
     user_email: str,
     request: UserScoreCalculationRequest,
+    db: AsyncSession = Depends(get_db),
     user_name: str = Query(...),
     department: str | None = Query(None),
-    db: AsyncSession = Depends(get_db),
 ):
     """Calculate or recalculate user awareness score."""
     try:
@@ -942,8 +942,8 @@ async def get_department_scores(
 
 @router.get("/awareness-scores/high-risk", response_model=list[SecurityAwarenessScoreResponse])
 async def get_high_risk_users(
-    threshold: int = Query(40, ge=0, le=100),
     db: AsyncSession = Depends(get_db),
+    threshold: int = Query(40, ge=0, le=100),
 ):
     """Identify users with awareness scores below threshold."""
     try:
@@ -993,8 +993,8 @@ async def list_training_modules(db: AsyncSession = Depends(get_db)):
 async def assign_training(
     user_email: str,
     request: TrainingAssignmentRequest,
-    user_name: str = Query(...),
     db: AsyncSession = Depends(get_db),
+    user_name: str = Query(...),
     current_user=Depends(get_current_user),
 ):
     """Assign training modules to a user."""
@@ -1059,9 +1059,9 @@ async def track_training_completion(
 )
 async def generate_certificate(
     user_email: str,
+    db: AsyncSession = Depends(get_db),
     training_module: str = Query(...),
     user_name: str = Query(...),
-    db: AsyncSession = Depends(get_db),
 ):
     """Generate training certificate."""
     try:

@@ -56,8 +56,8 @@ router = APIRouter(prefix="/audit-evidence", tags=["audit-evidence"])
 @router.post("/audit/log", response_model=AuditTrailResponse)
 async def log_audit_event(
     request: AuditLogRequest,
-    user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    user=Depends(get_current_user),
 ):
     """Log audit event"""
     try:
@@ -85,8 +85,8 @@ async def log_audit_event(
 @router.post("/audit/search", response_model=list[AuditTrailResponse])
 async def search_audit_trail(
     request: AuditSearchRequest,
-    user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    user=Depends(get_current_user),
 ):
     """Search audit trail with filters"""
     try:
@@ -117,8 +117,8 @@ async def search_audit_trail(
 
 @router.get("/audit/export", response_model=dict)
 async def export_audit_trail(
-    user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    user=Depends(get_current_user),
     format: str = Query("json", regex="^(json|csv|xml)$"),
     days: int = Query(30, ge=1, le=365),
 ):
@@ -149,9 +149,9 @@ async def export_audit_trail(
 
 @router.get("/audit/suspicious-activity", response_model=list[dict])
 async def detect_suspicious_activity(
+    db: AsyncSession = Depends(get_db_session),
     actor_id: str = Query(...),
     user=Depends(get_current_user),
-    db: AsyncSession = Depends(get_db_session),
 ):
     """Detect suspicious activity for actor"""
     try:
@@ -171,8 +171,8 @@ async def detect_suspicious_activity(
 @router.post("/evidence/collect", response_model=dict)
 async def collect_evidence(
     request: Body(...),
-    user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    user=Depends(get_current_user),
 ):
     """Collect evidence based on rule"""
     try:
@@ -190,8 +190,8 @@ async def collect_evidence(
 
 @router.post("/evidence/collect-all", response_model=dict)
 async def collect_all_automated_evidence(
-    user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    user=Depends(get_current_user),
 ):
     """Collect evidence from all enabled automated rules"""
     try:
@@ -209,9 +209,9 @@ async def collect_all_automated_evidence(
 
 @router.post("/evidence/verify", response_model=dict)
 async def verify_evidence_integrity(
+    db: AsyncSession = Depends(get_db_session),
     evidence_id: str = Query(...),
     user=Depends(get_current_user),
-    db: AsyncSession = Depends(get_db_session),
 ):
     """Verify evidence integrity"""
     try:
@@ -229,8 +229,8 @@ async def verify_evidence_integrity(
 
 @router.get("/evidence/list", response_model=list[dict])
 async def list_evidence_items(
-    user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    user=Depends(get_current_user),
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=500),
 ):
@@ -259,8 +259,8 @@ async def list_evidence_items(
 @router.post("/packages/create", response_model=EvidencePackageResponse)
 async def create_evidence_package(
     request: EvidencePackageCreateRequest,
-    user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    user=Depends(get_current_user),
 ):
     """Create evidence package"""
     try:
@@ -284,8 +284,8 @@ async def create_evidence_package(
 
 @router.get("/packages", response_model=list[EvidencePackageResponse])
 async def list_evidence_packages(
-    user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    user=Depends(get_current_user),
     status: Optional[str] = None,
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
@@ -308,8 +308,8 @@ async def list_evidence_packages(
 @router.get("/packages/{package_id}", response_model=EvidencePackageResponse)
 async def get_evidence_package(
     package_id: str,
-    user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    user=Depends(get_current_user),
 ):
     """Get evidence package details"""
     try:
@@ -331,8 +331,8 @@ async def get_evidence_package(
 @router.post("/packages/{package_id}/package", response_model=dict)
 async def package_evidence(
     package_id: str,
-    user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    user=Depends(get_current_user),
 ):
     """Package evidence for submission"""
     try:
@@ -347,8 +347,8 @@ async def package_evidence(
 @router.post("/packages/{package_id}/submit", response_model=dict)
 async def submit_evidence_package(
     package_id: str,
-    user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    user=Depends(get_current_user),
 ):
     """Submit evidence package to assessor"""
     try:
@@ -378,8 +378,8 @@ async def submit_evidence_package(
 @router.get("/packages/{package_id}/report", response_model=dict)
 async def get_evidence_report(
     package_id: str,
-    user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    user=Depends(get_current_user),
 ):
     """Get evidence report for package"""
     try:
@@ -398,8 +398,8 @@ async def get_evidence_report(
 
 @router.post("/conmon/run-cycle", response_model=ConMonReportResponse)
 async def run_conmon_cycle(
-    user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    user=Depends(get_current_user),
 ):
     """Run FedRAMP ConMon cycle"""
     try:
@@ -413,8 +413,8 @@ async def run_conmon_cycle(
 
 @router.get("/conmon/report", response_model=ConMonReportResponse)
 async def get_conmon_report(
-    user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    user=Depends(get_current_user),
 ):
     """Get latest ConMon report"""
     try:
@@ -428,8 +428,8 @@ async def get_conmon_report(
 
 @router.get("/conmon/status", response_model=dict)
 async def get_conmon_status(
-    user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    user=Depends(get_current_user),
 ):
     """Get ConMon status"""
     try:
@@ -452,9 +452,9 @@ async def get_conmon_status(
 
 @router.get("/readiness/check", response_model=AuditReadinessResponse)
 async def check_audit_readiness(
+    db: AsyncSession = Depends(get_db_session),
     framework: str = Query(..., description="Compliance framework"),
     user=Depends(get_current_user),
-    db: AsyncSession = Depends(get_db_session),
 ):
     """Check audit readiness for framework"""
     try:
@@ -468,9 +468,9 @@ async def check_audit_readiness(
 
 @router.get("/readiness/coverage", response_model=EvidenceCoverageResponse)
 async def check_evidence_coverage(
+    db: AsyncSession = Depends(get_db_session),
     framework_id: str = Query(...),
     user=Depends(get_current_user),
-    db: AsyncSession = Depends(get_db_session),
 ):
     """Check evidence coverage for framework"""
     try:
@@ -484,9 +484,9 @@ async def check_evidence_coverage(
 
 @router.get("/readiness/freshness", response_model=EvidenceFreshnessResponse)
 async def check_evidence_freshness(
+    db: AsyncSession = Depends(get_db_session),
     framework_id: str = Query(...),
     user=Depends(get_current_user),
-    db: AsyncSession = Depends(get_db_session),
 ):
     """Check evidence freshness for framework"""
     try:
@@ -500,9 +500,9 @@ async def check_evidence_freshness(
 
 @router.get("/readiness/assessor-package", response_model=AssessorPackageResponse)
 async def generate_assessor_package(
+    db: AsyncSession = Depends(get_db_session),
     framework_id: str = Query(...),
     user=Depends(get_current_user),
-    db: AsyncSession = Depends(get_db_session),
 ):
     """Generate package for external assessors"""
     try:
@@ -522,8 +522,8 @@ async def generate_assessor_package(
 @router.post("/rules/create", response_model=AutomatedEvidenceRuleResponse)
 async def create_evidence_rule(
     request: AutomatedRuleCreateRequest,
-    user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    user=Depends(get_current_user),
 ):
     """Create automated evidence collection rule"""
     try:
@@ -547,8 +547,8 @@ async def create_evidence_rule(
 
 @router.get("/rules", response_model=list[AutomatedEvidenceRuleResponse])
 async def list_evidence_rules(
-    user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    user=Depends(get_current_user),
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
 ):
@@ -574,8 +574,8 @@ async def list_evidence_rules(
 
 @router.get("/dashboard/stats", response_model=AuditDashboardStats)
 async def get_audit_dashboard_stats(
-    user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    user=Depends(get_current_user),
 ):
     """Get audit and evidence dashboard statistics"""
     try:

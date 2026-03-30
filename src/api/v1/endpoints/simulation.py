@@ -59,8 +59,8 @@ router = APIRouter(prefix="/simulation", tags=["simulation"])
 @router.post("/simulations", response_model=AttackSimulationSchema)
 async def create_simulation(
     request: SimulationCreateRequest,
-    session: AsyncSession = Depends(get_async_session),
     current_user: str = Depends(get_current_user),
+    session: AsyncSession = Depends(get_async_session),
 ) -> AttackSimulationSchema:
     """
     Create a new attack simulation.
@@ -96,12 +96,12 @@ async def create_simulation(
 
 @router.get("/simulations", response_model=SimulationListResponse)
 async def list_simulations(
+    current_user: str = Depends(get_current_user),
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
     status: Optional[str] = None,
     environment: Optional[str] = None,
     session: AsyncSession = Depends(get_async_session),
-    current_user: str = Depends(get_current_user),
 ) -> SimulationListResponse:
     """
     List simulations with filtering.
@@ -151,8 +151,8 @@ async def list_simulations(
 @router.get("/simulations/{simulation_id}", response_model=SimulationDetailResponse)
 async def get_simulation_detail(
     simulation_id: str,
-    session: AsyncSession = Depends(get_async_session),
     current_user: str = Depends(get_current_user),
+    session: AsyncSession = Depends(get_async_session),
 ) -> SimulationDetailResponse:
     """
     Get detailed simulation information with test results.
@@ -212,8 +212,8 @@ async def get_simulation_detail(
 @router.post("/simulations/{simulation_id}/start")
 async def start_simulation(
     simulation_id: str,
-    session: AsyncSession = Depends(get_async_session),
     current_user: str = Depends(get_current_user),
+    session: AsyncSession = Depends(get_async_session),
 ) -> dict:
     """
     Start executing a simulation.
@@ -243,8 +243,8 @@ async def start_simulation(
 @router.post("/simulations/{simulation_id}/pause")
 async def pause_simulation(
     simulation_id: str,
-    session: AsyncSession = Depends(get_async_session),
     current_user: str = Depends(get_current_user),
+    session: AsyncSession = Depends(get_async_session),
 ) -> dict:
     """
     Pause a running simulation.
@@ -270,8 +270,8 @@ async def pause_simulation(
 @router.post("/simulations/{simulation_id}/cancel")
 async def cancel_simulation(
     simulation_id: str,
-    session: AsyncSession = Depends(get_async_session),
     current_user: str = Depends(get_current_user),
+    session: AsyncSession = Depends(get_async_session),
 ) -> dict:
     """
     Cancel a simulation.
@@ -297,8 +297,8 @@ async def cancel_simulation(
 @router.get("/simulations/{simulation_id}/progress", response_model=SimulationProgressResponse)
 async def get_simulation_progress(
     simulation_id: str,
-    session: AsyncSession = Depends(get_async_session),
     current_user: str = Depends(get_current_user),
+    session: AsyncSession = Depends(get_async_session),
 ) -> SimulationProgressResponse:
     """
     Get live progress of a running simulation.
@@ -324,8 +324,8 @@ async def get_simulation_progress(
 @router.get("/simulations/{simulation_id}/report", response_model=SimulationReportResponse)
 async def get_simulation_report(
     simulation_id: str,
-    session: AsyncSession = Depends(get_async_session),
     current_user: str = Depends(get_current_user),
+    session: AsyncSession = Depends(get_async_session),
 ) -> SimulationReportResponse:
     """
     Get detailed simulation report.
@@ -352,12 +352,12 @@ async def get_simulation_report(
 
 @router.get("/techniques", response_model=TechniqueListResponse)
 async def list_techniques(
+    current_user: str = Depends(get_current_user),
     tactic: Optional[str] = None,
     platform: Optional[str] = None,
     risk_level: Optional[str] = None,
     safe_only: bool = False,
     session: AsyncSession = Depends(get_async_session),
-    current_user: str = Depends(get_current_user),
 ) -> TechniqueListResponse:
     """
     Browse technique library with filtering.
@@ -417,8 +417,8 @@ async def list_techniques(
 @router.get("/techniques/{mitre_id}", response_model=AttackTechniqueSchema)
 async def get_technique(
     mitre_id: str,
-    session: AsyncSession = Depends(get_async_session),
     current_user: str = Depends(get_current_user),
+    session: AsyncSession = Depends(get_async_session),
 ) -> AttackTechniqueSchema:
     """
     Get technique details.
@@ -450,9 +450,9 @@ async def get_technique(
 @router.post("/techniques/{mitre_id}/test")
 async def test_technique(
     mitre_id: str,
+    current_user: str = Depends(get_current_user),
     target_host: str = Body(...),
     session: AsyncSession = Depends(get_async_session),
-    current_user: str = Depends(get_current_user),
 ) -> dict:
     """
     Execute a single technique test.
@@ -503,8 +503,8 @@ async def test_technique(
 
 @router.get("/techniques/coverage")
 async def get_coverage_map(
-    session: AsyncSession = Depends(get_async_session),
     current_user: str = Depends(get_current_user),
+    session: AsyncSession = Depends(get_async_session),
 ) -> dict:
     """
     Get detection coverage map of techniques.
@@ -549,9 +549,9 @@ async def get_coverage_map(
 
 @router.get("/adversaries", response_model=AdversaryListResponse)
 async def list_adversaries(
+    current_user: str = Depends(get_current_user),
     builtin_only: bool = False,
     session: AsyncSession = Depends(get_async_session),
-    current_user: str = Depends(get_current_user),
 ) -> AdversaryListResponse:
     """
     List adversary profiles.
@@ -590,8 +590,8 @@ async def list_adversaries(
 @router.get("/adversaries/{adversary_id}", response_model=AdversaryProfileSchema)
 async def get_adversary(
     adversary_id: str,
-    session: AsyncSession = Depends(get_async_session),
     current_user: str = Depends(get_current_user),
+    session: AsyncSession = Depends(get_async_session),
 ) -> AdversaryProfileSchema:
     """
     Get adversary profile details.
@@ -626,8 +626,8 @@ async def get_adversary(
 @router.post("/adversaries/{adversary_id}/emulate", response_model=SimulationDetailResponse)
 async def create_emulation_plan(
     adversary_id: str,
-    session: AsyncSession = Depends(get_async_session),
     current_user: str = Depends(get_current_user),
+    session: AsyncSession = Depends(get_async_session),
 ) -> SimulationDetailResponse:
     """
     Create an attack simulation emulating an adversary.
@@ -662,8 +662,8 @@ async def create_emulation_plan(
 
 @router.get("/posture", response_model=PostureScoreResponse)
 async def get_current_posture(
-    session: AsyncSession = Depends(get_async_session),
     current_user: str = Depends(get_current_user),
+    session: AsyncSession = Depends(get_async_session),
 ) -> PostureScoreResponse:
     """
     Get current security posture score.
@@ -703,9 +703,9 @@ async def get_current_posture(
 
 @router.get("/posture/gaps", response_model=GapAnalysisResponse)
 async def get_gap_analysis(
+    current_user: str = Depends(get_current_user),
     simulation_id: Optional[str] = None,
     session: AsyncSession = Depends(get_async_session),
-    current_user: str = Depends(get_current_user),
 ) -> GapAnalysisResponse:
     """
     Get gap analysis for simulation.
@@ -759,8 +759,8 @@ async def get_gap_analysis(
 
 @router.get("/dashboard", response_model=DashboardStatsResponse)
 async def get_dashboard_stats(
-    session: AsyncSession = Depends(get_async_session),
     current_user: str = Depends(get_current_user),
+    session: AsyncSession = Depends(get_async_session),
 ) -> DashboardStatsResponse:
     """
     Get BAS dashboard statistics and recent activity.

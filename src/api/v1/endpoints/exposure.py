@@ -422,9 +422,9 @@ async def update_asset_vulnerability(
 @router.post("/asset-vulns/{mapping_id}/remediate", response_model=AssetVulnerabilityResponse)
 async def mark_as_remediated(
     mapping_id: str,
-    remediation_notes: Optional[str] = Query(None),
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
+    remediation_notes: Optional[str] = Query(None),
 ):
     """Mark asset-vulnerability as remediated"""
     mapping = await get_asset_vulnerability_or_404(db, mapping_id)
@@ -719,9 +719,9 @@ async def update_attack_surface(
 
 @router.post("/attack-surface/assess", response_model=AssessmentResult)
 async def trigger_assessment(
-    surface_id: str = Query(...),
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
+    surface_id: str = Query(...),
 ):
     """Trigger assessment of an attack surface"""
     return {
@@ -797,10 +797,10 @@ async def get_compliance_status(
 
 @router.post("/report", response_model=ExposureReport)
 async def generate_exposure_report(
-    title: str = Query(...),
-    include_recommendations: bool = Query(True),
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
+    title: str = Query(...),
+    include_recommendations: bool = Query(True),
 ):
     """Generate exposure management report"""
     return {

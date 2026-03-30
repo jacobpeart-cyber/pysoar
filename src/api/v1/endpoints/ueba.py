@@ -49,6 +49,8 @@ router = APIRouter(prefix="/ueba", tags=["ueba"])
     description="List user and entity profiles with filtering"
 )
 async def list_entities(
+    # Dependency injection placeholder,
+    db: AsyncSession = Depends(lambda: None),
     entity_type: Optional[str] = Query(None),
     risk_level: Optional[str] = Query(None),
     is_watched: Optional[bool] = Query(None),
@@ -56,7 +58,6 @@ async def list_entities(
     search: Optional[str] = Query(None),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
-    db: AsyncSession = Depends(lambda: None),  # Dependency injection placeholder
 ) -> list[dict]:
     """
     Retrieve list of entities with optional filtering.
@@ -122,8 +123,8 @@ async def get_entity(
 async def update_watchlist(
     entity_id: str,
     is_watched: bool,
-    reason: Optional[str] = None,
     db: AsyncSession = Depends(lambda: None),
+    reason: Optional[str] = None,
 ) -> dict:
     """
     Update watchlist status for an entity.
@@ -149,10 +150,10 @@ async def update_watchlist(
 )
 async def get_entity_timeline(
     entity_id: str,
+    db: AsyncSession = Depends(lambda: None),
     days: int = Query(7, ge=1, le=365),
     anomalies_only: bool = Query(False),
     limit: int = Query(100, ge=1, le=1000),
-    db: AsyncSession = Depends(lambda: None),
 ) -> dict:
     """
     Get behavior timeline for an entity.
@@ -179,8 +180,8 @@ async def get_entity_timeline(
 )
 async def get_entity_risk(
     entity_id: str,
-    days: int = Query(30, ge=1, le=365),
     db: AsyncSession = Depends(lambda: None),
+    days: int = Query(30, ge=1, le=365),
 ) -> dict:
     """
     Get detailed risk information for an entity.
@@ -230,6 +231,7 @@ async def get_peer_comparison(
     description="List risk alerts with filtering"
 )
 async def list_alerts(
+    db: AsyncSession = Depends(lambda: None),
     alert_type: Optional[str] = Query(None),
     severity: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
@@ -237,7 +239,6 @@ async def list_alerts(
     search: Optional[str] = Query(None),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
-    db: AsyncSession = Depends(lambda: None),
 ) -> list[dict]:
     """
     List UEBA risk alerts with optional filtering.
@@ -318,9 +319,9 @@ async def update_alert_status(
 )
 async def escalate_alert(
     alert_id: str,
+    db: AsyncSession = Depends(lambda: None),
     incident_id: str = Query(...),
     notes: Optional[str] = Query(None),
-    db: AsyncSession = Depends(lambda: None),
 ) -> dict:
     """
     Escalate alert to a security incident.
@@ -406,6 +407,7 @@ async def ingest_batch(
     description="Search and filter behavior events"
 )
 async def search_events(
+    db: AsyncSession = Depends(lambda: None),
     entity_id: Optional[str] = Query(None),
     event_type: Optional[str] = Query(None),
     is_anomalous: Optional[bool] = Query(None),
@@ -414,7 +416,6 @@ async def search_events(
     days: int = Query(7, ge=1, le=365),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
-    db: AsyncSession = Depends(lambda: None),
 ) -> list[dict]:
     """
     Search behavior events with filtering.
@@ -446,8 +447,8 @@ async def search_events(
     description="List all peer groups"
 )
 async def list_peer_groups(
-    group_type: Optional[str] = Query(None),
     db: AsyncSession = Depends(lambda: None),
+    group_type: Optional[str] = Query(None),
 ) -> list[dict]:
     """
     List peer groups.
@@ -538,8 +539,8 @@ async def trigger_auto_cluster(
 )
 async def get_baselines(
     entity_id: str,
-    behavior_type: Optional[str] = Query(None),
     db: AsyncSession = Depends(lambda: None),
+    behavior_type: Optional[str] = Query(None),
 ) -> list[dict]:
     """
     Get behavior baselines for an entity.
@@ -562,8 +563,8 @@ async def get_baselines(
     description="Trigger baseline recalculation"
 )
 async def rebuild_baselines(
-    entity_ids: Optional[list[str]] = Query(None),
     db: AsyncSession = Depends(lambda: None),
+    entity_ids: Optional[list[str]] = Query(None),
 ) -> dict:
     """
     Trigger baseline recalculation for entities.

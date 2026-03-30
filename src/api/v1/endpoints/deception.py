@@ -515,8 +515,8 @@ async def delete_token(
 
 @router.post("/tokens/rotate", status_code=status.HTTP_200_OK)
 async def rotate_tokens(
-    token_type: str = Query(...),
     db: AsyncSession = Depends(get_db),
+    token_type: str = Query(...),
     current_user = Depends(get_current_user),
 ):
     """Rotate all tokens of a specific type."""
@@ -614,9 +614,9 @@ async def get_interaction(
 
 @router.get("/interactions/timeline", response_model=InteractionTimelineResponse)
 async def get_interaction_timeline(
+    db: AsyncSession = Depends(get_db),
     decoy_id: UUID = Query(...),
     hours: int = Query(24, ge=1, le=720),
-    db: AsyncSession = Depends(get_db),
 ):
     """Get interaction timeline for a decoy."""
     try:

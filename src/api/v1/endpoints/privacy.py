@@ -244,8 +244,8 @@ async def update_dsr(
 @router.post("/dsr/requests/{request_id}/verify-identity")
 async def verify_dsr_identity(
     request_id: str,
-    verification_method: str = Query(..., description="email, phone, document"),
     db: AsyncSession = Depends(get_db),
+    verification_method: str = Query(..., description="email, phone, document"),
     user=Depends(get_current_user),
 ):
     """Verify Data Subject identity."""
@@ -271,8 +271,8 @@ async def verify_dsr_identity(
 @router.post("/dsr/requests/{request_id}/search-systems")
 async def search_data_systems(
     request_id: str,
-    systems: List[str] = Query(...),
     db: AsyncSession = Depends(get_db),
+    systems: List[str] = Query(...),
     user=Depends(get_current_user),
 ):
     """Search data systems for subject data."""
@@ -293,8 +293,8 @@ async def search_data_systems(
 @router.post("/dsr/requests/{request_id}/compile-data")
 async def compile_data_package(
     request_id: str,
-    format_type: str = Query("json", description="json, csv, xml"),
     db: AsyncSession = Depends(get_db),
+    format_type: str = Query("json", description="json, csv, xml"),
     user=Depends(get_current_user),
 ):
     """Compile data package for portability/access requests."""
@@ -434,9 +434,9 @@ async def get_pia(
 @router.post("/pia/assessments/{assessment_id}/assess-risks")
 async def assess_pia_risks(
     assessment_id: str,
+    db: AsyncSession = Depends(get_db),
     data_subjects_count: int = Query(..., ge=0),
     processing_scope: str = Query(...),
-    db: AsyncSession = Depends(get_db),
     user=Depends(get_current_user),
 ):
     """Assess risks to data subjects."""

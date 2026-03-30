@@ -90,9 +90,9 @@ async def natural_language_query(request: NLQueryRequest, current_user: CurrentU
 
 @router.get("/queries", response_model=list[QueryHistoryResponse], summary="Query history")
 async def query_history(
+    current_user: CurrentUser = None,
     limit: Annotated[int, Query(ge=1, le=100)] = 10,
     skip: Annotated[int, Query(ge=0)] = 0,
-    current_user: CurrentUser = None,
 ):
     """
     Get natural language query history.
@@ -362,12 +362,12 @@ async def generate_playbook(incident_pattern: str, limit: int = 5, current_user:
 
 @router.get("/anomalies", response_model=AnomalyListResponse, summary="List anomalies")
 async def list_anomalies(
+    current_user: CurrentUser = None,
     entity_type: str | None = None,
     entity_id: str | None = None,
     severity: str | None = None,
     skip: Annotated[int, Query(ge=0)] = 0,
     limit: Annotated[int, Query(ge=1, le=100)] = 20,
-    current_user: CurrentUser = None,
 ):
     """
     List detected anomalies with filtering and pagination.
@@ -456,10 +456,10 @@ async def anomaly_statistics(current_user: CurrentUser):
 
 @router.get("/predictions", response_model=list[ThreatPredictionResponse], summary="List predictions")
 async def list_threat_predictions(
+    current_user: CurrentUser = None,
     entity_type: str | None = None,
     skip: Annotated[int, Query(ge=0)] = 0,
     limit: Annotated[int, Query(ge=1, le=100)] = 20,
-    current_user: CurrentUser = None,
 ):
     """List active threat predictions."""
     logger.info(f"Listing threat predictions")

@@ -120,9 +120,9 @@ async def get_action_or_404(db: AsyncSession, action_id: str) -> ActionItem:
 
 @router.post("/rooms", response_model=WarRoomResponse, status_code=status.HTTP_201_CREATED)
 async def create_war_room(
+    room_data: WarRoomCreate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    room_data: WarRoomCreate,
 ):
     """Create a new war room"""
     manager = WarRoomManager(db)
@@ -201,10 +201,10 @@ async def get_war_room(
 
 @router.patch("/rooms/{room_id}", response_model=WarRoomResponse)
 async def update_war_room(
+    room_data: WarRoomUpdate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     room_id: str = Path(...),
-    room_data: WarRoomUpdate,
 ):
     """Update war room"""
     room = await get_war_room_or_404(db, room_id)
@@ -315,10 +315,10 @@ async def set_war_room_commander(
 
 @router.post("/rooms/{room_id}/messages", response_model=WarRoomMessageResponse, status_code=status.HTTP_201_CREATED)
 async def send_message(
+    msg_data: WarRoomMessageCreate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     room_id: str = Path(...),
-    msg_data: WarRoomMessageCreate,
 ):
     """Send message to war room"""
     room = await get_war_room_or_404(db, room_id)
@@ -362,10 +362,10 @@ async def get_room_messages(
 
 @router.patch("/messages/{message_id}", response_model=WarRoomMessageResponse)
 async def edit_message(
+    msg_data: WarRoomMessageUpdate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     message_id: str = Path(...),
-    msg_data: WarRoomMessageUpdate,
 ):
     """Edit message"""
     message = await get_message_or_404(db, message_id)
@@ -442,10 +442,10 @@ async def get_message_thread(
 
 @router.post("/rooms/{room_id}/artifacts", response_model=SharedArtifactResponse, status_code=status.HTTP_201_CREATED)
 async def upload_artifact(
+    artifact_data: SharedArtifactCreate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     room_id: str = Path(...),
-    artifact_data: SharedArtifactCreate,
 ):
     """Upload artifact to war room"""
     room = await get_war_room_or_404(db, room_id)
@@ -550,10 +550,10 @@ async def get_artifact_index(
 
 @router.post("/rooms/{room_id}/actions", response_model=ActionItemResponse, status_code=status.HTTP_201_CREATED)
 async def create_action_item(
+    action_data: ActionItemCreate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     room_id: str = Path(...),
-    action_data: ActionItemCreate,
 ):
     """Create action item"""
     room = await get_war_room_or_404(db, room_id)
@@ -617,10 +617,10 @@ async def list_room_actions(
 
 @router.patch("/actions/{action_id}", response_model=ActionItemResponse)
 async def update_action_item(
+    action_data: ActionItemUpdate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     action_id: str = Path(...),
-    action_data: ActionItemUpdate,
 ):
     """Update action item"""
     action = await get_action_or_404(db, action_id)
@@ -666,10 +666,10 @@ async def get_action_report(
 
 @router.post("/rooms/{room_id}/timeline", response_model=IncidentTimelineResponse, status_code=status.HTTP_201_CREATED)
 async def add_timeline_event(
+    event_data: IncidentTimelineCreate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     room_id: str = Path(...),
-    event_data: IncidentTimelineCreate,
 ):
     """Add event to timeline"""
     room = await get_war_room_or_404(db, room_id)
