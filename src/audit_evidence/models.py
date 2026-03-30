@@ -114,7 +114,7 @@ class EvidencePackage(BaseModel):
     package_hash: Mapped[Optional[str]] = mapped_column(
         String(128), nullable=True
     )  # SHA-512 integrity hash
-    metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    extra_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     organization_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("organizations.id"), nullable=False, index=True
     )

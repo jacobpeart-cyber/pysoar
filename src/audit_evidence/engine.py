@@ -483,7 +483,7 @@ class EvidenceCollector:
             "evidence_count": len(package.evidence_items),
             "control_mappings": package.control_mappings,
             "package_hash": package.package_hash,
-            "metadata": package.metadata,
+            "metadata": package.extra_metadata,
             "created_at": package.created_at.isoformat(),
             "updated_at": package.updated_at.isoformat(),
         }

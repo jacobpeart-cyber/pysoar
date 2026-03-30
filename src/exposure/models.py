@@ -217,7 +217,7 @@ class ExposureAsset(BaseModel):
     open_ports: Mapped[list[int]] = mapped_column(JSON, default=[])
     network_zone: Mapped[str | None] = mapped_column(String(100), nullable=True)
     compliance_status: Mapped[dict[str, Any]] = mapped_column(JSON, default={})
-    metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default={})
+    extra_metadata: Mapped[dict[str, Any]] = mapped_column(JSON, default={})
     organization_id: Mapped[str] = mapped_column(String(36), ForeignKey("organizations.id"), nullable=False)
 
     # Relationships
