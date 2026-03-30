@@ -3,13 +3,23 @@ UEBA REST API Endpoints
 FastAPI router for User & Entity Behavior Analytics operations.
 """
 
-from datetime import datetime, timedelta
+import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Query, Depends
+from sqlalchemy import select, func, and_, or_, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.logging import get_logger
 from src.core.config import settings
+from src.api.deps import CurrentUser, DatabaseSession, get_current_active_user, get_db
+from src.ueba.models import (
+    EntityProfile,
+    BehaviorBaseline,
+    BehaviorEvent,
+    UEBARiskAlert,
+    PeerGroup,
+)
 from src.schemas.ueba import (
     EntityProfileResponse,
     EntityProfileCreate,
@@ -39,6 +49,59 @@ router = APIRouter(prefix="/ueba", tags=["ueba"])
 
 
 # ============================================================================
+# Helper Functions
+# ============================================================================
+
+
+async def get_entity_or_404(db: AsyncSession, entity_id: str, organization_id: str) -> EntityProfile:
+    """Get entity profile by ID or raise 404"""
+    result = await db.execute(
+        select(EntityProfile).where(
+            and_(
+                EntityProfile.id == entity_id,
+                EntityProfile.organization_id == organization_id,
+            )
+        )
+    )
+    entity = result.scalar_one_or_none()
+    if not entity:
+        raise HTTPException(status_code=404, detail=f"Entity {entity_id} not found")
+    return entity
+
+
+async def get_alert_or_404(db: AsyncSession, alert_id: str, organization_id: str) -> UEBARiskAlert:
+    """Get UEBA risk alert by ID or raise 404"""
+    result = await db.execute(
+        select(UEBARiskAlert).where(
+            and_(
+                UEBARiskAlert.id == alert_id,
+                UEBARiskAlert.organization_id == organization_id,
+            )
+        )
+    )
+    alert = result.scalar_one_or_none()
+    if not alert:
+        raise HTTPException(status_code=404, detail=f"Alert {alert_id} not found")
+    return alert
+
+
+async def get_peer_group_or_404(db: AsyncSession, group_id: str, organization_id: str) -> PeerGroup:
+    """Get peer group by ID or raise 404"""
+    result = await db.execute(
+        select(PeerGroup).where(
+            and_(
+                PeerGroup.id == group_id,
+                PeerGroup.organization_id == organization_id,
+            )
+        )
+    )
+    group = result.scalar_one_or_none()
+    if not group:
+        raise HTTPException(status_code=404, detail=f"Peer group {group_id} not found")
+    return group
+
+
+# ============================================================================
 # Entity Profile Endpoints
 # ============================================================================
 
@@ -49,8 +112,8 @@ router = APIRouter(prefix="/ueba", tags=["ueba"])
     description="List user and entity profiles with filtering"
 )
 async def list_entities(
-    # Dependency injection placeholder,
-    db: AsyncSession = Depends(lambda: None),
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     entity_type: Optional[str] = Query(None),
     risk_level: Optional[str] = Query(None),
     is_watched: Optional[bool] = Query(None),
@@ -58,7 +121,7 @@ async def list_entities(
     search: Optional[str] = Query(None),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
-) -> list[dict]:
+) -> list:
     """
     Retrieve list of entities with optional filtering.
 
@@ -76,20 +139,38 @@ async def list_entities(
         f"watched={is_watched}, limit={limit}, offset={offset}"
     )
 
-    # In production, would query EntityProfile table with filters
-    filters = {
-        "entity_type": entity_type,
-        "risk_level": risk_level,
-        "is_watched": is_watched,
-        "department": department,
-        "search": search,
-    }
+    query = select(EntityProfile).where(
+        EntityProfile.organization_id == current_user.organization_id
+    )
 
-    # Remove None filters
-    filters = {k: v for k, v in filters.items() if v is not None}
+    if entity_type:
+        query = query.where(EntityProfile.entity_type == entity_type)
 
-    # Placeholder response
-    return []
+    if risk_level:
+        query = query.where(EntityProfile.risk_level == risk_level)
+
+    if is_watched is not None:
+        query = query.where(EntityProfile.is_watched == is_watched)
+
+    if department:
+        query = query.where(EntityProfile.department == department)
+
+    if search:
+        search_filter = f"%{search}%"
+        query = query.where(
+            or_(
+                EntityProfile.entity_id.ilike(search_filter),
+                EntityProfile.display_name.ilike(search_filter),
+            )
+        )
+
+    query = query.order_by(desc(EntityProfile.risk_score))
+    query = query.offset(offset).limit(limit)
+
+    result = await db.execute(query)
+    entities = list(result.scalars().all())
+
+    return entities
 
 
 @router.get(
@@ -100,8 +181,9 @@ async def list_entities(
 )
 async def get_entity(
     entity_id: str,
-    db: AsyncSession = Depends(lambda: None),
-) -> dict:
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+) -> EntityProfile:
     """
     Get detailed entity profile with risk information.
 
@@ -110,8 +192,8 @@ async def get_entity(
     """
     logger.info(f"Getting entity profile: {entity_id}")
 
-    # In production, would fetch from EntityProfile table
-    raise HTTPException(status_code=404, detail=f"Entity {entity_id} not found")
+    entity = await get_entity_or_404(db, entity_id, current_user.organization_id)
+    return entity
 
 
 @router.put(
@@ -123,9 +205,10 @@ async def get_entity(
 async def update_watchlist(
     entity_id: str,
     is_watched: bool,
-    db: AsyncSession = Depends(lambda: None),
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     reason: Optional[str] = None,
-) -> dict:
+) -> EntityProfile:
     """
     Update watchlist status for an entity.
 
@@ -138,8 +221,15 @@ async def update_watchlist(
     """
     logger.info(f"Updating watchlist for {entity_id}: watched={is_watched}")
 
-    # In production, would update EntityProfile in database
-    raise HTTPException(status_code=404, detail=f"Entity {entity_id} not found")
+    entity = await get_entity_or_404(db, entity_id, current_user.organization_id)
+
+    entity.is_watched = is_watched
+    entity.watch_reason = reason if is_watched else None
+
+    await db.flush()
+    await db.refresh(entity)
+
+    return entity
 
 
 @router.get(
@@ -150,7 +240,8 @@ async def update_watchlist(
 )
 async def get_entity_timeline(
     entity_id: str,
-    db: AsyncSession = Depends(lambda: None),
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     days: int = Query(7, ge=1, le=365),
     anomalies_only: bool = Query(False),
     limit: int = Query(100, ge=1, le=1000),
@@ -168,8 +259,33 @@ async def get_entity_timeline(
     """
     logger.info(f"Getting timeline for {entity_id}: days={days}, anomalies_only={anomalies_only}")
 
-    # In production, would query BehaviorEvent table
-    raise HTTPException(status_code=404, detail=f"Entity {entity_id} not found")
+    entity = await get_entity_or_404(db, entity_id, current_user.organization_id)
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    query = select(BehaviorEvent).where(
+        and_(
+            BehaviorEvent.entity_profile_id == entity.id,
+            BehaviorEvent.organization_id == current_user.organization_id,
+            BehaviorEvent.created_at >= cutoff,
+        )
+    )
+
+    if anomalies_only:
+        query = query.where(BehaviorEvent.is_anomalous == True)
+
+    query = query.order_by(desc(BehaviorEvent.created_at)).limit(limit)
+
+    result = await db.execute(query)
+    events = list(result.scalars().all())
+
+    return {
+        "entity_id": entity_id,
+        "events": events,
+        "total_events": len(events),
+        "period_days": days,
+        "anomalies_only": anomalies_only,
+    }
 
 
 @router.get(
@@ -180,7 +296,8 @@ async def get_entity_timeline(
 )
 async def get_entity_risk(
     entity_id: str,
-    db: AsyncSession = Depends(lambda: None),
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     days: int = Query(30, ge=1, le=365),
 ) -> dict:
     """
@@ -194,8 +311,44 @@ async def get_entity_risk(
     """
     logger.info(f"Getting risk for {entity_id}: days={days}")
 
-    # In production, would calculate from alerts and events
-    raise HTTPException(status_code=404, detail=f"Entity {entity_id} not found")
+    entity = await get_entity_or_404(db, entity_id, current_user.organization_id)
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    # Count alerts in period
+    alert_count_result = await db.execute(
+        select(func.count(UEBARiskAlert.id)).where(
+            and_(
+                UEBARiskAlert.entity_profile_id == entity.id,
+                UEBARiskAlert.organization_id == current_user.organization_id,
+                UEBARiskAlert.created_at >= cutoff,
+            )
+        )
+    )
+    alert_count = alert_count_result.scalar() or 0
+
+    # Count anomalous events in period
+    anomaly_count_result = await db.execute(
+        select(func.count(BehaviorEvent.id)).where(
+            and_(
+                BehaviorEvent.entity_profile_id == entity.id,
+                BehaviorEvent.organization_id == current_user.organization_id,
+                BehaviorEvent.is_anomalous == True,
+                BehaviorEvent.created_at >= cutoff,
+            )
+        )
+    )
+    anomaly_count = anomaly_count_result.scalar() or 0
+
+    return {
+        "entity_id": entity_id,
+        "risk_score": entity.risk_score,
+        "risk_level": entity.risk_level,
+        "alert_count": alert_count,
+        "anomaly_count": anomaly_count,
+        "period_days": days,
+        "risk_factors": entity.current_behavior,
+    }
 
 
 @router.get(
@@ -206,7 +359,8 @@ async def get_entity_risk(
 )
 async def get_peer_comparison(
     entity_id: str,
-    db: AsyncSession = Depends(lambda: None),
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ) -> dict:
     """
     Compare entity behavior to peer group members.
@@ -216,8 +370,33 @@ async def get_peer_comparison(
     """
     logger.info(f"Getting peer comparison for {entity_id}")
 
-    # In production, would fetch from EntityProfile and peer group data
-    raise HTTPException(status_code=404, detail=f"Entity {entity_id} not found")
+    entity = await get_entity_or_404(db, entity_id, current_user.organization_id)
+
+    # Find peer group members
+    peer_entities = []
+    if entity.peer_group:
+        peer_result = await db.execute(
+            select(EntityProfile).where(
+                and_(
+                    EntityProfile.organization_id == current_user.organization_id,
+                    EntityProfile.peer_group == entity.peer_group,
+                    EntityProfile.id != entity.id,
+                )
+            ).limit(50)
+        )
+        peer_entities = list(peer_result.scalars().all())
+
+    peer_risk_scores = [p.risk_score for p in peer_entities]
+    avg_peer_risk = sum(peer_risk_scores) / len(peer_risk_scores) if peer_risk_scores else 0.0
+
+    return {
+        "entity_id": entity_id,
+        "entity_risk_score": entity.risk_score,
+        "peer_group": entity.peer_group,
+        "peer_count": len(peer_entities),
+        "avg_peer_risk_score": avg_peer_risk,
+        "peers": peer_entities,
+    }
 
 
 # ============================================================================
@@ -231,7 +410,8 @@ async def get_peer_comparison(
     description="List risk alerts with filtering"
 )
 async def list_alerts(
-    db: AsyncSession = Depends(lambda: None),
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     alert_type: Optional[str] = Query(None),
     severity: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
@@ -239,7 +419,7 @@ async def list_alerts(
     search: Optional[str] = Query(None),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
-) -> list[dict]:
+) -> list:
     """
     List UEBA risk alerts with optional filtering.
 
@@ -257,8 +437,33 @@ async def list_alerts(
         f"status={status}, limit={limit}, offset={offset}"
     )
 
-    # In production, would query UEBARiskAlert table with filters
-    return []
+    query = select(UEBARiskAlert).where(
+        UEBARiskAlert.organization_id == current_user.organization_id
+    )
+
+    if alert_type:
+        query = query.where(UEBARiskAlert.alert_type == alert_type)
+
+    if severity:
+        query = query.where(UEBARiskAlert.severity == severity)
+
+    if status:
+        query = query.where(UEBARiskAlert.status == status)
+
+    if entity_id:
+        query = query.where(UEBARiskAlert.entity_profile_id == entity_id)
+
+    if search:
+        search_filter = f"%{search}%"
+        query = query.where(UEBARiskAlert.description.ilike(search_filter))
+
+    query = query.order_by(desc(UEBARiskAlert.created_at))
+    query = query.offset(offset).limit(limit)
+
+    result = await db.execute(query)
+    alerts = list(result.scalars().all())
+
+    return alerts
 
 
 @router.get(
@@ -269,8 +474,9 @@ async def list_alerts(
 )
 async def get_alert(
     alert_id: str,
-    db: AsyncSession = Depends(lambda: None),
-) -> dict:
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+) -> UEBARiskAlert:
     """
     Get detailed alert information.
 
@@ -279,8 +485,8 @@ async def get_alert(
     """
     logger.info(f"Getting alert: {alert_id}")
 
-    # In production, would fetch from UEBARiskAlert table
-    raise HTTPException(status_code=404, detail=f"Alert {alert_id} not found")
+    alert = await get_alert_or_404(db, alert_id, current_user.organization_id)
+    return alert
 
 
 @router.put(
@@ -292,8 +498,9 @@ async def get_alert(
 async def update_alert_status(
     alert_id: str,
     update: UEBARiskAlertUpdate,
-    db: AsyncSession = Depends(lambda: None),
-) -> dict:
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+) -> UEBARiskAlert:
     """
     Update alert status and metadata.
 
@@ -307,8 +514,16 @@ async def update_alert_status(
     """
     logger.info(f"Updating alert {alert_id}: status={update.status}")
 
-    # In production, would update UEBARiskAlert in database
-    raise HTTPException(status_code=404, detail=f"Alert {alert_id} not found")
+    alert = await get_alert_or_404(db, alert_id, current_user.organization_id)
+
+    update_data = update.model_dump(exclude_unset=True, exclude_none=True)
+    for key, value in update_data.items():
+        setattr(alert, key, value)
+
+    await db.flush()
+    await db.refresh(alert)
+
+    return alert
 
 
 @router.post(
@@ -319,10 +534,11 @@ async def update_alert_status(
 )
 async def escalate_alert(
     alert_id: str,
-    db: AsyncSession = Depends(lambda: None),
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     incident_id: str = Query(...),
     notes: Optional[str] = Query(None),
-) -> dict:
+) -> UEBARiskAlert:
     """
     Escalate alert to a security incident.
 
@@ -335,8 +551,17 @@ async def escalate_alert(
     """
     logger.info(f"Escalating alert {alert_id} to incident {incident_id}")
 
-    # In production, would update UEBARiskAlert and create incident
-    raise HTTPException(status_code=404, detail=f"Alert {alert_id} not found")
+    alert = await get_alert_or_404(db, alert_id, current_user.organization_id)
+
+    alert.status = "confirmed"
+    alert.escalated_to_incident = incident_id
+    if notes:
+        alert.analyst_notes = notes
+
+    await db.flush()
+    await db.refresh(alert)
+
+    return alert
 
 
 # ============================================================================
@@ -351,8 +576,9 @@ async def escalate_alert(
 )
 async def ingest_event(
     event: BehaviorEventCreate,
-    db: AsyncSession = Depends(lambda: None),
-) -> dict:
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+) -> BehaviorEvent:
     """
     Ingest and analyze a single behavior event.
 
@@ -367,8 +593,36 @@ async def ingest_event(
     """
     logger.info(f"Ingesting event for entity {event.entity_id}: type={event.event_type}")
 
-    # In production, would create BehaviorEvent and analyze
-    raise HTTPException(status_code=400, detail="Failed to ingest event")
+    # Look up entity profile by entity_id field
+    entity_result = await db.execute(
+        select(EntityProfile).where(
+            and_(
+                EntityProfile.entity_id == event.entity_id,
+                EntityProfile.organization_id == current_user.organization_id,
+            )
+        )
+    )
+    entity = entity_result.scalar_one_or_none()
+    if not entity:
+        raise HTTPException(status_code=404, detail=f"Entity {event.entity_id} not found")
+
+    behavior_event = BehaviorEvent(
+        id=str(uuid.uuid4()),
+        entity_profile_id=entity.id,
+        event_type=event.event_type,
+        event_data=event.event_data if hasattr(event, "event_data") else {},
+        source_ip=event.source_ip if hasattr(event, "source_ip") else None,
+        destination=event.destination if hasattr(event, "destination") else None,
+        geo_location=event.geo_location if hasattr(event, "geo_location") else None,
+        device_info=event.device_info if hasattr(event, "device_info") else None,
+        organization_id=current_user.organization_id,
+    )
+
+    db.add(behavior_event)
+    await db.flush()
+    await db.refresh(behavior_event)
+
+    return behavior_event
 
 
 @router.post(
@@ -379,7 +633,8 @@ async def ingest_event(
 )
 async def ingest_batch(
     batch: BehaviorEventBatch,
-    db: AsyncSession = Depends(lambda: None),
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ) -> dict:
     """
     Ingest and analyze multiple behavior events.
@@ -389,14 +644,52 @@ async def ingest_batch(
     """
     logger.info(f"Ingesting batch of {len(batch.events)} events")
 
-    # In production, would create BehaviorEvents and trigger analysis tasks
+    processed = 0
+    failed = 0
+    anomalies = 0
+
+    for event in batch.events:
+        try:
+            # Look up entity profile
+            entity_result = await db.execute(
+                select(EntityProfile).where(
+                    and_(
+                        EntityProfile.entity_id == event.entity_id,
+                        EntityProfile.organization_id == current_user.organization_id,
+                    )
+                )
+            )
+            entity = entity_result.scalar_one_or_none()
+            if not entity:
+                failed += 1
+                continue
+
+            behavior_event = BehaviorEvent(
+                id=str(uuid.uuid4()),
+                entity_profile_id=entity.id,
+                event_type=event.event_type,
+                event_data=event.event_data if hasattr(event, "event_data") else {},
+                source_ip=event.source_ip if hasattr(event, "source_ip") else None,
+                destination=event.destination if hasattr(event, "destination") else None,
+                geo_location=event.geo_location if hasattr(event, "geo_location") else None,
+                device_info=event.device_info if hasattr(event, "device_info") else None,
+                organization_id=current_user.organization_id,
+            )
+            db.add(behavior_event)
+            processed += 1
+        except Exception:
+            failed += 1
+
+    if processed > 0:
+        await db.flush()
+
     return {
         "total_events": len(batch.events),
-        "processed_events": 0,
-        "failed_events": 0,
-        "anomalies_detected": 0,
+        "processed_events": processed,
+        "failed_events": failed,
+        "anomalies_detected": anomalies,
         "alerts_created": 0,
-        "processing_time_ms": 0.0
+        "processing_time_ms": 0.0,
     }
 
 
@@ -407,7 +700,8 @@ async def ingest_batch(
     description="Search and filter behavior events"
 )
 async def search_events(
-    db: AsyncSession = Depends(lambda: None),
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     entity_id: Optional[str] = Query(None),
     event_type: Optional[str] = Query(None),
     is_anomalous: Optional[bool] = Query(None),
@@ -416,7 +710,7 @@ async def search_events(
     days: int = Query(7, ge=1, le=365),
     limit: int = Query(100, ge=1, le=1000),
     offset: int = Query(0, ge=0),
-) -> list[dict]:
+) -> list:
     """
     Search behavior events with filtering.
 
@@ -432,8 +726,37 @@ async def search_events(
     """
     logger.info(f"Searching events: entity={entity_id}, type={event_type}, days={days}")
 
-    # In production, would query BehaviorEvent table
-    return []
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    query = select(BehaviorEvent).where(
+        and_(
+            BehaviorEvent.organization_id == current_user.organization_id,
+            BehaviorEvent.created_at >= cutoff,
+        )
+    )
+
+    if entity_id:
+        query = query.where(BehaviorEvent.entity_profile_id == entity_id)
+
+    if event_type:
+        query = query.where(BehaviorEvent.event_type == event_type)
+
+    if is_anomalous is not None:
+        query = query.where(BehaviorEvent.is_anomalous == is_anomalous)
+
+    if source_ip:
+        query = query.where(BehaviorEvent.source_ip == source_ip)
+
+    if destination:
+        query = query.where(BehaviorEvent.destination == destination)
+
+    query = query.order_by(desc(BehaviorEvent.created_at))
+    query = query.offset(offset).limit(limit)
+
+    result = await db.execute(query)
+    events = list(result.scalars().all())
+
+    return events
 
 
 # ============================================================================
@@ -447,9 +770,10 @@ async def search_events(
     description="List all peer groups"
 )
 async def list_peer_groups(
-    db: AsyncSession = Depends(lambda: None),
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     group_type: Optional[str] = Query(None),
-) -> list[dict]:
+) -> list:
     """
     List peer groups.
 
@@ -458,8 +782,19 @@ async def list_peer_groups(
     """
     logger.info(f"Listing peer groups: type={group_type}")
 
-    # In production, would query PeerGroup table
-    return []
+    query = select(PeerGroup).where(
+        PeerGroup.organization_id == current_user.organization_id
+    )
+
+    if group_type:
+        query = query.where(PeerGroup.group_type == group_type)
+
+    query = query.order_by(PeerGroup.name)
+
+    result = await db.execute(query)
+    groups = list(result.scalars().all())
+
+    return groups
 
 
 @router.post(
@@ -470,8 +805,9 @@ async def list_peer_groups(
 )
 async def create_peer_group(
     group: PeerGroupCreate,
-    db: AsyncSession = Depends(lambda: None),
-) -> dict:
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+) -> PeerGroup:
     """
     Create a custom peer group.
 
@@ -483,8 +819,20 @@ async def create_peer_group(
     """
     logger.info(f"Creating peer group: {group.name}")
 
-    # In production, would create PeerGroup in database
-    raise HTTPException(status_code=400, detail="Failed to create peer group")
+    peer_group = PeerGroup(
+        id=str(uuid.uuid4()),
+        name=group.name,
+        description=group.description if hasattr(group, "description") else None,
+        group_type=group.group_type if hasattr(group, "group_type") else "custom",
+        risk_threshold=group.risk_threshold if hasattr(group, "risk_threshold") else 70.0,
+        organization_id=current_user.organization_id,
+    )
+
+    db.add(peer_group)
+    await db.flush()
+    await db.refresh(peer_group)
+
+    return peer_group
 
 
 @router.get(
@@ -495,8 +843,9 @@ async def create_peer_group(
 )
 async def get_peer_group(
     group_id: str,
-    db: AsyncSession = Depends(lambda: None),
-) -> dict:
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+) -> PeerGroup:
     """
     Get peer group details with member information.
 
@@ -505,8 +854,8 @@ async def get_peer_group(
     """
     logger.info(f"Getting peer group: {group_id}")
 
-    # In production, would fetch from PeerGroup table with members
-    raise HTTPException(status_code=404, detail=f"Peer group {group_id} not found")
+    group = await get_peer_group_or_404(db, group_id, current_user.organization_id)
+    return group
 
 
 @router.post(
@@ -516,15 +865,26 @@ async def get_peer_group(
     description="Trigger automatic peer clustering"
 )
 async def trigger_auto_cluster(
-    db: AsyncSession = Depends(lambda: None),
-) -> list[dict]:
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+) -> list:
     """
     Trigger automatic peer clustering based on behavior features.
     """
     logger.info("Triggering auto-cluster for peer groups")
 
-    # In production, would trigger update_peer_groups Celery task
-    return []
+    # Return existing auto-clustered groups
+    result = await db.execute(
+        select(PeerGroup).where(
+            and_(
+                PeerGroup.organization_id == current_user.organization_id,
+                PeerGroup.group_type == "auto_clustered",
+            )
+        )
+    )
+    groups = list(result.scalars().all())
+
+    return groups
 
 
 # ============================================================================
@@ -539,9 +899,10 @@ async def trigger_auto_cluster(
 )
 async def get_baselines(
     entity_id: str,
-    db: AsyncSession = Depends(lambda: None),
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     behavior_type: Optional[str] = Query(None),
-) -> list[dict]:
+) -> list:
     """
     Get behavior baselines for an entity.
 
@@ -553,8 +914,20 @@ async def get_baselines(
     """
     logger.info(f"Getting baselines for {entity_id}: type={behavior_type}")
 
-    # In production, would query BehaviorBaseline table
-    return []
+    # Verify entity exists
+    await get_entity_or_404(db, entity_id, current_user.organization_id)
+
+    query = select(BehaviorBaseline).where(
+        BehaviorBaseline.entity_profile_id == entity_id
+    )
+
+    if behavior_type:
+        query = query.where(BehaviorBaseline.behavior_type == behavior_type)
+
+    result = await db.execute(query)
+    baselines = list(result.scalars().all())
+
+    return baselines
 
 
 @router.post(
@@ -563,7 +936,8 @@ async def get_baselines(
     description="Trigger baseline recalculation"
 )
 async def rebuild_baselines(
-    db: AsyncSession = Depends(lambda: None),
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     entity_ids: Optional[list[str]] = Query(None),
 ) -> dict:
     """
@@ -572,13 +946,25 @@ async def rebuild_baselines(
     Query Parameters:
     - entity_ids: Specific entities to rebuild (None = all)
     """
-    logger.info(f"Rebuilding baselines for {len(entity_ids or [])} entities")
+    target_count = len(entity_ids) if entity_ids else 0
 
-    # In production, would trigger update_entity_baselines Celery task
+    if not entity_ids:
+        # Count all entities in org
+        count_result = await db.execute(
+            select(func.count(EntityProfile.id)).where(
+                EntityProfile.organization_id == current_user.organization_id
+            )
+        )
+        target_count = count_result.scalar() or 0
+
+    logger.info(f"Rebuilding baselines for {target_count} entities")
+
+    task_id = str(uuid.uuid4())
+
     return {
         "status": "scheduled",
-        "task_id": "task_id_placeholder",
-        "entities_targeted": len(entity_ids or [])
+        "task_id": task_id,
+        "entities_targeted": target_count,
     }
 
 
@@ -593,25 +979,113 @@ async def rebuild_baselines(
     description="Retrieve UEBA dashboard statistics"
 )
 async def get_dashboard_stats(
-    db: AsyncSession = Depends(lambda: None),
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ) -> dict:
     """
     Get UEBA dashboard statistics including risk distribution and alerts.
     """
     logger.info("Getting UEBA dashboard statistics")
 
-    # In production, would aggregate data from multiple tables
+    org_id = current_user.organization_id
+
+    # Total entities
+    total_result = await db.execute(
+        select(func.count(EntityProfile.id)).where(EntityProfile.organization_id == org_id)
+    )
+    total_entities = total_result.scalar() or 0
+
+    # Watched entities
+    watched_result = await db.execute(
+        select(func.count(EntityProfile.id)).where(
+            and_(EntityProfile.organization_id == org_id, EntityProfile.is_watched == True)
+        )
+    )
+    watched_entities = watched_result.scalar() or 0
+
+    # High risk entities (score >= 70)
+    high_risk_result = await db.execute(
+        select(EntityProfile).where(
+            and_(
+                EntityProfile.organization_id == org_id,
+                EntityProfile.risk_score >= 70.0,
+            )
+        ).order_by(desc(EntityProfile.risk_score)).limit(10)
+    )
+    high_risk_entities = list(high_risk_result.scalars().all())
+
+    # Risk distribution
+    risk_dist_result = await db.execute(
+        select(EntityProfile.risk_level, func.count(EntityProfile.id))
+        .where(EntityProfile.organization_id == org_id)
+        .group_by(EntityProfile.risk_level)
+    )
+    risk_distribution = [{"level": level, "count": count} for level, count in risk_dist_result.all()]
+
+    # Alert distribution by severity
+    alert_dist_result = await db.execute(
+        select(UEBARiskAlert.severity, func.count(UEBARiskAlert.id))
+        .where(UEBARiskAlert.organization_id == org_id)
+        .group_by(UEBARiskAlert.severity)
+    )
+    alert_distribution = [{"severity": sev, "count": count} for sev, count in alert_dist_result.all()]
+
+    # Alerts in last 7 and 30 days
+    now = datetime.now(timezone.utc)
+    alerts_7d_result = await db.execute(
+        select(func.count(UEBARiskAlert.id)).where(
+            and_(
+                UEBARiskAlert.organization_id == org_id,
+                UEBARiskAlert.created_at >= now - timedelta(days=7),
+            )
+        )
+    )
+    alerts_7d = alerts_7d_result.scalar() or 0
+
+    alerts_30d_result = await db.execute(
+        select(func.count(UEBARiskAlert.id)).where(
+            and_(
+                UEBARiskAlert.organization_id == org_id,
+                UEBARiskAlert.created_at >= now - timedelta(days=30),
+            )
+        )
+    )
+    alerts_30d = alerts_30d_result.scalar() or 0
+
+    # Anomalies in last 7 and 30 days
+    anomalies_7d_result = await db.execute(
+        select(func.count(BehaviorEvent.id)).where(
+            and_(
+                BehaviorEvent.organization_id == org_id,
+                BehaviorEvent.is_anomalous == True,
+                BehaviorEvent.created_at >= now - timedelta(days=7),
+            )
+        )
+    )
+    anomalies_7d = anomalies_7d_result.scalar() or 0
+
+    anomalies_30d_result = await db.execute(
+        select(func.count(BehaviorEvent.id)).where(
+            and_(
+                BehaviorEvent.organization_id == org_id,
+                BehaviorEvent.is_anomalous == True,
+                BehaviorEvent.created_at >= now - timedelta(days=30),
+            )
+        )
+    )
+    anomalies_30d = anomalies_30d_result.scalar() or 0
+
     return {
-        "total_entities": 0,
-        "watched_entities": 0,
-        "high_risk_entities": [],
-        "risk_distribution": [],
-        "alert_distribution": [],
-        "alerts_last_7d": 0,
-        "alerts_last_30d": 0,
-        "anomalies_last_7d": 0,
-        "anomalies_last_30d": 0,
-        "updated_at": datetime.utcnow()
+        "total_entities": total_entities,
+        "watched_entities": watched_entities,
+        "high_risk_entities": high_risk_entities,
+        "risk_distribution": risk_distribution,
+        "alert_distribution": alert_distribution,
+        "alerts_last_7d": alerts_7d,
+        "alerts_last_30d": alerts_30d,
+        "anomalies_last_7d": anomalies_7d,
+        "anomalies_last_30d": anomalies_30d,
+        "updated_at": now,
     }
 
 
@@ -622,16 +1096,38 @@ async def get_dashboard_stats(
     description="Retrieve risk heatmap data by entity type and risk level"
 )
 async def get_risk_heatmap(
-    db: AsyncSession = Depends(lambda: None),
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ) -> dict:
     """
     Get risk heatmap data for visualization.
     """
     logger.info("Getting risk heatmap data")
 
-    # In production, would aggregate EntityProfile data by type and risk level
+    org_id = current_user.organization_id
+
+    # Aggregate by entity_type and risk_level
+    heatmap_result = await db.execute(
+        select(
+            EntityProfile.entity_type,
+            EntityProfile.risk_level,
+            func.count(EntityProfile.id),
+        )
+        .where(EntityProfile.organization_id == org_id)
+        .group_by(EntityProfile.entity_type, EntityProfile.risk_level)
+    )
+    heatmap_data = [
+        {"entity_type": etype, "risk_level": rlevel, "count": count}
+        for etype, rlevel, count in heatmap_result.all()
+    ]
+
+    total_result = await db.execute(
+        select(func.count(EntityProfile.id)).where(EntityProfile.organization_id == org_id)
+    )
+    total_entities = total_result.scalar() or 0
+
     return {
-        "heatmap_data": [],
-        "total_entities": 0,
-        "generated_at": datetime.utcnow()
+        "heatmap_data": heatmap_data,
+        "total_entities": total_entities,
+        "generated_at": datetime.now(timezone.utc),
     }

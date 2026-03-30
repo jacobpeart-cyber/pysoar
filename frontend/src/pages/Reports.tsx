@@ -91,10 +91,14 @@ export default function Reports() {
         const blob = new Blob([csv], { type: 'text/csv' });
         downloadBlob(blob, `${filename}.csv`);
       } else {
-        // For PDF, we'll just export JSON for now
-        alert('PDF export coming soon! Downloading JSON instead.');
-        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-        downloadBlob(blob, `${filename}.json`);
+        // Generate printable HTML report for PDF (use browser print dialog)
+        const reportHtml = `<!DOCTYPE html><html><head><title>${filename}</title><style>body{font-family:Arial,sans-serif;margin:40px;color:#333}h1{color:#1e40af}table{width:100%;border-collapse:collapse;margin:20px 0}th,td{border:1px solid #ddd;padding:8px;text-align:left}th{background:#f3f4f6}pre{background:#f9fafb;padding:16px;border-radius:4px;overflow:auto;font-size:12px}</style></head><body><h1>PySOAR Report: ${filename}</h1><p>Generated: ${new Date().toISOString()}</p><pre>${JSON.stringify(data, null, 2)}</pre></body></html>`;
+        const printWindow = window.open('', '_blank');
+        if (printWindow) {
+          printWindow.document.write(reportHtml);
+          printWindow.document.close();
+          printWindow.print();
+        }
       }
     } finally {
       setIsExporting(false);
