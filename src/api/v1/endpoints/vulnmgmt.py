@@ -191,7 +191,7 @@ async def update_vulnerability(
     return VulnerabilityResponse.from_orm(vuln)
 
 
-@router.post("/vulnerabilities/import-scan", response_model=dict)
+@router.post("/vulnerabilities/import-scan", response_model=None)
 async def import_scan_results(
     scan_request: ScanImportRequest,
     current_user: CurrentUser = None,

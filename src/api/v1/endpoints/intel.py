@@ -145,7 +145,7 @@ async def delete_threat_feed(
     )
 
 
-@router.post("/feeds/{feed_id}/poll", response_model=dict, operation_id="poll_threat_feed")
+@router.post("/feeds/{feed_id}/poll", response_model=None, operation_id="poll_threat_feed")
 async def poll_threat_feed(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
@@ -162,7 +162,7 @@ async def poll_threat_feed(
     return {"status": "poll_scheduled", "feed_id": feed_id}
 
 
-@router.post("/feeds/register-builtins", response_model=dict, operation_id="register_builtin_feeds")
+@router.post("/feeds/register-builtins", response_model=None, operation_id="register_builtin_feeds")
 async def register_builtin_feeds(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
@@ -178,7 +178,7 @@ async def register_builtin_feeds(
     return {"status": "feeds_registered", "count": 0}
 
 
-@router.get("/feeds/{feed_id}/stats", response_model=dict, operation_id="get_feed_stats")
+@router.get("/feeds/{feed_id}/stats", response_model=None, operation_id="get_feed_stats")
 async def get_feed_stats(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
@@ -218,7 +218,7 @@ async def create_indicator(
     )
 
 
-@router.post("/indicators/bulk", response_model=dict, status_code=status.HTTP_201_CREATED, operation_id="bulk_import_indicators")
+@router.post("/indicators/bulk", response_model=None, status_code=status.HTTP_201_CREATED, operation_id="bulk_import_indicators")
 async def bulk_import_indicators(
     import_data: BulkIndicatorImport,
     current_user: CurrentUser = None,
@@ -316,7 +316,7 @@ async def delete_indicator(
     )
 
 
-@router.post("/indicators/{indicator_id}/enrich", response_model=dict, operation_id="enrich_indicator")
+@router.post("/indicators/{indicator_id}/enrich", response_model=None, operation_id="enrich_indicator")
 async def enrich_indicator(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
@@ -348,7 +348,7 @@ async def whitelist_indicator(
     )
 
 
-@router.get("/indicators/{indicator_id}/timeline", response_model=list, operation_id="get_indicator_timeline")
+@router.get("/indicators/{indicator_id}/timeline", response_model=None, operation_id="get_indicator_timeline")
 async def get_indicator_timeline(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
@@ -403,7 +403,7 @@ async def record_sighting(
     )
 
 
-@router.get("/indicators/{indicator_id}/sightings", response_model=list[IndicatorSightingResponse], operation_id="get_indicator_sightings")
+@router.get("/indicators/{indicator_id}/sightings", response_model=None[IndicatorSightingResponse], operation_id="get_indicator_sightings")
 async def get_indicator_sightings(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
@@ -744,7 +744,7 @@ async def get_dashboard_stats(
     )
 
 
-@router.get("/export", response_model=dict, operation_id="export_indicators")
+@router.get("/export", response_model=None, operation_id="export_indicators")
 async def export_indicators(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,

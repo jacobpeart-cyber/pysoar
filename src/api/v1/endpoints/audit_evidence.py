@@ -83,7 +83,7 @@ async def log_audit_event(
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
 
 
-@router.post("/audit/search", response_model=list[AuditTrailResponse])
+@router.post("/audit/search", response_model=None[AuditTrailResponse])
 async def search_audit_trail(
     request: AuditSearchRequest,
     db: AsyncSession = Depends(get_db),
@@ -116,11 +116,11 @@ async def search_audit_trail(
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
 
 
-@router.get("/audit/export", response_model=dict)
+@router.get("/audit/export", response_model=None)
 async def export_audit_trail(
     db: AsyncSession = Depends(get_db),
     user=Depends(get_current_active_user),
-    format: str = Query("json", regex="^(json|csv|xml)$"),
+    format: str = Query("json", pattern="^(json|csv|xml)$"),
     days: int = Query(30, ge=1, le=365),
 ):
     """Export audit trail"""
@@ -148,7 +148,7 @@ async def export_audit_trail(
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
 
 
-@router.get("/audit/suspicious-activity", response_model=list[dict])
+@router.get("/audit/suspicious-activity", response_model=None[dict])
 async def detect_suspicious_activity(
     db: AsyncSession = Depends(get_db),
     actor_id: str = Query(...),
@@ -169,7 +169,7 @@ async def detect_suspicious_activity(
 # ============================================================================
 
 
-@router.post("/evidence/collect", response_model=dict)
+@router.post("/evidence/collect", response_model=None)
 async def collect_evidence(
     request: Body(...),
     db: AsyncSession = Depends(get_db),
@@ -189,7 +189,7 @@ async def collect_evidence(
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
 
 
-@router.post("/evidence/collect-all", response_model=dict)
+@router.post("/evidence/collect-all", response_model=None)
 async def collect_all_automated_evidence(
     db: AsyncSession = Depends(get_db),
     user=Depends(get_current_active_user),
@@ -208,7 +208,7 @@ async def collect_all_automated_evidence(
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
 
 
-@router.post("/evidence/verify", response_model=dict)
+@router.post("/evidence/verify", response_model=None)
 async def verify_evidence_integrity(
     db: AsyncSession = Depends(get_db),
     evidence_id: str = Query(...),
@@ -228,7 +228,7 @@ async def verify_evidence_integrity(
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
 
 
-@router.get("/evidence/list", response_model=list[dict])
+@router.get("/evidence/list", response_model=None[dict])
 async def list_evidence_items(
     db: AsyncSession = Depends(get_db),
     user=Depends(get_current_active_user),
@@ -283,7 +283,7 @@ async def create_evidence_package(
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
 
 
-@router.get("/packages", response_model=list[EvidencePackageResponse])
+@router.get("/packages", response_model=None[EvidencePackageResponse])
 async def list_evidence_packages(
     db: AsyncSession = Depends(get_db),
     user=Depends(get_current_active_user),
@@ -329,7 +329,7 @@ async def get_evidence_package(
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
 
 
-@router.post("/packages/{package_id}/package", response_model=dict)
+@router.post("/packages/{package_id}/package", response_model=None)
 async def package_evidence(
     package_id: str,
     db: AsyncSession = Depends(get_db),
@@ -345,7 +345,7 @@ async def package_evidence(
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
 
 
-@router.post("/packages/{package_id}/submit", response_model=dict)
+@router.post("/packages/{package_id}/submit", response_model=None)
 async def submit_evidence_package(
     package_id: str,
     db: AsyncSession = Depends(get_db),
@@ -376,7 +376,7 @@ async def submit_evidence_package(
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
 
 
-@router.get("/packages/{package_id}/report", response_model=dict)
+@router.get("/packages/{package_id}/report", response_model=None)
 async def get_evidence_report(
     package_id: str,
     db: AsyncSession = Depends(get_db),
@@ -427,7 +427,7 @@ async def get_conmon_report(
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
 
 
-@router.get("/conmon/status", response_model=dict)
+@router.get("/conmon/status", response_model=None)
 async def get_conmon_status(
     db: AsyncSession = Depends(get_db),
     user=Depends(get_current_active_user),
@@ -546,7 +546,7 @@ async def create_evidence_rule(
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
 
 
-@router.get("/rules", response_model=list[AutomatedEvidenceRuleResponse])
+@router.get("/rules", response_model=None[AutomatedEvidenceRuleResponse])
 async def list_evidence_rules(
     db: AsyncSession = Depends(get_db),
     user=Depends(get_current_active_user),

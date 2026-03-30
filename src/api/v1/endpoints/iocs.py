@@ -186,7 +186,7 @@ async def create_ioc(
     return ioc_to_response(ioc)
 
 
-@router.post("/bulk", response_model=dict)
+@router.post("/bulk", response_model=None)
 async def bulk_create_iocs(
     bulk_data: IOCBulkCreate,
     current_user: CurrentUser = None,
@@ -289,7 +289,7 @@ async def delete_ioc(
     await db.flush()
 
 
-@router.post("/search", response_model=list[IOCResponse])
+@router.post("/search", response_model=None[IOCResponse])
 async def search_ioc(
     search_data: IOCSearchRequest,
     current_user: CurrentUser = None,

@@ -398,7 +398,7 @@ async def pin_message(
     return {"status": "pinned", "message_id": message_id}
 
 
-@router.get("/rooms/{room_id}/messages/search", response_model=list[WarRoomMessageResponse])
+@router.get("/rooms/{room_id}/messages/search", response_model=None[WarRoomMessageResponse])
 async def search_messages(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
@@ -738,7 +738,7 @@ async def export_timeline(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     room_id: str = Path(...),
-    format: str = Query("json", regex="^(json|text)$"),
+    format: str = Query("json", pattern="^(json|text)$"),
 ):
     """Export timeline"""
     room = await get_war_room_or_404(db, room_id)

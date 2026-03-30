@@ -429,7 +429,7 @@ async def run_fair_simulation_endpoint(
 
 @router.get(
     "/fair-analyses/{analysis_id}/loss-exceedance-curve",
-    response_model=dict,
+    response_model=None,
 )
 async def get_loss_exceedance_curve(
     analysis_id: str,

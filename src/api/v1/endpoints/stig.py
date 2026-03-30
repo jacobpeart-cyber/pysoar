@@ -47,7 +47,7 @@ router = APIRouter(prefix="/stig", tags=["stig"])
 # ============================================================================
 
 
-@router.get("/benchmarks", response_model=list[BenchmarkListResponse])
+@router.get("/benchmarks", response_model=None[BenchmarkListResponse])
 async def list_benchmarks(
     db: AsyncSession = Depends(get_db),
     user=Depends(get_current_active_user),
@@ -92,7 +92,7 @@ async def get_benchmark(
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
 
 
-@router.get("/benchmarks/{benchmark_id}/rules", response_model=list[STIGRuleResponse])
+@router.get("/benchmarks/{benchmark_id}/rules", response_model=None[STIGRuleResponse])
 async def list_benchmark_rules(
     benchmark_id: str,
     db: AsyncSession = Depends(get_db),
@@ -129,7 +129,7 @@ async def list_benchmark_rules(
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
 
 
-@router.get("/rules/search", response_model=list[RuleSearchResponse])
+@router.get("/rules/search", response_model=None[RuleSearchResponse])
 async def search_rules(
     db: AsyncSession = Depends(get_db),
     q: str = Query(..., min_length=1),
@@ -173,7 +173,7 @@ async def get_rule(
 # ============================================================================
 
 
-@router.post("/scans/launch", response_model=dict)
+@router.post("/scans/launch", response_model=None)
 async def launch_scan(
     request: ScanRequest,
     db: AsyncSession = Depends(get_db),
@@ -194,7 +194,7 @@ async def launch_scan(
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
 
 
-@router.post("/scans/fleet", response_model=list[dict])
+@router.post("/scans/fleet", response_model=None[dict])
 async def launch_fleet_scan(
     request: ScanFleetRequest,
     db: AsyncSession = Depends(get_db),
@@ -214,7 +214,7 @@ async def launch_fleet_scan(
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
 
 
-@router.get("/scans", response_model=list[STIGScanResultResponse])
+@router.get("/scans", response_model=None[STIGScanResultResponse])
 async def list_scans(
     db: AsyncSession = Depends(get_db),
     user=Depends(get_current_active_user),
@@ -363,7 +363,7 @@ async def import_scap_content(
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
 
 
-@router.post("/scap/scan", response_model=dict)
+@router.post("/scap/scan", response_model=None)
 async def run_scap_scan(
     request: Body(...),
     db: AsyncSession = Depends(get_db),
@@ -382,7 +382,7 @@ async def run_scap_scan(
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
 
 
-@router.post("/scap/validate-oval", response_model=dict)
+@router.post("/scap/validate-oval", response_model=None)
 async def validate_oval(
     request: OVALValidationRequest,
     db: AsyncSession = Depends(get_db),
@@ -398,7 +398,7 @@ async def validate_oval(
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
 
 
-@router.post("/scap/arf-report", response_model=dict)
+@router.post("/scap/arf-report", response_model=None)
 async def generate_arf_report(
     request: ARFReportRequest,
     db: AsyncSession = Depends(get_db),
@@ -414,7 +414,7 @@ async def generate_arf_report(
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
 
 
-@router.get("/scap/profiles", response_model=list[SCAPProfileResponse])
+@router.get("/scap/profiles", response_model=None[SCAPProfileResponse])
 async def list_scap_profiles(
     db: AsyncSession = Depends(get_db),
     user=Depends(get_current_active_user),

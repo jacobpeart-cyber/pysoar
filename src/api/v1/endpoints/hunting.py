@@ -565,7 +565,7 @@ async def update_finding(
     return HuntFindingResponse.model_validate(finding)
 
 
-@router.post("/findings/{finding_id}/escalate", response_model=dict)
+@router.post("/findings/{finding_id}/escalate", response_model=None)
 async def escalate_finding(
     finding_id: str,
     current_user: CurrentUser = None,
@@ -592,7 +592,7 @@ async def escalate_finding(
 # ============================================================================
 
 
-@router.get("/templates", response_model=list[HuntTemplateResponse])
+@router.get("/templates", response_model=None[HuntTemplateResponse])
 async def list_templates(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
@@ -781,7 +781,7 @@ async def update_notebook(
     return HuntNotebookResponse.model_validate(notebook)
 
 
-@router.post("/notebooks/{notebook_id}/execute-cell", response_model=dict)
+@router.post("/notebooks/{notebook_id}/execute-cell", response_model=None)
 async def execute_notebook_cell(
     notebook_id: str,
     cell_data: HuntNotebookCellExecute,
@@ -818,12 +818,12 @@ async def publish_notebook(
     return HuntNotebookResponse.model_validate(notebook)
 
 
-@router.get("/notebooks/{notebook_id}/export", response_model=dict)
+@router.get("/notebooks/{notebook_id}/export", response_model=None)
 async def export_notebook(
     notebook_id: str,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    format: str = Query("json", regex="^(json|markdown|html)$"),
+    format: str = Query("json", pattern="^(json|markdown|html)$"),
 ):
     """Export a notebook in the specified format"""
     # Note: In a real implementation, this would use the NotebookService

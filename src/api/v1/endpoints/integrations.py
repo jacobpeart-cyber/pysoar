@@ -914,7 +914,7 @@ async def get_health_dashboard(
 async def get_execution_stats(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    period: str = Query("day", regex="^(hour|day|week|month)$"),
+    period: str = Query("day", pattern="^(hour|day|week|month)$"),
 ):
     """Get execution statistics dashboard"""
     return DashboardExecutionStatsResponse(

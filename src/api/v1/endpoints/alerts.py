@@ -258,7 +258,7 @@ async def delete_alert(
     await db.flush()
 
 
-@router.post("/bulk", response_model=dict)
+@router.post("/bulk", response_model=None)
 async def bulk_action(
     action_data: AlertBulkAction,
     current_user: CurrentUser = None,

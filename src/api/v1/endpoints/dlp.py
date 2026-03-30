@@ -951,7 +951,7 @@ async def get_dlp_dashboard(
 async def get_violation_trends(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    period: str = Query("month", regex="^(day|week|month|year)$"),
+    period: str = Query("month", pattern="^(day|week|month|year)$"),
 ):
     """Get violation trends"""
     return ViolationTrendResponse(

@@ -117,7 +117,7 @@ async def ingest_log(
     return LogEntryResponse.model_validate(log_entry)
 
 
-@router.post("/logs/batch", response_model=dict)
+@router.post("/logs/batch", response_model=None)
 async def batch_ingest_logs(
     batch_data: LogBatchIngestRequest,
     current_user: CurrentUser = None,
@@ -229,7 +229,7 @@ async def search_logs(
     )
 
 
-@router.post("/logs/aggregate", response_model=dict)
+@router.post("/logs/aggregate", response_model=None)
 async def aggregate_logs(
     agg_data: AggregationRequest,
     current_user: CurrentUser = None,
@@ -482,7 +482,7 @@ async def delete_rule(
     await db.flush()
 
 
-@router.post("/rules/{rule_id}/test", response_model=dict)
+@router.post("/rules/{rule_id}/test", response_model=None)
 async def test_rule(
     rule_id: str,
     sample_logs: list[str],
@@ -506,7 +506,7 @@ async def test_rule(
     }
 
 
-@router.post("/rules/validate", response_model=dict)
+@router.post("/rules/validate", response_model=None)
 async def validate_rule(
     rule_data: DetectionRuleCreate,
     current_user: CurrentUser = None,
@@ -534,7 +534,7 @@ async def validate_rule(
 # ============================================================================
 
 
-@router.get("/correlations", response_model=list[CorrelationEventResponse])
+@router.get("/correlations", response_model=None[CorrelationEventResponse])
 async def list_correlations(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
@@ -597,7 +597,7 @@ async def update_correlation_status(
 # ============================================================================
 
 
-@router.get("/sources", response_model=list[DataSourceResponse])
+@router.get("/sources", response_model=None[DataSourceResponse])
 async def list_sources(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
