@@ -194,7 +194,7 @@ async def create_monitor(
 async def get_monitor(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    monitor_id: str,
+    monitor_id: str = Path(...),
 ):
     """Get monitor by ID"""
     monitor = await get_monitor_or_404(db, monitor_id)
@@ -209,7 +209,7 @@ async def get_monitor(
 async def update_monitor(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    monitor_id: str,
+    monitor_id: str = Path(...),
     update: DarkWebMonitorUpdate,
 ):
     """Update monitor configuration"""
@@ -248,7 +248,7 @@ async def update_monitor(
 async def delete_monitor(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    monitor_id: str,
+    monitor_id: str = Path(...),
 ):
     """Delete monitor"""
     monitor = await get_monitor_or_404(db, monitor_id)
@@ -269,7 +269,7 @@ async def delete_monitor(
 async def trigger_monitor_scan(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    monitor_id: str,
+    monitor_id: str = Path(...),
     background_tasks: BackgroundTasks,
     scan_request: ScanTriggerRequest,
 ):
@@ -369,7 +369,7 @@ async def list_findings(
 async def get_finding(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    finding_id: str,
+    finding_id: str = Path(...),
 ):
     """Get finding details with related data"""
     finding = await get_finding_or_404(db, finding_id)
@@ -384,7 +384,7 @@ async def get_finding(
 async def update_finding(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    finding_id: str,
+    finding_id: str = Path(...),
     update: DarkWebFindingUpdate,
 ):
     """Update finding status and notes"""
@@ -530,7 +530,7 @@ async def list_credentials(
 async def update_credential(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    credential_id: str,
+    credential_id: str = Path(...),
     update: CredentialLeakUpdate,
 ):
     """Update credential leak remediation status"""
@@ -663,7 +663,7 @@ async def list_brand_threats(
 async def update_brand_threat(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    threat_id: str,
+    threat_id: str = Path(...),
     update: BrandThreatUpdate,
 ):
     """Update brand threat takedown status"""
@@ -693,7 +693,7 @@ async def update_brand_threat(
 async def initiate_takedown(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    threat_id: str,
+    threat_id: str = Path(...),
     background_tasks: BackgroundTasks,
 ):
     """Initiate takedown for brand threat"""

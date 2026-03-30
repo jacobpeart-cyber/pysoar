@@ -92,7 +92,7 @@ async def list_threat_feeds(
 async def get_threat_feed(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    feed_id: str,
+    feed_id: str = Path(...),
 ) -> ThreatFeedResponse:
     """
     Get threat feed details.
@@ -108,7 +108,7 @@ async def get_threat_feed(
 async def update_threat_feed(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    feed_id: str,
+    feed_id: str = Path(...),
     feed_update: ThreatFeedUpdate,
 ) -> ThreatFeedResponse:
     """
@@ -129,7 +129,7 @@ async def update_threat_feed(
 async def delete_threat_feed(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    feed_id: str,
+    feed_id: str = Path(...),
 ) -> None:
     """
     Delete a threat feed.
@@ -149,7 +149,7 @@ async def delete_threat_feed(
 async def poll_threat_feed(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    feed_id: str,
+    feed_id: str = Path(...),
 ) -> dict:
     """
     Trigger a manual poll of a threat feed.
@@ -182,7 +182,7 @@ async def register_builtin_feeds(
 async def get_feed_stats(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    feed_id: str,
+    feed_id: str = Path(...),
 ) -> dict:
     """
     Get statistics for a threat feed.
@@ -271,7 +271,7 @@ async def list_indicators(
 async def get_indicator(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    indicator_id: str,
+    indicator_id: str = Path(...),
 ) -> ThreatIndicatorResponse:
     """
     Get a specific threat indicator.
@@ -287,7 +287,7 @@ async def get_indicator(
 async def update_indicator(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    indicator_id: str,
+    indicator_id: str = Path(...),
     indicator_update: ThreatIndicatorUpdate,
 ) -> ThreatIndicatorResponse:
     """
@@ -304,7 +304,7 @@ async def update_indicator(
 async def delete_indicator(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    indicator_id: str,
+    indicator_id: str = Path(...),
 ) -> None:
     """
     Delete a threat indicator.
@@ -320,7 +320,7 @@ async def delete_indicator(
 async def enrich_indicator(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    indicator_id: str,
+    indicator_id: str = Path(...),
 ) -> dict:
     """
     Trigger enrichment for a threat indicator.
@@ -336,7 +336,7 @@ async def enrich_indicator(
 async def whitelist_indicator(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    indicator_id: str,
+    indicator_id: str = Path(...),
 ) -> ThreatIndicatorResponse:
     """
     Whitelist a threat indicator.
@@ -352,7 +352,7 @@ async def whitelist_indicator(
 async def get_indicator_timeline(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    indicator_id: str,
+    indicator_id: str = Path(...),
 ) -> list:
     """
     Get the timeline/history for a threat indicator.
@@ -407,7 +407,7 @@ async def record_sighting(
 async def get_indicator_sightings(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    indicator_id: str,
+    indicator_id: str = Path(...),
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=200),
 ) -> list[IndicatorSightingResponse]:
@@ -467,7 +467,7 @@ async def list_actors(
 async def get_actor(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    actor_id: str,
+    actor_id: str = Path(...),
 ) -> ThreatActorResponse:
     """
     Get threat actor details with associated campaigns and indicators.
@@ -483,7 +483,7 @@ async def get_actor(
 async def update_actor(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    actor_id: str,
+    actor_id: str = Path(...),
     actor_update: ThreatActorUpdate,
 ) -> ThreatActorResponse:
     """
@@ -500,7 +500,7 @@ async def update_actor(
 async def delete_actor(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    actor_id: str,
+    actor_id: str = Path(...),
 ) -> None:
     """
     Delete a threat actor.
@@ -560,7 +560,7 @@ async def list_campaigns(
 async def get_campaign(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    campaign_id: str,
+    campaign_id: str = Path(...),
 ) -> ThreatCampaignResponse:
     """
     Get threat campaign details.
@@ -576,7 +576,7 @@ async def get_campaign(
 async def update_campaign(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    campaign_id: str,
+    campaign_id: str = Path(...),
     campaign_update: ThreatCampaignUpdate,
 ) -> ThreatCampaignResponse:
     """
@@ -593,7 +593,7 @@ async def update_campaign(
 async def delete_campaign(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    campaign_id: str,
+    campaign_id: str = Path(...),
 ) -> None:
     """
     Delete a threat campaign.
@@ -654,7 +654,7 @@ async def list_reports(
 async def get_report(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    report_id: str,
+    report_id: str = Path(...),
 ) -> IntelReportResponse:
     """
     Get a specific intel report.
@@ -670,7 +670,7 @@ async def get_report(
 async def update_report(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    report_id: str,
+    report_id: str = Path(...),
     report_update: IntelReportUpdate,
 ) -> IntelReportResponse:
     """
@@ -687,7 +687,7 @@ async def update_report(
 async def publish_report(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    report_id: str,
+    report_id: str = Path(...),
 ) -> IntelReportResponse:
     """
     Publish an intel report.
@@ -703,7 +703,7 @@ async def publish_report(
 async def delete_report(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    report_id: str,
+    report_id: str = Path(...),
 ) -> None:
     """
     Delete an intel report.

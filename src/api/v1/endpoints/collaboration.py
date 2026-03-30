@@ -192,7 +192,7 @@ async def list_war_rooms(
 async def get_war_room(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    room_id: str,
+    room_id: str = Path(...),
 ):
     """Get war room details"""
     room = await get_war_room_or_404(db, room_id)
@@ -203,7 +203,7 @@ async def get_war_room(
 async def update_war_room(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    room_id: str,
+    room_id: str = Path(...),
     room_data: WarRoomUpdate,
 ):
     """Update war room"""
@@ -231,7 +231,7 @@ async def update_war_room(
 async def archive_war_room(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    room_id: str,
+    room_id: str = Path(...),
 ):
     """Archive war room"""
     room = await get_war_room_or_404(db, room_id)
@@ -245,7 +245,7 @@ async def archive_war_room(
 async def get_room_summary(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    room_id: str,
+    room_id: str = Path(...),
 ):
     """Get war room summary with metrics"""
     room = await get_war_room_or_404(db, room_id)
@@ -258,7 +258,7 @@ async def get_room_summary(
 async def join_war_room(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    room_id: str,
+    room_id: str = Path(...),
 ):
     """Join a war room"""
     room = await get_war_room_or_404(db, room_id)
@@ -279,7 +279,7 @@ async def join_war_room(
 async def leave_war_room(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    room_id: str,
+    room_id: str = Path(...),
 ):
     """Leave a war room"""
     room = await get_war_room_or_404(db, room_id)
@@ -293,8 +293,8 @@ async def leave_war_room(
 async def set_war_room_commander(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    room_id: str,
-    user_id: str,
+    room_id: str = Path(...),
+    user_id: str = Path(...),
 ):
     """Set incident commander for war room"""
     room = await get_war_room_or_404(db, room_id)
@@ -317,7 +317,7 @@ async def set_war_room_commander(
 async def send_message(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    room_id: str,
+    room_id: str = Path(...),
     msg_data: WarRoomMessageCreate,
 ):
     """Send message to war room"""
@@ -343,7 +343,7 @@ async def send_message(
 async def get_room_messages(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    room_id: str,
+    room_id: str = Path(...),
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=200),
 ):
@@ -364,7 +364,7 @@ async def get_room_messages(
 async def edit_message(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    message_id: str,
+    message_id: str = Path(...),
     msg_data: WarRoomMessageUpdate,
 ):
     """Edit message"""
@@ -384,7 +384,7 @@ async def edit_message(
 async def pin_message(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    message_id: str,
+    message_id: str = Path(...),
 ):
     """Pin message in room"""
     message = await get_message_or_404(db, message_id)
@@ -402,7 +402,7 @@ async def pin_message(
 async def search_messages(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    room_id: str,
+    room_id: str = Path(...),
     q: str = Query(..., min_length=1),
     limit: int = Query(50, ge=1, le=200),
 ):
@@ -417,8 +417,8 @@ async def search_messages(
 async def get_message_thread(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    room_id: str,
-    message_id: str,
+    room_id: str = Path(...),
+    message_id: str = Path(...),
 ):
     """Get message thread"""
     room = await get_war_room_or_404(db, room_id)
@@ -444,7 +444,7 @@ async def get_message_thread(
 async def upload_artifact(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    room_id: str,
+    room_id: str = Path(...),
     artifact_data: SharedArtifactCreate,
 ):
     """Upload artifact to war room"""
@@ -471,7 +471,7 @@ async def upload_artifact(
 async def list_room_artifacts(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    room_id: str,
+    room_id: str = Path(...),
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     artifact_type: Optional[str] = None,
@@ -509,7 +509,7 @@ async def list_room_artifacts(
 async def get_artifact(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    artifact_id: str,
+    artifact_id: str = Path(...),
 ):
     """Get artifact details"""
     artifact = await get_artifact_or_404(db, artifact_id)
@@ -520,7 +520,7 @@ async def get_artifact(
 async def download_artifact(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    artifact_id: str,
+    artifact_id: str = Path(...),
 ):
     """Track artifact download"""
     artifact = await get_artifact_or_404(db, artifact_id)
@@ -534,7 +534,7 @@ async def download_artifact(
 async def get_artifact_index(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    room_id: str,
+    room_id: str = Path(...),
 ):
     """Get artifact index for room"""
     room = await get_war_room_or_404(db, room_id)
@@ -552,7 +552,7 @@ async def get_artifact_index(
 async def create_action_item(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    room_id: str,
+    room_id: str = Path(...),
     action_data: ActionItemCreate,
 ):
     """Create action item"""
@@ -577,7 +577,7 @@ async def create_action_item(
 async def list_room_actions(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    room_id: str,
+    room_id: str = Path(...),
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=200),
     status: Optional[str] = None,
@@ -619,7 +619,7 @@ async def list_room_actions(
 async def update_action_item(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    action_id: str,
+    action_id: str = Path(...),
     action_data: ActionItemUpdate,
 ):
     """Update action item"""
@@ -650,7 +650,7 @@ async def update_action_item(
 async def get_action_report(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    room_id: str,
+    room_id: str = Path(...),
 ):
     """Get action items report"""
     room = await get_war_room_or_404(db, room_id)
@@ -668,7 +668,7 @@ async def get_action_report(
 async def add_timeline_event(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    room_id: str,
+    room_id: str = Path(...),
     event_data: IncidentTimelineCreate,
 ):
     """Add event to timeline"""
@@ -694,7 +694,7 @@ async def add_timeline_event(
 async def get_timeline(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    room_id: str,
+    room_id: str = Path(...),
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=200),
     event_type: Optional[str] = None,
@@ -724,7 +724,7 @@ async def get_timeline(
 async def get_timeline_report(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    room_id: str,
+    room_id: str = Path(...),
 ):
     """Get timeline report"""
     room = await get_war_room_or_404(db, room_id)
@@ -737,7 +737,7 @@ async def get_timeline_report(
 async def export_timeline(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    room_id: str,
+    room_id: str = Path(...),
     format: str = Query("json", regex="^(json|text)$"),
 ):
     """Export timeline"""
@@ -756,7 +756,7 @@ async def export_timeline(
 async def generate_post_mortem(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    room_id: str,
+    room_id: str = Path(...),
 ):
     """Generate post-mortem report"""
     room = await get_war_room_or_404(db, room_id)
@@ -769,7 +769,7 @@ async def generate_post_mortem(
 async def get_postmortem_analysis(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    room_id: str,
+    room_id: str = Path(...),
 ):
     """Get complete post-mortem analysis"""
     room = await get_war_room_or_404(db, room_id)
@@ -866,7 +866,7 @@ async def get_collaboration_dashboard(
 async def get_room_activity_metrics(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    room_id: str,
+    room_id: str = Path(...),
 ):
     """Get activity metrics for room"""
     room = await get_war_room_or_404(db, room_id)
@@ -935,7 +935,7 @@ async def get_room_activity_metrics(
 async def search_collaboration(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    room_id: str,
+    room_id: str = Path(...),
     q: str = Query(..., min_length=1),
 ):
     """Search across messages and artifacts"""

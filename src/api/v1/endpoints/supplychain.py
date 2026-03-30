@@ -193,7 +193,7 @@ async def import_sbom(
 async def export_sbom(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    sbom_id: str,
+    sbom_id: str = Path(...),
     export_request: SBOMExportRequest,
 ):
     """Export SBOM in specified format"""
@@ -279,7 +279,7 @@ async def list_sboms(
 async def get_sbom(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    sbom_id: str,
+    sbom_id: str = Path(...),
 ):
     """Get SBOM details"""
     sbom = await get_sbom_or_404(db, sbom_id)
@@ -294,7 +294,7 @@ async def get_sbom(
 async def update_sbom(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    sbom_id: str,
+    sbom_id: str = Path(...),
     sbom_update: SBOMUpdate,
 ):
     """Update SBOM"""
@@ -407,7 +407,7 @@ async def list_components(
 async def get_component(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    component_id: str,
+    component_id: str = Path(...),
 ):
     """Get component details"""
     component = await get_component_or_404(db, component_id)
@@ -422,7 +422,7 @@ async def get_component(
 async def update_component(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    component_id: str,
+    component_id: str = Path(...),
     component_update: SoftwareComponentUpdate,
 ):
     """Update component"""
@@ -444,7 +444,7 @@ async def update_component(
 async def get_component_dependency_tree(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    component_id: str,
+    component_id: str = Path(...),
 ):
     """Get component dependency tree"""
     component = await get_component_or_404(db, component_id)
@@ -471,7 +471,7 @@ async def get_component_dependency_tree(
 async def get_component_vulnerabilities(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    component_id: str,
+    component_id: str = Path(...),
 ):
     """Look up known vulnerabilities for component"""
     component = await get_component_or_404(db, component_id)
@@ -569,7 +569,7 @@ async def list_risks(
 async def get_risk(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    risk_id: str,
+    risk_id: str = Path(...),
 ):
     """Get risk details"""
     risk = await get_risk_or_404(db, risk_id)
@@ -584,7 +584,7 @@ async def get_risk(
 async def update_risk(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    risk_id: str,
+    risk_id: str = Path(...),
     risk_update: SupplyChainRiskUpdate,
 ):
     """Update risk status and remediation"""
@@ -668,7 +668,7 @@ async def list_vendors(
 async def get_vendor(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    vendor_id: str,
+    vendor_id: str = Path(...),
 ):
     """Get vendor assessment"""
     vendor = await get_vendor_or_404(db, vendor_id)
@@ -683,7 +683,7 @@ async def get_vendor(
 async def update_vendor(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    vendor_id: str,
+    vendor_id: str = Path(...),
     vendor_update: VendorAssessmentUpdate,
 ):
     """Update vendor assessment"""
@@ -708,7 +708,7 @@ async def update_vendor(
 async def validate_sbom_compliance(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    sbom_id: str,
+    sbom_id: str = Path(...),
 ):
     """Validate SBOM compliance with CISA guidelines"""
     sbom = await get_sbom_or_404(db, sbom_id)

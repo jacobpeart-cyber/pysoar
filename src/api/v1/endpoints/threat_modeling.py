@@ -214,7 +214,7 @@ async def list_threat_models(
 async def get_threat_model(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    model_id: str,
+    model_id: str = Path(...),
 ):
     """Get threat model by ID"""
     model = await get_threat_model_or_404(db, model_id, current_user.organization_id)
@@ -225,7 +225,7 @@ async def get_threat_model(
 async def update_threat_model(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    model_id: str,
+    model_id: str = Path(...),
     data: ThreatModelUpdate,
 ):
     """Update threat model"""
@@ -243,7 +243,7 @@ async def update_threat_model(
 async def delete_threat_model(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    model_id: str,
+    model_id: str = Path(...),
 ):
     """Delete threat model"""
     model = await get_threat_model_or_404(db, model_id, current_user.organization_id)
@@ -257,7 +257,7 @@ async def delete_threat_model(
 async def create_component(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    model_id: str,
+    model_id: str = Path(...),
     data: ComponentCreate,
 ):
     """Create component in threat model"""
@@ -285,7 +285,7 @@ async def create_component(
 async def list_components(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    model_id: str,
+    model_id: str = Path(...),
 ):
     """List components in threat model"""
     model = await get_threat_model_or_404(db, model_id, current_user.organization_id)
@@ -302,8 +302,8 @@ async def list_components(
 async def update_component(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    model_id: str,
-    component_id: str,
+    model_id: str = Path(...),
+    component_id: str = Path(...),
     data: ComponentUpdate,
 ):
     """Update component"""
@@ -321,8 +321,8 @@ async def update_component(
 async def delete_component(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    model_id: str,
-    component_id: str,
+    model_id: str = Path(...),
+    component_id: str = Path(...),
 ):
     """Delete component"""
     component = await get_component_or_404(db, component_id, current_user.organization_id)
@@ -336,7 +336,7 @@ async def delete_component(
 async def create_threat(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    model_id: str,
+    model_id: str = Path(...),
     data: ThreatCreate,
 ):
     """Create identified threat"""
@@ -379,7 +379,7 @@ async def create_threat(
 async def list_threats(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    model_id: str,
+    model_id: str = Path(...),
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     stride_category: Optional[str] = None,
@@ -434,8 +434,8 @@ async def list_threats(
 async def get_threat(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    model_id: str,
-    threat_id: str,
+    model_id: str = Path(...),
+    threat_id: str = Path(...),
 ):
     """Get threat by ID"""
     threat = await get_threat_or_404(db, threat_id, current_user.organization_id)
@@ -446,8 +446,8 @@ async def get_threat(
 async def update_threat(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    model_id: str,
-    threat_id: str,
+    model_id: str = Path(...),
+    threat_id: str = Path(...),
     data: ThreatUpdate,
 ):
     """Update threat"""
@@ -473,8 +473,8 @@ async def update_threat(
 async def delete_threat(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    model_id: str,
-    threat_id: str,
+    model_id: str = Path(...),
+    threat_id: str = Path(...),
 ):
     """Delete threat"""
     threat = await get_threat_or_404(db, threat_id, current_user.organization_id)
@@ -493,8 +493,8 @@ async def delete_threat(
 async def create_mitigation(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    model_id: str,
-    threat_id: str,
+    model_id: str = Path(...),
+    threat_id: str = Path(...),
     data: MitigationCreate,
 ):
     """Create mitigation for threat"""
@@ -530,8 +530,8 @@ async def create_mitigation(
 async def list_mitigations(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    model_id: str,
-    threat_id: str,
+    model_id: str = Path(...),
+    threat_id: str = Path(...),
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
 ):
@@ -568,9 +568,9 @@ async def list_mitigations(
 async def update_mitigation(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    model_id: str,
-    threat_id: str,
-    mitigation_id: str,
+    model_id: str = Path(...),
+    threat_id: str = Path(...),
+    mitigation_id: str = Path(...),
     data: MitigationUpdate,
 ):
     """Update mitigation"""
@@ -601,7 +601,7 @@ async def update_mitigation(
 async def run_stride_analysis(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    model_id: str,
+    model_id: str = Path(...),
     request: STRIDEAnalysisRequest,
 ):
     """Run STRIDE analysis on threat model"""
@@ -634,7 +634,7 @@ async def run_stride_analysis(
 async def run_pasta_analysis(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    model_id: str,
+    model_id: str = Path(...),
     request: PASTAAnalysisRequest,
 ):
     """Run PASTA analysis on threat model"""
@@ -669,7 +669,7 @@ async def run_pasta_analysis(
 async def validate_model(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    model_id: str,
+    model_id: str = Path(...),
     request: ValidationRequest,
 ):
     """Validate threat model completeness"""
@@ -708,8 +708,8 @@ async def validate_model(
 async def get_mitigation_recommendations(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    model_id: str,
-    threat_id: str,
+    model_id: str = Path(...),
+    threat_id: str = Path(...),
 ):
     """Get recommended mitigations for threat"""
     threat = await get_threat_or_404(db, threat_id, current_user.organization_id)
@@ -734,7 +734,7 @@ async def get_mitigation_recommendations(
 async def get_dashboard(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    model_id: str,
+    model_id: str = Path(...),
 ):
     """Get threat modeling dashboard data"""
     model = await get_threat_model_or_404(db, model_id, current_user.organization_id)
