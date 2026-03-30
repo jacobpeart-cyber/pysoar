@@ -18,7 +18,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, desc
 
-from src.api.deps import CurrentUser, DatabaseSession
+from src.api.deps import CurrentUser, DatabaseSession, get_current_active_user
+from src.core.database import get_db
 from src.core.logging import get_logger
 from src.models.base import utc_now
 from src.remediation.models import (
@@ -67,7 +68,7 @@ router = APIRouter(prefix="/remediation", tags=["remediation"])
 async def create_policy(
     request: RemediationPolicyCreate,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Create a new remediation policy."""
     logger.info("Creating remediation policy", extra={
@@ -113,7 +114,7 @@ async def list_policies(
     enabled_only: bool = Query(default=True),
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, ge=1, le=500),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """List remediation policies with optional filtering."""
     query = select(RemediationPolicy).where(
@@ -136,7 +137,7 @@ async def list_policies(
 async def get_policy(
     policy_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Get a specific policy with execution history."""
     policy = await db.get(RemediationPolicy, policy_id)
@@ -150,7 +151,7 @@ async def update_policy(
     policy_id: str,
     request: RemediationPolicyUpdate,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Update a policy."""
     policy = await db.get(RemediationPolicy, policy_id)
@@ -171,7 +172,7 @@ async def update_policy(
 async def delete_policy(
     policy_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Disable a policy (soft delete)."""
     policy = await db.get(RemediationPolicy, policy_id)
@@ -188,7 +189,7 @@ async def test_policy(
     policy_id: str,
     trigger_data: dict,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Test a policy against sample data."""
     policy = await db.get(RemediationPolicy, policy_id)
@@ -212,7 +213,7 @@ async def test_policy(
 @router.get("/policies/builtin")
 async def list_builtin_policies(
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """List built-in remediation policies."""
     # Return metadata about available built-in policies
@@ -247,7 +248,7 @@ async def list_actions(
     action_type: Optional[str] = Query(None),
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, ge=1, le=500),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """List available remediation actions."""
     query = select(RemediationAction).where(
@@ -266,7 +267,7 @@ async def list_actions(
 async def create_action(
     request: RemediationActionCreate,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Create a custom remediation action."""
     action = RemediationAction(
@@ -297,7 +298,7 @@ async def create_action(
 async def get_action(
     action_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Get a specific action."""
     action = await db.get(RemediationAction, action_id)
@@ -311,7 +312,7 @@ async def test_action(
     action_id: str,
     target: str,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Test an action."""
     action = await db.get(RemediationAction, action_id)
@@ -338,7 +339,7 @@ async def list_executions(
     days: int = Query(default=7, ge=1, le=90),
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, ge=1, le=500),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """List remediation executions."""
     query = select(RemediationExecution).where(
@@ -362,7 +363,7 @@ async def list_executions(
 async def get_execution(
     execution_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Get execution detail with action results."""
     execution = await db.get(RemediationExecution, execution_id)
@@ -375,7 +376,7 @@ async def get_execution(
 async def get_execution_progress(
     execution_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Get real-time execution progress."""
     execution = await db.get(RemediationExecution, execution_id)
@@ -407,7 +408,7 @@ async def approve_execution(
     execution_id: str,
     request: ApprovalRequest,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Approve a pending remediation execution."""
     execution = await db.get(RemediationExecution, execution_id)
@@ -435,7 +436,7 @@ async def reject_execution(
     execution_id: str,
     request: RejectionRequest,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Reject a pending remediation execution."""
     execution = await db.get(RemediationExecution, execution_id)
@@ -455,7 +456,7 @@ async def reject_execution(
 async def rollback_execution(
     execution_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Rollback a completed execution."""
     execution = await db.get(RemediationExecution, execution_id)
@@ -476,7 +477,7 @@ async def rollback_execution(
 async def cancel_execution(
     execution_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Cancel a running execution."""
     execution = await db.get(RemediationExecution, execution_id)
@@ -493,7 +494,7 @@ async def cancel_execution(
 @router.get("/executions/pending")
 async def get_pending_approvals(
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Get pending approvals for current organization."""
     query = select(RemediationExecution).where(
@@ -519,7 +520,7 @@ async def get_pending_approvals(
 async def execute_manual_remediation(
     request: ManualRemediationRequest,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Trigger manual remediation."""
     engine = RemediationEngine(db)
@@ -546,7 +547,7 @@ async def execute_manual_remediation(
 async def quick_block_ip(
     request: QuickBlockIPRequest,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Quick action: block an IP."""
     logger.info("Quick block IP", extra={"ip": request.ip})
@@ -562,7 +563,7 @@ async def quick_block_ip(
 async def quick_isolate_host(
     request: QuickIsolateHostRequest,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Quick action: isolate a host."""
     logger.info("Quick isolate host", extra={"hostname": request.hostname})
@@ -577,7 +578,7 @@ async def quick_isolate_host(
 async def quick_disable_account(
     request: QuickDisableAccountRequest,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Quick action: disable an account."""
     logger.info("Quick disable account", extra={"username": request.username})
@@ -592,7 +593,7 @@ async def quick_disable_account(
 async def quick_quarantine_file(
     request: QuickQuarantineFileRequest,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Quick action: quarantine a file."""
     logger.info("Quick quarantine file", extra={
@@ -617,7 +618,7 @@ async def list_playbooks(
     playbook_type: Optional[str] = Query(None),
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, ge=1, le=500),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """List remediation playbooks."""
     query = select(RemediationPlaybook).where(
@@ -636,7 +637,7 @@ async def list_playbooks(
 async def create_playbook(
     request: RemediationPlaybookCreate,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Create a remediation playbook."""
     playbook = RemediationPlaybook(
@@ -664,7 +665,7 @@ async def create_playbook(
 async def get_playbook(
     playbook_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Get a specific playbook."""
     playbook = await db.get(RemediationPlaybook, playbook_id)
@@ -678,7 +679,7 @@ async def update_playbook(
     playbook_id: str,
     request: RemediationPlaybookCreate,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Update a playbook."""
     playbook = await db.get(RemediationPlaybook, playbook_id)
@@ -701,7 +702,7 @@ async def execute_playbook(
     playbook_id: str,
     trigger_data: dict,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Execute a playbook."""
     playbook = await db.get(RemediationPlaybook, playbook_id)
@@ -723,7 +724,7 @@ async def execute_playbook(
 async def list_integrations(
     db: AsyncSession = Depends(get_db),
     integration_type: Optional[str] = Query(None),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """List remediation integrations."""
     query = select(RemediationIntegration).where(
@@ -741,7 +742,7 @@ async def list_integrations(
 async def create_integration(
     request: RemediationIntegrationCreate,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Add a remediation integration."""
     integration = RemediationIntegration(
@@ -767,7 +768,7 @@ async def update_integration(
     integration_id: str,
     request: RemediationIntegrationCreate,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Update an integration."""
     integration = await db.get(RemediationIntegration, integration_id)
@@ -787,7 +788,7 @@ async def update_integration(
 async def test_integration(
     integration_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Test integration connectivity."""
     integration = await db.get(RemediationIntegration, integration_id)
@@ -806,7 +807,7 @@ async def test_integration(
 async def get_integration_health(
     integration_id: str,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Check integration health status."""
     integration = await db.get(RemediationIntegration, integration_id)
@@ -829,7 +830,7 @@ async def get_integration_health(
 async def get_dashboard_stats(
     db: AsyncSession = Depends(get_db),
     days: int = Query(default=7, ge=1, le=90),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Get remediation dashboard statistics."""
     cutoff = utc_now() - timedelta(days=days)
@@ -870,7 +871,7 @@ async def get_dashboard_stats(
 async def get_remediation_timeline(
     db: AsyncSession = Depends(get_db),
     days: int = Query(default=7, ge=1, le=90),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Get recent remediation timeline."""
     cutoff = utc_now() - timedelta(days=days)
@@ -897,7 +898,7 @@ async def get_remediation_timeline(
 async def get_effectiveness_metrics(
     db: AsyncSession = Depends(get_db),
     days: int = Query(default=7, ge=1, le=90),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Get remediation effectiveness metrics."""
     return EffectivenessMetrics(

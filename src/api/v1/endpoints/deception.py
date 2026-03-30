@@ -10,7 +10,8 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import CurrentUser, DatabaseSession
+from src.api.deps import CurrentUser, DatabaseSession, get_current_active_user
+from src.core.database import get_db
 from src.core.logging import get_logger
 from src.deception.engine import (
     DecoyManager,
@@ -71,7 +72,7 @@ orchestrator = DeceptionOrchestrator()
 async def deploy_decoy(
     request: DecoyDeployRequest,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Deploy a new decoy asset."""
     try:
@@ -175,7 +176,7 @@ async def update_decoy(
     decoy_id: UUID,
     request: DecoyDeployRequest,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Update decoy configuration."""
     try:
@@ -209,7 +210,7 @@ async def update_decoy(
 async def disable_decoy(
     decoy_id: UUID,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Disable a decoy."""
     try:
@@ -241,7 +242,7 @@ async def disable_decoy(
 async def rotate_decoy(
     decoy_id: UUID,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Rotate/refresh a decoy to avoid fingerprinting."""
     try:
@@ -275,7 +276,7 @@ async def rotate_decoy(
 async def undeploy_decoy(
     decoy_id: UUID,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Undeploy and delete a decoy."""
     try:
@@ -318,7 +319,7 @@ async def undeploy_decoy(
 async def generate_token(
     request: HoneyTokenGenerateRequest,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Generate a new honeytoken."""
     try:
@@ -485,7 +486,7 @@ async def check_token(
 async def delete_token(
     token_id: UUID,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Disable/delete a honeytoken."""
     try:
@@ -517,7 +518,7 @@ async def delete_token(
 async def rotate_tokens(
     db: AsyncSession = Depends(get_db),
     token_type: str = Query(...),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Rotate all tokens of a specific type."""
     try:
@@ -651,7 +652,7 @@ async def investigate_interaction(
     interaction_id: UUID,
     request: InteractionInvestigationRequest,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Trigger deep investigation of an interaction."""
     try:
@@ -708,7 +709,7 @@ async def investigate_interaction(
 async def create_campaign(
     request: DeceptionCampaignCreateRequest,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Create a new deception campaign."""
     try:
@@ -805,7 +806,7 @@ async def update_campaign_status(
     campaign_id: UUID,
     request: CampaignStatusUpdateRequest,
     db: AsyncSession = Depends(get_db),
-    current_user = Depends(get_current_user),
+    current_user = Depends(get_current_active_user),
 ):
     """Update campaign status (pause/resume/complete)."""
     try:
