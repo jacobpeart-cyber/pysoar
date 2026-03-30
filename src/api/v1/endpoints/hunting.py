@@ -11,7 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DatabaseSession
 from src.core.database import async_session_factory
-from src.models.hunting import (
+from src.hunting.models import (
     HuntFinding,
     HuntHypothesis,
     HuntSession,

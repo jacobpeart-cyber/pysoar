@@ -10,7 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DatabaseSession
-from src.models.data_lake import (
+from src.data_lake.models import (
     DataPartition,
     DataPipeline,
     DataSource,
