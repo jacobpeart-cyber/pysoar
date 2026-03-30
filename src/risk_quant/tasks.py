@@ -5,7 +5,7 @@ Asynchronous tasks for FAIR analysis, risk reviews, control audits, and BIA upda
 
 from datetime import datetime, timedelta, timezone
 
-from src.core.celery import shared_task
+from celery import shared_task
 from src.core.logging import get_logger
 from src.risk_quant.engine import (
     BIAEngine,

@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
-from src.core.celery import app
+from celery import Celery; app = Celery()
 from src.core.logging import get_logger
 from src.core.config import settings
 from src.models.base import utc_now
