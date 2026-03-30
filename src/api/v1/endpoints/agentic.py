@@ -107,7 +107,7 @@ async def list_agents(
 async def get_agent(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    agent_id: str,
+    agent_id: str = Path(...),
 ):
     """Get specific agent details"""
     agent = await db.get(SOCAgent, agent_id)
@@ -150,7 +150,7 @@ async def create_agent(
 async def update_agent(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    agent_id: str,
+    agent_id: str = Path(...),
     agent_data: SOCAgentUpdate,
 ):
     """Update agent configuration"""
@@ -184,7 +184,7 @@ async def update_agent(
 async def start_agent(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    agent_id: str,
+    agent_id: str = Path(...),
 ):
     """Start agent operation"""
     agent = await db.get(SOCAgent, agent_id)
@@ -205,7 +205,7 @@ async def start_agent(
 async def stop_agent(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    agent_id: str,
+    agent_id: str = Path(...),
 ):
     """Stop agent operation"""
     agent = await db.get(SOCAgent, agent_id)
@@ -226,7 +226,7 @@ async def stop_agent(
 async def get_agent_performance(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    agent_id: str,
+    agent_id: str = Path(...),
 ):
     """Get agent performance metrics"""
     agent = await db.get(SOCAgent, agent_id)
@@ -303,7 +303,7 @@ async def list_investigations(
 async def get_investigation(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    investigation_id: str,
+    investigation_id: str = Path(...),
 ):
     """Get investigation details"""
     investigation = await db.get(Investigation, investigation_id)
@@ -392,7 +392,7 @@ async def start_investigation(
 async def update_investigation(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    investigation_id: str,
+    investigation_id: str = Path(...),
     inv_data: InvestigationUpdate,
 ):
     """Update investigation"""
@@ -427,7 +427,7 @@ async def update_investigation(
 async def get_reasoning_chain(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    investigation_id: str,
+    investigation_id: str = Path(...),
 ):
     """Get detailed reasoning chain for investigation"""
     investigation = await db.get(Investigation, investigation_id)
@@ -460,7 +460,7 @@ async def get_reasoning_chain(
 async def get_investigation_timeline(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    investigation_id: str,
+    investigation_id: str = Path(...),
 ):
     """Get timeline view of investigation"""
     investigation = await db.get(Investigation, investigation_id)
@@ -487,7 +487,7 @@ async def get_investigation_timeline(
 async def submit_investigation_feedback(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    investigation_id: str,
+    investigation_id: str = Path(...),
     feedback: InvestigationFeedback,
 ):
     """Submit feedback on investigation quality"""
@@ -571,7 +571,7 @@ async def list_pending_approvals(
 async def approve_action(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    action_id: str,
+    action_id: str = Path(...),
     approval: AgentActionApproval,
 ):
     """Approve action execution"""
@@ -602,7 +602,7 @@ async def approve_action(
 async def rollback_action(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    action_id: str,
+    action_id: str = Path(...),
 ):
     """Rollback executed action"""
     action = await db.get(AgentAction, action_id)
@@ -661,7 +661,7 @@ async def chat_with_agent(
 async def explain_alert(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    alert_id: str,
+    alert_id: str = Path(...),
 ):
     """Get natural language explanation of alert"""
     nl_interface = NaturalLanguageInterface(db)
@@ -683,7 +683,7 @@ async def explain_alert(
 async def explain_investigation(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    investigation_id: str,
+    investigation_id: str = Path(...),
 ):
     """Get natural language explanation of investigation"""
     investigation = await db.get(Investigation, investigation_id)
@@ -857,7 +857,7 @@ async def start_threat_hunt(
 async def list_agent_memory(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    agent_id: str,
+    agent_id: str = Path(...),
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     memory_type: Optional[str] = None,
@@ -902,7 +902,7 @@ async def list_agent_memory(
 async def get_memory_stats(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    agent_id: str,
+    agent_id: str = Path(...),
 ):
     """Get agent memory statistics"""
     agent = await db.get(SOCAgent, agent_id)
@@ -939,7 +939,7 @@ async def get_memory_stats(
 async def clear_agent_memory(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    agent_id: str,
+    agent_id: str = Path(...),
     memory_type: Optional[str] = None,
 ):
     """Clear agent memory (optional filter by type)"""

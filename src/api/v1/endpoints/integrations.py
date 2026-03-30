@@ -156,7 +156,7 @@ async def list_connectors(
 @router.get("/connectors/{connector_name}")
 async def get_connector_details(
     current_user: CurrentUser = None,
-    connector_name: str,
+    connector_name: str = Path(...),
 ):
     """Get detailed information about a specific connector"""
     connector_meta = registry.get_connector_details(connector_name)
@@ -326,7 +326,7 @@ async def list_installed_integrations(
 async def get_installed_integration(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    integration_id: str,
+    integration_id: str = Path(...),
 ):
     """Get details of installed integration"""
     integration = await get_installed_integration_or_404(db, integration_id)
@@ -359,7 +359,7 @@ async def get_installed_integration(
 async def update_installed_integration(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    integration_id: str,
+    integration_id: str = Path(...),
     request: InstalledIntegrationUpdate,
 ):
     """Update installed integration configuration"""
@@ -404,7 +404,7 @@ async def update_installed_integration(
 async def test_integration(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    integration_id: str,
+    integration_id: str = Path(...),
 ):
     """Test connection to installed integration"""
     integration = await get_installed_integration_or_404(db, integration_id)
@@ -431,7 +431,7 @@ async def test_integration(
 async def enable_integration(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    integration_id: str,
+    integration_id: str = Path(...),
 ):
     """Enable integration"""
     integration = await get_installed_integration_or_404(db, integration_id)
@@ -462,7 +462,7 @@ async def enable_integration(
 async def disable_integration(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    integration_id: str,
+    integration_id: str = Path(...),
 ):
     """Disable integration"""
     integration = await get_installed_integration_or_404(db, integration_id)
@@ -493,7 +493,7 @@ async def disable_integration(
 async def uninstall_integration(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    integration_id: str,
+    integration_id: str = Path(...),
 ):
     """Uninstall integration"""
     integration = await get_installed_integration_or_404(db, integration_id)
@@ -514,7 +514,7 @@ async def uninstall_integration(
 async def list_integration_actions(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    integration_id: str,
+    integration_id: str = Path(...),
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
 ):
@@ -585,8 +585,8 @@ async def list_integration_actions(
 async def execute_action(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    integration_id: str,
-    action_id: str,
+    integration_id: str = Path(...),
+    action_id: str = Path(...),
     request: ActionExecutionRequest,
 ):
     """Execute an integration action"""
@@ -653,7 +653,7 @@ async def execute_action(
 async def get_execution_history(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    integration_id: str,
+    integration_id: str = Path(...),
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     status: Optional[str] = None,
@@ -730,7 +730,7 @@ async def get_execution_history(
 async def register_webhook(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    integration_id: str,
+    integration_id: str = Path(...),
     request: WebhookRegisterRequest,
 ):
     """Register webhook for integration"""
@@ -779,7 +779,7 @@ async def register_webhook(
 async def list_webhooks(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    integration_id: str,
+    integration_id: str = Path(...),
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
 ):
@@ -845,8 +845,8 @@ async def list_webhooks(
 async def delete_webhook(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    integration_id: str,
-    webhook_id: str,
+    integration_id: str = Path(...),
+    webhook_id: str = Path(...),
 ):
     """Delete webhook"""
     integration = await get_installed_integration_or_404(db, integration_id)

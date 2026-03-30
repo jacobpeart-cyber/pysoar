@@ -165,7 +165,7 @@ async def create_vulnerability(
 async def get_vulnerability(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    vuln_id: str,
+    vuln_id: str = Path(...),
 ):
     """Get vulnerability by ID"""
     vuln = await get_or_404(db, Vulnerability, vuln_id, current_user.organization_id)
@@ -176,7 +176,7 @@ async def get_vulnerability(
 async def update_vulnerability(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    vuln_id: str,
+    vuln_id: str = Path(...),
     vuln_data: VulnerabilityUpdate,
 ):
     """Update a vulnerability"""
@@ -344,7 +344,7 @@ async def create_instance(
 async def get_instance(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    instance_id: str,
+    instance_id: str = Path(...),
 ):
     """Get vulnerability instance by ID"""
     instance = await get_or_404(
@@ -357,7 +357,7 @@ async def get_instance(
 async def update_instance(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    instance_id: str,
+    instance_id: str = Path(...),
     instance_data: VulnerabilityInstanceUpdate,
 ):
     """Update vulnerability instance"""
@@ -468,7 +468,7 @@ async def create_scan_profile(
 async def update_scan_profile(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    profile_id: str,
+    profile_id: str = Path(...),
     profile_data: ScanProfileUpdate,
 ):
     """Update scan profile"""
@@ -556,7 +556,7 @@ async def create_patch_plan(
 async def schedule_patch(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    patch_id: str,
+    patch_id: str = Path(...),
     schedule_request: PatchDeploymentRequest,
 ):
     """Schedule patch deployment"""
@@ -581,7 +581,7 @@ async def schedule_patch(
 async def verify_patch(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    patch_id: str,
+    patch_id: str = Path(...),
     verification_request: PatchVerificationRequest,
 ):
     """Verify patch deployment"""
@@ -606,7 +606,7 @@ async def verify_patch(
 async def rollback_patch(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    patch_id: str,
+    patch_id: str = Path(...),
     rollback_request: PatchRollbackRequest,
 ):
     """Rollback patch deployment"""
@@ -651,7 +651,7 @@ async def create_exception(
 async def update_exception(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    exception_id: str,
+    exception_id: str = Path(...),
     exception_data: VulnerabilityExceptionUpdate,
 ):
     """Update vulnerability exception"""

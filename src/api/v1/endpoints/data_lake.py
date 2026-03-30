@@ -141,7 +141,7 @@ async def list_data_sources(
 async def get_data_source(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    source_id: str,
+    source_id: str = Path(...),
 ):
     """Get data source by ID"""
     result = await db.execute(
@@ -160,7 +160,7 @@ async def get_data_source(
 async def update_data_source(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    source_id: str,
+    source_id: str = Path(...),
     source_in: DataSourceUpdate,
 ):
     """Update data source"""
@@ -190,7 +190,7 @@ async def update_data_source(
 async def start_data_source_ingestion(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    source_id: str,
+    source_id: str = Path(...),
 ):
     """Start ingestion for a data source"""
     result = await db.execute(
@@ -221,7 +221,7 @@ async def start_data_source_ingestion(
 async def stop_data_source_ingestion(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    source_id: str,
+    source_id: str = Path(...),
 ):
     """Stop ingestion for a data source"""
     result = await db.execute(
@@ -324,7 +324,7 @@ async def list_partitions(
 async def update_partition(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    partition_id: str,
+    partition_id: str = Path(...),
     partition_in: DataPartitionUpdate,
 ):
     """Update partition (e.g., storage tier, indexes)"""
@@ -426,7 +426,7 @@ async def list_pipelines(
 async def update_pipeline(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    pipeline_id: str,
+    pipeline_id: str = Path(...),
     pipeline_in: DataPipelineUpdate,
 ):
     """Update data pipeline"""
@@ -531,7 +531,7 @@ async def list_unified_models(
 async def update_unified_model(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    model_id: str,
+    model_id: str = Path(...),
     model_in: UnifiedDataModelUpdate,
 ):
     """Update unified data model"""
@@ -652,7 +652,7 @@ async def list_queries(
 async def get_query(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    query_id: str,
+    query_id: str = Path(...),
 ):
     """Get query job details"""
     result = await db.execute(
@@ -671,7 +671,7 @@ async def get_query(
 async def estimate_query_cost(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    query_id: str,
+    query_id: str = Path(...),
     data_scanned_gb: int = Query(..., ge=1),
 ):
     """Estimate query execution cost"""
@@ -706,7 +706,7 @@ async def search_datasets(
 @router.get("/catalog/lineage/{dataset_id}")
 async def get_data_lineage(
     current_user: CurrentUser = None,
-    dataset_id: str,
+    dataset_id: str = Path(...),
 ):
     """Get data lineage for a dataset"""
     try:
@@ -725,7 +725,7 @@ async def get_data_lineage(
 async def get_data_quality(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    dataset_id: str,
+    dataset_id: str = Path(...),
 ):
     """Get data quality report for dataset"""
     try:
