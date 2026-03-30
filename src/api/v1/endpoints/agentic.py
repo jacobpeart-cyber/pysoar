@@ -123,9 +123,9 @@ async def get_agent(
 
 @router.post("/agents", response_model=SOCAgentResponse, status_code=status.HTTP_201_CREATED)
 async def create_agent(
+    agent_data: SOCAgentCreate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    agent_data: SOCAgentCreate,
 ):
     """Create new SOC agent"""
     agent = SOCAgent(
@@ -148,10 +148,10 @@ async def create_agent(
 
 @router.put("/agents/{agent_id}", response_model=SOCAgentResponse)
 async def update_agent(
+    agent_data: SOCAgentUpdate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     agent_id: str = Path(...),
-    agent_data: SOCAgentUpdate,
 ):
     """Update agent configuration"""
     agent = await db.get(SOCAgent, agent_id)
@@ -346,9 +346,9 @@ async def get_investigation(
 
 @router.post("/investigations", response_model=InvestigationResponse, status_code=status.HTTP_201_CREATED)
 async def start_investigation(
+    inv_data: InvestigationCreate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    inv_data: InvestigationCreate,
 ):
     """Start manual investigation"""
     # Verify agent exists
@@ -390,10 +390,10 @@ async def start_investigation(
 
 @router.put("/investigations/{investigation_id}", response_model=InvestigationResponse)
 async def update_investigation(
+    inv_data: InvestigationUpdate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     investigation_id: str = Path(...),
-    inv_data: InvestigationUpdate,
 ):
     """Update investigation"""
     investigation = await db.get(Investigation, investigation_id)
@@ -485,10 +485,10 @@ async def get_investigation_timeline(
 
 @router.post("/investigations/{investigation_id}/feedback")
 async def submit_investigation_feedback(
+    feedback: InvestigationFeedback,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     investigation_id: str = Path(...),
-    feedback: InvestigationFeedback,
 ):
     """Submit feedback on investigation quality"""
     investigation = await db.get(Investigation, investigation_id)
@@ -569,10 +569,10 @@ async def list_pending_approvals(
 
 @router.post("/actions/{action_id}/approve")
 async def approve_action(
+    approval: AgentActionApproval,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     action_id: str = Path(...),
-    approval: AgentActionApproval,
 ):
     """Approve action execution"""
     action = await db.get(AgentAction, action_id)
@@ -634,9 +634,9 @@ async def rollback_action(
 
 @router.post("/chat", response_model=NaturalLanguageResponse)
 async def chat_with_agent(
+    query_data: NaturalLanguageQuery,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    query_data: NaturalLanguageQuery,
 ):
     """Chat with SOC agent in natural language"""
     nl_interface = NaturalLanguageInterface(db)
@@ -812,9 +812,9 @@ async def get_accuracy_stats(
 
 @router.post("/threat-hunts", response_model=ThreatHuntResult)
 async def start_threat_hunt(
+    hunt_request: ThreatHuntRequest,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    hunt_request: ThreatHuntRequest,
 ):
     """Start threat hunt with specified profile"""
     # Select agent if not specified

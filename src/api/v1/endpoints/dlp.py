@@ -868,10 +868,10 @@ async def assess_breach(
 )
 async def get_notification_tracking(
     incident_id: str,
-    notified_count: int = Query(0, ge=0),
-    total_required: int = Query(0, ge=0),
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
+    notified_count: int = Query(0, ge=0),
+    total_required: int = Query(0, ge=0),
 ):
     """Get notification compliance tracking"""
     tracking = assessor.track_notification_compliance(

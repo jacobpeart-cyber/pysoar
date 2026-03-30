@@ -62,9 +62,9 @@ router = APIRouter(prefix="/data-lake", tags=["Data Lake"])
 
 @router.post("/sources", response_model=DataSourceResponse, status_code=status.HTTP_201_CREATED)
 async def create_data_source(
+    source_in: DataSourceCreate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    source_in: DataSourceCreate,
 ):
     """Create new data source"""
     try:
@@ -158,10 +158,10 @@ async def get_data_source(
 
 @router.patch("/sources/{source_id}", response_model=DataSourceResponse)
 async def update_data_source(
+    source_in: DataSourceUpdate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     source_id: str = Path(...),
-    source_in: DataSourceUpdate,
 ):
     """Update data source"""
     result = await db.execute(
@@ -252,9 +252,9 @@ async def stop_data_source_ingestion(
 
 @router.post("/partitions", response_model=DataPartitionResponse, status_code=status.HTTP_201_CREATED)
 async def create_partition(
+    partition_in: DataPartitionCreate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    partition_in: DataPartitionCreate,
 ):
     """Create new data partition"""
     try:
@@ -322,10 +322,10 @@ async def list_partitions(
 
 @router.patch("/partitions/{partition_id}", response_model=DataPartitionResponse)
 async def update_partition(
+    partition_in: DataPartitionUpdate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     partition_id: str = Path(...),
-    partition_in: DataPartitionUpdate,
 ):
     """Update partition (e.g., storage tier, indexes)"""
     result = await db.execute(
@@ -355,9 +355,9 @@ async def update_partition(
 
 @router.post("/pipelines", response_model=DataPipelineResponse, status_code=status.HTTP_201_CREATED)
 async def create_pipeline(
+    pipeline_in: DataPipelineCreate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    pipeline_in: DataPipelineCreate,
 ):
     """Create new data pipeline"""
     try:
@@ -424,10 +424,10 @@ async def list_pipelines(
 
 @router.patch("/pipelines/{pipeline_id}", response_model=DataPipelineResponse)
 async def update_pipeline(
+    pipeline_in: DataPipelineUpdate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     pipeline_id: str = Path(...),
-    pipeline_in: DataPipelineUpdate,
 ):
     """Update data pipeline"""
     result = await db.execute(
@@ -459,9 +459,9 @@ async def update_pipeline(
 
 @router.post("/models", response_model=UnifiedDataModelResponse, status_code=status.HTTP_201_CREATED)
 async def create_unified_model(
+    model_in: UnifiedDataModelCreate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    model_in: UnifiedDataModelCreate,
 ):
     """Create unified data model"""
     try:
@@ -529,10 +529,10 @@ async def list_unified_models(
 
 @router.patch("/models/{model_id}", response_model=UnifiedDataModelResponse)
 async def update_unified_model(
+    model_in: UnifiedDataModelUpdate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     model_id: str = Path(...),
-    model_in: UnifiedDataModelUpdate,
 ):
     """Update unified data model"""
     result = await db.execute(
@@ -564,9 +564,9 @@ async def update_unified_model(
 
 @router.post("/queries", response_model=QueryJobResponse, status_code=status.HTTP_201_CREATED)
 async def submit_query(
+    query_in: QueryJobCreate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    query_in: QueryJobCreate,
 ):
     """Submit a query job"""
     try:

@@ -146,9 +146,9 @@ async def list_vulnerabilities(
 
 @router.post("/vulnerabilities", response_model=VulnerabilityResponse, status_code=status.HTTP_201_CREATED)
 async def create_vulnerability(
+    vuln_data: VulnerabilityCreate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    vuln_data: VulnerabilityCreate,
 ):
     """Create a vulnerability record"""
     vuln_data.organization_id = current_user.organization_id
@@ -174,10 +174,10 @@ async def get_vulnerability(
 
 @router.put("/vulnerabilities/{vuln_id}", response_model=VulnerabilityResponse)
 async def update_vulnerability(
+    vuln_data: VulnerabilityUpdate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     vuln_id: str = Path(...),
-    vuln_data: VulnerabilityUpdate,
 ):
     """Update a vulnerability"""
     vuln = await get_or_404(db, Vulnerability, vuln_id, current_user.organization_id)
@@ -193,9 +193,9 @@ async def update_vulnerability(
 
 @router.post("/vulnerabilities/import-scan", response_model=dict)
 async def import_scan_results(
+    scan_request: ScanImportRequest,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    scan_request: ScanImportRequest,
 ):
     """Import vulnerability scan results"""
     org_id = current_user.organization_id
@@ -229,9 +229,9 @@ async def import_scan_results(
 
 @router.post("/vulnerabilities/sync-kev")
 async def sync_kev(
+    kev_data: dict,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    kev_data: dict,
 ):
     """Sync CISA Known Exploited Vulnerabilities"""
     org_id = current_user.organization_id
@@ -325,9 +325,9 @@ async def list_instances(
 
 @router.post("/instances", response_model=VulnerabilityInstanceResponse, status_code=status.HTTP_201_CREATED)
 async def create_instance(
+    instance_data: VulnerabilityInstanceCreate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    instance_data: VulnerabilityInstanceCreate,
 ):
     """Create vulnerability instance"""
     instance_data.organization_id = current_user.organization_id
@@ -355,10 +355,10 @@ async def get_instance(
 
 @router.put("/instances/{instance_id}", response_model=VulnerabilityInstanceResponse)
 async def update_instance(
+    instance_data: VulnerabilityInstanceUpdate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     instance_id: str = Path(...),
-    instance_data: VulnerabilityInstanceUpdate,
 ):
     """Update vulnerability instance"""
     instance = await get_or_404(
@@ -376,9 +376,9 @@ async def update_instance(
 
 @router.post("/instances/bulk-action")
 async def bulk_action_instances(
+    action_request: BulkAction,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    action_request: BulkAction,
 ):
     """Perform bulk action on vulnerability instances"""
     org_id = current_user.organization_id
@@ -449,9 +449,9 @@ async def list_scan_profiles(
 
 @router.post("/scan-profiles", response_model=ScanProfileResponse, status_code=status.HTTP_201_CREATED)
 async def create_scan_profile(
+    profile_data: ScanProfileCreate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    profile_data: ScanProfileCreate,
 ):
     """Create scan profile"""
     profile_data.organization_id = current_user.organization_id
@@ -466,10 +466,10 @@ async def create_scan_profile(
 
 @router.put("/scan-profiles/{profile_id}", response_model=ScanProfileResponse)
 async def update_scan_profile(
+    profile_data: ScanProfileUpdate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     profile_id: str = Path(...),
-    profile_data: ScanProfileUpdate,
 ):
     """Update scan profile"""
     profile = await get_or_404(
@@ -522,9 +522,9 @@ async def list_patch_operations(
 
 @router.post("/patch-operations/create-plan")
 async def create_patch_plan(
+    plan_request: PatchPlanRequest,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    plan_request: PatchPlanRequest,
 ):
     """Create patch deployment plan"""
     org_id = current_user.organization_id
@@ -554,10 +554,10 @@ async def create_patch_plan(
 
 @router.post("/patch-operations/{patch_id}/schedule")
 async def schedule_patch(
+    schedule_request: PatchDeploymentRequest,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     patch_id: str = Path(...),
-    schedule_request: PatchDeploymentRequest,
 ):
     """Schedule patch deployment"""
     org_id = current_user.organization_id
@@ -579,10 +579,10 @@ async def schedule_patch(
 
 @router.post("/patch-operations/{patch_id}/verify")
 async def verify_patch(
+    verification_request: PatchVerificationRequest,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     patch_id: str = Path(...),
-    verification_request: PatchVerificationRequest,
 ):
     """Verify patch deployment"""
     org_id = current_user.organization_id
@@ -604,10 +604,10 @@ async def verify_patch(
 
 @router.post("/patch-operations/{patch_id}/rollback")
 async def rollback_patch(
+    rollback_request: PatchRollbackRequest,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     patch_id: str = Path(...),
-    rollback_request: PatchRollbackRequest,
 ):
     """Rollback patch deployment"""
     org_id = current_user.organization_id
@@ -632,9 +632,9 @@ async def rollback_patch(
 # Exception and Risk Acceptance Endpoints
 @router.post("/exceptions", response_model=VulnerabilityExceptionResponse, status_code=status.HTTP_201_CREATED)
 async def create_exception(
+    exception_data: VulnerabilityExceptionCreate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    exception_data: VulnerabilityExceptionCreate,
 ):
     """Create vulnerability exception"""
     exception_data.organization_id = current_user.organization_id
@@ -649,10 +649,10 @@ async def create_exception(
 
 @router.put("/exceptions/{exception_id}", response_model=VulnerabilityExceptionResponse)
 async def update_exception(
+    exception_data: VulnerabilityExceptionUpdate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     exception_id: str = Path(...),
-    exception_data: VulnerabilityExceptionUpdate,
 ):
     """Update vulnerability exception"""
     exception = await get_or_404(

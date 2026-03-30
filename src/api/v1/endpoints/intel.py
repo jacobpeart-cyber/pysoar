@@ -47,9 +47,9 @@ router = APIRouter(prefix="/intel", tags=["Threat Intelligence"])
 
 @router.post("/feeds", response_model=ThreatFeedResponse, status_code=status.HTTP_201_CREATED)
 async def create_threat_feed(
+    feed_data: ThreatFeedCreate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    feed_data: ThreatFeedCreate,
 ) -> ThreatFeedResponse:
     """
     Create a new threat feed.
@@ -106,10 +106,10 @@ async def get_threat_feed(
 
 @router.put("/feeds/{feed_id}", response_model=ThreatFeedResponse, operation_id="update_threat_feed")
 async def update_threat_feed(
+    feed_update: ThreatFeedUpdate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     feed_id: str = Path(...),
-    feed_update: ThreatFeedUpdate,
 ) -> ThreatFeedResponse:
     """
     Update a threat feed.
@@ -204,9 +204,9 @@ async def get_feed_stats(
 
 @router.post("/indicators", response_model=ThreatIndicatorResponse, status_code=status.HTTP_201_CREATED)
 async def create_indicator(
+    indicator_data: ThreatIndicatorCreate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    indicator_data: ThreatIndicatorCreate,
 ) -> ThreatIndicatorResponse:
     """
     Create a new threat indicator.
@@ -220,9 +220,9 @@ async def create_indicator(
 
 @router.post("/indicators/bulk", response_model=dict, status_code=status.HTTP_201_CREATED, operation_id="bulk_import_indicators")
 async def bulk_import_indicators(
+    import_data: BulkIndicatorImport,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    import_data: BulkIndicatorImport,
 ) -> dict:
     """
     Bulk import threat indicators.
@@ -285,10 +285,10 @@ async def get_indicator(
 
 @router.put("/indicators/{indicator_id}", response_model=ThreatIndicatorResponse, operation_id="update_indicator")
 async def update_indicator(
+    indicator_update: ThreatIndicatorUpdate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     indicator_id: str = Path(...),
-    indicator_update: ThreatIndicatorUpdate,
 ) -> ThreatIndicatorResponse:
     """
     Update a threat indicator.
@@ -363,9 +363,9 @@ async def get_indicator_timeline(
 
 @router.post("/indicators/search", response_model=ThreatIndicatorListResponse, operation_id="advanced_search_indicators")
 async def advanced_search_indicators(
+    search_request: IntelSearchRequest,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    search_request: IntelSearchRequest,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=200),
 ) -> ThreatIndicatorListResponse:
@@ -389,9 +389,9 @@ async def advanced_search_indicators(
 
 @router.post("/sightings", response_model=IndicatorSightingResponse, status_code=status.HTTP_201_CREATED, operation_id="record_sighting")
 async def record_sighting(
+    sighting_data: IndicatorSightingCreate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    sighting_data: IndicatorSightingCreate,
 ) -> IndicatorSightingResponse:
     """
     Record a new sighting for a threat indicator.
@@ -425,9 +425,9 @@ async def get_indicator_sightings(
 
 @router.post("/actors", response_model=ThreatActorResponse, status_code=status.HTTP_201_CREATED, operation_id="create_actor")
 async def create_actor(
+    actor_data: ThreatActorCreate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    actor_data: ThreatActorCreate,
 ) -> ThreatActorResponse:
     """
     Create a new threat actor.
@@ -481,10 +481,10 @@ async def get_actor(
 
 @router.put("/actors/{actor_id}", response_model=ThreatActorResponse, operation_id="update_actor")
 async def update_actor(
+    actor_update: ThreatActorUpdate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     actor_id: str = Path(...),
-    actor_update: ThreatActorUpdate,
 ) -> ThreatActorResponse:
     """
     Update a threat actor.
@@ -519,9 +519,9 @@ async def delete_actor(
 
 @router.post("/campaigns", response_model=ThreatCampaignResponse, status_code=status.HTTP_201_CREATED, operation_id="create_campaign")
 async def create_campaign(
+    campaign_data: ThreatCampaignCreate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    campaign_data: ThreatCampaignCreate,
 ) -> ThreatCampaignResponse:
     """
     Create a new threat campaign.
@@ -574,10 +574,10 @@ async def get_campaign(
 
 @router.put("/campaigns/{campaign_id}", response_model=ThreatCampaignResponse, operation_id="update_campaign")
 async def update_campaign(
+    campaign_update: ThreatCampaignUpdate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     campaign_id: str = Path(...),
-    campaign_update: ThreatCampaignUpdate,
 ) -> ThreatCampaignResponse:
     """
     Update a threat campaign.
@@ -612,9 +612,9 @@ async def delete_campaign(
 
 @router.post("/reports", response_model=IntelReportResponse, status_code=status.HTTP_201_CREATED, operation_id="create_report")
 async def create_report(
+    report_data: IntelReportCreate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    report_data: IntelReportCreate,
 ) -> IntelReportResponse:
     """
     Create a new intel report.
@@ -668,10 +668,10 @@ async def get_report(
 
 @router.put("/reports/{report_id}", response_model=IntelReportResponse, operation_id="update_report")
 async def update_report(
+    report_update: IntelReportUpdate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     report_id: str = Path(...),
-    report_update: IntelReportUpdate,
 ) -> IntelReportResponse:
     """
     Update an intel report.

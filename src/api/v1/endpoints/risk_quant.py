@@ -115,7 +115,8 @@ async def get_risk_control_or_404(db: AsyncSession, control_id: str) -> RiskCont
 
 
 async def get_bia_or_404(
-    db: AsyncSession, bia_id: str
+    bia_id: str,
+    db: AsyncSession,
 ) -> BusinessImpactAssessment:
     """Get BusinessImpactAssessment by ID or raise 404"""
     result = await db.execute(

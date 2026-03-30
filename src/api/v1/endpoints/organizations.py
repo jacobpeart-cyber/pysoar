@@ -577,9 +577,9 @@ async def remove_team_member(
 
 # Helper functions
 async def _get_organization(
-    db: AsyncSession,
     org_id: str,
     user: User,
+    db: AsyncSession,
     require_admin: bool = False,
 ) -> Organization:
     """Get an organization with access check"""
@@ -621,9 +621,9 @@ async def _get_organization(
 
 
 async def _get_team(
-    db: AsyncSession,
     team_id: str,
     user: User,
+    db: AsyncSession,
 ) -> Team:
     """Get a team with access check"""
     result = await db.execute(select(Team).where(Team.id == team_id))

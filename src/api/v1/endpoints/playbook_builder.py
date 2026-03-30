@@ -110,9 +110,9 @@ async def list_playbooks(
 
 @router.post("", response_model=PlaybookResponse, status_code=status.HTTP_201_CREATED)
 async def create_playbook(
+    request: PlaybookCreate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    request: PlaybookCreate,
 ):
     """Create a new playbook"""
     designer = PlaybookDesigner()
@@ -149,9 +149,9 @@ async def get_playbook(
 @router.put("/{playbook_id}", response_model=PlaybookResponse)
 async def update_playbook(
     playbook_id: str,
+    request: PlaybookUpdate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    request: PlaybookUpdate,
 ):
     """Update a playbook"""
     playbook = await _get_playbook_or_404(db, playbook_id, current_user.organization_id)
@@ -197,9 +197,9 @@ async def delete_playbook(
 @router.post("/{playbook_id}/validate", response_model=PlaybookValidateResponse)
 async def validate_playbook(
     playbook_id: str,
+    request: PlaybookValidateRequest,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    request: PlaybookValidateRequest,
 ):
     """Validate playbook structure"""
     playbook = await _get_playbook_or_404(db, playbook_id, current_user.organization_id)
@@ -214,9 +214,9 @@ async def validate_playbook(
 @router.post("/{playbook_id}/clone", response_model=PlaybookResponse)
 async def clone_playbook(
     playbook_id: str,
+    request: PlaybookCloneRequest,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    request: PlaybookCloneRequest,
 ):
     """Clone a playbook"""
     playbook = await _get_playbook_or_404(db, playbook_id, current_user.organization_id)
@@ -254,9 +254,9 @@ async def export_playbook(
 
 @router.post("/import", response_model=PlaybookResponse, status_code=status.HTTP_201_CREATED)
 async def import_playbook(
+    request: PlaybookImportRequest,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    request: PlaybookImportRequest,
 ):
     """Import a playbook from JSON"""
     designer = PlaybookDesigner()
@@ -277,9 +277,9 @@ async def import_playbook(
 @router.post("/{playbook_id}/nodes", response_model=PlaybookNodeResponse)
 async def add_node(
     playbook_id: str,
+    request: PlaybookNodeCreate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    request: PlaybookNodeCreate,
 ):
     """Add a node to a playbook"""
     playbook = await _get_playbook_or_404(db, playbook_id, current_user.organization_id)
@@ -310,9 +310,9 @@ async def add_node(
 async def update_node(
     playbook_id: str,
     node_id: str,
+    request: PlaybookNodeUpdate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    request: PlaybookNodeUpdate,
 ):
     """Update a node"""
     playbook = await _get_playbook_or_404(db, playbook_id, current_user.organization_id)
@@ -366,9 +366,9 @@ async def remove_node(
 @router.post("/{playbook_id}/edges", response_model=PlaybookEdgeResponse)
 async def connect_nodes(
     playbook_id: str,
+    request: PlaybookEdgeCreate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    request: PlaybookEdgeCreate,
 ):
     """Connect two nodes"""
     playbook = await _get_playbook_or_404(db, playbook_id, current_user.organization_id)
@@ -396,9 +396,9 @@ async def connect_nodes(
 async def update_edge(
     playbook_id: str,
     edge_id: str,
+    request: PlaybookEdgeUpdate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    request: PlaybookEdgeUpdate,
 ):
     """Update an edge"""
     playbook = await _get_playbook_or_404(db, playbook_id, current_user.organization_id)
@@ -441,9 +441,9 @@ async def disconnect_nodes(
 @router.post("/{playbook_id}/execute", response_model=PlaybookExecutionResponse)
 async def execute_playbook(
     playbook_id: str,
+    request: PlaybookExecutionTrigger,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    request: PlaybookExecutionTrigger,
 ):
     """Trigger playbook execution"""
     playbook = await _get_playbook_or_404(db, playbook_id, current_user.organization_id)
@@ -589,9 +589,9 @@ async def list_templates(
 @router.post("/templates/{template_id}/create", response_model=PlaybookResponse)
 async def create_from_template(
     template_id: str,
+    request: CreateFromTemplateRequest,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    request: CreateFromTemplateRequest,
 ):
     """Create playbook from template"""
     templates = TemplateLibrary.get_templates()
@@ -676,7 +676,9 @@ async def get_dashboard(
 
 # Helper functions
 async def _get_playbook_or_404(
-    db: AsyncSession, playbook_id: str, organization_id: str
+    playbook_id: str,
+    organization_id: str,
+    db: AsyncSession,
 ) -> VisualPlaybook:
     """Get playbook or raise 404"""
     result = await db.execute(

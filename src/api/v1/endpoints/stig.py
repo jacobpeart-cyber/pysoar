@@ -48,8 +48,8 @@ router = APIRouter(prefix="/stig", tags=["stig"])
 
 @router.get("/benchmarks", response_model=list[BenchmarkListResponse])
 async def list_benchmarks(
-    user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    user=Depends(get_current_user),
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
 ):
@@ -71,8 +71,8 @@ async def list_benchmarks(
 @router.get("/benchmarks/{benchmark_id}", response_model=STIGBenchmarkResponse)
 async def get_benchmark(
     benchmark_id: str,
-    user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    user=Depends(get_current_user),
 ):
     """Get STIG benchmark details"""
     try:
@@ -94,8 +94,8 @@ async def get_benchmark(
 @router.get("/benchmarks/{benchmark_id}/rules", response_model=list[STIGRuleResponse])
 async def list_benchmark_rules(
     benchmark_id: str,
-    user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    user=Depends(get_current_user),
     severity: Optional[str] = None,
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=500),
@@ -130,9 +130,9 @@ async def list_benchmark_rules(
 
 @router.get("/rules/search", response_model=list[RuleSearchResponse])
 async def search_rules(
+    db: AsyncSession = Depends(get_db_session),
     q: str = Query(..., min_length=1),
     user=Depends(get_current_user),
-    db: AsyncSession = Depends(get_db_session),
 ):
     """Search STIG rules by keyword, ID, or content"""
     try:
@@ -147,8 +147,8 @@ async def search_rules(
 @router.get("/rules/{rule_id}", response_model=STIGRuleResponse)
 async def get_rule(
     rule_id: str,
-    user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    user=Depends(get_current_user),
 ):
     """Get STIG rule details"""
     try:
@@ -175,8 +175,8 @@ async def get_rule(
 @router.post("/scans/launch", response_model=dict)
 async def launch_scan(
     request: ScanRequest,
-    user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    user=Depends(get_current_user),
 ):
     """Launch STIG benchmark scan against target host"""
     try:
@@ -196,8 +196,8 @@ async def launch_scan(
 @router.post("/scans/fleet", response_model=list[dict])
 async def launch_fleet_scan(
     request: ScanFleetRequest,
-    user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    user=Depends(get_current_user),
 ):
     """Launch STIG scans against multiple hosts"""
     try:
@@ -215,8 +215,8 @@ async def launch_fleet_scan(
 
 @router.get("/scans", response_model=list[STIGScanResultResponse])
 async def list_scans(
-    user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    user=Depends(get_current_user),
     benchmark_id: Optional[str] = None,
     target_host: Optional[str] = None,
     status: Optional[str] = None,
@@ -254,8 +254,8 @@ async def list_scans(
 @router.get("/scans/{scan_id}", response_model=STIGScanResultResponse)
 async def get_scan(
     scan_id: str,
-    user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    user=Depends(get_current_user),
 ):
     """Get STIG scan result details"""
     try:
@@ -277,8 +277,8 @@ async def get_scan(
 @router.post("/scans/compare", response_model=ScanComparisonResponse)
 async def compare_scans(
     request: ScanComparisonRequest,
-    user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    user=Depends(get_current_user),
 ):
     """Compare two STIG scan baselines"""
     try:
@@ -298,8 +298,8 @@ async def compare_scans(
 @router.post("/remediate/auto", response_model=RemediationResponse)
 async def auto_remediate(
     request: RemediationRequest,
-    user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    user=Depends(get_current_user),
 ):
     """Auto-remediate STIG findings"""
     try:
@@ -317,8 +317,8 @@ async def auto_remediate(
 @router.post("/remediate/script", response_model=RemediationScriptResponse)
 async def generate_remediation_script(
     request: Body(...),
-    user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    user=Depends(get_current_user),
 ):
     """Generate remediation script for findings"""
     try:
@@ -346,8 +346,8 @@ async def generate_remediation_script(
 @router.post("/scap/import", response_model=SCAPProfileResponse)
 async def import_scap_content(
     request: SCAPImportRequest,
-    user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    user=Depends(get_current_user),
 ):
     """Import SCAP content (XCCDF, OVAL)"""
     try:
@@ -365,8 +365,8 @@ async def import_scap_content(
 @router.post("/scap/scan", response_model=dict)
 async def run_scap_scan(
     request: Body(...),
-    user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    user=Depends(get_current_user),
 ):
     """Run SCAP scan using profile"""
     try:
@@ -384,8 +384,8 @@ async def run_scap_scan(
 @router.post("/scap/validate-oval", response_model=dict)
 async def validate_oval(
     request: OVALValidationRequest,
-    user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    user=Depends(get_current_user),
 ):
     """Validate OVAL (Open Vulnerability and Assessment Language) definitions"""
     try:
@@ -400,8 +400,8 @@ async def validate_oval(
 @router.post("/scap/arf-report", response_model=dict)
 async def generate_arf_report(
     request: ARFReportRequest,
-    user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    user=Depends(get_current_user),
 ):
     """Generate Assessment Results Format (ARF) report"""
     try:
@@ -415,8 +415,8 @@ async def generate_arf_report(
 
 @router.get("/scap/profiles", response_model=list[SCAPProfileResponse])
 async def list_scap_profiles(
-    user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    user=Depends(get_current_user),
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
 ):
@@ -442,8 +442,8 @@ async def list_scap_profiles(
 
 @router.get("/dashboard/stats", response_model=STIGDashboardStats)
 async def get_stig_stats(
-    user=Depends(get_current_user),
     db: AsyncSession = Depends(get_db_session),
+    user=Depends(get_current_user),
 ):
     """Get STIG compliance dashboard statistics"""
     try:

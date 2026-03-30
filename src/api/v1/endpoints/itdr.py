@@ -415,8 +415,8 @@ async def respond_to_threat(
 @router.post("/threats/scan")
 async def run_threat_scan(
     current_user: CurrentUser = None,
-    organization_id: Optional[str] = None,
     background_tasks: BackgroundTasks = None,
+    organization_id: Optional[str] = None,
 ):
     """Run comprehensive threat detection scan"""
     logger.info(f"Initiating threat scan for org={organization_id or current_user.organization_id}")

@@ -435,9 +435,9 @@ async def investigate_alert(alert_id: str, current_user: CurrentUser = None, db:
 @router.post("/alerts/{alert_id}/respond")
 async def respond_to_alert(
     alert_id: str,
-    response_action: str = Query(...),
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
+    response_action: str = Query(...),
 ):
     """Record response action to alert"""
     alert = await get_alert_or_404(db, alert_id)
@@ -452,10 +452,10 @@ async def respond_to_alert(
 
 @router.post("/alerts/bulk_action")
 async def bulk_alert_action(
-    alert_ids: list = Query(...),
-    action: str = Query(...),
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
+    alert_ids: list = Query(...),
+    action: str = Query(...),
 ):
     """Perform bulk action on multiple alerts"""
     result = await db.execute(
@@ -715,9 +715,9 @@ async def update_incident(
 @router.post("/incidents/{incident_id}/containment_strategy")
 async def set_containment_strategy(
     incident_id: str,
-    strategy: str = Query(...),
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
+    strategy: str = Query(...),
 ):
     """Set containment strategy for incident"""
     incident = await get_incident_or_404(db, incident_id)

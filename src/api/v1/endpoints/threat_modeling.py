@@ -68,7 +68,9 @@ router = APIRouter(prefix="/threat-modeling", tags=["Threat Modeling"])
 
 
 async def get_threat_model_or_404(
-    db: AsyncSession, model_id: str, org_id: str
+    model_id: str,
+    org_id: str,
+    db: AsyncSession,
 ) -> ThreatModel:
     """Get threat model or raise 404"""
     result = await db.execute(
@@ -87,7 +89,9 @@ async def get_threat_model_or_404(
 
 
 async def get_component_or_404(
-    db: AsyncSession, component_id: str, org_id: str
+    component_id: str,
+    org_id: str,
+    db: AsyncSession,
 ) -> ThreatModelComponent:
     """Get component or raise 404"""
     result = await db.execute(
@@ -106,7 +110,9 @@ async def get_component_or_404(
 
 
 async def get_threat_or_404(
-    db: AsyncSession, threat_id: str, org_id: str
+    threat_id: str,
+    org_id: str,
+    db: AsyncSession,
 ) -> IdentifiedThreat:
     """Get threat or raise 404"""
     result = await db.execute(
@@ -128,9 +134,9 @@ async def get_threat_or_404(
 
 @router.post("", response_model=ThreatModelResponse, status_code=status.HTTP_201_CREATED)
 async def create_threat_model(
+    data: ThreatModelCreate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    data: ThreatModelCreate,
 ):
     """Create new threat model"""
     model = ThreatModel(
@@ -223,10 +229,10 @@ async def get_threat_model(
 
 @router.put("/{model_id}", response_model=ThreatModelResponse)
 async def update_threat_model(
+    data: ThreatModelUpdate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     model_id: str = Path(...),
-    data: ThreatModelUpdate,
 ):
     """Update threat model"""
     model = await get_threat_model_or_404(db, model_id, current_user.organization_id)
@@ -255,10 +261,10 @@ async def delete_threat_model(
 
 @router.post("/{model_id}/components", response_model=ComponentResponse)
 async def create_component(
+    data: ComponentCreate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     model_id: str = Path(...),
-    data: ComponentCreate,
 ):
     """Create component in threat model"""
     model = await get_threat_model_or_404(db, model_id, current_user.organization_id)
@@ -300,11 +306,11 @@ async def list_components(
 
 @router.put("/{model_id}/components/{component_id}", response_model=ComponentResponse)
 async def update_component(
+    data: ComponentUpdate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     model_id: str = Path(...),
     component_id: str = Path(...),
-    data: ComponentUpdate,
 ):
     """Update component"""
     component = await get_component_or_404(db, component_id, current_user.organization_id)
@@ -334,10 +340,10 @@ async def delete_component(
 
 @router.post("/{model_id}/threats", response_model=ThreatResponse)
 async def create_threat(
+    data: ThreatCreate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     model_id: str = Path(...),
-    data: ThreatCreate,
 ):
     """Create identified threat"""
     model = await get_threat_model_or_404(db, model_id, current_user.organization_id)
@@ -444,11 +450,11 @@ async def get_threat(
 
 @router.put("/{model_id}/threats/{threat_id}", response_model=ThreatResponse)
 async def update_threat(
+    data: ThreatUpdate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     model_id: str = Path(...),
     threat_id: str = Path(...),
-    data: ThreatUpdate,
 ):
     """Update threat"""
     threat = await get_threat_or_404(db, threat_id, current_user.organization_id)
@@ -491,11 +497,11 @@ async def delete_threat(
 
 @router.post("/{model_id}/threats/{threat_id}/mitigations", response_model=MitigationResponse)
 async def create_mitigation(
+    data: MitigationCreate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     model_id: str = Path(...),
     threat_id: str = Path(...),
-    data: MitigationCreate,
 ):
     """Create mitigation for threat"""
     threat = await get_threat_or_404(db, threat_id, current_user.organization_id)
@@ -566,12 +572,12 @@ async def list_mitigations(
 
 @router.put("/{model_id}/threats/{threat_id}/mitigations/{mitigation_id}", response_model=MitigationResponse)
 async def update_mitigation(
+    data: MitigationUpdate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     model_id: str = Path(...),
     threat_id: str = Path(...),
     mitigation_id: str = Path(...),
-    data: MitigationUpdate,
 ):
     """Update mitigation"""
     result = await db.execute(
@@ -599,10 +605,10 @@ async def update_mitigation(
 
 @router.post("/{model_id}/analyze/stride", response_model=STRIDEAnalysisResponse)
 async def run_stride_analysis(
+    request: STRIDEAnalysisRequest,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     model_id: str = Path(...),
-    request: STRIDEAnalysisRequest,
 ):
     """Run STRIDE analysis on threat model"""
     model = await get_threat_model_or_404(db, model_id, current_user.organization_id)
@@ -632,10 +638,10 @@ async def run_stride_analysis(
 
 @router.post("/{model_id}/analyze/pasta", response_model=PASTAAnalysisResponse)
 async def run_pasta_analysis(
+    request: PASTAAnalysisRequest,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     model_id: str = Path(...),
-    request: PASTAAnalysisRequest,
 ):
     """Run PASTA analysis on threat model"""
     model = await get_threat_model_or_404(db, model_id, current_user.organization_id)
@@ -667,10 +673,10 @@ async def run_pasta_analysis(
 
 @router.post("/{model_id}/validate", response_model=ValidationResponse)
 async def validate_model(
+    request: ValidationRequest,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     model_id: str = Path(...),
-    request: ValidationRequest,
 ):
     """Validate threat model completeness"""
     model = await get_threat_model_or_404(db, model_id, current_user.organization_id)

@@ -160,9 +160,9 @@ async def list_monitors(
 
 @router.post("/monitors", response_model=DarkWebMonitorResponse, status_code=201)
 async def create_monitor(
+    monitor: DarkWebMonitorCreate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    monitor: DarkWebMonitorCreate,
 ):
     """Create a new dark web monitor"""
     db_monitor = DarkWebMonitor(
@@ -207,10 +207,10 @@ async def get_monitor(
 
 @router.patch("/monitors/{monitor_id}", response_model=DarkWebMonitorResponse)
 async def update_monitor(
+    update: DarkWebMonitorUpdate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     monitor_id: str = Path(...),
-    update: DarkWebMonitorUpdate,
 ):
     """Update monitor configuration"""
     monitor = await get_monitor_or_404(db, monitor_id)
@@ -267,11 +267,11 @@ async def delete_monitor(
     response_model=ScanStatusResponse,
 )
 async def trigger_monitor_scan(
+    scan_request: ScanTriggerRequest,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    monitor_id: str = Path(...),
     background_tasks: BackgroundTasks,
-    scan_request: ScanTriggerRequest,
+    monitor_id: str = Path(...),
 ):
     """Trigger immediate scan for monitor"""
     monitor = await get_monitor_or_404(db, monitor_id)
@@ -382,10 +382,10 @@ async def get_finding(
 
 @router.patch("/findings/{finding_id}", response_model=DarkWebFindingResponse)
 async def update_finding(
+    update: DarkWebFindingUpdate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     finding_id: str = Path(...),
-    update: DarkWebFindingUpdate,
 ):
     """Update finding status and notes"""
     finding = await get_finding_or_404(db, finding_id)
@@ -410,9 +410,9 @@ async def update_finding(
 
 @router.post("/findings/bulk-action")
 async def bulk_finding_action(
+    action: BulkFindingAction,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    action: BulkFindingAction,
     background_tasks: BackgroundTasks,
 ):
     """Perform bulk actions on findings"""
@@ -528,10 +528,10 @@ async def list_credentials(
 
 @router.patch("/credentials/{credential_id}", response_model=CredentialLeakResponse)
 async def update_credential(
+    update: CredentialLeakUpdate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     credential_id: str = Path(...),
-    update: CredentialLeakUpdate,
 ):
     """Update credential leak remediation status"""
     credential = await get_credential_or_404(db, credential_id)
@@ -554,9 +554,9 @@ async def update_credential(
 
 @router.post("/credentials/bulk-remediate", response_model=CredentialRemediationReport)
 async def bulk_remediate_credentials(
+    action: BulkCredentialRemediateAction,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    action: BulkCredentialRemediateAction,
 ):
     """Bulk remediate credentials"""
     # Verify ownership
@@ -661,10 +661,10 @@ async def list_brand_threats(
 
 @router.patch("/brand-threats/{threat_id}", response_model=BrandThreatResponse)
 async def update_brand_threat(
+    update: BrandThreatUpdate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     threat_id: str = Path(...),
-    update: BrandThreatUpdate,
 ):
     """Update brand threat takedown status"""
     result = await db.execute(
@@ -693,8 +693,8 @@ async def update_brand_threat(
 async def initiate_takedown(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    threat_id: str = Path(...),
     background_tasks: BackgroundTasks,
+    threat_id: str = Path(...),
 ):
     """Initiate takedown for brand threat"""
     result = await db.execute(
