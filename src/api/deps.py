@@ -2,7 +2,7 @@
 
 from typing import Annotated, Optional
 
-import aioredis
+from redis import asyncio as aioredis
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
