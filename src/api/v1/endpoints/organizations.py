@@ -94,7 +94,7 @@ class TeamResponse(BaseModel):
 
 
 # Organization endpoints
-@router.get("/organizations", response_model=list[OrganizationResponse])
+@router.get("/organizations", response_model=None[OrganizationResponse])
 async def list_organizations(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
@@ -239,7 +239,7 @@ async def delete_organization(
 
 
 # Organization members
-@router.get("/organizations/{org_id}/members", response_model=list[MemberResponse])
+@router.get("/organizations/{org_id}/members", response_model=None[MemberResponse])
 async def list_organization_members(
     org_id: str,
     db: DatabaseSession = None,
@@ -349,7 +349,7 @@ async def remove_organization_member(
 
 
 # Team endpoints
-@router.get("/teams", response_model=list[TeamResponse])
+@router.get("/teams", response_model=None[TeamResponse])
 async def list_teams(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,

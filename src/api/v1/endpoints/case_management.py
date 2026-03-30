@@ -219,7 +219,7 @@ async def add_timeline_event(
 # =============================================================================
 
 
-@router.get("/incidents/{incident_id}/notes", response_model=list[NoteResponse])
+@router.get("/incidents/{incident_id}/notes", response_model=None[NoteResponse])
 async def list_notes(
     incident_id: str,
     db: DatabaseSession = None,
@@ -418,7 +418,7 @@ async def delete_note(
 # =============================================================================
 
 
-@router.get("/incidents/{incident_id}/tasks", response_model=list[TaskResponse])
+@router.get("/incidents/{incident_id}/tasks", response_model=None[TaskResponse])
 async def list_tasks(
     incident_id: str,
     db: DatabaseSession = None,
@@ -640,7 +640,7 @@ async def delete_task(
 
 
 @router.get(
-    "/incidents/{incident_id}/attachments", response_model=list[AttachmentResponse]
+    "/incidents/{incident_id}/attachments", response_model=None[AttachmentResponse]
 )
 async def list_attachments(
     incident_id: str,
@@ -832,7 +832,7 @@ async def delete_attachment(
 # =============================================================================
 
 
-@router.get("/incidents/{incident_id}/timeline", response_model=list[TimelineResponse])
+@router.get("/incidents/{incident_id}/timeline", response_model=None[TimelineResponse])
 async def get_timeline(
     incident_id: str,
     db: DatabaseSession = None,
