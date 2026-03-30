@@ -261,7 +261,7 @@ class SimulationDetailResponse(BaseModel):
 
     simulation: AttackSimulationSchema
     tests: List[SimulationTestSchema]
-    posture_score: Optional[PostureScoreSchema] = None
+    posture_score: Optional[SecurityPostureScoreSchema] = None
     execution_summary: Dict[str, Any]
 
 
