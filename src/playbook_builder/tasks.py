@@ -36,7 +36,7 @@ def async_playbook_execution(
 
         from src.core.database import async_session_factory
         from src.playbook_builder.engine import PlaybookExecutionEngine
-        from src.playbook_builder.models import VisualPlaybook, PlaybookExecution
+        from src.playbook_builder.models import VisualPlaybook, VisualPlaybookExecution
         from sqlalchemy import select
 
         # This is a simplified version - would need async context in real implementation
@@ -117,7 +117,7 @@ def execution_cleanup(
 
         from datetime import timedelta
         from src.core.database import async_session_factory
-        from src.playbook_builder.models import PlaybookExecution
+        from src.playbook_builder.models import VisualPlaybookExecution
         from sqlalchemy import select, delete
         from sqlalchemy.orm import Session
 
