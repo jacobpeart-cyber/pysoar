@@ -4,7 +4,8 @@ from typing import AsyncGenerator
 
 from sqlalchemy import event, pool, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.pool import NullPool, QueuePool
+from sqlalchemy.pool import NullPool
+from sqlalchemy.ext.asyncio import AsyncAdaptedQueuePool
 
 from src.core.config import settings
 
@@ -18,7 +19,7 @@ def _create_engine():
         engine_kwargs = {}
     else:
         # Production database configuration
-        poolclass = QueuePool
+        poolclass = AsyncAdaptedQueuePool
         connect_args = {
             "server_settings": {
                 "application_name": "pysoar",
@@ -44,7 +45,7 @@ def _create_engine():
     )
 
     # Add event listener for connection pool events in production
-    if poolclass is QueuePool:
+    if poolclass is AsyncAdaptedQueuePool:
         @event.listens_for(engine.sync_engine, "connect")
         def receive_connect(dbapi_conn, connection_record):
             """Configure connection on creation"""
