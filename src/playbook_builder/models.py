@@ -276,9 +276,9 @@ class PlaybookEdge(BaseModel):
 
 
 class PlaybookExecution(BaseModel):
-    """Execution record of a playbook"""
+    """Execution record of a visual playbook"""
 
-    __tablename__ = "playbook_executions"
+    __tablename__ = "visual_playbook_executions"
 
     # Foreign keys
     playbook_id: Mapped[str] = mapped_column(
@@ -290,7 +290,7 @@ class PlaybookExecution(BaseModel):
     organization_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
     parent_execution_id: Mapped[Optional[str]] = mapped_column(
         String(36),
-        ForeignKey("playbook_executions.id"),
+        ForeignKey("visual_playbook_executions.id"),
         nullable=True,
     )
 
@@ -342,7 +342,7 @@ class PlaybookNodeExecution(BaseModel):
     # Foreign keys
     execution_id: Mapped[str] = mapped_column(
         String(36),
-        ForeignKey("playbook_executions.id"),
+        ForeignKey("visual_playbook_executions.id"),
         nullable=False,
         index=True,
     )
