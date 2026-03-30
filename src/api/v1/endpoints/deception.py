@@ -98,7 +98,7 @@ async def deploy_decoy(
         )
 
 
-@router.get("/decoys", response_model=None[DecoyResponse])
+@router.get("/decoys", response_model=list[DecoyResponse])
 async def list_decoys(
     db: AsyncSession = Depends(get_db),
     decoy_type: str | None = Query(None),
@@ -379,7 +379,7 @@ async def generate_token(
         )
 
 
-@router.get("/tokens", response_model=None[HoneyTokenResponse])
+@router.get("/tokens", response_model=list[HoneyTokenResponse])
 async def list_tokens(
     db: AsyncSession = Depends(get_db),
     token_type: str | None = Query(None),
@@ -545,7 +545,7 @@ async def rotate_tokens(
 # ============================================================================
 
 
-@router.get("/interactions", response_model=None[DecoyInteractionResponse])
+@router.get("/interactions", response_model=list[DecoyInteractionResponse])
 async def list_interactions(
     db: AsyncSession = Depends(get_db),
     decoy_id: UUID | None = Query(None),
@@ -738,7 +738,7 @@ async def create_campaign(
         )
 
 
-@router.get("/campaigns", response_model=None[DeceptionCampaignResponse])
+@router.get("/campaigns", response_model=list[DeceptionCampaignResponse])
 async def list_campaigns(
     db: AsyncSession = Depends(get_db),
     objective: str | None = Query(None),

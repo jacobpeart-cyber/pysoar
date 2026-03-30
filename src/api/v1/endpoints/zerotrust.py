@@ -159,7 +159,7 @@ async def continuous_session_evaluation(
         )
 
 
-@router.get("/decisions", response_model=None[str, Any])
+@router.get("/decisions", response_model=list[str, Any])
 async def list_access_decisions(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
@@ -251,7 +251,7 @@ async def create_policy(
     return ZeroTrustPolicyResponse.from_orm(db_policy)
 
 
-@router.get("/policies", response_model=None[str, Any])
+@router.get("/policies", response_model=list[str, Any])
 async def list_policies(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
@@ -425,7 +425,7 @@ async def test_policy(
 # ============================================================================
 
 
-@router.get("/devices", response_model=None[str, Any])
+@router.get("/devices", response_model=list[str, Any])
 async def list_devices(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
@@ -529,7 +529,7 @@ async def update_device_compliance(
     return DeviceTrustProfileResponse.from_orm(device)
 
 
-@router.get("/devices/non-compliant", response_model=None[str, Any])
+@router.get("/devices/non-compliant", response_model=list[str, Any])
 async def list_non_compliant_devices(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
@@ -576,7 +576,7 @@ async def create_segment(
     return MicroSegmentResponse.from_orm(seg)
 
 
-@router.get("/segments", response_model=None[str, Any])
+@router.get("/segments", response_model=list[str, Any])
 async def list_segments(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
@@ -720,7 +720,7 @@ async def evaluate_segment_traffic(
     return SegmentTrafficResponse(**result)
 
 
-@router.get("/segments/{segment_id}/violations", response_model=None[str, Any])
+@router.get("/segments/{segment_id}/violations", response_model=list[str, Any])
 async def get_segment_violations(
     segment_id: str,
     db: DatabaseSession = None,
@@ -734,7 +734,7 @@ async def get_segment_violations(
     return {"segment_id": segment_id, "violations": violations}
 
 
-@router.get("/topology", response_model=None[str, Any])
+@router.get("/topology", response_model=list[str, Any])
 async def get_segment_topology(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
@@ -772,7 +772,7 @@ async def initiate_verification(
     return IdentityVerificationResponse.from_orm(v)
 
 
-@router.post("/step-up/{session_id}", response_model=None[str, Any])
+@router.post("/step-up/{session_id}", response_model=list[str, Any])
 async def step_up_authentication(
     session_id: str,
     db: DatabaseSession = None,
@@ -785,7 +785,7 @@ async def step_up_authentication(
     return await auth_engine.step_up_authentication(session_id, required_level)
 
 
-@router.get("/verifications", response_model=None[str, Any])
+@router.get("/verifications", response_model=list[str, Any])
 async def list_verifications(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
@@ -849,7 +849,7 @@ async def get_maturity_score(
     )
 
 
-@router.get("/maturity/pillars", response_model=None[str, Any])
+@router.get("/maturity/pillars", response_model=list[str, Any])
 async def get_maturity_pillars(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
@@ -862,7 +862,7 @@ async def get_maturity_pillars(
     return {"pillars": maturity["pillars"]}
 
 
-@router.get("/recommendations", response_model=None[str, Any])
+@router.get("/recommendations", response_model=list[str, Any])
 async def get_recommendations(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
