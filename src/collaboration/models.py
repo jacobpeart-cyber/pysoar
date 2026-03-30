@@ -217,7 +217,7 @@ class WarRoomMessage(BaseModel):
 
     # Reactions and metadata
     reactions: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON
-    metadata: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON
+    extra_metadata: Mapped[Optional[str]] = mapped_column("metadata", Text, nullable=True)  # JSON
 
     # Relationships
     war_room: Mapped["WarRoom"] = relationship(
