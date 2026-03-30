@@ -9,9 +9,9 @@ from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, Query, Body
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.database import get_async_session
+from src.core.database import get_db as get_async_session
 from src.core.logging import get_logger
-from src.core.security import get_current_user
+from src.api.deps import get_current_active_user as get_current_user, CurrentUser, DatabaseSession
 from src.simulation.engine import (
     SimulationOrchestrator,
     AtomicTestLibrary,
