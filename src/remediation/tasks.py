@@ -33,7 +33,7 @@ logger = get_logger(__name__)
 
 async def get_db_session() -> AsyncSession:
     """Create async database session for tasks."""
-    engine = create_async_engine(settings.DATABASE_URL, echo=False)
+    engine = create_async_engine(settings.database_url, echo=False)
     async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     async with async_session() as session:
         return session
