@@ -5,7 +5,7 @@ continuous authentication, and maturity assessment.
 """
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from sqlalchemy import and_, desc, select
@@ -236,13 +236,51 @@ class PolicyDecisionPoint:
         """
         risk_score = 20.0  # Baseline
 
-        # TODO: Integrate with UEBA (User and Entity Behavior Analytics)
-        # For now, return baseline
-        # In production, this would check:
-        # - Recent failed authentications
-        # - Unusual access patterns
-        # - Privilege escalation attempts
-        # - Service account activity patterns
+        # Check recent failed access decisions for this subject
+        recent_cutoff = datetime.now(timezone.utc) - timedelta(hours=1)
+        failed_result = await self.db.execute(
+            select(AccessDecision).where(
+                and_(
+                    AccessDecision.subject_id == subject_id,
+                    AccessDecision.organization_id == self.organization_id,
+                    AccessDecision.decision == "deny",
+                    AccessDecision.created_at >= recent_cutoff,
+                )
+            )
+        )
+        recent_failures = failed_result.scalars().all()
+        # Each recent denied access adds to risk
+        risk_score += len(recent_failures) * 5.0
+
+        # Check for step-up/challenge decisions (indicates elevated risk context)
+        stepup_result = await self.db.execute(
+            select(AccessDecision).where(
+                and_(
+                    AccessDecision.subject_id == subject_id,
+                    AccessDecision.organization_id == self.organization_id,
+                    AccessDecision.decision.in_(["step_up", "challenge"]),
+                    AccessDecision.created_at >= recent_cutoff,
+                )
+            )
+        )
+        recent_stepups = stepup_result.scalars().all()
+        risk_score += len(recent_stepups) * 3.0
+
+        # Check failed identity verifications
+        failed_verif_result = await self.db.execute(
+            select(IdentityVerification).where(
+                and_(
+                    IdentityVerification.user_id == subject_id,
+                    IdentityVerification.organization_id == self.organization_id,
+                    IdentityVerification.result == "failure",
+                    IdentityVerification.created_at >= recent_cutoff,
+                )
+            )
+        )
+        failed_verifications = failed_verif_result.scalars().all()
+        risk_score += len(failed_verifications) * 10.0
+
+        risk_score = min(risk_score, 100.0)
 
         logger.debug("calculated_subject_risk", subject_id=subject_id, risk=risk_score)
         return risk_score
@@ -541,13 +579,59 @@ class MicroSegmentationEngine:
         Returns:
             {allowed: bool, reason: str, segments: list}
         """
-        # TODO: Implement traffic evaluation logic
-        # This would check segment policies, allowed protocols/ports, etc.
+        # Fetch all active segments for the organization
+        result = await self.db.execute(
+            select(MicroSegment).where(
+                and_(
+                    MicroSegment.organization_id == self.organization_id,
+                    MicroSegment.is_active == True,
+                )
+            )
+        )
+        segments = result.scalars().all()
+
+        matched_segments = []
+        for segment in segments:
+            cidr_ranges = json.loads(segment.cidr_ranges or "[]")
+            # Check if source or destination falls within segment CIDR ranges
+            source_in_segment = any(source.startswith(cidr.split("/")[0].rsplit(".", 1)[0]) for cidr in cidr_ranges) if cidr_ranges else False
+            dest_in_segment = any(destination.startswith(cidr.split("/")[0].rsplit(".", 1)[0]) for cidr in cidr_ranges) if cidr_ranges else False
+
+            if source_in_segment or dest_in_segment:
+                matched_segments.append(segment)
+
+        if not matched_segments:
+            return {
+                "allowed": True,
+                "reason": "No segment policies apply to this traffic",
+                "segments": [],
+            }
+
+        # Evaluate against each matched segment's policies
+        for segment in matched_segments:
+            allowed_protocols = json.loads(segment.allowed_protocols or "[]")
+            allowed_ports = json.loads(segment.allowed_ports or "[]")
+
+            # Check protocol
+            if allowed_protocols and protocol not in allowed_protocols:
+                return {
+                    "allowed": False,
+                    "reason": f"Protocol '{protocol}' not allowed in segment '{segment.name}'",
+                    "segments": [{"id": segment.id, "name": segment.name}],
+                }
+
+            # Check port
+            if allowed_ports and port not in [int(p) for p in allowed_ports]:
+                return {
+                    "allowed": False,
+                    "reason": f"Port {port} not allowed in segment '{segment.name}'",
+                    "segments": [{"id": segment.id, "name": segment.name}],
+                }
 
         return {
             "allowed": True,
-            "reason": "No restrictions",
-            "segments": [],
+            "reason": "Traffic permitted by segment policies",
+            "segments": [{"id": s.id, "name": s.name} for s in matched_segments],
         }
 
     async def detect_lateral_movement(
@@ -559,7 +643,45 @@ class MicroSegmentationEngine:
             List of detected anomalies with details
         """
         anomalies = []
-        # TODO: Implement lateral movement detection
+
+        # Analyze traffic data for lateral movement patterns
+        # Track unique source-destination pairs per source
+        source_destinations: dict[str, set[str]] = {}
+        source_protocols: dict[str, set[str]] = {}
+
+        for entry in traffic_data:
+            src = entry.get("source", "")
+            dst = entry.get("destination", "")
+            proto = entry.get("protocol", "")
+
+            if src not in source_destinations:
+                source_destinations[src] = set()
+                source_protocols[src] = set()
+            source_destinations[src].add(dst)
+            source_protocols[src].add(proto)
+
+        for src, destinations in source_destinations.items():
+            # Flag: single source contacting many destinations (fan-out)
+            if len(destinations) > 5:
+                anomalies.append({
+                    "type": "fan_out",
+                    "source": src,
+                    "destination_count": len(destinations),
+                    "severity": "high" if len(destinations) > 10 else "medium",
+                    "description": f"Source {src} contacted {len(destinations)} unique destinations",
+                })
+
+            # Flag: unusual protocol usage (more than 3 distinct protocols)
+            protocols = source_protocols[src]
+            if len(protocols) > 3:
+                anomalies.append({
+                    "type": "protocol_scan",
+                    "source": src,
+                    "protocols": list(protocols),
+                    "severity": "medium",
+                    "description": f"Source {src} used {len(protocols)} different protocols",
+                })
+
         return anomalies
 
     async def get_segment_violations(self, segment_id: str) -> list[dict[str, Any]]:
@@ -579,8 +701,31 @@ class MicroSegmentationEngine:
         if not segment:
             return []
 
-        # TODO: Return actual violations from audit logs
-        return []
+        # Query access decisions that were denied for resources in this segment
+        result_decisions = await self.db.execute(
+            select(AccessDecision).where(
+                and_(
+                    AccessDecision.organization_id == self.organization_id,
+                    AccessDecision.decision.in_(["deny", "isolate"]),
+                    AccessDecision.resource_type == "network_segment",
+                    AccessDecision.resource_id == segment_id,
+                )
+            ).order_by(desc(AccessDecision.created_at)).limit(100)
+        )
+        denied_decisions = result_decisions.scalars().all()
+
+        violations = []
+        for decision in denied_decisions:
+            violations.append({
+                "id": decision.id,
+                "timestamp": decision.created_at.isoformat() if decision.created_at else None,
+                "subject": f"{decision.subject_type}:{decision.subject_id}",
+                "decision": decision.decision,
+                "risk_score": decision.risk_score,
+                "reason": decision.decision_reason,
+            })
+
+        return violations
 
     async def visualize_segments(self) -> dict[str, Any]:
         """Get topology data for visualization
@@ -606,7 +751,18 @@ class MicroSegmentationEngine:
                 }
                 for s in segments
             ],
-            "connections": [],  # TODO: Populate from traffic data
+            "connections": [
+                {
+                    "from": s.id,
+                    "to": target_id,
+                }
+                for s in segments
+                for target_id in [
+                    p.get("target_segment")
+                    for p in json.loads(s.egress_policies or "[]")
+                    if isinstance(p, dict) and p.get("target_segment")
+                ]
+            ],
         }
 
         return topology
@@ -701,7 +857,33 @@ class ContinuousAuthEngine:
         Returns:
             True if valid, False otherwise
         """
-        # TODO: Check against session store
+        # Check the most recent access decision for this session
+        result = await self.db.execute(
+            select(AccessDecision)
+            .where(
+                and_(
+                    AccessDecision.session_id == session_id,
+                    AccessDecision.organization_id == self.organization_id,
+                )
+            )
+            .order_by(desc(AccessDecision.created_at))
+            .limit(1)
+        )
+        last_decision = result.scalar_one_or_none()
+
+        if not last_decision:
+            return False
+
+        # Session invalid if last decision was deny or isolate
+        if last_decision.decision in ("deny", "isolate"):
+            return False
+
+        # Session invalid if older than 8 hours
+        if last_decision.created_at:
+            session_age = datetime.now(timezone.utc) - last_decision.created_at
+            if session_age > timedelta(hours=8):
+                return False
+
         return True
 
     async def _should_reauthenticate(
@@ -720,8 +902,14 @@ class ContinuousAuthEngine:
         if risk_delta > 30:
             return True
 
-        # Re-auth based on session age (e.g., > 1 hour)
-        # TODO: Implement session age check
+        # Re-auth based on session age (> 1 hour)
+        session_created = session_data.get("created_at")
+        if session_created:
+            if isinstance(session_created, str):
+                session_created = datetime.fromisoformat(session_created)
+            session_age = datetime.now(timezone.utc) - session_created
+            if session_age > timedelta(hours=1):
+                return True
 
         return False
 
@@ -787,17 +975,116 @@ class ZeroTrustScorer:
         Returns:
             {pillar, score, maturity_level, details}
         """
-        # TODO: Implement pillar-specific assessment logic
-        # This would check relevant policies, devices, segments, etc.
+        score = 0.0
+        details: dict[str, Any] = {}
 
-        score = 50.0  # Baseline
-        maturity_level = "initial"
+        if pillar == "identity":
+            # Assess identity pillar: check MFA policies and verification success rates
+            policy_result = await self.db.execute(
+                select(ZeroTrustPolicy).where(
+                    and_(
+                        ZeroTrustPolicy.organization_id == self.organization_id,
+                        ZeroTrustPolicy.is_enabled == True,
+                        ZeroTrustPolicy.policy_type == "identity",
+                    )
+                )
+            )
+            identity_policies = policy_result.scalars().all()
+            mfa_policies = [p for p in identity_policies if p.requires_mfa]
+            details["total_identity_policies"] = len(identity_policies)
+            details["mfa_enforced_policies"] = len(mfa_policies)
+            # Score: base 20 + up to 40 for policies + 40 for MFA coverage
+            score = 20.0
+            score += min(len(identity_policies) * 10.0, 40.0)
+            if identity_policies:
+                mfa_ratio = len(mfa_policies) / len(identity_policies)
+                score += mfa_ratio * 40.0
+
+        elif pillar == "devices":
+            # Assess device pillar: check device trust scores
+            device_result = await self.db.execute(
+                select(DeviceTrustProfile).where(
+                    DeviceTrustProfile.organization_id == self.organization_id
+                )
+            )
+            devices = device_result.scalars().all()
+            details["total_devices"] = len(devices)
+            if devices:
+                avg_trust = sum(d.trust_score for d in devices) / len(devices)
+                compliant = sum(1 for d in devices if d.trust_score >= 70)
+                details["average_trust_score"] = round(avg_trust, 1)
+                details["compliant_devices"] = compliant
+                score = avg_trust  # Device maturity tracks average trust score
+            else:
+                score = 0.0
+
+        elif pillar == "networks":
+            # Assess network pillar: check micro-segmentation coverage
+            segment_result = await self.db.execute(
+                select(MicroSegment).where(
+                    and_(
+                        MicroSegment.organization_id == self.organization_id,
+                        MicroSegment.is_active == True,
+                    )
+                )
+            )
+            segments = segment_result.scalars().all()
+            details["total_segments"] = len(segments)
+            details["segment_types"] = list({s.segment_type for s in segments})
+            # Score: base 10 + up to 90 based on segment count and type diversity
+            score = 10.0
+            score += min(len(segments) * 8.0, 50.0)
+            type_diversity = len(details["segment_types"])
+            score += min(type_diversity * 10.0, 40.0)
+
+        elif pillar == "applications":
+            # Assess applications pillar: check application-related policies
+            app_policy_result = await self.db.execute(
+                select(ZeroTrustPolicy).where(
+                    and_(
+                        ZeroTrustPolicy.organization_id == self.organization_id,
+                        ZeroTrustPolicy.is_enabled == True,
+                        ZeroTrustPolicy.policy_type.in_(["access", "workload"]),
+                    )
+                )
+            )
+            app_policies = app_policy_result.scalars().all()
+            details["total_app_policies"] = len(app_policies)
+            trust_required = sum(1 for p in app_policies if p.requires_device_trust)
+            details["device_trust_required_count"] = trust_required
+            score = 15.0
+            score += min(len(app_policies) * 8.0, 45.0)
+            if app_policies:
+                score += (trust_required / len(app_policies)) * 40.0
+
+        elif pillar == "data":
+            # Assess data pillar: check data classification policies
+            data_policy_result = await self.db.execute(
+                select(ZeroTrustPolicy).where(
+                    and_(
+                        ZeroTrustPolicy.organization_id == self.organization_id,
+                        ZeroTrustPolicy.is_enabled == True,
+                        ZeroTrustPolicy.policy_type == "data",
+                    )
+                )
+            )
+            data_policies = data_policy_result.scalars().all()
+            classified = [p for p in data_policies if p.data_classification_required]
+            details["total_data_policies"] = len(data_policies)
+            details["classified_policies"] = len(classified)
+            score = 10.0
+            score += min(len(data_policies) * 10.0, 40.0)
+            if data_policies:
+                score += (len(classified) / len(data_policies)) * 50.0
+
+        score = min(score, 100.0)
+        maturity_level = self.get_maturity_level_from_score(score)
 
         return {
             "pillar": pillar,
-            "score": score,
+            "score": round(score, 1),
             "maturity_level": maturity_level,
-            "details": {},
+            "details": details,
         }
 
     async def get_maturity_level(self) -> str:
@@ -836,6 +1123,47 @@ class ZeroTrustScorer:
         """
         recommendations = []
 
-        # TODO: Generate pillar-specific recommendations based on gaps
+        pillar_recommendations = {
+            "identity": [
+                {"threshold": 50, "priority": "high", "recommendation": "Enforce MFA on all identity policies to strengthen authentication posture"},
+                {"threshold": 75, "priority": "medium", "recommendation": "Implement continuous identity verification with behavioral analytics"},
+                {"threshold": 90, "priority": "low", "recommendation": "Add FIDO2/WebAuthn support for phishing-resistant authentication"},
+            ],
+            "devices": [
+                {"threshold": 50, "priority": "high", "recommendation": "Enroll all devices in trust assessment and enforce minimum compliance scores"},
+                {"threshold": 75, "priority": "medium", "recommendation": "Enable automated device compliance remediation and real-time posture checks"},
+                {"threshold": 90, "priority": "low", "recommendation": "Implement certificate-based device attestation for all endpoints"},
+            ],
+            "networks": [
+                {"threshold": 50, "priority": "high", "recommendation": "Implement micro-segmentation for critical network zones and workloads"},
+                {"threshold": 75, "priority": "medium", "recommendation": "Deploy east-west traffic monitoring and automated lateral movement detection"},
+                {"threshold": 90, "priority": "low", "recommendation": "Achieve full software-defined perimeter with per-session network access"},
+            ],
+            "applications": [
+                {"threshold": 50, "priority": "high", "recommendation": "Define access policies for all critical applications with device trust requirements"},
+                {"threshold": 75, "priority": "medium", "recommendation": "Implement runtime application security monitoring and workload isolation"},
+                {"threshold": 90, "priority": "low", "recommendation": "Deploy just-in-time application access with automated privilege expiration"},
+            ],
+            "data": [
+                {"threshold": 50, "priority": "high", "recommendation": "Classify all data assets and apply data-centric access policies"},
+                {"threshold": 75, "priority": "medium", "recommendation": "Implement data loss prevention with automated classification enforcement"},
+                {"threshold": 90, "priority": "low", "recommendation": "Deploy granular data-level encryption with attribute-based access controls"},
+            ],
+        }
+
+        for pillar_name, pillar_data in pillars.items():
+            score = pillar_data.get("score", 0)
+            for rec in pillar_recommendations.get(pillar_name, []):
+                if score < rec["threshold"]:
+                    recommendations.append({
+                        "pillar": pillar_name,
+                        "current_score": score,
+                        "priority": rec["priority"],
+                        "recommendation": rec["recommendation"],
+                    })
+
+        # Sort by priority: high > medium > low
+        priority_order = {"high": 0, "medium": 1, "low": 2}
+        recommendations.sort(key=lambda r: priority_order.get(r["priority"], 99))
 
         return recommendations

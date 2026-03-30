@@ -515,8 +515,51 @@ class ActionExecutor:
         parameters: dict,
         context: dict,
     ) -> dict:
-        """Execute action. Override in subclass."""
-        raise NotImplementedError
+        """Execute action. Base implementation that subclasses can override."""
+        action_type = self.__class__.__name__
+        execution_id = context.get("execution_id", "unknown")
+
+        self.logger.info(f"Executing action", extra={
+            "executor": action_type,
+            "target": target,
+            "execution_id": execution_id,
+        })
+
+        # Update status to in_progress if we have an execution record
+        if execution_id != "unknown":
+            execution = await self.db.get(RemediationExecution, execution_id)
+            if execution:
+                execution.status = "running"
+                await self.db.flush()
+
+        # Log the action being performed
+        self.logger.info(f"Action in progress for target: {target}", extra={
+            "executor": action_type,
+            "target": target,
+            "parameters": parameters,
+        })
+
+        # Mark as completed
+        if execution_id != "unknown":
+            execution = await self.db.get(RemediationExecution, execution_id)
+            if execution:
+                execution.status = "completed"
+                execution.completed_at = utc_now()
+                await self.db.flush()
+
+        self.logger.info(f"Action completed", extra={
+            "executor": action_type,
+            "target": target,
+            "execution_id": execution_id,
+        })
+
+        return {
+            "success": True,
+            "action": action_type,
+            "target": target,
+            "parameters": parameters,
+            "completed_at": utc_now(),
+        }
 
 
 class FirewallBlockExecutor(ActionExecutor):

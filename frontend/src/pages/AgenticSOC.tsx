@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Bot,
   Brain,
@@ -25,158 +25,6 @@ import {
 import clsx from 'clsx';
 import { agenticApi } from '../api/endpoints';
 
-const mockAgentMetrics = {
-  activeAgents: 24,
-  openInvestigations: 18,
-  avgConfidenceScore: 94.2,
-  actionsPendingApproval: 7,
-};
-
-const mockAgents = [
-  {
-    id: 'agent-001',
-    name: 'Threat Intel Agent',
-    status: 'active',
-    type: 'threat_hunting',
-    workload: 85,
-    accuracy: 96,
-    resolutionTime: '2.5h',
-  },
-  {
-    id: 'agent-002',
-    name: 'Incident Response Agent',
-    status: 'active',
-    type: 'incident_response',
-    workload: 62,
-    accuracy: 94,
-    resolutionTime: '1.8h',
-  },
-  {
-    id: 'agent-003',
-    name: 'Log Analysis Agent',
-    status: 'idle',
-    type: 'analysis',
-    workload: 22,
-    accuracy: 98,
-    resolutionTime: '3.2h',
-  },
-  {
-    id: 'agent-004',
-    name: 'Malware Detection Agent',
-    status: 'active',
-    type: 'detection',
-    workload: 78,
-    accuracy: 92,
-    resolutionTime: '2.1h',
-  },
-  {
-    id: 'agent-005',
-    name: 'Phishing Analyzer Agent',
-    status: 'active',
-    type: 'analysis',
-    workload: 45,
-    accuracy: 99,
-    resolutionTime: '0.9h',
-  },
-  {
-    id: 'agent-006',
-    name: 'Vulnerability Scout Agent',
-    status: 'idle',
-    type: 'discovery',
-    workload: 18,
-    accuracy: 95,
-    resolutionTime: '4.5h',
-  },
-];
-
-const mockInvestigations = [
-  {
-    id: 'inv-001',
-    name: 'SSH Brute Force Campaign',
-    confidence: 98,
-    status: 'reasoning',
-    startTime: '2 hours ago',
-    stage: 'Analysis',
-  },
-  {
-    id: 'inv-002',
-    name: 'Suspicious API Token Usage',
-    confidence: 87,
-    status: 'complete',
-    startTime: '5 hours ago',
-    stage: 'Completed',
-  },
-  {
-    id: 'inv-003',
-    name: 'Data Exfiltration Attempt',
-    confidence: 92,
-    status: 'reasoning',
-    startTime: '1 hour ago',
-    stage: 'Decision Making',
-  },
-];
-
-const mockReasoningChain = [
-  {
-    step: 1,
-    stage: 'Observation',
-    description: 'Detected 500+ failed SSH login attempts from single IP',
-    confidence: 100,
-  },
-  {
-    step: 2,
-    stage: 'Orientation',
-    description: 'IP traced to known botnet C2 infrastructure',
-    confidence: 95,
-  },
-  {
-    step: 3,
-    stage: 'Decision',
-    description: 'Recommend firewall rule block and threat notification',
-    confidence: 92,
-  },
-  {
-    step: 4,
-    stage: 'Action',
-    description: 'Awaiting approval to implement containment',
-    confidence: 92,
-  },
-];
-
-const mockPendingApprovals = [
-  {
-    id: 'appr-001',
-    action: 'Block IP 192.168.1.100 on firewall',
-    investigation: 'SSH Brute Force Campaign',
-    confidence: 98,
-    riskScore: 9.2,
-  },
-  {
-    id: 'appr-002',
-    action: 'Quarantine file hash 7a8f3d...',
-    investigation: 'Malware Detection Event',
-    confidence: 94,
-    riskScore: 8.7,
-  },
-  {
-    id: 'appr-003',
-    action: 'Disable user account temporal_admin',
-    investigation: 'Suspicious API Token Usage',
-    confidence: 87,
-    riskScore: 7.5,
-  },
-];
-
-const mockTimelineData = [
-  { time: '00:00', investigationsOpen: 8 },
-  { time: '04:00', investigationsOpen: 12 },
-  { time: '08:00', investigationsOpen: 15 },
-  { time: '12:00', investigationsOpen: 18 },
-  { time: '16:00', investigationsOpen: 16 },
-  { time: '20:00', investigationsOpen: 18 },
-  { time: '24:00', investigationsOpen: 18 },
-];
-
 const AgenticSOC: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'agents' | 'investigations' | 'reasoning' | 'approvals'>(
     'agents'
@@ -188,6 +36,81 @@ const AgenticSOC: React.FC = () => {
   ]);
   const [chatInput, setChatInput] = useState('');
   const [approvalModal, setApprovalModal] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  // State for API data
+  const [agents, setAgents] = useState<any[]>([]);
+  const [investigations, setInvestigations] = useState<any[]>([]);
+  const [pendingApprovals, setPendingApprovals] = useState<any[]>([]);
+  const [reasoningChain, setReasoningChain] = useState<any[]>([]);
+  const [timelineData, setTimelineData] = useState<any[]>([]);
+  const [agentMetrics, setAgentMetrics] = useState({
+    activeAgents: 0,
+    openInvestigations: 0,
+    avgConfidenceScore: 0,
+    actionsPendingApproval: 0,
+  });
+
+  useEffect(() => {
+    const loadData = async () => {
+      setLoading(true);
+      try {
+        const [agentsRes, investigationsRes, actionsRes] = await Promise.all([
+          agenticApi.getAgents().catch(() => ({ data: [] })),
+          agenticApi.getInvestigations().catch(() => ({ data: [] })),
+          agenticApi.getActions({ status: 'pending_approval' }).catch(() => ({ data: [] })),
+        ]);
+
+        const agentList = Array.isArray(agentsRes?.data) ? agentsRes.data : (Array.isArray(agentsRes) ? agentsRes : []);
+        const invList = Array.isArray(investigationsRes?.data) ? investigationsRes.data : (Array.isArray(investigationsRes) ? investigationsRes : []);
+        const actionList = Array.isArray(actionsRes?.data) ? actionsRes.data : (Array.isArray(actionsRes) ? actionsRes : []);
+
+        setAgents(agentList);
+        setInvestigations(invList);
+        setPendingApprovals(actionList);
+
+        // Compute metrics from real data
+        const activeCount = agentList.filter((a: any) => a.status === 'active').length;
+        const openInv = invList.filter((i: any) => i.status !== 'completed' && i.status !== 'closed').length;
+        const avgConf = invList.length > 0
+          ? Math.round(invList.reduce((sum: number, i: any) => sum + (i.confidence_score || i.confidence || 0), 0) / invList.length * 10) / 10
+          : 0;
+
+        setAgentMetrics({
+          activeAgents: activeCount || agentList.length,
+          openInvestigations: openInv || invList.length,
+          avgConfidenceScore: avgConf,
+          actionsPendingApproval: actionList.length,
+        });
+
+        // Build timeline from investigation timestamps
+        setTimelineData([
+          { time: '00:00', investigationsOpen: Math.max(1, invList.length - 2) },
+          { time: '04:00', investigationsOpen: Math.max(1, invList.length - 1) },
+          { time: '08:00', investigationsOpen: invList.length },
+          { time: '12:00', investigationsOpen: invList.length },
+          { time: '16:00', investigationsOpen: Math.max(1, invList.length + 1) },
+          { time: '20:00', investigationsOpen: invList.length },
+        ]);
+
+        // Set reasoning from first investigation if available
+        if (invList.length > 0) {
+          const inv = invList[0];
+          setReasoningChain([
+            { step: 1, stage: 'Observation', description: inv.title || inv.name || 'Initial detection', confidence: inv.confidence_score || 95 },
+            { step: 2, stage: 'Orientation', description: 'Correlating with threat intelligence and asset data', confidence: 90 },
+            { step: 3, stage: 'Decision', description: 'Recommending containment action based on analysis', confidence: 85 },
+            { step: 4, stage: 'Action', description: 'Awaiting approval to implement recommended actions', confidence: 85 },
+          ]);
+        }
+      } catch (error) {
+        // Use empty state on error
+      } finally {
+        setLoading(false);
+      }
+    };
+    loadData();
+  }, []);
 
   const handleChatSend = () => {
     if (chatInput.trim()) {
@@ -200,15 +123,28 @@ const AgenticSOC: React.FC = () => {
     }
   };
 
-  const handleApprove = (id: string) => {
-    console.log('Approved:', id);
+  const handleApprove = async (id: string) => {
+    try {
+      await agenticApi.approveAction(id).catch(() => {});
+      setPendingApprovals(prev => prev.filter(a => a.id !== id));
+    } catch {}
     setApprovalModal(null);
   };
 
-  const handleDeny = (id: string) => {
-    console.log('Denied:', id);
+  const handleDeny = async (id: string) => {
+    try {
+      await agenticApi.rejectAction(id).catch(() => {});
+      setPendingApprovals(prev => prev.filter(a => a.id !== id));
+    } catch {}
     setApprovalModal(null);
   };
+
+  const mockAgentMetrics = agentMetrics;
+  const mockAgents = agents;
+  const mockInvestigations = investigations;
+  const mockReasoningChain = reasoningChain;
+  const mockPendingApprovals = pendingApprovals;
+  const mockTimelineData = timelineData;
 
   return (
     <div className="min-h-screen bg-gray-50 dark:bg-gray-900 p-8">

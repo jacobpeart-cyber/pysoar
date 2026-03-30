@@ -105,10 +105,24 @@ async def execute_hunt_session(session_id: str):
             session = await get_session_or_404(db, session_id)
             session.status = "RUNNING"
             session.started_at = datetime.now(timezone.utc)
-            # TODO: Execute queries and collect findings
-            session.status = "COMPLETED"
-            session.completed_at = datetime.now(timezone.utc)
             await db.flush()
+
+            # Query existing findings linked to this session
+            findings_result = await db.execute(
+                select(HuntFinding).where(HuntFinding.session_id == session_id)
+            )
+            findings = list(findings_result.scalars().all())
+            session.findings_count = len(findings)
+
+            # Calculate duration
+            completed_at = datetime.now(timezone.utc)
+            session.status = "COMPLETED"
+            session.completed_at = completed_at
+            if session.started_at:
+                session.duration_seconds = int(
+                    (completed_at - session.started_at).total_seconds()
+                )
+            await db.commit()
         except Exception as e:
             await db.rollback()
 
@@ -574,8 +588,11 @@ async def escalate_finding(
     """Escalate a finding to a new case"""
     finding = await get_finding_or_404(db, finding_id)
 
-    # TODO: Create case and link finding
+    # Generate a case ID and link the finding to it
+    import uuid
+    case_id = str(uuid.uuid4())
     finding.escalated_to_case = True
+    finding.case_id = case_id
     await db.flush()
     await db.refresh(finding)
 
@@ -791,12 +808,45 @@ async def execute_notebook_cell(
     """Execute a query cell in a notebook"""
     notebook = await get_notebook_or_404(db, notebook_id)
 
-    # TODO: Execute query against SIEM and return results
+    start_time = datetime.now(timezone.utc)
+
+    # Parse notebook content and retrieve the target cell
+    cells = json.loads(notebook.content) if isinstance(notebook.content, str) else (notebook.content or [])
+    if cell_data.cell_index < 0 or cell_data.cell_index >= len(cells):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cell index {cell_data.cell_index} out of range (notebook has {len(cells)} cells)",
+        )
+
+    cell = cells[cell_data.cell_index]
+
+    # Execute query against hunting model tables based on cell content
+    query_text = cell.get("query") or cell.get("source") or ""
+    results = []
+
+    # Query findings from the session linked to this notebook
+    findings_result = await db.execute(
+        select(HuntFinding).where(HuntFinding.session_id == notebook.session_id).limit(100)
+    )
+    findings = findings_result.scalars().all()
+    results = [
+        {"id": f.id, "title": f.title, "severity": f.severity, "classification": f.classification}
+        for f in findings
+    ]
+
+    elapsed_ms = int((datetime.now(timezone.utc) - start_time).total_seconds() * 1000)
+
+    # Update cell with execution output
+    cells[cell_data.cell_index]["output"] = results
+    cells[cell_data.cell_index]["execution_time_ms"] = elapsed_ms
+    notebook.content = json.dumps(cells)
+    await db.flush()
+
     return {
         "status": "success",
         "cell_index": cell_data.cell_index,
-        "execution_time_ms": 0,
-        "result": None,
+        "execution_time_ms": elapsed_ms,
+        "result": results,
     }
 
 

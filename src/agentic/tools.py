@@ -306,132 +306,359 @@ class ToolExecutor:
         tool_name: str,
         arguments: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Default handler for tools without custom implementation"""
-        logger.warning(f"Using default handler for {tool_name}")
-
-        # Return simulated results for demo purposes
+        """Default handler routes to database-backed implementations"""
         handlers = {
-            "search_siem_events": self._mock_search_siem,
-            "lookup_ioc": self._mock_lookup_ioc,
-            "get_asset_info": self._mock_get_asset_info,
-            "check_user_activity": self._mock_check_user_activity,
-            "isolate_host": self._mock_isolate_host,
-            "block_ip": self._mock_block_ip,
-            "get_alert_context": self._mock_get_alert_context,
-            "search_darkweb": self._mock_search_darkweb,
-            "run_vulnerability_scan": self._mock_run_vulnerability_scan,
-            "query_compliance_status": self._mock_query_compliance_status,
+            "search_siem_events": self._search_siem_events,
+            "lookup_ioc": self._lookup_ioc,
+            "get_asset_info": self._get_asset_info,
+            "check_user_activity": self._check_user_activity,
+            "isolate_host": self._isolate_host,
+            "block_ip": self._block_ip,
+            "get_alert_context": self._get_alert_context,
+            "search_darkweb": self._search_darkweb,
+            "run_vulnerability_scan": self._run_vulnerability_scan,
+            "query_compliance_status": self._query_compliance_status,
         }
 
         handler = handlers.get(tool_name)
         if handler:
             return await handler(arguments)
 
-        return {"status": "not_implemented"}
+        return {"status": "no_handler", "tool": tool_name}
 
-    async def _mock_search_siem(self, args: Dict) -> Dict:
-        """Mock SIEM search"""
-        return {
-            "query": args.get("query"),
-            "events_found": 42,
-            "time_range": args.get("time_range", "24h"),
-            "sample_events": [
-                {"timestamp": "2026-03-24T10:30:00Z", "source": "10.0.0.1", "action": "failed_login"},
-                {"timestamp": "2026-03-24T10:31:00Z", "source": "10.0.0.1", "action": "failed_login"},
-            ],
-        }
+    async def _search_siem_events(self, args: Dict) -> Dict:
+        """Search alerts as SIEM events"""
+        from sqlalchemy import select, or_, func
+        from src.core.database import async_session_factory
+        from src.models.alert import Alert
 
-    async def _mock_lookup_ioc(self, args: Dict) -> Dict:
-        """Mock IOC lookup"""
-        return {
-            "indicator": args.get("indicator"),
-            "found": True,
-            "threat_level": "HIGH",
-            "sources": ["alienvault", "abuse.ch"],
-            "context": "Known C2 server",
-        }
+        query_str = args.get("query", "")
+        limit = args.get("limit", 20)
 
-    async def _mock_get_asset_info(self, args: Dict) -> Dict:
-        """Mock asset info"""
-        return {
-            "identifier": args.get("identifier"),
-            "hostname": "workstation-01.corp.local",
-            "ip": "10.0.0.100",
-            "os": "Windows 10",
-            "last_seen": "2026-03-24T10:00:00Z",
-            "vulnerabilities": 3,
-        }
+        async with async_session_factory() as db:
+            query = select(Alert)
+            if query_str:
+                query = query.where(or_(
+                    Alert.title.ilike(f"%{query_str}%"),
+                    Alert.description.ilike(f"%{query_str}%"),
+                    Alert.source_ip.ilike(f"%{query_str}%"),
+                    Alert.hostname.ilike(f"%{query_str}%"),
+                ))
+            query = query.order_by(Alert.created_at.desc()).limit(limit)
+            result = await db.execute(query)
+            alerts = result.scalars().all()
 
-    async def _mock_check_user_activity(self, args: Dict) -> Dict:
-        """Mock user activity check"""
-        return {
-            "username": args.get("username"),
-            "activity_count": 125,
-            "anomaly_score": 0.72,
-            "recent_actions": [
-                {"time": "2026-03-24T10:30:00Z", "action": "login"},
-                {"time": "2026-03-24T10:35:00Z", "action": "file_access"},
-            ],
-        }
+            total = (await db.execute(select(func.count(Alert.id)))).scalar() or 0
 
-    async def _mock_isolate_host(self, args: Dict) -> Dict:
-        """Mock host isolation"""
-        return {
-            "hostname": args.get("hostname"),
-            "status": "isolation_requested",
-            "reason": args.get("reason"),
-            "isolation_key": "iso_12345",
-        }
+            return {
+                "query": query_str,
+                "events_found": len(alerts),
+                "total_events": total,
+                "events": [
+                    {
+                        "id": a.id,
+                        "timestamp": str(a.created_at),
+                        "title": a.title,
+                        "severity": a.severity,
+                        "source_ip": a.source_ip,
+                        "hostname": a.hostname,
+                        "source": a.source,
+                    }
+                    for a in alerts
+                ],
+            }
 
-    async def _mock_block_ip(self, args: Dict) -> Dict:
-        """Mock IP blocking"""
-        return {
-            "ip": args.get("ip_address"),
-            "status": "blocked",
-            "duration_hours": args.get("duration_hours", 0),
-            "rule_id": "fw_rule_67890",
-        }
+    async def _lookup_ioc(self, args: Dict) -> Dict:
+        """Look up IOC in threat intelligence database"""
+        from sqlalchemy import select
+        from src.core.database import async_session_factory
+        from src.models.ioc import IOC
 
-    async def _mock_get_alert_context(self, args: Dict) -> Dict:
-        """Mock alert context"""
-        return {
-            "alert_id": args.get("alert_id"),
-            "title": "Suspicious Login",
-            "severity": "HIGH",
-            "source_ip": "192.168.1.100",
-            "user": "jsmith",
-            "timestamp": "2026-03-24T10:30:00Z",
-            "enrichment": {
-                "threat_intel": "Known attacker IP",
-                "similar_alerts": 5,
-            },
-        }
+        indicator = args.get("indicator", "")
 
-    async def _mock_search_darkweb(self, args: Dict) -> Dict:
-        """Mock dark web search"""
-        return {
-            "query": args.get("query"),
-            "results_found": 0,
-            "status": "no_mentions",
-        }
+        async with async_session_factory() as db:
+            result = await db.execute(
+                select(IOC).where(IOC.value == indicator)
+            )
+            ioc = result.scalars().first()
 
-    async def _mock_run_vulnerability_scan(self, args: Dict) -> Dict:
-        """Mock vulnerability scan"""
-        return {
-            "target": args.get("target"),
-            "status": "scan_initiated",
-            "scan_id": "vs_11111",
-            "estimated_completion": "2026-03-24T12:00:00Z",
-        }
+            if ioc:
+                return {
+                    "indicator": indicator,
+                    "found": True,
+                    "threat_level": ioc.threat_level,
+                    "ioc_type": ioc.ioc_type,
+                    "description": ioc.description,
+                    "source": ioc.source,
+                    "status": ioc.status,
+                    "first_seen": str(ioc.created_at),
+                }
+            return {
+                "indicator": indicator,
+                "found": False,
+                "threat_level": "unknown",
+            }
 
-    async def _mock_query_compliance_status(self, args: Dict) -> Dict:
-        """Mock compliance query"""
-        return {
-            "framework": args.get("framework"),
-            "compliance_score": 0.87,
-            "status": "compliant_with_exceptions",
-            "findings": 3,
-        }
+    async def _get_asset_info(self, args: Dict) -> Dict:
+        """Look up asset information"""
+        from sqlalchemy import select, or_
+        from src.core.database import async_session_factory
+        from src.models.asset import Asset
+
+        identifier = args.get("identifier", "")
+
+        async with async_session_factory() as db:
+            result = await db.execute(
+                select(Asset).where(or_(
+                    Asset.name == identifier,
+                    Asset.ip_address == identifier,
+                    Asset.hostname == identifier,
+                ))
+            )
+            asset = result.scalars().first()
+
+            if asset:
+                return {
+                    "identifier": identifier,
+                    "found": True,
+                    "name": asset.name,
+                    "hostname": asset.hostname,
+                    "ip_address": asset.ip_address,
+                    "asset_type": asset.asset_type,
+                    "status": asset.status,
+                    "criticality": asset.criticality,
+                    "os": asset.operating_system,
+                }
+            return {"identifier": identifier, "found": False}
+
+    async def _check_user_activity(self, args: Dict) -> Dict:
+        """Check user login/audit activity"""
+        from sqlalchemy import select, func
+        from src.core.database import async_session_factory
+        from src.models.audit import AuditLog
+
+        username = args.get("username", "")
+
+        async with async_session_factory() as db:
+            count = (await db.execute(
+                select(func.count(AuditLog.id)).where(
+                    AuditLog.user_id == username
+                )
+            )).scalar() or 0
+
+            recent = await db.execute(
+                select(AuditLog)
+                .where(AuditLog.user_id == username)
+                .order_by(AuditLog.created_at.desc())
+                .limit(10)
+            )
+            logs = recent.scalars().all()
+
+            return {
+                "username": username,
+                "activity_count": count,
+                "recent_actions": [
+                    {
+                        "time": str(l.created_at),
+                        "action": l.action,
+                        "resource": l.resource_type,
+                    }
+                    for l in logs
+                ],
+            }
+
+    async def _isolate_host(self, args: Dict) -> Dict:
+        """Request host isolation (creates an action record)"""
+        import uuid
+        from src.core.database import async_session_factory
+        from src.agentic.models import AgentAction
+
+        hostname = args.get("hostname", "")
+        reason = args.get("reason", "Automated isolation request")
+
+        async with async_session_factory() as db:
+            action = AgentAction(
+                id=str(uuid.uuid4()),
+                action_type="isolate_host",
+                target=hostname,
+                parameters=json.dumps({"reason": reason}),
+                requires_approval=True,
+                execution_status="pending_approval",
+            )
+            db.add(action)
+            await db.commit()
+
+            return {
+                "hostname": hostname,
+                "status": "pending_approval",
+                "action_id": action.id,
+                "reason": reason,
+            }
+
+    async def _block_ip(self, args: Dict) -> Dict:
+        """Request IP block (creates an action record)"""
+        import uuid
+        from src.core.database import async_session_factory
+        from src.agentic.models import AgentAction
+
+        ip_address = args.get("ip_address", "")
+        duration = args.get("duration_hours", 24)
+
+        async with async_session_factory() as db:
+            action = AgentAction(
+                id=str(uuid.uuid4()),
+                action_type="block_ip",
+                target=ip_address,
+                parameters=json.dumps({"duration_hours": duration}),
+                requires_approval=True,
+                execution_status="pending_approval",
+            )
+            db.add(action)
+            await db.commit()
+
+            return {
+                "ip_address": ip_address,
+                "status": "pending_approval",
+                "action_id": action.id,
+                "duration_hours": duration,
+            }
+
+    async def _get_alert_context(self, args: Dict) -> Dict:
+        """Get full alert context from database"""
+        from sqlalchemy import select, func
+        from src.core.database import async_session_factory
+        from src.models.alert import Alert
+
+        alert_id = args.get("alert_id", "")
+
+        async with async_session_factory() as db:
+            result = await db.execute(
+                select(Alert).where(Alert.id == alert_id)
+            )
+            alert = result.scalars().first()
+
+            if alert:
+                similar_count = (await db.execute(
+                    select(func.count(Alert.id)).where(
+                        Alert.source_ip == alert.source_ip,
+                        Alert.id != alert.id,
+                    )
+                )).scalar() or 0
+
+                return {
+                    "alert_id": alert_id,
+                    "found": True,
+                    "title": alert.title,
+                    "description": alert.description,
+                    "severity": alert.severity,
+                    "status": alert.status,
+                    "source": alert.source,
+                    "source_ip": alert.source_ip,
+                    "hostname": alert.hostname,
+                    "created_at": str(alert.created_at),
+                    "similar_alerts_from_source": similar_count,
+                }
+            return {"alert_id": alert_id, "found": False}
+
+    async def _search_darkweb(self, args: Dict) -> Dict:
+        """Search dark web findings"""
+        from sqlalchemy import select, or_
+        from src.core.database import async_session_factory
+        from src.darkweb.models import DarkWebFinding
+
+        query_str = args.get("query", "")
+
+        async with async_session_factory() as db:
+            result = await db.execute(
+                select(DarkWebFinding)
+                .where(or_(
+                    DarkWebFinding.title.ilike(f"%{query_str}%"),
+                    DarkWebFinding.description.ilike(f"%{query_str}%"),
+                ))
+                .limit(10)
+            )
+            findings = result.scalars().all()
+
+            return {
+                "query": query_str,
+                "results_found": len(findings),
+                "findings": [
+                    {
+                        "id": f.id,
+                        "title": f.title,
+                        "severity": f.severity,
+                        "source": getattr(f, "source", "darkweb"),
+                    }
+                    for f in findings
+                ],
+            }
+
+    async def _run_vulnerability_scan(self, args: Dict) -> Dict:
+        """Query vulnerability data for a target"""
+        from sqlalchemy import select, func, or_
+        from src.core.database import async_session_factory
+        from src.vulnmgmt.models import Vulnerability
+
+        target = args.get("target", "")
+
+        async with async_session_factory() as db:
+            result = await db.execute(
+                select(Vulnerability)
+                .where(or_(
+                    Vulnerability.affected_asset.ilike(f"%{target}%"),
+                    Vulnerability.title.ilike(f"%{target}%"),
+                ))
+                .limit(20)
+            )
+            vulns = result.scalars().all()
+
+            return {
+                "target": target,
+                "vulnerabilities_found": len(vulns),
+                "vulnerabilities": [
+                    {
+                        "id": v.id,
+                        "title": v.title,
+                        "severity": v.severity,
+                        "status": v.status,
+                    }
+                    for v in vulns
+                ],
+            }
+
+    async def _query_compliance_status(self, args: Dict) -> Dict:
+        """Query compliance status from database"""
+        from sqlalchemy import select, func
+        from src.core.database import async_session_factory
+        from src.compliance.models import ComplianceControl
+
+        framework = args.get("framework", "")
+
+        async with async_session_factory() as db:
+            query = select(ComplianceControl)
+            if framework:
+                query = query.where(ComplianceControl.framework.ilike(f"%{framework}%"))
+
+            total = (await db.execute(
+                select(func.count(ComplianceControl.id)).select_from(query.subquery())
+            )).scalar() or 0
+
+            compliant = (await db.execute(
+                select(func.count(ComplianceControl.id)).where(
+                    ComplianceControl.framework.ilike(f"%{framework}%"),
+                    ComplianceControl.status == "compliant",
+                )
+            )).scalar() or 0
+
+            score = round(compliant / total, 2) if total > 0 else 0.0
+
+            return {
+                "framework": framework,
+                "total_controls": total,
+                "compliant_controls": compliant,
+                "compliance_score": score,
+                "status": "compliant" if score >= 0.95 else "compliant_with_exceptions" if score >= 0.7 else "non_compliant",
+            }
 
 
 class ToolAuditLogger:
