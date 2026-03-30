@@ -1,7 +1,4 @@
-# PySOAR Production Docker Compose
-# Use: docker-compose -f docker-compose.prod.yml up -d
-
-version: '3.8'
+version: '3.9'
 
 services:
   # Nginx Reverse Proxy with SSL

@@ -1,0 +1,40 @@
+title: Lateral Movement Detection
+id: 550e8400-e29b-41d4-a716-446655440002
+status: active
+description: Detects authentication pattern indicating lateral movement - failed login from an IP followed by successful logins to multiple different hosts within a short timeframe
+author: PySOAR
+severity: high
+logtypes:
+  - authentication
+detection:
+  selection_failed:
+    action: login_failed
+  selection_success:
+    action: login_success
+  selection_multiple_hosts:
+    destination_host:
+      - "*.windows.local"
+      - "*.domain.local"
+  filter_same_source:
+    source_address: "10.0.0.0/8"
+  condition: "selection_failed and selection_success and selection_multiple_hosts and not filter_same_source"
+  timewindow: 900
+  threshold: 3
+  group_by:
+    - source_address
+mitre:
+  tactics:
+    - TA0008
+  techniques:
+    - T1021
+falsepositives:
+  - Legitimate user troubleshooting authentication issues across multiple systems
+  - Multi-host maintenance activities
+  - Scheduled service account operations across multiple servers
+tags:
+  - attack.lateral_movement
+  - attack.credential_access
+  - detection.persistence
+references:
+  - https://attack.mitre.org/tactics/TA0008/
+  - https://attack.mitre.org/techniques/T1021/

@@ -1,0 +1,65 @@
+title: Suspicious Process Execution
+id: 550e8400-e29b-41d4-a716-446655440005
+status: active
+description: Detects suspicious process execution patterns including encoded PowerShell commands, Office applications spawning cmd/PowerShell, and living-off-the-land binaries abuse
+author: PySOAR
+severity: high
+logtypes:
+  - endpoint
+detection:
+  selection_powershell_encoded:
+    process_name: "powershell.exe"
+    command_line|contains:
+      - "-enc"
+      - "-EncodedCommand"
+      - "-e "
+      - "-e\t"
+  selection_office_spawn:
+    parent_process_name:
+      - "WINWORD.EXE"
+      - "EXCEL.EXE"
+      - "POWERPNT.EXE"
+      - "OUTLOOK.EXE"
+    process_name:
+      - "cmd.exe"
+      - "powershell.exe"
+      - "cscript.exe"
+      - "wscript.exe"
+  selection_lotl_binaries:
+    process_name:
+      - "certutil.exe"
+      - "bitsadmin.exe"
+      - "mshta.exe"
+      - "rundll32.exe"
+      - "regsvcs.exe"
+      - "regasm.exe"
+      - "InstallUtil.exe"
+    command_line|contains:
+      - "http://"
+      - "https://"
+      - "ftp://"
+      - ".ps1"
+      - ".vbs"
+      - "encoded"
+  filter_legitimate:
+    parent_user: "SYSTEM"
+    process_path: "C:\\Windows\\System32\\"
+  condition: "(selection_powershell_encoded or selection_office_spawn or selection_lotl_binaries) and not filter_legitimate"
+  timewindow: 60
+mitre:
+  tactics:
+    - TA0002
+  techniques:
+    - T1059
+falsepositives:
+  - Legitimate system administrator tasks
+  - Antivirus or security software processes
+  - Authorized penetration testing activities
+  - Software installation and updates
+tags:
+  - attack.execution
+  - attack.defense_evasion
+  - detection.command_line
+references:
+  - https://attack.mitre.org/tactics/TA0002/
+  - https://attack.mitre.org/techniques/T1059/

@@ -1,0 +1,59 @@
+title: Data Exfiltration Detection
+id: 550e8400-e29b-41d4-a716-446655440004
+status: active
+description: Detects potential data exfiltration through large outbound transfers, suspicious ports, or communication patterns indicative of data theft
+author: PySOAR
+severity: critical
+logtypes:
+  - network
+detection:
+  selection_large_transfer:
+    direction: outbound
+    bytes_transferred|gt: 1073741824
+    destination_ip|ipnet:
+      - "!10.0.0.0/8"
+      - "!172.16.0.0/12"
+      - "!192.168.0.0/16"
+  selection_suspicious_port:
+    direction: outbound
+    destination_port:
+      - 443
+      - 8080
+      - 8443
+      - 53
+      - 9200
+      - 27017
+    bytes_transferred|gt: 536870912
+  selection_known_c2:
+    destination_domain|contains:
+      - "pastebin.com"
+      - "github.com/raw"
+      - "herokuapp.com"
+      - "ngrok.io"
+  filter_legitimate:
+    application|contains:
+      - "Backup"
+      - "Cloud Sync"
+      - "OneDrive"
+      - "Dropbox"
+  condition: "(selection_large_transfer or selection_suspicious_port or selection_known_c2) and not filter_legitimate"
+  timewindow: 300
+  threshold: 1
+mitre:
+  tactics:
+    - TA0010
+  techniques:
+    - T1048
+falsepositives:
+  - Legitimate backup operations
+  - Cloud storage synchronization
+  - Large legitimate file transfers
+  - Software updates and patches
+  - Media streaming services
+tags:
+  - attack.exfiltration
+  - attack.data_staged
+  - detection.impact
+references:
+  - https://attack.mitre.org/tactics/TA0010/
+  - https://attack.mitre.org/techniques/T1048/

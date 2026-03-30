@@ -21,6 +21,36 @@ import ApiKeys from './pages/ApiKeys'
 import Analytics from './pages/Analytics'
 import Organizations from './pages/Organizations'
 import ThreatIntel from './pages/ThreatIntel'
+import SIEMDashboard from './pages/SIEMDashboard'
+import ThreatHunting from './pages/ThreatHunting'
+import ExposureManagement from './pages/ExposureManagement'
+import AIEngine from './pages/AIEngine'
+import UEBADashboard from './pages/UEBADashboard'
+import AttackSimulation from './pages/AttackSimulation'
+import DeceptionTech from './pages/DeceptionTech'
+import Remediation from './pages/Remediation'
+import ComplianceDashboard from './pages/ComplianceDashboard'
+import ZeroTrustDashboard from './pages/ZeroTrustDashboard'
+import STIGCompliance from './pages/STIGCompliance'
+import AuditEvidence from './pages/AuditEvidence'
+import DFIRDashboard from './pages/DFIRDashboard'
+import ITDRDashboard from './pages/ITDRDashboard'
+import VulnManagement from './pages/VulnManagement'
+import SupplyChainDashboard from './pages/SupplyChainDashboard'
+import DarkWebMonitor from './pages/DarkWebMonitor'
+import IntegrationMarketplace from './pages/IntegrationMarketplace'
+import AgenticSOC from './pages/AgenticSOC'
+import PlaybookBuilder from './pages/PlaybookBuilder'
+import DLPDashboard from './pages/DLPDashboard'
+import RiskQuantification from './pages/RiskQuantification'
+import OTSecurityDashboard from './pages/OTSecurityDashboard'
+import ContainerSecurity from './pages/ContainerSecurity'
+import PrivacyDashboard from './pages/PrivacyDashboard'
+import ThreatModeling from './pages/ThreatModeling'
+import APISecurityDashboard from './pages/APISecurityDashboard'
+import DataLakeDashboard from './pages/DataLakeDashboard'
+import WarRoom from './pages/WarRoom'
+import PhishingSimulation from './pages/PhishingSimulation'
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -103,6 +133,36 @@ function AppRoutes() {
         <Route path="analytics" element={<Analytics />} />
         <Route path="organizations" element={<Organizations />} />
         <Route path="threat-intel" element={<ThreatIntel />} />
+        <Route path="siem" element={<SIEMDashboard />} />
+        <Route path="hunting" element={<ThreatHunting />} />
+        <Route path="exposure" element={<ExposureManagement />} />
+        <Route path="ai" element={<AIEngine />} />
+        <Route path="ueba" element={<UEBADashboard />} />
+        <Route path="simulation" element={<AttackSimulation />} />
+        <Route path="deception" element={<DeceptionTech />} />
+        <Route path="remediation" element={<Remediation />} />
+        <Route path="compliance" element={<ComplianceDashboard />} />
+        <Route path="zerotrust" element={<ZeroTrustDashboard />} />
+        <Route path="stig" element={<STIGCompliance />} />
+        <Route path="audit-evidence" element={<AuditEvidence />} />
+        <Route path="dfir" element={<DFIRDashboard />} />
+        <Route path="itdr" element={<ITDRDashboard />} />
+        <Route path="vulnmgmt" element={<VulnManagement />} />
+        <Route path="supplychain" element={<SupplyChainDashboard />} />
+        <Route path="darkweb" element={<DarkWebMonitor />} />
+        <Route path="integrations" element={<IntegrationMarketplace />} />
+        <Route path="agentic" element={<AgenticSOC />} />
+        <Route path="playbook-builder" element={<PlaybookBuilder />} />
+        <Route path="dlp" element={<DLPDashboard />} />
+        <Route path="risk" element={<RiskQuantification />} />
+        <Route path="ot-security" element={<OTSecurityDashboard />} />
+        <Route path="container-security" element={<ContainerSecurity />} />
+        <Route path="privacy" element={<PrivacyDashboard />} />
+        <Route path="threat-modeling" element={<ThreatModeling />} />
+        <Route path="api-security" element={<APISecurityDashboard />} />
+        <Route path="data-lake" element={<DataLakeDashboard />} />
+        <Route path="warroom" element={<WarRoom />} />
+        <Route path="phishing" element={<PhishingSimulation />} />
       </Route>
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>

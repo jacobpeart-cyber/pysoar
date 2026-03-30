@@ -1,0 +1,1278 @@
+import { useState, useEffect } from 'react';
+import { useQuery, useMutation } from '@tanstack/react-query';
+import {
+  AreaChart,
+  Area,
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  Legend,
+  ResponsiveContainer,
+} from 'recharts';
+import {
+  Wrench,
+  AlertCircle,
+  CheckCircle2,
+  Clock,
+  Activity,
+  Plus,
+  Filter,
+  ChevronDown,
+  ChevronRight,
+  ChevronLeft,
+  Search,
+  ToggleLeft,
+  ToggleRight,
+  AlertTriangle,
+  Server,
+  Lock,
+  User,
+  FileText,
+  Zap,
+  CheckSquare,
+  XSquare,
+  Loader,
+  Shield,
+  Network,
+  Smartphone,
+  Mail,
+  Ticket,
+  Cloud,
+  Globe,
+  Wifi,
+} from 'lucide-react';
+import { api } from '../lib/api';
+import clsx from 'clsx';
+import { remediationApi } from '../api/endpoints';
+
+interface Tab {
+  id: string;
+  label: string;
+}
+
+interface StatCard {
+  label: string;
+  value: string | number;
+  icon: React.ReactNode;
+  trend?: string;
+  badge?: string | number;
+}
+
+interface Policy {
+  id: string;
+  name: string;
+  type: string;
+  trigger: string;
+  enabled: boolean;
+  requires_approval: boolean;
+  executions: number;
+  success_rate: number;
+  last_executed: string;
+}
+
+interface Execution {
+  id: string;
+  time: string;
+  trigger: string;
+  target: string;
+  policy: string;
+  status: string;
+  duration: number;
+  actions_completed?: string;
+  analyst?: string;
+}
+
+interface QuickAction {
+  id: string;
+  type: string;
+  target: string;
+  timestamp: string;
+  status: string;
+}
+
+interface Integration {
+  id: string;
+  name: string;
+  type: string;
+  vendor: string;
+  status: string;
+  capabilities: string[];
+  last_health_check: string;
+}
+
+const tabs: Tab[] = [
+  { id: 'dashboard', label: 'Dashboard' },
+  { id: 'policies', label: 'Policies' },
+  { id: 'executions', label: 'Executions' },
+  { id: 'quick-actions', label: 'Quick Actions' },
+  { id: 'integrations', label: 'Integrations' },
+];
+
+const policyTypeColors: Record<string, string> = {
+  auto_block: 'bg-red-100 text-red-700 border-red-200',
+  auto_isolate: 'bg-orange-100 text-orange-700 border-orange-200',
+  auto_patch: 'bg-blue-100 text-blue-700 border-blue-200',
+  auto_disable: 'bg-yellow-100 text-yellow-700 border-yellow-200',
+  notification: 'bg-gray-100 text-gray-700 border-gray-200',
+  custom: 'bg-purple-100 text-purple-700 border-purple-200',
+};
+
+const statusColors: Record<string, string> = {
+  completed: 'bg-green-100 text-green-700',
+  running: 'bg-blue-100 text-blue-700',
+  awaiting_approval: 'bg-yellow-100 text-yellow-700',
+  failed: 'bg-red-100 text-red-700',
+  rolled_back: 'bg-purple-100 text-purple-700',
+};
+
+const triggerIcons: Record<string, React.ReactNode> = {
+  alert: <AlertCircle className="w-4 h-4" />,
+  anomaly: <Activity className="w-4 h-4" />,
+  ueba: <User className="w-4 h-4" />,
+  deception: <Zap className="w-4 h-4" />,
+};
+
+const integrationTypeColors: Record<string, string> = {
+  firewall: 'bg-red-100 text-red-700',
+  edr: 'bg-blue-100 text-blue-700',
+  'active-directory': 'bg-purple-100 text-purple-700',
+  'email-gateway': 'bg-orange-100 text-orange-700',
+  ticketing: 'bg-green-100 text-green-700',
+  'cloud-provider': 'bg-indigo-100 text-indigo-700',
+  dns: 'bg-pink-100 text-pink-700',
+  waf: 'bg-yellow-100 text-yellow-700',
+  proxy: 'bg-cyan-100 text-cyan-700',
+};
+
+export default function Remediation() {
+  const [activeTab, setActiveTab] = useState<string>('dashboard');
+  const [expandedExecution, setExpandedExecution] = useState<string | null>(null);
+  const [policyTypeFilter, setPolicyTypeFilter] = useState('');
+  const [policyEnabledFilter, setPolicyEnabledFilter] = useState('');
+  const [executionStatusFilter, setExecutionStatusFilter] = useState('');
+  const [executionTriggerFilter, setExecutionTriggerFilter] = useState('');
+  const [blockIPValue, setBlockIPValue] = useState('');
+  const [blockDuration, setBlockDuration] = useState('24h');
+  const [isolateHostValue, setIsolateHostValue] = useState('');
+  const [isolateReason, setIsolateReason] = useState('');
+  const [disableUsername, setDisableUsername] = useState('');
+  const [forcePasswordReset, setForcePasswordReset] = useState(false);
+  const [quarantineHost, setQuarantineHost] = useState('');
+  const [quarantineFilePath, setQuarantineFilePath] = useState('');
+
+  // Fetch dashboard stats
+  const { data: dashboardData, isLoading: dashboardLoading } = useQuery({
+    queryKey: ['remediation-dashboard'],
+    queryFn: async () => {
+      const response = await api.get('/remediation/dashboard');
+      return response.data;
+    },
+    enabled: activeTab === 'dashboard',
+  });
+
+  // Fetch policies
+  const { data: policiesData, isLoading: policiesLoading } = useQuery({
+    queryKey: ['remediation-policies', policyTypeFilter, policyEnabledFilter],
+    queryFn: async () => {
+      const response = await api.get('/remediation/policies', {
+        params: {
+          type: policyTypeFilter,
+          enabled: policyEnabledFilter,
+        },
+      });
+      return response.data;
+    },
+    enabled: activeTab === 'policies',
+  });
+
+  // Fetch executions
+  const { data: executionsData, isLoading: executionsLoading } = useQuery({
+    queryKey: ['remediation-executions', executionStatusFilter, executionTriggerFilter],
+    queryFn: async () => {
+      const response = await api.get('/remediation/executions', {
+        params: {
+          status: executionStatusFilter,
+          trigger: executionTriggerFilter,
+        },
+      });
+      return response.data;
+    },
+    enabled: activeTab === 'executions',
+  });
+
+  // Fetch pending approvals
+  const { data: pendingApprovalsData, isLoading: pendingApprovalsLoading } = useQuery({
+    queryKey: ['remediation-pending-approvals'],
+    queryFn: async () => {
+      const response = await api.get('/remediation/executions/pending');
+      return response.data;
+    },
+    enabled: activeTab === 'executions',
+  });
+
+  // Fetch quick actions
+  const { data: quickActionsData, isLoading: quickActionsLoading } = useQuery({
+    queryKey: ['remediation-quick-actions'],
+    queryFn: async () => {
+      const response = await api.get('/remediation/quick-actions');
+      return response.data;
+    },
+    enabled: activeTab === 'quick-actions',
+  });
+
+  // Fetch integrations
+  const { data: integrationsData, isLoading: integrationsLoading } = useQuery({
+    queryKey: ['remediation-integrations'],
+    queryFn: async () => {
+      const response = await api.get('/remediation/integrations');
+      return response.data;
+    },
+    enabled: activeTab === 'integrations',
+  });
+
+  // Mutations
+  const blockIPMutation = useMutation({
+    mutationFn: async (data: { ip: string; duration: string }) => {
+      const response = await api.post('/remediation/block-ip', data);
+      return response.data;
+    },
+  });
+
+  const isolateHostMutation = useMutation({
+    mutationFn: async (data: { hostname: string; reason: string }) => {
+      const response = await api.post('/remediation/isolate-host', data);
+      return response.data;
+    },
+  });
+
+  const disableAccountMutation = useMutation({
+    mutationFn: async (data: { username: string; force_password_reset: boolean }) => {
+      const response = await api.post('/remediation/disable-account', data);
+      return response.data;
+    },
+  });
+
+  const quarantineFileMutation = useMutation({
+    mutationFn: async (data: { host: string; file_path: string }) => {
+      const response = await api.post('/remediation/quarantine-file', data);
+      return response.data;
+    },
+  });
+
+  const handleBlockIP = () => {
+    if (blockIPValue.trim()) {
+      blockIPMutation.mutate({ ip: blockIPValue, duration: blockDuration });
+      setBlockIPValue('');
+    }
+  };
+
+  const handleIsolateHost = () => {
+    if (isolateHostValue.trim()) {
+      isolateHostMutation.mutate({ hostname: isolateHostValue, reason: isolateReason });
+      setIsolateHostValue('');
+      setIsolateReason('');
+    }
+  };
+
+  const handleDisableAccount = () => {
+    if (disableUsername.trim()) {
+      disableAccountMutation.mutate({ username: disableUsername, force_password_reset: forcePasswordReset });
+      setDisableUsername('');
+      setForcePasswordReset(false);
+    }
+  };
+
+  const handleQuarantineFile = () => {
+    if (quarantineHost.trim() && quarantineFilePath.trim()) {
+      quarantineFileMutation.mutate({ host: quarantineHost, file_path: quarantineFilePath });
+      setQuarantineHost('');
+      setQuarantineFilePath('');
+    }
+  };
+
+  // Mock data for charts
+  const executionTimelineData = [
+    { date: 'Mon', successful: 24, failed: 4 },
+    { date: 'Tue', successful: 32, failed: 2 },
+    { date: 'Wed', successful: 28, failed: 5 },
+    { date: 'Thu', successful: 35, failed: 3 },
+    { date: 'Fri', successful: 42, failed: 6 },
+    { date: 'Sat', successful: 18, failed: 2 },
+    { date: 'Sun', successful: 22, failed: 4 },
+  ];
+
+  const actionTypeData = [
+    { type: 'firewall_block', count: 145 },
+    { type: 'host_isolate', count: 89 },
+    { type: 'account_disable', count: 56 },
+    { type: 'file_quarantine', count: 72 },
+    { type: 'password_reset', count: 43 },
+    { type: 'privilege_revoke', count: 31 },
+  ];
+
+  // Render Dashboard Tab
+  const renderDashboard = () => {
+    if (dashboardLoading) {
+      return <LoadingState />;
+    }
+
+    const stats: StatCard[] = [
+      {
+        label: 'Total Executions',
+        value: dashboardData?.total_executions || '1,247',
+        icon: <Activity className="w-6 h-6 text-blue-500" />,
+        trend: '+12.5%',
+      },
+      {
+        label: 'Success Rate',
+        value: `${dashboardData?.success_rate || '94.2'}%`,
+        icon: <CheckCircle2 className="w-6 h-6 text-green-500" />,
+      },
+      {
+        label: 'Pending Approvals',
+        value: dashboardData?.pending_approvals || '3',
+        icon: <AlertCircle className="w-6 h-6 text-yellow-500" />,
+        badge: dashboardData?.pending_approvals || 3,
+      },
+      {
+        label: 'Avg Remediation Time',
+        value: `${dashboardData?.avg_remediation_time || '2.4'}m`,
+        icon: <Clock className="w-6 h-6 text-orange-500" />,
+      },
+      {
+        label: 'Active Policies',
+        value: dashboardData?.active_policies || '28',
+        icon: <Shield className="w-6 h-6 text-purple-500" />,
+      },
+      {
+        label: 'Actions Today',
+        value: dashboardData?.actions_today || '47',
+        icon: <Zap className="w-6 h-6 text-amber-500" />,
+      },
+    ];
+
+    return (
+      <div className="space-y-6">
+        {/* Stats Cards */}
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+          {stats.map((stat, idx) => (
+            <div
+              key={idx}
+              className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6"
+            >
+              <div className="flex items-start justify-between">
+                <div>
+                  <p className="text-sm text-gray-600 dark:text-gray-400 font-medium">
+                    {stat.label}
+                  </p>
+                  <p className="text-2xl font-bold text-gray-900 dark:text-white mt-2">
+                    {stat.value}
+                  </p>
+                  {stat.trend && (
+                    <p className="text-sm text-green-600 mt-1">{stat.trend}</p>
+                  )}
+                </div>
+                <div className="p-3 bg-gray-100 dark:bg-gray-700 rounded-lg">
+                  {stat.icon}
+                </div>
+              </div>
+              {stat.badge !== undefined && (
+                <div className="mt-4 inline-flex items-center px-2.5 py-0.5 rounded-full text-sm font-medium bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200">
+                  {stat.badge} pending
+                </div>
+              )}
+            </div>
+          ))}
+        </div>
+
+        {/* Charts */}
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          {/* Execution Timeline */}
+          <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
+            <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">
+              Execution Timeline (7 Days)
+            </h3>
+            <ResponsiveContainer width="100%" height={300}>
+              <AreaChart data={executionTimelineData}>
+                <defs>
+                  <linearGradient id="colorSuccessful" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="#10b981" stopOpacity={0.8} />
+                    <stop offset="95%" stopColor="#10b981" stopOpacity={0} />
+                  </linearGradient>
+                  <linearGradient id="colorFailed" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="5%" stopColor="#ef4444" stopOpacity={0.8} />
+                    <stop offset="95%" stopColor="#ef4444" stopOpacity={0} />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="date" />
+                <YAxis />
+                <Tooltip />
+                <Area
+                  type="monotone"
+                  dataKey="successful"
+                  stroke="#10b981"
+                  fillOpacity={1}
+                  fill="url(#colorSuccessful)"
+                />
+                <Area
+                  type="monotone"
+                  dataKey="failed"
+                  stroke="#ef4444"
+                  fillOpacity={1}
+                  fill="url(#colorFailed)"
+                />
+              </AreaChart>
+            </ResponsiveContainer>
+          </div>
+
+          {/* Actions by Type */}
+          <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
+            <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">
+              Actions by Type
+            </h3>
+            <ResponsiveContainer width="100%" height={300}>
+              <BarChart data={actionTypeData}>
+                <CartesianGrid strokeDasharray="3 3" />
+                <XAxis dataKey="type" angle={-45} textAnchor="end" height={80} />
+                <YAxis />
+                <Tooltip />
+                <Bar dataKey="count" fill="#3b82f6" />
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+
+        {/* Recent Executions Table */}
+        <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700">
+          <div className="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
+            <h3 className="text-lg font-semibold text-gray-900 dark:text-white">
+              Recent Executions
+            </h3>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full">
+              <thead className="bg-gray-50 dark:bg-gray-700">
+                <tr>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
+                    Time
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
+                    Trigger
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
+                    Target
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
+                    Policy
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
+                    Status
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
+                    Duration
+                  </th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
+                {dashboardData?.recent_executions?.slice(0, 5).map((execution: any, idx: number) => (
+                  <tr key={idx} className="hover:bg-gray-50 dark:hover:bg-gray-700 transition">
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-gray-100">
+                      {execution.time}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
+                      {execution.trigger}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
+                      {execution.target}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
+                      {execution.policy}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap">
+                      <span
+                        className={clsx(
+                          'inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium',
+                          statusColors[execution.status] || 'bg-gray-100 text-gray-700'
+                        )}
+                      >
+                        {execution.status === 'running' && (
+                          <Loader className="w-3 h-3 mr-1 animate-spin" />
+                        )}
+                        {execution.status}
+                      </span>
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
+                      {execution.duration}s
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  // Render Policies Tab
+  const renderPolicies = () => {
+    if (policiesLoading) {
+      return <LoadingState />;
+    }
+
+    const allPolicies = policiesData?.policies || [];
+
+    return (
+      <div className="space-y-6">
+        {/* Filters and Button */}
+        <div className="flex flex-col lg:flex-row gap-4 items-center justify-between">
+          <div className="flex flex-col sm:flex-row gap-4 items-center flex-1">
+            <select
+              value={policyTypeFilter}
+              onChange={(e) => setPolicyTypeFilter(e.target.value)}
+              className="px-4 py-2 border border-gray-200 dark:border-gray-700 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-white"
+            >
+              <option value="">All Types</option>
+              <option value="auto_block">Auto Block</option>
+              <option value="auto_isolate">Auto Isolate</option>
+              <option value="auto_patch">Auto Patch</option>
+              <option value="auto_disable">Auto Disable</option>
+              <option value="notification">Notification</option>
+              <option value="custom">Custom</option>
+            </select>
+
+            <select
+              value={policyEnabledFilter}
+              onChange={(e) => setPolicyEnabledFilter(e.target.value)}
+              className="px-4 py-2 border border-gray-200 dark:border-gray-700 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-white"
+            >
+              <option value="">All States</option>
+              <option value="true">Enabled</option>
+              <option value="false">Disabled</option>
+            </select>
+          </div>
+
+          <button className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition">
+            <Plus className="w-5 h-5" />
+            Create Policy
+          </button>
+        </div>
+
+        {/* Built-in Policies Section */}
+        <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
+          <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">
+            Built-in Policies
+          </h3>
+          <div className="text-sm text-gray-600 dark:text-gray-400 mb-4">
+            8 pre-configured policies available for immediate deployment
+          </div>
+        </div>
+
+        {/* Policies Table */}
+        <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700">
+          <div className="overflow-x-auto">
+            <table className="w-full">
+              <thead className="bg-gray-50 dark:bg-gray-700">
+                <tr>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
+                    Name
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
+                    Type
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
+                    Trigger
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
+                    Status
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
+                    Requires Approval
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
+                    Executions
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
+                    Success Rate
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
+                    Last Executed
+                  </th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
+                {allPolicies.map((policy: Policy, idx: number) => (
+                  <tr key={idx} className="hover:bg-gray-50 dark:hover:bg-gray-700 transition">
+                    <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-white">
+                      {policy.name}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap">
+                      <span
+                        className={clsx(
+                          'inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium border',
+                          policyTypeColors[policy.type] || 'bg-gray-100 text-gray-700'
+                        )}
+                      >
+                        {policy.type}
+                      </span>
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
+                      {policy.trigger}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap">
+                      <button className="flex items-center gap-2 px-3 py-1 rounded-lg transition">
+                        {policy.enabled ? (
+                          <>
+                            <ToggleRight className="w-5 h-5 text-green-600" />
+                            <span className="text-sm font-medium text-green-600">Enabled</span>
+                          </>
+                        ) : (
+                          <>
+                            <ToggleLeft className="w-5 h-5 text-gray-400" />
+                            <span className="text-sm font-medium text-gray-600 dark:text-gray-400">
+                              Disabled
+                            </span>
+                          </>
+                        )}
+                      </button>
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap">
+                      {policy.requires_approval ? (
+                        <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200">
+                          Required
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300">
+                          Not Required
+                        </span>
+                      )}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
+                      {policy.executions}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm">
+                      <div className="flex items-center gap-2">
+                        <div className="w-16 h-1.5 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
+                          <div
+                            className="h-full bg-green-500"
+                            style={{ width: `${policy.success_rate}%` }}
+                          />
+                        </div>
+                        <span className="text-gray-600 dark:text-gray-400">{policy.success_rate}%</span>
+                      </div>
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
+                      {policy.last_executed}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  // Render Executions Tab
+  const renderExecutions = () => {
+    if (executionsLoading || pendingApprovalsLoading) {
+      return <LoadingState />;
+    }
+
+    const allExecutions = executionsData?.executions || [];
+    const pendingApprovals = pendingApprovalsData?.pending || [];
+
+    return (
+      <div className="space-y-6">
+        {/* Pending Approvals Section */}
+        {pendingApprovals.length > 0 && (
+          <div className="bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-700 rounded-lg p-6">
+            <div className="flex items-start justify-between mb-4">
+              <div>
+                <h3 className="text-lg font-semibold text-yellow-900 dark:text-yellow-100">
+                  Pending Approvals
+                </h3>
+                <p className="text-sm text-yellow-700 dark:text-yellow-200 mt-1">
+                  {pendingApprovals.length} execution(s) awaiting approval
+                </p>
+              </div>
+            </div>
+            <div className="space-y-3">
+              {pendingApprovals.map((approval: any, idx: number) => (
+                <div
+                  key={idx}
+                  className="flex items-center justify-between bg-white dark:bg-gray-800 p-4 rounded-lg border border-yellow-100 dark:border-yellow-700"
+                >
+                  <div>
+                    <p className="font-medium text-gray-900 dark:text-white">{approval.policy}</p>
+                    <p className="text-sm text-gray-600 dark:text-gray-400">
+                      Target: {approval.target}
+                    </p>
+                  </div>
+                  <div className="flex gap-2">
+                    <button className="px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg font-medium transition">
+                      Approve
+                    </button>
+                    <button className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg font-medium transition">
+                      Reject
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Filters */}
+        <div className="flex flex-col sm:flex-row gap-4">
+          <select
+            value={executionStatusFilter}
+            onChange={(e) => setExecutionStatusFilter(e.target.value)}
+            className="px-4 py-2 border border-gray-200 dark:border-gray-700 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-white"
+          >
+            <option value="">All Statuses</option>
+            <option value="completed">Completed</option>
+            <option value="running">Running</option>
+            <option value="awaiting_approval">Awaiting Approval</option>
+            <option value="failed">Failed</option>
+            <option value="rolled_back">Rolled Back</option>
+          </select>
+
+          <select
+            value={executionTriggerFilter}
+            onChange={(e) => setExecutionTriggerFilter(e.target.value)}
+            className="px-4 py-2 border border-gray-200 dark:border-gray-700 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-white"
+          >
+            <option value="">All Triggers</option>
+            <option value="alert">Alert</option>
+            <option value="anomaly">Anomaly</option>
+            <option value="ueba">UEBA</option>
+            <option value="deception">Deception</option>
+          </select>
+        </div>
+
+        {/* Executions Table */}
+        <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700">
+          <div className="overflow-x-auto">
+            <table className="w-full">
+              <thead className="bg-gray-50 dark:bg-gray-700">
+                <tr>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
+                    Time
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
+                    Trigger
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
+                    Target
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
+                    Policy
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
+                    Status
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
+                    Actions
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
+                    Duration
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
+                    Analyst
+                  </th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
+                {allExecutions.map((execution: Execution, idx: number) => (
+                  <React.Fragment key={idx}>
+                    <tr
+                      className="hover:bg-gray-50 dark:hover:bg-gray-700 transition cursor-pointer"
+                      onClick={() =>
+                        setExpandedExecution(
+                          expandedExecution === execution.id ? null : execution.id
+                        )
+                      }
+                    >
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-white">
+                        {execution.time}
+                      </td>
+                      <td className="px-6 py-4 whitespace-nowrap">
+                        <div className="flex items-center gap-2">
+                          {triggerIcons[execution.trigger] || <AlertCircle className="w-4 h-4" />}
+                          <span className="text-sm text-gray-600 dark:text-gray-400">
+                            {execution.trigger}
+                          </span>
+                        </div>
+                      </td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
+                        {execution.target}
+                      </td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
+                        {execution.policy}
+                      </td>
+                      <td className="px-6 py-4 whitespace-nowrap">
+                        <span
+                          className={clsx(
+                            'inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium',
+                            statusColors[execution.status] || 'bg-gray-100 text-gray-700'
+                          )}
+                        >
+                          {execution.status === 'running' && (
+                            <Loader className="w-3 h-3 mr-1 animate-spin" />
+                          )}
+                          {execution.status}
+                        </span>
+                      </td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
+                        {execution.actions_completed}
+                      </td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
+                        {execution.duration}s
+                      </td>
+                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
+                        {execution.analyst || 'System'}
+                      </td>
+                      <td className="px-6 py-4 text-right">
+                        <ChevronRight
+                          className={clsx(
+                            'w-5 h-5 text-gray-400 transition',
+                            expandedExecution === execution.id && 'rotate-90'
+                          )}
+                        />
+                      </td>
+                    </tr>
+                    {expandedExecution === execution.id && (
+                      <tr className="bg-gray-50 dark:bg-gray-700">
+                        <td colSpan={9} className="px-6 py-4">
+                          <div className="space-y-3">
+                            <h4 className="font-semibold text-gray-900 dark:text-white">
+                              Action Results
+                            </h4>
+                            <div className="space-y-2">
+                              <div className="flex items-center gap-2">
+                                <CheckSquare className="w-4 h-4 text-green-600" />
+                                <span className="text-sm text-gray-700 dark:text-gray-300">
+                                  Block IP: 192.168.1.100
+                                </span>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <CheckSquare className="w-4 h-4 text-green-600" />
+                                <span className="text-sm text-gray-700 dark:text-gray-300">
+                                  Update Firewall Rules
+                                </span>
+                              </div>
+                              <div className="flex items-center gap-2">
+                                <XSquare className="w-4 h-4 text-red-600" />
+                                <span className="text-sm text-gray-700 dark:text-gray-300">
+                                  Notify SOC Team
+                                </span>
+                              </div>
+                            </div>
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                  </React.Fragment>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  // Render Quick Actions Tab
+  const renderQuickActions = () => {
+    if (quickActionsLoading) {
+      return <LoadingState />;
+    }
+
+    return (
+      <div className="space-y-6">
+        {/* Action Cards Grid */}
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+          {/* Block IP Card */}
+          <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
+            <div className="flex items-start justify-between mb-4">
+              <div>
+                <h3 className="text-lg font-semibold text-gray-900 dark:text-white">Block IP</h3>
+                <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
+                  Add IP to firewall blocklist
+                </p>
+              </div>
+              <Network className="w-8 h-8 text-red-500" />
+            </div>
+            <div className="space-y-3">
+              <input
+                type="text"
+                placeholder="Enter IP address"
+                value={blockIPValue}
+                onChange={(e) => setBlockIPValue(e.target.value)}
+                className="w-full px-3 py-2 border border-gray-200 dark:border-gray-700 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500"
+              />
+              <select
+                value={blockDuration}
+                onChange={(e) => setBlockDuration(e.target.value)}
+                className="w-full px-3 py-2 border border-gray-200 dark:border-gray-700 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+              >
+                <option value="1h">1 Hour</option>
+                <option value="6h">6 Hours</option>
+                <option value="24h">24 Hours</option>
+                <option value="permanent">Permanent</option>
+              </select>
+              <button
+                onClick={handleBlockIP}
+                disabled={blockIPMutation.isPending || !blockIPValue.trim()}
+                className="w-full px-4 py-2 bg-red-600 hover:bg-red-700 disabled:bg-gray-400 text-white rounded-lg font-medium transition"
+              >
+                {blockIPMutation.isPending ? 'Blocking...' : 'Block IP'}
+              </button>
+            </div>
+          </div>
+
+          {/* Isolate Host Card */}
+          <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
+            <div className="flex items-start justify-between mb-4">
+              <div>
+                <h3 className="text-lg font-semibold text-gray-900 dark:text-white">
+                  Isolate Host
+                </h3>
+                <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
+                  Disconnect from network
+                </p>
+              </div>
+              <Server className="w-8 h-8 text-orange-500" />
+            </div>
+            <div className="space-y-3">
+              <input
+                type="text"
+                placeholder="Enter hostname"
+                value={isolateHostValue}
+                onChange={(e) => setIsolateHostValue(e.target.value)}
+                className="w-full px-3 py-2 border border-gray-200 dark:border-gray-700 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500"
+              />
+              <input
+                type="text"
+                placeholder="Reason for isolation"
+                value={isolateReason}
+                onChange={(e) => setIsolateReason(e.target.value)}
+                className="w-full px-3 py-2 border border-gray-200 dark:border-gray-700 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500"
+              />
+              <button
+                onClick={handleIsolateHost}
+                disabled={isolateHostMutation.isPending || !isolateHostValue.trim()}
+                className="w-full px-4 py-2 bg-orange-600 hover:bg-orange-700 disabled:bg-gray-400 text-white rounded-lg font-medium transition"
+              >
+                {isolateHostMutation.isPending ? 'Isolating...' : 'Isolate Host'}
+              </button>
+            </div>
+          </div>
+
+          {/* Disable Account Card */}
+          <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
+            <div className="flex items-start justify-between mb-4">
+              <div>
+                <h3 className="text-lg font-semibold text-gray-900 dark:text-white">
+                  Disable Account
+                </h3>
+                <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
+                  Lock user account
+                </p>
+              </div>
+              <Lock className="w-8 h-8 text-yellow-500" />
+            </div>
+            <div className="space-y-3">
+              <input
+                type="text"
+                placeholder="Enter username"
+                value={disableUsername}
+                onChange={(e) => setDisableUsername(e.target.value)}
+                className="w-full px-3 py-2 border border-gray-200 dark:border-gray-700 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500"
+              />
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={forcePasswordReset}
+                  onChange={(e) => setForcePasswordReset(e.target.checked)}
+                  className="rounded border-gray-300"
+                />
+                <span className="text-sm text-gray-700 dark:text-gray-300">
+                  Force password reset
+                </span>
+              </label>
+              <button
+                onClick={handleDisableAccount}
+                disabled={disableAccountMutation.isPending || !disableUsername.trim()}
+                className="w-full px-4 py-2 bg-yellow-600 hover:bg-yellow-700 disabled:bg-gray-400 text-white rounded-lg font-medium transition"
+              >
+                {disableAccountMutation.isPending ? 'Disabling...' : 'Disable Account'}
+              </button>
+            </div>
+          </div>
+
+          {/* Quarantine File Card */}
+          <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
+            <div className="flex items-start justify-between mb-4">
+              <div>
+                <h3 className="text-lg font-semibold text-gray-900 dark:text-white">
+                  Quarantine File
+                </h3>
+                <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
+                  Isolate suspected malware
+                </p>
+              </div>
+              <FileText className="w-8 h-8 text-purple-500" />
+            </div>
+            <div className="space-y-3">
+              <input
+                type="text"
+                placeholder="Enter hostname"
+                value={quarantineHost}
+                onChange={(e) => setQuarantineHost(e.target.value)}
+                className="w-full px-3 py-2 border border-gray-200 dark:border-gray-700 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500"
+              />
+              <input
+                type="text"
+                placeholder="File path"
+                value={quarantineFilePath}
+                onChange={(e) => setQuarantineFilePath(e.target.value)}
+                className="w-full px-3 py-2 border border-gray-200 dark:border-gray-700 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white placeholder-gray-400 dark:placeholder-gray-500"
+              />
+              <button
+                onClick={handleQuarantineFile}
+                disabled={
+                  quarantineFileMutation.isPending ||
+                  !quarantineHost.trim() ||
+                  !quarantineFilePath.trim()
+                }
+                className="w-full px-4 py-2 bg-purple-600 hover:bg-purple-700 disabled:bg-gray-400 text-white rounded-lg font-medium transition"
+              >
+                {quarantineFileMutation.isPending ? 'Quarantining...' : 'Quarantine File'}
+              </button>
+            </div>
+          </div>
+        </div>
+
+        {/* Recent Quick Actions */}
+        <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700">
+          <div className="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
+            <h3 className="text-lg font-semibold text-gray-900 dark:text-white">
+              Recent Quick Actions
+            </h3>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full">
+              <thead className="bg-gray-50 dark:bg-gray-700">
+                <tr>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
+                    Type
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
+                    Target
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
+                    Timestamp
+                  </th>
+                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
+                    Status
+                  </th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
+                {quickActionsData?.recent?.map((action: QuickAction, idx: number) => (
+                  <tr key={idx} className="hover:bg-gray-50 dark:hover:bg-gray-700 transition">
+                    <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-white">
+                      {action.type}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
+                      {action.target}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
+                      {action.timestamp}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap">
+                      <span
+                        className={clsx(
+                          'inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium',
+                          statusColors[action.status] || 'bg-gray-100 text-gray-700'
+                        )}
+                      >
+                        {action.status}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    );
+  };
+
+  // Render Integrations Tab
+  const renderIntegrations = () => {
+    if (integrationsLoading) {
+      return <LoadingState />;
+    }
+
+    const integrations = integrationsData?.integrations || [];
+
+    return (
+      <div className="space-y-6">
+        {/* Action Buttons */}
+        <div className="flex flex-col sm:flex-row gap-4">
+          <button className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition">
+            <Plus className="w-5 h-5" />
+            Add Integration
+          </button>
+        </div>
+
+        {/* Integrations Grid */}
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+          {integrations.map((integration: Integration, idx: number) => (
+            <div
+              key={idx}
+              className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6"
+            >
+              <div className="flex items-start justify-between mb-4">
+                <div>
+                  <h3 className="text-lg font-semibold text-gray-900 dark:text-white">
+                    {integration.name}
+                  </h3>
+                  <p className="text-sm text-gray-600 dark:text-gray-400">
+                    {integration.vendor}
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <div
+                    className={clsx(
+                      'w-3 h-3 rounded-full',
+                      integration.status === 'connected'
+                        ? 'bg-green-500'
+                        : integration.status === 'error'
+                          ? 'bg-red-500'
+                          : 'bg-gray-400'
+                    )}
+                  />
+                </div>
+              </div>
+
+              <div className="mb-4">
+                <span
+                  className={clsx(
+                    'inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium border',
+                    integrationTypeColors[integration.type] || 'bg-gray-100 text-gray-700'
+                  )}
+                >
+                  {integration.type}
+                </span>
+              </div>
+
+              <div className="mb-4">
+                <h4 className="text-sm font-semibold text-gray-900 dark:text-white mb-2">
+                  Capabilities
+                </h4>
+                <div className="flex flex-wrap gap-1">
+                  {integration.capabilities.map((cap, capIdx) => (
+                    <span
+                      key={capIdx}
+                      className="inline-flex items-center px-2 py-1 rounded text-xs bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300"
+                    >
+                      {cap}
+                    </span>
+                  ))}
+                </div>
+              </div>
+
+              <div className="mb-4 pb-4 border-b border-gray-200 dark:border-gray-700">
+                <p className="text-xs text-gray-600 dark:text-gray-400">
+                  Last health check: {integration.last_health_check}
+                </p>
+              </div>
+
+              <button className="w-full px-3 py-2 bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 text-gray-900 dark:text-white rounded-lg font-medium transition text-sm">
+                Test Connection
+              </button>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  };
+
+  const renderLoading = () => (
+    <div className="flex items-center justify-center h-96">
+      <div className="text-center">
+        <Loader className="w-12 h-12 animate-spin text-blue-600 mx-auto mb-4" />
+        <p className="text-gray-600 dark:text-gray-400">Loading...</p>
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="min-h-screen bg-gray-50 dark:bg-gray-900">
+      <div className="px-4 sm:px-6 lg:px-8 py-8">
+        {/* Header */}
+        <div className="mb-8">
+          <div className="flex items-center gap-3 mb-2">
+            <Wrench className="w-8 h-8 text-blue-600" />
+            <h1 className="text-3xl font-bold text-gray-900 dark:text-white">
+              Automated Remediation Engine
+            </h1>
+          </div>
+          <p className="text-gray-600 dark:text-gray-400">
+            Manage policies, executions, and automated response actions
+          </p>
+        </div>
+
+        {/* Tabs */}
+        <div className="mb-6">
+          <div className="flex flex-wrap gap-2 border-b border-gray-200 dark:border-gray-700">
+            {tabs.map((tab) => (
+              <button
+                key={tab.id}
+                onClick={() => setActiveTab(tab.id)}
+                className={clsx(
+                  'px-4 py-2 font-medium border-b-2 transition-colors whitespace-nowrap',
+                  activeTab === tab.id
+                    ? 'border-blue-600 text-blue-600'
+                    : 'border-transparent text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-white'
+                )}
+              >
+                {tab.label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* Tab Content */}
+        <div>
+          {activeTab === 'dashboard' && renderDashboard()}
+          {activeTab === 'policies' && renderPolicies()}
+          {activeTab === 'executions' && renderExecutions()}
+          {activeTab === 'quick-actions' && renderQuickActions()}
+          {activeTab === 'integrations' && renderIntegrations()}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function LoadingState() {
+  return (
+    <div className="flex items-center justify-center h-96">
+      <div className="text-center">
+        <Loader className="w-12 h-12 animate-spin text-blue-600 mx-auto mb-4" />
+        <p className="text-gray-600 dark:text-gray-400">Loading...</p>
+      </div>
+    </div>
+  );
+}

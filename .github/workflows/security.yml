@@ -1,0 +1,74 @@
+name: Security Scanning
+
+on:
+  schedule:
+    - cron: '0 0 * * 0'  # Weekly on Sunday
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  container-scan:
+    name: Container Scanning
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker image
+        run: docker build -t pysoar-backend:scan .
+
+      - name: Run Trivy scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'pysoar-backend:scan'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+      - name: Upload Trivy results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+          category: 'trivy'
+
+  dependency-scan:
+    name: Dependency Vulnerability Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pip-audit
+
+      - name: Run pip-audit
+        run: pip-audit -r requirements.txt --format json --output pip-audit-results.json || true
+
+      - name: Run safety check
+        run: safety check -r requirements.txt --json --output safety-results.json || true
+
+      - name: Upload pip-audit results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: pip-audit-results
+          path: pip-audit-results.json
+
+      - name: Upload safety results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: safety-results
+          path: safety-results.json

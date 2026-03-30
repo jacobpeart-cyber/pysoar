@@ -1,0 +1,47 @@
+title: Privilege Escalation Indicators
+id: 550e8400-e29b-41d4-a716-446655440003
+status: active
+description: Detects multiple privilege escalation indicators including sudo abuse, admin group modifications, and UAC bypass attempts
+author: PySOAR
+severity: critical
+logtypes:
+  - endpoint
+  - system
+detection:
+  selection_sudo:
+    event_type: process_execution
+    command_line|contains:
+      - "sudo "
+      - "sudo_user"
+    user: "!root"
+  selection_admin_group:
+    event_type: group_modification
+    target_group: "Administrators"
+    action: "add_member"
+  selection_uac_bypass:
+    event_type: process_execution
+    command_line|re: "(bypassUAC|EventVwer|Fodhelper|Compfiles|Slui|slui.exe|compmgmt.msc)"
+  selection_registry_run:
+    event_type: registry_modification
+    registry_path|contains:
+      - "Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+      - "Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce"
+  condition: "selection_sudo or selection_admin_group or selection_uac_bypass or selection_registry_run"
+  timewindow: 600
+mitre:
+  tactics:
+    - TA0004
+  techniques:
+    - T1548
+falsepositives:
+  - Legitimate administrative password changes and user management
+  - System administrator performing maintenance tasks
+  - Scheduled privileged operations by service accounts
+  - Enterprise monitoring agents that require elevated permissions
+tags:
+  - attack.privilege_escalation
+  - attack.defense_evasion
+  - detection.lateral_movement
+references:
+  - https://attack.mitre.org/tactics/TA0004/
+  - https://attack.mitre.org/techniques/T1548/

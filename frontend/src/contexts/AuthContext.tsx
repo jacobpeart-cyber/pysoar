@@ -1,5 +1,5 @@
 import { createContext, useContext, useState, useEffect, ReactNode } from 'react';
-import { authApi } from '../lib/api';
+import { authApi, apiClient } from '../api';
 
 interface User {
   id: string;
@@ -16,50 +16,53 @@ interface AuthContextType {
   isLoading: boolean;
   isAuthenticated: boolean;
   login: (email: string, password: string) => Promise<void>;
-  logout: () => void;
+  logout: () => Promise<void>;
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
-  const [token, setToken] = useState<string | null>(localStorage.getItem('access_token'));
+  const [token, setToken] = useState<string | null>(apiClient.getToken());
   const [isLoading, setIsLoading] = useState(true);
 
   useEffect(() => {
-    const storedToken = localStorage.getItem('access_token');
-    if (storedToken) {
-      authApi.me()
-        .then((userData) => {
+    const initializeAuth = async () => {
+      const storedToken = apiClient.getToken();
+      if (storedToken && !apiClient.isTokenExpired()) {
+        try {
+          const userData = await authApi.getProfile();
           setUser(userData);
-        })
-        .catch(() => {
-          localStorage.removeItem('access_token');
-          localStorage.removeItem('refresh_token');
+        } catch (error) {
+          apiClient.clearToken();
           setToken(null);
-        })
-        .finally(() => {
-          setIsLoading(false);
-        });
-    } else {
+        }
+      }
       setIsLoading(false);
-    }
+    };
+
+    initializeAuth();
   }, []);
 
   const login = async (email: string, password: string) => {
-    const response = await authApi.login(email, password);
-    localStorage.setItem('access_token', response.access_token);
-    localStorage.setItem('refresh_token', response.refresh_token);
-    setToken(response.access_token);
-    const userData = await authApi.me();
-    setUser(userData);
+    try {
+      const response = await authApi.login(email, password);
+      setToken(response.access_token);
+      setUser(response.user);
+    } catch (error) {
+      apiClient.clearToken();
+      throw error;
+    }
   };
 
-  const logout = () => {
-    localStorage.removeItem('access_token');
-    localStorage.removeItem('refresh_token');
-    setUser(null);
-    setToken(null);
+  const logout = async () => {
+    try {
+      await authApi.logout();
+    } finally {
+      apiClient.clearToken();
+      setUser(null);
+      setToken(null);
+    }
   };
 
   return (
