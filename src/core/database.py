@@ -68,9 +68,17 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 async def init_db() -> None:
     """Initialize the database (create tables)"""
     from src.models.base import Base
+    import sqlalchemy.exc
 
-    async with engine.begin() as conn:
-        await conn.run_sync(lambda conn: Base.metadata.create_all(conn, checkfirst=True))
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+    except sqlalchemy.exc.ProgrammingError as e:
+        if "already exists" in str(e):
+            # Tables/indexes already exist — ignore, schema is up to date
+            pass
+        else:
+            raise
 
 
 async def close_db() -> None:
