@@ -12,7 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Body
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
-from src.api.dependencies import get_current_user, get_db_session
+from src.api.deps import CurrentUser, DatabaseSession
 from src.core.logging import get_logger
 from src.stig.engine import STIGScanner, STIGRemediator, STIGLibrary, SCAPEngine
 from src.stig.models import STIGBenchmark, STIGRule, STIGScanResult, SCAPProfile

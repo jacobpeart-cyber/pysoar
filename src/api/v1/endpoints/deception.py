@@ -10,7 +10,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.dependencies import get_db, get_current_user
+from src.api.deps import CurrentUser, DatabaseSession
 from src.core.logging import get_logger
 from src.deception.engine import (
     DecoyManager,
