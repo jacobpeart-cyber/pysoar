@@ -14,7 +14,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from src.api.deps import CurrentUser, DatabaseSession
+from src.api.deps import DatabaseSession, CurrentUser, DatabaseSession
 from src.models.case import (
     AttachmentType,
     CaseAttachment,
