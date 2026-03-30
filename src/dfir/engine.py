@@ -3,7 +3,7 @@
 import hashlib
 import json
 from datetime import datetime, timezone, timedelta
-from typing import Optional, Any, dict, list
+from typing import Optional, Any
 from abc import ABC, abstractmethod
 
 from src.core.logging import get_logger
