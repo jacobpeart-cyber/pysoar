@@ -153,7 +153,7 @@ class SoftwareComponent(BaseModel):
     # Relationships
     parent_component: Mapped[Optional["SoftwareComponent"]] = relationship(
         "SoftwareComponent",
-        remote_side=[__table__.c.id],
+        remote_side="SoftwareComponent.id",
         back_populates="child_components",
         foreign_keys=[parent_component_id],
     )
