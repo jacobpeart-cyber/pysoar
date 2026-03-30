@@ -44,7 +44,7 @@ async def login(
     lockout_manager = AccountLockoutManager(redis)
 
     # Check if account is locked
-    is_locked, seconds_remaining = lockout_manager.check_lockout(request.email)
+    is_locked, seconds_remaining = await lockout_manager.check_lockout(request.email)
     if is_locked:
         logger.warning(f"Login attempt on locked account: {request.email}")
         raise HTTPException(
@@ -58,7 +58,7 @@ async def login(
 
     if not user:
         # Record failed attempt
-        attempts_remaining, is_now_locked = lockout_manager.record_failed_attempt(
+        attempts_remaining, is_now_locked = await lockout_manager.record_failed_attempt(
             request.email
         )
         logger.warning(
@@ -71,7 +71,7 @@ async def login(
         )
 
     # Reset failed attempts on successful authentication
-    lockout_manager.reset_attempts(request.email)
+    await lockout_manager.reset_attempts(request.email)
 
     # Check if user must change password
     if getattr(user, "force_password_change", False):
