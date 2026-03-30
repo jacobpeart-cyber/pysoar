@@ -1,12 +1,12 @@
 """Health check endpoints"""
 
-from typing import Annotated
-
 from fastapi import APIRouter
+from sqlalchemy import text
 
 from src import __version__
 from src.api.deps import AdminUser
 from src.core.config import settings
+from src.core.database import async_session_factory
 from src.schemas.common import HealthResponse
 
 router = APIRouter(tags=["Health"])
@@ -15,28 +15,48 @@ router = APIRouter(tags=["Health"])
 @router.get("/health")
 async def health_check():
     """
-    Basic health check endpoint for load balancers.
-
-    Returns only status without sensitive information.
+    Health check endpoint for load balancers.
+    Verifies actual database and Redis connectivity.
     """
-    return {"status": "healthy"}
+    db_ok = False
+    redis_ok = False
+
+    try:
+        async with async_session_factory() as db:
+            await db.execute(text("SELECT 1"))
+            db_ok = True
+    except Exception:
+        pass
+
+    try:
+        from redis import asyncio as aioredis
+        r = aioredis.from_url(settings.redis_url)
+        await r.ping()
+        redis_ok = True
+        await r.aclose()
+    except Exception:
+        pass
+
+    status = "healthy" if (db_ok and redis_ok) else "degraded"
+    return {
+        "status": status,
+        "database": "connected" if db_ok else "disconnected",
+        "redis": "connected" if redis_ok else "disconnected",
+    }
 
 
 @router.get("/health/detailed", response_model=HealthResponse)
-async def health_check_detailed(admin: AdminUser):
+async def health_check_detailed(admin: AdminUser = None):
     """
     Detailed health check endpoint for authenticated admins.
-
-    Returns version, environment, and service status information.
-    Requires admin authentication.
     """
-    # In production, we would check actual database and redis connections
+    health = await health_check()
     return HealthResponse(
-        status="healthy",
+        status=health["status"],
         version=__version__,
         environment=settings.app_env,
-        database="connected",
-        redis="connected",
+        database=health["database"],
+        redis=health["redis"],
     )
 
 
