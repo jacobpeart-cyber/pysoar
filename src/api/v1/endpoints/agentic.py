@@ -31,6 +31,7 @@ from src.schemas.agentic import (
     SOCAgentListResponse,
     SOCAgentPerformance,
     InvestigationCreate,
+    InvestigationUpdate,
     InvestigationResponse,
     InvestigationListResponse,
     InvestigationFeedback,
