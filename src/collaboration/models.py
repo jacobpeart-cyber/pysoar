@@ -227,14 +227,7 @@ class WarRoomMessage(BaseModel):
     )
     replies: Mapped[list["WarRoomMessage"]] = relationship(
         "WarRoomMessage",
-        remote_side=[id],
-        back_populates="parent_message",
-        cascade="all, delete-orphan",
-    )
-    parent_message: Mapped[Optional["WarRoomMessage"]] = relationship(
-        "WarRoomMessage",
-        back_populates="replies",
-        remote_side=[parent_message_id],
+        foreign_keys="[WarRoomMessage.parent_message_id]",
     )
 
     def __repr__(self) -> str:
