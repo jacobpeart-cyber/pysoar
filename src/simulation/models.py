@@ -5,6 +5,7 @@ Defines schemas for simulations, techniques, tests, adversary profiles,
 and security posture scoring.
 """
 
+from datetime import datetime
 from typing import Optional
 from sqlalchemy import String, Text, Integer, Float, Boolean, DateTime, JSON, ForeignKey
 from sqlalchemy.orm import Mapped, mapped_column
