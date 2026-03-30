@@ -16,7 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.logging import get_logger
 from src.api.deps import get_current_active_user as get_current_user
-from src.db.session import get_db
+from src.core.database import get_db
 from src.schemas.privacy import (
     DataSubjectRequestCreate,
     DataSubjectRequestUpdate,
