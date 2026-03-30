@@ -72,8 +72,8 @@ router = APIRouter(prefix="/compliance", tags=["compliance"])
 
 @router.get("/frameworks", response_model=List[ComplianceFrameworkResponse])
 async def list_frameworks(
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
     status: Optional[str] = None,
@@ -107,8 +107,8 @@ async def list_frameworks(
 @router.get("/frameworks/{framework_id}", response_model=ComplianceFrameworkResponse)
 async def get_framework(
     framework_id: str,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Get framework details with control summary."""
     stmt = select(ComplianceFramework).where(
@@ -129,8 +129,8 @@ async def get_framework(
 @router.post("/frameworks/{framework_id}/assess", response_model=FrameworkAssessmentResponse)
 async def trigger_assessment(
     framework_id: str,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """
     Trigger full compliance assessment for framework.
@@ -162,8 +162,8 @@ async def trigger_assessment(
 @router.get("/frameworks/{framework_id}/gaps", response_model=ControlGapAnalysisResponse)
 async def get_control_gaps(
     framework_id: str,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """
     Get control implementation gaps for framework.
@@ -205,8 +205,8 @@ async def get_control_gaps(
 @router.get("/frameworks/{framework_id}/ssp", response_model=SSPGenerationResponse)
 async def generate_ssp(
     framework_id: str,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """
     Generate System Security Plan (SSP) for framework.
@@ -234,8 +234,8 @@ async def generate_ssp(
 @router.get("/frameworks/{framework_id}/report")
 async def get_framework_report(
     framework_id: str,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Get comprehensive framework compliance report."""
     stmt = select(ComplianceFramework).where(
@@ -270,8 +270,8 @@ async def get_framework_report(
 @router.post("/frameworks/{framework_id}/conmon")
 async def run_continuous_monitoring(
     framework_id: str,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """
     Run FedRAMP Continuous Monitoring (ConMon) checks.
@@ -307,8 +307,8 @@ async def run_continuous_monitoring(
 
 @router.get("/controls", response_model=List[ComplianceControlResponse])
 async def list_controls(
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     framework_id: Optional[str] = None,
     family: Optional[str] = None,
     status: Optional[str] = None,
@@ -348,8 +348,8 @@ async def list_controls(
 @router.get("/controls/{control_id}", response_model=ComplianceControlResponse)
 async def get_control(
     control_id: str,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Get control details with evidence."""
     stmt = select(ComplianceControl).where(
@@ -371,8 +371,8 @@ async def get_control(
 async def update_control(
     control_id: str,
     req: ControlStatusUpdateRequest,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Update control implementation status."""
     stmt = select(ComplianceControl).where(
@@ -404,8 +404,8 @@ async def update_control(
 @router.post("/controls/{control_id}/assess")
 async def run_control_assessment(
     control_id: str,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Run automated check for specific control."""
     stmt = select(ComplianceControl).where(
@@ -428,10 +428,10 @@ async def run_control_assessment(
 
 @router.get("/controls/cross-map")
 async def cross_map_controls(
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     source_framework_id: str = Query(...),
     target_framework_id: str = Query(...),
-    user=Depends(get_current_user),
+    current_user: CurrentUser = None,
 ):
     """Get cross-framework control mapping."""
     engine = ComplianceEngine(db, user.organization_id)
@@ -447,8 +447,8 @@ async def cross_map_controls(
 
 @router.get("/poams", response_model=List[POAMResponse])
 async def list_poams(
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     status: Optional[str] = None,
     risk_level: Optional[str] = None,
     overdue_only: bool = False,
@@ -489,8 +489,8 @@ async def list_poams(
 @router.post("/poams", response_model=POAMResponse)
 async def create_poam(
     req: POAMCreateRequest,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Create new POA&M."""
     poam = POAM(
@@ -515,8 +515,8 @@ async def create_poam(
 @router.get("/poams/{poam_id}", response_model=POAMResponse)
 async def get_poam(
     poam_id: str,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Get POA&M details."""
     stmt = select(POAM).where(
@@ -538,8 +538,8 @@ async def get_poam(
 async def update_poam(
     poam_id: str,
     req: POAMUpdateRequest,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Update POA&M."""
     stmt = select(POAM).where(
@@ -575,8 +575,8 @@ async def update_poam(
 
 @router.get("/poams/overdue")
 async def get_overdue_poams(
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Get overdue POA&Ms."""
     now = datetime.utcnow()
@@ -595,8 +595,8 @@ async def get_overdue_poams(
 
 @router.get("/poams/report")
 async def get_poam_report(
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Get POA&M summary report."""
     stmt = select(POAM).where(POAM.organization_id == user.organization_id)
@@ -624,8 +624,8 @@ async def get_poam_report(
 
 @router.get("/evidence", response_model=List[ComplianceEvidenceResponse])
 async def list_evidence(
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     control_id_ref: Optional[str] = None,
     evidence_type: Optional[str] = None,
     review_status: Optional[str] = None,
@@ -656,11 +656,11 @@ async def upload_evidence(
     control_id_ref: str,
     evidence_type: str,
     title: str,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     description: Optional[str] = None,
     content: Optional[str] = None,
     file_path: Optional[str] = None,
-    user=Depends(get_current_user),
+    current_user: CurrentUser = None,
 ):
     """Upload compliance evidence."""
     evidence = ComplianceEvidence(
@@ -684,8 +684,8 @@ async def upload_evidence(
 @router.get("/evidence/{evidence_id}", response_model=ComplianceEvidenceResponse)
 async def get_evidence(
     evidence_id: str,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Get evidence details."""
     stmt = select(ComplianceEvidence).where(
@@ -708,8 +708,8 @@ async def review_evidence(
     evidence_id: str,
     review_status: str,
     reviewed_by: str,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Review and approve evidence."""
     stmt = select(ComplianceEvidence).where(
@@ -741,8 +741,8 @@ async def review_evidence(
 
 @router.get("/cui", response_model=List[CUIMarkingResponse])
 async def list_cui_markings(
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     active_only: bool = True,
 ):
     """List CUI markings."""
@@ -762,8 +762,8 @@ async def list_cui_markings(
 @router.post("/cui", response_model=CUIMarkingResponse)
 async def mark_cui(
     req: CUIMarkingRequest,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Mark asset as CUI."""
     marking = CUIMarking(
@@ -789,8 +789,8 @@ async def mark_cui(
 async def update_cui_marking(
     marking_id: str,
     req: CUIMarkingRequest,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Update CUI marking."""
     stmt = select(CUIMarking).where(
@@ -820,8 +820,8 @@ async def update_cui_marking(
 
 @router.get("/cui/audit")
 async def audit_cui_handling(
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """CUI handling compliance audit."""
     stmt = select(CUIMarking).where(
@@ -850,8 +850,8 @@ async def audit_cui_handling(
 
 @router.get("/cisa/directives", response_model=List[CISADirectiveResponse])
 async def list_cisa_directives(
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     active_only: bool = True,
 ):
     """List CISA BODs and Emergency Directives."""
@@ -871,8 +871,8 @@ async def list_cisa_directives(
 @router.get("/cisa/directives/{directive_id}", response_model=CISADirectiveResponse)
 async def get_cisa_directive(
     directive_id: str,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Get CISA directive details."""
     stmt = select(CISADirective).where(
@@ -893,8 +893,8 @@ async def get_cisa_directive(
 @router.post("/cisa/directives/{directive_id}/check")
 async def check_cisa_compliance(
     directive_id: str,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Check compliance with specific CISA directive."""
     stmt = select(CISADirective).where(
@@ -926,8 +926,8 @@ async def check_cisa_compliance(
 
 @router.get("/dashboard", response_model=ComplianceDashboardStats)
 async def get_dashboard_stats(
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Get compliance dashboard statistics."""
     # Frameworks
@@ -1036,8 +1036,8 @@ async def get_dashboard_stats(
 
 @router.get("/score-history")
 async def get_score_history(
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     framework_id: Optional[str] = None,
     days: int = Query(90, ge=1, le=365),
 ):
