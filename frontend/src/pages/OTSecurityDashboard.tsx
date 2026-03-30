@@ -1,30 +1,12 @@
-'use client';
+import React from 'react';
 
-import React, { useState } from 'react';
-import {
-  Cpu,
-  Factory,
-  Layers,
-  ShieldAlert,
-  Zap,
-  AlertTriangle,
-  Clock,
-  CheckCircle,
-  X,
-  Activity,
-} from 'lucide-react';
-import {
-  BarChart,
-  Bar,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Tooltip,
-  ResponsiveContainer,
-  LineChart,
-  Line,
-} from 'recharts';
-import clsx from 'clsx';
-import { otsecurityApi } from '../api/endpoints';
+function OTSecurityDashboard() {
+  return (
+    <div className="p-6">
+      <h1 className="text-2xl font-bold mb-4">OT Security</h1>
+      <p className="text-gray-600">Operational technology security monitoring.</p>
+    </div>
+  );
+}
 
 export default OTSecurityDashboard;

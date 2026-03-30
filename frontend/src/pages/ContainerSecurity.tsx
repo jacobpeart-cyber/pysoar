@@ -1,33 +1,12 @@
-'use client';
+import React from 'react';
 
-import React, { useState } from 'react';
-import {
-  Container,
-  Server,
-  Shield,
-  AlertTriangle,
-  FileCode,
-  Search,
-  CheckCircle2,
-  AlertCircle,
-  X,
-  Edit2,
-  Copy,
-} from 'lucide-react';
-import {
-  BarChart,
-  Bar,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Tooltip,
-  ResponsiveContainer,
-  HeatmapChart,
-  ScatterChart,
-  Scatter,
-  Cell,
-} from 'recharts';
-import clsx from 'clsx';
-import { containerApi } from '../api/endpoints';
+function ContainerSecurity() {
+  return (
+    <div className="p-6">
+      <h1 className="text-2xl font-bold mb-4">Container Security</h1>
+      <p className="text-gray-600">Container security monitoring and policy enforcement.</p>
+    </div>
+  );
+}
 
 export default ContainerSecurity;

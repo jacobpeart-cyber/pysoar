@@ -1,30 +1,12 @@
-'use client';
+import React from 'react';
 
-import React, { useState } from 'react';
-import {
-  Calculator,
-  TrendingUp,
-  Shield,
-  DollarSign,
-  BarChart3,
-  Edit2,
-  AlertCircle,
-  CheckCircle2,
-  X,
-} from 'lucide-react';
-import {
-  LineChart,
-  Line,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Tooltip,
-  ResponsiveContainer,
-  ScatterChart,
-  Scatter,
-  Cell,
-} from 'recharts';
-import clsx from 'clsx';
-import { riskquantApi } from '../api/endpoints';
+function RiskQuantification() {
+  return (
+    <div className="p-6">
+      <h1 className="text-2xl font-bold mb-4">Risk Quantification</h1>
+      <p className="text-gray-600">FAIR-based risk analysis and quantification.</p>
+    </div>
+  );
+}
 
 export default RiskQuantification;
