@@ -48,7 +48,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     try {
       const response = await authApi.login(email, password);
       setToken(response.access_token);
-      setUser(response.user);
+      // Fetch user profile since login response may not include user data
+      const userData = await authApi.getProfile();
+      setUser(userData);
     } catch (error) {
       apiClient.clearToken();
       throw error;
