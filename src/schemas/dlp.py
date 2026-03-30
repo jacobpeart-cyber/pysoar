@@ -188,7 +188,7 @@ class DataClassificationBase(BaseModel):
     encryption_required: bool = False
     dlp_policies: Optional[list[str]] = None
     auto_classification_rules: Optional[dict[str, Any]] = None
-    color_code: Optional[str] = Field(None, regex=r"^#[0-9A-Fa-f]{6}$")
+    color_code: Optional[str] = Field(None, pattern=r"^#[0-9A-Fa-f]{6}$")
 
 
 class DataClassificationCreate(DataClassificationBase):
@@ -208,7 +208,7 @@ class DataClassificationUpdate(BaseModel):
     encryption_required: Optional[bool] = None
     dlp_policies: Optional[list[str]] = None
     auto_classification_rules: Optional[dict[str, Any]] = None
-    color_code: Optional[str] = Field(None, regex=r"^#[0-9A-Fa-f]{6}$")
+    color_code: Optional[str] = Field(None, pattern=r"^#[0-9A-Fa-f]{6}$")
 
 
 class DataClassificationResponse(DataClassificationBase):

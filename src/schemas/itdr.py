@@ -79,7 +79,7 @@ class IdentityThreatBase(BaseModel):
     """Base identity threat schema"""
 
     threat_type: str
-    severity: str = Field(..., regex="^(critical|high|medium|low)$")
+    severity: str = Field(..., pattern="^(critical|high|medium|low)$")
     confidence_score: float = Field(0.0, ge=0.0, le=100.0)
     source_ip: Optional[str] = None
     source_location: Optional[str] = None
@@ -187,7 +187,7 @@ class CredentialRemediationRequest(BaseModel):
     """Schema for credential remediation request"""
 
     exposure_ids: list[str]
-    remediation_type: str = Field(..., regex="^(password_reset|token_revoke|key_rotation)$")
+    remediation_type: str = Field(..., pattern="^(password_reset|token_revoke|key_rotation)$")
     require_approval: bool = True
     justification: str
 
@@ -336,7 +336,7 @@ class PrivilegedAccessAuditRequest(BaseModel):
     """Schema for privileged access audit request"""
 
     organization_id: str
-    audit_scope: str = Field(default="all", regex="^(all|elevation_requests|jit_access)$")
+    audit_scope: str = Field(default="all", pattern="^(all|elevation_requests|jit_access)$")
     include_service_accounts: bool = False
     start_date: Optional[str] = None
     end_date: Optional[str] = None
