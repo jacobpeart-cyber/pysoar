@@ -12,7 +12,7 @@ from src.playbook_builder.engine import (
 )
 from src.playbook_builder.models import (
     PlaybookEdge,
-    PlaybookExecution,
+    VisualPlaybookExecution,
     PlaybookNode,
     PlaybookNodeExecution,
     VisualPlaybook,
@@ -22,7 +22,7 @@ __all__ = [
     "VisualPlaybook",
     "PlaybookNode",
     "PlaybookEdge",
-    "PlaybookExecution",
+    "VisualPlaybookExecution",
     "PlaybookNodeExecution",
     "PlaybookDesigner",
     "PlaybookExecutionEngine",

@@ -16,7 +16,7 @@ from src.playbook_builder.models import (
     NodeExecutionStatus,
     NodeType,
     PlaybookEdge,
-    PlaybookExecution,
+    VisualPlaybookExecution,
     PlaybookNode,
     PlaybookNodeExecution,
     TriggerType,
@@ -405,9 +405,9 @@ class PlaybookExecutionEngine:
         playbook: VisualPlaybook,
         trigger_event: Optional[dict] = None,
         variables: Optional[dict] = None,
-    ) -> PlaybookExecution:
+    ) -> VisualPlaybookExecution:
         """Execute a playbook"""
-        execution = PlaybookExecution(
+        execution = VisualPlaybookExecution(
             playbook_id=playbook.id,
             organization_id=playbook.organization_id,
             trigger_event=json.dumps(trigger_event) if trigger_event else None,
@@ -466,7 +466,7 @@ class PlaybookExecutionEngine:
     async def execute_node(
         self,
         node: PlaybookNode,
-        execution: PlaybookExecution,
+        execution: VisualPlaybookExecution,
         variables: dict,
     ) -> PlaybookNodeExecution:
         """Execute a single node"""

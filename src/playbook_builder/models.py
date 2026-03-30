@@ -165,8 +165,8 @@ class VisualPlaybook(BaseModel):
         back_populates="playbook",
         cascade="all, delete-orphan",
     )
-    executions: Mapped[list["PlaybookExecution"]] = relationship(
-        "PlaybookExecution",
+    executions: Mapped[list["VisualPlaybookExecution"]] = relationship(
+        "VisualPlaybookExecution",
         back_populates="playbook",
         cascade="all, delete-orphan",
     )
@@ -268,7 +268,7 @@ class PlaybookEdge(BaseModel):
         return f"<PlaybookEdge {self.source_node_id}->{self.target_node_id}>"
 
 
-class PlaybookExecution(BaseModel):
+class VisualPlaybookExecution(BaseModel):
     """Execution record of a visual playbook"""
 
     __tablename__ = "visual_playbook_executions"
@@ -324,7 +324,7 @@ class PlaybookExecution(BaseModel):
     )
 
     def __repr__(self) -> str:
-        return f"<PlaybookExecution {self.id}:{self.status}>"
+        return f"<VisualPlaybookExecution {self.id}:{self.status}>"
 
 
 class PlaybookNodeExecution(BaseModel):
@@ -368,8 +368,8 @@ class PlaybookNodeExecution(BaseModel):
     approved_by: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
 
     # Relationships
-    execution: Mapped["PlaybookExecution"] = relationship(
-        "PlaybookExecution",
+    execution: Mapped["VisualPlaybookExecution"] = relationship(
+        "VisualPlaybookExecution",
         back_populates="node_executions",
     )
     node: Mapped["PlaybookNode"] = relationship(
