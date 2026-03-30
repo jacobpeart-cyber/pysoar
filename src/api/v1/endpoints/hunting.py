@@ -300,12 +300,7 @@ async def activate_hypothesis(
 
 
 @router.post("/sessions", response_model=HuntSessionResponse, status_code=status.HTTP_201_CREATED)
-async def create_session(
-    session_data: HuntSessionCreate,
-    current_user: CurrentUser = None,
-    db: DatabaseSession = None,
-    background_tasks: BackgroundTasks,
-):
+async def create_session(session_data: HuntSessionCreate, current_user: CurrentUser = None, db: DatabaseSession = None, background_tasks: BackgroundTasks = None):
     """Create and start a hunt session"""
     hypothesis = await get_hypothesis_or_404(db, session_data.hypothesis_id)
 

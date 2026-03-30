@@ -47,11 +47,7 @@ async def list_users(
 
 
 @router.post("", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-async def create_user(
-    user_data: UserCreate,
-    current_user: AdminUser,
-    db: DatabaseSession = None,
-):
+async def create_user(user_data: UserCreate, current_user: AdminUser = None, db: DatabaseSession = None):
     """Create a new user (admin only)"""
     user_service = UserService(db)
 
@@ -137,11 +133,7 @@ async def update_user(
 
 
 @router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_user(
-    user_id: str,
-    current_user: AdminUser,
-    db: DatabaseSession = None,
-):
+async def delete_user(user_id: str, current_user: AdminUser = None, db: DatabaseSession = None):
     """Delete a user (admin only)"""
     # Prevent self-deletion
     if user_id == current_user.id:

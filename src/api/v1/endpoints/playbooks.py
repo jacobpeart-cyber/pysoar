@@ -138,11 +138,7 @@ async def list_playbooks(
 
 
 @router.post("", response_model=PlaybookResponse, status_code=status.HTTP_201_CREATED)
-async def create_playbook(
-    playbook_data: PlaybookCreate,
-    current_user: AdminUser,
-    db: DatabaseSession = None,
-):
+async def create_playbook(playbook_data: PlaybookCreate, current_user: AdminUser = None, db: DatabaseSession = None):
     """Create a new playbook (admin only)"""
     playbook = Playbook(
         name=playbook_data.name,
@@ -178,12 +174,7 @@ async def get_playbook(
 
 
 @router.patch("/{playbook_id}", response_model=PlaybookResponse)
-async def update_playbook(
-    playbook_id: str,
-    playbook_data: PlaybookUpdate,
-    current_user: AdminUser,
-    db: DatabaseSession = None,
-):
+async def update_playbook(playbook_id: str, playbook_data: PlaybookUpdate, current_user: AdminUser = None, db: DatabaseSession = None):
     """Update a playbook (admin only)"""
     playbook = await get_playbook_or_404(db, playbook_id)
 
@@ -213,11 +204,7 @@ async def update_playbook(
 
 
 @router.delete("/{playbook_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_playbook(
-    playbook_id: str,
-    current_user: AdminUser,
-    db: DatabaseSession = None,
-):
+async def delete_playbook(playbook_id: str, current_user: AdminUser = None, db: DatabaseSession = None):
     """Delete a playbook (admin only)"""
     playbook = await get_playbook_or_404(db, playbook_id)
     await db.delete(playbook)
@@ -225,13 +212,7 @@ async def delete_playbook(
 
 
 @router.post("/{playbook_id}/execute", response_model=PlaybookExecutionResponse)
-async def execute_playbook(
-    playbook_id: str,
-    execute_data: PlaybookExecuteRequest,
-    current_user: CurrentUser = None,
-    db: DatabaseSession = None,
-    background_tasks: BackgroundTasks,
-):
+async def execute_playbook(playbook_id: str, execute_data: PlaybookExecuteRequest, current_user: CurrentUser = None, db: DatabaseSession = None, background_tasks: BackgroundTasks = None):
     """Execute a playbook"""
     playbook = await get_playbook_or_404(db, playbook_id)
 
