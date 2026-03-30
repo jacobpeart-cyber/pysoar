@@ -3,16 +3,7 @@
 from enum import Enum
 from typing import Optional
 
-from sqlalchemy import (, BigInteger, Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text
-    BigInteger,
-    Boolean,
-    DateTime,
-    Float,
-    ForeignKey,
-    Integer,
-    String,
-    Text,
-)
+from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text
 from sqlalchemy.dialects.postgresql import JSON
 from sqlalchemy.orm import Mapped, mapped_column
 

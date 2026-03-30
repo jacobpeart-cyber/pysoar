@@ -7,16 +7,7 @@ and automated collection rules for compliance audit support.
 
 from datetime import datetime
 from typing import Any, Optional
-from sqlalchemy import (, Boolean, DateTime, ForeignKey, Index, Integer, JSON, String, Text
-    String,
-    Integer,
-    Text,
-    DateTime,
-    Boolean,
-    JSON,
-    Index,
-    ForeignKey,
-)
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, Integer, JSON, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.models.base import BaseModel, utc_now

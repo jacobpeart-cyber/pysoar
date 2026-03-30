@@ -9,18 +9,7 @@ Supports Purdue model hierarchical segmentation and NERC-CIP / IEC 62443 complia
 
 from datetime import datetime
 from typing import Dict, Any, Optional, List
-from sqlalchemy import (, Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
-    String,
-    Integer,
-    Float,
-    Text,
-    DateTime,
-    Boolean,
-    JSON,
-    Index,
-    ForeignKey,
-    UniqueConstraint,
-)
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.models.base import BaseModel, utc_now
