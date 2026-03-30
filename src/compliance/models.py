@@ -7,18 +7,7 @@ Supports multi-tenant compliance tracking with full audit trail.
 
 from datetime import datetime
 from typing import List, Dict, Any, Optional
-from sqlalchemy import (, Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
-    String,
-    Integer,
-    Float,
-    Text,
-    DateTime,
-    Boolean,
-    JSON,
-    Index,
-    ForeignKey,
-    UniqueConstraint,
-)
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.models.base import Base, BaseModel, utc_now

@@ -3,17 +3,7 @@
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import (, Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text
-    Boolean,
-    DateTime,
-    Float,
-    Integer,
-    JSON,
-    String,
-    Text,
-    Index,
-    ForeignKey,
-)
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.models.base import BaseModel, utc_now

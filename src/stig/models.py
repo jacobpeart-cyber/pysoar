@@ -7,17 +7,7 @@ and SCAP profile management. Supports comprehensive compliance automation.
 
 from datetime import datetime
 from typing import Any, Optional
-from sqlalchemy import (, Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text
-    String,
-    Integer,
-    Float,
-    Text,
-    DateTime,
-    Boolean,
-    JSON,
-    Index,
-    ForeignKey,
-)
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.models.base import BaseModel, utc_now
