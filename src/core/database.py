@@ -4,8 +4,7 @@ from typing import AsyncGenerator
 
 from sqlalchemy import event, pool, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
-from sqlalchemy.pool import NullPool
-from sqlalchemy.ext.asyncio import AsyncAdaptedQueuePool
+from sqlalchemy.pool import NullPool, AsyncAdaptedQueuePool
 
 from src.core.config import settings
 
