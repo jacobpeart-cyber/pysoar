@@ -69,7 +69,7 @@ class ComplianceFramework(BaseModel):
     )  # FedRAMP High, CMMC Level 2, IL4, etc.
 
     is_enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
-    metadata: Mapped[Dict[str, Any]] = mapped_column(JSON, default={})
+    extra_metadata: Mapped[Dict[str, Any]] = mapped_column(JSON, default={})
 
     organization_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("organizations.id"), nullable=False, index=True

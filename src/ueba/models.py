@@ -70,7 +70,7 @@ class EntityProfile(BaseModel):
     tags: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
     """Custom tags for categorization"""
 
-    metadata: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    extra_metadata: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
     """Additional metadata"""
 
     organization_id: Mapped[str] = mapped_column(String(36), ForeignKey("organizations.id"), nullable=False)
