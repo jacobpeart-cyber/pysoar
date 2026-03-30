@@ -51,11 +51,6 @@ def _create_engine():
             if hasattr(dbapi_conn, "isolation_level"):
                 dbapi_conn.isolation_level = None
 
-        @event.listens_for(engine.sync_engine, "pool_connect")
-        def receive_pool_connect(dbapi_conn, connection_record):
-            """Configure connection from pool"""
-            pass
-
     return engine
 
 
