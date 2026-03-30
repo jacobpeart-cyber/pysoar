@@ -4,6 +4,7 @@ SQLAlchemy models for Deception Technology module.
 Defines Decoy, DecoyInteraction, DeceptionCampaign, and HoneyToken models.
 """
 
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy import JSON, DateTime, ForeignKey, Integer, String, Text, Boolean, Float
