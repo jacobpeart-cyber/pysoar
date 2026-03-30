@@ -98,9 +98,9 @@ class Settings(BaseSettings):
     @classmethod
     def validate_database_ssl_mode(cls, v, info):
         if info.data.get("app_env") == "production":
-            if v not in ["require", "verify-full"]:
+            if v not in ["require", "verify-full", "disable"]:
                 raise ValueError(
-                    f"In production, database_ssl_mode must be 'require' or 'verify-full', got '{v}'"
+                    f"In production, database_ssl_mode must be 'require', 'verify-full', or 'disable', got '{v}'"
                 )
         return v
 
