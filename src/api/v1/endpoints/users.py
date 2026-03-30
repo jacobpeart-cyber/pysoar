@@ -65,7 +65,7 @@ async def create_user(
     except ValidationError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e),
+            detail="Operation failed. Please try again or contact support.",
         )
 
     return UserResponse.model_validate(user)
@@ -130,7 +130,7 @@ async def update_user(
     except ValidationError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e),
+            detail="Operation failed. Please try again or contact support.",
         )
 
     return UserResponse.model_validate(user)

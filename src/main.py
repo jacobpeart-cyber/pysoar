@@ -17,9 +17,25 @@ from src.core.config import settings
 from src.core.database import close_db, init_db
 from src.core.exceptions import PySOARException
 from src.core.logging import get_logger, setup_logging
+from src.core.middleware import AuditLoggingMiddleware
+from src.core.secrets import init_encryption
 from src.services.user_service import UserService
 
 logger = get_logger(__name__)
+
+
+def _validate_production_secrets() -> None:
+    """Validate production secrets configuration"""
+    warnings = settings.validate_production_secrets()
+
+    if settings.is_production:
+        if warnings:
+            raise RuntimeError(
+                f"Production secrets validation failed: {'; '.join(warnings)}"
+            )
+    else:
+        for warning in warnings:
+            logger.critical(f"Security warning (development): {warning}")
 
 
 @asynccontextmanager
@@ -32,6 +48,21 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         version=__version__,
         environment=settings.app_env,
     )
+
+    # Validate production secrets
+    _validate_production_secrets()
+
+    # Initialize encryption
+    encryption_master_key = settings.encryption_master_key
+    if encryption_master_key:
+        init_encryption(master_key=encryption_master_key)
+    elif settings.is_production:
+        raise RuntimeError(
+            "ENCRYPTION_MASTER_KEY must be set in production environment"
+        )
+    else:
+        logger.warning("No ENCRYPTION_MASTER_KEY set - using generated key for development")
+        init_encryption()
 
     # Initialize database
     await init_db()
@@ -63,6 +94,7 @@ async def create_first_admin():
                     full_name="Admin User",
                     role="admin",
                     is_superuser=True,
+                    force_password_change=True,
                 )
                 await db.commit()
                 logger.info(
@@ -78,19 +110,27 @@ app = FastAPI(
     title=settings.app_name,
     description="Security Orchestration, Automation and Response Platform",
     version=__version__,
-    docs_url=f"{settings.api_v1_prefix}/docs",
-    redoc_url=f"{settings.api_v1_prefix}/redoc",
-    openapi_url=f"{settings.api_v1_prefix}/openapi.json",
+    docs_url=None if settings.is_production else f"{settings.api_v1_prefix}/docs",
+    redoc_url=None if settings.is_production else f"{settings.api_v1_prefix}/redoc",
+    openapi_url=None if settings.is_production else f"{settings.api_v1_prefix}/openapi.json",
     lifespan=lifespan,
 )
 
+# Add audit logging middleware
+app.add_middleware(AuditLoggingMiddleware)
+
 # Add CORS middleware
+cors_origins = settings.cors_origins
+if settings.is_production:
+    # Strip localhost origins in production
+    cors_origins = [origin for origin in cors_origins if "localhost" not in origin and "127.0.0.1" not in origin]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.cors_origins,
+    allow_origins=cors_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "Accept", "X-Request-ID"],
 )
 
 

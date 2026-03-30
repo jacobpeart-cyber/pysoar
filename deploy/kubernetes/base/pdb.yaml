@@ -1,0 +1,11 @@
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: pysoar-api
+  namespace: pysoar
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: pysoar-api
+      component: api

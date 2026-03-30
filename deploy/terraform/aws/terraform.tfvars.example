@@ -1,0 +1,46 @@
+# PySOAR AWS Terraform Configuration Example
+# Copy this file to terraform.tfvars and customize for your environment
+
+# Project and Environment
+project_name = "pysoar"
+environment  = "production"
+
+# AWS Configuration
+aws_region            = "us-east-1"
+availability_zones    = ["us-east-1a", "us-east-1b", "us-east-1c"]
+vpc_cidr              = "10.0.0.0/16"
+
+# EKS Configuration
+eks_cluster_version      = "1.29"
+eks_node_instance_types  = ["t3.large"]
+eks_min_nodes            = 2
+eks_max_nodes            = 10
+eks_desired_nodes        = 3
+
+# RDS Configuration
+db_instance_class       = "db.t3.medium"
+db_engine_version       = "16.3"
+db_allocated_storage    = 50
+db_name                 = "pysoar"
+db_username             = "pysoaradmin"
+db_multi_az             = true
+db_backup_retention_days = 7
+
+# ElastiCache Redis Configuration
+redis_node_type               = "cache.t3.medium"
+redis_num_cache_nodes         = 2
+redis_snapshot_retention_limit = 5
+
+# Application Configuration
+domain_name = null  # Set to your domain if using Route53
+
+# Features
+enable_waf        = true
+enable_monitoring = true
+
+# Custom Tags
+tags = {
+  CostCenter = "security-ops"
+  Team       = "security"
+  Application = "pysoar"
+}

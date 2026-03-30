@@ -1,10 +1,34 @@
 """Application configuration using Pydantic Settings"""
 
 from functools import lru_cache
-from typing import List, Optional
+from typing import List, Optional, Literal
+import math
 
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _estimate_entropy(value: str) -> float:
+    """
+    Estimate Shannon entropy of a string.
+    Returns entropy in bits.
+    """
+    if not value:
+        return 0.0
+
+    # Count frequency of each character
+    char_counts = {}
+    for char in value:
+        char_counts[char] = char_counts.get(char, 0) + 1
+
+    # Calculate Shannon entropy
+    entropy = 0.0
+    length = len(value)
+    for count in char_counts.values():
+        probability = count / length
+        entropy -= probability * math.log2(probability)
+
+    return entropy
 
 
 class Settings(BaseSettings):
@@ -31,6 +55,7 @@ class Settings(BaseSettings):
 
     # Database
     database_url: str = "sqlite+aiosqlite:///./pysoar.db"
+    database_ssl_mode: str = "prefer"
 
     # Redis
     redis_url: str = "redis://localhost:6379/0"
@@ -39,9 +64,17 @@ class Settings(BaseSettings):
 
     # JWT Authentication
     jwt_secret_key: str = "jwt-secret-change-in-production"
-    jwt_algorithm: str = "HS256"
+    jwt_algorithm: Literal["HS256", "HS384", "HS512"] = "HS256"
     access_token_expire_minutes: int = 30
     refresh_token_expire_days: int = 7
+
+    # Encryption
+    encryption_master_key: Optional[str] = None
+
+    # Account Security
+    account_lockout_max_attempts: int = 5
+    account_lockout_duration_seconds: int = 900
+    password_min_length: int = 12
 
     # First Admin User
     first_admin_email: str = "admin@pysoar.local"
@@ -59,6 +92,16 @@ class Settings(BaseSettings):
                 return json.loads(v)
             except json.JSONDecodeError:
                 return [origin.strip() for origin in v.split(",")]
+        return v
+
+    @field_validator("database_ssl_mode")
+    @classmethod
+    def validate_database_ssl_mode(cls, v, info):
+        if info.data.get("app_env") == "production":
+            if v not in ["require", "verify-full"]:
+                raise ValueError(
+                    f"In production, database_ssl_mode must be 'require' or 'verify-full', got '{v}'"
+                )
         return v
 
     # Logging
@@ -106,6 +149,53 @@ class Settings(BaseSettings):
     @property
     def is_production(self) -> bool:
         return self.app_env == "production"
+
+    def validate_production_secrets(self) -> list[str]:
+        """
+        Validate production secret strength and configuration.
+        Returns list of warning strings if issues are found.
+        """
+        warnings = []
+        weak_patterns = ["change", "default", "password", "secret", "admin", "test", "example", "placeholder"]
+
+        # Check secret_key entropy
+        secret_entropy = _estimate_entropy(self.secret_key)
+        if secret_entropy < 3.0:
+            warnings.append(
+                f"secret_key entropy is {secret_entropy:.2f} bits (< 3.0). Consider using a more random value."
+            )
+
+        # Check jwt_secret_key entropy
+        jwt_entropy = _estimate_entropy(self.jwt_secret_key)
+        if jwt_entropy < 3.0:
+            warnings.append(
+                f"jwt_secret_key entropy is {jwt_entropy:.2f} bits (< 3.0). Consider using a more random value."
+            )
+
+        # Check for weak patterns in secrets
+        for secret_name, secret_value in [("secret_key", self.secret_key), ("jwt_secret_key", self.jwt_secret_key)]:
+            secret_lower = secret_value.lower()
+            for pattern in weak_patterns:
+                if pattern in secret_lower:
+                    warnings.append(
+                        f"{secret_name} contains weak pattern '{pattern}'. Use a cryptographically random secret."
+                    )
+                    break
+
+        # Check encryption_master_key is set
+        if not self.encryption_master_key:
+            warnings.append(
+                "encryption_master_key is not set. Data encryption will not be available."
+            )
+
+        # Check first_admin_password entropy
+        first_admin_entropy = _estimate_entropy(self.first_admin_password)
+        if first_admin_entropy < 3.0:
+            warnings.append(
+                f"first_admin_password entropy is {first_admin_entropy:.2f} bits (< 3.0). Set a stronger initial admin password."
+            )
+
+        return warnings
 
 
 @lru_cache

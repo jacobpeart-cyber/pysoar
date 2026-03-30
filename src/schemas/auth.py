@@ -54,3 +54,11 @@ class TokenPayload(BaseModel):
     exp: int
     type: str
     role: Optional[str] = None
+
+
+class MFARequiredResponse(BaseModel):
+    """MFA required response schema"""
+
+    mfa_required: bool = True
+    mfa_token: str
+    expires_in: int

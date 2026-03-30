@@ -33,6 +33,9 @@ router = APIRouter()
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads/attachments")
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 50 * 1024 * 1024))  # 50MB default
 
+# Allowed file extensions for uploads
+ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".gif", ".doc", ".docx", ".xls", ".xlsx", ".txt", ".csv", ".zip", ".eml", ".msg", ".pcap", ".json", ".xml", ".log"}
+
 
 # =============================================================================
 # Schemas
@@ -710,8 +713,17 @@ async def upload_attachment(
             detail=f"File too large. Maximum size is {MAX_FILE_SIZE // (1024 * 1024)}MB",
         )
 
+    # Validate file extension
+    file_ext = os.path.splitext(file.filename or "")[1].lower()
+    # Strip any path separators to prevent path traversal
+    file_ext = file_ext.replace("/", "").replace("\\", "").replace("..", "")
+    if file_ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="File type not allowed",
+        )
+
     # Generate unique filename
-    file_ext = os.path.splitext(file.filename or "")[1]
     unique_filename = f"{uuid.uuid4()}{file_ext}"
 
     # Calculate hash

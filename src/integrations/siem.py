@@ -49,7 +49,7 @@ class SplunkIntegration(BaseSIEMIntegration):
     async def test_connection(self) -> bool:
         """Test the Splunk connection"""
         try:
-            async with httpx.AsyncClient(verify=False) as client:
+            async with httpx.AsyncClient() as client:
                 response = await client.get(
                     f"{self.base_url}/services/server/info",
                     headers={"Authorization": f"Bearer {self.token}"},
@@ -74,7 +74,7 @@ class SplunkIntegration(BaseSIEMIntegration):
         search_query = f'search index={self.index} sourcetype=alert earliest={earliest} latest={latest} | head {limit}'
 
         try:
-            async with httpx.AsyncClient(verify=False) as client:
+            async with httpx.AsyncClient() as client:
                 # Create search job
                 response = await client.post(
                     f"{self.base_url}/services/search/jobs",
@@ -111,7 +111,7 @@ class SplunkIntegration(BaseSIEMIntegration):
         }
 
         try:
-            async with httpx.AsyncClient(verify=False) as client:
+            async with httpx.AsyncClient() as client:
                 response = await client.post(
                     self.hec_url,
                     headers={"Authorization": f"Splunk {self.hec_token}"},
@@ -126,7 +126,7 @@ class SplunkIntegration(BaseSIEMIntegration):
     async def run_search(self, spl_query: str, timeout: int = 60) -> list[dict]:
         """Run a custom SPL search"""
         try:
-            async with httpx.AsyncClient(verify=False) as client:
+            async with httpx.AsyncClient() as client:
                 response = await client.post(
                     f"{self.base_url}/services/search/jobs",
                     headers={"Authorization": f"Bearer {self.token}"},
@@ -177,7 +177,7 @@ class ElasticSIEMIntegration(BaseSIEMIntegration):
     async def test_connection(self) -> bool:
         """Test the Elasticsearch connection"""
         try:
-            async with httpx.AsyncClient(verify=False) as client:
+            async with httpx.AsyncClient() as client:
                 response = await client.get(
                     f"{self.base_url}/_cluster/health",
                     headers=self._get_auth_headers(),
@@ -216,7 +216,7 @@ class ElasticSIEMIntegration(BaseSIEMIntegration):
             query["query"]["bool"]["filter"].append({"range": time_range})
 
         try:
-            async with httpx.AsyncClient(verify=False) as client:
+            async with httpx.AsyncClient() as client:
                 response = await client.post(
                     f"{self.base_url}/{self.index_pattern}/_search",
                     headers=self._get_auth_headers(),
@@ -241,7 +241,7 @@ class ElasticSIEMIntegration(BaseSIEMIntegration):
         log_data["event.module"] = "pysoar"
 
         try:
-            async with httpx.AsyncClient(verify=False) as client:
+            async with httpx.AsyncClient() as client:
                 response = await client.post(
                     f"{self.base_url}/pysoar-logs/_doc",
                     headers=self._get_auth_headers(),
@@ -257,7 +257,7 @@ class ElasticSIEMIntegration(BaseSIEMIntegration):
     async def search(self, query: dict) -> list[dict]:
         """Run a custom Elasticsearch query"""
         try:
-            async with httpx.AsyncClient(verify=False) as client:
+            async with httpx.AsyncClient() as client:
                 response = await client.post(
                     f"{self.base_url}/{self.index_pattern}/_search",
                     headers=self._get_auth_headers(),
@@ -290,7 +290,7 @@ class QRadarIntegration(BaseSIEMIntegration):
     async def test_connection(self) -> bool:
         """Test the QRadar connection"""
         try:
-            async with httpx.AsyncClient(verify=False) as client:
+            async with httpx.AsyncClient() as client:
                 response = await client.get(
                     f"{self.base_url}/api/system/servers",
                     headers={
@@ -317,7 +317,7 @@ class QRadarIntegration(BaseSIEMIntegration):
             params["filter"] = f"start_time >= {int(start_time.timestamp() * 1000)}"
 
         try:
-            async with httpx.AsyncClient(verify=False) as client:
+            async with httpx.AsyncClient() as client:
                 response = await client.get(
                     f"{self.base_url}/api/siem/offenses",
                     headers={
@@ -345,7 +345,7 @@ class QRadarIntegration(BaseSIEMIntegration):
     async def get_offense(self, offense_id: int) -> Optional[dict]:
         """Get offense details"""
         try:
-            async with httpx.AsyncClient(verify=False) as client:
+            async with httpx.AsyncClient() as client:
                 response = await client.get(
                     f"{self.base_url}/api/siem/offenses/{offense_id}",
                     headers={
@@ -365,7 +365,7 @@ class QRadarIntegration(BaseSIEMIntegration):
     async def close_offense(self, offense_id: int, closing_reason_id: int = 1) -> bool:
         """Close a QRadar offense"""
         try:
-            async with httpx.AsyncClient(verify=False) as client:
+            async with httpx.AsyncClient() as client:
                 response = await client.post(
                     f"{self.base_url}/api/siem/offenses/{offense_id}",
                     headers={

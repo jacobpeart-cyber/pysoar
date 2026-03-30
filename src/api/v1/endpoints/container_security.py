@@ -1,0 +1,928 @@
+"""
+Container Security REST API Endpoints
+
+Complete API for managing container images, Kubernetes clusters,
+security findings, runtime alerts, and compliance.
+"""
+
+from datetime import datetime, timedelta
+from typing import List, Optional, Dict, Any
+
+from fastapi import APIRouter, Depends, HTTPException, status, Query
+from sqlalchemy import select, and_, func, desc
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.core.logging import get_logger
+from src.core.auth import get_current_user
+from src.db.session import get_db
+from src.schemas.container_security import (
+    ContainerImageResponse,
+    ContainerImageCreateRequest,
+    ContainerImageUpdateRequest,
+    ImageVulnerabilityResponse,
+    ImageVulnerabilityCreateRequest,
+    KubernetesClusterResponse,
+    KubernetesClusterCreateRequest,
+    KubernetesClusterUpdateRequest,
+    K8sSecurityFindingResponse,
+    K8sSecurityFindingCreateRequest,
+    K8sSecurityFindingUpdateRequest,
+    RuntimeAlertResponse,
+    RuntimeAlertCreateRequest,
+    RuntimeAlertUpdateRequest,
+    ImageScanRequest,
+    ImageScanResponse,
+    ClusterAuditRequest,
+    ClusterAuditResponse,
+    SecurityFindingRemediationRequest,
+    SecurityFindingRemediationResponse,
+    RuntimeAlertInvestigationRequest,
+    PodQuarantineRequest,
+    DashboardOverviewResponse,
+    ComplianceMatrixResponse,
+    PaginationParams,
+)
+from src.container_security.models import (
+    ContainerImage,
+    ImageVulnerability,
+    KubernetesCluster,
+    K8sSecurityFinding,
+    RuntimeAlert,
+)
+from src.container_security.engine import (
+    ImageScanner,
+    K8sSecurityAuditor,
+    RuntimeProtector,
+    K8sRemediator,
+    ComplianceChecker,
+)
+from src.container_security.tasks import (
+    scheduled_image_scan,
+    cluster_security_audit,
+    runtime_monitoring,
+    compliance_check,
+    stale_image_report,
+)
+
+logger = get_logger(__name__)
+
+router = APIRouter(prefix="/container-security", tags=["container-security"])
+
+
+# ============================================================================
+# IMAGE ENDPOINTS
+# ============================================================================
+
+
+@router.get("/images", response_model=List[ContainerImageResponse])
+async def list_images(
+    db: AsyncSession = Depends(get_db),
+    user=Depends(get_current_user),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+    compliance_status: Optional[str] = None,
+    risk_score_min: Optional[int] = Query(None, ge=0, le=100),
+    risk_score_max: Optional[int] = Query(None, ge=0, le=100),
+):
+    """
+    List container images with optional filtering.
+
+    Query Parameters:
+    - compliance_status: Filter by compliance status
+    - risk_score_min/max: Filter by risk score range
+    - skip, limit: Pagination
+    """
+    stmt = select(ContainerImage).where(
+        ContainerImage.organization_id == user.organization_id
+    )
+
+    if compliance_status:
+        stmt = stmt.where(ContainerImage.compliance_status == compliance_status)
+
+    if risk_score_min is not None:
+        stmt = stmt.where(ContainerImage.risk_score >= risk_score_min)
+
+    if risk_score_max is not None:
+        stmt = stmt.where(ContainerImage.risk_score <= risk_score_max)
+
+    stmt = stmt.order_by(desc(ContainerImage.risk_score)).offset(skip).limit(limit)
+    result = await db.execute(stmt)
+    images = result.scalars().all()
+
+    return images
+
+
+@router.post("/images", response_model=ContainerImageResponse, status_code=201)
+async def create_image(
+    request: ContainerImageCreateRequest,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    """Create new container image record."""
+    image = ContainerImage(
+        registry=request.registry,
+        repository=request.repository,
+        tag=request.tag,
+        digest_sha256=request.digest_sha256,
+        image_size_mb=request.image_size_mb,
+        os=request.os,
+        architecture=request.architecture,
+        base_image=request.base_image,
+        labels=request.labels or {},
+        compliance_status="not_scanned",
+        organization_id=user.organization_id,
+    )
+    db.add(image)
+    await db.commit()
+    await db.refresh(image)
+
+    logger.info(f"Created image {image.id}")
+    return image
+
+
+@router.get("/images/{image_id}", response_model=ContainerImageResponse)
+async def get_image(
+    image_id: str,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    """Get image details."""
+    stmt = select(ContainerImage).where(
+        and_(
+            ContainerImage.id == image_id,
+            ContainerImage.organization_id == user.organization_id,
+        )
+    )
+    result = await db.execute(stmt)
+    image = result.scalar_one_or_none()
+
+    if not image:
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    return image
+
+
+@router.patch("/images/{image_id}", response_model=ContainerImageResponse)
+async def update_image(
+    image_id: str,
+    request: ContainerImageUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    """Update image metadata."""
+    stmt = select(ContainerImage).where(
+        and_(
+            ContainerImage.id == image_id,
+            ContainerImage.organization_id == user.organization_id,
+        )
+    )
+    result = await db.execute(stmt)
+    image = result.scalar_one_or_none()
+
+    if not image:
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    if request.labels is not None:
+        image.labels = request.labels
+    if request.base_image is not None:
+        image.base_image = request.base_image
+    if request.sbom_generated is not None:
+        image.sbom_generated = request.sbom_generated
+
+    await db.commit()
+    await db.refresh(image)
+
+    return image
+
+
+@router.post("/images/{image_id}/scan", response_model=ImageScanResponse)
+async def scan_image(
+    image_id: str,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    """
+    Trigger image vulnerability scan.
+
+    Scans image for known vulnerabilities and updates risk score.
+    """
+    stmt = select(ContainerImage).where(
+        and_(
+            ContainerImage.id == image_id,
+            ContainerImage.organization_id == user.organization_id,
+        )
+    )
+    result = await db.execute(stmt)
+    image = result.scalar_one_or_none()
+
+    if not image:
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    # Queue async scan task
+    scheduled_image_scan.delay(image_id, user.organization_id)
+
+    logger.info(f"Queued scan for image {image_id}")
+
+    return ImageScanResponse(
+        status="queued",
+        image_id=image_id,
+        vulnerabilities=image.vulnerability_count_critical
+        + image.vulnerability_count_high,
+        risk_score=image.risk_score,
+        compliance_status=image.compliance_status,
+    )
+
+
+@router.get("/images/{image_id}/vulnerabilities", response_model=List[ImageVulnerabilityResponse])
+async def get_image_vulnerabilities(
+    image_id: str,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(get_current_user),
+    severity: Optional[str] = None,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+):
+    """Get vulnerabilities for image."""
+    # Verify image ownership
+    stmt = select(ContainerImage).where(
+        and_(
+            ContainerImage.id == image_id,
+            ContainerImage.organization_id == user.organization_id,
+        )
+    )
+    result = await db.execute(stmt)
+    if not result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    # Get vulnerabilities
+    stmt = select(ImageVulnerability).where(ImageVulnerability.image_id == image_id)
+
+    if severity:
+        stmt = stmt.where(ImageVulnerability.severity == severity)
+
+    stmt = stmt.order_by(desc(ImageVulnerability.cvss_score)).offset(skip).limit(limit)
+    result = await db.execute(stmt)
+    vulnerabilities = result.scalars().all()
+
+    return vulnerabilities
+
+
+@router.post("/images/{image_id}/verify-signature")
+async def verify_image_signature(
+    image_id: str,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    """
+    Verify image signature (cosign/notary).
+
+    Validates image signature and updates verification status.
+    """
+    stmt = select(ContainerImage).where(
+        and_(
+            ContainerImage.id == image_id,
+            ContainerImage.organization_id == user.organization_id,
+        )
+    )
+    result = await db.execute(stmt)
+    image = result.scalar_one_or_none()
+
+    if not image:
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    scanner = ImageScanner()
+    verification = await scanner.verify_image_signature(
+        image.registry, image.repository, image.tag
+    )
+
+    image.is_signed = verification["is_signed"]
+    image.signature_verified = verification["signature_verified"]
+
+    await db.commit()
+
+    return verification
+
+
+@router.get("/images/{image_id}/risk-assessment")
+async def assess_image_risk(
+    image_id: str,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    """Get image risk assessment."""
+    stmt = select(ContainerImage).where(
+        and_(
+            ContainerImage.id == image_id,
+            ContainerImage.organization_id == user.organization_id,
+        )
+    )
+    result = await db.execute(stmt)
+    image = result.scalar_one_or_none()
+
+    if not image:
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    return {
+        "image_id": image_id,
+        "risk_score": image.risk_score,
+        "compliance_status": image.compliance_status,
+        "vulnerability_critical": image.vulnerability_count_critical,
+        "vulnerability_high": image.vulnerability_count_high,
+        "is_signed": image.is_signed,
+        "signature_verified": image.signature_verified,
+        "days_since_scan": (
+            (datetime.utcnow() - image.scanned_at).days if image.scanned_at else None
+        ),
+        "recommendation": (
+            "High risk - remediate immediately"
+            if image.risk_score >= 80
+            else "Medium risk - plan remediation"
+            if image.risk_score >= 50
+            else "Low risk - acceptable"
+        ),
+    }
+
+
+# ============================================================================
+# CLUSTER ENDPOINTS
+# ============================================================================
+
+
+@router.get("/clusters", response_model=List[KubernetesClusterResponse])
+async def list_clusters(
+    db: AsyncSession = Depends(get_db),
+    user=Depends(get_current_user),
+    skip: int = Query(0, ge=0),
+    limit: int = Query(20, ge=1, le=100),
+    provider: Optional[str] = None,
+):
+    """List Kubernetes clusters."""
+    stmt = select(KubernetesCluster).where(
+        KubernetesCluster.organization_id == user.organization_id
+    )
+
+    if provider:
+        stmt = stmt.where(KubernetesCluster.provider == provider)
+
+    stmt = stmt.order_by(desc(KubernetesCluster.risk_score)).offset(skip).limit(limit)
+    result = await db.execute(stmt)
+    clusters = result.scalars().all()
+
+    return clusters
+
+
+@router.post("/clusters", response_model=KubernetesClusterResponse, status_code=201)
+async def create_cluster(
+    request: KubernetesClusterCreateRequest,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    """Create Kubernetes cluster record."""
+    cluster = KubernetesCluster(
+        name=request.name,
+        version=request.version,
+        provider=request.provider,
+        endpoint=request.endpoint,
+        pod_security_standards=request.pod_security_standards,
+        admission_controllers=request.admission_controllers or {},
+        organization_id=user.organization_id,
+    )
+    db.add(cluster)
+    await db.commit()
+    await db.refresh(cluster)
+
+    logger.info(f"Created cluster {cluster.id}")
+    return cluster
+
+
+@router.get("/clusters/{cluster_id}", response_model=KubernetesClusterResponse)
+async def get_cluster(
+    cluster_id: str,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    """Get cluster details."""
+    stmt = select(KubernetesCluster).where(
+        and_(
+            KubernetesCluster.id == cluster_id,
+            KubernetesCluster.organization_id == user.organization_id,
+        )
+    )
+    result = await db.execute(stmt)
+    cluster = result.scalar_one_or_none()
+
+    if not cluster:
+        raise HTTPException(status_code=404, detail="Cluster not found")
+
+    return cluster
+
+
+@router.patch("/clusters/{cluster_id}", response_model=KubernetesClusterResponse)
+async def update_cluster(
+    cluster_id: str,
+    request: KubernetesClusterUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    """Update cluster configuration."""
+    stmt = select(KubernetesCluster).where(
+        and_(
+            KubernetesCluster.id == cluster_id,
+            KubernetesCluster.organization_id == user.organization_id,
+        )
+    )
+    result = await db.execute(stmt)
+    cluster = result.scalar_one_or_none()
+
+    if not cluster:
+        raise HTTPException(status_code=404, detail="Cluster not found")
+
+    for field, value in request.dict(exclude_unset=True).items():
+        setattr(cluster, field, value)
+
+    await db.commit()
+    await db.refresh(cluster)
+
+    return cluster
+
+
+@router.post("/clusters/{cluster_id}/audit", response_model=ClusterAuditResponse)
+async def audit_cluster(
+    cluster_id: str,
+    request: ClusterAuditRequest,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    """
+    Trigger cluster security audit.
+
+    Performs full security audit including CIS benchmarks, RBAC, network policies.
+    """
+    stmt = select(KubernetesCluster).where(
+        and_(
+            KubernetesCluster.id == cluster_id,
+            KubernetesCluster.organization_id == user.organization_id,
+        )
+    )
+    result = await db.execute(stmt)
+    cluster = result.scalar_one_or_none()
+
+    if not cluster:
+        raise HTTPException(status_code=404, detail="Cluster not found")
+
+    # Queue async audit task
+    cluster_security_audit.delay(cluster_id, user.organization_id)
+
+    logger.info(f"Queued audit for cluster {cluster_id}")
+
+    return ClusterAuditResponse(
+        status="queued",
+        cluster_id=cluster_id,
+        findings=0,
+        risk_score=cluster.risk_score,
+        compliance_score=cluster.compliance_score,
+        cis_compliance=0.0,
+    )
+
+
+@router.get("/clusters/{cluster_id}/compliance-check")
+async def check_cluster_compliance(
+    cluster_id: str,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    """Get cluster compliance status."""
+    stmt = select(KubernetesCluster).where(
+        and_(
+            KubernetesCluster.id == cluster_id,
+            KubernetesCluster.organization_id == user.organization_id,
+        )
+    )
+    result = await db.execute(stmt)
+    cluster = result.scalar_one_or_none()
+
+    if not cluster:
+        raise HTTPException(status_code=404, detail="Cluster not found")
+
+    # Queue compliance check
+    compliance_check.delay(cluster_id, user.organization_id)
+
+    return {
+        "status": "queued",
+        "cluster_id": cluster_id,
+        "current_compliance_score": cluster.compliance_score,
+    }
+
+
+@router.get("/clusters/{cluster_id}/findings", response_model=List[K8sSecurityFindingResponse])
+async def get_cluster_findings(
+    cluster_id: str,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(get_current_user),
+    status: Optional[str] = None,
+    severity: Optional[str] = None,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+):
+    """Get security findings for cluster."""
+    # Verify cluster ownership
+    stmt = select(KubernetesCluster).where(
+        and_(
+            KubernetesCluster.id == cluster_id,
+            KubernetesCluster.organization_id == user.organization_id,
+        )
+    )
+    result = await db.execute(stmt)
+    if not result.scalar_one_or_none():
+        raise HTTPException(status_code=404, detail="Cluster not found")
+
+    # Get findings
+    stmt = select(K8sSecurityFinding).where(
+        K8sSecurityFinding.cluster_id == cluster_id
+    )
+
+    if status:
+        stmt = stmt.where(K8sSecurityFinding.status == status)
+
+    if severity:
+        stmt = stmt.where(K8sSecurityFinding.severity == severity)
+
+    stmt = stmt.order_by(desc(K8sSecurityFinding.detected_at)).offset(skip).limit(limit)
+    result = await db.execute(stmt)
+    findings = result.scalars().all()
+
+    return findings
+
+
+# ============================================================================
+# SECURITY FINDINGS ENDPOINTS
+# ============================================================================
+
+
+@router.get("/findings", response_model=List[K8sSecurityFindingResponse])
+async def list_findings(
+    db: AsyncSession = Depends(get_db),
+    user=Depends(get_current_user),
+    status: Optional[str] = None,
+    severity: Optional[str] = None,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+):
+    """List security findings across clusters."""
+    stmt = select(K8sSecurityFinding).where(
+        K8sSecurityFinding.organization_id == user.organization_id
+    )
+
+    if status:
+        stmt = stmt.where(K8sSecurityFinding.status == status)
+
+    if severity:
+        stmt = stmt.where(K8sSecurityFinding.severity == severity)
+
+    stmt = stmt.order_by(desc(K8sSecurityFinding.detected_at)).offset(skip).limit(limit)
+    result = await db.execute(stmt)
+    findings = result.scalars().all()
+
+    return findings
+
+
+@router.post("/findings/{finding_id}/remediate", response_model=SecurityFindingRemediationResponse)
+async def remediate_finding(
+    finding_id: str,
+    request: SecurityFindingRemediationRequest,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    """
+    Generate and apply remediation for finding.
+
+    Creates YAML manifest for remediation.
+    """
+    stmt = select(K8sSecurityFinding).where(
+        and_(
+            K8sSecurityFinding.id == finding_id,
+            K8sSecurityFinding.organization_id == user.organization_id,
+        )
+    )
+    result = await db.execute(stmt)
+    finding = result.scalar_one_or_none()
+
+    if not finding:
+        raise HTTPException(status_code=404, detail="Finding not found")
+
+    remediator = K8sRemediator()
+    manifest = await remediator.generate_remediation_manifest(
+        finding.finding_type,
+        finding.namespace,
+        finding.resource_type,
+        finding.resource_name,
+    )
+
+    finding.status = "remediated"
+    await db.commit()
+
+    logger.info(f"Generated remediation for finding {finding_id}")
+
+    return SecurityFindingRemediationResponse(
+        status="success",
+        finding_id=finding_id,
+        manifest=manifest,
+        description=f"Remediation for {finding.finding_type}",
+    )
+
+
+@router.patch("/findings/{finding_id}", response_model=K8sSecurityFindingResponse)
+async def update_finding(
+    finding_id: str,
+    request: K8sSecurityFindingUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    """Update finding status."""
+    stmt = select(K8sSecurityFinding).where(
+        and_(
+            K8sSecurityFinding.id == finding_id,
+            K8sSecurityFinding.organization_id == user.organization_id,
+        )
+    )
+    result = await db.execute(stmt)
+    finding = result.scalar_one_or_none()
+
+    if not finding:
+        raise HTTPException(status_code=404, detail="Finding not found")
+
+    if request.status:
+        finding.status = request.status
+    if request.remediation:
+        finding.remediation = request.remediation
+
+    await db.commit()
+    await db.refresh(finding)
+
+    return finding
+
+
+# ============================================================================
+# RUNTIME ALERTS ENDPOINTS
+# ============================================================================
+
+
+@router.get("/runtime-alerts", response_model=List[RuntimeAlertResponse])
+async def list_runtime_alerts(
+    db: AsyncSession = Depends(get_db),
+    user=Depends(get_current_user),
+    status: Optional[str] = None,
+    severity: Optional[str] = None,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(50, ge=1, le=200),
+):
+    """List runtime security alerts."""
+    stmt = select(RuntimeAlert).where(
+        RuntimeAlert.organization_id == user.organization_id
+    )
+
+    if status:
+        stmt = stmt.where(RuntimeAlert.status == status)
+
+    if severity:
+        stmt = stmt.where(RuntimeAlert.severity == severity)
+
+    stmt = stmt.order_by(desc(RuntimeAlert.created_at)).offset(skip).limit(limit)
+    result = await db.execute(stmt)
+    alerts = result.scalars().all()
+
+    return alerts
+
+
+@router.patch("/runtime-alerts/{alert_id}", response_model=RuntimeAlertResponse)
+async def update_runtime_alert(
+    alert_id: str,
+    request: RuntimeAlertUpdateRequest,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    """Update runtime alert status."""
+    stmt = select(RuntimeAlert).where(
+        and_(
+            RuntimeAlert.id == alert_id,
+            RuntimeAlert.organization_id == user.organization_id,
+        )
+    )
+    result = await db.execute(stmt)
+    alert = result.scalar_one_or_none()
+
+    if not alert:
+        raise HTTPException(status_code=404, detail="Alert not found")
+
+    if request.status:
+        alert.status = request.status
+    if request.mitre_technique:
+        alert.mitre_technique = request.mitre_technique
+
+    await db.commit()
+    await db.refresh(alert)
+
+    return alert
+
+
+@router.post("/runtime-alerts/{alert_id}/investigate")
+async def investigate_alert(
+    alert_id: str,
+    request: RuntimeAlertInvestigationRequest,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    """Investigate runtime alert."""
+    stmt = select(RuntimeAlert).where(
+        and_(
+            RuntimeAlert.id == alert_id,
+            RuntimeAlert.organization_id == user.organization_id,
+        )
+    )
+    result = await db.execute(stmt)
+    alert = result.scalar_one_or_none()
+
+    if not alert:
+        raise HTTPException(status_code=404, detail="Alert not found")
+
+    alert.status = "investigating"
+    await db.commit()
+
+    logger.info(f"Investigating alert {alert_id}")
+
+    return {
+        "status": "investigating",
+        "alert_id": alert_id,
+        "timestamp": datetime.utcnow(),
+    }
+
+
+@router.post("/runtime-alerts/{alert_id}/quarantine-pod")
+async def quarantine_pod_from_alert(
+    alert_id: str,
+    db: AsyncSession = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    """Quarantine pod from runtime alert."""
+    stmt = select(RuntimeAlert).where(
+        and_(
+            RuntimeAlert.id == alert_id,
+            RuntimeAlert.organization_id == user.organization_id,
+        )
+    )
+    result = await db.execute(stmt)
+    alert = result.scalar_one_or_none()
+
+    if not alert:
+        raise HTTPException(status_code=404, detail="Alert not found")
+
+    protector = RuntimeProtector()
+    quarantine = await protector.quarantine_pod(
+        alert.namespace, alert.pod_name, alert.description
+    )
+
+    alert.status = "contained"
+    await db.commit()
+
+    logger.info(f"Quarantined pod from alert {alert_id}")
+
+    return quarantine
+
+
+# ============================================================================
+# DASHBOARD ENDPOINTS
+# ============================================================================
+
+
+@router.get("/dashboard/overview", response_model=DashboardOverviewResponse)
+async def get_dashboard_overview(
+    db: AsyncSession = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    """
+    Get container security dashboard overview.
+
+    Returns summary of images, clusters, vulnerabilities, and alerts.
+    """
+    # Count images
+    img_stmt = select(func.count(ContainerImage.id)).where(
+        ContainerImage.organization_id == user.organization_id
+    )
+    img_result = await db.execute(img_stmt)
+    total_images = img_result.scalar() or 0
+
+    # Count clusters
+    cls_stmt = select(func.count(KubernetesCluster.id)).where(
+        KubernetesCluster.organization_id == user.organization_id
+    )
+    cls_result = await db.execute(cls_stmt)
+    total_clusters = cls_result.scalar() or 0
+
+    # Count vulnerabilities by severity
+    vuln_stmt = select(ImageVulnerability).where(
+        ImageVulnerability.organization_id == user.organization_id
+    )
+    vuln_result = await db.execute(vuln_stmt)
+    vulns = vuln_result.scalars().all()
+
+    vuln_counts = {
+        "critical": sum(1 for v in vulns if v.severity == "critical"),
+        "high": sum(1 for v in vulns if v.severity == "high"),
+        "medium": sum(1 for v in vulns if v.severity == "medium"),
+        "low": sum(1 for v in vulns if v.severity == "low"),
+        "negligible": sum(1 for v in vulns if v.severity == "negligible"),
+    }
+
+    # Count critical findings
+    finding_stmt = select(func.count(K8sSecurityFinding.id)).where(
+        and_(
+            K8sSecurityFinding.organization_id == user.organization_id,
+            K8sSecurityFinding.severity == "critical",
+        )
+    )
+    finding_result = await db.execute(finding_stmt)
+    critical_findings = finding_result.scalar() or 0
+
+    # Count new alerts
+    alert_stmt = select(func.count(RuntimeAlert.id)).where(
+        and_(
+            RuntimeAlert.organization_id == user.organization_id,
+            RuntimeAlert.status == "new",
+        )
+    )
+    alert_result = await db.execute(alert_stmt)
+    new_alerts = alert_result.scalar() or 0
+
+    # High risk images
+    high_risk_stmt = select(func.count(ContainerImage.id)).where(
+        and_(
+            ContainerImage.organization_id == user.organization_id,
+            ContainerImage.risk_score >= 80,
+        )
+    )
+    high_risk_result = await db.execute(high_risk_stmt)
+    high_risk_images = high_risk_result.scalar() or 0
+
+    # Non-compliant clusters
+    non_compliant_stmt = select(func.count(KubernetesCluster.id)).where(
+        and_(
+            KubernetesCluster.organization_id == user.organization_id,
+            KubernetesCluster.compliance_score < 60,
+        )
+    )
+    non_compliant_result = await db.execute(non_compliant_stmt)
+    non_compliant_clusters = non_compliant_result.scalar() or 0
+
+    return DashboardOverviewResponse(
+        total_images=total_images,
+        total_clusters=total_clusters,
+        total_vulnerabilities=vuln_counts,
+        critical_findings=critical_findings,
+        runtime_alerts_new=new_alerts,
+        high_risk_images=high_risk_images,
+        non_compliant_clusters=non_compliant_clusters,
+        top_vulnerabilities=[],
+        cluster_compliance=[],
+        runtime_alert_trends=[],
+    )
+
+
+@router.get("/dashboard/compliance-matrix", response_model=List[ComplianceMatrixResponse])
+async def get_compliance_matrix(
+    db: AsyncSession = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    """Get compliance matrix across frameworks."""
+    stmt = select(KubernetesCluster).where(
+        KubernetesCluster.organization_id == user.organization_id
+    )
+    result = await db.execute(stmt)
+    clusters = result.scalars().all()
+
+    checker = ComplianceChecker()
+    matrices = []
+
+    for cluster in clusters:
+        nsa_cisa = await checker.check_nsa_cisa_hardening(cluster)
+        dod_stig = await checker.check_dod_stig(cluster)
+        soc2 = await checker.check_soc2_controls(cluster)
+
+        matrices.append(
+            ComplianceMatrixResponse(
+                cluster_name=cluster.name,
+                nsa_cisa_score=nsa_cisa["compliance_score"],
+                dod_stig_score=dod_stig["compliance_score"],
+                soc2_score=soc2["compliance_score"],
+                overall_compliance=int(
+                    (
+                        nsa_cisa["compliance_score"]
+                        + dod_stig["compliance_score"]
+                        + soc2["compliance_score"]
+                    )
+                    / 3
+                ),
+                timestamp=datetime.utcnow(),
+            )
+        )
+
+    return matrices

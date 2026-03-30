@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { useAuth } from '../contexts/AuthContext';
+import { useQueryClient } from '@tanstack/react-query';
 
 export interface WebSocketMessage {
   type: string;
@@ -9,6 +10,7 @@ export interface WebSocketMessage {
   message?: string;
   alert_id?: string;
   incident_id?: string;
+  message_id?: string;
   [key: string]: unknown;
 }
 
@@ -20,30 +22,62 @@ interface UseWebSocketReturn {
   subscribe: (channel: string) => void;
   unsubscribe: (channel: string) => void;
   addMessageHandler: (handler: MessageHandler) => () => void;
+  sendMessage: (action: string, data?: Record<string, unknown>) => void;
 }
 
 function getWebSocketUrl(): string {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${protocol}//${window.location.host}/api/v1/ws`;
+  return `${protocol}//${window.location.host}/api/v1/ws/connect`;
 }
+
+const RECONNECT_DELAYS = [1000, 2000, 4000, 8000, 16000, 30000]; // max 30s
 
 export function useWebSocket(): UseWebSocketReturn {
   const { token } = useAuth();
+  const queryClient = useQueryClient();
   const [isConnected, setIsConnected] = useState(false);
   const [lastMessage, setLastMessage] = useState<WebSocketMessage | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
   const handlersRef = useRef<Set<MessageHandler>>(new Set());
+  const reconnectAttemptRef = useRef(0);
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const heartbeatTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const mountedRef = useRef(true);
 
-  const connect = useCallback(() => {
-    // Don't connect if no token or already connected
-    if (!token || wsRef.current?.readyState === WebSocket.OPEN) {
-      return;
-    }
+  // Exponential backoff reconnect delay
+  const getReconnectDelay = useCallback(() => {
+    const index = Math.min(reconnectAttemptRef.current, RECONNECT_DELAYS.length - 1);
+    return RECONNECT_DELAYS[index];
+  }, []);
 
-    // Don't connect if already connecting
-    if (wsRef.current?.readyState === WebSocket.CONNECTING) {
+  // Heartbeat ping every 30 seconds
+  const startHeartbeat = useCallback(() => {
+    const sendPing = () => {
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ action: 'ping' }));
+      }
+      if (mountedRef.current) {
+        heartbeatTimeoutRef.current = setTimeout(sendPing, 30000);
+      }
+    };
+
+    if (mountedRef.current) {
+      heartbeatTimeoutRef.current = setTimeout(sendPing, 30000);
+    }
+  }, []);
+
+  const stopHeartbeat = useCallback(() => {
+    if (heartbeatTimeoutRef.current) {
+      clearTimeout(heartbeatTimeoutRef.current);
+      heartbeatTimeoutRef.current = null;
+    }
+  }, []);
+
+  const connect = useCallback(() => {
+    // Don't connect if no token or already connected/connecting
+    if (!token) return;
+
+    if (wsRef.current?.readyState === WebSocket.OPEN || wsRef.current?.readyState === WebSocket.CONNECTING) {
       return;
     }
 
@@ -55,6 +89,8 @@ export function useWebSocket(): UseWebSocketReturn {
         if (mountedRef.current) {
           console.log('WebSocket connected');
           setIsConnected(true);
+          reconnectAttemptRef.current = 0;
+          startHeartbeat();
         }
       };
 
@@ -64,6 +100,37 @@ export function useWebSocket(): UseWebSocketReturn {
         try {
           const message: WebSocketMessage = JSON.parse(event.data);
           setLastMessage(message);
+
+          // Auto-invalidate queries on relevant events for TanStack Query integration
+          switch (message.type) {
+            case 'alert_created':
+            case 'alert_updated':
+            case 'alert_escalated':
+            case 'alert_resolved':
+              queryClient.invalidateQueries({ queryKey: ['alerts'] });
+              break;
+            case 'incident_created':
+            case 'incident_updated':
+            case 'incident_escalated':
+            case 'incident_resolved':
+              queryClient.invalidateQueries({ queryKey: ['incidents'] });
+              break;
+            case 'playbook_execution_started':
+            case 'playbook_execution_completed':
+            case 'playbook_execution_failed':
+            case 'playbook_step_completed':
+              queryClient.invalidateQueries({ queryKey: ['playbooks'] });
+              break;
+            case 'threat_detected':
+            case 'ioc_matched':
+              queryClient.invalidateQueries({ queryKey: ['threats'] });
+              queryClient.invalidateQueries({ queryKey: ['iocs'] });
+              break;
+            case 'compliance_violation':
+            case 'compliance_check_passed':
+              queryClient.invalidateQueries({ queryKey: ['compliance'] });
+              break;
+          }
 
           // Call all registered handlers
           handlersRef.current.forEach(handler => {
@@ -82,16 +149,21 @@ export function useWebSocket(): UseWebSocketReturn {
         if (!mountedRef.current) return;
 
         console.log('WebSocket disconnected');
+        stopHeartbeat();
         setIsConnected(false);
         wsRef.current = null;
 
-        // Attempt to reconnect after 5 seconds if we still have a token
+        // Attempt to reconnect with exponential backoff
         if (token && mountedRef.current) {
+          const delay = getReconnectDelay();
+          reconnectAttemptRef.current += 1;
+          console.log(`Reconnecting in ${delay}ms (attempt ${reconnectAttemptRef.current})`);
+
           reconnectTimeoutRef.current = setTimeout(() => {
             if (mountedRef.current) {
               connect();
             }
-          }, 5000);
+          }, delay);
         }
       };
 
@@ -103,7 +175,7 @@ export function useWebSocket(): UseWebSocketReturn {
     } catch (e) {
       console.error('Failed to create WebSocket connection:', e);
     }
-  }, [token]);
+  }, [token, getReconnectDelay, startHeartbeat, stopHeartbeat, queryClient]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -120,12 +192,14 @@ export function useWebSocket(): UseWebSocketReturn {
         reconnectTimeoutRef.current = null;
       }
 
+      stopHeartbeat();
+
       if (wsRef.current) {
         wsRef.current.close();
         wsRef.current = null;
       }
     };
-  }, [connect, token]);
+  }, [connect, token, stopHeartbeat]);
 
   const subscribe = useCallback((channel: string) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -136,6 +210,12 @@ export function useWebSocket(): UseWebSocketReturn {
   const unsubscribe = useCallback((channel: string) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify({ action: 'unsubscribe', channel }));
+    }
+  }, []);
+
+  const sendMessage = useCallback((action: string, data?: Record<string, unknown>) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ action, ...data }));
     }
   }, []);
 
@@ -151,6 +231,7 @@ export function useWebSocket(): UseWebSocketReturn {
     lastMessage,
     subscribe,
     unsubscribe,
+    sendMessage,
     addMessageHandler,
   };
 }

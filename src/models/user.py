@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Optional
 from sqlalchemy import Boolean, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
+from src.core.encryption import EncryptedType, EncryptedJSON
 from src.models.base import BaseModel
 
 if TYPE_CHECKING:
@@ -42,11 +43,17 @@ class User(BaseModel):
     )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     is_superuser: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    force_password_change: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    mfa_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     # Optional fields
     phone: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     department: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     avatar_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # MFA fields
+    mfa_secret: Mapped[Optional[str]] = mapped_column(EncryptedType(), nullable=True)
+    mfa_backup_codes: Mapped[Optional[dict]] = mapped_column(EncryptedJSON(), nullable=True)
 
     # Last login tracking
     last_login: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)

@@ -1,0 +1,33 @@
+title: Brute Force Login Attempts
+id: 550e8400-e29b-41d4-a716-446655440001
+status: active
+description: Detects multiple failed login attempts from the same source within a short timeframe, indicating a potential brute force attack
+author: PySOAR
+severity: high
+logtypes:
+  - authentication
+detection:
+  selection:
+    action: login_failed
+  condition: "selection"
+  timewindow: 300
+  threshold: 5
+  group_by:
+    - source_address
+    - username
+mitre:
+  tactics:
+    - TA0006
+  techniques:
+    - T1110
+falsepositives:
+  - User forgetting password and retrying
+  - Automated backup systems with incorrect credentials
+  - VPN client reconnection attempts
+tags:
+  - attack.credential_access
+  - attack.brute_force
+  - detection.initial_access
+references:
+  - https://attack.mitre.org/tactics/TA0006/
+  - https://attack.mitre.org/techniques/T1110/

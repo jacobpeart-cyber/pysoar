@@ -1,0 +1,69 @@
+title: Persistence Mechanism Detection
+id: 550e8400-e29b-41d4-a716-446655440006
+status: active
+description: Detects persistence mechanisms including scheduled tasks, registry run keys, new services, and cron job modifications
+author: PySOAR
+severity: medium
+logtypes:
+  - endpoint
+  - system
+detection:
+  selection_scheduled_task:
+    event_type: process_execution
+    process_name: "schtasks.exe"
+    command_line|contains:
+      - "/create"
+      - "/change"
+  selection_registry_run:
+    event_type: registry_modification
+    registry_path|contains:
+      - "Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+      - "Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce"
+      - "Software\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon"
+    action:
+      - "set_value"
+      - "create"
+  selection_new_service:
+    event_type: service_creation
+    service_start_type: "auto"
+    service_executable|contains:
+      - ".ps1"
+      - ".vbs"
+      - ".bat"
+      - ".cmd"
+  selection_cron_job:
+    event_type: file_modification
+    file_path|contains:
+      - "/etc/cron"
+      - "/var/spool/cron"
+      - "crontab"
+    action:
+      - "create"
+      - "modify"
+  filter_system:
+    user: "SYSTEM"
+    process_path|startswith:
+      - "C:\\Windows\\System32"
+      - "C:\\Windows\\SysWOW64"
+  filter_admin_user:
+    user_groups|contains: "Administrators"
+  condition: "(selection_scheduled_task or selection_registry_run or selection_new_service or selection_cron_job) and not (filter_system or filter_admin_user)"
+  timewindow: 300
+mitre:
+  tactics:
+    - TA0003
+  techniques:
+    - T1053
+falsepositives:
+  - Legitimate software installation and updates
+  - Authorized system administration activities
+  - Standard system maintenance tasks
+  - Legitimate scheduled backup operations
+  - Third-party application auto-updates
+tags:
+  - attack.persistence
+  - attack.privilege_escalation
+  - detection.scheduled_execution
+references:
+  - https://attack.mitre.org/tactics/TA0003/
+  - https://attack.mitre.org/techniques/T1053/
