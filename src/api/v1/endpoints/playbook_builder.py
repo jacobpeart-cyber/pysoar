@@ -17,7 +17,7 @@ from src.playbook_builder.engine import (
 )
 from src.playbook_builder.models import (
     PlaybookEdge,
-    PlaybookExecution,
+    VisualPlaybookExecution,
     PlaybookNode,
     PlaybookNodeExecution,
     VisualPlaybook,
@@ -448,7 +448,7 @@ async def execute_playbook(
     """Trigger playbook execution"""
     playbook = await _get_playbook_or_404(db, playbook_id, current_user.organization_id)
 
-    execution = PlaybookExecution(
+    execution = VisualPlaybookExecution(
         playbook_id=playbook.id,
         organization_id=playbook.organization_id,
         triggered_by=current_user.id,
@@ -483,11 +483,11 @@ async def list_executions(
     """List playbook executions"""
     playbook = await _get_playbook_or_404(db, playbook_id, current_user.organization_id)
 
-    query = select(PlaybookExecution).where(PlaybookExecution.playbook_id == playbook.id)
+    query = select(VisualPlaybookExecution).where(VisualPlaybookExecution.playbook_id == playbook.id)
 
     # Get total count
     count_result = await db.execute(
-        select(func.count(PlaybookExecution.id)).select_from(PlaybookExecution)
+        select(func.count(VisualPlaybookExecution.id)).select_from(VisualPlaybookExecution)
     )
     total = count_result.scalar() or 0
 
@@ -518,7 +518,7 @@ async def get_execution_status(
 ):
     """Get execution status"""
     result = await db.execute(
-        select(PlaybookExecution).where(PlaybookExecution.id == execution_id)
+        select(VisualPlaybookExecution).where(VisualPlaybookExecution.id == execution_id)
     )
     execution = result.scalar_one_or_none()
 
@@ -653,8 +653,8 @@ async def get_dashboard(
 
     # Count executions
     result = await db.execute(
-        select(func.count(PlaybookExecution.id)).where(
-            PlaybookExecution.organization_id == current_user.organization_id
+        select(func.count(VisualPlaybookExecution.id)).where(
+            VisualPlaybookExecution.organization_id == current_user.organization_id
         )
     )
     total_executions = result.scalar() or 0
@@ -780,7 +780,7 @@ def _edge_to_response(edge: PlaybookEdge) -> PlaybookEdgeResponse:
     )
 
 
-def _execution_to_response(execution: PlaybookExecution) -> PlaybookExecutionResponse:
+def _execution_to_response(execution: VisualPlaybookExecution) -> PlaybookExecutionResponse:
     """Convert execution to response"""
     return PlaybookExecutionResponse(
         id=execution.id,
