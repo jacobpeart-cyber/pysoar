@@ -184,7 +184,7 @@ async def seed():
                 threat_level=threat_level,
                 description=desc,
                 source="threat_feed",
-                is_active=True,
+                status="active",
                 created_at=rand_date(60),
                 updated_at=datetime.now(timezone.utc),
             )
