@@ -19,11 +19,14 @@ from src.exposure.models import (
     ExposureAsset,
     ExposureScan,
     RemediationTicket,
-    Vulnerability,
+    ExposureVulnerability,
 )
+
+Vulnerability = ExposureVulnerability  # Backwards compatibility alias
 
 __all__ = [
     "ExposureAsset",
+    "ExposureVulnerability",
     "Vulnerability",
     "AssetVulnerability",
     "ExposureScan",
