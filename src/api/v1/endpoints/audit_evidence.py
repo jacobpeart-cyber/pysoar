@@ -171,7 +171,7 @@ async def detect_suspicious_activity(
 
 @router.post("/evidence/collect", response_model=None)
 async def collect_evidence(
-    request: Body(...),
+    request: dict = Body(...),
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
 ):

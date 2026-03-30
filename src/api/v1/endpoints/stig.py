@@ -317,7 +317,7 @@ async def auto_remediate(
 
 @router.post("/remediate/script", response_model=RemediationScriptResponse)
 async def generate_remediation_script(
-    request: Body(...),
+    request: dict = Body(...),
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
 ):
@@ -365,7 +365,7 @@ async def import_scap_content(
 
 @router.post("/scap/scan", response_model=None)
 async def run_scap_scan(
-    request: Body(...),
+    request: dict = Body(...),
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
 ):
