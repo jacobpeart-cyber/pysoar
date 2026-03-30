@@ -270,7 +270,7 @@ async def trigger_monitor_scan(
     scan_request: ScanTriggerRequest,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    background_tasks: BackgroundTasks,
+    background_tasks: BackgroundTasks = None,
     monitor_id: str = Path(...),
 ):
     """Trigger immediate scan for monitor"""
@@ -688,7 +688,7 @@ async def update_brand_threat(
 async def initiate_takedown(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    background_tasks: BackgroundTasks,
+    background_tasks: BackgroundTasks = None,
     threat_id: str = Path(...),
 ):
     """Initiate takedown for brand threat"""
