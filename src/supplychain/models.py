@@ -151,16 +151,9 @@ class SoftwareComponent(BaseModel):
     last_scanned: Mapped[Optional[datetime]] = mapped_column(nullable=True)
 
     # Relationships
-    parent_component: Mapped[Optional["SoftwareComponent"]] = relationship(
-        "SoftwareComponent",
-        remote_side="SoftwareComponent.id",
-        back_populates="child_components",
-        foreign_keys=[parent_component_id],
-    )
     child_components: Mapped[list["SoftwareComponent"]] = relationship(
         "SoftwareComponent",
-        back_populates="parent_component",
-        foreign_keys=[parent_component_id],
+        foreign_keys="[SoftwareComponent.parent_component_id]",
     )
     sbom_components: Mapped[list["SBOMComponent"]] = relationship(
         "SBOMComponent",
