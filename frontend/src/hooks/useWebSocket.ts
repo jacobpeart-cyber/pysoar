@@ -27,7 +27,7 @@ interface UseWebSocketReturn {
 
 function getWebSocketUrl(): string {
   const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${protocol}//${window.location.host}/api/v1/ws/connect`;
+  return `${protocol}//${window.location.host}/api/v1/ws`;
 }
 
 const RECONNECT_DELAYS = [1000, 2000, 4000, 8000, 16000, 30000]; // max 30s
