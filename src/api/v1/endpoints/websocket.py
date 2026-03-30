@@ -18,7 +18,7 @@ async def get_user_from_token(token: str) -> Optional[str]:
         payload = jwt.decode(
             token,
             settings.jwt_secret_key,
-            algorithms=["HS256"],
+            algorithms=[settings.jwt_algorithm],
         )
         user_id: str = payload.get("sub")
         return user_id
@@ -59,6 +59,7 @@ async def websocket_endpoint(
         user_id = await get_user_from_token(token)
 
     if not user_id:
+        await websocket.accept()
         await websocket.close(code=4001, reason="Authentication required")
         return
 
