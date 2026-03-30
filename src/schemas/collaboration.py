@@ -433,4 +433,4 @@ class BulkParticipantUpdate(BaseModel):
 
     room_id: str
     user_ids: list[str]
-    action: str = Field(..., regex="^(add|remove)$")
+    action: str = Field(..., pattern="^(add|remove)$")
