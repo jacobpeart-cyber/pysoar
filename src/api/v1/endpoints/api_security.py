@@ -79,8 +79,8 @@ async def get_endpoint_or_404(db: AsyncSession, endpoint_id: str) -> APIEndpoint
 
 @router.get("/endpoints", response_model=APIEndpointInventoryListResponse)
 async def list_endpoints(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     service_name: Optional[str] = None,
@@ -147,8 +147,8 @@ async def list_endpoints(
 @router.post("/endpoints", response_model=APIEndpointInventoryResponse, status_code=status.HTTP_201_CREATED)
 async def create_endpoint(
     endpoint_data: APIEndpointInventoryCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Create a new API endpoint"""
     endpoint = APIEndpointInventory(
@@ -164,8 +164,8 @@ async def create_endpoint(
 @router.get("/endpoints/{endpoint_id}", response_model=APIEndpointInventoryResponse)
 async def get_endpoint(
     endpoint_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get endpoint by ID"""
     endpoint = await get_endpoint_or_404(db, endpoint_id)
@@ -176,8 +176,8 @@ async def get_endpoint(
 async def update_endpoint(
     endpoint_id: str,
     endpoint_data: APIEndpointInventoryUpdate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Update an API endpoint"""
     endpoint = await get_endpoint_or_404(db, endpoint_id)
@@ -194,8 +194,8 @@ async def update_endpoint(
 @router.delete("/endpoints/{endpoint_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_endpoint(
     endpoint_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Delete an API endpoint"""
     endpoint = await get_endpoint_or_404(db, endpoint_id)
@@ -224,8 +224,8 @@ async def get_vulnerability_or_404(db: AsyncSession, vuln_id: str) -> APIVulnera
 
 @router.get("/vulnerabilities", response_model=APIVulnerabilityListResponse)
 async def list_vulnerabilities(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     endpoint_id: Optional[str] = None,
@@ -283,8 +283,8 @@ async def list_vulnerabilities(
 @router.post("/vulnerabilities", response_model=APIVulnerabilityResponse, status_code=status.HTTP_201_CREATED)
 async def create_vulnerability(
     vuln_data: APIVulnerabilityCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Create a new vulnerability"""
     vuln = APIVulnerability(
@@ -300,8 +300,8 @@ async def create_vulnerability(
 @router.get("/vulnerabilities/{vuln_id}", response_model=APIVulnerabilityResponse)
 async def get_vulnerability(
     vuln_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get vulnerability by ID"""
     vuln = await get_vulnerability_or_404(db, vuln_id)
@@ -312,8 +312,8 @@ async def get_vulnerability(
 async def update_vulnerability(
     vuln_id: str,
     vuln_data: APIVulnerabilityUpdate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Update a vulnerability"""
     vuln = await get_vulnerability_or_404(db, vuln_id)
@@ -330,8 +330,8 @@ async def update_vulnerability(
 @router.post("/vulnerabilities/bulk-update")
 async def bulk_update_vulnerabilities(
     bulk_data: APIVulnerabilityBulkUpdate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Bulk update vulnerabilities"""
     result = await db.execute(
@@ -370,8 +370,8 @@ async def get_policy_or_404(db: AsyncSession, policy_id: str) -> APISecurityPoli
 
 @router.get("/policies", response_model=APISecurityPolicyListResponse)
 async def list_policies(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     policy_type: Optional[str] = None,
@@ -423,8 +423,8 @@ async def list_policies(
 @router.post("/policies", response_model=APISecurityPolicyResponse, status_code=status.HTTP_201_CREATED)
 async def create_policy(
     policy_data: APISecurityPolicyCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Create a new security policy"""
     policy = APISecurityPolicy(
@@ -440,8 +440,8 @@ async def create_policy(
 @router.get("/policies/{policy_id}", response_model=APISecurityPolicyResponse)
 async def get_policy(
     policy_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get policy by ID"""
     policy = await get_policy_or_404(db, policy_id)
@@ -452,8 +452,8 @@ async def get_policy(
 async def update_policy(
     policy_id: str,
     policy_data: APISecurityPolicyUpdate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Update a security policy"""
     policy = await get_policy_or_404(db, policy_id)
@@ -470,8 +470,8 @@ async def update_policy(
 @router.delete("/policies/{policy_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_policy(
     policy_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Delete a security policy"""
     policy = await get_policy_or_404(db, policy_id)
@@ -500,8 +500,8 @@ async def get_anomaly_or_404(db: AsyncSession, anomaly_id: str) -> APIAnomalyDet
 
 @router.get("/anomalies", response_model=APIAnomalyDetectionListResponse)
 async def list_anomalies(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     endpoint_id: Optional[str] = None,
@@ -559,8 +559,8 @@ async def list_anomalies(
 @router.post("/anomalies", response_model=APIAnomalyDetectionResponse, status_code=status.HTTP_201_CREATED)
 async def create_anomaly(
     anomaly_data: APIAnomalyDetectionCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Create a new anomaly detection record"""
     anomaly = APIAnomalyDetection(
@@ -576,8 +576,8 @@ async def create_anomaly(
 @router.get("/anomalies/{anomaly_id}", response_model=APIAnomalyDetectionResponse)
 async def get_anomaly(
     anomaly_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get anomaly by ID"""
     anomaly = await get_anomaly_or_404(db, anomaly_id)
@@ -588,8 +588,8 @@ async def get_anomaly(
 async def update_anomaly(
     anomaly_id: str,
     anomaly_data: APIAnomalyDetectionUpdate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Update an anomaly detection record"""
     anomaly = await get_anomaly_or_404(db, anomaly_id)
@@ -624,8 +624,8 @@ async def get_compliance_check_or_404(db: AsyncSession, check_id: str) -> APICom
 
 @router.get("/compliance-checks", response_model=APIComplianceCheckListResponse)
 async def list_compliance_checks(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     endpoint_id: Optional[str] = None,
@@ -680,8 +680,8 @@ async def list_compliance_checks(
 @router.post("/compliance-checks", response_model=APIComplianceCheckResponse, status_code=status.HTTP_201_CREATED)
 async def create_compliance_check(
     check_data: APIComplianceCheckCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Create a new compliance check"""
     check = APIComplianceCheck(
@@ -697,8 +697,8 @@ async def create_compliance_check(
 @router.get("/compliance-checks/{check_id}", response_model=APIComplianceCheckResponse)
 async def get_compliance_check(
     check_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get compliance check by ID"""
     check = await get_compliance_check_or_404(db, check_id)
@@ -709,8 +709,8 @@ async def get_compliance_check(
 async def update_compliance_check(
     check_id: str,
     check_data: APIComplianceCheckUpdate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Update a compliance check"""
     check = await get_compliance_check_or_404(db, check_id)
@@ -731,8 +731,8 @@ async def update_compliance_check(
 
 @router.get("/dashboard", response_model=APISecurityDashboardResponse)
 async def get_dashboard(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get API security dashboard"""
     # Total endpoints
@@ -869,8 +869,8 @@ async def get_dashboard(
 
 @router.post("/scan/discover", response_model=APIDiscoveryResultsResponse)
 async def trigger_api_discovery(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     background_tasks: BackgroundTasks,
     traffic_logs: Optional[List[dict]] = Body(None),
 ):
@@ -892,8 +892,8 @@ async def trigger_api_discovery(
 @router.post("/scan/security/{endpoint_id}", response_model=APIScanResultResponse)
 async def trigger_security_scan(
     endpoint_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     background_tasks: BackgroundTasks,
 ):
     """Trigger security assessment for endpoint"""
@@ -917,8 +917,8 @@ async def trigger_security_scan(
 @router.post("/scan/compliance/{endpoint_id}")
 async def trigger_compliance_check(
     endpoint_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     background_tasks: BackgroundTasks,
 ):
     """Trigger compliance checks for endpoint"""
@@ -932,8 +932,8 @@ async def trigger_compliance_check(
 
 @router.post("/scan/shadows")
 async def trigger_shadow_api_detection(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     background_tasks: BackgroundTasks,
     traffic_logs: Optional[List[dict]] = Body(None),
 ):
@@ -953,8 +953,8 @@ async def trigger_shadow_api_detection(
 
 @router.get("/reports/compliance", response_model=APIComplianceReportResponse)
 async def get_compliance_report(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get comprehensive compliance report"""
     # Total checks

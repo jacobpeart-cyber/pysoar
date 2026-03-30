@@ -36,8 +36,8 @@ router = APIRouter(prefix="/auth", tags=["Authentication"])
 @router.post("/login")
 async def login(
     request: LoginRequest,
-    db: DatabaseSession,
-    redis: RedisClient,
+    db: DatabaseSession = None,
+    redis: RedisClient = None,
 ):
     """Authenticate user and return tokens or MFA challenge"""
     # Initialize account lockout manager
@@ -123,7 +123,7 @@ async def login(
 @router.post("/refresh", response_model=TokenResponse)
 async def refresh_token_endpoint(
     request: RefreshTokenRequest,
-    db: DatabaseSession,
+    db: DatabaseSession = None,
 ):
     """Refresh access token using refresh token"""
     user_id = verify_token(request.refresh_token, token_type="refresh")
@@ -163,7 +163,7 @@ async def refresh_token_endpoint(
 
 @router.get("/me", response_model=UserResponse)
 async def get_current_user_info(
-    current_user: CurrentUser,
+    current_user: CurrentUser = None,
 ):
     """Get current authenticated user info"""
     return current_user
@@ -172,9 +172,9 @@ async def get_current_user_info(
 @router.post("/change-password")
 async def change_password(
     request: PasswordChangeRequest,
-    current_user: CurrentUser,
-    db: DatabaseSession,
-    redis: RedisClient,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+    redis: RedisClient = None,
 ):
     """Change current user's password"""
     user_service = UserService(db)
@@ -225,8 +225,8 @@ async def change_password(
 
 @router.post("/logout")
 async def logout(
-    current_user: CurrentUser,
-    redis: RedisClient,
+    current_user: CurrentUser = None,
+    redis: RedisClient = None,
 ):
     """Logout current user by revoking all tokens"""
     blacklist = TokenBlacklist(redis)
@@ -237,8 +237,8 @@ async def logout(
 
 @router.post("/revoke-all")
 async def revoke_all_tokens(
-    current_user: CurrentUser,
-    redis: RedisClient,
+    current_user: CurrentUser = None,
+    redis: RedisClient = None,
 ):
     """Revoke all tokens for current user (security incident endpoint)"""
     blacklist = TokenBlacklist(redis)

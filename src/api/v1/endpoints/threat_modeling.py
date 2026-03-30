@@ -128,8 +128,8 @@ async def get_threat_or_404(
 
 @router.post("", response_model=ThreatModelResponse, status_code=status.HTTP_201_CREATED)
 async def create_threat_model(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     data: ThreatModelCreate,
 ):
     """Create new threat model"""
@@ -153,8 +153,8 @@ async def create_threat_model(
 
 @router.get("", response_model=ThreatModelListResponse)
 async def list_threat_models(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     search: Optional[str] = None,
@@ -212,8 +212,8 @@ async def list_threat_models(
 
 @router.get("/{model_id}", response_model=ThreatModelResponse)
 async def get_threat_model(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     model_id: str,
 ):
     """Get threat model by ID"""
@@ -223,8 +223,8 @@ async def get_threat_model(
 
 @router.put("/{model_id}", response_model=ThreatModelResponse)
 async def update_threat_model(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     model_id: str,
     data: ThreatModelUpdate,
 ):
@@ -241,8 +241,8 @@ async def update_threat_model(
 
 @router.delete("/{model_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_threat_model(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     model_id: str,
 ):
     """Delete threat model"""
@@ -255,8 +255,8 @@ async def delete_threat_model(
 
 @router.post("/{model_id}/components", response_model=ComponentResponse)
 async def create_component(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     model_id: str,
     data: ComponentCreate,
 ):
@@ -283,8 +283,8 @@ async def create_component(
 
 @router.get("/{model_id}/components", response_model=list[ComponentResponse])
 async def list_components(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     model_id: str,
 ):
     """List components in threat model"""
@@ -300,8 +300,8 @@ async def list_components(
 
 @router.put("/{model_id}/components/{component_id}", response_model=ComponentResponse)
 async def update_component(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     model_id: str,
     component_id: str,
     data: ComponentUpdate,
@@ -319,8 +319,8 @@ async def update_component(
 
 @router.delete("/{model_id}/components/{component_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_component(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     model_id: str,
     component_id: str,
 ):
@@ -334,8 +334,8 @@ async def delete_component(
 
 @router.post("/{model_id}/threats", response_model=ThreatResponse)
 async def create_threat(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     model_id: str,
     data: ThreatCreate,
 ):
@@ -377,8 +377,8 @@ async def create_threat(
 
 @router.get("/{model_id}/threats", response_model=ThreatListResponse)
 async def list_threats(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     model_id: str,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -432,8 +432,8 @@ async def list_threats(
 
 @router.get("/{model_id}/threats/{threat_id}", response_model=ThreatResponse)
 async def get_threat(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     model_id: str,
     threat_id: str,
 ):
@@ -444,8 +444,8 @@ async def get_threat(
 
 @router.put("/{model_id}/threats/{threat_id}", response_model=ThreatResponse)
 async def update_threat(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     model_id: str,
     threat_id: str,
     data: ThreatUpdate,
@@ -471,8 +471,8 @@ async def update_threat(
 
 @router.delete("/{model_id}/threats/{threat_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_threat(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     model_id: str,
     threat_id: str,
 ):
@@ -491,8 +491,8 @@ async def delete_threat(
 
 @router.post("/{model_id}/threats/{threat_id}/mitigations", response_model=MitigationResponse)
 async def create_mitigation(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     model_id: str,
     threat_id: str,
     data: MitigationCreate,
@@ -528,8 +528,8 @@ async def create_mitigation(
 
 @router.get("/{model_id}/threats/{threat_id}/mitigations", response_model=MitigationListResponse)
 async def list_mitigations(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     model_id: str,
     threat_id: str,
     page: int = Query(1, ge=1),
@@ -566,8 +566,8 @@ async def list_mitigations(
 
 @router.put("/{model_id}/threats/{threat_id}/mitigations/{mitigation_id}", response_model=MitigationResponse)
 async def update_mitigation(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     model_id: str,
     threat_id: str,
     mitigation_id: str,
@@ -599,8 +599,8 @@ async def update_mitigation(
 
 @router.post("/{model_id}/analyze/stride", response_model=STRIDEAnalysisResponse)
 async def run_stride_analysis(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     model_id: str,
     request: STRIDEAnalysisRequest,
 ):
@@ -632,8 +632,8 @@ async def run_stride_analysis(
 
 @router.post("/{model_id}/analyze/pasta", response_model=PASTAAnalysisResponse)
 async def run_pasta_analysis(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     model_id: str,
     request: PASTAAnalysisRequest,
 ):
@@ -667,8 +667,8 @@ async def run_pasta_analysis(
 
 @router.post("/{model_id}/validate", response_model=ValidationResponse)
 async def validate_model(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     model_id: str,
     request: ValidationRequest,
 ):
@@ -706,8 +706,8 @@ async def validate_model(
 
 @router.get("/{model_id}/mitigations/recommendations/{threat_id}", response_model=RecommendationResponse)
 async def get_mitigation_recommendations(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     model_id: str,
     threat_id: str,
 ):
@@ -732,8 +732,8 @@ async def get_mitigation_recommendations(
 
 @router.get("/{model_id}/dashboard", response_model=ThreatModelDashboard)
 async def get_dashboard(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     model_id: str,
 ):
     """Get threat modeling dashboard data"""

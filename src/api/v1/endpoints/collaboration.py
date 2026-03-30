@@ -120,8 +120,8 @@ async def get_action_or_404(db: AsyncSession, action_id: str) -> ActionItem:
 
 @router.post("/rooms", response_model=WarRoomResponse, status_code=status.HTTP_201_CREATED)
 async def create_war_room(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     room_data: WarRoomCreate,
 ):
     """Create a new war room"""
@@ -146,8 +146,8 @@ async def create_war_room(
 
 @router.get("/rooms", response_model=WarRoomListResponse)
 async def list_war_rooms(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     status: Optional[str] = None,
@@ -190,8 +190,8 @@ async def list_war_rooms(
 
 @router.get("/rooms/{room_id}", response_model=WarRoomResponse)
 async def get_war_room(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     room_id: str,
 ):
     """Get war room details"""
@@ -201,8 +201,8 @@ async def get_war_room(
 
 @router.patch("/rooms/{room_id}", response_model=WarRoomResponse)
 async def update_war_room(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     room_id: str,
     room_data: WarRoomUpdate,
 ):
@@ -229,8 +229,8 @@ async def update_war_room(
 
 @router.post("/rooms/{room_id}/archive")
 async def archive_war_room(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     room_id: str,
 ):
     """Archive war room"""
@@ -243,8 +243,8 @@ async def archive_war_room(
 
 @router.get("/rooms/{room_id}/summary", response_model=WarRoomSummary)
 async def get_room_summary(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     room_id: str,
 ):
     """Get war room summary with metrics"""
@@ -256,8 +256,8 @@ async def get_room_summary(
 
 @router.post("/rooms/{room_id}/join")
 async def join_war_room(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     room_id: str,
 ):
     """Join a war room"""
@@ -277,8 +277,8 @@ async def join_war_room(
 
 @router.post("/rooms/{room_id}/leave")
 async def leave_war_room(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     room_id: str,
 ):
     """Leave a war room"""
@@ -291,8 +291,8 @@ async def leave_war_room(
 
 @router.post("/rooms/{room_id}/commander/{user_id}")
 async def set_war_room_commander(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     room_id: str,
     user_id: str,
 ):
@@ -315,8 +315,8 @@ async def set_war_room_commander(
 
 @router.post("/rooms/{room_id}/messages", response_model=WarRoomMessageResponse, status_code=status.HTTP_201_CREATED)
 async def send_message(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     room_id: str,
     msg_data: WarRoomMessageCreate,
 ):
@@ -341,8 +341,8 @@ async def send_message(
 
 @router.get("/rooms/{room_id}/messages", response_model=WarRoomMessageListResponse)
 async def get_room_messages(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     room_id: str,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=200),
@@ -362,8 +362,8 @@ async def get_room_messages(
 
 @router.patch("/messages/{message_id}", response_model=WarRoomMessageResponse)
 async def edit_message(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     message_id: str,
     msg_data: WarRoomMessageUpdate,
 ):
@@ -382,8 +382,8 @@ async def edit_message(
 
 @router.post("/messages/{message_id}/pin")
 async def pin_message(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     message_id: str,
 ):
     """Pin message in room"""
@@ -400,8 +400,8 @@ async def pin_message(
 
 @router.get("/rooms/{room_id}/messages/search", response_model=list[WarRoomMessageResponse])
 async def search_messages(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     room_id: str,
     q: str = Query(..., min_length=1),
     limit: int = Query(50, ge=1, le=200),
@@ -415,8 +415,8 @@ async def search_messages(
 
 @router.get("/rooms/{room_id}/messages/{message_id}/thread", response_model=MessageThreadResponse)
 async def get_message_thread(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     room_id: str,
     message_id: str,
 ):
@@ -442,8 +442,8 @@ async def get_message_thread(
 
 @router.post("/rooms/{room_id}/artifacts", response_model=SharedArtifactResponse, status_code=status.HTTP_201_CREATED)
 async def upload_artifact(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     room_id: str,
     artifact_data: SharedArtifactCreate,
 ):
@@ -469,8 +469,8 @@ async def upload_artifact(
 
 @router.get("/rooms/{room_id}/artifacts", response_model=SharedArtifactListResponse)
 async def list_room_artifacts(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     room_id: str,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -507,8 +507,8 @@ async def list_room_artifacts(
 
 @router.get("/artifacts/{artifact_id}", response_model=SharedArtifactResponse)
 async def get_artifact(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     artifact_id: str,
 ):
     """Get artifact details"""
@@ -518,8 +518,8 @@ async def get_artifact(
 
 @router.post("/artifacts/{artifact_id}/download")
 async def download_artifact(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     artifact_id: str,
 ):
     """Track artifact download"""
@@ -532,8 +532,8 @@ async def download_artifact(
 
 @router.get("/rooms/{room_id}/artifacts/index")
 async def get_artifact_index(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     room_id: str,
 ):
     """Get artifact index for room"""
@@ -550,8 +550,8 @@ async def get_artifact_index(
 
 @router.post("/rooms/{room_id}/actions", response_model=ActionItemResponse, status_code=status.HTTP_201_CREATED)
 async def create_action_item(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     room_id: str,
     action_data: ActionItemCreate,
 ):
@@ -575,8 +575,8 @@ async def create_action_item(
 
 @router.get("/rooms/{room_id}/actions", response_model=ActionItemListResponse)
 async def list_room_actions(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     room_id: str,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=200),
@@ -617,8 +617,8 @@ async def list_room_actions(
 
 @router.patch("/actions/{action_id}", response_model=ActionItemResponse)
 async def update_action_item(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     action_id: str,
     action_data: ActionItemUpdate,
 ):
@@ -648,8 +648,8 @@ async def update_action_item(
 
 @router.get("/rooms/{room_id}/actions/report", response_model=ActionReport)
 async def get_action_report(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     room_id: str,
 ):
     """Get action items report"""
@@ -666,8 +666,8 @@ async def get_action_report(
 
 @router.post("/rooms/{room_id}/timeline", response_model=IncidentTimelineResponse, status_code=status.HTTP_201_CREATED)
 async def add_timeline_event(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     room_id: str,
     event_data: IncidentTimelineCreate,
 ):
@@ -692,8 +692,8 @@ async def add_timeline_event(
 
 @router.get("/rooms/{room_id}/timeline", response_model=IncidentTimelineListResponse)
 async def get_timeline(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     room_id: str,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=200),
@@ -722,8 +722,8 @@ async def get_timeline(
 
 @router.get("/rooms/{room_id}/timeline/report")
 async def get_timeline_report(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     room_id: str,
 ):
     """Get timeline report"""
@@ -735,8 +735,8 @@ async def get_timeline_report(
 
 @router.get("/rooms/{room_id}/timeline/export")
 async def export_timeline(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     room_id: str,
     format: str = Query("json", regex="^(json|text)$"),
 ):
@@ -754,8 +754,8 @@ async def export_timeline(
 
 @router.post("/rooms/{room_id}/postmortem", response_model=PostMortemReport)
 async def generate_post_mortem(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     room_id: str,
 ):
     """Generate post-mortem report"""
@@ -767,8 +767,8 @@ async def generate_post_mortem(
 
 @router.get("/rooms/{room_id}/postmortem/analysis", response_model=PostMortemAnalysis)
 async def get_postmortem_analysis(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     room_id: str,
 ):
     """Get complete post-mortem analysis"""
@@ -803,8 +803,8 @@ async def get_postmortem_analysis(
 
 @router.get("/dashboard", response_model=CollaborationDashboard)
 async def get_collaboration_dashboard(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get collaboration dashboard"""
     manager = WarRoomManager(db)
@@ -864,8 +864,8 @@ async def get_collaboration_dashboard(
 
 @router.get("/rooms/{room_id}/activity-metrics", response_model=RoomActivityMetrics)
 async def get_room_activity_metrics(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     room_id: str,
 ):
     """Get activity metrics for room"""
@@ -933,8 +933,8 @@ async def get_room_activity_metrics(
 
 @router.get("/search", response_model=SearchResultsResponse)
 async def search_collaboration(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     room_id: str,
     q: str = Query(..., min_length=1),
 ):

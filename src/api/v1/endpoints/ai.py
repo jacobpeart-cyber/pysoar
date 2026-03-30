@@ -92,7 +92,7 @@ async def natural_language_query(request: NLQueryRequest, current_user: CurrentU
 async def query_history(
     limit: Annotated[int, Query(ge=1, le=100)] = 10,
     skip: Annotated[int, Query(ge=0)] = 0,
-    current_user: CurrentUser,
+    current_user: CurrentUser = None,
 ):
     """
     Get natural language query history.
@@ -367,7 +367,7 @@ async def list_anomalies(
     severity: str | None = None,
     skip: Annotated[int, Query(ge=0)] = 0,
     limit: Annotated[int, Query(ge=1, le=100)] = 20,
-    current_user: CurrentUser,
+    current_user: CurrentUser = None,
 ):
     """
     List detected anomalies with filtering and pagination.
@@ -459,7 +459,7 @@ async def list_threat_predictions(
     entity_type: str | None = None,
     skip: Annotated[int, Query(ge=0)] = 0,
     limit: Annotated[int, Query(ge=1, le=100)] = 20,
-    current_user: CurrentUser,
+    current_user: CurrentUser = None,
 ):
     """List active threat predictions."""
     logger.info(f"Listing threat predictions")

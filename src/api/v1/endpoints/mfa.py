@@ -29,8 +29,8 @@ router = APIRouter(prefix="/mfa", tags=["MFA"])
 
 @router.post("/setup", response_model=MFASetupResponse)
 async def setup_mfa(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Generate MFA secret and provisioning URI for setup"""
     logger.info(f"MFA setup initiated for user {current_user.id}")
@@ -63,8 +63,8 @@ async def setup_mfa(
 @router.post("/verify-setup")
 async def verify_mfa_setup(
     request: MFAVerifySetupRequest,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Verify TOTP code and persist MFA configuration"""
     logger.info(f"MFA setup verification initiated for user {current_user.id}")
@@ -111,8 +111,8 @@ async def verify_mfa_setup(
 @router.post("/verify", response_model=MFAVerifyResponse)
 async def verify_mfa_login(
     request: MFAVerifyLoginRequest,
-    db: DatabaseSession,
-    redis: RedisClient,
+    db: DatabaseSession = None,
+    redis: RedisClient = None,
 ):
     """Verify MFA code during login and issue tokens"""
     logger.info("MFA login verification initiated")
@@ -232,8 +232,8 @@ async def verify_mfa_login(
 @router.post("/backup-codes")
 async def regenerate_backup_codes(
     request: MFABackupCodesRequest,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Regenerate backup codes after TOTP verification"""
     logger.info(f"Backup code regeneration initiated for user {current_user.id}")
@@ -285,8 +285,8 @@ async def regenerate_backup_codes(
 @router.post("/disable")
 async def disable_mfa(
     request: MFADisableRequest,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Disable MFA after TOTP verification"""
     logger.info(f"MFA disable initiated for user {current_user.id}")

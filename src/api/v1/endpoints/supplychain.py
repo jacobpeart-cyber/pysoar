@@ -131,8 +131,8 @@ async def get_vendor_or_404(db: AsyncSession, vendor_id: str) -> VendorAssessmen
 
 @router.post("/sboms/generate", response_model=SBOMResponse)
 async def generate_sbom(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     sbom_create: SBOMCreate,
 ):
     """Generate new SBOM for application"""
@@ -149,8 +149,8 @@ async def generate_sbom(
 
 @router.post("/sboms/import", response_model=SBOMResponse)
 async def import_sbom(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     import_request: SBOMImportRequest,
 ):
     """Import SBOM from file or content"""
@@ -191,8 +191,8 @@ async def import_sbom(
 
 @router.post("/sboms/{sbom_id}/export")
 async def export_sbom(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     sbom_id: str,
     export_request: SBOMExportRequest,
 ):
@@ -230,8 +230,8 @@ async def export_sbom(
 
 @router.get("/sboms", response_model=SBOMListResponse)
 async def list_sboms(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     search: Optional[str] = None,
@@ -277,8 +277,8 @@ async def list_sboms(
 
 @router.get("/sboms/{sbom_id}", response_model=SBOMResponse)
 async def get_sbom(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     sbom_id: str,
 ):
     """Get SBOM details"""
@@ -292,8 +292,8 @@ async def get_sbom(
 
 @router.patch("/sboms/{sbom_id}", response_model=SBOMResponse)
 async def update_sbom(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     sbom_id: str,
     sbom_update: SBOMUpdate,
 ):
@@ -314,8 +314,8 @@ async def update_sbom(
 
 @router.post("/sboms/compare")
 async def compare_sboms(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     comparison_request: SBOMComparisonRequest,
 ):
     """Compare two SBOM versions"""
@@ -340,8 +340,8 @@ async def compare_sboms(
 
 @router.post("/components", response_model=SoftwareComponentResponse)
 async def create_component(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     component_create: SoftwareComponentCreate,
 ):
     """Create software component"""
@@ -357,8 +357,8 @@ async def create_component(
 
 @router.get("/components", response_model=SoftwareComponentListResponse)
 async def list_components(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     search: Optional[str] = None,
@@ -405,8 +405,8 @@ async def list_components(
 
 @router.get("/components/{component_id}", response_model=SoftwareComponentResponse)
 async def get_component(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     component_id: str,
 ):
     """Get component details"""
@@ -420,8 +420,8 @@ async def get_component(
 
 @router.patch("/components/{component_id}", response_model=SoftwareComponentResponse)
 async def update_component(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     component_id: str,
     component_update: SoftwareComponentUpdate,
 ):
@@ -442,8 +442,8 @@ async def update_component(
 
 @router.get("/components/{component_id}/dependency-tree")
 async def get_component_dependency_tree(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     component_id: str,
 ):
     """Get component dependency tree"""
@@ -469,8 +469,8 @@ async def get_component_dependency_tree(
 
 @router.get("/components/{component_id}/vulnerabilities")
 async def get_component_vulnerabilities(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     component_id: str,
 ):
     """Look up known vulnerabilities for component"""
@@ -505,8 +505,8 @@ async def get_component_vulnerabilities(
 
 @router.post("/risks", response_model=SupplyChainRiskResponse)
 async def create_risk(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     risk_create: SupplyChainRiskCreate,
 ):
     """Create supply chain risk record"""
@@ -523,8 +523,8 @@ async def create_risk(
 
 @router.get("/risks", response_model=SupplyChainRiskListResponse)
 async def list_risks(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     risk_type: Optional[str] = None,
@@ -567,8 +567,8 @@ async def list_risks(
 
 @router.get("/risks/{risk_id}", response_model=SupplyChainRiskResponse)
 async def get_risk(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     risk_id: str,
 ):
     """Get risk details"""
@@ -582,8 +582,8 @@ async def get_risk(
 
 @router.patch("/risks/{risk_id}", response_model=SupplyChainRiskResponse)
 async def update_risk(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     risk_id: str,
     risk_update: SupplyChainRiskUpdate,
 ):
@@ -607,8 +607,8 @@ async def update_risk(
 
 @router.post("/vendors", response_model=VendorAssessmentResponse)
 async def create_vendor(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     vendor_create: VendorAssessmentCreate,
 ):
     """Create vendor assessment"""
@@ -625,8 +625,8 @@ async def create_vendor(
 
 @router.get("/vendors", response_model=VendorAssessmentListResponse)
 async def list_vendors(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     search: Optional[str] = None,
@@ -666,8 +666,8 @@ async def list_vendors(
 
 @router.get("/vendors/{vendor_id}", response_model=VendorAssessmentResponse)
 async def get_vendor(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     vendor_id: str,
 ):
     """Get vendor assessment"""
@@ -681,8 +681,8 @@ async def get_vendor(
 
 @router.patch("/vendors/{vendor_id}", response_model=VendorAssessmentResponse)
 async def update_vendor(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     vendor_id: str,
     vendor_update: VendorAssessmentUpdate,
 ):
@@ -706,8 +706,8 @@ async def update_vendor(
 
 @router.post("/compliance/validate-sbom")
 async def validate_sbom_compliance(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     sbom_id: str,
 ):
     """Validate SBOM compliance with CISA guidelines"""
@@ -731,8 +731,8 @@ async def validate_sbom_compliance(
 
 @router.get("/compliance/license-audit")
 async def license_audit(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Audit license compliance across organization"""
     result = await db.execute(
@@ -774,8 +774,8 @@ async def license_audit(
 
 @router.get("/dashboard/overview")
 async def dashboard_overview(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get supply chain security dashboard overview"""
     sbom_result = await db.execute(
@@ -846,8 +846,8 @@ async def dashboard_overview(
 
 @router.get("/dashboard/top-risky-components")
 async def get_top_risky_components(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     limit: int = Query(10, ge=1, le=50),
 ):
     """Get top risky components by risk score"""
@@ -889,8 +889,8 @@ async def get_top_risky_components(
 
 @router.get("/dashboard/vendor-scores")
 async def get_vendor_scores(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get vendor risk scores"""
     result = await db.execute(

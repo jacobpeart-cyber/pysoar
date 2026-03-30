@@ -105,8 +105,8 @@ async def get_attack_surface_or_404(db: AsyncSession, surface_id: str):
 @router.post("/assets", response_model=ExposureAssetResponse, status_code=status.HTTP_201_CREATED)
 async def create_asset(
     asset_data: ExposureAssetCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Create a new exposure asset"""
     # Implementation depends on Asset model in src/models/exposure.py
@@ -147,8 +147,8 @@ async def create_asset(
 
 @router.get("/assets", response_model=ExposureAssetListResponse)
 async def list_assets(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=500),
     search: Optional[str] = None,
@@ -174,8 +174,8 @@ async def list_assets(
 @router.get("/assets/{asset_id}", response_model=ExposureAssetResponse)
 async def get_asset(
     asset_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get a specific exposure asset with details and vulnerabilities"""
     asset = await get_asset_or_404(db, asset_id)
@@ -186,8 +186,8 @@ async def get_asset(
 async def update_asset(
     asset_id: str,
     asset_data: ExposureAssetUpdate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Update an exposure asset"""
     asset = await get_asset_or_404(db, asset_id)
@@ -197,8 +197,8 @@ async def update_asset(
 @router.delete("/assets/{asset_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def deactivate_asset(
     asset_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Deactivate an exposure asset"""
     asset = await get_asset_or_404(db, asset_id)
@@ -207,8 +207,8 @@ async def deactivate_asset(
 @router.post("/assets/discover", response_model=DiscoveryResult)
 async def trigger_asset_discovery(
     discovery_request: AssetDiscoveryRequest,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Trigger asset discovery scan (network, cloud, AD, DNS)"""
     return {
@@ -223,8 +223,8 @@ async def trigger_asset_discovery(
 @router.post("/assets/import", response_model=BulkImportResult)
 async def import_assets(
     import_data: BulkAssetImportRequest,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Bulk import assets from CSV or JSON"""
     return {
@@ -238,8 +238,8 @@ async def import_assets(
 @router.get("/assets/{asset_id}/vulnerabilities", response_model=AssetVulnerabilityListResponse)
 async def get_asset_vulnerabilities(
     asset_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=500),
     status: Optional[str] = None,
@@ -264,8 +264,8 @@ async def get_asset_vulnerabilities(
 @router.post("/vulnerabilities", response_model=VulnerabilityResponse, status_code=status.HTTP_201_CREATED)
 async def create_vulnerability(
     vuln_data: VulnerabilityCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Create a new vulnerability record"""
     return {
@@ -293,8 +293,8 @@ async def create_vulnerability(
 
 @router.get("/vulnerabilities", response_model=VulnerabilityListResponse)
 async def list_vulnerabilities(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=500),
     search: Optional[str] = None,
@@ -316,8 +316,8 @@ async def list_vulnerabilities(
 @router.get("/vulnerabilities/{vuln_id}", response_model=VulnerabilityResponse)
 async def get_vulnerability(
     vuln_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get a specific vulnerability with affected assets"""
     vuln = await get_vulnerability_or_404(db, vuln_id)
@@ -328,8 +328,8 @@ async def get_vulnerability(
 async def update_vulnerability(
     vuln_id: str,
     vuln_data: VulnerabilityUpdate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Update vulnerability information"""
     vuln = await get_vulnerability_or_404(db, vuln_id)
@@ -339,8 +339,8 @@ async def update_vulnerability(
 @router.delete("/vulnerabilities/{vuln_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_vulnerability(
     vuln_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Delete a vulnerability record"""
     vuln = await get_vulnerability_or_404(db, vuln_id)
@@ -348,8 +348,8 @@ async def delete_vulnerability(
 
 @router.get("/vulnerabilities/kev")
 async def get_cisa_kev_list(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get CISA Known Exploited Vulnerabilities list (with integration)"""
     return {
@@ -362,8 +362,8 @@ async def get_cisa_kev_list(
 @router.post("/vulnerabilities/search", response_model=VulnerabilityListResponse)
 async def advanced_vulnerability_search(
     search_request: ExposureSearchRequest,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=500),
 ):
@@ -385,8 +385,8 @@ async def advanced_vulnerability_search(
 @router.post("/asset-vulns", response_model=AssetVulnerabilityResponse, status_code=status.HTTP_201_CREATED)
 async def create_asset_vulnerability(
     mapping_data: AssetVulnerabilityCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Create asset-vulnerability mapping"""
     return {
@@ -411,8 +411,8 @@ async def create_asset_vulnerability(
 async def update_asset_vulnerability(
     mapping_id: str,
     mapping_data: AssetVulnerabilityUpdate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Update asset-vulnerability status (open, remediated, accepted, false-positive)"""
     mapping = await get_asset_vulnerability_or_404(db, mapping_id)
@@ -433,8 +433,8 @@ async def mark_as_remediated(
 
 @router.get("/asset-vulns/prioritized", response_model=AssetVulnerabilityListResponse)
 async def get_prioritized_remediation_list(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=500),
     criticality: Optional[str] = None,
@@ -458,8 +458,8 @@ async def get_prioritized_remediation_list(
 @router.post("/scans", response_model=ExposureScanResponse, status_code=status.HTTP_201_CREATED)
 async def launch_scan(
     scan_data: ExposureScanCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Launch a new exposure scan"""
     return {
@@ -482,8 +482,8 @@ async def launch_scan(
 
 @router.get("/scans", response_model=ExposureScanListResponse)
 async def list_scans(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=500),
     scan_type: Optional[str] = None,
@@ -503,8 +503,8 @@ async def list_scans(
 @router.get("/scans/{scan_id}", response_model=ExposureScanResponse)
 async def get_scan(
     scan_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get scan results and details"""
     scan = await get_scan_or_404(db, scan_id)
@@ -514,8 +514,8 @@ async def get_scan(
 @router.post("/scans/{scan_id}/cancel", response_model=ExposureScanResponse)
 async def cancel_scan(
     scan_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Cancel a running scan"""
     scan = await get_scan_or_404(db, scan_id)
@@ -525,8 +525,8 @@ async def cancel_scan(
 @router.post("/scans/import", response_model=ScannerImportResult)
 async def import_scan_results(
     import_data: ExternalScannerImportRequest,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Import results from external scanners (Nessus, Qualys, etc.)"""
     return {
@@ -547,8 +547,8 @@ async def import_scan_results(
 @router.post("/tickets", response_model=RemediationTicketResponse, status_code=status.HTTP_201_CREATED)
 async def create_remediation_ticket(
     ticket_data: RemediationTicketCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Create a remediation ticket"""
     return {
@@ -573,8 +573,8 @@ async def create_remediation_ticket(
 
 @router.get("/tickets", response_model=RemediationTicketListResponse)
 async def list_remediation_tickets(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=500),
     status: Optional[str] = None,
@@ -595,8 +595,8 @@ async def list_remediation_tickets(
 @router.get("/tickets/{ticket_id}", response_model=RemediationTicketResponse)
 async def get_remediation_ticket(
     ticket_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get a specific remediation ticket"""
     ticket = await get_ticket_or_404(db, ticket_id)
@@ -607,8 +607,8 @@ async def get_remediation_ticket(
 async def update_remediation_ticket(
     ticket_id: str,
     ticket_data: RemediationTicketUpdate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Update a remediation ticket"""
     ticket = await get_ticket_or_404(db, ticket_id)
@@ -619,8 +619,8 @@ async def update_remediation_ticket(
 async def verify_remediation(
     ticket_id: str,
     verification_data: RemediationVerificationRequest,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Verify remediation completion"""
     ticket = await get_ticket_or_404(db, ticket_id)
@@ -635,8 +635,8 @@ async def verify_remediation(
 
 @router.get("/tickets/overdue", response_model=RemediationTicketListResponse)
 async def get_overdue_tickets(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=500),
 ):
@@ -658,8 +658,8 @@ async def get_overdue_tickets(
 @router.post("/attack-surface", response_model=AttackSurfaceResponse, status_code=status.HTTP_201_CREATED)
 async def define_attack_surface(
     surface_data: AttackSurfaceCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Define an attack surface"""
     return {
@@ -678,8 +678,8 @@ async def define_attack_surface(
 
 @router.get("/attack-surface", response_model=AttackSurfaceListResponse)
 async def list_attack_surfaces(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=500),
     surface_type: Optional[str] = None,
@@ -697,8 +697,8 @@ async def list_attack_surfaces(
 @router.get("/attack-surface/{surface_id}", response_model=AttackSurfaceResponse)
 async def get_attack_surface(
     surface_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get attack surface details and composition"""
     surface = await get_attack_surface_or_404(db, surface_id)
@@ -709,8 +709,8 @@ async def get_attack_surface(
 async def update_attack_surface(
     surface_id: str,
     surface_data: AttackSurfaceUpdate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Update attack surface"""
     surface = await get_attack_surface_or_404(db, surface_id)
@@ -742,8 +742,8 @@ async def trigger_assessment(
 
 @router.get("/dashboard", response_model=ExposureDashboardStats)
 async def get_dashboard_statistics(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get exposure management dashboard statistics"""
     return {
@@ -769,8 +769,8 @@ async def get_dashboard_statistics(
 
 @router.get("/risk-matrix", response_model=RiskMatrix)
 async def get_risk_matrix(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get risk matrix (criticality vs severity)"""
     return {
@@ -782,8 +782,8 @@ async def get_risk_matrix(
 
 @router.get("/compliance", response_model=ComplianceSummary)
 async def get_compliance_status(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get compliance status summary"""
     return {

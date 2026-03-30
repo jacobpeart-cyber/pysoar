@@ -63,8 +63,8 @@ router = APIRouter(prefix="/agentic", tags=["Agentic"])
 
 @router.get("/agents", response_model=SOCAgentListResponse)
 async def list_agents(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     agent_type: Optional[str] = None,
@@ -105,8 +105,8 @@ async def list_agents(
 
 @router.get("/agents/{agent_id}", response_model=SOCAgentResponse)
 async def get_agent(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     agent_id: str,
 ):
     """Get specific agent details"""
@@ -123,8 +123,8 @@ async def get_agent(
 
 @router.post("/agents", response_model=SOCAgentResponse, status_code=status.HTTP_201_CREATED)
 async def create_agent(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     agent_data: SOCAgentCreate,
 ):
     """Create new SOC agent"""
@@ -148,8 +148,8 @@ async def create_agent(
 
 @router.put("/agents/{agent_id}", response_model=SOCAgentResponse)
 async def update_agent(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     agent_id: str,
     agent_data: SOCAgentUpdate,
 ):
@@ -182,8 +182,8 @@ async def update_agent(
 
 @router.post("/agents/{agent_id}/start")
 async def start_agent(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     agent_id: str,
 ):
     """Start agent operation"""
@@ -203,8 +203,8 @@ async def start_agent(
 
 @router.post("/agents/{agent_id}/stop")
 async def stop_agent(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     agent_id: str,
 ):
     """Stop agent operation"""
@@ -224,8 +224,8 @@ async def stop_agent(
 
 @router.get("/agents/{agent_id}/performance", response_model=SOCAgentPerformance)
 async def get_agent_performance(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     agent_id: str,
 ):
     """Get agent performance metrics"""
@@ -255,8 +255,8 @@ async def get_agent_performance(
 
 @router.get("/investigations", response_model=InvestigationListResponse)
 async def list_investigations(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     agent_id: Optional[str] = None,
@@ -301,8 +301,8 @@ async def list_investigations(
 
 @router.get("/investigations/{investigation_id}", response_model=InvestigationResponse)
 async def get_investigation(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     investigation_id: str,
 ):
     """Get investigation details"""
@@ -346,8 +346,8 @@ async def get_investigation(
 
 @router.post("/investigations", response_model=InvestigationResponse, status_code=status.HTTP_201_CREATED)
 async def start_investigation(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     inv_data: InvestigationCreate,
 ):
     """Start manual investigation"""
@@ -390,8 +390,8 @@ async def start_investigation(
 
 @router.put("/investigations/{investigation_id}", response_model=InvestigationResponse)
 async def update_investigation(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     investigation_id: str,
     inv_data: InvestigationUpdate,
 ):
@@ -425,8 +425,8 @@ async def update_investigation(
 
 @router.get("/investigations/{investigation_id}/reasoning-chain")
 async def get_reasoning_chain(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     investigation_id: str,
 ):
     """Get detailed reasoning chain for investigation"""
@@ -458,8 +458,8 @@ async def get_reasoning_chain(
 
 @router.get("/investigations/{investigation_id}/timeline")
 async def get_investigation_timeline(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     investigation_id: str,
 ):
     """Get timeline view of investigation"""
@@ -485,8 +485,8 @@ async def get_investigation_timeline(
 
 @router.post("/investigations/{investigation_id}/feedback")
 async def submit_investigation_feedback(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     investigation_id: str,
     feedback: InvestigationFeedback,
 ):
@@ -518,8 +518,8 @@ async def submit_investigation_feedback(
 
 @router.get("/actions/pending-approval")
 async def list_pending_approvals(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
 ):
@@ -569,8 +569,8 @@ async def list_pending_approvals(
 
 @router.post("/actions/{action_id}/approve")
 async def approve_action(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     action_id: str,
     approval: AgentActionApproval,
 ):
@@ -600,8 +600,8 @@ async def approve_action(
 
 @router.post("/actions/{action_id}/rollback")
 async def rollback_action(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     action_id: str,
 ):
     """Rollback executed action"""
@@ -634,8 +634,8 @@ async def rollback_action(
 
 @router.post("/chat", response_model=NaturalLanguageResponse)
 async def chat_with_agent(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     query_data: NaturalLanguageQuery,
 ):
     """Chat with SOC agent in natural language"""
@@ -659,8 +659,8 @@ async def chat_with_agent(
 
 @router.get("/alerts/{alert_id}/explain", response_model=AlertExplanation)
 async def explain_alert(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     alert_id: str,
 ):
     """Get natural language explanation of alert"""
@@ -681,8 +681,8 @@ async def explain_alert(
 
 @router.get("/investigations/{investigation_id}/explain", response_model=InvestigationExplanation)
 async def explain_investigation(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     investigation_id: str,
 ):
     """Get natural language explanation of investigation"""
@@ -715,8 +715,8 @@ async def explain_investigation(
 
 @router.get("/dashboard/metrics", response_model=DashboardMetrics)
 async def get_dashboard_metrics(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get SOC dashboard metrics"""
     # Count agents
@@ -764,8 +764,8 @@ async def get_dashboard_metrics(
 
 @router.get("/dashboard/investigation-metrics", response_model=InvestigationMetrics)
 async def get_investigation_metrics(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get investigation statistics"""
     return InvestigationMetrics(
@@ -790,8 +790,8 @@ async def get_investigation_metrics(
 
 @router.get("/dashboard/accuracy-stats", response_model=AccuracyStats)
 async def get_accuracy_stats(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get accuracy and false positive statistics"""
     return AccuracyStats(
@@ -812,8 +812,8 @@ async def get_accuracy_stats(
 
 @router.post("/threat-hunts", response_model=ThreatHuntResult)
 async def start_threat_hunt(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     hunt_request: ThreatHuntRequest,
 ):
     """Start threat hunt with specified profile"""
@@ -855,8 +855,8 @@ async def start_threat_hunt(
 
 @router.get("/agents/{agent_id}/memory", response_model=AgentMemoryListResponse)
 async def list_agent_memory(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     agent_id: str,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -900,8 +900,8 @@ async def list_agent_memory(
 
 @router.get("/agents/{agent_id}/memory/stats", response_model=MemoryStats)
 async def get_memory_stats(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     agent_id: str,
 ):
     """Get agent memory statistics"""
@@ -937,8 +937,8 @@ async def get_memory_stats(
 
 @router.delete("/agents/{agent_id}/memory")
 async def clear_agent_memory(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     agent_id: str,
     memory_type: Optional[str] = None,
 ):

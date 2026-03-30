@@ -96,8 +96,8 @@ class TeamResponse(BaseModel):
 # Organization endpoints
 @router.get("/organizations", response_model=list[OrganizationResponse])
 async def list_organizations(
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, ge=1, le=100),
 ):
@@ -135,8 +135,8 @@ async def list_organizations(
 @router.post("/organizations", response_model=OrganizationResponse, status_code=status.HTTP_201_CREATED)
 async def create_organization(
     data: OrganizationCreate,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Create a new organization"""
     # Check if slug is unique
@@ -177,8 +177,8 @@ async def create_organization(
 @router.get("/organizations/{org_id}", response_model=OrganizationResponse)
 async def get_organization(
     org_id: str,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Get an organization by ID"""
     org = await _get_organization(db, org_id, current_user)
@@ -197,8 +197,8 @@ async def get_organization(
 async def update_organization(
     org_id: str,
     data: OrganizationUpdate,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Update an organization"""
     org = await _get_organization(db, org_id, current_user, require_admin=True)
@@ -221,7 +221,7 @@ async def update_organization(
 @router.delete("/organizations/{org_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_organization(
     org_id: str,
-    db: DatabaseSession,
+    db: DatabaseSession = None,
     admin_user: User = Depends(get_current_admin_user),
 ):
     """Delete an organization (admin only)"""
@@ -242,8 +242,8 @@ async def delete_organization(
 @router.get("/organizations/{org_id}/members", response_model=list[MemberResponse])
 async def list_organization_members(
     org_id: str,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """List members of an organization"""
     await _get_organization(db, org_id, current_user)
@@ -275,8 +275,8 @@ async def list_organization_members(
 async def add_organization_member(
     org_id: str,
     data: AddMemberRequest,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Add a member to an organization"""
     await _get_organization(db, org_id, current_user, require_admin=True)
@@ -317,8 +317,8 @@ async def add_organization_member(
 async def remove_organization_member(
     org_id: str,
     user_id: str,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Remove a member from an organization"""
     await _get_organization(db, org_id, current_user, require_admin=True)
@@ -351,8 +351,8 @@ async def remove_organization_member(
 # Team endpoints
 @router.get("/teams", response_model=list[TeamResponse])
 async def list_teams(
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     organization_id: Optional[str] = None,
 ):
     """List all teams"""
@@ -388,8 +388,8 @@ async def list_teams(
 @router.post("/teams", response_model=TeamResponse, status_code=status.HTTP_201_CREATED)
 async def create_team(
     data: TeamCreate,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Create a new team"""
     if not data.organization_id:
@@ -427,8 +427,8 @@ async def create_team(
 @router.get("/teams/{team_id}", response_model=TeamResponse)
 async def get_team(
     team_id: str,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Get a team by ID"""
     team = await _get_team(db, team_id, current_user)
@@ -445,8 +445,8 @@ async def get_team(
 async def update_team(
     team_id: str,
     data: TeamUpdate,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Update a team"""
     team = await _get_team(db, team_id, current_user)
@@ -465,8 +465,8 @@ async def update_team(
 @router.delete("/teams/{team_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_team(
     team_id: str,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Delete a team"""
     team = await _get_team(db, team_id, current_user)
@@ -485,8 +485,8 @@ async def delete_team(
 @router.get("/teams/{team_id}/members")
 async def list_team_members(
     team_id: str,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """List members of a team"""
     await _get_team(db, team_id, current_user)
@@ -517,8 +517,8 @@ async def list_team_members(
 async def add_team_member(
     team_id: str,
     data: AddMemberRequest,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Add a member to a team"""
     await _get_team(db, team_id, current_user)
@@ -551,8 +551,8 @@ async def add_team_member(
 async def remove_team_member(
     team_id: str,
     user_id: str,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Remove a member from a team"""
     await _get_team(db, team_id, current_user)

@@ -20,7 +20,7 @@ router = APIRouter(prefix="/users", tags=["Users"])
 @router.get("", response_model=UserListResponse)
 async def list_users(
     current_user: AdminUser,
-    db: DatabaseSession,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     search: str | None = None,
@@ -50,7 +50,7 @@ async def list_users(
 async def create_user(
     user_data: UserCreate,
     current_user: AdminUser,
-    db: DatabaseSession,
+    db: DatabaseSession = None,
 ):
     """Create a new user (admin only)"""
     user_service = UserService(db)
@@ -74,8 +74,8 @@ async def create_user(
 @router.get("/{user_id}", response_model=UserResponse)
 async def get_user(
     user_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get a user by ID"""
     # Users can view their own profile, admins can view any profile
@@ -101,8 +101,8 @@ async def get_user(
 async def update_user(
     user_id: str,
     user_data: UserUpdate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Update a user"""
     # Users can update their own profile (limited fields), admins can update any profile
@@ -140,7 +140,7 @@ async def update_user(
 async def delete_user(
     user_id: str,
     current_user: AdminUser,
-    db: DatabaseSession,
+    db: DatabaseSession = None,
 ):
     """Delete a user (admin only)"""
     # Prevent self-deletion

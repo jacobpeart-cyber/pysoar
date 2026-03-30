@@ -42,8 +42,8 @@ async def get_incident_or_404(db: AsyncSession, incident_id: str) -> Incident:
 
 @router.get("", response_model=IncidentListResponse)
 async def list_incidents(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     search: Optional[str] = None,
@@ -117,8 +117,8 @@ async def list_incidents(
 @router.post("", response_model=IncidentResponse, status_code=status.HTTP_201_CREATED)
 async def create_incident(
     incident_data: IncidentCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Create a new incident"""
     incident = Incident(
@@ -158,8 +158,8 @@ async def create_incident(
 
 @router.get("/stats", response_model=IncidentStats)
 async def get_incident_stats(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get incident statistics"""
     # Total count
@@ -203,8 +203,8 @@ async def get_incident_stats(
 @router.get("/{incident_id}", response_model=IncidentResponse)
 async def get_incident(
     incident_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get an incident by ID"""
     incident = await get_incident_or_404(db, incident_id)
@@ -217,8 +217,8 @@ async def get_incident(
 async def update_incident(
     incident_id: str,
     incident_data: IncidentUpdate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Update an incident"""
     incident = await get_incident_or_404(db, incident_id)
@@ -251,8 +251,8 @@ async def update_incident(
 @router.delete("/{incident_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_incident(
     incident_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Delete an incident"""
     incident = await get_incident_or_404(db, incident_id)
@@ -269,8 +269,8 @@ async def delete_incident(
 async def link_alert_to_incident(
     incident_id: str,
     alert_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Link an alert to an incident"""
     incident = await get_incident_or_404(db, incident_id)
@@ -294,8 +294,8 @@ async def link_alert_to_incident(
 async def unlink_alert_from_incident(
     incident_id: str,
     alert_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Unlink an alert from an incident"""
     await get_incident_or_404(db, incident_id)

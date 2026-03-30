@@ -18,8 +18,8 @@ router = APIRouter()
 
 @router.get("/overview")
 async def get_metrics_overview(
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     days: int = Query(default=30, ge=1, le=365),
 ):
     """Get overview metrics for the dashboard"""
@@ -86,8 +86,8 @@ async def get_metrics_overview(
 
 @router.get("/alerts/by-severity")
 async def get_alerts_by_severity(
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     days: int = Query(default=30, ge=1, le=365),
 ):
     """Get alert counts grouped by severity"""
@@ -115,8 +115,8 @@ async def get_alerts_by_severity(
 
 @router.get("/alerts/by-source")
 async def get_alerts_by_source(
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     days: int = Query(default=30, ge=1, le=365),
 ):
     """Get alert counts grouped by source"""
@@ -138,8 +138,8 @@ async def get_alerts_by_source(
 
 @router.get("/alerts/by-status")
 async def get_alerts_by_status(
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     days: int = Query(default=30, ge=1, le=365),
 ):
     """Get alert counts grouped by status"""
@@ -159,8 +159,8 @@ async def get_alerts_by_status(
 
 @router.get("/alerts/trend")
 async def get_alerts_trend(
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     days: int = Query(default=30, ge=1, le=365),
 ):
     """Get daily alert trend"""
@@ -198,8 +198,8 @@ async def get_alerts_trend(
 
 @router.get("/incidents/by-type")
 async def get_incidents_by_type(
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     days: int = Query(default=30, ge=1, le=365),
 ):
     """Get incident counts grouped by type"""
@@ -220,8 +220,8 @@ async def get_incidents_by_type(
 
 @router.get("/incidents/mttr")
 async def get_mean_time_to_resolve(
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     days: int = Query(default=30, ge=1, le=365),
 ):
     """Get Mean Time To Resolve (MTTR) for incidents"""
@@ -280,8 +280,8 @@ async def get_mean_time_to_resolve(
 
 @router.get("/playbooks/executions")
 async def get_playbook_execution_stats(
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     days: int = Query(default=30, ge=1, le=365),
 ):
     """Get playbook execution statistics"""
@@ -318,8 +318,8 @@ async def get_playbook_execution_stats(
 
 @router.get("/iocs/by-type")
 async def get_iocs_by_type(
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Get IOC counts grouped by type"""
     result = await db.execute(
@@ -336,8 +336,8 @@ async def get_iocs_by_type(
 
 @router.get("/iocs/by-threat-level")
 async def get_iocs_by_threat_level(
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Get IOC counts grouped by threat level"""
     result = await db.execute(
@@ -353,8 +353,8 @@ async def get_iocs_by_threat_level(
 
 @router.get("/top-attackers")
 async def get_top_attackers(
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     days: int = Query(default=30, ge=1, le=365),
     limit: int = Query(default=10, ge=1, le=100),
 ):

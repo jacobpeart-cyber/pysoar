@@ -94,8 +94,8 @@ async def get_source_or_404(db: AsyncSession, source_id: str) -> SIEMDataSource:
 @router.post("/logs/ingest", response_model=LogEntryResponse, status_code=status.HTTP_201_CREATED)
 async def ingest_log(
     log_data: LogIngestRequest,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Ingest a single log entry"""
     log_entry = LogEntry(
@@ -120,8 +120,8 @@ async def ingest_log(
 @router.post("/logs/batch", response_model=dict)
 async def batch_ingest_logs(
     batch_data: LogBatchIngestRequest,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Batch ingest multiple log entries"""
     logs = []
@@ -158,8 +158,8 @@ async def batch_ingest_logs(
 @router.post("/logs/search", response_model=LogSearchResponse)
 async def search_logs(
     search_data: LogSearchRequest,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Search logs with complex filtering"""
     query = select(LogEntry)
@@ -232,8 +232,8 @@ async def search_logs(
 @router.post("/logs/aggregate", response_model=dict)
 async def aggregate_logs(
     agg_data: AggregationRequest,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Run aggregation query on logs"""
     query = select(getattr(LogEntry, agg_data.field), func.count(LogEntry.id))
@@ -266,8 +266,8 @@ async def aggregate_logs(
 @router.get("/logs/{log_id}", response_model=LogEntryResponse)
 async def get_log(
     log_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get a log entry by ID"""
     log_entry = await get_log_or_404(db, log_id)
@@ -276,8 +276,8 @@ async def get_log(
 
 @router.get("/logs/stats", response_model=SIEMStatsResponse)
 async def get_siem_stats(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get SIEM statistics"""
     # Total logs
@@ -343,8 +343,8 @@ async def get_siem_stats(
 
 @router.get("/rules", response_model=DetectionRuleListResponse)
 async def list_rules(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     search: Optional[str] = None,
@@ -402,8 +402,8 @@ async def list_rules(
 @router.post("/rules", response_model=DetectionRuleResponse, status_code=status.HTTP_201_CREATED)
 async def create_rule(
     rule_data: DetectionRuleCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Create a new detection rule"""
     rule = DetectionRule(
@@ -435,8 +435,8 @@ async def create_rule(
 @router.get("/rules/{rule_id}", response_model=DetectionRuleResponse)
 async def get_rule(
     rule_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get a detection rule by ID"""
     rule = await get_rule_or_404(db, rule_id)
@@ -447,8 +447,8 @@ async def get_rule(
 async def update_rule(
     rule_id: str,
     rule_data: DetectionRuleUpdate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Update a detection rule"""
     rule = await get_rule_or_404(db, rule_id)
@@ -473,8 +473,8 @@ async def update_rule(
 @router.delete("/rules/{rule_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_rule(
     rule_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Delete a detection rule"""
     rule = await get_rule_or_404(db, rule_id)
@@ -486,8 +486,8 @@ async def delete_rule(
 async def test_rule(
     rule_id: str,
     sample_logs: list[str],
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Test a detection rule against sample logs"""
     rule = await get_rule_or_404(db, rule_id)
@@ -509,7 +509,7 @@ async def test_rule(
 @router.post("/rules/validate", response_model=dict)
 async def validate_rule(
     rule_data: DetectionRuleCreate,
-    current_user: CurrentUser,
+    current_user: CurrentUser = None,
 ):
     """Validate rule YAML without saving"""
     errors = []
@@ -536,8 +536,8 @@ async def validate_rule(
 
 @router.get("/correlations", response_model=list[CorrelationEventResponse])
 async def list_correlations(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     severity: Optional[str] = None,
@@ -565,8 +565,8 @@ async def list_correlations(
 @router.get("/correlations/{correlation_id}", response_model=CorrelationEventResponse)
 async def get_correlation(
     correlation_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get a correlation event by ID"""
     correlation = await get_correlation_or_404(db, correlation_id)
@@ -577,8 +577,8 @@ async def get_correlation(
 async def update_correlation_status(
     correlation_id: str,
     status_update: dict,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Update correlation event status"""
     correlation = await get_correlation_or_404(db, correlation_id)
@@ -599,8 +599,8 @@ async def update_correlation_status(
 
 @router.get("/sources", response_model=list[DataSourceResponse])
 async def list_sources(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
 ):
@@ -617,8 +617,8 @@ async def list_sources(
 @router.post("/sources", response_model=DataSourceResponse, status_code=status.HTTP_201_CREATED)
 async def create_source(
     source_data: DataSourceCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Create a new data source"""
     source = SIEMDataSource(
@@ -641,8 +641,8 @@ async def create_source(
 async def update_source(
     source_id: str,
     source_data: DataSourceCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Update a data source"""
     source = await get_source_or_404(db, source_id)
@@ -663,8 +663,8 @@ async def update_source(
 @router.delete("/sources/{source_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_source(
     source_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Delete a data source"""
     source = await get_source_or_404(db, source_id)

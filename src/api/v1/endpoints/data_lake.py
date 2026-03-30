@@ -62,8 +62,8 @@ router = APIRouter(prefix="/data-lake", tags=["Data Lake"])
 
 @router.post("/sources", response_model=DataSourceResponse, status_code=status.HTTP_201_CREATED)
 async def create_data_source(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     source_in: DataSourceCreate,
 ):
     """Create new data source"""
@@ -92,8 +92,8 @@ async def create_data_source(
 
 @router.get("/sources", response_model=DataSourceListResponse)
 async def list_data_sources(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     search: Optional[str] = None,
@@ -139,8 +139,8 @@ async def list_data_sources(
 
 @router.get("/sources/{source_id}", response_model=DataSourceResponse)
 async def get_data_source(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     source_id: str,
 ):
     """Get data source by ID"""
@@ -158,8 +158,8 @@ async def get_data_source(
 
 @router.patch("/sources/{source_id}", response_model=DataSourceResponse)
 async def update_data_source(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     source_id: str,
     source_in: DataSourceUpdate,
 ):
@@ -188,8 +188,8 @@ async def update_data_source(
 
 @router.post("/sources/{source_id}/start")
 async def start_data_source_ingestion(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     source_id: str,
 ):
     """Start ingestion for a data source"""
@@ -219,8 +219,8 @@ async def start_data_source_ingestion(
 
 @router.post("/sources/{source_id}/stop")
 async def stop_data_source_ingestion(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     source_id: str,
 ):
     """Stop ingestion for a data source"""
@@ -252,8 +252,8 @@ async def stop_data_source_ingestion(
 
 @router.post("/partitions", response_model=DataPartitionResponse, status_code=status.HTTP_201_CREATED)
 async def create_partition(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     partition_in: DataPartitionCreate,
 ):
     """Create new data partition"""
@@ -280,8 +280,8 @@ async def create_partition(
 
 @router.get("/partitions", response_model=DataPartitionListResponse)
 async def list_partitions(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     source_id: Optional[str] = None,
@@ -322,8 +322,8 @@ async def list_partitions(
 
 @router.patch("/partitions/{partition_id}", response_model=DataPartitionResponse)
 async def update_partition(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     partition_id: str,
     partition_in: DataPartitionUpdate,
 ):
@@ -355,8 +355,8 @@ async def update_partition(
 
 @router.post("/pipelines", response_model=DataPipelineResponse, status_code=status.HTTP_201_CREATED)
 async def create_pipeline(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     pipeline_in: DataPipelineCreate,
 ):
     """Create new data pipeline"""
@@ -382,8 +382,8 @@ async def create_pipeline(
 
 @router.get("/pipelines", response_model=DataPipelineListResponse)
 async def list_pipelines(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     pipeline_type: Optional[str] = None,
@@ -424,8 +424,8 @@ async def list_pipelines(
 
 @router.patch("/pipelines/{pipeline_id}", response_model=DataPipelineResponse)
 async def update_pipeline(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     pipeline_id: str,
     pipeline_in: DataPipelineUpdate,
 ):
@@ -459,8 +459,8 @@ async def update_pipeline(
 
 @router.post("/models", response_model=UnifiedDataModelResponse, status_code=status.HTTP_201_CREATED)
 async def create_unified_model(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     model_in: UnifiedDataModelCreate,
 ):
     """Create unified data model"""
@@ -486,8 +486,8 @@ async def create_unified_model(
 
 @router.get("/models", response_model=UnifiedDataModelListResponse)
 async def list_unified_models(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     entity_type: Optional[str] = None,
@@ -529,8 +529,8 @@ async def list_unified_models(
 
 @router.patch("/models/{model_id}", response_model=UnifiedDataModelResponse)
 async def update_unified_model(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     model_id: str,
     model_in: UnifiedDataModelUpdate,
 ):
@@ -564,8 +564,8 @@ async def update_unified_model(
 
 @router.post("/queries", response_model=QueryJobResponse, status_code=status.HTTP_201_CREATED)
 async def submit_query(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     query_in: QueryJobCreate,
 ):
     """Submit a query job"""
@@ -612,8 +612,8 @@ async def submit_query(
 
 @router.get("/queries", response_model=QueryJobListResponse)
 async def list_queries(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     status: Optional[str] = None,
@@ -650,8 +650,8 @@ async def list_queries(
 
 @router.get("/queries/{query_id}", response_model=QueryJobResponse)
 async def get_query(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     query_id: str,
 ):
     """Get query job details"""
@@ -669,8 +669,8 @@ async def get_query(
 
 @router.post("/queries/{query_id}/estimate-cost")
 async def estimate_query_cost(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     query_id: str,
     data_scanned_gb: int = Query(..., ge=1),
 ):
@@ -691,7 +691,7 @@ async def estimate_query_cost(
 
 @router.get("/catalog/datasets")
 async def search_datasets(
-    current_user: CurrentUser,
+    current_user: CurrentUser = None,
     search: str = Query(..., min_length=1),
 ):
     """Search datasets in data catalog"""
@@ -705,7 +705,7 @@ async def search_datasets(
 
 @router.get("/catalog/lineage/{dataset_id}")
 async def get_data_lineage(
-    current_user: CurrentUser,
+    current_user: CurrentUser = None,
     dataset_id: str,
 ):
     """Get data lineage for a dataset"""
@@ -723,8 +723,8 @@ async def get_data_lineage(
 
 @router.get("/catalog/quality/{dataset_id}")
 async def get_data_quality(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     dataset_id: str,
 ):
     """Get data quality report for dataset"""
@@ -746,8 +746,8 @@ async def get_data_quality(
 
 @router.get("/dashboard/metrics")
 async def get_dashboard_metrics(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get unified dashboard metrics"""
     try:
@@ -794,8 +794,8 @@ async def get_dashboard_metrics(
 
 @router.get("/dashboard/storage-breakdown")
 async def get_storage_breakdown(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get detailed storage usage breakdown"""
     try:
@@ -819,8 +819,8 @@ async def get_storage_breakdown(
 
 @router.get("/dashboard/pipeline-status")
 async def get_pipeline_status(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get pipeline execution status and health"""
     try:
