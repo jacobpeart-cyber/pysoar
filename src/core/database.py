@@ -70,7 +70,7 @@ async def init_db() -> None:
     from src.models.base import Base
 
     async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(lambda conn: Base.metadata.create_all(conn, checkfirst=True))
 
 
 async def close_db() -> None:
