@@ -871,7 +871,7 @@ async def get_dashboard(
 async def trigger_api_discovery(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    background_tasks: BackgroundTasks,
+    background_tasks: BackgroundTasks = None,
     traffic_logs: Optional[List[dict]] = Body(None),
 ):
     """Trigger API discovery scan from traffic"""
@@ -924,7 +924,7 @@ async def trigger_compliance_check(endpoint_id: str, current_user: CurrentUser =
 async def trigger_shadow_api_detection(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    background_tasks: BackgroundTasks,
+    background_tasks: BackgroundTasks = None,
     traffic_logs: Optional[List[dict]] = Body(None),
 ):
     """Trigger shadow API detection"""
