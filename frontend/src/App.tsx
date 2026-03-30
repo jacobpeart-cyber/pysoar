@@ -51,6 +51,7 @@ import APISecurityDashboard from './pages/APISecurityDashboard'
 import DataLakeDashboard from './pages/DataLakeDashboard'
 import WarRoom from './pages/WarRoom'
 import PhishingSimulation from './pages/PhishingSimulation'
+import NotFound from './pages/NotFound'
 
 import React from 'react'
 
@@ -191,7 +192,7 @@ function AppRoutes() {
         <Route path="warroom" element={<WarRoom />} />
         <Route path="phishing" element={<PhishingSimulation />} />
       </Route>
-      <Route path="*" element={<Navigate to="/" replace />} />
+      <Route path="*" element={<NotFound />} />
     </Routes>
   )
 }

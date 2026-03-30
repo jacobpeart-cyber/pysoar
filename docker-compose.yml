@@ -84,6 +84,12 @@ services:
     networks:
       - pysoar-network
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A src.workers.celery_app inspect ping --timeout 10 2>/dev/null | grep -q pong || exit 1"]
+      interval: 30s
+      timeout: 15s
+      retries: 3
+      start_period: 30s
 
   # Celery Beat for scheduled tasks
   scheduler:
@@ -107,6 +113,12 @@ services:
     networks:
       - pysoar-network
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'celery.*beat' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
   # Flower - Celery monitoring
   flower:
@@ -125,6 +137,12 @@ services:
     networks:
       - pysoar-network
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:5555/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
 
   # PostgreSQL Database
   postgres:

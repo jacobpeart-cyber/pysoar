@@ -110,9 +110,9 @@ app = FastAPI(
     title=settings.app_name,
     description="Security Orchestration, Automation and Response Platform",
     version=__version__,
-    docs_url=None if settings.is_production else f"{settings.api_v1_prefix}/docs",
-    redoc_url=None if settings.is_production else f"{settings.api_v1_prefix}/redoc",
-    openapi_url=None if settings.is_production else f"{settings.api_v1_prefix}/openapi.json",
+    docs_url=f"{settings.api_v1_prefix}/docs",
+    redoc_url=f"{settings.api_v1_prefix}/redoc",
+    openapi_url=f"{settings.api_v1_prefix}/openapi.json",
     lifespan=lifespan,
 )
 
