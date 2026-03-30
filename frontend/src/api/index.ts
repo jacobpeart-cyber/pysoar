@@ -19,7 +19,7 @@ export {
   deceptionApi,
   remediationApi,
   complianceApi,
-  zerotrust​Api,
+  zerotrustApi,
   stigApi,
   auditEvidenceApi,
   dfirApi,
