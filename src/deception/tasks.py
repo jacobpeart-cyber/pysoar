@@ -6,7 +6,7 @@ Asynchronous tasks for monitoring, analyzing, and managing deception infrastruct
 
 from datetime import datetime, timedelta
 
-from src.core.celery import shared_task
+from celery import shared_task
 from src.core.logging import get_logger
 from src.deception.engine import InteractionAnalyzer
 
