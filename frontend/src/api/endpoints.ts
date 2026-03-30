@@ -396,7 +396,7 @@ export const complianceApi = {
 };
 
 // Zero Trust
-export const zerotrust​Api = {
+export const zerotrustApi = {
   getPolicies: async (): Promise<ZeroTrustPolicy[]> => {
     const response = await api.get('/zerotrust/policies');
     return response.data;
