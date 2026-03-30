@@ -77,8 +77,8 @@ def ioc_to_response(ioc: IOC) -> IOCResponse:
 
 @router.get("", response_model=IOCListResponse)
 async def list_iocs(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     search: Optional[str] = None,
@@ -137,8 +137,8 @@ async def list_iocs(
 @router.post("", response_model=IOCResponse, status_code=status.HTTP_201_CREATED)
 async def create_ioc(
     ioc_data: IOCCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Create a new IOC"""
     # Check for duplicate
@@ -189,8 +189,8 @@ async def create_ioc(
 @router.post("/bulk", response_model=dict)
 async def bulk_create_iocs(
     bulk_data: IOCBulkCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Bulk create IOCs"""
     created_count = 0
@@ -244,8 +244,8 @@ async def bulk_create_iocs(
 @router.get("/{ioc_id}", response_model=IOCResponse)
 async def get_ioc(
     ioc_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get an IOC by ID"""
     ioc = await get_ioc_or_404(db, ioc_id)
@@ -256,8 +256,8 @@ async def get_ioc(
 async def update_ioc(
     ioc_id: str,
     ioc_data: IOCUpdate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Update an IOC"""
     ioc = await get_ioc_or_404(db, ioc_id)
@@ -280,8 +280,8 @@ async def update_ioc(
 @router.delete("/{ioc_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_ioc(
     ioc_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Delete an IOC"""
     ioc = await get_ioc_or_404(db, ioc_id)
@@ -292,8 +292,8 @@ async def delete_ioc(
 @router.post("/search", response_model=list[IOCResponse])
 async def search_ioc(
     search_data: IOCSearchRequest,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Search for an IOC by value"""
     query = select(IOC).where(IOC.value == search_data.value)
@@ -318,8 +318,8 @@ async def search_ioc(
 @router.post("/{ioc_id}/enrich", response_model=IOCResponse)
 async def enrich_ioc(
     ioc_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Enrich an IOC with threat intelligence"""
     ioc = await get_ioc_or_404(db, ioc_id)

@@ -99,8 +99,8 @@ async def get_threat_or_404(db: AsyncSession, threat_id: str) -> IdentityThreat:
 
 @router.get("/identities", response_model=IdentityProfileListResponse)
 async def list_identities(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     search: Optional[str] = None,
@@ -165,8 +165,8 @@ async def list_identities(
 @router.get("/identities/{identity_id}", response_model=IdentityProfileResponse)
 async def get_identity(
     identity_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get identity profile details"""
     identity = await get_identity_or_404(db, identity_id)
@@ -176,8 +176,8 @@ async def get_identity(
 @router.post("/identities", response_model=IdentityProfileResponse, status_code=status.HTTP_201_CREATED)
 async def create_identity(
     data: IdentityProfileCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Create new identity profile"""
     identity = IdentityProfile(
@@ -195,8 +195,8 @@ async def create_identity(
 async def update_identity(
     identity_id: str,
     data: IdentityProfileUpdate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Update identity profile"""
     identity = await get_identity_or_404(db, identity_id)
@@ -212,8 +212,8 @@ async def update_identity(
 @router.get("/identities/{identity_id}/risk-score")
 async def get_identity_risk_score(
     identity_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get identity risk score breakdown"""
     identity = await get_identity_or_404(db, identity_id)
@@ -268,8 +268,8 @@ async def get_identity_risk_score(
 
 @router.get("/threats", response_model=IdentityThreatListResponse)
 async def list_threats(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     threat_type: Optional[str] = None,
@@ -328,8 +328,8 @@ async def list_threats(
 @router.get("/threats/{threat_id}", response_model=IdentityThreatResponse)
 async def get_threat(
     threat_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get identity threat details"""
     threat = await get_threat_or_404(db, threat_id)
@@ -339,8 +339,8 @@ async def get_threat(
 @router.post("/threats", response_model=IdentityThreatResponse, status_code=status.HTTP_201_CREATED)
 async def create_threat(
     data: IdentityThreatCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Create new identity threat"""
     threat = IdentityThreat(
@@ -358,8 +358,8 @@ async def create_threat(
 async def update_threat(
     threat_id: str,
     data: IdentityThreatUpdate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Update identity threat status and details"""
     threat = await get_threat_or_404(db, threat_id)
@@ -376,8 +376,8 @@ async def update_threat(
 async def investigate_threat(
     threat_id: str,
     data: ThreatInvestigationRequest,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Start threat investigation"""
     threat = await get_threat_or_404(db, threat_id)
@@ -396,8 +396,8 @@ async def investigate_threat(
 async def respond_to_threat(
     threat_id: str,
     data: ThreatResponseAction,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Execute threat response action"""
     threat = await get_threat_or_404(db, threat_id)
@@ -414,7 +414,7 @@ async def respond_to_threat(
 
 @router.post("/threats/scan")
 async def run_threat_scan(
-    current_user: CurrentUser,
+    current_user: CurrentUser = None,
     organization_id: Optional[str] = None,
     background_tasks: BackgroundTasks = None,
 ):
@@ -436,8 +436,8 @@ async def run_threat_scan(
 
 @router.get("/credential-exposures", response_model=CredentialExposureListResponse)
 async def list_exposures(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     credential_type: Optional[str] = None,
@@ -492,8 +492,8 @@ async def list_exposures(
 @router.get("/credential-exposures/{exposure_id}", response_model=CredentialExposureResponse)
 async def get_exposure(
     exposure_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get credential exposure details"""
     result = await db.execute(
@@ -511,7 +511,7 @@ async def get_exposure(
 @router.post("/credential-exposures/check")
 async def check_credential_exposure(
     identity_id: str,
-    current_user: CurrentUser,
+    current_user: CurrentUser = None,
 ):
     """Check identity credentials for exposure"""
     logger.info(f"Checking credential exposure for identity {identity_id}")
@@ -527,7 +527,7 @@ async def check_credential_exposure(
 @router.post("/credential-exposures/remediate")
 async def remediate_exposures(
     data: CredentialRemediationRequest,
-    current_user: CurrentUser,
+    current_user: CurrentUser = None,
 ):
     """Remediate exposed credentials"""
     logger.info(f"Remediating {len(data.exposure_ids)} credential exposures")
@@ -548,8 +548,8 @@ async def remediate_exposures(
 
 @router.get("/anomalies", response_model=AccessAnomalyListResponse)
 async def list_anomalies(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     anomaly_type: Optional[str] = None,
@@ -604,8 +604,8 @@ async def list_anomalies(
 @router.get("/anomalies/{anomaly_id}", response_model=AccessAnomalyResponse)
 async def get_anomaly(
     anomaly_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get access anomaly details"""
     result = await db.execute(
@@ -624,8 +624,8 @@ async def get_anomaly(
 async def review_anomaly(
     anomaly_id: str,
     data: AnomalyReviewRequest,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Review anomaly as legitimate or suspicious"""
     result = await db.execute(
@@ -659,8 +659,8 @@ async def review_anomaly(
 
 @router.get("/privileged-access", response_model=PrivilegedAccessEventListResponse)
 async def list_privileged_events(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     event_type: Optional[str] = None,
@@ -711,8 +711,8 @@ async def list_privileged_events(
 @router.post("/privileged-access/request")
 async def request_elevation(
     data: ElevationRequest,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Request privilege elevation"""
     identity = await get_identity_or_404(db, data.identity_id)
@@ -742,8 +742,8 @@ async def request_elevation(
 async def approve_elevation(
     event_id: str,
     data: ElevationApprovalRequest,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Approve privilege elevation request"""
     result = await db.execute(
@@ -777,8 +777,8 @@ async def approve_elevation(
 async def revoke_access(
     event_id: str,
     revocation_reason: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Revoke privileged access"""
     result = await db.execute(
@@ -812,8 +812,8 @@ async def revoke_access(
 
 @router.get("/dashboard/metrics", response_model=ITDRDashboardMetrics)
 async def get_dashboard_metrics(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get ITDR dashboard metrics"""
     identities_result = await db.execute(
@@ -894,8 +894,8 @@ async def get_dashboard_metrics(
 
 @router.get("/dashboard/risk-overview")
 async def get_risk_overview(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get ITDR risk overview"""
     critical_threats_result = await db.execute(

@@ -131,8 +131,8 @@ async def get_policy_or_404(db: AsyncSession, policy_id: str) -> OTPolicyRule:
 
 @router.get("/assets", response_model=OTAssetListResponse)
 async def list_assets(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     asset_type: Optional[str] = None,
@@ -187,8 +187,8 @@ async def list_assets(
 @router.post("/assets", response_model=OTAssetResponse, status_code=status.HTTP_201_CREATED)
 async def create_asset(
     asset_data: OTAssetCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Create a new OT asset"""
     asset = OTAsset(
@@ -216,7 +216,7 @@ async def create_asset(
 
 
 @router.get("/assets/{asset_id}", response_model=OTAssetResponse)
-async def get_asset(asset_id: str, current_user: CurrentUser, db: DatabaseSession):
+async def get_asset(asset_id: str, current_user: CurrentUser = None, db: DatabaseSession):
     """Get OT asset by ID"""
     asset = await get_asset_or_404(db, asset_id)
     return OTAssetResponse.model_validate(asset)
@@ -226,8 +226,8 @@ async def get_asset(asset_id: str, current_user: CurrentUser, db: DatabaseSessio
 async def update_asset(
     asset_id: str,
     asset_data: OTAssetUpdate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Update OT asset"""
     asset = await get_asset_or_404(db, asset_id)
@@ -243,7 +243,7 @@ async def update_asset(
 
 
 @router.delete("/assets/{asset_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_asset(asset_id: str, current_user: CurrentUser, db: DatabaseSession):
+async def delete_asset(asset_id: str, current_user: CurrentUser = None, db: DatabaseSession):
     """Delete OT asset"""
     asset = await get_asset_or_404(db, asset_id)
     await db.delete(asset)
@@ -264,7 +264,7 @@ async def discover_asset_networks(
 
 
 @router.get("/assets/{asset_id}/status")
-async def get_asset_status(asset_id: str, current_user: CurrentUser, db: DatabaseSession):
+async def get_asset_status(asset_id: str, current_user: CurrentUser = None, db: DatabaseSession):
     """Get current status of OT asset"""
     asset = await get_asset_or_404(db, asset_id)
 
@@ -281,7 +281,7 @@ async def get_asset_status(asset_id: str, current_user: CurrentUser, db: Databas
 
 @router.get("/assets/{asset_id}/risk_assessment")
 async def get_asset_risk_assessment(
-    asset_id: str, current_user: CurrentUser, db: DatabaseSession
+    asset_id: str, current_user: CurrentUser = None, db: DatabaseSession = None
 ):
     """Get risk assessment for OT asset"""
     asset = await get_asset_or_404(db, asset_id)
@@ -301,7 +301,7 @@ async def get_asset_risk_assessment(
 
 
 @router.post("/assets/{asset_id}/firmware_check")
-async def check_asset_firmware(asset_id: str, current_user: CurrentUser, db: DatabaseSession):
+async def check_asset_firmware(asset_id: str, current_user: CurrentUser = None, db: DatabaseSession):
     """Check firmware version and vulnerabilities"""
     asset = await get_asset_or_404(db, asset_id)
     assessor = OTVulnerabilityAssessor(current_user.organization_id)
@@ -321,8 +321,8 @@ async def check_asset_firmware(asset_id: str, current_user: CurrentUser, db: Dat
 
 @router.get("/alerts", response_model=OTAlertListResponse)
 async def list_alerts(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     alert_type: Optional[str] = None,
@@ -368,8 +368,8 @@ async def list_alerts(
 @router.post("/alerts", response_model=OTAlertResponse, status_code=status.HTTP_201_CREATED)
 async def create_alert(
     alert_data: OTAlertCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Create a new OT alert"""
     alert = OTAlert(
@@ -394,7 +394,7 @@ async def create_alert(
 
 
 @router.get("/alerts/{alert_id}", response_model=OTAlertResponse)
-async def get_alert(alert_id: str, current_user: CurrentUser, db: DatabaseSession):
+async def get_alert(alert_id: str, current_user: CurrentUser = None, db: DatabaseSession):
     """Get OT alert by ID"""
     alert = await get_alert_or_404(db, alert_id)
     return OTAlertResponse.model_validate(alert)
@@ -404,8 +404,8 @@ async def get_alert(alert_id: str, current_user: CurrentUser, db: DatabaseSessio
 async def update_alert(
     alert_id: str,
     alert_data: OTAlertUpdate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Update OT alert status"""
     alert = await get_alert_or_404(db, alert_id)
@@ -421,7 +421,7 @@ async def update_alert(
 
 
 @router.post("/alerts/{alert_id}/investigate")
-async def investigate_alert(alert_id: str, current_user: CurrentUser, db: DatabaseSession):
+async def investigate_alert(alert_id: str, current_user: CurrentUser = None, db: DatabaseSession):
     """Start investigation of OT alert"""
     alert = await get_alert_or_404(db, alert_id)
     alert.status = "investigating"
@@ -482,8 +482,8 @@ async def bulk_alert_action(
 
 @router.get("/zones", response_model=OTZoneListResponse)
 async def list_zones(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     purdue_level: Optional[str] = None,
@@ -517,8 +517,8 @@ async def list_zones(
 @router.post("/zones", response_model=OTZoneResponse, status_code=status.HTTP_201_CREATED)
 async def create_zone(
     zone_data: OTZoneCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Create a new OT security zone"""
     zone = OTZone(
@@ -539,7 +539,7 @@ async def create_zone(
 
 
 @router.get("/zones/{zone_id}", response_model=OTZoneResponse)
-async def get_zone(zone_id: str, current_user: CurrentUser, db: DatabaseSession):
+async def get_zone(zone_id: str, current_user: CurrentUser = None, db: DatabaseSession):
     """Get OT zone by ID"""
     zone = await get_zone_or_404(db, zone_id)
     return OTZoneResponse.model_validate(zone)
@@ -549,8 +549,8 @@ async def get_zone(zone_id: str, current_user: CurrentUser, db: DatabaseSession)
 async def update_zone(
     zone_id: str,
     zone_data: OTZoneUpdate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Update OT zone"""
     zone = await get_zone_or_404(db, zone_id)
@@ -566,7 +566,7 @@ async def update_zone(
 
 
 @router.delete("/zones/{zone_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_zone(zone_id: str, current_user: CurrentUser, db: DatabaseSession):
+async def delete_zone(zone_id: str, current_user: CurrentUser = None, db: DatabaseSession):
     """Delete OT zone"""
     zone = await get_zone_or_404(db, zone_id)
     await db.delete(zone)
@@ -574,7 +574,7 @@ async def delete_zone(zone_id: str, current_user: CurrentUser, db: DatabaseSessi
 
 
 @router.post("/zones/{zone_id}/compliance_check")
-async def check_zone_compliance(zone_id: str, current_user: CurrentUser, db: DatabaseSession):
+async def check_zone_compliance(zone_id: str, current_user: CurrentUser = None, db: DatabaseSession):
     """Check zone compliance with Purdue model"""
     zone = await get_zone_or_404(db, zone_id)
     enforcer = PurdueModelEnforcer(current_user.organization_id)
@@ -586,7 +586,7 @@ async def check_zone_compliance(zone_id: str, current_user: CurrentUser, db: Dat
 
 @router.get("/zones/{zone_id}/communication_matrix")
 async def get_zone_communication_matrix(
-    zone_id: str, current_user: CurrentUser, db: DatabaseSession
+    zone_id: str, current_user: CurrentUser = None, db: DatabaseSession = None
 ):
     """Get zone-to-zone communication policy matrix"""
     zone = await get_zone_or_404(db, zone_id)
@@ -600,7 +600,7 @@ async def get_zone_communication_matrix(
 
 
 @router.post("/zones/{zone_id}/segmentation_audit")
-async def audit_zone_segmentation(zone_id: str, current_user: CurrentUser, db: DatabaseSession):
+async def audit_zone_segmentation(zone_id: str, current_user: CurrentUser = None, db: DatabaseSession):
     """Audit network segmentation for zone"""
     zone = await get_zone_or_404(db, zone_id)
 
@@ -621,8 +621,8 @@ async def audit_zone_segmentation(zone_id: str, current_user: CurrentUser, db: D
 
 @router.get("/incidents", response_model=OTIncidentListResponse)
 async def list_incidents(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     status: Optional[str] = None,
@@ -664,8 +664,8 @@ async def list_incidents(
 @router.post("/incidents", response_model=OTIncidentResponse, status_code=status.HTTP_201_CREATED)
 async def create_incident(
     incident_data: OTIncidentCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Create a new OT incident"""
     incident = OTIncident(
@@ -686,7 +686,7 @@ async def create_incident(
 
 
 @router.get("/incidents/{incident_id}", response_model=OTIncidentResponse)
-async def get_incident(incident_id: str, current_user: CurrentUser, db: DatabaseSession):
+async def get_incident(incident_id: str, current_user: CurrentUser = None, db: DatabaseSession):
     """Get OT incident by ID"""
     incident = await get_incident_or_404(db, incident_id)
     return OTIncidentResponse.model_validate(incident)
@@ -696,8 +696,8 @@ async def get_incident(incident_id: str, current_user: CurrentUser, db: Database
 async def update_incident(
     incident_id: str,
     incident_data: OTIncidentUpdate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Update OT incident"""
     incident = await get_incident_or_404(db, incident_id)
@@ -731,7 +731,7 @@ async def set_containment_strategy(
 
 @router.post("/incidents/{incident_id}/safe_shutdown")
 async def initiate_safe_shutdown(
-    incident_id: str, current_user: CurrentUser, db: DatabaseSession
+    incident_id: str, current_user: CurrentUser = None, db: DatabaseSession = None
 ):
     """Initiate safe shutdown procedure for incident"""
     incident = await get_incident_or_404(db, incident_id)
@@ -749,7 +749,7 @@ async def initiate_safe_shutdown(
 
 @router.get("/incidents/{incident_id}/post_incident")
 async def get_post_incident_report(
-    incident_id: str, current_user: CurrentUser, db: DatabaseSession
+    incident_id: str, current_user: CurrentUser = None, db: DatabaseSession = None
 ):
     """Generate post-incident report"""
     incident = await get_incident_or_404(db, incident_id)
@@ -765,8 +765,8 @@ async def get_post_incident_report(
 
 @router.get("/policies", response_model=OTPolicyListResponse)
 async def list_policies(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     rule_type: Optional[str] = None,
@@ -804,8 +804,8 @@ async def list_policies(
 @router.post("/policies", response_model=OTPolicyRuleResponse, status_code=status.HTTP_201_CREATED)
 async def create_policy(
     policy_data: OTPolicyRuleCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Create a new OT policy rule"""
     policy = OTPolicyRule(
@@ -826,7 +826,7 @@ async def create_policy(
 
 
 @router.get("/policies/{policy_id}", response_model=OTPolicyRuleResponse)
-async def get_policy(policy_id: str, current_user: CurrentUser, db: DatabaseSession):
+async def get_policy(policy_id: str, current_user: CurrentUser = None, db: DatabaseSession):
     """Get OT policy rule by ID"""
     policy = await get_policy_or_404(db, policy_id)
     return OTPolicyRuleResponse.model_validate(policy)
@@ -836,8 +836,8 @@ async def get_policy(policy_id: str, current_user: CurrentUser, db: DatabaseSess
 async def update_policy(
     policy_id: str,
     policy_data: OTPolicyRuleUpdate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Update OT policy rule"""
     policy = await get_policy_or_404(db, policy_id)
@@ -853,7 +853,7 @@ async def update_policy(
 
 
 @router.delete("/policies/{policy_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_policy(policy_id: str, current_user: CurrentUser, db: DatabaseSession):
+async def delete_policy(policy_id: str, current_user: CurrentUser = None, db: DatabaseSession):
     """Delete OT policy rule"""
     policy = await get_policy_or_404(db, policy_id)
     await db.delete(policy)
@@ -861,7 +861,7 @@ async def delete_policy(policy_id: str, current_user: CurrentUser, db: DatabaseS
 
 
 @router.post("/policies/{policy_id}/enable")
-async def enable_policy(policy_id: str, current_user: CurrentUser, db: DatabaseSession):
+async def enable_policy(policy_id: str, current_user: CurrentUser = None, db: DatabaseSession):
     """Enable OT policy rule"""
     policy = await get_policy_or_404(db, policy_id)
     policy.enabled = True
@@ -872,7 +872,7 @@ async def enable_policy(policy_id: str, current_user: CurrentUser, db: DatabaseS
 
 
 @router.post("/policies/{policy_id}/disable")
-async def disable_policy(policy_id: str, current_user: CurrentUser, db: DatabaseSession):
+async def disable_policy(policy_id: str, current_user: CurrentUser = None, db: DatabaseSession):
     """Disable OT policy rule"""
     policy = await get_policy_or_404(db, policy_id)
     policy.enabled = False
@@ -885,8 +885,8 @@ async def disable_policy(policy_id: str, current_user: CurrentUser, db: Database
 @router.get("/policies/{policy_id}/violation_history")
 async def get_policy_violation_history(
     policy_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     limit: int = Query(10, ge=1, le=100),
 ):
     """Get policy violation history"""
@@ -904,7 +904,7 @@ async def get_policy_violation_history(
 
 
 @router.get("/dashboard", response_model=OTDashboardResponse)
-async def get_ot_dashboard(current_user: CurrentUser, db: DatabaseSession):
+async def get_ot_dashboard(current_user: CurrentUser = None, db: DatabaseSession):
     """Get OT security dashboard"""
     org_id = current_user.organization_id
 
@@ -965,7 +965,7 @@ async def get_ot_dashboard(current_user: CurrentUser, db: DatabaseSession):
 
 
 @router.get("/compliance/report", response_model=ComplianceReportResponse)
-async def get_compliance_report(current_user: CurrentUser, db: DatabaseSession):
+async def get_compliance_report(current_user: CurrentUser = None, db: DatabaseSession):
     """Get comprehensive ICS compliance report"""
     org_id = current_user.organization_id
 
@@ -998,7 +998,7 @@ async def get_compliance_report(current_user: CurrentUser, db: DatabaseSession):
 
 
 @router.get("/risk_assessment", response_model=OTRiskAssessmentResponse)
-async def get_risk_assessment(current_user: CurrentUser, db: DatabaseSession):
+async def get_risk_assessment(current_user: CurrentUser = None, db: DatabaseSession):
     """Get OT risk assessment report"""
     org_id = current_user.organization_id
 

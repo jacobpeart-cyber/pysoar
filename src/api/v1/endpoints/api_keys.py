@@ -67,8 +67,8 @@ class APIKeyUpdate(BaseModel):
 
 @router.get("", response_model=list[APIKeyResponse])
 async def list_api_keys(
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     include_inactive: bool = Query(default=False),
 ):
     """List all API keys for the current user"""
@@ -88,8 +88,8 @@ async def list_api_keys(
 @router.post("", response_model=APIKeyCreatedResponse, status_code=status.HTTP_201_CREATED)
 async def create_api_key(
     data: APIKeyCreate,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Create a new API key"""
     # Validate permissions
@@ -144,8 +144,8 @@ async def create_api_key(
 @router.get("/{key_id}", response_model=APIKeyResponse)
 async def get_api_key(
     key_id: str,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Get an API key by ID"""
     api_key = await _get_user_api_key(db, key_id, current_user)
@@ -156,8 +156,8 @@ async def get_api_key(
 async def update_api_key(
     key_id: str,
     data: APIKeyUpdate,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Update an API key"""
     api_key = await _get_user_api_key(db, key_id, current_user)
@@ -184,8 +184,8 @@ async def update_api_key(
 @router.delete("/{key_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_api_key(
     key_id: str,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Delete an API key"""
     api_key = await _get_user_api_key(db, key_id, current_user)
@@ -196,8 +196,8 @@ async def delete_api_key(
 @router.post("/{key_id}/regenerate", response_model=APIKeyCreatedResponse)
 async def regenerate_api_key(
     key_id: str,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Regenerate an API key (creates a new key value)"""
     api_key = await _get_user_api_key(db, key_id, current_user)
@@ -222,7 +222,7 @@ async def regenerate_api_key(
 
 @router.get("/permissions/available", response_model=list[str])
 async def list_available_permissions(
-    current_user: CurrentUser,
+    current_user: CurrentUser = None,
 ):
     """List all available permissions"""
     return APIKeyPermission.all_permissions()
@@ -231,7 +231,7 @@ async def list_available_permissions(
 # Admin endpoints
 @router.get("/admin/all", response_model=list[APIKeyResponse])
 async def list_all_api_keys(
-    db: DatabaseSession,
+    db: DatabaseSession = None,
     admin_user: User = Depends(get_current_admin_user),
 ):
     """List all API keys (admin only)"""

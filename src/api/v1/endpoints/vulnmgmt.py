@@ -86,8 +86,8 @@ async def get_or_404(db: AsyncSession, model: type, item_id: str, org_id: str) -
 # Vulnerability Database Endpoints
 @router.get("/vulnerabilities", response_model=VulnerabilityListResponse)
 async def list_vulnerabilities(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     search: Optional[str] = None,
@@ -146,8 +146,8 @@ async def list_vulnerabilities(
 
 @router.post("/vulnerabilities", response_model=VulnerabilityResponse, status_code=status.HTTP_201_CREATED)
 async def create_vulnerability(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     vuln_data: VulnerabilityCreate,
 ):
     """Create a vulnerability record"""
@@ -163,8 +163,8 @@ async def create_vulnerability(
 
 @router.get("/vulnerabilities/{vuln_id}", response_model=VulnerabilityResponse)
 async def get_vulnerability(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     vuln_id: str,
 ):
     """Get vulnerability by ID"""
@@ -174,8 +174,8 @@ async def get_vulnerability(
 
 @router.put("/vulnerabilities/{vuln_id}", response_model=VulnerabilityResponse)
 async def update_vulnerability(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     vuln_id: str,
     vuln_data: VulnerabilityUpdate,
 ):
@@ -193,8 +193,8 @@ async def update_vulnerability(
 
 @router.post("/vulnerabilities/import-scan", response_model=dict)
 async def import_scan_results(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     scan_request: ScanImportRequest,
 ):
     """Import vulnerability scan results"""
@@ -229,8 +229,8 @@ async def import_scan_results(
 
 @router.post("/vulnerabilities/sync-kev")
 async def sync_kev(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     kev_data: dict,
 ):
     """Sync CISA Known Exploited Vulnerabilities"""
@@ -260,8 +260,8 @@ async def sync_kev(
 # Vulnerability Instance Endpoints
 @router.get("/instances", response_model=VulnerabilityInstanceListResponse)
 async def list_instances(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     asset_id: Optional[str] = None,
@@ -325,8 +325,8 @@ async def list_instances(
 
 @router.post("/instances", response_model=VulnerabilityInstanceResponse, status_code=status.HTTP_201_CREATED)
 async def create_instance(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     instance_data: VulnerabilityInstanceCreate,
 ):
     """Create vulnerability instance"""
@@ -342,8 +342,8 @@ async def create_instance(
 
 @router.get("/instances/{instance_id}", response_model=VulnerabilityInstanceResponse)
 async def get_instance(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     instance_id: str,
 ):
     """Get vulnerability instance by ID"""
@@ -355,8 +355,8 @@ async def get_instance(
 
 @router.put("/instances/{instance_id}", response_model=VulnerabilityInstanceResponse)
 async def update_instance(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     instance_id: str,
     instance_data: VulnerabilityInstanceUpdate,
 ):
@@ -376,8 +376,8 @@ async def update_instance(
 
 @router.post("/instances/bulk-action")
 async def bulk_action_instances(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     action_request: BulkAction,
 ):
     """Perform bulk action on vulnerability instances"""
@@ -415,8 +415,8 @@ async def bulk_action_instances(
 # Scan Profile Endpoints
 @router.get("/scan-profiles", response_model=ScanProfileListResponse)
 async def list_scan_profiles(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     enabled_only: bool = False,
@@ -449,8 +449,8 @@ async def list_scan_profiles(
 
 @router.post("/scan-profiles", response_model=ScanProfileResponse, status_code=status.HTTP_201_CREATED)
 async def create_scan_profile(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     profile_data: ScanProfileCreate,
 ):
     """Create scan profile"""
@@ -466,8 +466,8 @@ async def create_scan_profile(
 
 @router.put("/scan-profiles/{profile_id}", response_model=ScanProfileResponse)
 async def update_scan_profile(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     profile_id: str,
     profile_data: ScanProfileUpdate,
 ):
@@ -488,8 +488,8 @@ async def update_scan_profile(
 # Patch Operation Endpoints
 @router.get("/patch-operations", response_model=PatchOperationListResponse)
 async def list_patch_operations(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     status: Optional[str] = None,
@@ -522,8 +522,8 @@ async def list_patch_operations(
 
 @router.post("/patch-operations/create-plan")
 async def create_patch_plan(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     plan_request: PatchPlanRequest,
 ):
     """Create patch deployment plan"""
@@ -554,8 +554,8 @@ async def create_patch_plan(
 
 @router.post("/patch-operations/{patch_id}/schedule")
 async def schedule_patch(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     patch_id: str,
     schedule_request: PatchDeploymentRequest,
 ):
@@ -579,8 +579,8 @@ async def schedule_patch(
 
 @router.post("/patch-operations/{patch_id}/verify")
 async def verify_patch(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     patch_id: str,
     verification_request: PatchVerificationRequest,
 ):
@@ -604,8 +604,8 @@ async def verify_patch(
 
 @router.post("/patch-operations/{patch_id}/rollback")
 async def rollback_patch(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     patch_id: str,
     rollback_request: PatchRollbackRequest,
 ):
@@ -632,8 +632,8 @@ async def rollback_patch(
 # Exception and Risk Acceptance Endpoints
 @router.post("/exceptions", response_model=VulnerabilityExceptionResponse, status_code=status.HTTP_201_CREATED)
 async def create_exception(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     exception_data: VulnerabilityExceptionCreate,
 ):
     """Create vulnerability exception"""
@@ -649,8 +649,8 @@ async def create_exception(
 
 @router.put("/exceptions/{exception_id}", response_model=VulnerabilityExceptionResponse)
 async def update_exception(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     exception_id: str,
     exception_data: VulnerabilityExceptionUpdate,
 ):
@@ -671,8 +671,8 @@ async def update_exception(
 # Dashboard and Reporting Endpoints
 @router.get("/dashboard", response_model=DashboardMetrics)
 async def get_dashboard(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get vulnerability management dashboard metrics"""
     org_id = current_user.organization_id
@@ -727,8 +727,8 @@ async def get_dashboard(
 
 @router.get("/report/executive")
 async def get_executive_report(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get executive summary report"""
     org_id = current_user.organization_id
@@ -741,8 +741,8 @@ async def get_executive_report(
 
 @router.get("/report/kev-compliance")
 async def get_kev_compliance_report(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get BOD 22-01 KEV compliance report"""
     org_id = current_user.organization_id

@@ -106,8 +106,8 @@ async def get_credential_or_404(db: AsyncSession, credential_id: str) -> Credent
 
 @router.get("/monitors", response_model=DarkWebMonitorListResponse)
 async def list_monitors(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     enabled: Optional[bool] = None,
@@ -160,8 +160,8 @@ async def list_monitors(
 
 @router.post("/monitors", response_model=DarkWebMonitorResponse, status_code=201)
 async def create_monitor(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     monitor: DarkWebMonitorCreate,
 ):
     """Create a new dark web monitor"""
@@ -192,8 +192,8 @@ async def create_monitor(
 
 @router.get("/monitors/{monitor_id}", response_model=DarkWebMonitorResponse)
 async def get_monitor(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     monitor_id: str,
 ):
     """Get monitor by ID"""
@@ -207,8 +207,8 @@ async def get_monitor(
 
 @router.patch("/monitors/{monitor_id}", response_model=DarkWebMonitorResponse)
 async def update_monitor(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     monitor_id: str,
     update: DarkWebMonitorUpdate,
 ):
@@ -246,8 +246,8 @@ async def update_monitor(
 
 @router.delete("/monitors/{monitor_id}", status_code=204)
 async def delete_monitor(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     monitor_id: str,
 ):
     """Delete monitor"""
@@ -267,8 +267,8 @@ async def delete_monitor(
     response_model=ScanStatusResponse,
 )
 async def trigger_monitor_scan(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     monitor_id: str,
     background_tasks: BackgroundTasks,
     scan_request: ScanTriggerRequest,
@@ -305,8 +305,8 @@ async def trigger_monitor_scan(
 
 @router.get("/findings", response_model=DarkWebFindingListResponse)
 async def list_findings(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     monitor_id: Optional[str] = None,
@@ -367,8 +367,8 @@ async def list_findings(
 
 @router.get("/findings/{finding_id}", response_model=DarkWebFindingDetailResponse)
 async def get_finding(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     finding_id: str,
 ):
     """Get finding details with related data"""
@@ -382,8 +382,8 @@ async def get_finding(
 
 @router.patch("/findings/{finding_id}", response_model=DarkWebFindingResponse)
 async def update_finding(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     finding_id: str,
     update: DarkWebFindingUpdate,
 ):
@@ -410,8 +410,8 @@ async def update_finding(
 
 @router.post("/findings/bulk-action")
 async def bulk_finding_action(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     action: BulkFindingAction,
     background_tasks: BackgroundTasks,
 ):
@@ -458,8 +458,8 @@ async def bulk_finding_action(
 
 @router.get("/credentials", response_model=CredentialLeakListResponse)
 async def list_credentials(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     remediated: Optional[bool] = None,
@@ -528,8 +528,8 @@ async def list_credentials(
 
 @router.patch("/credentials/{credential_id}", response_model=CredentialLeakResponse)
 async def update_credential(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     credential_id: str,
     update: CredentialLeakUpdate,
 ):
@@ -554,8 +554,8 @@ async def update_credential(
 
 @router.post("/credentials/bulk-remediate", response_model=CredentialRemediationReport)
 async def bulk_remediate_credentials(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     action: BulkCredentialRemediateAction,
 ):
     """Bulk remediate credentials"""
@@ -613,8 +613,8 @@ async def bulk_remediate_credentials(
 
 @router.get("/brand-threats", response_model=BrandThreatListResponse)
 async def list_brand_threats(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     status: Optional[str] = None,
@@ -661,8 +661,8 @@ async def list_brand_threats(
 
 @router.patch("/brand-threats/{threat_id}", response_model=BrandThreatResponse)
 async def update_brand_threat(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     threat_id: str,
     update: BrandThreatUpdate,
 ):
@@ -691,8 +691,8 @@ async def update_brand_threat(
 
 @router.post("/brand-threats/{threat_id}/initiate-takedown")
 async def initiate_takedown(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     threat_id: str,
     background_tasks: BackgroundTasks,
 ):
@@ -728,8 +728,8 @@ async def initiate_takedown(
 
 @router.get("/dashboard", response_model=DarkWebDashboard)
 async def get_dashboard(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get dark web monitoring dashboard"""
     org_id = current_user.organization_id

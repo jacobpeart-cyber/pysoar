@@ -222,8 +222,8 @@ async def add_timeline_event(
 @router.get("/incidents/{incident_id}/notes", response_model=list[NoteResponse])
 async def list_notes(
     incident_id: str,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     include_internal: bool = Query(default=True),
 ):
     """List all notes for an incident"""
@@ -268,8 +268,8 @@ async def list_notes(
 async def create_note(
     incident_id: str,
     data: NoteCreate,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Create a new note for an incident"""
     await get_incident_or_404(db, incident_id)
@@ -324,8 +324,8 @@ async def update_note(
     incident_id: str,
     note_id: str,
     data: NoteUpdate,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Update a note"""
     await get_incident_or_404(db, incident_id)
@@ -383,8 +383,8 @@ async def update_note(
 async def delete_note(
     incident_id: str,
     note_id: str,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Delete a note"""
     await get_incident_or_404(db, incident_id)
@@ -421,8 +421,8 @@ async def delete_note(
 @router.get("/incidents/{incident_id}/tasks", response_model=list[TaskResponse])
 async def list_tasks(
     incident_id: str,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     status_filter: Optional[str] = Query(None, alias="status"),
     assigned_to: Optional[str] = None,
 ):
@@ -474,8 +474,8 @@ async def list_tasks(
 async def create_task(
     incident_id: str,
     data: TaskCreate,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Create a new task for an incident"""
     await get_incident_or_404(db, incident_id)
@@ -541,8 +541,8 @@ async def update_task(
     incident_id: str,
     task_id: str,
     data: TaskUpdate,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Update a task"""
     await get_incident_or_404(db, incident_id)
@@ -613,8 +613,8 @@ async def update_task(
 async def delete_task(
     incident_id: str,
     task_id: str,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Delete a task"""
     await get_incident_or_404(db, incident_id)
@@ -644,8 +644,8 @@ async def delete_task(
 )
 async def list_attachments(
     incident_id: str,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """List all attachments for an incident"""
     await get_incident_or_404(db, incident_id)
@@ -686,8 +686,8 @@ async def list_attachments(
 )
 async def upload_attachment(
     incident_id: str,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     file: UploadFile = File(...),
     attachment_type: str = Form(default=AttachmentType.OTHER.value),
     description: Optional[str] = Form(default=None),
@@ -792,8 +792,8 @@ async def upload_attachment(
 async def delete_attachment(
     incident_id: str,
     attachment_id: str,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Delete an attachment"""
     await get_incident_or_404(db, incident_id)
@@ -835,8 +835,8 @@ async def delete_attachment(
 @router.get("/incidents/{incident_id}/timeline", response_model=list[TimelineResponse])
 async def get_timeline(
     incident_id: str,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     event_type: Optional[str] = None,
     limit: int = Query(default=50, ge=1, le=200),
 ):
@@ -883,8 +883,8 @@ async def get_timeline(
 async def create_timeline_event(
     incident_id: str,
     data: TimelineCreate,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Create a custom timeline event"""
     await get_incident_or_404(db, incident_id)

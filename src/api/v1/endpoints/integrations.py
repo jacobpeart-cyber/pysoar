@@ -93,8 +93,8 @@ async def get_action_or_404(
 # Marketplace endpoints
 @router.get("/connectors", response_model=ConnectorListResponse)
 async def list_connectors(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     category: Optional[str] = None,
@@ -155,7 +155,7 @@ async def list_connectors(
 
 @router.get("/connectors/{connector_name}")
 async def get_connector_details(
-    current_user: CurrentUser,
+    current_user: CurrentUser = None,
     connector_name: str,
 ):
     """Get detailed information about a specific connector"""
@@ -193,8 +193,8 @@ async def get_connector_details(
 # Installed integrations endpoints
 @router.post("/install", response_model=InstalledIntegrationResponse, status_code=status.HTTP_201_CREATED)
 async def install_connector(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     request: IntegrationInstallRequest,
 ):
     """Install a connector"""
@@ -253,8 +253,8 @@ async def install_connector(
 
 @router.get("/installed", response_model=InstalledIntegrationListResponse)
 async def list_installed_integrations(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     status: Optional[str] = None,
@@ -324,8 +324,8 @@ async def list_installed_integrations(
 
 @router.get("/installed/{integration_id}", response_model=InstalledIntegrationResponse)
 async def get_installed_integration(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     integration_id: str,
 ):
     """Get details of installed integration"""
@@ -357,8 +357,8 @@ async def get_installed_integration(
 
 @router.patch("/installed/{integration_id}", response_model=InstalledIntegrationResponse)
 async def update_installed_integration(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     integration_id: str,
     request: InstalledIntegrationUpdate,
 ):
@@ -402,8 +402,8 @@ async def update_installed_integration(
 
 @router.post("/installed/{integration_id}/test", response_model=IntegrationTestResponse)
 async def test_integration(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     integration_id: str,
 ):
     """Test connection to installed integration"""
@@ -429,8 +429,8 @@ async def test_integration(
 
 @router.post("/installed/{integration_id}/enable", response_model=IntegrationStatusResponse)
 async def enable_integration(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     integration_id: str,
 ):
     """Enable integration"""
@@ -460,8 +460,8 @@ async def enable_integration(
 
 @router.post("/installed/{integration_id}/disable", response_model=IntegrationStatusResponse)
 async def disable_integration(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     integration_id: str,
 ):
     """Disable integration"""
@@ -491,8 +491,8 @@ async def disable_integration(
 
 @router.delete("/installed/{integration_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def uninstall_integration(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     integration_id: str,
 ):
     """Uninstall integration"""
@@ -512,8 +512,8 @@ async def uninstall_integration(
 # Action endpoints
 @router.get("/installed/{integration_id}/actions", response_model=IntegrationActionListResponse)
 async def list_integration_actions(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     integration_id: str,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -583,8 +583,8 @@ async def list_integration_actions(
     status_code=status.HTTP_202_ACCEPTED,
 )
 async def execute_action(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     integration_id: str,
     action_id: str,
     request: ActionExecutionRequest,
@@ -651,8 +651,8 @@ async def execute_action(
     response_model=ExecutionHistoryListResponse,
 )
 async def get_execution_history(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     integration_id: str,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -728,8 +728,8 @@ async def get_execution_history(
     status_code=status.HTTP_201_CREATED,
 )
 async def register_webhook(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     integration_id: str,
     request: WebhookRegisterRequest,
 ):
@@ -777,8 +777,8 @@ async def register_webhook(
     response_model=WebhookListResponse,
 )
 async def list_webhooks(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     integration_id: str,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -843,8 +843,8 @@ async def list_webhooks(
     status_code=status.HTTP_204_NO_CONTENT,
 )
 async def delete_webhook(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     integration_id: str,
     webhook_id: str,
 ):
@@ -876,8 +876,8 @@ async def delete_webhook(
 # Dashboard endpoints
 @router.get("/dashboard/health", response_model=DashboardIntegrationHealthResponse)
 async def get_health_dashboard(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get integration health overview dashboard"""
     query = select(InstalledIntegration).where(
@@ -912,8 +912,8 @@ async def get_health_dashboard(
 
 @router.get("/dashboard/stats", response_model=DashboardExecutionStatsResponse)
 async def get_execution_stats(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     period: str = Query("day", regex="^(hour|day|week|month)$"),
 ):
     """Get execution statistics dashboard"""
@@ -930,8 +930,8 @@ async def get_execution_stats(
 
 @router.get("/dashboard/summary", response_model=DashboardSummaryResponse)
 async def get_dashboard_summary(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get complete dashboard summary"""
     query = select(InstalledIntegration).where(

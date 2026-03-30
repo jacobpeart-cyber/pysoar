@@ -56,8 +56,8 @@ router = APIRouter(prefix="/zerotrust", tags=["Zero Trust"])
 @router.post("/evaluate", response_model=AccessDecisionResponse)
 async def evaluate_access_request(
     request: AccessRequestSchema,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ) -> AccessDecisionResponse:
     """Evaluate access request and return decision (Policy Decision Point)
 
@@ -117,8 +117,8 @@ async def evaluate_access_request(
 @router.post("/continuous-eval/{session_id}", response_model=AccessDecisionResponse)
 async def continuous_session_evaluation(
     session_id: str,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ) -> AccessDecisionResponse:
     """Re-evaluate active session for risk changes
 
@@ -217,8 +217,8 @@ async def list_access_decisions(
 @router.post("/policies", response_model=ZeroTrustPolicyResponse)
 async def create_policy(
     policy: ZeroTrustPolicyCreate,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ) -> ZeroTrustPolicyResponse:
     """Create a new Zero Trust policy"""
     logger.info("api_create_policy", name=policy.name, type=policy.policy_type)
@@ -292,8 +292,8 @@ async def list_policies(
 @router.get("/policies/{policy_id}", response_model=ZeroTrustPolicyResponse)
 async def get_policy(
     policy_id: str,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ) -> ZeroTrustPolicyResponse:
     """Get policy details"""
     result = await db.execute(
@@ -318,8 +318,8 @@ async def get_policy(
 async def update_policy(
     policy_id: str,
     policy_update: ZeroTrustPolicyUpdate,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ) -> ZeroTrustPolicyResponse:
     """Update Zero Trust policy"""
     result = await db.execute(
@@ -356,8 +356,8 @@ async def update_policy(
 @router.delete("/policies/{policy_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_policy(
     policy_id: str,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ) -> None:
     """Delete Zero Trust policy"""
     result = await db.execute(
@@ -383,8 +383,8 @@ async def delete_policy(
 async def test_policy(
     policy_id: str,
     test_request: AccessRequestSchema,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ) -> dict[str, Any]:
     """Test policy against sample access request"""
     result = await db.execute(
@@ -477,8 +477,8 @@ async def list_devices(
 @router.get("/devices/{device_id}", response_model=DeviceTrustProfileResponse)
 async def get_device(
     device_id: str,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ) -> DeviceTrustProfileResponse:
     """Get device trust details"""
     result = await db.execute(
@@ -502,8 +502,8 @@ async def get_device(
 @router.post("/devices/{device_id}/assess", response_model=DeviceTrustProfileResponse)
 async def assess_device(
     device_id: str,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ) -> DeviceTrustProfileResponse:
     """Assess device compliance and trust score"""
     assessor = DeviceTrustAssessor(db, current_user.organization_id)
@@ -517,8 +517,8 @@ async def assess_device(
 async def update_device_compliance(
     device_id: str,
     compliance: DeviceComplianceUpdate,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ) -> DeviceTrustProfileResponse:
     """Update device compliance data"""
     assessor = DeviceTrustAssessor(db, current_user.organization_id)
@@ -531,8 +531,8 @@ async def update_device_compliance(
 
 @router.get("/devices/non-compliant", response_model=dict[str, Any])
 async def list_non_compliant_devices(
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ) -> dict[str, Any]:
     """Get devices below compliance threshold"""
     assessor = DeviceTrustAssessor(db, current_user.organization_id)
@@ -561,8 +561,8 @@ async def list_non_compliant_devices(
 @router.post("/segments", response_model=MicroSegmentResponse)
 async def create_segment(
     segment: MicroSegmentCreate,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ) -> MicroSegmentResponse:
     """Create a new micro-segment"""
     engine = MicroSegmentationEngine(db, current_user.organization_id)
@@ -613,8 +613,8 @@ async def list_segments(
 @router.get("/segments/{segment_id}", response_model=MicroSegmentResponse)
 async def get_segment(
     segment_id: str,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ) -> MicroSegmentResponse:
     """Get segment details"""
     result = await db.execute(
@@ -639,8 +639,8 @@ async def get_segment(
 async def update_segment(
     segment_id: str,
     segment_update: MicroSegmentUpdate,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ) -> MicroSegmentResponse:
     """Update micro-segment"""
     result = await db.execute(
@@ -677,8 +677,8 @@ async def update_segment(
 @router.delete("/segments/{segment_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_segment(
     segment_id: str,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ) -> None:
     """Delete micro-segment"""
     result = await db.execute(
@@ -704,8 +704,8 @@ async def delete_segment(
 async def evaluate_segment_traffic(
     segment_id: str,
     traffic: SegmentTrafficRequest,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ) -> SegmentTrafficResponse:
     """Evaluate if traffic is allowed within segment"""
     engine = MicroSegmentationEngine(db, current_user.organization_id)
@@ -723,8 +723,8 @@ async def evaluate_segment_traffic(
 @router.get("/segments/{segment_id}/violations", response_model=dict[str, Any])
 async def get_segment_violations(
     segment_id: str,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ) -> dict[str, Any]:
     """Get policy violations for segment"""
     engine = MicroSegmentationEngine(db, current_user.organization_id)
@@ -736,8 +736,8 @@ async def get_segment_violations(
 
 @router.get("/topology", response_model=dict[str, Any])
 async def get_segment_topology(
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ) -> dict[str, Any]:
     """Get network topology visualization"""
     engine = MicroSegmentationEngine(db, current_user.organization_id)
@@ -753,8 +753,8 @@ async def get_segment_topology(
 @router.post("/verify", response_model=IdentityVerificationResponse)
 async def initiate_verification(
     verification: IdentityVerificationCreate,
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ) -> IdentityVerificationResponse:
     """Initiate identity verification"""
     auth_engine = ContinuousAuthEngine(db, current_user.organization_id)
@@ -832,8 +832,8 @@ async def list_verifications(
 
 @router.get("/maturity", response_model=ZeroTrustMaturityResponse)
 async def get_maturity_score(
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ) -> ZeroTrustMaturityResponse:
     """Get Zero Trust maturity score and assessment"""
     scorer = ZeroTrustScorer(db, current_user.organization_id)
@@ -851,8 +851,8 @@ async def get_maturity_score(
 
 @router.get("/maturity/pillars", response_model=dict[str, Any])
 async def get_maturity_pillars(
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ) -> dict[str, Any]:
     """Get per-pillar maturity breakdown"""
     scorer = ZeroTrustScorer(db, current_user.organization_id)
@@ -864,8 +864,8 @@ async def get_maturity_pillars(
 
 @router.get("/recommendations", response_model=dict[str, Any])
 async def get_recommendations(
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ) -> dict[str, Any]:
     """Get improvement recommendations"""
     scorer = ZeroTrustScorer(db, current_user.organization_id)
@@ -885,8 +885,8 @@ async def get_recommendations(
 
 @router.get("/dashboard", response_model=ZeroTrustDashboardStats)
 async def get_dashboard_stats(
-    db: DatabaseSession,
-    current_user: CurrentUser,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ) -> ZeroTrustDashboardStats:
     """Get Zero Trust dashboard statistics"""
     logger.info("api_get_dashboard_stats")

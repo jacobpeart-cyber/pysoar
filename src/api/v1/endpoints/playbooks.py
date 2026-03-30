@@ -86,8 +86,8 @@ def playbook_to_response(playbook: Playbook) -> PlaybookResponse:
 
 @router.get("", response_model=PlaybookListResponse)
 async def list_playbooks(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     search: Optional[str] = None,
@@ -141,7 +141,7 @@ async def list_playbooks(
 async def create_playbook(
     playbook_data: PlaybookCreate,
     current_user: AdminUser,
-    db: DatabaseSession,
+    db: DatabaseSession = None,
 ):
     """Create a new playbook (admin only)"""
     playbook = Playbook(
@@ -169,8 +169,8 @@ async def create_playbook(
 @router.get("/{playbook_id}", response_model=PlaybookResponse)
 async def get_playbook(
     playbook_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get a playbook by ID"""
     playbook = await get_playbook_or_404(db, playbook_id)
@@ -182,7 +182,7 @@ async def update_playbook(
     playbook_id: str,
     playbook_data: PlaybookUpdate,
     current_user: AdminUser,
-    db: DatabaseSession,
+    db: DatabaseSession = None,
 ):
     """Update a playbook (admin only)"""
     playbook = await get_playbook_or_404(db, playbook_id)
@@ -216,7 +216,7 @@ async def update_playbook(
 async def delete_playbook(
     playbook_id: str,
     current_user: AdminUser,
-    db: DatabaseSession,
+    db: DatabaseSession = None,
 ):
     """Delete a playbook (admin only)"""
     playbook = await get_playbook_or_404(db, playbook_id)
@@ -228,8 +228,8 @@ async def delete_playbook(
 async def execute_playbook(
     playbook_id: str,
     execute_data: PlaybookExecuteRequest,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     background_tasks: BackgroundTasks,
 ):
     """Execute a playbook"""
@@ -290,8 +290,8 @@ async def execute_playbook(
 @router.get("/{playbook_id}/executions", response_model=PlaybookExecutionListResponse)
 async def list_playbook_executions(
     playbook_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     execution_status: Optional[str] = Query(None, alias="status"),

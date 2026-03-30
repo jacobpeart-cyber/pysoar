@@ -69,8 +69,8 @@ def asset_to_response(asset: Asset) -> AssetResponse:
 
 @router.get("", response_model=AssetListResponse)
 async def list_assets(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     search: Optional[str] = None,
@@ -125,8 +125,8 @@ async def list_assets(
 @router.post("", response_model=AssetResponse, status_code=status.HTTP_201_CREATED)
 async def create_asset(
     asset_data: AssetCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Create a new asset"""
     asset = Asset(
@@ -163,8 +163,8 @@ async def create_asset(
 @router.get("/{asset_id}", response_model=AssetResponse)
 async def get_asset(
     asset_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get an asset by ID"""
     asset = await get_asset_or_404(db, asset_id)
@@ -175,8 +175,8 @@ async def get_asset(
 async def update_asset(
     asset_id: str,
     asset_data: AssetUpdate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Update an asset"""
     asset = await get_asset_or_404(db, asset_id)
@@ -199,8 +199,8 @@ async def update_asset(
 @router.delete("/{asset_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_asset(
     asset_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Delete an asset"""
     asset = await get_asset_or_404(db, asset_id)

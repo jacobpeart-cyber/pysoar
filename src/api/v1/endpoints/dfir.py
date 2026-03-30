@@ -112,8 +112,8 @@ async def get_evidence_or_404(db: AsyncSession, evidence_id: str) -> ForensicEvi
 
 @router.get("/cases", response_model=ForensicCaseListResponse)
 async def list_cases(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     search: Optional[str] = None,
@@ -181,8 +181,8 @@ async def list_cases(
 @router.get("/cases/{case_id}", response_model=ForensicCaseResponse)
 async def get_case(
     case_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get a specific forensic case"""
     case = await get_case_or_404(db, case_id)
@@ -192,8 +192,8 @@ async def get_case(
 @router.post("/cases", response_model=ForensicCaseResponse, status_code=status.HTTP_201_CREATED)
 async def create_case(
     case_data: ForensicCaseCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Create a new forensic case"""
     # Check for duplicate case number
@@ -230,8 +230,8 @@ async def create_case(
 async def update_case(
     case_id: str,
     case_data: ForensicCaseUpdate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Update a forensic case"""
     case = await get_case_or_404(db, case_id)
@@ -255,8 +255,8 @@ async def update_case(
 @router.post("/cases/{case_id}/close", response_model=ForensicCaseResponse)
 async def close_case(
     case_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     conclusion: Optional[str] = None,
 ):
     """Close a forensic case"""
@@ -279,8 +279,8 @@ async def close_case(
 @router.get("/cases/{case_id}/evidence", response_model=ForensicEvidenceListResponse)
 async def list_evidence(
     case_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     evidence_type: Optional[str] = None,
@@ -325,8 +325,8 @@ async def list_evidence(
 @router.get("/evidence/{evidence_id}", response_model=ForensicEvidenceResponse)
 async def get_evidence(
     evidence_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get a specific evidence item"""
     evidence = await get_evidence_or_404(db, evidence_id)
@@ -336,8 +336,8 @@ async def get_evidence(
 @router.post("/evidence", response_model=ForensicEvidenceResponse, status_code=status.HTTP_201_CREATED)
 async def collect_evidence(
     evidence_data: ForensicEvidenceCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Collect and register forensic evidence"""
     # Verify case exists
@@ -378,8 +378,8 @@ async def collect_evidence(
 async def verify_evidence_integrity(
     evidence_id: str,
     verify_data: EvidenceVerifyRequest,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Verify evidence integrity through hash comparison"""
     evidence = await get_evidence_or_404(db, evidence_id)
@@ -408,8 +408,8 @@ async def verify_evidence_integrity(
 async def update_chain_of_custody(
     evidence_id: str,
     coc_data: ChainOfCustodyUpdateRequest,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Update chain of custody log"""
     evidence = await get_evidence_or_404(db, evidence_id)
@@ -448,8 +448,8 @@ async def update_chain_of_custody(
 @router.get("/cases/{case_id}/timeline", response_model=ForensicTimelineListResponse)
 async def get_timeline(
     case_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=200),
     event_type: Optional[str] = None,
@@ -494,8 +494,8 @@ async def get_timeline(
 async def add_timeline_event(
     case_id: str,
     event_data: ForensicTimelineCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Add event to case timeline"""
     await get_case_or_404(db, case_id)
@@ -524,8 +524,8 @@ async def add_timeline_event(
 @router.post("/cases/{case_id}/timeline/export", response_model=TimelineExportResponse)
 async def export_timeline(
     case_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Export case timeline"""
     case = await get_case_or_404(db, case_id)
@@ -553,8 +553,8 @@ async def export_timeline(
 @router.get("/cases/{case_id}/artifacts", response_model=ForensicArtifactListResponse)
 async def list_artifacts(
     case_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     artifact_type: Optional[str] = None,
@@ -599,8 +599,8 @@ async def list_artifacts(
 async def create_artifact(
     case_id: str,
     artifact_data: ForensicArtifactCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Create forensic artifact"""
     await get_case_or_404(db, case_id)
@@ -628,8 +628,8 @@ async def create_artifact(
 @router.post("/artifacts/analyze", response_model=ArtifactAnalysisResponse)
 async def analyze_artifact(
     analysis_data: ArtifactAnalysisRequest,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Analyze a forensic artifact"""
     analyzer = ArtifactAnalyzer()
@@ -665,8 +665,8 @@ async def analyze_artifact(
 @router.post("/cases/{case_id}/artifacts/extract-iocs", response_model=IOCExtractionResponse)
 async def extract_case_iocs(
     case_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Extract all IOCs from case artifacts"""
     await get_case_or_404(db, case_id)
@@ -714,8 +714,8 @@ async def extract_case_iocs(
 @router.get("/cases/{case_id}/legal-holds", response_model=LegalHoldListResponse)
 async def list_legal_holds(
     case_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
 ):
@@ -750,8 +750,8 @@ async def list_legal_holds(
 async def create_legal_hold(
     case_id: str,
     hold_data: LegalHoldCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Create a legal hold"""
     case = await get_case_or_404(db, case_id)
@@ -780,8 +780,8 @@ async def create_legal_hold(
 async def update_legal_hold(
     hold_id: str,
     hold_data: LegalHoldUpdate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Update legal hold"""
     result = await db.execute(select(LegalHold).where(LegalHold.id == hold_id))
@@ -809,8 +809,8 @@ async def update_legal_hold(
 @router.get("/cases/{case_id}/report", response_model=CaseReportResponse)
 async def generate_case_report(
     case_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Generate comprehensive case report"""
     case = await get_case_or_404(db, case_id)
@@ -835,8 +835,8 @@ async def generate_case_report(
 @router.get("/evidence/{evidence_id}/chain-of-custody", response_model=ChainOfCustodyReportResponse)
 async def get_chain_of_custody_report(
     evidence_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get chain of custody report"""
     evidence = await get_evidence_or_404(db, evidence_id)
@@ -866,8 +866,8 @@ async def get_chain_of_custody_report(
 
 @router.get("/dashboard/metrics", response_model=DFIRDashboardResponse)
 async def get_dfir_dashboard(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get DFIR dashboard metrics"""
     # Count cases by status
@@ -921,8 +921,8 @@ async def get_dfir_dashboard(
 @router.get("/cases/{case_id}/metrics", response_model=CaseMetrics)
 async def get_case_metrics(
     case_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get metrics for a specific case"""
     case = await get_case_or_404(db, case_id)

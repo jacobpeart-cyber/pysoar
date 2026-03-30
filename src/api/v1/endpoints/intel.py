@@ -47,8 +47,8 @@ router = APIRouter(prefix="/intel", tags=["Threat Intelligence"])
 
 @router.post("/feeds", response_model=ThreatFeedResponse, status_code=status.HTTP_201_CREATED)
 async def create_threat_feed(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     feed_data: ThreatFeedCreate,
 ) -> ThreatFeedResponse:
     """
@@ -67,8 +67,8 @@ async def create_threat_feed(
 
 @router.get("/feeds", response_model=ThreatFeedListResponse, operation_id="list_threat_feeds")
 async def list_threat_feeds(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=200),
     is_enabled: Optional[bool] = None,
@@ -90,8 +90,8 @@ async def list_threat_feeds(
 
 @router.get("/feeds/{feed_id}", response_model=ThreatFeedResponse, operation_id="get_threat_feed")
 async def get_threat_feed(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     feed_id: str,
 ) -> ThreatFeedResponse:
     """
@@ -106,8 +106,8 @@ async def get_threat_feed(
 
 @router.put("/feeds/{feed_id}", response_model=ThreatFeedResponse, operation_id="update_threat_feed")
 async def update_threat_feed(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     feed_id: str,
     feed_update: ThreatFeedUpdate,
 ) -> ThreatFeedResponse:
@@ -127,8 +127,8 @@ async def update_threat_feed(
 
 @router.delete("/feeds/{feed_id}", status_code=status.HTTP_204_NO_CONTENT, operation_id="delete_threat_feed")
 async def delete_threat_feed(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     feed_id: str,
 ) -> None:
     """
@@ -147,8 +147,8 @@ async def delete_threat_feed(
 
 @router.post("/feeds/{feed_id}/poll", response_model=dict, operation_id="poll_threat_feed")
 async def poll_threat_feed(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     feed_id: str,
 ) -> dict:
     """
@@ -164,8 +164,8 @@ async def poll_threat_feed(
 
 @router.post("/feeds/register-builtins", response_model=dict, operation_id="register_builtin_feeds")
 async def register_builtin_feeds(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ) -> dict:
     """
     Register built-in threat feeds.
@@ -180,8 +180,8 @@ async def register_builtin_feeds(
 
 @router.get("/feeds/{feed_id}/stats", response_model=dict, operation_id="get_feed_stats")
 async def get_feed_stats(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     feed_id: str,
 ) -> dict:
     """
@@ -204,8 +204,8 @@ async def get_feed_stats(
 
 @router.post("/indicators", response_model=ThreatIndicatorResponse, status_code=status.HTTP_201_CREATED)
 async def create_indicator(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     indicator_data: ThreatIndicatorCreate,
 ) -> ThreatIndicatorResponse:
     """
@@ -220,8 +220,8 @@ async def create_indicator(
 
 @router.post("/indicators/bulk", response_model=dict, status_code=status.HTTP_201_CREATED, operation_id="bulk_import_indicators")
 async def bulk_import_indicators(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     import_data: BulkIndicatorImport,
 ) -> dict:
     """
@@ -237,8 +237,8 @@ async def bulk_import_indicators(
 
 @router.get("/indicators", response_model=ThreatIndicatorListResponse, operation_id="list_indicators")
 async def list_indicators(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=200),
     indicator_type: Optional[str] = None,
@@ -269,8 +269,8 @@ async def list_indicators(
 
 @router.get("/indicators/{indicator_id}", response_model=ThreatIndicatorResponse, operation_id="get_indicator")
 async def get_indicator(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     indicator_id: str,
 ) -> ThreatIndicatorResponse:
     """
@@ -285,8 +285,8 @@ async def get_indicator(
 
 @router.put("/indicators/{indicator_id}", response_model=ThreatIndicatorResponse, operation_id="update_indicator")
 async def update_indicator(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     indicator_id: str,
     indicator_update: ThreatIndicatorUpdate,
 ) -> ThreatIndicatorResponse:
@@ -302,8 +302,8 @@ async def update_indicator(
 
 @router.delete("/indicators/{indicator_id}", status_code=status.HTTP_204_NO_CONTENT, operation_id="delete_indicator")
 async def delete_indicator(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     indicator_id: str,
 ) -> None:
     """
@@ -318,8 +318,8 @@ async def delete_indicator(
 
 @router.post("/indicators/{indicator_id}/enrich", response_model=dict, operation_id="enrich_indicator")
 async def enrich_indicator(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     indicator_id: str,
 ) -> dict:
     """
@@ -334,8 +334,8 @@ async def enrich_indicator(
 
 @router.post("/indicators/{indicator_id}/whitelist", response_model=ThreatIndicatorResponse, operation_id="whitelist_indicator")
 async def whitelist_indicator(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     indicator_id: str,
 ) -> ThreatIndicatorResponse:
     """
@@ -350,8 +350,8 @@ async def whitelist_indicator(
 
 @router.get("/indicators/{indicator_id}/timeline", response_model=list, operation_id="get_indicator_timeline")
 async def get_indicator_timeline(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     indicator_id: str,
 ) -> list:
     """
@@ -363,8 +363,8 @@ async def get_indicator_timeline(
 
 @router.post("/indicators/search", response_model=ThreatIndicatorListResponse, operation_id="advanced_search_indicators")
 async def advanced_search_indicators(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     search_request: IntelSearchRequest,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=200),
@@ -389,8 +389,8 @@ async def advanced_search_indicators(
 
 @router.post("/sightings", response_model=IndicatorSightingResponse, status_code=status.HTTP_201_CREATED, operation_id="record_sighting")
 async def record_sighting(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     sighting_data: IndicatorSightingCreate,
 ) -> IndicatorSightingResponse:
     """
@@ -405,8 +405,8 @@ async def record_sighting(
 
 @router.get("/indicators/{indicator_id}/sightings", response_model=list[IndicatorSightingResponse], operation_id="get_indicator_sightings")
 async def get_indicator_sightings(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     indicator_id: str,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=200),
@@ -425,8 +425,8 @@ async def get_indicator_sightings(
 
 @router.post("/actors", response_model=ThreatActorResponse, status_code=status.HTTP_201_CREATED, operation_id="create_actor")
 async def create_actor(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     actor_data: ThreatActorCreate,
 ) -> ThreatActorResponse:
     """
@@ -441,8 +441,8 @@ async def create_actor(
 
 @router.get("/actors", response_model=ThreatActorListResponse, operation_id="list_actors")
 async def list_actors(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=200),
     search: Optional[str] = None,
@@ -465,8 +465,8 @@ async def list_actors(
 
 @router.get("/actors/{actor_id}", response_model=ThreatActorResponse, operation_id="get_actor")
 async def get_actor(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     actor_id: str,
 ) -> ThreatActorResponse:
     """
@@ -481,8 +481,8 @@ async def get_actor(
 
 @router.put("/actors/{actor_id}", response_model=ThreatActorResponse, operation_id="update_actor")
 async def update_actor(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     actor_id: str,
     actor_update: ThreatActorUpdate,
 ) -> ThreatActorResponse:
@@ -498,8 +498,8 @@ async def update_actor(
 
 @router.delete("/actors/{actor_id}", status_code=status.HTTP_204_NO_CONTENT, operation_id="delete_actor")
 async def delete_actor(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     actor_id: str,
 ) -> None:
     """
@@ -519,8 +519,8 @@ async def delete_actor(
 
 @router.post("/campaigns", response_model=ThreatCampaignResponse, status_code=status.HTTP_201_CREATED, operation_id="create_campaign")
 async def create_campaign(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     campaign_data: ThreatCampaignCreate,
 ) -> ThreatCampaignResponse:
     """
@@ -535,8 +535,8 @@ async def create_campaign(
 
 @router.get("/campaigns", response_model=ThreatCampaignListResponse, operation_id="list_campaigns")
 async def list_campaigns(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=200),
     status: Optional[str] = None,
@@ -558,8 +558,8 @@ async def list_campaigns(
 
 @router.get("/campaigns/{campaign_id}", response_model=ThreatCampaignResponse, operation_id="get_campaign")
 async def get_campaign(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     campaign_id: str,
 ) -> ThreatCampaignResponse:
     """
@@ -574,8 +574,8 @@ async def get_campaign(
 
 @router.put("/campaigns/{campaign_id}", response_model=ThreatCampaignResponse, operation_id="update_campaign")
 async def update_campaign(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     campaign_id: str,
     campaign_update: ThreatCampaignUpdate,
 ) -> ThreatCampaignResponse:
@@ -591,8 +591,8 @@ async def update_campaign(
 
 @router.delete("/campaigns/{campaign_id}", status_code=status.HTTP_204_NO_CONTENT, operation_id="delete_campaign")
 async def delete_campaign(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     campaign_id: str,
 ) -> None:
     """
@@ -612,8 +612,8 @@ async def delete_campaign(
 
 @router.post("/reports", response_model=IntelReportResponse, status_code=status.HTTP_201_CREATED, operation_id="create_report")
 async def create_report(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     report_data: IntelReportCreate,
 ) -> IntelReportResponse:
     """
@@ -628,8 +628,8 @@ async def create_report(
 
 @router.get("/reports", response_model=IntelReportListResponse, operation_id="list_reports")
 async def list_reports(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=200),
     report_type: Optional[str] = None,
@@ -652,8 +652,8 @@ async def list_reports(
 
 @router.get("/reports/{report_id}", response_model=IntelReportResponse, operation_id="get_report")
 async def get_report(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     report_id: str,
 ) -> IntelReportResponse:
     """
@@ -668,8 +668,8 @@ async def get_report(
 
 @router.put("/reports/{report_id}", response_model=IntelReportResponse, operation_id="update_report")
 async def update_report(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     report_id: str,
     report_update: IntelReportUpdate,
 ) -> IntelReportResponse:
@@ -685,8 +685,8 @@ async def update_report(
 
 @router.post("/reports/{report_id}/publish", response_model=IntelReportResponse, operation_id="publish_report")
 async def publish_report(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     report_id: str,
 ) -> IntelReportResponse:
     """
@@ -701,8 +701,8 @@ async def publish_report(
 
 @router.delete("/reports/{report_id}", status_code=status.HTTP_204_NO_CONTENT, operation_id="delete_report")
 async def delete_report(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     report_id: str,
 ) -> None:
     """
@@ -722,8 +722,8 @@ async def delete_report(
 
 @router.get("/dashboard", response_model=IntelDashboardStats, operation_id="get_dashboard_stats")
 async def get_dashboard_stats(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ) -> IntelDashboardStats:
     """
     Get threat intelligence dashboard statistics.
@@ -746,8 +746,8 @@ async def get_dashboard_stats(
 
 @router.get("/export", response_model=dict, operation_id="export_indicators")
 async def export_indicators(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     format: str = Query("json", description="json, csv, stix"),
     indicator_types: Optional[list[str]] = Query(None),
     severity: Optional[list[str]] = Query(None),

@@ -120,8 +120,8 @@ async def execute_hunt_session(session_id: str):
 
 @router.get("/hypotheses", response_model=HuntHypothesisListResponse)
 async def list_hypotheses(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     search: Optional[str] = None,
@@ -182,8 +182,8 @@ async def list_hypotheses(
 @router.post("/hypotheses", response_model=HuntHypothesisResponse, status_code=status.HTTP_201_CREATED)
 async def create_hypothesis(
     hypothesis_data: HuntHypothesisCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Create a new hunt hypothesis"""
     hypothesis = HuntHypothesis(
@@ -210,8 +210,8 @@ async def create_hypothesis(
 @router.get("/hypotheses/{hypothesis_id}", response_model=HuntHypothesisResponse)
 async def get_hypothesis(
     hypothesis_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get a hypothesis by ID"""
     hypothesis = await get_hypothesis_or_404(db, hypothesis_id)
@@ -222,8 +222,8 @@ async def get_hypothesis(
 async def update_hypothesis(
     hypothesis_id: str,
     hypothesis_data: HuntHypothesisUpdate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Update a hypothesis"""
     hypothesis = await get_hypothesis_or_404(db, hypothesis_id)
@@ -255,8 +255,8 @@ async def update_hypothesis(
 @router.delete("/hypotheses/{hypothesis_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_hypothesis(
     hypothesis_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Delete a hypothesis (only if DRAFT)"""
     hypothesis = await get_hypothesis_or_404(db, hypothesis_id)
@@ -274,8 +274,8 @@ async def delete_hypothesis(
 @router.post("/hypotheses/{hypothesis_id}/activate", response_model=HuntHypothesisResponse)
 async def activate_hypothesis(
     hypothesis_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Activate a hypothesis (set status to ACTIVE)"""
     hypothesis = await get_hypothesis_or_404(db, hypothesis_id)
@@ -302,8 +302,8 @@ async def activate_hypothesis(
 @router.post("/sessions", response_model=HuntSessionResponse, status_code=status.HTTP_201_CREATED)
 async def create_session(
     session_data: HuntSessionCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     background_tasks: BackgroundTasks,
 ):
     """Create and start a hunt session"""
@@ -328,8 +328,8 @@ async def create_session(
 
 @router.get("/sessions", response_model=HuntSessionListResponse)
 async def list_sessions(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     hypothesis_id: Optional[str] = None,
@@ -377,8 +377,8 @@ async def list_sessions(
 @router.get("/sessions/{session_id}", response_model=HuntSessionResponse)
 async def get_session(
     session_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get a hunt session by ID"""
     session = await get_session_or_404(db, session_id)
@@ -388,8 +388,8 @@ async def get_session(
 @router.post("/sessions/{session_id}/pause", response_model=HuntSessionResponse)
 async def pause_session(
     session_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Pause a hunt session"""
     session = await get_session_or_404(db, session_id)
@@ -410,8 +410,8 @@ async def pause_session(
 @router.post("/sessions/{session_id}/resume", response_model=HuntSessionResponse)
 async def resume_session(
     session_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Resume a paused hunt session"""
     session = await get_session_or_404(db, session_id)
@@ -432,8 +432,8 @@ async def resume_session(
 @router.post("/sessions/{session_id}/cancel", response_model=HuntSessionResponse)
 async def cancel_session(
     session_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Cancel a hunt session"""
     session = await get_session_or_404(db, session_id)
@@ -459,8 +459,8 @@ async def cancel_session(
 
 @router.get("/findings", response_model=HuntFindingListResponse)
 async def list_findings(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     session_id: Optional[str] = None,
@@ -512,8 +512,8 @@ async def list_findings(
 @router.post("/findings", response_model=HuntFindingResponse, status_code=status.HTTP_201_CREATED)
 async def create_finding(
     finding_data: HuntFindingCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Create a new hunt finding"""
     # Verify session exists
@@ -541,8 +541,8 @@ async def create_finding(
 @router.get("/findings/{finding_id}", response_model=HuntFindingResponse)
 async def get_finding(
     finding_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get a finding by ID"""
     finding = await get_finding_or_404(db, finding_id)
@@ -553,8 +553,8 @@ async def get_finding(
 async def update_finding(
     finding_id: str,
     finding_data: HuntFindingUpdate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Update a finding"""
     finding = await get_finding_or_404(db, finding_id)
@@ -573,8 +573,8 @@ async def update_finding(
 @router.post("/findings/{finding_id}/escalate", response_model=dict)
 async def escalate_finding(
     finding_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Escalate a finding to a new case"""
     finding = await get_finding_or_404(db, finding_id)
@@ -599,8 +599,8 @@ async def escalate_finding(
 
 @router.get("/templates", response_model=list[HuntTemplateResponse])
 async def list_templates(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     category: Optional[str] = None,
     difficulty: Optional[str] = None,
     hunt_type: Optional[str] = None,
@@ -626,8 +626,8 @@ async def list_templates(
 @router.get("/templates/{template_id}", response_model=HuntTemplateResponse)
 async def get_template(
     template_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get a template by ID"""
     result = await db.execute(
@@ -648,8 +648,8 @@ async def get_template(
 async def instantiate_template(
     template_id: str,
     parameters: dict,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Create a hypothesis from a template"""
     result = await db.execute(
@@ -690,8 +690,8 @@ async def instantiate_template(
 
 @router.get("/notebooks", response_model=HuntNotebookListResponse)
 async def list_notebooks(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     session_id: Optional[str] = None,
@@ -727,8 +727,8 @@ async def list_notebooks(
 @router.post("/notebooks", response_model=HuntNotebookResponse, status_code=status.HTTP_201_CREATED)
 async def create_notebook(
     notebook_data: HuntNotebookCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Create a new hunt notebook"""
     # Verify session exists
@@ -752,8 +752,8 @@ async def create_notebook(
 @router.get("/notebooks/{notebook_id}", response_model=HuntNotebookResponse)
 async def get_notebook(
     notebook_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get a notebook by ID"""
     notebook = await get_notebook_or_404(db, notebook_id)
@@ -764,8 +764,8 @@ async def get_notebook(
 async def update_notebook(
     notebook_id: str,
     notebook_data: HuntNotebookUpdate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Update a notebook"""
     notebook = await get_notebook_or_404(db, notebook_id)
@@ -790,8 +790,8 @@ async def update_notebook(
 async def execute_notebook_cell(
     notebook_id: str,
     cell_data: HuntNotebookCellExecute,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Execute a query cell in a notebook"""
     notebook = await get_notebook_or_404(db, notebook_id)
@@ -808,8 +808,8 @@ async def execute_notebook_cell(
 @router.post("/notebooks/{notebook_id}/publish", response_model=HuntNotebookResponse)
 async def publish_notebook(
     notebook_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Publish a notebook as a report"""
     notebook = await get_notebook_or_404(db, notebook_id)
@@ -847,8 +847,8 @@ async def export_notebook(
 
 @router.get("/stats", response_model=HuntStatsResponse)
 async def get_hunting_stats(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get hunting statistics"""
     # Total hypotheses

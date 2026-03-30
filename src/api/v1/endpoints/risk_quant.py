@@ -136,8 +136,8 @@ async def get_bia_or_404(
     response_model=RiskScenarioListResponse,
 )
 async def list_risk_scenarios(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     search: Optional[str] = None,
@@ -192,8 +192,8 @@ async def list_risk_scenarios(
 )
 async def create_risk_scenario(
     scenario_data: RiskScenarioCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Create a new risk scenario"""
     scenario = RiskScenario(
@@ -222,8 +222,8 @@ async def create_risk_scenario(
 @router.get("/scenarios/{scenario_id}", response_model=RiskScenarioResponse)
 async def get_risk_scenario(
     scenario_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get a risk scenario by ID"""
     scenario = await get_risk_scenario_or_404(db, scenario_id)
@@ -234,8 +234,8 @@ async def get_risk_scenario(
 async def update_risk_scenario(
     scenario_id: str,
     scenario_data: RiskScenarioUpdate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Update a risk scenario"""
     scenario = await get_risk_scenario_or_404(db, scenario_id)
@@ -253,8 +253,8 @@ async def update_risk_scenario(
 @router.delete("/scenarios/{scenario_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_risk_scenario(
     scenario_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Delete a risk scenario"""
     scenario = await get_risk_scenario_or_404(db, scenario_id)
@@ -265,8 +265,8 @@ async def delete_risk_scenario(
 # FAIR Analysis Endpoints
 @router.get("/fair-analyses", response_model=FAIRAnalysisListResponse)
 async def list_fair_analyses(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     scenario_id: Optional[str] = None,
@@ -308,8 +308,8 @@ async def list_fair_analyses(
 )
 async def create_fair_analysis(
     analysis_data: FAIRAnalysisCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Create a new FAIR analysis"""
     # Verify scenario exists
@@ -356,8 +356,8 @@ async def create_fair_analysis(
 @router.get("/fair-analyses/{analysis_id}", response_model=FAIRAnalysisResponse)
 async def get_fair_analysis(
     analysis_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get a FAIR analysis by ID"""
     analysis = await get_fair_analysis_or_404(db, analysis_id)
@@ -370,8 +370,8 @@ async def get_fair_analysis(
 )
 async def run_fair_simulation_endpoint(
     analysis_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Run FAIR Monte Carlo simulation"""
     analysis = await get_fair_analysis_or_404(db, analysis_id)
@@ -432,8 +432,8 @@ async def run_fair_simulation_endpoint(
 )
 async def get_loss_exceedance_curve(
     analysis_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get loss exceedance curve for FAIR analysis"""
     analysis = await get_fair_analysis_or_404(db, analysis_id)
@@ -450,8 +450,8 @@ async def get_loss_exceedance_curve(
 # Risk Register Endpoints
 @router.get("/risk-registers", response_model=RiskRegisterListResponse)
 async def list_risk_registers(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     category: Optional[str] = None,
@@ -497,8 +497,8 @@ async def list_risk_registers(
 )
 async def create_risk_register(
     register_data: RiskRegisterCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Create a new risk register entry"""
     register = RiskRegister(
@@ -531,8 +531,8 @@ async def create_risk_register(
 @router.get("/risk-registers/{register_id}", response_model=RiskRegisterResponse)
 async def get_risk_register(
     register_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get a risk register entry by ID"""
     register = await get_risk_register_or_404(db, register_id)
@@ -543,8 +543,8 @@ async def get_risk_register(
 async def update_risk_register(
     register_id: str,
     register_data: RiskRegisterUpdate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Update a risk register entry"""
     register = await get_risk_register_or_404(db, register_id)
@@ -568,8 +568,8 @@ async def update_risk_register(
 @router.delete("/risk-registers/{register_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_risk_register(
     register_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Delete a risk register entry"""
     register = await get_risk_register_or_404(db, register_id)
@@ -580,8 +580,8 @@ async def delete_risk_register(
 # Risk Control Endpoints
 @router.get("/controls", response_model=RiskControlListResponse)
 async def list_risk_controls(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     control_type: Optional[str] = None,
@@ -627,8 +627,8 @@ async def list_risk_controls(
 )
 async def create_risk_control(
     control_data: RiskControlCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Create a new risk control"""
     control = RiskControl(
@@ -654,8 +654,8 @@ async def create_risk_control(
 @router.get("/controls/{control_id}", response_model=RiskControlResponse)
 async def get_risk_control(
     control_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get a risk control by ID"""
     control = await get_risk_control_or_404(db, control_id)
@@ -666,8 +666,8 @@ async def get_risk_control(
 async def update_risk_control(
     control_id: str,
     control_data: RiskControlUpdate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Update a risk control"""
     control = await get_risk_control_or_404(db, control_id)
@@ -686,8 +686,8 @@ async def update_risk_control(
 @router.delete("/controls/{control_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_risk_control(
     control_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Delete a risk control"""
     control = await get_risk_control_or_404(db, control_id)
@@ -698,8 +698,8 @@ async def delete_risk_control(
 @router.post("/controls/{control_id}/audit", response_model=ControlROIResponse)
 async def audit_control_effectiveness(
     control_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Audit control effectiveness and calculate ROI"""
     control = await get_risk_control_or_404(db, control_id)
@@ -737,8 +737,8 @@ async def audit_control_effectiveness(
 # Business Impact Assessment Endpoints
 @router.get("/bias", response_model=BusinessImpactAssessmentListResponse)
 async def list_bias(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     criticality: Optional[str] = None,
@@ -780,8 +780,8 @@ async def list_bias(
 )
 async def create_bia(
     bia_data: BusinessImpactAssessmentCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Create a new Business Impact Assessment"""
     bia = BusinessImpactAssessment(
@@ -812,8 +812,8 @@ async def create_bia(
 @router.get("/bias/{bia_id}", response_model=BusinessImpactAssessmentResponse)
 async def get_bia(
     bia_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get a BIA by ID"""
     bia = await get_bia_or_404(db, bia_id)
@@ -824,8 +824,8 @@ async def get_bia(
 async def update_bia(
     bia_id: str,
     bia_data: BusinessImpactAssessmentUpdate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Update a BIA"""
     bia = await get_bia_or_404(db, bia_id)
@@ -847,8 +847,8 @@ async def update_bia(
 @router.delete("/bias/{bia_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_bia(
     bia_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Delete a BIA"""
     bia = await get_bia_or_404(db, bia_id)
@@ -859,8 +859,8 @@ async def delete_bia(
 # Dashboard Endpoints
 @router.get("/dashboard", response_model=RiskDashboardResponse)
 async def get_risk_dashboard(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get organizational risk dashboard"""
     # Query all risks for organization
@@ -922,8 +922,8 @@ async def get_risk_dashboard(
 
 @router.get("/heatmap", response_model=RiskHeatmapResponse)
 async def get_risk_heatmap(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get risk heatmap (impact vs likelihood)"""
     aggregator = RiskAggregator()

@@ -54,8 +54,8 @@ async def get_alert_or_404(db: AsyncSession, alert_id: str) -> Alert:
 
 @router.get("", response_model=AlertListResponse)
 async def list_alerts(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     search: Optional[str] = None,
@@ -124,8 +124,8 @@ async def list_alerts(
 @router.post("", response_model=AlertResponse, status_code=status.HTTP_201_CREATED)
 async def create_alert(
     alert_data: AlertCreate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     background_tasks: BackgroundTasks,
 ):
     """Create a new alert"""
@@ -169,8 +169,8 @@ async def create_alert(
 
 @router.get("/stats", response_model=AlertStats)
 async def get_alert_stats(
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get alert statistics"""
     # Total count
@@ -214,8 +214,8 @@ async def get_alert_stats(
 @router.get("/{alert_id}", response_model=AlertResponse)
 async def get_alert(
     alert_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Get an alert by ID"""
     alert = await get_alert_or_404(db, alert_id)
@@ -226,8 +226,8 @@ async def get_alert(
 async def update_alert(
     alert_id: str,
     alert_data: AlertUpdate,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Update an alert"""
     alert = await get_alert_or_404(db, alert_id)
@@ -254,8 +254,8 @@ async def update_alert(
 @router.delete("/{alert_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_alert(
     alert_id: str,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Delete an alert"""
     alert = await get_alert_or_404(db, alert_id)
@@ -266,8 +266,8 @@ async def delete_alert(
 @router.post("/bulk", response_model=dict)
 async def bulk_action(
     action_data: AlertBulkAction,
-    current_user: CurrentUser,
-    db: DatabaseSession,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
     """Perform bulk action on alerts"""
     success_count = 0
