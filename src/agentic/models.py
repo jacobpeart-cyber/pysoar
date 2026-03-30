@@ -222,11 +222,6 @@ class SOCAgent(BaseModel):
         back_populates="agent",
         cascade="all, delete-orphan",
     )
-    actions: Mapped[list["AgentAction"]] = relationship(
-        "AgentAction",
-        back_populates="investigation",
-        cascade="all, delete-orphan",
-    )
     memories: Mapped[list["AgentMemory"]] = relationship(
         "AgentMemory",
         back_populates="agent",
