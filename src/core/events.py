@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional
 
-import aioredis
+from redis import asyncio as aioredis
 
 from src.core.logging import get_logger
 from src.core.websocket import manager as ws_manager

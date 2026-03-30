@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 
-import aioredis
+from redis import asyncio as aioredis
 from fastapi import WebSocket
 
 from src.core.logging import get_logger
