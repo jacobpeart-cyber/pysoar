@@ -131,7 +131,6 @@ class ForensicCase(BaseModel):
     # Relationships
     lead_investigator: Mapped[Optional["User"]] = relationship(
         "User",
-        back_populates="forensic_cases",
         foreign_keys=[lead_investigator_id],
     )
     evidence: Mapped[list["ForensicEvidence"]] = relationship(
