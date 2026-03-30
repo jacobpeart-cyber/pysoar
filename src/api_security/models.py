@@ -8,7 +8,7 @@ security policies, anomaly detection, and compliance checks.
 from datetime import datetime
 from typing import Dict, Any, Optional, List
 from enum import Enum
-from sqlalchemy import Boolean, DateTime, Enum, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Enum as SQLEnum, Float, ForeignKey, Index, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.models.base import BaseModel, utc_now
