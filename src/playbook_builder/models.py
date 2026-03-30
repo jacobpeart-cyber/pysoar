@@ -220,12 +220,6 @@ class PlaybookNode(BaseModel):
         "VisualPlaybook",
         back_populates="nodes",
     )
-    executions: Mapped[list["PlaybookNodeExecution"]] = relationship(
-        "PlaybookNodeExecution",
-        back_populates="node",
-        cascade="all, delete-orphan",
-    )
-
     def __repr__(self) -> str:
         return f"<PlaybookNode {self.node_id}:{self.node_type}>"
 
@@ -372,10 +366,5 @@ class PlaybookNodeExecution(BaseModel):
         "VisualPlaybookExecution",
         back_populates="node_executions",
     )
-    node: Mapped["PlaybookNode"] = relationship(
-        "PlaybookNode",
-        back_populates="executions",
-    )
-
     def __repr__(self) -> str:
         return f"<PlaybookNodeExecution {self.node_id}:{self.status}>"
