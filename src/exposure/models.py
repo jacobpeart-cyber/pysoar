@@ -226,7 +226,7 @@ class ExposureAsset(BaseModel):
     )
 
 
-class Vulnerability(BaseModel):
+class ExposureVulnerability(BaseModel):
     """
     Represents a known vulnerability that may affect assets in the organization.
 
@@ -234,7 +234,7 @@ class Vulnerability(BaseModel):
     and information about available patches and exploits.
     """
 
-    __tablename__ = "vulnerabilities"
+    __tablename__ = "exposure_vulnerabilities"
 
     cve_id: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
     title: Mapped[str] = mapped_column(String(500), nullable=False)
@@ -285,7 +285,7 @@ class AssetVulnerability(BaseModel):
 
     asset_id: Mapped[str] = mapped_column(String(36), ForeignKey("exposure_assets.id"), nullable=False)
     vulnerability_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("vulnerabilities.id"), nullable=False
+        String(36), ForeignKey("exposure_vulnerabilities.id"), nullable=False
     )
     status: Mapped[str] = mapped_column(String(50), default="open")
     detected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
@@ -304,7 +304,7 @@ class AssetVulnerability(BaseModel):
 
     # Relationships
     asset = relationship("ExposureAsset", back_populates="vulnerabilities")
-    vulnerability = relationship("Vulnerability", back_populates="asset_vulnerabilities")
+    vulnerability = relationship("ExposureVulnerability", back_populates="asset_vulnerabilities")
 
     __table_args__ = (
         Index("ix_asset_vulnerabilities_asset_id", "asset_id"),

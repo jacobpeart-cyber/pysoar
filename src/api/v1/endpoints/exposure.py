@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.deps import CurrentUser, DatabaseSession, get_current_active_user, get_db
 from src.exposure.models import (
     ExposureAsset,
-    Vulnerability,
+    ExposureVulnerability as Vulnerability,
     AssetVulnerability,
     ExposureScan,
     RemediationTicket,
