@@ -71,7 +71,7 @@ orchestrator = DeceptionOrchestrator()
 )
 async def deploy_decoy(
     request: DecoyDeployRequest,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """Deploy a new decoy asset."""
@@ -100,7 +100,7 @@ async def deploy_decoy(
 
 @router.get("/decoys", response_model=list[DecoyResponse])
 async def list_decoys(
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     decoy_type: str | None = Query(None),
     status: str | None = Query(None),
     category: str | None = Query(None),
@@ -137,7 +137,7 @@ async def list_decoys(
 @router.get("/decoys/{decoy_id}", response_model=DecoyDetailResponse)
 async def get_decoy_detail(
     decoy_id: UUID,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
 ):
     """Get detailed information about a specific decoy."""
     try:
@@ -175,7 +175,7 @@ async def get_decoy_detail(
 async def update_decoy(
     decoy_id: UUID,
     request: DecoyDeployRequest,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """Update decoy configuration."""
@@ -209,7 +209,7 @@ async def update_decoy(
 @router.post("/decoys/{decoy_id}/disable", status_code=status.HTTP_204_NO_CONTENT)
 async def disable_decoy(
     decoy_id: UUID,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """Disable a decoy."""
@@ -241,7 +241,7 @@ async def disable_decoy(
 @router.post("/decoys/{decoy_id}/rotate", response_model=DecoyResponse)
 async def rotate_decoy(
     decoy_id: UUID,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """Rotate/refresh a decoy to avoid fingerprinting."""
@@ -275,7 +275,7 @@ async def rotate_decoy(
 @router.delete("/decoys/{decoy_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def undeploy_decoy(
     decoy_id: UUID,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """Undeploy and delete a decoy."""
@@ -318,7 +318,7 @@ async def undeploy_decoy(
 )
 async def generate_token(
     request: HoneyTokenGenerateRequest,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """Generate a new honeytoken."""
@@ -381,7 +381,7 @@ async def generate_token(
 
 @router.get("/tokens", response_model=list[HoneyTokenResponse])
 async def list_tokens(
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     token_type: str | None = Query(None),
     status: str | None = Query(None),
     skip: int = Query(0, ge=0),
@@ -413,7 +413,7 @@ async def list_tokens(
 @router.get("/tokens/{token_id}", response_model=HoneyTokenResponse)
 async def get_token(
     token_id: UUID,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
 ):
     """Get details about a specific honeytoken."""
     try:
@@ -443,7 +443,7 @@ async def get_token(
 @router.post("/tokens/{token_id}/check", response_model=HoneyTokenCheckResponse)
 async def check_token(
     token_id: UUID,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
 ):
     """Check if a honeytoken has been used/triggered."""
     try:
@@ -485,7 +485,7 @@ async def check_token(
 @router.delete("/tokens/{token_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_token(
     token_id: UUID,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """Disable/delete a honeytoken."""
@@ -516,7 +516,7 @@ async def delete_token(
 
 @router.post("/tokens/rotate", status_code=status.HTTP_200_OK)
 async def rotate_tokens(
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     token_type: str = Query(...),
     current_user = Depends(get_current_active_user),
 ):
@@ -547,7 +547,7 @@ async def rotate_tokens(
 
 @router.get("/interactions", response_model=list[DecoyInteractionResponse])
 async def list_interactions(
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     decoy_id: UUID | None = Query(None),
     source_ip: str | None = Query(None),
     threat_level: str | None = Query(None),
@@ -586,7 +586,7 @@ async def list_interactions(
 @router.get("/interactions/{interaction_id}", response_model=DecoyInteractionResponse)
 async def get_interaction(
     interaction_id: UUID,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
 ):
     """Get details about a specific interaction."""
     try:
@@ -615,7 +615,7 @@ async def get_interaction(
 
 @router.get("/interactions/timeline", response_model=InteractionTimelineResponse)
 async def get_interaction_timeline(
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     decoy_id: UUID = Query(...),
     hours: int = Query(24, ge=1, le=720),
 ):
@@ -651,7 +651,7 @@ async def get_interaction_timeline(
 async def investigate_interaction(
     interaction_id: UUID,
     request: InteractionInvestigationRequest,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """Trigger deep investigation of an interaction."""
@@ -708,7 +708,7 @@ async def investigate_interaction(
 )
 async def create_campaign(
     request: DeceptionCampaignCreateRequest,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """Create a new deception campaign."""
@@ -740,7 +740,7 @@ async def create_campaign(
 
 @router.get("/campaigns", response_model=list[DeceptionCampaignResponse])
 async def list_campaigns(
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     objective: str | None = Query(None),
     status: str | None = Query(None),
     skip: int = Query(0, ge=0),
@@ -774,7 +774,7 @@ async def list_campaigns(
 @router.get("/campaigns/{campaign_id}", response_model=DeceptionCampaignDetailResponse)
 async def get_campaign_detail(
     campaign_id: UUID,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
 ):
     """Get detailed information about a campaign."""
     try:
@@ -805,7 +805,7 @@ async def get_campaign_detail(
 async def update_campaign_status(
     campaign_id: UUID,
     request: CampaignStatusUpdateRequest,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """Update campaign status (pause/resume/complete)."""
@@ -846,7 +846,7 @@ async def update_campaign_status(
 )
 async def get_campaign_effectiveness(
     campaign_id: UUID,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
 ):
     """Get effectiveness assessment of a campaign."""
     try:
@@ -904,7 +904,7 @@ async def get_campaign_effectiveness(
 
 @router.get("/dashboard", response_model=DeceptionDashboardResponse)
 async def get_dashboard(
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
 ):
     """Get deception module dashboard statistics."""
     try:
@@ -947,7 +947,7 @@ async def get_dashboard(
 
 @router.get("/coverage", response_model=CoverageMapResponse)
 async def get_coverage_map(
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
 ):
     """Get network coverage map for deception infrastructure."""
     try:
@@ -974,7 +974,7 @@ async def get_coverage_map(
 
 @router.get("/recommendations", response_model=RecommendationsResponse)
 async def get_recommendations(
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
 ):
     """Get recommendations for improving deception coverage."""
     try:

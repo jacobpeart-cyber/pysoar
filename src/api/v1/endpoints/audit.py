@@ -17,7 +17,7 @@ router = APIRouter(prefix="/audit", tags=["audit"])
 
 @router.get("", response_model=AuditLogListResponse)
 async def list_audit_logs(
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user: User = Depends(get_current_superuser),
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=100),
@@ -106,7 +106,7 @@ async def list_audit_actions(
 
 @router.get("/resource-types")
 async def list_resource_types(
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user: User = Depends(get_current_superuser),
 ) -> dict:
     """List all resource types that have audit logs"""
@@ -121,7 +121,7 @@ async def list_resource_types(
 
 @router.get("/stats")
 async def get_audit_stats(
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user: User = Depends(get_current_superuser),
 ) -> dict:
     """Get audit log statistics"""

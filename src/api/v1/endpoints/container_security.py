@@ -76,8 +76,8 @@ router = APIRouter(prefix="/container-security", tags=["container-security"])
 
 @router.get("/images", response_model=List[ContainerImageResponse])
 async def list_images(
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
     compliance_status: Optional[str] = None,
@@ -115,8 +115,8 @@ async def list_images(
 @router.post("/images", response_model=ContainerImageResponse, status_code=201)
 async def create_image(
     request: ContainerImageCreateRequest,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Create new container image record."""
     image = ContainerImage(
@@ -143,8 +143,8 @@ async def create_image(
 @router.get("/images/{image_id}", response_model=ContainerImageResponse)
 async def get_image(
     image_id: str,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Get image details."""
     stmt = select(ContainerImage).where(
@@ -166,8 +166,8 @@ async def get_image(
 async def update_image(
     image_id: str,
     request: ContainerImageUpdateRequest,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Update image metadata."""
     stmt = select(ContainerImage).where(
@@ -198,8 +198,8 @@ async def update_image(
 @router.post("/images/{image_id}/scan", response_model=ImageScanResponse)
 async def scan_image(
     image_id: str,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """
     Trigger image vulnerability scan.
@@ -236,8 +236,8 @@ async def scan_image(
 @router.get("/images/{image_id}/vulnerabilities", response_model=List[ImageVulnerabilityResponse])
 async def get_image_vulnerabilities(
     image_id: str,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     severity: Optional[str] = None,
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=200),
@@ -270,8 +270,8 @@ async def get_image_vulnerabilities(
 @router.post("/images/{image_id}/verify-signature")
 async def verify_image_signature(
     image_id: str,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """
     Verify image signature (cosign/notary).
@@ -306,8 +306,8 @@ async def verify_image_signature(
 @router.get("/images/{image_id}/risk-assessment")
 async def assess_image_risk(
     image_id: str,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Get image risk assessment."""
     stmt = select(ContainerImage).where(
@@ -350,8 +350,8 @@ async def assess_image_risk(
 
 @router.get("/clusters", response_model=List[KubernetesClusterResponse])
 async def list_clusters(
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
     provider: Optional[str] = None,
@@ -374,8 +374,8 @@ async def list_clusters(
 @router.post("/clusters", response_model=KubernetesClusterResponse, status_code=201)
 async def create_cluster(
     request: KubernetesClusterCreateRequest,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Create Kubernetes cluster record."""
     cluster = KubernetesCluster(
@@ -398,8 +398,8 @@ async def create_cluster(
 @router.get("/clusters/{cluster_id}", response_model=KubernetesClusterResponse)
 async def get_cluster(
     cluster_id: str,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Get cluster details."""
     stmt = select(KubernetesCluster).where(
@@ -421,8 +421,8 @@ async def get_cluster(
 async def update_cluster(
     cluster_id: str,
     request: KubernetesClusterUpdateRequest,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Update cluster configuration."""
     stmt = select(KubernetesCluster).where(
@@ -450,8 +450,8 @@ async def update_cluster(
 async def audit_cluster(
     cluster_id: str,
     request: ClusterAuditRequest,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """
     Trigger cluster security audit.
@@ -488,8 +488,8 @@ async def audit_cluster(
 @router.get("/clusters/{cluster_id}/compliance-check")
 async def check_cluster_compliance(
     cluster_id: str,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Get cluster compliance status."""
     stmt = select(KubernetesCluster).where(
@@ -517,8 +517,8 @@ async def check_cluster_compliance(
 @router.get("/clusters/{cluster_id}/findings", response_model=List[K8sSecurityFindingResponse])
 async def get_cluster_findings(
     cluster_id: str,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     status: Optional[str] = None,
     severity: Optional[str] = None,
     skip: int = Query(0, ge=0),
@@ -561,8 +561,8 @@ async def get_cluster_findings(
 
 @router.get("/findings", response_model=List[K8sSecurityFindingResponse])
 async def list_findings(
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     status: Optional[str] = None,
     severity: Optional[str] = None,
     skip: int = Query(0, ge=0),
@@ -590,8 +590,8 @@ async def list_findings(
 async def remediate_finding(
     finding_id: str,
     request: SecurityFindingRemediationRequest,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """
     Generate and apply remediation for finding.
@@ -635,8 +635,8 @@ async def remediate_finding(
 async def update_finding(
     finding_id: str,
     request: K8sSecurityFindingUpdateRequest,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Update finding status."""
     stmt = select(K8sSecurityFinding).where(
@@ -669,8 +669,8 @@ async def update_finding(
 
 @router.get("/runtime-alerts", response_model=List[RuntimeAlertResponse])
 async def list_runtime_alerts(
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     status: Optional[str] = None,
     severity: Optional[str] = None,
     skip: int = Query(0, ge=0),
@@ -698,8 +698,8 @@ async def list_runtime_alerts(
 async def update_runtime_alert(
     alert_id: str,
     request: RuntimeAlertUpdateRequest,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Update runtime alert status."""
     stmt = select(RuntimeAlert).where(
@@ -729,8 +729,8 @@ async def update_runtime_alert(
 async def investigate_alert(
     alert_id: str,
     request: RuntimeAlertInvestigationRequest,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Investigate runtime alert."""
     stmt = select(RuntimeAlert).where(
@@ -760,8 +760,8 @@ async def investigate_alert(
 @router.post("/runtime-alerts/{alert_id}/quarantine-pod")
 async def quarantine_pod_from_alert(
     alert_id: str,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Quarantine pod from runtime alert."""
     stmt = select(RuntimeAlert).where(
@@ -796,8 +796,8 @@ async def quarantine_pod_from_alert(
 
 @router.get("/dashboard/overview", response_model=DashboardOverviewResponse)
 async def get_dashboard_overview(
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """
     Get container security dashboard overview.
@@ -889,8 +889,8 @@ async def get_dashboard_overview(
 
 @router.get("/dashboard/compliance-matrix", response_model=List[ComplianceMatrixResponse])
 async def get_compliance_matrix(
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Get compliance matrix across frameworks."""
     stmt = select(KubernetesCluster).where(

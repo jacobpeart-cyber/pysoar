@@ -67,7 +67,7 @@ router = APIRouter(prefix="/remediation", tags=["remediation"])
 @router.post("/policies", response_model=RemediationPolicyResponse, status_code=status.HTTP_201_CREATED)
 async def create_policy(
     request: RemediationPolicyCreate,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """Create a new remediation policy."""
@@ -108,7 +108,7 @@ async def create_policy(
 
 @router.get("/policies", response_model=List[RemediationPolicyResponse])
 async def list_policies(
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     policy_type: Optional[str] = Query(None),
     trigger_type: Optional[str] = Query(None),
     enabled_only: bool = Query(default=True),
@@ -136,7 +136,7 @@ async def list_policies(
 @router.get("/policies/{policy_id}", response_model=RemediationPolicyResponse)
 async def get_policy(
     policy_id: str,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """Get a specific policy with execution history."""
@@ -150,7 +150,7 @@ async def get_policy(
 async def update_policy(
     policy_id: str,
     request: RemediationPolicyUpdate,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """Update a policy."""
@@ -171,7 +171,7 @@ async def update_policy(
 @router.delete("/policies/{policy_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_policy(
     policy_id: str,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """Disable a policy (soft delete)."""
@@ -188,7 +188,7 @@ async def delete_policy(
 async def test_policy(
     policy_id: str,
     trigger_data: dict,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """Test a policy against sample data."""
@@ -212,7 +212,7 @@ async def test_policy(
 
 @router.get("/policies/builtin")
 async def list_builtin_policies(
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """List built-in remediation policies."""
@@ -244,7 +244,7 @@ async def list_builtin_policies(
 
 @router.get("/actions", response_model=List[RemediationActionResponse])
 async def list_actions(
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     action_type: Optional[str] = Query(None),
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, ge=1, le=500),
@@ -266,7 +266,7 @@ async def list_actions(
 @router.post("/actions", response_model=RemediationActionResponse, status_code=status.HTTP_201_CREATED)
 async def create_action(
     request: RemediationActionCreate,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """Create a custom remediation action."""
@@ -297,7 +297,7 @@ async def create_action(
 @router.get("/actions/{action_id}", response_model=RemediationActionResponse)
 async def get_action(
     action_id: str,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """Get a specific action."""
@@ -311,7 +311,7 @@ async def get_action(
 async def test_action(
     action_id: str,
     target: str,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """Test an action."""
@@ -333,7 +333,7 @@ async def test_action(
 
 @router.get("/executions", response_model=List[RemediationExecutionResponse])
 async def list_executions(
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     status: Optional[str] = Query(None),
     trigger_source: Optional[str] = Query(None),
     days: int = Query(default=7, ge=1, le=90),
@@ -362,7 +362,7 @@ async def list_executions(
 @router.get("/executions/{execution_id}", response_model=RemediationExecutionResponse)
 async def get_execution(
     execution_id: str,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """Get execution detail with action results."""
@@ -375,7 +375,7 @@ async def get_execution(
 @router.get("/executions/{execution_id}/progress", response_model=ExecutionProgressResponse)
 async def get_execution_progress(
     execution_id: str,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """Get real-time execution progress."""
@@ -407,7 +407,7 @@ async def get_execution_progress(
 async def approve_execution(
     execution_id: str,
     request: ApprovalRequest,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """Approve a pending remediation execution."""
@@ -435,7 +435,7 @@ async def approve_execution(
 async def reject_execution(
     execution_id: str,
     request: RejectionRequest,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """Reject a pending remediation execution."""
@@ -455,7 +455,7 @@ async def reject_execution(
 @router.post("/executions/{execution_id}/rollback")
 async def rollback_execution(
     execution_id: str,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """Rollback a completed execution."""
@@ -476,7 +476,7 @@ async def rollback_execution(
 @router.post("/executions/{execution_id}/cancel")
 async def cancel_execution(
     execution_id: str,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """Cancel a running execution."""
@@ -493,7 +493,7 @@ async def cancel_execution(
 
 @router.get("/executions/pending")
 async def get_pending_approvals(
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """Get pending approvals for current organization."""
@@ -519,7 +519,7 @@ async def get_pending_approvals(
 @router.post("/execute")
 async def execute_manual_remediation(
     request: ManualRemediationRequest,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """Trigger manual remediation."""
@@ -546,7 +546,7 @@ async def execute_manual_remediation(
 @router.post("/block-ip")
 async def quick_block_ip(
     request: QuickBlockIPRequest,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """Quick action: block an IP."""
@@ -562,7 +562,7 @@ async def quick_block_ip(
 @router.post("/isolate-host")
 async def quick_isolate_host(
     request: QuickIsolateHostRequest,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """Quick action: isolate a host."""
@@ -577,7 +577,7 @@ async def quick_isolate_host(
 @router.post("/disable-account")
 async def quick_disable_account(
     request: QuickDisableAccountRequest,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """Quick action: disable an account."""
@@ -592,7 +592,7 @@ async def quick_disable_account(
 @router.post("/quarantine-file")
 async def quick_quarantine_file(
     request: QuickQuarantineFileRequest,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """Quick action: quarantine a file."""
@@ -614,7 +614,7 @@ async def quick_quarantine_file(
 
 @router.get("/playbooks", response_model=List[RemediationPlaybookResponse])
 async def list_playbooks(
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     playbook_type: Optional[str] = Query(None),
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, ge=1, le=500),
@@ -636,7 +636,7 @@ async def list_playbooks(
 @router.post("/playbooks", response_model=RemediationPlaybookResponse, status_code=status.HTTP_201_CREATED)
 async def create_playbook(
     request: RemediationPlaybookCreate,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """Create a remediation playbook."""
@@ -664,7 +664,7 @@ async def create_playbook(
 @router.get("/playbooks/{playbook_id}", response_model=RemediationPlaybookResponse)
 async def get_playbook(
     playbook_id: str,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """Get a specific playbook."""
@@ -678,7 +678,7 @@ async def get_playbook(
 async def update_playbook(
     playbook_id: str,
     request: RemediationPlaybookCreate,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """Update a playbook."""
@@ -701,7 +701,7 @@ async def update_playbook(
 async def execute_playbook(
     playbook_id: str,
     trigger_data: dict,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """Execute a playbook."""
@@ -722,7 +722,7 @@ async def execute_playbook(
 
 @router.get("/integrations", response_model=List[RemediationIntegrationResponse])
 async def list_integrations(
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     integration_type: Optional[str] = Query(None),
     current_user = Depends(get_current_active_user),
 ):
@@ -741,7 +741,7 @@ async def list_integrations(
 @router.post("/integrations", response_model=RemediationIntegrationResponse, status_code=status.HTTP_201_CREATED)
 async def create_integration(
     request: RemediationIntegrationCreate,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """Add a remediation integration."""
@@ -767,7 +767,7 @@ async def create_integration(
 async def update_integration(
     integration_id: str,
     request: RemediationIntegrationCreate,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """Update an integration."""
@@ -787,7 +787,7 @@ async def update_integration(
 @router.post("/integrations/{integration_id}/test", response_model=IntegrationTestResult)
 async def test_integration(
     integration_id: str,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """Test integration connectivity."""
@@ -806,7 +806,7 @@ async def test_integration(
 @router.get("/integrations/{integration_id}/health")
 async def get_integration_health(
     integration_id: str,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
     """Check integration health status."""
@@ -828,7 +828,7 @@ async def get_integration_health(
 
 @router.get("/dashboard", response_model=RemediationDashboardStats)
 async def get_dashboard_stats(
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     days: int = Query(default=7, ge=1, le=90),
     current_user = Depends(get_current_active_user),
 ):
@@ -869,7 +869,7 @@ async def get_dashboard_stats(
 
 @router.get("/timeline", response_model=RemediationTimelineResponse)
 async def get_remediation_timeline(
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     days: int = Query(default=7, ge=1, le=90),
     current_user = Depends(get_current_active_user),
 ):
@@ -896,7 +896,7 @@ async def get_remediation_timeline(
 
 @router.get("/effectiveness", response_model=EffectivenessMetrics)
 async def get_effectiveness_metrics(
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     days: int = Query(default=7, ge=1, le=90),
     current_user = Depends(get_current_active_user),
 ):

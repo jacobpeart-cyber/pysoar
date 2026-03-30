@@ -75,8 +75,8 @@ router = APIRouter(prefix="/privacy", tags=["privacy"])
 @router.post("/dsr/requests", response_model=DataSubjectRequestResponse, status_code=201)
 async def create_dsr(
     dsr: DataSubjectRequestCreate,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """
     Create new Data Subject Request.
@@ -114,8 +114,8 @@ async def create_dsr(
 
 @router.get("/dsr/requests", response_model=DataSubjectRequestListResponse)
 async def list_dsrs(
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     status: Optional[str] = None,
@@ -169,8 +169,8 @@ async def list_dsrs(
 @router.get("/dsr/requests/{request_id}", response_model=DataSubjectRequestResponse)
 async def get_dsr(
     request_id: str,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Get Data Subject Request by ID."""
     try:
@@ -203,8 +203,8 @@ async def get_dsr(
 async def update_dsr(
     request_id: str,
     dsr_update: DataSubjectRequestUpdate,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Update Data Subject Request status or notes."""
     try:
@@ -244,9 +244,9 @@ async def update_dsr(
 @router.post("/dsr/requests/{request_id}/verify-identity")
 async def verify_dsr_identity(
     request_id: str,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     verification_method: str = Query(..., description="email, phone, document"),
-    user=Depends(get_current_user),
+    current_user: CurrentUser = None,
 ):
     """Verify Data Subject identity."""
     try:
@@ -271,9 +271,9 @@ async def verify_dsr_identity(
 @router.post("/dsr/requests/{request_id}/search-systems")
 async def search_data_systems(
     request_id: str,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     systems: List[str] = Query(...),
-    user=Depends(get_current_user),
+    current_user: CurrentUser = None,
 ):
     """Search data systems for subject data."""
     try:
@@ -293,9 +293,9 @@ async def search_data_systems(
 @router.post("/dsr/requests/{request_id}/compile-data")
 async def compile_data_package(
     request_id: str,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     format_type: str = Query("json", description="json, csv, xml"),
-    user=Depends(get_current_user),
+    current_user: CurrentUser = None,
 ):
     """Compile data package for portability/access requests."""
     try:
@@ -314,8 +314,8 @@ async def compile_data_package(
 
 @router.post("/dsr/requests/{request_id}/deadline-alerts")
 async def get_deadline_alerts(
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ) -> List[DSRDeadlineAlert]:
     """Get DSR deadline compliance alerts."""
     try:
@@ -338,8 +338,8 @@ async def get_deadline_alerts(
 @router.post("/pia/assessments", response_model=PrivacyImpactAssessmentResponse, status_code=201)
 async def create_pia(
     pia: PrivacyImpactAssessmentCreate,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """
     Create Privacy Impact Assessment (DPIA/PIA).
@@ -369,8 +369,8 @@ async def create_pia(
 
 @router.get("/pia/assessments", response_model=List[PrivacyImpactAssessmentResponse])
 async def list_pias(
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     status: Optional[str] = None,
@@ -403,8 +403,8 @@ async def list_pias(
 @router.get("/pia/assessments/{assessment_id}", response_model=PrivacyImpactAssessmentResponse)
 async def get_pia(
     assessment_id: str,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Get Privacy Impact Assessment by ID."""
     try:
@@ -434,10 +434,10 @@ async def get_pia(
 @router.post("/pia/assessments/{assessment_id}/assess-risks")
 async def assess_pia_risks(
     assessment_id: str,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     data_subjects_count: int = Query(..., ge=0),
     processing_scope: str = Query(...),
-    user=Depends(get_current_user),
+    current_user: CurrentUser = None,
 ):
     """Assess risks to data subjects."""
     try:
@@ -459,8 +459,8 @@ async def assess_pia_risks(
 @router.post("/pia/assessments/{assessment_id}/mitigations")
 async def recommend_mitigations(
     assessment_id: str,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Get recommended mitigations for PIA."""
     try:
@@ -480,8 +480,8 @@ async def recommend_mitigations(
 @router.post("/pia/assessments/{assessment_id}/submit-dpo-review")
 async def submit_pia_for_dpo_review(
     assessment_id: str,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Submit PIA for Data Protection Officer review."""
     try:
@@ -511,8 +511,8 @@ async def submit_pia_for_dpo_review(
 @router.post("/consent/records", response_model=ConsentRecordResponse, status_code=201)
 async def create_consent_record(
     consent: ConsentRecordCreate,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """
     Record explicit consent per GDPR Article 7.
@@ -547,8 +547,8 @@ async def create_consent_record(
 @router.get("/consent/records/{subject_id}", response_model=List[ConsentRecordResponse])
 async def get_consent_records(
     subject_id: str,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Get all consent records for a data subject."""
     try:
@@ -572,8 +572,8 @@ async def get_consent_records(
 @router.post("/consent/records/{record_id}/withdraw")
 async def withdraw_consent(
     record_id: str,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Withdraw previously given consent (GDPR Article 7(3))."""
     try:
@@ -607,8 +607,8 @@ async def withdraw_consent(
 )
 async def create_processing_record(
     record: DataProcessingRecordCreate,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """
     Create Record of Processing Activities (ROPA) per GDPR Article 30.
@@ -636,8 +636,8 @@ async def create_processing_record(
     "/ropa/processing-records", response_model=List[DataProcessingRecordResponse]
 )
 async def list_processing_records(
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
 ):
@@ -665,8 +665,8 @@ async def list_processing_records(
 
 @router.post("/ropa/retention-violations", response_model=List[RetentionViolation])
 async def get_retention_violations(
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Check for data retention compliance violations."""
     try:
@@ -683,8 +683,8 @@ async def get_retention_violations(
 
 @router.get("/ropa/generate-ropa")
 async def generate_ropa(
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Generate complete ROPA document per GDPR Article 30."""
     try:
@@ -709,8 +709,8 @@ async def generate_ropa(
 )
 async def report_privacy_incident(
     incident: PrivacyIncidentCreate,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """
     Report privacy incident (data breach, processing violation, etc.).
@@ -746,8 +746,8 @@ async def report_privacy_incident(
 
 @router.get("/incidents/reports", response_model=List[PrivacyIncidentResponse])
 async def list_incidents(
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     status: Optional[str] = None,
@@ -782,8 +782,8 @@ async def list_incidents(
 )
 async def get_incident(
     incident_id: str,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Get privacy incident by ID."""
     try:
@@ -813,8 +813,8 @@ async def get_incident(
 @router.post("/incidents/reports/{incident_id}/notification-deadlines")
 async def get_notification_deadlines(
     incident_id: str,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Get regulatory notification deadlines for incident."""
     try:
@@ -834,8 +834,8 @@ async def get_notification_deadlines(
 @router.post("/incidents/reports/{incident_id}/mark-notified")
 async def mark_incident_notified(
     incident_id: str,
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Mark notifications as sent."""
     try:
@@ -864,8 +864,8 @@ async def mark_incident_notified(
 
 @router.get("/dashboard/stats", response_model=PrivacyDashboardStats)
 async def get_privacy_stats(
-    db: AsyncSession = Depends(get_db),
-    user=Depends(get_current_user),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Get privacy module dashboard statistics."""
     try:
@@ -933,7 +933,7 @@ async def get_privacy_stats(
 
 @router.post("/monitoring/trigger-dsr-deadline-check")
 async def trigger_dsr_deadline_check(
-    user=Depends(get_current_user),
+    current_user: CurrentUser = None,
 ):
     """Manually trigger DSR deadline monitoring task."""
     try:
@@ -949,7 +949,7 @@ async def trigger_dsr_deadline_check(
 
 @router.post("/monitoring/trigger-retention-check")
 async def trigger_retention_check(
-    user=Depends(get_current_user),
+    current_user: CurrentUser = None,
 ):
     """Manually trigger retention enforcement task."""
     try:
@@ -965,7 +965,7 @@ async def trigger_retention_check(
 
 @router.post("/monitoring/trigger-consent-expiry-check")
 async def trigger_consent_check(
-    user=Depends(get_current_user),
+    current_user: CurrentUser = None,
 ):
     """Manually trigger consent expiry check task."""
     try:
@@ -981,7 +981,7 @@ async def trigger_consent_check(
 
 @router.post("/monitoring/trigger-pia-review-reminder")
 async def trigger_pia_reminder(
-    user=Depends(get_current_user),
+    current_user: CurrentUser = None,
 ):
     """Manually trigger PIA review reminder task."""
     try:

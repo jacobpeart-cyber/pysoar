@@ -74,7 +74,7 @@ training_manager = TrainingManager()
 )
 async def create_template(
     request: PhishingTemplateCreateRequest,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user=Depends(get_current_active_user),
 ):
     """Create a new phishing template."""
@@ -119,7 +119,7 @@ async def create_template(
 
 @router.get("/templates", response_model=list[PhishingTemplateResponse])
 async def list_templates(
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     category: str | None = Query(None),
     difficulty: str | None = Query(None),
     skip: int = Query(0, ge=0),
@@ -154,7 +154,7 @@ async def list_templates(
 @router.get("/templates/{template_id}", response_model=PhishingTemplateResponse)
 async def get_template(
     template_id: UUID,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
 ):
     """Get a specific phishing template."""
     try:
@@ -182,7 +182,7 @@ async def get_template(
 async def update_template(
     template_id: UUID,
     request: PhishingTemplateUpdateRequest,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user=Depends(get_current_active_user),
 ):
     """Update a phishing template."""
@@ -217,7 +217,7 @@ async def update_template(
 async def render_template(
     template_id: UUID,
     target_data: dict[str, Any],
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
 ):
     """Render template with personalized target data."""
     try:
@@ -244,7 +244,7 @@ async def render_template(
 )
 async def validate_template(
     template_id: UUID,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
 ):
     """Validate template for rendering issues and broken links."""
     try:
@@ -271,7 +271,7 @@ async def validate_template(
 )
 async def get_template_effectiveness(
     template_id: UUID,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
 ):
     """Get historical effectiveness metrics for a template."""
     try:
@@ -299,7 +299,7 @@ async def get_template_effectiveness(
 )
 async def create_target_group(
     request: TargetGroupCreateRequest,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user=Depends(get_current_active_user),
 ):
     """Create a new target group."""
@@ -332,7 +332,7 @@ async def create_target_group(
 
 @router.get("/target-groups", response_model=list[TargetGroupResponse])
 async def list_target_groups(
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     department: str | None = Query(None),
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
@@ -353,7 +353,7 @@ async def list_target_groups(
 @router.get("/target-groups/{group_id}", response_model=TargetGroupResponse)
 async def get_target_group(
     group_id: UUID,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
 ):
     """Get a specific target group."""
     try:
@@ -374,7 +374,7 @@ async def get_target_group(
 async def update_target_group(
     group_id: UUID,
     request: TargetGroupUpdateRequest,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user=Depends(get_current_active_user),
 ):
     """Update a target group."""
@@ -400,7 +400,7 @@ async def update_target_group(
 @router.delete("/target-groups/{group_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_target_group(
     group_id: UUID,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user=Depends(get_current_active_user),
 ):
     """Delete a target group."""
@@ -435,7 +435,7 @@ async def delete_target_group(
 )
 async def create_campaign(
     request: PhishingCampaignCreateRequest,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user=Depends(get_current_active_user),
 ):
     """Create a new phishing campaign in draft status."""
@@ -472,7 +472,7 @@ async def create_campaign(
 
 @router.get("/campaigns", response_model=list[PhishingCampaignResponse])
 async def list_campaigns(
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     status_filter: str | None = Query(None, alias="status"),
     campaign_type: str | None = Query(None),
     skip: int = Query(0, ge=0),
@@ -510,7 +510,7 @@ async def list_campaigns(
 @router.get("/campaigns/{campaign_id}", response_model=CampaignDetailResponse)
 async def get_campaign(
     campaign_id: UUID,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
 ):
     """Get campaign details with current metrics."""
     try:
@@ -542,7 +542,7 @@ async def get_campaign(
 async def update_campaign(
     campaign_id: UUID,
     request: PhishingCampaignUpdateRequest,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user=Depends(get_current_active_user),
 ):
     """Update campaign configuration (only in draft status)."""
@@ -585,7 +585,7 @@ async def update_campaign(
 async def launch_campaign(
     campaign_id: UUID,
     request: CampaignLaunchRequest,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user=Depends(get_current_active_user),
 ):
     """Launch a campaign - begin email distribution."""
@@ -613,7 +613,7 @@ async def launch_campaign(
 @router.post("/campaigns/{campaign_id}/pause", response_model=list[str, Any])
 async def pause_campaign(
     campaign_id: UUID,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user=Depends(get_current_active_user),
 ):
     """Pause an active campaign."""
@@ -635,7 +635,7 @@ async def pause_campaign(
 @router.post("/campaigns/{campaign_id}/resume", response_model=list[str, Any])
 async def resume_campaign(
     campaign_id: UUID,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user=Depends(get_current_active_user),
 ):
     """Resume a paused campaign."""
@@ -657,7 +657,7 @@ async def resume_campaign(
 @router.post("/campaigns/{campaign_id}/end", response_model=list[str, Any])
 async def end_campaign(
     campaign_id: UUID,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user=Depends(get_current_active_user),
 ):
     """End a campaign and calculate final metrics."""
@@ -679,7 +679,7 @@ async def end_campaign(
 @router.post("/campaigns/{campaign_id}/clone", response_model=PhishingCampaignResponse)
 async def clone_campaign(
     campaign_id: UUID,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     new_name: str = Query(...),
     current_user=Depends(get_current_active_user),
 ):
@@ -710,7 +710,7 @@ async def clone_campaign(
 async def schedule_campaign(
     campaign_id: UUID,
     request: CampaignScheduleRequest,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     current_user=Depends(get_current_active_user),
 ):
     """Schedule a campaign to launch at specific time."""
@@ -738,7 +738,7 @@ async def schedule_campaign(
 @router.get("/campaigns/{campaign_id}/results", response_model=list[str, Any])
 async def get_campaign_results(
     campaign_id: UUID,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
 ):
     """Get current campaign results and metrics."""
     try:
@@ -767,7 +767,7 @@ async def get_campaign_results(
 async def record_event(
     campaign_id: UUID,
     request: CampaignEventCreateRequest,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
 ):
     """Record a campaign event (email open, link click, credential submission, etc.)."""
     try:
@@ -804,7 +804,7 @@ async def record_event(
 @router.get("/campaigns/{campaign_id}/events", response_model=list[CampaignEventResponse])
 async def list_campaign_events(
     campaign_id: UUID,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     event_type: str | None = Query(None),
     target_email: str | None = Query(None),
     skip: int = Query(0, ge=0),
@@ -834,7 +834,7 @@ async def list_campaign_events(
 @router.get("/campaigns/{campaign_id}/events/timeline", response_model=list[dict[str, Any]])
 async def get_event_timeline(
     campaign_id: UUID,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     target_email: str | None = Query(None),
 ):
     """Get event timeline for campaign or specific target."""
@@ -862,7 +862,7 @@ async def get_event_timeline(
 )
 async def get_user_awareness_score(
     user_email: str,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
 ):
     """Get security awareness score for a user."""
     try:
@@ -890,7 +890,7 @@ async def get_user_awareness_score(
 async def calculate_user_score(
     user_email: str,
     request: UserScoreCalculationRequest,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     user_name: str = Query(...),
     department: str | None = Query(None),
 ):
@@ -925,7 +925,7 @@ async def calculate_user_score(
 @router.get("/awareness-scores/department/{department}", response_model=list[str, Any])
 async def get_department_scores(
     department: str,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
 ):
     """Get aggregated scores for a department."""
     try:
@@ -943,7 +943,7 @@ async def get_department_scores(
 
 @router.get("/awareness-scores/high-risk", response_model=list[SecurityAwarenessScoreResponse])
 async def get_high_risk_users(
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     threshold: int = Query(40, ge=0, le=100),
 ):
     """Identify users with awareness scores below threshold."""
@@ -966,7 +966,7 @@ async def get_high_risk_users(
 
 
 @router.get("/training/modules", response_model=list[TrainingModuleResponse])
-async def list_training_modules(db: AsyncSession = Depends(get_db)):
+async def list_training_modules(db: DatabaseSession = None):
     """Get available training modules."""
     try:
         modules = [
@@ -994,7 +994,7 @@ async def list_training_modules(db: AsyncSession = Depends(get_db)):
 async def assign_training(
     user_email: str,
     request: TrainingAssignmentRequest,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     user_name: str = Query(...),
     current_user=Depends(get_current_active_user),
 ):
@@ -1029,7 +1029,7 @@ async def assign_training(
 async def track_training_completion(
     user_email: str,
     request: TrainingCompletionRequest,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
 ):
     """Track training module completion."""
     try:
@@ -1060,7 +1060,7 @@ async def track_training_completion(
 )
 async def generate_certificate(
     user_email: str,
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
     training_module: str = Query(...),
     user_name: str = Query(...),
 ):
@@ -1090,7 +1090,7 @@ async def generate_certificate(
 
 @router.get("/dashboard", response_model=DashboardResponse)
 async def get_dashboard(
-    db: AsyncSession = Depends(get_db),
+    db: DatabaseSession = None,
 ):
     """Get comprehensive phishing simulation dashboard."""
     try:
@@ -1162,7 +1162,7 @@ async def get_dashboard(
 
 
 @router.get("/reports/risk", response_model=list[str, Any])
-async def get_risk_report(db: AsyncSession = Depends(get_db)):
+async def get_risk_report(db: DatabaseSession = None):
     """Generate comprehensive risk assessment report."""
     try:
         report = awareness_scorer.generate_risk_report()
