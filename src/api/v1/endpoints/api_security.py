@@ -890,12 +890,7 @@ async def trigger_api_discovery(
 
 
 @router.post("/scan/security/{endpoint_id}", response_model=APIScanResultResponse)
-async def trigger_security_scan(
-    endpoint_id: str,
-    current_user: CurrentUser = None,
-    db: DatabaseSession = None,
-    background_tasks: BackgroundTasks,
-):
+async def trigger_security_scan(endpoint_id: str, current_user: CurrentUser = None, db: DatabaseSession = None, background_tasks: BackgroundTasks = None):
     """Trigger security assessment for endpoint"""
     background_tasks.add_task(
         security_assessment,
@@ -915,12 +910,7 @@ async def trigger_security_scan(
 
 
 @router.post("/scan/compliance/{endpoint_id}")
-async def trigger_compliance_check(
-    endpoint_id: str,
-    current_user: CurrentUser = None,
-    db: DatabaseSession = None,
-    background_tasks: BackgroundTasks,
-):
+async def trigger_compliance_check(endpoint_id: str, current_user: CurrentUser = None, db: DatabaseSession = None, background_tasks: BackgroundTasks = None):
     """Trigger compliance checks for endpoint"""
     background_tasks.add_task(
         compliance_check,

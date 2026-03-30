@@ -409,12 +409,7 @@ async def update_finding(
 
 
 @router.post("/findings/bulk-action")
-async def bulk_finding_action(
-    action: BulkFindingAction,
-    current_user: CurrentUser = None,
-    db: DatabaseSession = None,
-    background_tasks: BackgroundTasks,
-):
+async def bulk_finding_action(action: BulkFindingAction, current_user: CurrentUser = None, db: DatabaseSession = None, background_tasks: BackgroundTasks = None):
     """Perform bulk actions on findings"""
     # Verify ownership
     result = await db.execute(

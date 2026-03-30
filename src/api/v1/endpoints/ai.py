@@ -54,7 +54,7 @@ router = APIRouter(prefix="/ai", tags=["ai"])
 # Natural Language Query Endpoints
 
 @router.post("/query", response_model=NLQueryResponse, summary="Natural language query")
-async def natural_language_query(request: NLQueryRequest, current_user: CurrentUser):
+async def natural_language_query(request: NLQueryRequest, current_user: CurrentUser = None):
     """
     Process natural language security query.
 
@@ -116,7 +116,7 @@ async def query_history(
 # Alert Triage Endpoints
 
 @router.post("/triage/alert/{alert_id}", response_model=AlertTriageResponse, summary="Triage single alert")
-async def triage_single_alert(alert_id: str, request: AlertTriageRequest, current_user: CurrentUser):
+async def triage_single_alert(alert_id: str, request: AlertTriageRequest, current_user: CurrentUser = None):
     """
     AI triage for a single alert.
 
@@ -155,7 +155,7 @@ async def triage_single_alert(alert_id: str, request: AlertTriageRequest, curren
 
 
 @router.post("/triage/batch", response_model=BatchTriageResponse, summary="Batch triage alerts")
-async def batch_triage_alerts(request: BatchTriageRequest, current_user: CurrentUser):
+async def batch_triage_alerts(request: BatchTriageRequest, current_user: CurrentUser = None):
     """
     Batch triage of multiple alerts.
 
@@ -211,7 +211,7 @@ async def batch_triage_alerts(request: BatchTriageRequest, current_user: Current
 
 
 @router.get("/triage/stats", response_model=TriageStatsResponse, summary="Triage statistics")
-async def triage_statistics(current_user: CurrentUser):
+async def triage_statistics(current_user: CurrentUser = None):
     """
     Get alert triage performance statistics.
 
@@ -229,7 +229,7 @@ async def triage_statistics(current_user: CurrentUser):
 # Incident Analysis Endpoints
 
 @router.post("/analyze/incident/{incident_id}", response_model=IncidentAnalysisResponse, summary="Analyze incident")
-async def analyze_incident(incident_id: str, request: IncidentAnalysisRequest, current_user: CurrentUser):
+async def analyze_incident(incident_id: str, request: IncidentAnalysisRequest, current_user: CurrentUser = None):
     """
     Full AI analysis of an incident.
 
@@ -270,7 +270,7 @@ async def analyze_incident(incident_id: str, request: IncidentAnalysisRequest, c
 
 
 @router.post("/analyze/root-cause/{incident_id}", response_model=RootCauseAnalysis, summary="Root cause analysis")
-async def analyze_root_cause(incident_id: str, current_user: CurrentUser):
+async def analyze_root_cause(incident_id: str, current_user: CurrentUser = None):
     """
     Determine root cause of incident using evidence analysis.
 
@@ -303,7 +303,7 @@ async def analyze_root_cause(incident_id: str, current_user: CurrentUser):
 
 
 @router.post("/recommend/response/{incident_id}", response_model=ResponseRecommendation, summary="Response recommendations")
-async def recommend_response(incident_id: str, request: ResponseRecommendationRequest, current_user: CurrentUser):
+async def recommend_response(incident_id: str, request: ResponseRecommendationRequest, current_user: CurrentUser = None):
     """
     Get incident response recommendations.
 
@@ -333,7 +333,7 @@ async def recommend_response(incident_id: str, request: ResponseRecommendationRe
 
 
 @router.post("/generate/playbook", response_model=dict, summary="Generate playbook")
-async def generate_playbook(incident_pattern: str, limit: int = 5, current_user: CurrentUser):
+async def generate_playbook(incident_pattern: str, current_user: CurrentUser = None, limit: int = 5):
     """
     Generate incident response playbook from pattern.
 
@@ -396,7 +396,7 @@ async def list_anomalies(
 
 
 @router.get("/anomalies/{anomaly_id}", response_model=AnomalyDetectionResponse, summary="Get anomaly")
-async def get_anomaly(anomaly_id: str, current_user: CurrentUser):
+async def get_anomaly(anomaly_id: str, current_user: CurrentUser = None):
     """Get detailed anomaly information."""
     logger.info(f"Fetching anomaly {anomaly_id}")
 
@@ -417,7 +417,7 @@ async def get_anomaly(anomaly_id: str, current_user: CurrentUser):
 
 
 @router.post("/anomalies/{anomaly_id}/feedback", summary="Provide anomaly feedback")
-async def submit_anomaly_feedback(anomaly_id: str, feedback: AnomalyFeedback, current_user: CurrentUser):
+async def submit_anomaly_feedback(anomaly_id: str, feedback: AnomalyFeedback, current_user: CurrentUser = None):
     """
     Submit analyst feedback on anomaly.
 
@@ -429,7 +429,7 @@ async def submit_anomaly_feedback(anomaly_id: str, feedback: AnomalyFeedback, cu
 
 
 @router.get("/anomalies/stats", response_model=AnomalyStatsResponse, summary="Anomaly statistics")
-async def anomaly_statistics(current_user: CurrentUser):
+async def anomaly_statistics(current_user: CurrentUser = None):
     """Get anomaly detection statistics."""
     return AnomalyStatsResponse(
         total_detected=847,
@@ -485,7 +485,7 @@ async def list_threat_predictions(
 
 
 @router.post("/predictions/entity/{entity_id}", response_model=ThreatPredictionResponse, summary="Predict entity threat")
-async def predict_entity_threat(entity_id: str, request: ThreatPredictionRequest, current_user: CurrentUser):
+async def predict_entity_threat(entity_id: str, request: ThreatPredictionRequest, current_user: CurrentUser = None):
     """
     Predict threat probability for entity.
 
@@ -520,7 +520,7 @@ async def predict_entity_threat(entity_id: str, request: ThreatPredictionRequest
 
 
 @router.get("/predictions/dashboard", response_model=PredictionDashboard, summary="Prediction dashboard")
-async def prediction_dashboard(current_user: CurrentUser):
+async def prediction_dashboard(current_user: CurrentUser = None):
     """Get threat prediction dashboard data."""
     return PredictionDashboard(
         active_predictions=247,
@@ -542,7 +542,7 @@ async def prediction_dashboard(current_user: CurrentUser):
 # ML Model Endpoints
 
 @router.get("/models", response_model=list[MLModelResponse], summary="List ML models")
-async def list_models(current_user: CurrentUser):
+async def list_models(current_user: CurrentUser = None):
     """List all ML models."""
     logger.info("Listing ML models")
 
@@ -570,7 +570,7 @@ async def list_models(current_user: CurrentUser):
 
 
 @router.post("/models/train", response_model=dict, summary="Train ML model")
-async def train_model(request: ModelTrainingRequest, current_user: CurrentUser):
+async def train_model(request: ModelTrainingRequest, current_user: CurrentUser = None):
     """
     Trigger ML model training.
 
@@ -603,7 +603,7 @@ async def train_model(request: ModelTrainingRequest, current_user: CurrentUser):
 
 
 @router.get("/models/{model_id}", response_model=MLModelResponse, summary="Get model details")
-async def get_model(model_id: str, current_user: CurrentUser):
+async def get_model(model_id: str, current_user: CurrentUser = None):
     """Get ML model details and metrics."""
     logger.info(f"Fetching model {model_id}")
 
@@ -634,7 +634,7 @@ async def get_model(model_id: str, current_user: CurrentUser):
 
 
 @router.get("/models/{model_id}/drift", response_model=ModelDriftResponse, summary="Check model drift")
-async def check_model_drift(model_id: str, current_user: CurrentUser):
+async def check_model_drift(model_id: str, current_user: CurrentUser = None):
     """Check for model drift in deployed model."""
     logger.info(f"Checking drift for model {model_id}")
 
@@ -653,7 +653,7 @@ async def check_model_drift(model_id: str, current_user: CurrentUser):
 
 
 @router.delete("/models/{model_id}", summary="Retire model")
-async def retire_model(model_id: str, current_user: CurrentUser):
+async def retire_model(model_id: str, current_user: CurrentUser = None):
     """Retire ML model from service."""
     logger.info(f"Retiring model {model_id}")
 
@@ -663,7 +663,7 @@ async def retire_model(model_id: str, current_user: CurrentUser):
 # AI Feedback Endpoint
 
 @router.post("/feedback", summary="Submit AI feedback")
-async def submit_ai_feedback(feedback: AIFeedbackRequest, current_user: CurrentUser):
+async def submit_ai_feedback(feedback: AIFeedbackRequest, current_user: CurrentUser = None):
     """
     Submit feedback on AI analysis results.
 
@@ -677,7 +677,7 @@ async def submit_ai_feedback(feedback: AIFeedbackRequest, current_user: CurrentU
 # Dashboard Endpoint
 
 @router.get("/dashboard", response_model=AIDashboardResponse, summary="AI engine dashboard")
-async def ai_dashboard(current_user: CurrentUser):
+async def ai_dashboard(current_user: CurrentUser = None):
     """
     Get AI engine dashboard statistics.
 

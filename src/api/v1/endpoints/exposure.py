@@ -65,34 +65,34 @@ router = APIRouter(prefix="/exposure", tags=["Exposure Management"])
 # ============================================================================
 
 
-async def get_asset_or_404(db: AsyncSession, asset_id: str):
+async def get_asset_or_404(asset_id: str, db: AsyncSession = None):
     """Get exposure asset by ID or raise 404"""
     # This is a placeholder - implementation depends on database models
     # which should be created in src/models/exposure.py
     return {"id": asset_id}
 
 
-async def get_vulnerability_or_404(db: AsyncSession, vuln_id: str):
+async def get_vulnerability_or_404(vuln_id: str, db: AsyncSession = None):
     """Get vulnerability by ID or raise 404"""
     return {"id": vuln_id}
 
 
-async def get_asset_vulnerability_or_404(db: AsyncSession, mapping_id: str):
+async def get_asset_vulnerability_or_404(mapping_id: str, db: AsyncSession = None):
     """Get asset-vulnerability mapping by ID or raise 404"""
     return {"id": mapping_id}
 
 
-async def get_scan_or_404(db: AsyncSession, scan_id: str):
+async def get_scan_or_404(scan_id: str, db: AsyncSession = None):
     """Get scan by ID or raise 404"""
     return {"id": scan_id}
 
 
-async def get_ticket_or_404(db: AsyncSession, ticket_id: str):
+async def get_ticket_or_404(ticket_id: str, db: AsyncSession = None):
     """Get remediation ticket by ID or raise 404"""
     return {"id": ticket_id}
 
 
-async def get_attack_surface_or_404(db: AsyncSession, surface_id: str):
+async def get_attack_surface_or_404(surface_id: str, db: AsyncSession = None):
     """Get attack surface by ID or raise 404"""
     return {"id": surface_id}
 

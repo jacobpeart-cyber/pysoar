@@ -122,12 +122,7 @@ async def list_alerts(
 
 
 @router.post("", response_model=AlertResponse, status_code=status.HTTP_201_CREATED)
-async def create_alert(
-    alert_data: AlertCreate,
-    current_user: CurrentUser = None,
-    db: DatabaseSession = None,
-    background_tasks: BackgroundTasks,
-):
+async def create_alert(alert_data: AlertCreate, current_user: CurrentUser = None, db: DatabaseSession = None, background_tasks: BackgroundTasks = None):
     """Create a new alert"""
     alert = Alert(
         title=alert_data.title,
