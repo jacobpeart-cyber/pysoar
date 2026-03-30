@@ -30,7 +30,7 @@ logger = get_logger(__name__)
 
 
 # Create async session factory for tasks
-engine = create_async_engine(settings.DATABASE_URL, echo=False)
+engine = create_async_engine(settings.database_url, echo=False)
 AsyncSessionLocal = sessionmaker(
     engine, class_=AsyncSession, expire_on_commit=False
 )
