@@ -222,6 +222,92 @@ async def seed():
             )
             db.add(asset)
 
+        # Seed SIEM Log Entries
+        print("  Creating SIEM log entries...")
+        from src.siem.models import LogEntry, DetectionRule, SIEMDataSource
+
+        siem_logs = [
+            ("Failed SSH login from 192.168.1.100", "syslog", "fw-edge-01", "10.0.0.1", "authentication", "high"),
+            ("Successful RDP session from 10.0.5.20", "windows_event", "dc01.corp.local", "10.0.1.10", "authentication", "informational"),
+            ("DNS query to known C2 domain evil.com", "syslog", "dns-resolver-01", "10.0.0.2", "network", "critical"),
+            ("Firewall blocked inbound scan on port 445", "cef", "fw-edge-01", "10.0.0.1", "network", "medium"),
+            ("User account locked after 5 failed attempts", "windows_event", "dc01.corp.local", "10.0.1.10", "security", "high"),
+            ("AWS CloudTrail: S3 bucket policy changed", "cloud_trail", "aws-us-east-1", "172.16.0.1", "cloud", "high"),
+            ("Antivirus quarantined file on WORKSTATION-42", "json_api", "edr-console", "10.0.10.5", "endpoint", "medium"),
+            ("Apache access log: SQL injection attempt", "syslog", "web-prod-01", "10.0.2.20", "application", "critical"),
+            ("VPN connection established from remote IP", "syslog", "vpn-gateway", "10.0.0.5", "network", "low"),
+            ("Exchange: Suspicious mail forwarding rule created", "json_api", "exchange-01", "10.0.1.15", "application", "high"),
+            ("Linux audit: sudo command by non-admin user", "syslog", "db-prod-01", "10.0.3.30", "system", "medium"),
+            ("IDS alert: Port scan detected from external IP", "cef", "ids-sensor-01", "10.0.0.3", "security", "high"),
+            ("Container runtime: Privilege escalation attempt", "json_api", "k8s-node-01", "10.0.4.10", "endpoint", "critical"),
+            ("Azure AD: Impossible travel login detected", "cloud_trail", "azure-ad", "172.16.0.2", "authentication", "high"),
+            ("Proxy: Connection to TOR exit node blocked", "syslog", "proxy-01", "10.0.0.4", "network", "medium"),
+        ]
+
+        for raw_log, source_type, source_name, source_ip, log_type, severity in siem_logs:
+            log_entry = LogEntry(
+                id=str(uuid.uuid4()),
+                raw_log=raw_log,
+                message=raw_log,
+                source_type=source_type,
+                source_name=source_name,
+                source_ip=source_ip,
+                log_type=log_type,
+                severity=severity,
+                timestamp=rand_date(7).isoformat(),
+                received_at=datetime.now(timezone.utc).isoformat(),
+                created_at=rand_date(7),
+                updated_at=datetime.now(timezone.utc),
+            )
+            db.add(log_entry)
+
+        # Seed Detection Rules
+        print("  Creating SIEM detection rules...")
+        detection_rules = [
+            ("Brute Force SSH", "brute-force-ssh", "Detect multiple failed SSH logins", "high", True),
+            ("DNS to C2 Domain", "dns-c2-detection", "Alert on DNS queries to known C2 domains", "critical", True),
+            ("Port Scan Detection", "port-scan-detect", "Detect horizontal port scanning", "medium", True),
+            ("Privilege Escalation", "priv-esc-detect", "Detect privilege escalation attempts", "critical", True),
+            ("Data Exfiltration", "data-exfil-detect", "Large outbound data transfers", "high", True),
+            ("Suspicious Login Hours", "off-hours-login", "Login outside business hours", "low", False),
+        ]
+
+        for title, name, desc, severity, enabled in detection_rules:
+            rule = DetectionRule(
+                id=str(uuid.uuid4()),
+                title=title,
+                name=name,
+                description=desc,
+                severity=severity,
+                enabled=enabled,
+                match_count=random.randint(0, 50),
+                created_at=rand_date(60),
+                updated_at=datetime.now(timezone.utc),
+            )
+            db.add(rule)
+
+        # Seed Data Sources
+        print("  Creating SIEM data sources...")
+        data_sources = [
+            ("Edge Firewall", "Palo Alto PA-5250 edge firewall", "syslog", "connected"),
+            ("Domain Controller", "Windows Server 2022 AD DC", "windows_event", "connected"),
+            ("AWS CloudTrail", "AWS account us-east-1 CloudTrail", "cloud_trail", "connected"),
+            ("EDR Console", "CrowdStrike Falcon EDR", "json_api", "connected"),
+            ("IDS Sensor", "Suricata IDS network sensor", "cef", "connected"),
+        ]
+
+        for name, desc, source_type, ds_status in data_sources:
+            source = SIEMDataSource(
+                id=str(uuid.uuid4()),
+                name=name,
+                description=desc,
+                source_type=source_type,
+                status=ds_status,
+                created_at=rand_date(90),
+                updated_at=datetime.now(timezone.utc),
+            )
+            db.add(source)
+
         await db.commit()
         print("Demo data seeded successfully!")
         print(f"  - {len(ALERT_DATA)} alerts")
@@ -229,6 +315,9 @@ async def seed():
         print(f"  - {len(IOC_DATA)} IOCs")
         print(f"  - {len(PLAYBOOK_DATA)} playbooks")
         print(f"  - {len(ASSET_DATA)} assets")
+        print(f"  - {len(siem_logs)} SIEM log entries")
+        print(f"  - {len(detection_rules)} detection rules")
+        print(f"  - {len(data_sources)} data sources")
 
 
 if __name__ == "__main__":
