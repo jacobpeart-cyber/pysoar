@@ -68,6 +68,8 @@ export default function SIEMDashboard() {
   const [ruleStatusFilter, setRuleStatusFilter] = useState('');
   const [selectedRule, setSelectedRule] = useState<any>(null);
   const [selectedSource, setSelectedSource] = useState<any>(null);
+  const [sourceModalMode, setSourceModalMode] = useState<'view' | 'config' | 'add'>('view');
+  const [newSourceForm, setNewSourceForm] = useState({ name: '', description: '', source_type: 'syslog' });
 
   // Fetch dashboard stats
   const { data: stats, isLoading: statsLoading } = useQuery({
@@ -752,7 +754,10 @@ export default function SIEMDashboard() {
       {/* Data Sources Tab */}
       {activeTab === 'sources' && (
         <div className="space-y-6">
-          <button className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700">
+          <button
+            onClick={() => { setSourceModalMode('add'); setSelectedSource({}); setNewSourceForm({ name: '', description: '', source_type: 'syslog' }); }}
+            className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+          >
             <Plus className="w-5 h-5" />
             Add Data Source
           </button>
@@ -833,13 +838,13 @@ export default function SIEMDashboard() {
 
                   <div className="mt-4 flex gap-2">
                     <button
-                      onClick={() => setSelectedSource(source)}
+                      onClick={() => { setSourceModalMode('config'); setSelectedSource(source); setNewSourceForm({ name: source.name, description: source.description || '', source_type: source.source_type || 'syslog' }); }}
                       className="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-sm font-medium text-gray-700 hover:bg-gray-50"
                     >
                       Config
                     </button>
                     <button
-                      onClick={() => setSelectedSource(source)}
+                      onClick={() => { setSourceModalMode('view'); setSelectedSource(source); }}
                       className="flex-1 px-3 py-2 bg-blue-50 text-blue-600 rounded-lg text-sm font-medium hover:bg-blue-100"
                     >
                       View
@@ -849,92 +854,159 @@ export default function SIEMDashboard() {
               ))}
             </div>
 
-            {/* Source Detail/Config Modal */}
+            {/* Source Modal - View / Config / Add */}
             {selectedSource && (
               <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50">
                 <div className="bg-white rounded-lg shadow-xl w-full max-w-2xl mx-4 max-h-[80vh] overflow-y-auto">
                   <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200 sticky top-0 bg-white">
-                    <h2 className="text-lg font-semibold text-gray-900">Data Source: {selectedSource.name}</h2>
-                    <button onClick={() => setSelectedSource(null)} className="text-gray-400 hover:text-gray-600">
-                      ✕
-                    </button>
+                    <h2 className="text-lg font-semibold text-gray-900">
+                      {sourceModalMode === 'add' ? 'Add Data Source' : sourceModalMode === 'config' ? 'Configure Source' : 'Data Source Details'}
+                    </h2>
+                    <button onClick={() => setSelectedSource(null)} className="text-gray-400 hover:text-gray-600">✕</button>
                   </div>
-                  <div className="p-6 space-y-6">
-                    <div className="grid grid-cols-2 gap-4">
-                      <div>
-                        <label className="block text-sm font-medium text-gray-500 mb-1">Name</label>
-                        <p className="text-gray-900 font-medium">{selectedSource.name}</p>
-                      </div>
-                      <div>
-                        <label className="block text-sm font-medium text-gray-500 mb-1">Type</label>
-                        <p className="text-gray-900">{selectedSource.source_type || selectedSource.type}</p>
-                      </div>
-                      <div>
-                        <label className="block text-sm font-medium text-gray-500 mb-1">Status</label>
-                        <span className={clsx('px-2 py-1 text-xs font-medium rounded-full', selectedSource.enabled !== false ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-700')}>
-                          {selectedSource.enabled !== false ? 'Connected' : 'Disabled'}
-                        </span>
-                      </div>
-                      <div>
-                        <label className="block text-sm font-medium text-gray-500 mb-1">Events Today</label>
-                        <p className="text-gray-900">{selectedSource.events_today || 0}</p>
-                      </div>
-                    </div>
-                    {selectedSource.description && (
-                      <div>
-                        <label className="block text-sm font-medium text-gray-500 mb-1">Description</label>
-                        <p className="text-gray-900 text-sm">{selectedSource.description}</p>
-                      </div>
-                    )}
-                    <div>
-                      <label className="block text-sm font-medium text-gray-500 mb-1">Created</label>
-                      <p className="text-gray-900 text-sm">{selectedSource.created_at ? new Date(selectedSource.created_at).toLocaleString() : '-'}</p>
-                    </div>
-                    {selectedSource.last_error && (
-                      <div>
-                        <label className="block text-sm font-medium text-gray-500 mb-1">Last Error</label>
-                        <p className="text-red-600 text-sm bg-red-50 p-3 rounded">{selectedSource.last_error}</p>
-                      </div>
-                    )}
-                    <div className="border-t pt-4">
-                      <h3 className="text-sm font-semibold text-gray-900 mb-3">Configuration</h3>
-                      <div className="bg-gray-50 rounded-lg p-4">
-                        <div className="grid grid-cols-2 gap-3 text-sm">
+                  <div className="p-6 space-y-5">
+                    {/* Add / Config Mode - Editable Form */}
+                    {(sourceModalMode === 'add' || sourceModalMode === 'config') ? (
+                      <>
+                        <div>
+                          <label className="block text-sm font-medium text-gray-700 mb-1">Source Name *</label>
+                          <input
+                            type="text"
+                            value={newSourceForm.name}
+                            onChange={(e) => setNewSourceForm({ ...newSourceForm, name: e.target.value })}
+                            className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                            placeholder="e.g., Edge Firewall"
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-sm font-medium text-gray-700 mb-1">Description</label>
+                          <textarea
+                            value={newSourceForm.description}
+                            onChange={(e) => setNewSourceForm({ ...newSourceForm, description: e.target.value })}
+                            className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                            rows={3}
+                            placeholder="Describe this data source..."
+                          />
+                        </div>
+                        <div>
+                          <label className="block text-sm font-medium text-gray-700 mb-1">Source Type *</label>
+                          <select
+                            value={newSourceForm.source_type}
+                            onChange={(e) => setNewSourceForm({ ...newSourceForm, source_type: e.target.value })}
+                            className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+                          >
+                            <option value="syslog">Syslog</option>
+                            <option value="json_api">JSON API</option>
+                            <option value="cef">CEF</option>
+                            <option value="leef">LEEF</option>
+                            <option value="windows_event">Windows Event</option>
+                            <option value="cloud_trail">Cloud Trail</option>
+                            <option value="custom">Custom</option>
+                          </select>
+                        </div>
+                        {sourceModalMode === 'config' && selectedSource.id && (
+                          <div className="border-t pt-4">
+                            <div className="flex items-center justify-between">
+                              <span className="text-sm text-gray-600">Enabled</span>
+                              <button
+                                onClick={async () => {
+                                  try {
+                                    await api.put(`/siem/sources/${selectedSource.id}`, { enabled: !selectedSource.enabled });
+                                    setSelectedSource({ ...selectedSource, enabled: !selectedSource.enabled });
+                                  } catch {}
+                                }}
+                                className={clsx('px-3 py-1 rounded-full text-xs font-medium', selectedSource.enabled !== false ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-600')}
+                              >
+                                {selectedSource.enabled !== false ? 'Enabled' : 'Disabled'}
+                              </button>
+                            </div>
+                          </div>
+                        )}
+                        <div className="flex gap-3 pt-2 border-t">
+                          <button
+                            onClick={async () => {
+                              try {
+                                if (sourceModalMode === 'add') {
+                                  await api.post('/siem/sources', newSourceForm);
+                                } else {
+                                  await api.put(`/siem/sources/${selectedSource.id}`, newSourceForm);
+                                }
+                                setSelectedSource(null);
+                                window.location.reload();
+                              } catch {}
+                            }}
+                            disabled={!newSourceForm.name}
+                            className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50"
+                          >
+                            {sourceModalMode === 'add' ? 'Create Source' : 'Save Changes'}
+                          </button>
+                          <button onClick={() => setSelectedSource(null)} className="flex-1 px-4 py-2 bg-gray-100 text-gray-700 rounded-lg text-sm font-medium hover:bg-gray-200">
+                            Cancel
+                          </button>
+                        </div>
+                      </>
+                    ) : (
+                      /* View Mode - Read Only */
+                      <>
+                        <div className="grid grid-cols-2 gap-4">
                           <div>
-                            <span className="text-gray-500">Source ID:</span>
-                            <span className="ml-2 font-mono text-gray-700">{selectedSource.id}</span>
+                            <label className="block text-sm font-medium text-gray-500 mb-1">Name</label>
+                            <p className="text-gray-900 font-medium">{selectedSource.name}</p>
                           </div>
                           <div>
-                            <span className="text-gray-500">Error Count:</span>
-                            <span className="ml-2 text-gray-700">{selectedSource.error_count || 0}</span>
+                            <label className="block text-sm font-medium text-gray-500 mb-1">Type</label>
+                            <p className="text-gray-900">{selectedSource.source_type}</p>
+                          </div>
+                          <div>
+                            <label className="block text-sm font-medium text-gray-500 mb-1">Status</label>
+                            <span className={clsx('px-2 py-1 text-xs font-medium rounded-full', selectedSource.enabled !== false ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-700')}>
+                              {selectedSource.enabled !== false ? 'Connected' : 'Disabled'}
+                            </span>
+                          </div>
+                          <div>
+                            <label className="block text-sm font-medium text-gray-500 mb-1">Events Today</label>
+                            <p className="text-gray-900">{selectedSource.events_today || 0}</p>
                           </div>
                         </div>
-                      </div>
-                    </div>
-                    <div className="flex gap-3 pt-2">
-                      <button
-                        onClick={async () => {
-                          try {
-                            await api.put(`/siem/sources/${selectedSource.id}`, { enabled: !selectedSource.enabled });
-                            setSelectedSource(null);
-                          } catch {}
-                        }}
-                        className={clsx(
-                          'flex-1 px-4 py-2 rounded-lg text-sm font-medium',
-                          selectedSource.enabled !== false
-                            ? 'bg-red-50 text-red-600 hover:bg-red-100'
-                            : 'bg-green-50 text-green-600 hover:bg-green-100'
+                        {selectedSource.description && (
+                          <div>
+                            <label className="block text-sm font-medium text-gray-500 mb-1">Description</label>
+                            <p className="text-gray-900 text-sm">{selectedSource.description}</p>
+                          </div>
                         )}
-                      >
-                        {selectedSource.enabled !== false ? 'Disable Source' : 'Enable Source'}
-                      </button>
-                      <button
-                        onClick={() => setSelectedSource(null)}
-                        className="flex-1 px-4 py-2 bg-gray-100 text-gray-700 rounded-lg text-sm font-medium hover:bg-gray-200"
-                      >
-                        Close
-                      </button>
-                    </div>
+                        <div className="grid grid-cols-2 gap-4">
+                          <div>
+                            <label className="block text-sm font-medium text-gray-500 mb-1">Created</label>
+                            <p className="text-gray-900 text-sm">{selectedSource.created_at ? new Date(selectedSource.created_at).toLocaleString() : '-'}</p>
+                          </div>
+                          <div>
+                            <label className="block text-sm font-medium text-gray-500 mb-1">Error Count</label>
+                            <p className="text-gray-900 text-sm">{selectedSource.error_count || 0}</p>
+                          </div>
+                        </div>
+                        {selectedSource.last_error && (
+                          <div>
+                            <label className="block text-sm font-medium text-gray-500 mb-1">Last Error</label>
+                            <p className="text-red-600 text-sm bg-red-50 p-3 rounded">{selectedSource.last_error}</p>
+                          </div>
+                        )}
+                        <div className="border-t pt-4">
+                          <label className="block text-sm font-medium text-gray-500 mb-1">Source ID</label>
+                          <p className="text-gray-600 text-sm font-mono">{selectedSource.id}</p>
+                        </div>
+                        <div className="flex gap-3 pt-2">
+                          <button
+                            onClick={() => { setSourceModalMode('config'); setNewSourceForm({ name: selectedSource.name, description: selectedSource.description || '', source_type: selectedSource.source_type || 'syslog' }); }}
+                            className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700"
+                          >
+                            Edit Configuration
+                          </button>
+                          <button onClick={() => setSelectedSource(null)} className="flex-1 px-4 py-2 bg-gray-100 text-gray-700 rounded-lg text-sm font-medium hover:bg-gray-200">
+                            Close
+                          </button>
+                        </div>
+                      </>
+                    )}
                   </div>
                 </div>
               </div>
