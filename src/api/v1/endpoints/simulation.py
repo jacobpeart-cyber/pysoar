@@ -792,19 +792,31 @@ async def get_dashboard_stats(
         adversaries = await session.execute(select(AdversaryProfile))
         adversary_count = len(adversaries.scalars().all())
 
+        # Calculate average detection rate from completed simulations
+        from src.simulation.models import AttackSimulation
+        detection_result = await db.execute(
+            select(func.avg(AttackSimulation.detection_rate)).where(
+                AttackSimulation.status == "completed"
+            )
+        )
+        avg_detection = detection_result.scalar() or 0.0
+
+        posture_result = await db.execute(
+            select(func.avg(AttackSimulation.posture_score)).where(
+                AttackSimulation.status == "completed"
+            )
+        )
+        avg_posture = posture_result.scalar() or 0.0
+
         return DashboardStatsResponse(
             total_simulations=total_sims,
             completed_simulations=completed,
             running_simulations=running,
-            average_detection_rate=75.0,  # Placeholder
-            average_posture_score=72.5,  # Placeholder
+            average_detection_rate=round(float(avg_detection), 1),
+            average_posture_score=round(float(avg_posture), 1),
             techniques_in_library=technique_count,
             adversary_profiles=adversary_count,
-            top_tactics=[
-                {"tactic": "Initial Access", "count": 5},
-                {"tactic": "Execution", "count": 8},
-                {"tactic": "Persistence", "count": 6},
-            ],
+            top_tactics=[],
             recent_simulations=[],
             security_trends={
                 "scores": [60.0, 65.0, 70.0, 72.5],
