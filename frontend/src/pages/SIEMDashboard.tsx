@@ -767,6 +767,7 @@ export default function SIEMDashboard() {
               <p>No data sources configured</p>
             </div>
           ) : (
+            <>
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
               {sources.map((source: any) => (
                 <div key={source.id} className="bg-white rounded-lg border border-gray-200 p-6">
@@ -938,6 +939,7 @@ export default function SIEMDashboard() {
                 </div>
               </div>
             )}
+            </>
           )}
         </div>
       )}
