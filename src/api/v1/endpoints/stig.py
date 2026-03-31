@@ -58,7 +58,7 @@ async def list_benchmarks(
     try:
         stmt = (
             select(STIGBenchmark)
-            .where(STIGBenchmark.organization_id == user.organization_id)
+            .where(STIGBenchmark.organization_id == current_user.organization_id)
             .offset(skip)
             .limit(limit)
         )
@@ -79,7 +79,7 @@ async def get_benchmark(
     try:
         stmt = select(STIGBenchmark).where(
             (STIGBenchmark.benchmark_id == benchmark_id)
-            & (STIGBenchmark.organization_id == user.organization_id)
+            & (STIGBenchmark.organization_id == current_user.organization_id)
         )
         benchmark = await db.scalar(stmt)
         if not benchmark:
@@ -105,7 +105,7 @@ async def list_benchmark_rules(
     try:
         stmt = select(STIGBenchmark).where(
             (STIGBenchmark.benchmark_id == benchmark_id)
-            & (STIGBenchmark.organization_id == user.organization_id)
+            & (STIGBenchmark.organization_id == current_user.organization_id)
         )
         benchmark = await db.scalar(stmt)
         if not benchmark:
@@ -113,7 +113,7 @@ async def list_benchmark_rules(
 
         query = select(STIGRule).where(
             (STIGRule.benchmark_id_ref == benchmark.id)
-            & (STIGRule.organization_id == user.organization_id)
+            & (STIGRule.organization_id == current_user.organization_id)
         )
 
         if severity:
@@ -138,7 +138,7 @@ async def search_rules(
     """Search STIG rules by keyword, ID, or content"""
     try:
         library = STIGLibrary(db)
-        results = await library.search_rules(q, user.organization_id)
+        results = await library.search_rules(q, current_user.organization_id)
         return results
     except Exception as e:
         logger.error(f"Error searching rules: {str(e)}")
@@ -155,7 +155,7 @@ async def get_rule(
     try:
         stmt = select(STIGRule).where(
             (STIGRule.rule_id == rule_id)
-            & (STIGRule.organization_id == user.organization_id)
+            & (STIGRule.organization_id == current_user.organization_id)
         )
         rule = await db.scalar(stmt)
         if not rule:
@@ -227,7 +227,7 @@ async def list_scans(
     """List STIG scan results"""
     try:
         query = select(STIGScanResult).where(
-            STIGScanResult.organization_id == user.organization_id
+            STIGScanResult.organization_id == current_user.organization_id
         )
 
         if benchmark_id:
@@ -262,7 +262,7 @@ async def get_scan(
     try:
         stmt = select(STIGScanResult).where(
             (STIGScanResult.id == scan_id)
-            & (STIGScanResult.organization_id == user.organization_id)
+            & (STIGScanResult.organization_id == current_user.organization_id)
         )
         scan = await db.scalar(stmt)
         if not scan:
@@ -355,7 +355,7 @@ async def import_scap_content(
         engine = SCAPEngine(db)
         result = await engine.import_scap_content(
             xccdf_path=request.content_path,
-            org_id=user.organization_id,
+            org_id=current_user.organization_id,
         )
         return result
     except Exception as e:
@@ -425,7 +425,7 @@ async def list_scap_profiles(
     try:
         query = (
             select(SCAPProfile)
-            .where(SCAPProfile.organization_id == user.organization_id)
+            .where(SCAPProfile.organization_id == current_user.organization_id)
             .offset(skip)
             .limit(limit)
         )
@@ -450,14 +450,14 @@ async def get_stig_stats(
     try:
         # Count benchmarks
         bench_query = select(STIGBenchmark).where(
-            STIGBenchmark.organization_id == user.organization_id
+            STIGBenchmark.organization_id == current_user.organization_id
         )
         benchmarks = await db.scalars(bench_query)
         total_benchmarks = len(list(benchmarks))
 
         # Count scans
         scan_query = select(STIGScanResult).where(
-            STIGScanResult.organization_id == user.organization_id
+            STIGScanResult.organization_id == current_user.organization_id
         )
         scans = await db.scalars(scan_query)
         scan_list = list(scans)
@@ -480,7 +480,7 @@ async def get_stig_stats(
         )
 
         return STIGDashboardStats(
-            organization_id=user.organization_id,
+            organization_id=current_user.organization_id,
             total_benchmarks=total_benchmarks,
             total_scans=total_scans,
             average_compliance=avg_compliance,

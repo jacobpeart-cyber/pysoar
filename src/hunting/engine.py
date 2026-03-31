@@ -299,8 +299,11 @@ class HuntExecutor:
             # Analyze results
             analyzed = await self._analyze_results(results)
 
-            # Create findings
+            # Create findings and persist to database
             findings = await self._create_findings(session_id, analyzed)
+            for finding in findings:
+                self.db.add(finding)
+            await self.db.flush()
 
             # Update session with results
             session.findings_count = len(findings)

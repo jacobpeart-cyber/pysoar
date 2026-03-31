@@ -62,7 +62,7 @@ async def log_audit_event(
 ):
     """Log audit event"""
     try:
-        audit_logger = AuditLogger(db, user.organization_id)
+        audit_logger = AuditLogger(db, current_user.organization_id)
         trail = await audit_logger.log_event(
             event_type=request.event_type,
             action=request.action,
@@ -91,7 +91,7 @@ async def search_audit_trail(
 ):
     """Search audit trail with filters"""
     try:
-        audit_logger = AuditLogger(db, user.organization_id)
+        audit_logger = AuditLogger(db, current_user.organization_id)
 
         filters = {}
         if request.event_type:
@@ -125,7 +125,7 @@ async def export_audit_trail(
 ):
     """Export audit trail"""
     try:
-        audit_logger = AuditLogger(db, user.organization_id)
+        audit_logger = AuditLogger(db, current_user.organization_id)
 
         date_from = datetime.now(timezone.utc) - timedelta(days=days)
         date_to = datetime.now(timezone.utc)
@@ -156,7 +156,7 @@ async def detect_suspicious_activity(
 ):
     """Detect suspicious activity for actor"""
     try:
-        audit_logger = AuditLogger(db, user.organization_id)
+        audit_logger = AuditLogger(db, current_user.organization_id)
         activities = await audit_logger.detect_suspicious_activity(actor_id)
         return activities
     except Exception as e:
@@ -177,7 +177,7 @@ async def collect_evidence(
 ):
     """Collect evidence based on rule"""
     try:
-        collector = EvidenceCollector(db, user.organization_id)
+        collector = EvidenceCollector(db, current_user.organization_id)
         result = await collector.collect_evidence(request.get("rule_id"))
         return {
             "status": "success",
@@ -196,7 +196,7 @@ async def collect_all_automated_evidence(
 ):
     """Collect evidence from all enabled automated rules"""
     try:
-        collector = EvidenceCollector(db, user.organization_id)
+        collector = EvidenceCollector(db, current_user.organization_id)
         results = await collector.collect_all_automated()
         return {
             "status": "completed",
@@ -216,7 +216,7 @@ async def verify_evidence_integrity(
 ):
     """Verify evidence integrity"""
     try:
-        collector = EvidenceCollector(db, user.organization_id)
+        collector = EvidenceCollector(db, current_user.organization_id)
         is_valid = await collector.verify_evidence_integrity(evidence_id)
         return {
             "evidence_id": evidence_id,
@@ -273,7 +273,7 @@ async def create_evidence_package(
             assessor=request.assessor,
             due_date=request.due_date,
             metadata=request.metadata or {},
-            organization_id=user.organization_id,
+            organization_id=current_user.organization_id,
         )
         db.add(package)
         await db.commit()
@@ -294,7 +294,7 @@ async def list_evidence_packages(
     """List evidence packages"""
     try:
         query = select(EvidencePackage).where(
-            EvidencePackage.organization_id == user.organization_id
+            EvidencePackage.organization_id == current_user.organization_id
         )
         if status:
             query = query.where(EvidencePackage.status == status)
@@ -316,7 +316,7 @@ async def get_evidence_package(
     try:
         query = select(EvidencePackage).where(
             (EvidencePackage.id == package_id)
-            & (EvidencePackage.organization_id == user.organization_id)
+            & (EvidencePackage.organization_id == current_user.organization_id)
         )
         package = await db.scalar(query)
         if not package:
@@ -337,7 +337,7 @@ async def package_evidence(
 ):
     """Package evidence for submission"""
     try:
-        collector = EvidenceCollector(db, user.organization_id)
+        collector = EvidenceCollector(db, current_user.organization_id)
         result = await collector.package_evidence(package_id)
         return result
     except Exception as e:
@@ -384,7 +384,7 @@ async def get_evidence_report(
 ):
     """Get evidence report for package"""
     try:
-        collector = EvidenceCollector(db, user.organization_id)
+        collector = EvidenceCollector(db, current_user.organization_id)
         result = await collector.generate_evidence_report(package_id)
         return result
     except Exception as e:
@@ -404,7 +404,7 @@ async def run_conmon_cycle(
 ):
     """Run FedRAMP ConMon cycle"""
     try:
-        monitor = ContinuousMonitor(db, user.organization_id)
+        monitor = ContinuousMonitor(db, current_user.organization_id)
         report = await monitor.generate_conmon_report()
         return report
     except Exception as e:
@@ -419,7 +419,7 @@ async def get_conmon_report(
 ):
     """Get latest ConMon report"""
     try:
-        monitor = ContinuousMonitor(db, user.organization_id)
+        monitor = ContinuousMonitor(db, current_user.organization_id)
         report = await monitor.generate_conmon_report()
         return report
     except Exception as e:
@@ -434,7 +434,7 @@ async def get_conmon_status(
 ):
     """Get ConMon status"""
     try:
-        monitor = ContinuousMonitor(db, user.organization_id)
+        monitor = ContinuousMonitor(db, current_user.organization_id)
         cycle_results = await monitor.run_conmon_cycle()
         return {
             "status": "compliant",
@@ -459,7 +459,7 @@ async def check_audit_readiness(
 ):
     """Check audit readiness for framework"""
     try:
-        checker = AuditReadinessChecker(db, user.organization_id)
+        checker = AuditReadinessChecker(db, current_user.organization_id)
         result = await checker.check_readiness(framework)
         return result
     except Exception as e:
@@ -475,7 +475,7 @@ async def check_evidence_coverage(
 ):
     """Check evidence coverage for framework"""
     try:
-        checker = AuditReadinessChecker(db, user.organization_id)
+        checker = AuditReadinessChecker(db, current_user.organization_id)
         result = await checker.check_evidence_coverage(framework_id)
         return result
     except Exception as e:
@@ -491,7 +491,7 @@ async def check_evidence_freshness(
 ):
     """Check evidence freshness for framework"""
     try:
-        checker = AuditReadinessChecker(db, user.organization_id)
+        checker = AuditReadinessChecker(db, current_user.organization_id)
         result = await checker.check_evidence_freshness(framework_id)
         return result
     except Exception as e:
@@ -507,7 +507,7 @@ async def generate_assessor_package(
 ):
     """Generate package for external assessors"""
     try:
-        checker = AuditReadinessChecker(db, user.organization_id)
+        checker = AuditReadinessChecker(db, current_user.organization_id)
         result = await checker.generate_assessor_package(framework_id)
         return result
     except Exception as e:
@@ -536,7 +536,7 @@ async def create_evidence_rule(
             collection_config=request.collection_config,
             schedule=request.schedule,
             is_enabled=request.is_enabled,
-            organization_id=user.organization_id,
+            organization_id=current_user.organization_id,
         )
         db.add(rule)
         await db.commit()
@@ -557,7 +557,7 @@ async def list_evidence_rules(
     try:
         query = (
             select(AutomatedEvidenceRule)
-            .where(AutomatedEvidenceRule.organization_id == user.organization_id)
+            .where(AutomatedEvidenceRule.organization_id == current_user.organization_id)
             .offset(skip)
             .limit(limit)
         )
@@ -582,14 +582,14 @@ async def get_audit_dashboard_stats(
     try:
         # Count audit entries
         audit_query = select(AuditTrail).where(
-            AuditTrail.organization_id == user.organization_id
+            AuditTrail.organization_id == current_user.organization_id
         )
         audits = await db.scalars(audit_query)
         audit_list = list(audits)
 
         # Count packages
         pkg_query = select(EvidencePackage).where(
-            EvidencePackage.organization_id == user.organization_id
+            EvidencePackage.organization_id == current_user.organization_id
         )
         packages = await db.scalars(pkg_query)
         pkg_list = list(packages)
@@ -603,7 +603,7 @@ async def get_audit_dashboard_stats(
         pkg_submitted = len([p for p in pkg_list if p.status == "submitted"])
 
         return AuditDashboardStats(
-            organization_id=user.organization_id,
+            organization_id=current_user.organization_id,
             total_audit_entries=len(audit_list),
             audit_entries_this_month=month_audits,
             event_types_breakdown={},
