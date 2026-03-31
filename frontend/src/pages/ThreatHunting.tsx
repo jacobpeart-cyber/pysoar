@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useQuery, useMutation } from '@tanstack/react-query';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   Search,
   Plus,
@@ -35,13 +35,35 @@ const statusColors: Record<string, string> = {
   paused: 'text-yellow-600 bg-yellow-50 border border-yellow-200',
   completed: 'text-blue-600 bg-blue-50 border border-blue-200',
   cancelled: 'text-gray-600 bg-gray-50 border border-gray-200',
+  pending: 'text-purple-600 bg-purple-50 border border-purple-200',
+  running: 'text-green-600 bg-green-50 border border-green-200',
+  failed: 'text-red-600 bg-red-50 border border-red-200',
   new: 'text-blue-600 bg-blue-50',
   investigating: 'text-yellow-600 bg-yellow-50',
   confirmed: 'text-green-600 bg-green-50',
   false_positive: 'text-purple-600 bg-purple-50',
+  DRAFT: 'text-gray-600 bg-gray-50 border border-gray-200',
+  ACTIVE: 'text-green-600 bg-green-50 border border-green-200',
+  COMPLETED: 'text-blue-600 bg-blue-50 border border-blue-200',
+  ARCHIVED: 'text-gray-600 bg-gray-50 border border-gray-200',
+  PENDING: 'text-purple-600 bg-purple-50 border border-purple-200',
+  RUNNING: 'text-green-600 bg-green-50 border border-green-200',
+  PAUSED: 'text-yellow-600 bg-yellow-50 border border-yellow-200',
+  FAILED: 'text-red-600 bg-red-50 border border-red-200',
+  CANCELLED: 'text-gray-600 bg-gray-50 border border-gray-200',
 };
 
+function formatDuration(seconds: number | null | undefined): string {
+  if (!seconds) return '-';
+  if (seconds < 60) return `${seconds}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  return `${h}h ${m}m`;
+}
+
 export default function ThreatHunting() {
+  const queryClient = useQueryClient();
   const [activeTab, setActiveTab] = useState<'hunts' | 'hypotheses' | 'findings' | 'notebooks' | 'templates'>(
     'hunts'
   );
@@ -53,6 +75,14 @@ export default function ThreatHunting() {
   const [mitreFilterTab, setMitreFilterTab] = useState('');
   const [priorityFilterTab, setPriorityFilterTab] = useState('');
   const [hypothesisStatusFilter, setHypothesisStatusFilter] = useState('');
+
+  // Modal states
+  const [showNewHuntModal, setShowNewHuntModal] = useState(false);
+  const [showNewHypothesisModal, setShowNewHypothesisModal] = useState(false);
+  const [newHuntHypothesisId, setNewHuntHypothesisId] = useState('');
+  const [newHypothesisTitle, setNewHypothesisTitle] = useState('');
+  const [newHypothesisDescription, setNewHypothesisDescription] = useState('');
+  const [newHypothesisPriority, setNewHypothesisPriority] = useState(3);
 
   // Fetch hunting stats
   const { data: stats, isLoading: statsLoading } = useQuery({
@@ -88,7 +118,7 @@ export default function ThreatHunting() {
       });
       return response.data;
     },
-    enabled: activeTab === 'hypotheses',
+    enabled: activeTab === 'hypotheses' || showNewHuntModal,
   });
 
   // Fetch findings
@@ -98,7 +128,7 @@ export default function ThreatHunting() {
       const response = await api.get('/hunting/findings', {
         params: {
           ...(findingSeverityFilter && { severity: findingSeverityFilter }),
-          ...(findingStatusFilter && { status: findingStatusFilter }),
+          ...(findingStatusFilter && { classification: findingStatusFilter }),
         },
       });
       return response.data;
@@ -132,6 +162,10 @@ export default function ThreatHunting() {
       const response = await api.post(`/hunting/sessions/${huntId}/${action}`);
       return response.data;
     },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['hunting-sessions'] });
+      queryClient.invalidateQueries({ queryKey: ['hunting-stats'] });
+    },
   });
 
   // Cancel hunt mutation
@@ -140,6 +174,53 @@ export default function ThreatHunting() {
       const response = await api.post(`/hunting/sessions/${huntId}/cancel`);
       return response.data;
     },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['hunting-sessions'] });
+      queryClient.invalidateQueries({ queryKey: ['hunting-stats'] });
+    },
+  });
+
+  // Create hunt session mutation
+  const createHuntMutation = useMutation({
+    mutationFn: async (hypothesisId: string) => {
+      const response = await api.post('/hunting/sessions', { hypothesis_id: hypothesisId });
+      return response.data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['hunting-sessions'] });
+      queryClient.invalidateQueries({ queryKey: ['hunting-stats'] });
+      setShowNewHuntModal(false);
+      setNewHuntHypothesisId('');
+    },
+  });
+
+  // Create hypothesis mutation
+  const createHypothesisMutation = useMutation({
+    mutationFn: async (data: { title: string; description: string; priority: number }) => {
+      const response = await api.post('/hunting/hypotheses', data);
+      return response.data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['hunting-hypotheses'] });
+      queryClient.invalidateQueries({ queryKey: ['hunting-stats'] });
+      setShowNewHypothesisModal(false);
+      setNewHypothesisTitle('');
+      setNewHypothesisDescription('');
+      setNewHypothesisPriority(3);
+    },
+  });
+
+  // Instantiate template mutation
+  const instantiateTemplateMutation = useMutation({
+    mutationFn: async (templateId: string) => {
+      const response = await api.post(`/hunting/templates/${templateId}/instantiate`, {});
+      return response.data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['hunting-hypotheses'] });
+      queryClient.invalidateQueries({ queryKey: ['hunting-stats'] });
+      setActiveTab('hypotheses');
+    },
   });
 
   // Escalate finding mutation
@@ -147,6 +228,9 @@ export default function ThreatHunting() {
     mutationFn: async (findingId: string) => {
       const response = await api.post(`/hunting/findings/${findingId}/escalate`);
       return response.data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['hunting-findings'] });
     },
   });
 
@@ -158,11 +242,11 @@ export default function ThreatHunting() {
     { id: 'templates', label: 'Templates', icon: Search },
   ];
 
-  const hunts = huntsData?.items || [];
-  const hypotheses = hypothesesData?.items || [];
-  const findings = findingsData?.items || [];
-  const notebooks = notebooksData?.items || [];
-  const templates = templatesData?.items || [];
+  const hunts = huntsData?.items || (Array.isArray(huntsData) ? huntsData : []);
+  const hypotheses = hypothesesData?.items || (Array.isArray(hypothesesData) ? hypothesesData : []);
+  const findings = findingsData?.items || (Array.isArray(findingsData) ? findingsData : []);
+  const notebooks = notebooksData?.items || (Array.isArray(notebooksData) ? notebooksData : []);
+  const templates = Array.isArray(templatesData) ? templatesData : (templatesData?.items || []);
 
   return (
     <div className="space-y-6">
@@ -211,7 +295,7 @@ export default function ThreatHunting() {
             />
             <StatsCard
               title="Hypotheses"
-              value={statsLoading ? '-' : stats?.hypotheses_tracked || 0}
+              value={statsLoading ? '-' : stats?.total_hypotheses || 0}
               icon={Lightbulb}
               color="yellow"
             />
@@ -222,8 +306,8 @@ export default function ThreatHunting() {
               color="green"
             />
             <StatsCard
-              title="Confirmed Threats"
-              value={statsLoading ? '-' : stats?.confirmed_threats || 0}
+              title="Completed Hunts"
+              value={statsLoading ? '-' : stats?.completed_hunts || 0}
               icon={AlertCircle}
               color="red"
             />
@@ -271,7 +355,10 @@ export default function ThreatHunting() {
 
             <div className="flex-1" />
 
-            <button className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700">
+            <button
+              onClick={() => setShowNewHuntModal(true)}
+              className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+            >
               <Plus className="w-5 h-5" />
               New Hunt
             </button>
@@ -293,7 +380,7 @@ export default function ThreatHunting() {
                 <thead className="bg-gray-50 border-b border-gray-200">
                   <tr>
                     <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Hunt Name
+                      Hunt ID
                     </th>
                     <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                       Hypothesis
@@ -316,10 +403,14 @@ export default function ThreatHunting() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-100">
-                  {hunts.map((hunt: any) => (
+                  {hunts.map((hunt: any, index: number) => (
                     <tr key={hunt.id} className="hover:bg-gray-50">
-                      <td className="px-6 py-4 text-sm font-medium text-gray-900">{hunt.name}</td>
-                      <td className="px-6 py-4 text-sm text-gray-600">{hunt.hypothesis}</td>
+                      <td className="px-6 py-4 text-sm font-medium text-gray-900 font-mono">
+                        {hunt.id?.slice(0, 8)}
+                      </td>
+                      <td className="px-6 py-4 text-sm text-gray-600 font-mono">
+                        {hunt.hypothesis_id?.slice(0, 8) || '-'}
+                      </td>
                       <td className="px-6 py-4">
                         <span className={clsx('px-2 py-1 text-xs font-medium rounded-full capitalize', statusColors[hunt.status])}>
                           {hunt.status}
@@ -327,9 +418,9 @@ export default function ThreatHunting() {
                       </td>
                       <td className="px-6 py-4 text-sm font-medium text-gray-900">{hunt.findings_count || 0}</td>
                       <td className="px-6 py-4 text-sm text-gray-600">
-                        {new Date(hunt.started_at).toLocaleDateString()}
+                        {hunt.started_at ? new Date(hunt.started_at).toLocaleDateString() : '-'}
                       </td>
-                      <td className="px-6 py-4 text-sm text-gray-600">{hunt.duration || '-'}</td>
+                      <td className="px-6 py-4 text-sm text-gray-600">{formatDuration(hunt.duration_seconds)}</td>
                       <td className="px-6 py-4 text-right">
                         <div className="flex items-center justify-end gap-2">
                           <button
@@ -338,7 +429,7 @@ export default function ThreatHunting() {
                           >
                             View
                           </button>
-                          {hunt.status === 'active' ? (
+                          {(hunt.status === 'RUNNING' || hunt.status === 'active') ? (
                             <button
                               onClick={() =>
                                 toggleHuntMutation.mutate({
@@ -351,7 +442,7 @@ export default function ThreatHunting() {
                             >
                               <Pause className="w-4 h-4" />
                             </button>
-                          ) : hunt.status === 'paused' ? (
+                          ) : (hunt.status === 'PAUSED' || hunt.status === 'paused') ? (
                             <button
                               onClick={() =>
                                 toggleHuntMutation.mutate({
@@ -365,7 +456,7 @@ export default function ThreatHunting() {
                               <Play className="w-4 h-4" />
                             </button>
                           ) : null}
-                          {hunt.status !== 'completed' && hunt.status !== 'cancelled' && (
+                          {!['COMPLETED', 'FAILED', 'CANCELLED', 'completed', 'cancelled'].includes(hunt.status) && (
                             <button
                               onClick={() => cancelHuntMutation.mutate(hunt.id)}
                               className="text-red-600 hover:text-red-800 p-1"
@@ -388,7 +479,9 @@ export default function ThreatHunting() {
             <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50">
               <div className="bg-white rounded-lg shadow-xl w-full max-w-2xl mx-4 max-h-[80vh] overflow-y-auto">
                 <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200 sticky top-0 bg-white">
-                  <h2 className="text-lg font-semibold text-gray-900">{selectedHunt.name}</h2>
+                  <h2 className="text-lg font-semibold text-gray-900">
+                    Hunt <span className="font-mono">{selectedHunt.id?.slice(0, 8)}</span>
+                  </h2>
                   <button
                     onClick={() => setSelectedHunt(null)}
                     className="text-gray-400 hover:text-gray-600"
@@ -415,12 +508,109 @@ export default function ThreatHunting() {
                     </div>
                   </div>
                   <div>
-                    <label className="block text-sm font-medium text-gray-500 mb-1">Hypothesis</label>
-                    <p className="text-gray-900">{selectedHunt.hypothesis}</p>
+                    <label className="block text-sm font-medium text-gray-500 mb-1">Hypothesis ID</label>
+                    <p className="text-gray-900 font-mono">{selectedHunt.hypothesis_id || '-'}</p>
                   </div>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-sm font-medium text-gray-500 mb-1">Events Analyzed</label>
+                      <p className="text-gray-900 font-medium">{selectedHunt.events_analyzed || 0}</p>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-500 mb-1">Queries Executed</label>
+                      <p className="text-gray-900 font-medium">{selectedHunt.queries_executed || selectedHunt.query_count || 0}</p>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-sm font-medium text-gray-500 mb-1">Duration</label>
+                      <p className="text-gray-900">{formatDuration(selectedHunt.duration_seconds)}</p>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-500 mb-1">Created By</label>
+                      <p className="text-gray-900">{selectedHunt.created_by || '-'}</p>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-sm font-medium text-gray-500 mb-1">Started At</label>
+                      <p className="text-gray-900 text-sm">
+                        {selectedHunt.started_at ? new Date(selectedHunt.started_at).toLocaleString() : '-'}
+                      </p>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-500 mb-1">Completed At</label>
+                      <p className="text-gray-900 text-sm">
+                        {selectedHunt.completed_at ? new Date(selectedHunt.completed_at).toLocaleString() : '-'}
+                      </p>
+                    </div>
+                  </div>
+                  {selectedHunt.error_message && (
+                    <div>
+                      <label className="block text-sm font-medium text-gray-500 mb-1">Error</label>
+                      <p className="text-red-600 text-sm">{selectedHunt.error_message}</p>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* New Hunt Modal */}
+          {showNewHuntModal && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50">
+              <div className="bg-white rounded-lg shadow-xl w-full max-w-md mx-4">
+                <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200">
+                  <h2 className="text-lg font-semibold text-gray-900">Create New Hunt Session</h2>
+                  <button
+                    onClick={() => setShowNewHuntModal(false)}
+                    className="text-gray-400 hover:text-gray-600"
+                  >
+                    <X className="w-5 h-5" />
+                  </button>
+                </div>
+                <div className="p-6 space-y-4">
                   <div>
-                    <label className="block text-sm font-medium text-gray-500 mb-1">Description</label>
-                    <p className="text-gray-900 text-sm">{selectedHunt.description || '-'}</p>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Select Hypothesis</label>
+                    <select
+                      value={newHuntHypothesisId}
+                      onChange={(e) => setNewHuntHypothesisId(e.target.value)}
+                      className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-blue-500 focus:border-blue-500"
+                    >
+                      <option value="">-- Select a hypothesis --</option>
+                      {hypotheses.map((h: any) => (
+                        <option key={h.id} value={h.id}>
+                          {h.title} ({h.status})
+                        </option>
+                      ))}
+                    </select>
+                    {hypotheses.length === 0 && (
+                      <p className="text-xs text-gray-500 mt-1">No hypotheses available. Create one first.</p>
+                    )}
+                  </div>
+                  <div className="flex justify-end gap-2">
+                    <button
+                      onClick={() => setShowNewHuntModal(false)}
+                      className="px-4 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 text-sm font-medium"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      onClick={() => {
+                        if (newHuntHypothesisId) {
+                          createHuntMutation.mutate(newHuntHypothesisId);
+                        }
+                      }}
+                      disabled={!newHuntHypothesisId || createHuntMutation.isPending}
+                      className={clsx(
+                        'px-4 py-2 rounded-lg text-sm font-medium text-white',
+                        !newHuntHypothesisId || createHuntMutation.isPending
+                          ? 'bg-blue-400 cursor-not-allowed'
+                          : 'bg-blue-600 hover:bg-blue-700'
+                      )}
+                    >
+                      {createHuntMutation.isPending ? 'Creating...' : 'Create Hunt'}
+                    </button>
                   </div>
                 </div>
               </div>
@@ -485,7 +675,10 @@ export default function ThreatHunting() {
 
             <div className="flex-1" />
 
-            <button className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700">
+            <button
+              onClick={() => setShowNewHypothesisModal(true)}
+              className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+            >
               <Plus className="w-5 h-5" />
               Create Hypothesis
             </button>
@@ -510,14 +703,14 @@ export default function ThreatHunting() {
                     <span
                       className={clsx(
                         'px-2 py-1 text-xs font-medium rounded-full whitespace-nowrap ml-2',
-                        hypothesis.priority === 'high'
+                        hypothesis.priority <= 2
                           ? 'bg-red-100 text-red-700'
-                          : hypothesis.priority === 'medium'
+                          : hypothesis.priority === 3
                             ? 'bg-yellow-100 text-yellow-700'
                             : 'bg-blue-100 text-blue-700'
                       )}
                     >
-                      {hypothesis.priority}
+                      P{hypothesis.priority}
                     </span>
                   </div>
 
@@ -546,20 +739,106 @@ export default function ThreatHunting() {
                     <span
                       className={clsx(
                         'px-2 py-1 rounded-full',
-                        hypothesis.status === 'active'
-                          ? 'bg-green-100 text-green-700'
-                          : 'bg-gray-100 text-gray-700'
+                        statusColors[hypothesis.status] || 'bg-gray-100 text-gray-700'
                       )}
                     >
                       {hypothesis.status}
                     </span>
                   </div>
 
-                  <button className="w-full px-3 py-2 bg-blue-50 text-blue-600 rounded-lg hover:bg-blue-100 text-sm font-medium">
+                  <button
+                    onClick={() => {
+                      setNewHuntHypothesisId(hypothesis.id);
+                      setShowNewHuntModal(true);
+                      setActiveTab('hunts');
+                    }}
+                    className="w-full px-3 py-2 bg-blue-50 text-blue-600 rounded-lg hover:bg-blue-100 text-sm font-medium"
+                  >
                     Start Hunt
                   </button>
                 </div>
               ))}
+            </div>
+          )}
+
+          {/* New Hypothesis Modal */}
+          {showNewHypothesisModal && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50">
+              <div className="bg-white rounded-lg shadow-xl w-full max-w-md mx-4">
+                <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200">
+                  <h2 className="text-lg font-semibold text-gray-900">Create New Hypothesis</h2>
+                  <button
+                    onClick={() => setShowNewHypothesisModal(false)}
+                    className="text-gray-400 hover:text-gray-600"
+                  >
+                    <X className="w-5 h-5" />
+                  </button>
+                </div>
+                <div className="p-6 space-y-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Title</label>
+                    <input
+                      type="text"
+                      value={newHypothesisTitle}
+                      onChange={(e) => setNewHypothesisTitle(e.target.value)}
+                      placeholder="Enter hypothesis title"
+                      className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-blue-500 focus:border-blue-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Description</label>
+                    <textarea
+                      value={newHypothesisDescription}
+                      onChange={(e) => setNewHypothesisDescription(e.target.value)}
+                      placeholder="Describe the hypothesis"
+                      rows={3}
+                      className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-blue-500 focus:border-blue-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Priority (1=highest, 5=lowest)</label>
+                    <select
+                      value={newHypothesisPriority}
+                      onChange={(e) => setNewHypothesisPriority(Number(e.target.value))}
+                      className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-blue-500 focus:border-blue-500"
+                    >
+                      <option value={1}>1 - Critical</option>
+                      <option value={2}>2 - High</option>
+                      <option value={3}>3 - Medium</option>
+                      <option value={4}>4 - Low</option>
+                      <option value={5}>5 - Info</option>
+                    </select>
+                  </div>
+                  <div className="flex justify-end gap-2">
+                    <button
+                      onClick={() => setShowNewHypothesisModal(false)}
+                      className="px-4 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 text-sm font-medium"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      onClick={() => {
+                        if (newHypothesisTitle && newHypothesisDescription) {
+                          createHypothesisMutation.mutate({
+                            title: newHypothesisTitle,
+                            description: newHypothesisDescription,
+                            priority: newHypothesisPriority,
+                          });
+                        }
+                      }}
+                      disabled={!newHypothesisTitle || !newHypothesisDescription || createHypothesisMutation.isPending}
+                      className={clsx(
+                        'px-4 py-2 rounded-lg text-sm font-medium text-white',
+                        !newHypothesisTitle || !newHypothesisDescription || createHypothesisMutation.isPending
+                          ? 'bg-blue-400 cursor-not-allowed'
+                          : 'bg-blue-600 hover:bg-blue-700'
+                      )}
+                    >
+                      {createHypothesisMutation.isPending ? 'Creating...' : 'Create Hypothesis'}
+                    </button>
+                  </div>
+                </div>
+              </div>
             </div>
           )}
         </div>
@@ -604,19 +883,19 @@ export default function ThreatHunting() {
 
             <div className="h-6 border-r border-gray-300" />
 
-            <span className="text-xs text-gray-500 font-medium">Status:</span>
-            {['new', 'investigating', 'confirmed', 'false_positive'].map((status) => (
+            <span className="text-xs text-gray-500 font-medium">Classification:</span>
+            {['true_positive', 'false_positive', 'testing'].map((classification) => (
               <button
-                key={status}
-                onClick={() => setFindingStatusFilter(findingStatusFilter === status ? '' : status)}
+                key={classification}
+                onClick={() => setFindingStatusFilter(findingStatusFilter === classification ? '' : classification)}
                 className={clsx(
                   'px-2 py-1 rounded text-xs font-medium transition-colors',
-                  findingStatusFilter === status
+                  findingStatusFilter === classification
                     ? 'bg-blue-600 text-white'
                     : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
                 )}
               >
-                {status.replace('_', ' ')}
+                {classification.replace(/_/g, ' ')}
               </button>
             ))}
           </div>
@@ -640,10 +919,10 @@ export default function ThreatHunting() {
                       Time
                     </th>
                     <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Hunt
+                      Title
                     </th>
                     <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Type
+                      Session
                     </th>
                     <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
                       Severity
@@ -655,7 +934,7 @@ export default function ThreatHunting() {
                       Evidence
                     </th>
                     <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                      Status
+                      Classification
                     </th>
                     <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
                       Actions
@@ -666,10 +945,12 @@ export default function ThreatHunting() {
                   {findings.map((finding: any) => (
                     <tr key={finding.id} className="hover:bg-gray-50">
                       <td className="px-6 py-4 text-sm text-gray-500">
-                        {new Date(finding.timestamp).toLocaleString()}
+                        {new Date(finding.created_at).toLocaleString()}
                       </td>
-                      <td className="px-6 py-4 text-sm font-medium text-gray-900">{finding.hunt_name}</td>
-                      <td className="px-6 py-4 text-sm text-gray-600">{finding.finding_type}</td>
+                      <td className="px-6 py-4 text-sm font-medium text-gray-900">{finding.title}</td>
+                      <td className="px-6 py-4 text-sm text-gray-600 font-mono">
+                        {finding.session_id?.slice(0, 8) || '-'}
+                      </td>
                       <td className="px-6 py-4">
                         <span
                           className={clsx(
@@ -681,15 +962,21 @@ export default function ThreatHunting() {
                         </span>
                       </td>
                       <td className="px-6 py-4 text-sm text-gray-600 max-w-xs truncate">{finding.description}</td>
-                      <td className="px-6 py-4 text-sm font-medium text-gray-900">{finding.evidence_count || 0}</td>
+                      <td className="px-6 py-4 text-sm font-medium text-gray-900">
+                        {finding.evidence?.length || 0}
+                      </td>
                       <td className="px-6 py-4">
                         <span
                           className={clsx(
                             'px-2 py-1 text-xs font-medium rounded-full capitalize',
-                            statusColors[finding.status]
+                            finding.classification === 'true_positive'
+                              ? 'text-green-600 bg-green-50'
+                              : finding.classification === 'false_positive'
+                                ? 'text-purple-600 bg-purple-50'
+                                : 'text-gray-600 bg-gray-50'
                           )}
                         >
-                          {finding.status.replace('_', ' ')}
+                          {finding.classification ? finding.classification.replace(/_/g, ' ') : 'unclassified'}
                         </span>
                       </td>
                       <td className="px-6 py-4 text-right">
@@ -700,7 +987,7 @@ export default function ThreatHunting() {
                           >
                             View
                           </button>
-                          {finding.status === 'confirmed' && (
+                          {!finding.escalated_to_case && (
                             <button
                               onClick={() => escalateFindingMutation.mutate(finding.id)}
                               className="text-red-600 hover:text-red-800 text-sm font-medium"
@@ -722,7 +1009,7 @@ export default function ThreatHunting() {
             <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50">
               <div className="bg-white rounded-lg shadow-xl w-full max-w-2xl mx-4 max-h-[80vh] overflow-y-auto">
                 <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200 sticky top-0 bg-white">
-                  <h2 className="text-lg font-semibold text-gray-900">Finding Details</h2>
+                  <h2 className="text-lg font-semibold text-gray-900">Finding: {selectedFinding.title}</h2>
                   <button
                     onClick={() => setSelectedFinding(null)}
                     className="text-gray-400 hover:text-gray-600"
@@ -733,14 +1020,18 @@ export default function ThreatHunting() {
                 <div className="p-6 space-y-4">
                   <div className="grid grid-cols-2 gap-4">
                     <div>
-                      <label className="block text-sm font-medium text-gray-500 mb-1">Status</label>
+                      <label className="block text-sm font-medium text-gray-500 mb-1">Classification</label>
                       <span
                         className={clsx(
                           'px-2 py-1 text-xs font-medium rounded-full capitalize',
-                          statusColors[selectedFinding.status]
+                          selectedFinding.classification === 'true_positive'
+                            ? 'text-green-600 bg-green-50'
+                            : selectedFinding.classification === 'false_positive'
+                              ? 'text-purple-600 bg-purple-50'
+                              : 'text-gray-600 bg-gray-50'
                         )}
                       >
-                        {selectedFinding.status.replace('_', ' ')}
+                        {selectedFinding.classification ? selectedFinding.classification.replace(/_/g, ' ') : 'unclassified'}
                       </span>
                     </div>
                     <div>
@@ -756,12 +1047,58 @@ export default function ThreatHunting() {
                     </div>
                   </div>
                   <div>
+                    <label className="block text-sm font-medium text-gray-500 mb-1">Session ID</label>
+                    <p className="text-gray-900 font-mono text-sm">{selectedFinding.session_id || '-'}</p>
+                  </div>
+                  <div>
                     <label className="block text-sm font-medium text-gray-500 mb-1">Description</label>
                     <p className="text-gray-900">{selectedFinding.description}</p>
                   </div>
+                  {selectedFinding.evidence && selectedFinding.evidence.length > 0 && (
+                    <div>
+                      <label className="block text-sm font-medium text-gray-500 mb-1">Evidence</label>
+                      <ul className="list-disc list-inside text-sm text-gray-900">
+                        {selectedFinding.evidence.map((e: string, i: number) => (
+                          <li key={i}>{e}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {selectedFinding.affected_assets && selectedFinding.affected_assets.length > 0 && (
+                    <div>
+                      <label className="block text-sm font-medium text-gray-500 mb-1">Affected Assets</label>
+                      <div className="flex flex-wrap gap-1">
+                        {selectedFinding.affected_assets.map((a: string, i: number) => (
+                          <span key={i} className="px-2 py-1 text-xs bg-gray-100 text-gray-700 rounded">{a}</span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {selectedFinding.iocs_found && selectedFinding.iocs_found.length > 0 && (
+                    <div>
+                      <label className="block text-sm font-medium text-gray-500 mb-1">IOCs Found</label>
+                      <div className="flex flex-wrap gap-1">
+                        {selectedFinding.iocs_found.map((ioc: string, i: number) => (
+                          <span key={i} className="px-2 py-1 text-xs bg-red-50 text-red-700 rounded font-mono">{ioc}</span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {selectedFinding.mitre_techniques && selectedFinding.mitre_techniques.length > 0 && (
+                    <div>
+                      <label className="block text-sm font-medium text-gray-500 mb-1">MITRE Techniques</label>
+                      <div className="flex flex-wrap gap-1">
+                        {selectedFinding.mitre_techniques.map((t: string, i: number) => (
+                          <span key={i} className="px-2 py-1 text-xs bg-blue-50 text-blue-700 rounded">{t}</span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
                   <div>
-                    <label className="block text-sm font-medium text-gray-500 mb-1">Evidence Count</label>
-                    <p className="text-gray-900 font-medium">{selectedFinding.evidence_count || 0}</p>
+                    <label className="block text-sm font-medium text-gray-500 mb-1">Escalated</label>
+                    <p className="text-gray-900 font-medium">
+                      {selectedFinding.escalated_to_case ? `Yes (Case: ${selectedFinding.case_id?.slice(0, 8)})` : 'No'}
+                    </p>
                   </div>
                 </div>
               </div>
@@ -792,15 +1129,18 @@ export default function ThreatHunting() {
               {notebooks.map((notebook: any) => (
                 <div key={notebook.id} className="bg-white rounded-lg border border-gray-200 p-6">
                   <h3 className="font-semibold text-gray-900 mb-2">{notebook.title}</h3>
-                  <p className="text-sm text-gray-600 mb-4 line-clamp-2">{notebook.description}</p>
+                  <p className="text-sm text-gray-600 mb-4 line-clamp-2">
+                    Session: <span className="font-mono">{notebook.session_id?.slice(0, 8) || '-'}</span>
+                  </p>
 
                   <div className="space-y-2 text-xs text-gray-500 mb-4">
                     <div className="flex items-center justify-between">
-                      <span>Created by: {notebook.created_by}</span>
+                      <span>Version: {notebook.version || 1}</span>
+                      <span>{notebook.is_published ? 'Published' : 'Draft'}</span>
                     </div>
                     <div className="flex items-center justify-between">
-                      <span>Last modified: {new Date(notebook.last_modified).toLocaleDateString()}</span>
-                      <span>{notebook.cell_count} cells</span>
+                      <span>Updated: {new Date(notebook.updated_at).toLocaleDateString()}</span>
+                      <span>{notebook.content?.length || 0} cells</span>
                     </div>
                   </div>
 
@@ -840,7 +1180,21 @@ export default function ThreatHunting() {
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
               {templates.map((template: any) => (
                 <div key={template.id} className="bg-white rounded-lg border border-gray-200 p-6">
-                  <h3 className="font-semibold text-gray-900 mb-2">{template.name}</h3>
+                  <div className="flex items-start justify-between mb-2">
+                    <h3 className="font-semibold text-gray-900">{template.name}</h3>
+                    <span
+                      className={clsx(
+                        'px-2 py-1 text-xs font-medium rounded-full whitespace-nowrap ml-2',
+                        template.difficulty === 'advanced'
+                          ? 'bg-red-100 text-red-700'
+                          : template.difficulty === 'intermediate'
+                            ? 'bg-yellow-100 text-yellow-700'
+                            : 'bg-green-100 text-green-700'
+                      )}
+                    >
+                      {template.difficulty}
+                    </span>
+                  </div>
                   <p className="text-sm text-gray-600 mb-4 line-clamp-2">{template.description}</p>
 
                   {template.mitre_techniques && template.mitre_techniques.length > 0 && (
@@ -857,12 +1211,22 @@ export default function ThreatHunting() {
                   )}
 
                   <div className="space-y-2 text-xs text-gray-500 mb-4">
-                    <div>Data sources: {template.data_sources?.join(', ') || 'None'}</div>
-                    <div>Frequency: {template.recommended_frequency}</div>
+                    <div>Category: {template.category}</div>
+                    <div>Type: {template.hunt_type}</div>
+                    <div>Est. Duration: {template.estimated_duration_minutes}m</div>
                   </div>
 
-                  <button className="w-full px-3 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium">
-                    Start Hunt from Template
+                  <button
+                    onClick={() => instantiateTemplateMutation.mutate(template.id)}
+                    disabled={instantiateTemplateMutation.isPending}
+                    className={clsx(
+                      'w-full px-3 py-2 rounded-lg text-sm font-medium text-white',
+                      instantiateTemplateMutation.isPending
+                        ? 'bg-blue-400 cursor-not-allowed'
+                        : 'bg-blue-600 hover:bg-blue-700'
+                    )}
+                  >
+                    {instantiateTemplateMutation.isPending ? 'Creating...' : 'Use Template'}
                   </button>
                 </div>
               ))}
