@@ -289,20 +289,20 @@ async def seed():
         # Seed Data Sources
         print("  Creating SIEM data sources...")
         data_sources = [
-            ("Edge Firewall", "Palo Alto PA-5250 edge firewall", "syslog", "connected"),
-            ("Domain Controller", "Windows Server 2022 AD DC", "windows_event", "connected"),
-            ("AWS CloudTrail", "AWS account us-east-1 CloudTrail", "cloud_trail", "connected"),
-            ("EDR Console", "CrowdStrike Falcon EDR", "json_api", "connected"),
-            ("IDS Sensor", "Suricata IDS network sensor", "cef", "connected"),
+            ("Edge Firewall", "Palo Alto PA-5250 edge firewall", "syslog"),
+            ("Domain Controller", "Windows Server 2022 AD DC", "windows_event"),
+            ("AWS CloudTrail", "AWS account us-east-1 CloudTrail", "cloud_trail"),
+            ("EDR Console", "CrowdStrike Falcon EDR", "json_api"),
+            ("IDS Sensor", "Suricata IDS network sensor", "cef"),
         ]
 
-        for name, desc, source_type, ds_status in data_sources:
+        for name, desc, source_type in data_sources:
             source = SIEMDataSource(
                 id=str(uuid.uuid4()),
                 name=name,
                 description=desc,
                 source_type=source_type,
-                status=ds_status,
+                enabled=True,
                 created_at=rand_date(90),
                 updated_at=datetime.now(timezone.utc),
             )
