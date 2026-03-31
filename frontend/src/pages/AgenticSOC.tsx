@@ -139,12 +139,6 @@ const AgenticSOC: React.FC = () => {
     setApprovalModal(null);
   };
 
-  const mockAgentMetrics = agentMetrics;
-  const mockAgents = agents;
-  const mockInvestigations = investigations;
-  const mockReasoningChain = reasoningChain;
-  const mockPendingApprovals = pendingApprovals;
-  const mockTimelineData = timelineData;
 
   return (
     <div className="min-h-screen bg-gray-50 dark:bg-gray-900 p-8">
@@ -167,7 +161,7 @@ const AgenticSOC: React.FC = () => {
               <div>
                 <p className="text-gray-600 dark:text-gray-400 text-sm font-medium">Active Agents</p>
                 <p className="text-3xl font-bold text-gray-900 dark:text-white mt-2">
-                  {mockAgentMetrics.activeAgents}
+                  {agentMetrics.activeAgents}
                 </p>
               </div>
               <Bot className="w-10 h-10 text-blue-500 dark:text-blue-400 opacity-20" />
@@ -181,7 +175,7 @@ const AgenticSOC: React.FC = () => {
                   Open Investigations
                 </p>
                 <p className="text-3xl font-bold text-gray-900 dark:text-white mt-2">
-                  {mockAgentMetrics.openInvestigations}
+                  {agentMetrics.openInvestigations}
                 </p>
               </div>
               <Brain className="w-10 h-10 text-purple-500 dark:text-purple-400 opacity-20" />
@@ -195,7 +189,7 @@ const AgenticSOC: React.FC = () => {
                   Avg Confidence Score
                 </p>
                 <p className="text-3xl font-bold text-gray-900 dark:text-white mt-2">
-                  {mockAgentMetrics.avgConfidenceScore}%
+                  {agentMetrics.avgConfidenceScore}%
                 </p>
               </div>
               <TrendingUp className="w-10 h-10 text-green-500 dark:text-green-400 opacity-20" />
@@ -209,7 +203,7 @@ const AgenticSOC: React.FC = () => {
                   Actions Pending
                 </p>
                 <p className="text-3xl font-bold text-gray-900 dark:text-white mt-2">
-                  {mockAgentMetrics.actionsPendingApproval}
+                  {agentMetrics.actionsPendingApproval}
                 </p>
               </div>
               <AlertCircle className="w-10 h-10 text-orange-500 dark:text-orange-400 opacity-20" />
@@ -242,7 +236,7 @@ const AgenticSOC: React.FC = () => {
             <div>
               <h2 className="text-xl font-bold text-gray-900 dark:text-white mb-6">Active Agents</h2>
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-                {mockAgents.map((agent) => (
+                {agents.map((agent) => (
                   <div
                     key={agent.id}
                     className="border border-gray-200 dark:border-gray-700 rounded-lg p-4 hover:shadow-lg dark:hover:shadow-gray-900 transition cursor-pointer"
@@ -306,7 +300,7 @@ const AgenticSOC: React.FC = () => {
               </h2>
               <div className="mb-6">
                 <ResponsiveContainer width="100%" height={300}>
-                  <LineChart data={mockTimelineData}>
+                  <LineChart data={timelineData}>
                     <CartesianGrid stroke="#e5e7eb" strokeDasharray="5 5" />
                     <XAxis stroke="#9ca3af" />
                     <YAxis stroke="#9ca3af" />
@@ -330,7 +324,7 @@ const AgenticSOC: React.FC = () => {
               </div>
 
               <div className="space-y-4">
-                {mockInvestigations.map((inv) => (
+                {investigations.map((inv) => (
                   <div
                     key={inv.id}
                     className="border border-gray-200 dark:border-gray-700 rounded-lg p-4 hover:bg-gray-50 dark:hover:bg-gray-700 transition cursor-pointer"
@@ -376,13 +370,13 @@ const AgenticSOC: React.FC = () => {
                 OODA Loop - Reasoning Chain
               </h2>
               <div className="space-y-4">
-                {mockReasoningChain.map((item, idx) => (
+                {reasoningChain.map((item, idx) => (
                   <div key={idx} className="flex gap-4">
                     <div className="flex flex-col items-center">
                       <div className="w-10 h-10 rounded-full bg-blue-600 dark:bg-blue-500 text-white flex items-center justify-center font-bold text-sm">
                         {item.step}
                       </div>
-                      {idx < mockReasoningChain.length - 1 && (
+                      {idx < reasoningChain.length - 1 && (
                         <div className="w-1 h-12 bg-blue-300 dark:bg-blue-700 mt-2"></div>
                       )}
                     </div>
@@ -442,7 +436,7 @@ const AgenticSOC: React.FC = () => {
                     </tr>
                   </thead>
                   <tbody>
-                    {mockPendingApprovals.map((approval) => (
+                    {pendingApprovals.map((approval) => (
                       <tr
                         key={approval.id}
                         className="border-b border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700"
@@ -544,7 +538,7 @@ const AgenticSOC: React.FC = () => {
               </button>
             </div>
 
-            {mockPendingApprovals
+            {pendingApprovals
               .filter((a) => a.id === approvalModal)
               .map((approval) => (
                 <div key={approval.id} className="space-y-4">

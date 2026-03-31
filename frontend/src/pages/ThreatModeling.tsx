@@ -53,11 +53,20 @@ export default function ThreatModeling() {
     { name: 'Planned', count: mitigations.filter((m: Mitigation) => m.status === 'Planned').length },
   ];
 
-  const mitigationTrend = [
-    { month: 'Jan', implemented: 3, planned: 6 },
-    { month: 'Feb', implemented: 4, planned: 5 },
-    { month: 'Mar', implemented: 5, planned: 3 },
-  ];
+  const mitigationTrend = useMemo(() => {
+    if (mitigations.length === 0) return [];
+    const grouped: Record<string, { implemented: number; planned: number }> = {};
+    mitigations.forEach((m: Mitigation) => {
+      // Group by month from the mitigation data; fall back to index-based months if no date field
+      const monthLabel = m.createdDate
+        ? new Date(m.createdDate).toLocaleDateString('en-US', { month: 'short' })
+        : 'N/A';
+      if (!grouped[monthLabel]) grouped[monthLabel] = { implemented: 0, planned: 0 };
+      if (m.status === 'Implemented') grouped[monthLabel].implemented += 1;
+      else if (m.status === 'Planned') grouped[monthLabel].planned += 1;
+    });
+    return Object.entries(grouped).map(([month, counts]) => ({ month, ...counts }));
+  }, [mitigations]);
 
   return (
     <div className="min-h-screen bg-gray-900 text-white p-8">

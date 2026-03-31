@@ -38,16 +38,26 @@ export default function WarRoom() {
     const activeRooms = warRooms.filter((r: WarRoom) => r.status === 'Active').length;
     const myActionItems = actionItems.length;
     const overdueActions = actionItems.filter((a: ActionItem) => a.status === 'Overdue').length;
-    const avgMTTR = '35m';
+    const avgMTTR = postMortems.length > 0
+      ? `${Math.round(postMortems.reduce((sum: number, pm: PostMortem) => sum + (parseInt(pm.mttr) || 0), 0) / postMortems.length)}m`
+      : '0m';
     return { activeRooms, myActionItems, overdueActions, avgMTTR };
-  }, [warRooms, actionItems]);
+  }, [warRooms, actionItems, postMortems]);
 
-  const mttrTrendData = [
-    { incident: 'Cache Failure', mttd: 8, mttr: 42 },
-    { incident: 'DNS Issue', mttd: 15, mttr: 25 },
-    { incident: 'LB Config', mttd: 5, mttr: 18 },
-    { incident: 'Avg', mttd: 9, mttr: 28 },
-  ];
+  const mttrTrendData = useMemo(() => {
+    if (postMortems.length === 0) return [];
+    const entries = postMortems.map((pm: PostMortem) => ({
+      incident: pm.title,
+      mttd: parseInt(pm.mttd) || 0,
+      mttr: parseInt(pm.mttr) || 0,
+    }));
+    if (entries.length > 1) {
+      const avgMttd = Math.round(entries.reduce((s: number, e: { mttd: number }) => s + e.mttd, 0) / entries.length);
+      const avgMttr = Math.round(entries.reduce((s: number, e: { mttr: number }) => s + e.mttr, 0) / entries.length);
+      entries.push({ incident: 'Avg', mttd: avgMttd, mttr: avgMttr });
+    }
+    return entries;
+  }, [postMortems]);
 
   const handleSendMessage = () => {
     if (newMessage.trim()) {
