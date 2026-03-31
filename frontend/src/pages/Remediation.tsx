@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { useQuery, useMutation } from '@tanstack/react-query';
 import {
   AreaChart,
@@ -293,25 +293,30 @@ export default function Remediation() {
     }
   };
 
-  // Mock data for charts
-  const executionTimelineData = [
-    { date: 'Mon', successful: 24, failed: 4 },
-    { date: 'Tue', successful: 32, failed: 2 },
-    { date: 'Wed', successful: 28, failed: 5 },
-    { date: 'Thu', successful: 35, failed: 3 },
-    { date: 'Fri', successful: 42, failed: 6 },
-    { date: 'Sat', successful: 18, failed: 2 },
-    { date: 'Sun', successful: 22, failed: 4 },
-  ];
+  // Derive chart data from executions API response
+  const executionTimelineData = useMemo(() => {
+    const executions: Execution[] = executionsData || [];
+    if (executions.length === 0) return [];
+    const grouped: Record<string, { successful: number; failed: number }> = {};
+    executions.forEach((exec) => {
+      const day = new Date(exec.time).toLocaleDateString('en-US', { weekday: 'short' });
+      if (!grouped[day]) grouped[day] = { successful: 0, failed: 0 };
+      if (exec.status === 'completed') grouped[day].successful += 1;
+      else if (exec.status === 'failed') grouped[day].failed += 1;
+    });
+    return Object.entries(grouped).map(([date, counts]) => ({ date, ...counts }));
+  }, [executionsData]);
 
-  const actionTypeData = [
-    { type: 'firewall_block', count: 145 },
-    { type: 'host_isolate', count: 89 },
-    { type: 'account_disable', count: 56 },
-    { type: 'file_quarantine', count: 72 },
-    { type: 'password_reset', count: 43 },
-    { type: 'privilege_revoke', count: 31 },
-  ];
+  const actionTypeData = useMemo(() => {
+    const executions: Execution[] = executionsData || [];
+    if (executions.length === 0) return [];
+    const counts: Record<string, number> = {};
+    executions.forEach((exec) => {
+      const type = exec.trigger || 'unknown';
+      counts[type] = (counts[type] || 0) + 1;
+    });
+    return Object.entries(counts).map(([type, count]) => ({ type, count }));
+  }, [executionsData]);
 
   // Render Dashboard Tab
   const renderDashboard = () => {

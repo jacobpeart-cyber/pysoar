@@ -54,18 +54,32 @@ export default function PhishingSimulation() {
     risk: group.avgAwarenessScore,
   }));
 
-  const awarenessData = [
-    { month: 'Jan', score: 58 },
-    { month: 'Feb', score: 62 },
-    { month: 'Mar', score: 68 },
-  ];
+  const awarenessData = useMemo(() => {
+    // Derive awareness trend from awareness scores grouped by department
+    const deptScores: Record<string, number[]> = {};
+    awarenessScores.forEach((s: AwarenessScore) => {
+      if (!deptScores[s.department]) deptScores[s.department] = [];
+      deptScores[s.department].push(s.score);
+    });
+    const depts = Object.keys(deptScores);
+    if (depts.length === 0) return [];
+    // Use departments as x-axis points with their average scores
+    return depts.map((dept) => ({
+      month: dept,
+      score: Math.round(deptScores[dept].reduce((a, b) => a + b, 0) / deptScores[dept].length),
+    }));
+  }, [awarenessScores]);
 
-  const trainingData = [
-    { id: 'TR-001', title: 'Phishing Recognition Basics', completions: 892, duration: '15 min', certification: true },
-    { id: 'TR-002', title: 'Advanced Social Engineering', completions: 450, duration: '45 min', certification: true },
-    { id: 'TR-003', title: 'Email Security Best Practices', completions: 1250, duration: '20 min', certification: false },
-    { id: 'TR-004', title: 'Password Management & MFA', completions: 1100, duration: '25 min', certification: true },
-  ];
+  const trainingData = useMemo(() => {
+    // Derive training data from templates (each template represents a training module)
+    return templates.map((t: Template, idx: number) => ({
+      id: `TR-${String(idx + 1).padStart(3, '0')}`,
+      title: t.name,
+      completions: t.used || 0,
+      duration: t.difficulty === 'Hard' ? '45 min' : t.difficulty === 'Medium' ? '25 min' : '15 min',
+      certification: t.difficulty !== 'Easy',
+    }));
+  }, [templates]);
 
   const COLORS = ['#06B6D4', '#10B981', '#F59E0B', '#EF4444', '#8B5CF6'];
 

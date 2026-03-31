@@ -287,12 +287,23 @@ function OverviewTab({
     );
   }
 
-  const maturityLevels = [
-    { level: 'traditional' as const, label: 'Traditional' },
-    { level: 'initial' as const, label: 'Initial' },
-    { level: 'advanced' as const, label: 'Advanced' },
-    { level: 'optimal' as const, label: 'Optimal' },
-  ];
+  const maturityLevels = (() => {
+    const levels: { level: MaturityLevel; label: string; pillarCount: number }[] = [
+      { level: 'traditional', label: 'Traditional', pillarCount: 0 },
+      { level: 'initial', label: 'Initial', pillarCount: 0 },
+      { level: 'advanced', label: 'Advanced', pillarCount: 0 },
+      { level: 'optimal', label: 'Optimal', pillarCount: 0 },
+    ];
+    if (data?.pillars) {
+      data.pillars.forEach((pillar) => {
+        if (pillar.score >= 90) levels[3].pillarCount += 1;
+        else if (pillar.score >= 70) levels[2].pillarCount += 1;
+        else if (pillar.score >= 40) levels[1].pillarCount += 1;
+        else levels[0].pillarCount += 1;
+      });
+    }
+    return levels;
+  })();
 
   return (
     <div className="space-y-6">
@@ -312,7 +323,10 @@ function OverviewTab({
                   : 'bg-gray-50 dark:bg-gray-700/50 border-gray-200 dark:border-gray-600 text-gray-600 dark:text-gray-400'
               )}
             >
-              {item.label}
+              <div>{item.label}</div>
+              {item.pillarCount > 0 && (
+                <div className="text-xs opacity-75 mt-1">{item.pillarCount} pillar{item.pillarCount !== 1 ? 's' : ''}</div>
+              )}
             </div>
           ))}
         </div>

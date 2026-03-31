@@ -38,29 +38,42 @@ export default function DataLakeDashboard() {
     return { activeSources, totalEventsPerSec, totalStorage, activePipelines };
   }, [sources, pipelines]);
 
-  const storageBreakdown = [
-    { name: 'Hot', value: 120, size: '120GB' },
-    { name: 'Warm', value: 450, size: '450GB' },
-    { name: 'Cold', value: 2100, size: '2.1TB' },
-    { name: 'Archived', value: 15000, size: '15TB' },
-  ];
+  const storageBreakdown = useMemo(() => {
+    // Distribute total estimated storage across tiers based on source data
+    const totalGB = sources.reduce((sum: number, s: DataSource) => sum + (s.events * 0.0002), 0) / 1000;
+    const hotPct = 0.007, warmPct = 0.025, coldPct = 0.12;
+    const hotVal = Math.round(totalGB * hotPct) || 1;
+    const warmVal = Math.round(totalGB * warmPct) || 1;
+    const coldVal = Math.round(totalGB * coldPct) || 1;
+    const archivedVal = Math.round(totalGB * (1 - hotPct - warmPct - coldPct)) || 1;
+    const fmt = (v: number) => v >= 1000 ? `${(v / 1000).toFixed(1)}TB` : `${v}GB`;
+    return [
+      { name: 'Hot', value: hotVal, size: fmt(hotVal) },
+      { name: 'Warm', value: warmVal, size: fmt(warmVal) },
+      { name: 'Cold', value: coldVal, size: fmt(coldVal) },
+      { name: 'Archived', value: archivedVal, size: fmt(archivedVal) },
+    ];
+  }, [sources]);
 
   const STORAGE_COLORS = ['#3B82F6', '#10B981', '#F59E0B', '#8B5CF6'];
 
-  const ingestTrendData = [
-    { time: '10:00', rate: 115000 },
-    { time: '11:00', rate: 128000 },
-    { time: '12:00', rate: 135000 },
-    { time: '13:00', rate: 122000 },
-    { time: '14:00', rate: 125000 },
-  ];
+  const ingestTrendData = useMemo(() => {
+    // Build trend from individual source ingestion rates
+    if (sources.length === 0) return [];
+    const baseRate = sources.reduce((sum: number, s: DataSource) => sum + s.ingestionRate, 0);
+    return ['10:00', '11:00', '12:00', '13:00', '14:00'].map((time, i) => ({
+      time,
+      rate: Math.round(baseRate * (0.9 + (i % 3) * 0.05)),
+    }));
+  }, [sources]);
 
-  const pipelineHealthData = [
-    { pipeline: 'ETL', success: 99.8, failure: 0.2 },
-    { pipeline: 'Quality', success: 98.5, failure: 1.5 },
-    { pipeline: 'Aggregation', success: 100, failure: 0 },
-    { pipeline: 'ML Features', success: 97.2, failure: 2.8 },
-  ];
+  const pipelineHealthData = useMemo(() => {
+    return pipelines.map((p: Pipeline) => ({
+      pipeline: p.name,
+      success: p.successRate,
+      failure: Math.round((100 - p.successRate) * 10) / 10,
+    }));
+  }, [pipelines]);
 
   return (
     <div className="min-h-screen bg-gray-900 text-white p-8">
@@ -445,32 +458,40 @@ Rows returned: 1,250,400`}
             </div>
 
             <div className="space-y-4">
-              {storageBreakdown.map((tier, idx) => (
-                <div key={tier.name} className="bg-gray-800 border border-gray-700 rounded-lg p-4 dark:bg-gray-800 dark:border-gray-700">
-                  <div className="flex items-start justify-between mb-2">
-                    <h4 className="font-semibold text-white">{tier.name} Storage</h4>
-                    <span className="text-sm text-gray-400">{tier.size}</span>
-                  </div>
-                  <div className="flex justify-between text-xs text-gray-500 mb-2">
-                    <span>Capacity Used</span>
-                    <span>{Math.round((tier.value / 17670) * 100)}%</span>
-                  </div>
-                  <div className="w-full h-2 bg-gray-700 rounded-full dark:bg-gray-700">
-                    <div
-                      className="h-full rounded-full"
-                      style={{
-                        backgroundColor: STORAGE_COLORS[idx],
-                        width: `${Math.round((tier.value / 17670) * 100)}%`,
-                      }}
-                    />
-                  </div>
-                </div>
-              ))}
+              {(() => {
+                const totalValue = storageBreakdown.reduce((sum, t) => sum + t.value, 0) || 1;
+                const totalLabel = totalValue >= 1000 ? `${(totalValue / 1000).toFixed(2)} TB` : `${totalValue} GB`;
+                return (
+                  <>
+                    {storageBreakdown.map((tier, idx) => (
+                      <div key={tier.name} className="bg-gray-800 border border-gray-700 rounded-lg p-4 dark:bg-gray-800 dark:border-gray-700">
+                        <div className="flex items-start justify-between mb-2">
+                          <h4 className="font-semibold text-white">{tier.name} Storage</h4>
+                          <span className="text-sm text-gray-400">{tier.size}</span>
+                        </div>
+                        <div className="flex justify-between text-xs text-gray-500 mb-2">
+                          <span>Capacity Used</span>
+                          <span>{Math.round((tier.value / totalValue) * 100)}%</span>
+                        </div>
+                        <div className="w-full h-2 bg-gray-700 rounded-full dark:bg-gray-700">
+                          <div
+                            className="h-full rounded-full"
+                            style={{
+                              backgroundColor: STORAGE_COLORS[idx],
+                              width: `${Math.round((tier.value / totalValue) * 100)}%`,
+                            }}
+                          />
+                        </div>
+                      </div>
+                    ))}
 
-              <div className="bg-gray-700/50 rounded-lg p-4 mt-4">
-                <p className="text-sm text-gray-400 mb-2">Total Capacity</p>
-                <p className="text-3xl font-bold text-emerald-400">17.67 TB</p>
-              </div>
+                    <div className="bg-gray-700/50 rounded-lg p-4 mt-4">
+                      <p className="text-sm text-gray-400 mb-2">Total Capacity</p>
+                      <p className="text-3xl font-bold text-emerald-400">{totalLabel}</p>
+                    </div>
+                  </>
+                );
+              })()}
             </div>
           </div>
         )}

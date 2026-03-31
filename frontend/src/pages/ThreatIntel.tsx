@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useMemo } from 'react';
 import { useQuery, useMutation } from '@tanstack/react-query';
 import {
   Search,
@@ -59,13 +59,23 @@ interface ThreatStats {
   last_update: string | null;
 }
 
-const indicatorTypes = [
+const defaultIndicatorTypes = [
   { value: 'ip', label: 'IP Address', icon: Server },
   { value: 'domain', label: 'Domain', icon: Globe },
   { value: 'url', label: 'URL', icon: ExternalLink },
   { value: 'hash', label: 'File Hash', icon: Hash },
   { value: 'email', label: 'Email', icon: Mail },
 ];
+
+const indicatorTypeIcons: Record<string, typeof Server> = {
+  ip: Server,
+  domain: Globe,
+  url: ExternalLink,
+  hash: Hash,
+  email: Mail,
+  file: FileText,
+  process: Activity,
+};
 
 export default function ThreatIntel() {
   const [searchQuery, setSearchQuery] = useState('');
@@ -79,6 +89,30 @@ export default function ThreatIntel() {
       return response.data;
     },
   });
+
+  const { data: indicatorsData } = useQuery<{ items: Array<{ ioc_type: string }> }>({
+    queryKey: ['threat-intel', 'indicators'],
+    queryFn: async () => {
+      const response = await api.get('/threat-intel/indicators', { params: { size: 1000 } });
+      return response.data;
+    },
+  });
+
+  const indicatorTypes = useMemo(() => {
+    const items = indicatorsData?.items;
+    if (!items || items.length === 0) return defaultIndicatorTypes;
+    const typeCounts: Record<string, number> = {};
+    items.forEach((item) => {
+      const t = item.ioc_type || 'unknown';
+      typeCounts[t] = (typeCounts[t] || 0) + 1;
+    });
+    return Object.entries(typeCounts).map(([value, count]) => ({
+      value,
+      label: value.charAt(0).toUpperCase() + value.slice(1),
+      icon: indicatorTypeIcons[value] || Activity,
+      count,
+    }));
+  }, [indicatorsData]);
 
   const { data: feeds, refetch: refetchFeeds } = useQuery<ThreatFeed[]>({
     queryKey: ['threat-intel', 'feeds'],
