@@ -232,21 +232,21 @@ async def verify_evidence_integrity(
 async def list_evidence_items(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
+    evidence_type: Optional[str] = None,
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=500),
 ):
     """List evidence items"""
     try:
-        # Placeholder: Would query evidence items from database
-        return [
-            {
-                "evidence_id": f"ev_{i}",
-                "type": "scan_result",
-                "source": "STIG",
-                "collected_at": datetime.now(timezone.utc).isoformat(),
-            }
-            for i in range(limit)
-        ]
+        query = select(AutomatedEvidenceRule).where(
+            AutomatedEvidenceRule.organization_id == current_user.organization_id
+        )
+        if evidence_type:
+            query = query.where(AutomatedEvidenceRule.rule_type == evidence_type)
+        query = query.offset(skip).limit(limit)
+        result = await db.execute(query)
+        items = result.scalars().all()
+        return list(items)
     except Exception as e:
         logger.error(f"Error listing evidence: {str(e)}")
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
