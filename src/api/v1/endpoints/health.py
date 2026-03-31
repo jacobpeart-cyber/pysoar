@@ -16,7 +16,7 @@ router = APIRouter(tags=["Health"])
 async def health_check():
     """
     Health check endpoint for load balancers.
-    Verifies actual database and Redis connectivity.
+    Returns minimal status only (no internal details).
     """
     db_ok = False
     redis_ok = False
@@ -38,11 +38,7 @@ async def health_check():
         pass
 
     status = "healthy" if (db_ok and redis_ok) else "degraded"
-    return {
-        "status": status,
-        "database": "connected" if db_ok else "disconnected",
-        "redis": "connected" if redis_ok else "disconnected",
-    }
+    return {"status": status}
 
 
 @router.get("/health/detailed", response_model=HealthResponse)
