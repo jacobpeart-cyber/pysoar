@@ -263,63 +263,44 @@ async def aggregate_logs(
     }
 
 
-@router.get("/logs/{log_id}", response_model=LogEntryResponse)
-async def get_log(
-    log_id: str,
-    current_user: CurrentUser = None,
-    db: DatabaseSession = None,
-):
-    """Get a log entry by ID"""
-    log_entry = await get_log_or_404(db, log_id)
-    return LogEntryResponse.model_validate(log_entry)
-
-
 @router.get("/logs/stats", response_model=SIEMStatsResponse)
 async def get_siem_stats(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Get SIEM statistics"""
-    # Total logs
     total_result = await db.execute(select(func.count(LogEntry.id)))
     total_logs = total_result.scalar() or 0
 
-    # Logs today (simplified)
     logs_today_result = await db.execute(select(func.count(LogEntry.id)))
     logs_today = logs_today_result.scalar() or 0
 
-    # By type
     type_result = await db.execute(
         select(LogEntry.log_type, func.count(LogEntry.id))
         .group_by(LogEntry.log_type)
     )
     logs_by_type = dict(type_result.all())
 
-    # By severity
     severity_result = await db.execute(
         select(LogEntry.severity, func.count(LogEntry.id))
         .group_by(LogEntry.severity)
     )
     logs_by_severity = dict(severity_result.all())
 
-    # By source
     source_result = await db.execute(
         select(LogEntry.source_name, func.count(LogEntry.id))
         .group_by(LogEntry.source_name)
     )
     logs_by_source = dict(source_result.all())
 
-    # Active rules
     rules_result = await db.execute(
         select(func.count(DetectionRule.id)).where(DetectionRule.enabled == True)
     )
     active_rules = rules_result.scalar() or 0
 
-    # Rule matches today
     matches_result = await db.execute(select(func.sum(DetectionRule.match_count)))
     rule_matches_today = matches_result.scalar() or 0
 
-    # Active correlations
     corr_result = await db.execute(select(func.count(CorrelationEvent.id)))
     active_correlations = corr_result.scalar() or 0
 
@@ -334,6 +315,17 @@ async def get_siem_stats(
         active_correlations=active_correlations,
         ingestion_rate_per_hour=0.0,
     )
+
+
+@router.get("/logs/{log_id}", response_model=LogEntryResponse)
+async def get_log(
+    log_id: str,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+):
+    """Get a log entry by ID"""
+    log_entry = await get_log_or_404(db, log_id)
+    return LogEntryResponse.model_validate(log_entry)
 
 
 # ============================================================================
