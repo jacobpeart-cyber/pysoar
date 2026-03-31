@@ -72,7 +72,7 @@ export default function SIEMDashboard() {
   const { data: stats, isLoading: statsLoading } = useQuery({
     queryKey: ['siem-stats'],
     queryFn: async () => {
-      const response = await api.get('/siem/stats');
+      const response = await api.get('/siem/logs/stats');
       return response.data;
     },
   });
@@ -82,10 +82,9 @@ export default function SIEMDashboard() {
     queryKey: ['siem-logs', searchQuery, timeRange, sourceTypeFilter, severityFilter, searchPage],
     queryFn: async () => {
       const response = await api.post('/siem/logs/search', {
-        query: searchQuery,
-        time_range: timeRange,
-        source_type: sourceTypeFilter,
-        severity: severityFilter,
+        query: searchQuery || undefined,
+        source_types: sourceTypeFilter ? [sourceTypeFilter] : undefined,
+        severities: severityFilter ? [severityFilter] : undefined,
         page: searchPage,
         size: 15,
       });
@@ -108,7 +107,7 @@ export default function SIEMDashboard() {
   const { data: sourcesData, isLoading: sourcesLoading } = useQuery({
     queryKey: ['siem-sources'],
     queryFn: async () => {
-      const response = await api.get('/siem/data-sources');
+      const response = await api.get('/siem/sources');
       return response.data;
     },
     enabled: activeTab === 'sources',
@@ -143,8 +142,8 @@ export default function SIEMDashboard() {
   const logs = logsData?.items || [];
   const logTotal = logsData?.total || 0;
   const rules = rulesData?.items || [];
-  const sources = sourcesData?.items || [];
-  const correlations = correlationsData?.items || [];
+  const sources = Array.isArray(sourcesData) ? sourcesData : (sourcesData?.items || []);
+  const correlations = Array.isArray(correlationsData) ? correlationsData : (correlationsData?.items || []);
 
   const logPages = Math.ceil(logTotal / 15);
 
