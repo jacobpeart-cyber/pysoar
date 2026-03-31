@@ -339,8 +339,15 @@ async def list_target_groups(
 ):
     """List all target groups."""
     try:
-        # In real implementation, would query from database
-        return []
+        from src.phishing_sim.models import TargetGroup
+        query = select(TargetGroup).where(
+            TargetGroup.organization_id == current_user.organization_id
+        )
+        if department:
+            query = query.where(TargetGroup.department == department)
+        query = query.offset(skip).limit(limit)
+        result = await db.execute(query)
+        return list(result.scalars().all())
 
     except Exception as e:
         logger.error(f"Failed to list target groups: {e}")
