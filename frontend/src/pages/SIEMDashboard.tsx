@@ -67,6 +67,7 @@ export default function SIEMDashboard() {
   const [selectedLogDetail, setSelectedLogDetail] = useState<any>(null);
   const [ruleStatusFilter, setRuleStatusFilter] = useState('');
   const [selectedRule, setSelectedRule] = useState<any>(null);
+  const [selectedSource, setSelectedSource] = useState<any>(null);
 
   // Fetch dashboard stats
   const { data: stats, isLoading: statsLoading } = useQuery({
@@ -774,17 +775,15 @@ export default function SIEMDashboard() {
                       <Server className="w-6 h-6 text-blue-600" />
                       <div>
                         <h3 className="font-semibold text-gray-900">{source.name}</h3>
-                        <p className="text-sm text-gray-500">{source.type}</p>
+                        <p className="text-sm text-gray-500">{source.source_type || source.type}</p>
                       </div>
                     </div>
                     <div
                       className={clsx(
                         'w-3 h-3 rounded-full',
-                        source.status === 'connected'
+                        source.enabled !== false
                           ? 'bg-green-500'
-                          : source.status === 'error'
-                            ? 'bg-red-500'
-                            : 'bg-gray-400'
+                          : 'bg-gray-400'
                       )}
                     />
                   </div>
@@ -795,37 +794,150 @@ export default function SIEMDashboard() {
                       <span
                         className={clsx(
                           'px-2 py-1 text-xs font-medium rounded-full capitalize',
-                          sourceStatusColors[source.status] || sourceStatusColors.disabled
+                          source.enabled !== false
+                            ? 'bg-green-100 text-green-700'
+                            : 'bg-gray-100 text-gray-700'
                         )}
                       >
-                        {source.status}
+                        {source.enabled !== false ? 'Connected' : 'Disabled'}
                       </span>
                     </div>
 
                     <div className="flex items-center justify-between">
-                      <span className="text-sm text-gray-600">Events/sec</span>
-                      <span className="text-sm font-medium text-gray-900">{source.events_per_sec || 0}</span>
+                      <span className="text-sm text-gray-600">Events Today</span>
+                      <span className="text-sm font-medium text-gray-900">{source.events_today || 0}</span>
                     </div>
 
                     <div className="flex items-center justify-between">
                       <span className="text-sm text-gray-600">Last Event</span>
                       <span className="text-sm text-gray-600">
-                        {source.last_event ? new Date(source.last_event).toLocaleTimeString() : '-'}
+                        {source.last_event_at ? new Date(source.last_event_at).toLocaleTimeString() : '-'}
                       </span>
                     </div>
+
+                    {source.description && (
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm text-gray-600">Description</span>
+                        <span className="text-sm text-gray-600 truncate max-w-[200px]">{source.description}</span>
+                      </div>
+                    )}
+
+                    {source.error_count > 0 && (
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm text-red-600">Errors</span>
+                        <span className="text-sm font-medium text-red-600">{source.error_count}</span>
+                      </div>
+                    )}
                   </div>
 
                   <div className="mt-4 flex gap-2">
-                    <button className="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-sm font-medium text-gray-700 hover:bg-gray-50">
+                    <button
+                      onClick={() => setSelectedSource(source)}
+                      className="flex-1 px-3 py-2 border border-gray-300 rounded-lg text-sm font-medium text-gray-700 hover:bg-gray-50"
+                    >
                       Config
                     </button>
-                    <button className="flex-1 px-3 py-2 bg-blue-50 text-blue-600 rounded-lg text-sm font-medium hover:bg-blue-100">
+                    <button
+                      onClick={() => setSelectedSource(source)}
+                      className="flex-1 px-3 py-2 bg-blue-50 text-blue-600 rounded-lg text-sm font-medium hover:bg-blue-100"
+                    >
                       View
                     </button>
                   </div>
                 </div>
               ))}
             </div>
+
+            {/* Source Detail/Config Modal */}
+            {selectedSource && (
+              <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50">
+                <div className="bg-white rounded-lg shadow-xl w-full max-w-2xl mx-4 max-h-[80vh] overflow-y-auto">
+                  <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200 sticky top-0 bg-white">
+                    <h2 className="text-lg font-semibold text-gray-900">Data Source: {selectedSource.name}</h2>
+                    <button onClick={() => setSelectedSource(null)} className="text-gray-400 hover:text-gray-600">
+                      ✕
+                    </button>
+                  </div>
+                  <div className="p-6 space-y-6">
+                    <div className="grid grid-cols-2 gap-4">
+                      <div>
+                        <label className="block text-sm font-medium text-gray-500 mb-1">Name</label>
+                        <p className="text-gray-900 font-medium">{selectedSource.name}</p>
+                      </div>
+                      <div>
+                        <label className="block text-sm font-medium text-gray-500 mb-1">Type</label>
+                        <p className="text-gray-900">{selectedSource.source_type || selectedSource.type}</p>
+                      </div>
+                      <div>
+                        <label className="block text-sm font-medium text-gray-500 mb-1">Status</label>
+                        <span className={clsx('px-2 py-1 text-xs font-medium rounded-full', selectedSource.enabled !== false ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-700')}>
+                          {selectedSource.enabled !== false ? 'Connected' : 'Disabled'}
+                        </span>
+                      </div>
+                      <div>
+                        <label className="block text-sm font-medium text-gray-500 mb-1">Events Today</label>
+                        <p className="text-gray-900">{selectedSource.events_today || 0}</p>
+                      </div>
+                    </div>
+                    {selectedSource.description && (
+                      <div>
+                        <label className="block text-sm font-medium text-gray-500 mb-1">Description</label>
+                        <p className="text-gray-900 text-sm">{selectedSource.description}</p>
+                      </div>
+                    )}
+                    <div>
+                      <label className="block text-sm font-medium text-gray-500 mb-1">Created</label>
+                      <p className="text-gray-900 text-sm">{selectedSource.created_at ? new Date(selectedSource.created_at).toLocaleString() : '-'}</p>
+                    </div>
+                    {selectedSource.last_error && (
+                      <div>
+                        <label className="block text-sm font-medium text-gray-500 mb-1">Last Error</label>
+                        <p className="text-red-600 text-sm bg-red-50 p-3 rounded">{selectedSource.last_error}</p>
+                      </div>
+                    )}
+                    <div className="border-t pt-4">
+                      <h3 className="text-sm font-semibold text-gray-900 mb-3">Configuration</h3>
+                      <div className="bg-gray-50 rounded-lg p-4">
+                        <div className="grid grid-cols-2 gap-3 text-sm">
+                          <div>
+                            <span className="text-gray-500">Source ID:</span>
+                            <span className="ml-2 font-mono text-gray-700">{selectedSource.id}</span>
+                          </div>
+                          <div>
+                            <span className="text-gray-500">Error Count:</span>
+                            <span className="ml-2 text-gray-700">{selectedSource.error_count || 0}</span>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                    <div className="flex gap-3 pt-2">
+                      <button
+                        onClick={async () => {
+                          try {
+                            await api.put(`/siem/sources/${selectedSource.id}`, { enabled: !selectedSource.enabled });
+                            setSelectedSource(null);
+                          } catch {}
+                        }}
+                        className={clsx(
+                          'flex-1 px-4 py-2 rounded-lg text-sm font-medium',
+                          selectedSource.enabled !== false
+                            ? 'bg-red-50 text-red-600 hover:bg-red-100'
+                            : 'bg-green-50 text-green-600 hover:bg-green-100'
+                        )}
+                      >
+                        {selectedSource.enabled !== false ? 'Disable Source' : 'Enable Source'}
+                      </button>
+                      <button
+                        onClick={() => setSelectedSource(null)}
+                        className="flex-1 px-4 py-2 bg-gray-100 text-gray-700 rounded-lg text-sm font-medium hover:bg-gray-200"
+                      >
+                        Close
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
           )}
         </div>
       )}
