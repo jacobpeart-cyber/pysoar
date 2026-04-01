@@ -344,7 +344,17 @@ export default function Profile() {
               </div>
               <div className="flex items-center gap-2">
                 <span className="text-sm text-gray-500">Not enabled</span>
-                <button className="px-4 py-2 text-sm text-blue-600 hover:text-blue-700">
+                <button
+                  onClick={async () => {
+                    try {
+                      await api.post('/auth/mfa/enable');
+                      alert('Two-factor authentication setup initiated. Check your email for the QR code.');
+                    } catch (err) {
+                      console.error('MFA enable failed:', err);
+                    }
+                  }}
+                  className="px-4 py-2 text-sm text-blue-600 hover:text-blue-700"
+                >
                   Enable
                 </button>
               </div>

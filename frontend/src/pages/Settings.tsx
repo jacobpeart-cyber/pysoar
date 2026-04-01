@@ -156,6 +156,18 @@ export default function Settings() {
 }
 
 function GeneralSettings({ settings }: { settings: SettingsData['general'] }) {
+  const queryClient = useQueryClient();
+  const [formData, setFormData] = useState(settings);
+  const saveMutation = useMutation({
+    mutationFn: async (data: typeof formData) => {
+      const response = await api.patch('/settings/general', data);
+      return response.data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['settings'] });
+    },
+  });
+
   return (
     <div className="space-y-6">
       <div>
@@ -168,14 +180,16 @@ function GeneralSettings({ settings }: { settings: SettingsData['general'] }) {
           <label className="block text-sm font-medium text-gray-700">Application Name</label>
           <input
             type="text"
-            defaultValue={settings.app_name}
+            value={formData.app_name}
+            onChange={(e) => setFormData({ ...formData, app_name: e.target.value })}
             className="mt-1 block w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
           />
         </div>
         <div>
           <label className="block text-sm font-medium text-gray-700">Timezone</label>
           <select
-            defaultValue={settings.timezone}
+            value={formData.timezone}
+            onChange={(e) => setFormData({ ...formData, timezone: e.target.value })}
             className="mt-1 block w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
           >
             <option value="UTC">UTC</option>
@@ -188,7 +202,8 @@ function GeneralSettings({ settings }: { settings: SettingsData['general'] }) {
         <div>
           <label className="block text-sm font-medium text-gray-700">Date Format</label>
           <select
-            defaultValue={settings.date_format}
+            value={formData.date_format}
+            onChange={(e) => setFormData({ ...formData, date_format: e.target.value })}
             className="mt-1 block w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
           >
             <option value="YYYY-MM-DD">YYYY-MM-DD</option>
@@ -199,7 +214,8 @@ function GeneralSettings({ settings }: { settings: SettingsData['general'] }) {
         <div>
           <label className="block text-sm font-medium text-gray-700">Time Format</label>
           <select
-            defaultValue={settings.time_format}
+            value={formData.time_format}
+            onChange={(e) => setFormData({ ...formData, time_format: e.target.value })}
             className="mt-1 block w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
           >
             <option value="HH:mm:ss">24-hour (HH:mm:ss)</option>
@@ -209,8 +225,12 @@ function GeneralSettings({ settings }: { settings: SettingsData['general'] }) {
       </div>
 
       <div className="flex justify-end pt-4 border-t border-gray-200">
-        <button className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700">
-          <Save className="w-4 h-4" />
+        <button
+          onClick={() => saveMutation.mutate(formData)}
+          disabled={saveMutation.isPending}
+          className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
+        >
+          {saveMutation.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
           Save Changes
         </button>
       </div>
@@ -219,6 +239,18 @@ function GeneralSettings({ settings }: { settings: SettingsData['general'] }) {
 }
 
 function NotificationSettings({ settings }: { settings: SettingsData['notifications'] }) {
+  const queryClient = useQueryClient();
+  const [formData, setFormData] = useState(settings);
+  const saveMutation = useMutation({
+    mutationFn: async (data: typeof formData) => {
+      const response = await api.patch('/settings/notifications', data);
+      return response.data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['settings'] });
+    },
+  });
+
   return (
     <div className="space-y-6">
       <div>
@@ -235,7 +267,8 @@ function NotificationSettings({ settings }: { settings: SettingsData['notificati
           <label className="relative inline-flex items-center cursor-pointer">
             <input
               type="checkbox"
-              defaultChecked={settings.email_enabled}
+              checked={formData.email_enabled}
+              onChange={(e) => setFormData({ ...formData, email_enabled: e.target.checked })}
               className="sr-only peer"
             />
             <div className="w-11 h-6 bg-gray-200 peer-focus:ring-2 peer-focus:ring-blue-500 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600"></div>
@@ -248,7 +281,7 @@ function NotificationSettings({ settings }: { settings: SettingsData['notificati
             <p className="text-sm text-gray-500">Send alerts to a Slack channel</p>
           </div>
           <div className="flex items-center gap-2">
-            {settings.slack_enabled ? (
+            {formData.slack_enabled ? (
               <span className="flex items-center gap-1 text-sm text-green-600">
                 <CheckCircle className="w-4 h-4" /> Connected
               </span>
@@ -266,7 +299,7 @@ function NotificationSettings({ settings }: { settings: SettingsData['notificati
             <p className="text-sm text-gray-500">Send alerts to a Teams channel</p>
           </div>
           <div className="flex items-center gap-2">
-            {settings.teams_enabled ? (
+            {formData.teams_enabled ? (
               <span className="flex items-center gap-1 text-sm text-green-600">
                 <CheckCircle className="w-4 h-4" /> Connected
               </span>
@@ -280,8 +313,12 @@ function NotificationSettings({ settings }: { settings: SettingsData['notificati
       </div>
 
       <div className="flex justify-end pt-4 border-t border-gray-200">
-        <button className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700">
-          <Save className="w-4 h-4" />
+        <button
+          onClick={() => saveMutation.mutate(formData)}
+          disabled={saveMutation.isPending}
+          className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
+        >
+          {saveMutation.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
           Save Changes
         </button>
       </div>
@@ -372,7 +409,16 @@ function EmailSettings({
           )}
           Test Connection
         </button>
-        <button className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700">
+        <button
+          onClick={async () => {
+            try {
+              await api.patch('/settings/smtp', settings);
+            } catch (err) {
+              console.error('Failed to save SMTP settings:', err);
+            }
+          }}
+          className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+        >
           <Save className="w-4 h-4" />
           Save Changes
         </button>
@@ -913,6 +959,17 @@ function SecuritySettings({
   settings: SettingsData['alert_correlation'];
   general: SettingsData['general'];
 }) {
+  const queryClient = useQueryClient();
+  const saveMutation = useMutation({
+    mutationFn: async () => {
+      const response = await api.patch('/settings/security', { alert_correlation: settings, general });
+      return response.data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['settings'] });
+    },
+  });
+
   return (
     <div className="space-y-6">
       <div>
@@ -1004,8 +1061,12 @@ function SecuritySettings({
       </div>
 
       <div className="flex justify-end pt-4 border-t border-gray-200">
-        <button className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700">
-          <Save className="w-4 h-4" />
+        <button
+          onClick={() => saveMutation.mutate()}
+          disabled={saveMutation.isPending}
+          className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
+        >
+          {saveMutation.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
           Save Changes
         </button>
       </div>

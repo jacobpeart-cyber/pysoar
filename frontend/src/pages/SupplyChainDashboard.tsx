@@ -57,6 +57,10 @@ export default function SupplyChainDashboard() {
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
   const [showNewComponentModal, setShowNewComponentModal] = useState(false);
+  const [selectedSBOM, setSelectedSBOM] = useState<any | null>(null);
+  const [selectedComponent, setSelectedComponent] = useState<any | null>(null);
+  const [selectedVendor, setSelectedVendor] = useState<any | null>(null);
+  const [showFilter, setShowFilter] = useState(false);
 
   React.useEffect(() => {
     const loadData = async () => {
@@ -221,13 +225,35 @@ export default function SupplyChainDashboard() {
                         />
                       </div>
                       <div className="flex gap-2">
-                        <button className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                        <button
+                          onClick={() => setSelectedSBOM(sbom)}
+                          className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                        >
                           View
                         </button>
-                        <button className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                        <button
+                          onClick={async () => {
+                            try {
+                              const res = await supplychainApi.getSBOMs();
+                              const blob = new Blob([JSON.stringify(res.data?.find((s: any) => s.id === sbom.id) || sbom, null, 2)], { type: 'application/json' });
+                              const url = URL.createObjectURL(blob);
+                              const a = document.createElement('a');
+                              a.href = url;
+                              a.download = `${sbom.name}-sbom.json`;
+                              a.click();
+                              URL.revokeObjectURL(url);
+                            } catch (err) {
+                              console.error('Error downloading SBOM:', err);
+                            }
+                          }}
+                          className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                        >
                           Download
                         </button>
-                        <button className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                        <button
+                          onClick={() => setSelectedSBOM(sbom)}
+                          className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                        >
                           Edit
                         </button>
                       </div>
@@ -251,7 +277,10 @@ export default function SupplyChainDashboard() {
                       className="w-full pl-10 pr-4 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
                     />
                   </div>
-                  <button className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                  <button
+                    onClick={() => setShowFilter((prev) => !prev)}
+                    className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                  >
                     <Filter className="w-4 h-4" />
                     Filter
                   </button>
@@ -286,10 +315,16 @@ export default function SupplyChainDashboard() {
                           </td>
                           <td className="px-6 py-4 text-sm font-mono text-gray-600 dark:text-gray-400">{comp.latestVersion}</td>
                           <td className="px-6 py-4 text-sm flex gap-2">
-                            <button className="text-blue-600 dark:text-blue-400 hover:underline">
+                            <button
+                              onClick={() => setSelectedComponent(comp)}
+                              className="text-blue-600 dark:text-blue-400 hover:underline"
+                            >
                               <Eye className="w-4 h-4" />
                             </button>
-                            <button className="text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100">
+                            <button
+                              onClick={() => setSelectedComponent(comp)}
+                              className="text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100"
+                            >
                               <Edit className="w-4 h-4" />
                             </button>
                           </td>
@@ -413,7 +448,10 @@ export default function SupplyChainDashboard() {
                         <div className="pt-2 border-t border-gray-200 dark:border-gray-700">
                           <p className="text-xs text-gray-600 dark:text-gray-400">Last Audit: {vendor.lastAudit}</p>
                         </div>
-                        <button className="w-full px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                        <button
+                          onClick={() => setSelectedVendor(vendor)}
+                          className="w-full px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                        >
                           View Full Assessment
                         </button>
                       </div>

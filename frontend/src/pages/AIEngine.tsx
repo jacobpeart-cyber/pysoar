@@ -405,7 +405,16 @@ export default function AIEngine() {
             </table>
           </div>
 
-          <button className="px-4 py-2 rounded-lg bg-blue-600 dark:bg-blue-700 text-white hover:bg-blue-700 dark:hover:bg-blue-600 font-medium transition-colors">
+          <button
+            onClick={async () => {
+              try {
+                await api.post('/ai/alerts/triage');
+              } catch (err) {
+                console.error('Triage failed:', err);
+              }
+            }}
+            className="px-4 py-2 rounded-lg bg-blue-600 dark:bg-blue-700 text-white hover:bg-blue-700 dark:hover:bg-blue-600 font-medium transition-colors"
+          >
             Triage Pending Alerts
           </button>
         </div>
@@ -615,7 +624,16 @@ export default function AIEngine() {
       {/* ML Models Tab */}
       {activeTab === 'models' && (
         <div className="space-y-6">
-          <button className="px-4 py-2 rounded-lg bg-blue-600 dark:bg-blue-700 text-white hover:bg-blue-700 dark:hover:bg-blue-600 font-medium transition-colors">
+          <button
+            onClick={async () => {
+              try {
+                await api.post('/ai/models/train');
+              } catch (err) {
+                console.error('Training failed:', err);
+              }
+            }}
+            className="px-4 py-2 rounded-lg bg-blue-600 dark:bg-blue-700 text-white hover:bg-blue-700 dark:hover:bg-blue-600 font-medium transition-colors"
+          >
             Train New Model
           </button>
 

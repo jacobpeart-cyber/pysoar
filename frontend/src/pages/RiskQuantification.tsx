@@ -61,6 +61,9 @@ export default function RiskQuantification() {
   const [error, setError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [showNewScenarioModal, setShowNewScenarioModal] = useState(false);
+  const [selectedScenario, setSelectedScenario] = useState<any | null>(null);
+  const [selectedControl, setSelectedControl] = useState<any | null>(null);
+  const [showFilter, setShowFilter] = useState(false);
 
   React.useEffect(() => {
     const loadData = async () => {
@@ -125,7 +128,18 @@ export default function RiskQuantification() {
             <h1 className="text-3xl font-bold">Risk Quantification</h1>
           </div>
           <div className="flex items-center gap-3">
-            <button className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+            <button
+              onClick={() => {
+                const blob = new Blob([JSON.stringify(scenarios, null, 2)], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'risk-quantification-export.json';
+                a.click();
+                URL.revokeObjectURL(url);
+              }}
+              className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+            >
               <Download className="w-4 h-4" />
               Export
             </button>
@@ -223,7 +237,10 @@ export default function RiskQuantification() {
                       className="w-full pl-10 pr-4 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
                     />
                   </div>
-                  <button className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                  <button
+                    onClick={() => setShowFilter((prev) => !prev)}
+                    className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                  >
                     <Filter className="w-4 h-4" />
                     Filter
                   </button>
@@ -285,10 +302,16 @@ export default function RiskQuantification() {
                               </td>
                               <td className="px-6 py-4 text-sm">{scenario.controls?.length || scenario.controlCount || 0}</td>
                               <td className="px-6 py-4 text-sm flex gap-2">
-                                <button className="text-blue-600 dark:text-blue-400 hover:underline">
+                                <button
+                                  onClick={() => setSelectedScenario(scenario)}
+                                  className="text-blue-600 dark:text-blue-400 hover:underline"
+                                >
                                   <Eye className="w-4 h-4" />
                                 </button>
-                                <button className="text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100">
+                                <button
+                                  onClick={() => setSelectedScenario(scenario)}
+                                  className="text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100"
+                                >
                                   <Edit className="w-4 h-4" />
                                 </button>
                               </td>
@@ -395,7 +418,19 @@ export default function RiskQuantification() {
                     <Activity className="w-4 h-4" />
                     Run Monte Carlo Simulation
                   </button>
-                  <button className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                  <button
+                    onClick={() => {
+                      const data = { scenarios, analysisResults };
+                      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+                      const url = URL.createObjectURL(blob);
+                      const a = document.createElement('a');
+                      a.href = url;
+                      a.download = 'risk-analysis-export.json';
+                      a.click();
+                      URL.revokeObjectURL(url);
+                    }}
+                    className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                  >
                     <Download className="w-4 h-4" />
                     Export Analysis
                   </button>
@@ -417,7 +452,10 @@ export default function RiskQuantification() {
                       className="w-full pl-10 pr-4 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
                     />
                   </div>
-                  <button className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                  <button
+                    onClick={() => setShowFilter((prev) => !prev)}
+                    className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                  >
                     <Filter className="w-4 h-4" />
                     Filter
                   </button>
@@ -472,13 +510,22 @@ export default function RiskQuantification() {
                               </div>
                             </div>
                             <div className="flex gap-2 mt-4">
-                              <button className="flex-1 px-3 py-2 text-sm bg-emerald-600 hover:bg-emerald-700 text-white rounded transition">
+                              <button
+                                onClick={() => { setSelectedScenario(risk); setActiveTab('analysis'); }}
+                                className="flex-1 px-3 py-2 text-sm bg-emerald-600 hover:bg-emerald-700 text-white rounded transition"
+                              >
                                 View Analysis
                               </button>
-                              <button className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                              <button
+                                onClick={() => setSelectedScenario(risk)}
+                                className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                              >
                                 Edit Risk
                               </button>
-                              <button className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                              <button
+                                onClick={() => { setSelectedScenario(risk); setActiveTab('controls'); }}
+                                className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                              >
                                 Add Control
                               </button>
                             </div>
@@ -576,10 +623,16 @@ export default function RiskQuantification() {
                               </span>
                             </td>
                             <td className="px-6 py-4 text-sm flex gap-2">
-                              <button className="text-blue-600 dark:text-blue-400 hover:underline">
+                              <button
+                                onClick={() => setSelectedControl(control)}
+                                className="text-blue-600 dark:text-blue-400 hover:underline"
+                              >
                                 <Eye className="w-4 h-4" />
                               </button>
-                              <button className="text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100">
+                              <button
+                                onClick={() => setSelectedControl(control)}
+                                className="text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100"
+                              >
                                 <Edit className="w-4 h-4" />
                               </button>
                             </td>

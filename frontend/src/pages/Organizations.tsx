@@ -259,6 +259,32 @@ function OrganizationsList({
 
 function TeamsList() {
   const queryClient = useQueryClient();
+  const [editingTeam, setEditingTeam] = useState<Team | null>(null);
+  const [editName, setEditName] = useState('');
+  const [editDescription, setEditDescription] = useState('');
+  const [addMemberTeamId, setAddMemberTeamId] = useState<string | null>(null);
+  const [memberEmail, setMemberEmail] = useState('');
+
+  const updateTeamMutation = useMutation({
+    mutationFn: async ({ id, name, description }: { id: string; name: string; description: string }) => {
+      await api.patch(`/teams/${id}`, { name, description });
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['teams'] });
+      setEditingTeam(null);
+    },
+  });
+
+  const addTeamMemberMutation = useMutation({
+    mutationFn: async ({ teamId, email }: { teamId: string; email: string }) => {
+      await api.post(`/teams/${teamId}/members`, { email });
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['teams'] });
+      setAddMemberTeamId(null);
+      setMemberEmail('');
+    },
+  });
 
   const { data: teams, isLoading } = useQuery<Team[]>({
     queryKey: ['teams'],
@@ -340,10 +366,16 @@ function TeamsList() {
               </td>
               <td className="px-6 py-4">
                 <div className="flex items-center justify-end gap-2">
-                  <button className="p-2 text-gray-500 hover:text-blue-600 hover:bg-blue-50 dark:hover:bg-blue-900/30 rounded">
+                  <button
+                    onClick={() => { setAddMemberTeamId(team.id); setMemberEmail(''); }}
+                    className="p-2 text-gray-500 hover:text-blue-600 hover:bg-blue-50 dark:hover:bg-blue-900/30 rounded"
+                  >
                     <UserPlus className="w-4 h-4" />
                   </button>
-                  <button className="p-2 text-gray-500 hover:text-blue-600 hover:bg-blue-50 dark:hover:bg-blue-900/30 rounded">
+                  <button
+                    onClick={() => { setEditingTeam(team); setEditName(team.name); setEditDescription(team.description || ''); }}
+                    className="p-2 text-gray-500 hover:text-blue-600 hover:bg-blue-50 dark:hover:bg-blue-900/30 rounded"
+                  >
                     <Edit2 className="w-4 h-4" />
                   </button>
                   <button
@@ -371,6 +403,60 @@ function TeamsList() {
           <p className="text-gray-500 dark:text-gray-400 mt-1">
             Create a team to organize your members
           </p>
+        </div>
+      )}
+
+      {/* Edit Team Modal */}
+      {editingTeam && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-white dark:bg-gray-800 rounded-lg shadow-xl w-full max-w-sm p-6">
+            <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">Edit Team</h3>
+            <div className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">Name</label>
+                <input type="text" value={editName} onChange={(e) => setEditName(e.target.value)} className="mt-1 block w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">Description</label>
+                <textarea value={editDescription} onChange={(e) => setEditDescription(e.target.value)} rows={3} className="mt-1 block w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm" />
+              </div>
+            </div>
+            <div className="flex justify-end gap-3 mt-6">
+              <button onClick={() => setEditingTeam(null)} className="px-4 py-2 text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg">Cancel</button>
+              <button
+                onClick={() => updateTeamMutation.mutate({ id: editingTeam.id, name: editName, description: editDescription })}
+                disabled={!editName || updateTeamMutation.isPending}
+                className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
+              >
+                {updateTeamMutation.isPending && <Loader2 className="w-4 h-4 animate-spin" />}
+                Save
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Add Team Member Modal */}
+      {addMemberTeamId && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-white dark:bg-gray-800 rounded-lg shadow-xl w-full max-w-sm p-6">
+            <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">Add Team Member</h3>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">Email</label>
+              <input type="email" value={memberEmail} onChange={(e) => setMemberEmail(e.target.value)} placeholder="user@example.com" className="mt-1 block w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm" />
+            </div>
+            <div className="flex justify-end gap-3 mt-6">
+              <button onClick={() => setAddMemberTeamId(null)} className="px-4 py-2 text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg">Cancel</button>
+              <button
+                onClick={() => addTeamMemberMutation.mutate({ teamId: addMemberTeamId, email: memberEmail })}
+                disabled={!memberEmail || addTeamMemberMutation.isPending}
+                className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
+              >
+                {addTeamMemberMutation.isPending && <Loader2 className="w-4 h-4 animate-spin" />}
+                Add
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>
@@ -505,6 +591,22 @@ function OrganizationDetailModal({
   onClose: () => void;
 }) {
   const [activeTab, setActiveTab] = useState<'members' | 'settings'>('members');
+  const [showAddMemberModal, setShowAddMemberModal] = useState(false);
+  const [newMemberEmail, setNewMemberEmail] = useState('');
+  const [newMemberRole, setNewMemberRole] = useState('member');
+  const queryClient = useQueryClient();
+
+  const addMemberMutation = useMutation({
+    mutationFn: async () => {
+      await api.post(`/organizations/${organization.id}/members`, { email: newMemberEmail, role: newMemberRole });
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['organization-members', organization.id] });
+      setShowAddMemberModal(false);
+      setNewMemberEmail('');
+      setNewMemberRole('member');
+    },
+  });
 
   const { data: members, isLoading } = useQuery<OrganizationMember[]>({
     queryKey: ['organization-members', organization.id],
@@ -561,7 +663,10 @@ function OrganizationDetailModal({
             <div className="space-y-4">
               <div className="flex justify-between items-center">
                 <h3 className="font-medium text-gray-900 dark:text-white">Members</h3>
-                <button className="flex items-center gap-2 px-3 py-1.5 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700">
+                <button
+                  onClick={() => setShowAddMemberModal(true)}
+                  className="flex items-center gap-2 px-3 py-1.5 text-sm bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+                >
                   <UserPlus className="w-4 h-4" />
                   Add Member
                 </button>
@@ -652,6 +757,49 @@ function OrganizationDetailModal({
           </button>
         </div>
       </div>
+
+      {/* Add Member Modal */}
+      {showAddMemberModal && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[60]">
+          <div className="bg-white dark:bg-gray-800 rounded-lg shadow-xl w-full max-w-sm p-6">
+            <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">Add Member</h3>
+            <div className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">Email</label>
+                <input
+                  type="email"
+                  value={newMemberEmail}
+                  onChange={(e) => setNewMemberEmail(e.target.value)}
+                  placeholder="user@example.com"
+                  className="mt-1 block w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">Role</label>
+                <select
+                  value={newMemberRole}
+                  onChange={(e) => setNewMemberRole(e.target.value)}
+                  className="mt-1 block w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm"
+                >
+                  <option value="member">Member</option>
+                  <option value="admin">Admin</option>
+                </select>
+              </div>
+            </div>
+            <div className="flex justify-end gap-3 mt-6">
+              <button onClick={() => setShowAddMemberModal(false)} className="px-4 py-2 text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg">Cancel</button>
+              <button
+                onClick={() => addMemberMutation.mutate()}
+                disabled={!newMemberEmail || addMemberMutation.isPending}
+                className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
+              >
+                {addMemberMutation.isPending && <Loader2 className="w-4 h-4 animate-spin" />}
+                Add
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

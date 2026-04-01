@@ -22,6 +22,7 @@ export default function PhishingSimulation() {
   const [activeTab, setActiveTab] = useState<'campaigns' | 'templates' | 'groups' | 'awareness' | 'training'>('campaigns');
   const [selectedCampaign, setSelectedCampaign] = useState<Campaign | null>(null);
   const [showModal, setShowModal] = useState(false);
+  const [selectedTraining, setSelectedTraining] = useState<{ id: string; title: string; completions: number; duration: string; certification: boolean } | null>(null);
 
   const { data: campaigns = [] } = useQuery({ queryKey: ['campaigns'], queryFn: phishingApi.getCampaigns });
   const { data: templates = [] } = useQuery({ queryKey: ['templates'], queryFn: phishingApi.getTemplates });
@@ -293,7 +294,12 @@ export default function PhishingSimulation() {
                     <p className="text-xs text-gray-400 mb-1">Times Used</p>
                     <p className="text-xl font-bold text-white">{template.used.toLocaleString()}</p>
                   </div>
-                  <button className="text-blue-400 hover:text-blue-300 font-medium text-sm transition-colors mt-4">
+                  <button
+                    onClick={() => {
+                      setShowModal(true);
+                    }}
+                    className="text-blue-400 hover:text-blue-300 font-medium text-sm transition-colors mt-4"
+                  >
                     Use Template →
                   </button>
                 </div>
@@ -353,7 +359,16 @@ export default function PhishingSimulation() {
                       <p className="text-xs text-gray-400 mb-1">Team Size</p>
                       <p className="text-2xl font-bold text-white">{group.size}</p>
                     </div>
-                    <button className="text-blue-400 hover:text-blue-300 font-medium text-sm transition-colors mt-4">
+                    <button
+                      onClick={async () => {
+                        try {
+                          await phishingApi.launchCampaign(group.id);
+                        } catch (err) {
+                          console.error('Launch campaign failed:', err);
+                        }
+                      }}
+                      className="text-blue-400 hover:text-blue-300 font-medium text-sm transition-colors mt-4"
+                    >
                       Launch Campaign →
                     </button>
                   </div>
@@ -467,7 +482,10 @@ export default function PhishingSimulation() {
                           style={{ width: `${Math.min((training.completions / 1500) * 100, 100)}%` }}
                         />
                       </div>
-                      <button className="text-blue-400 hover:text-blue-300 text-sm font-medium transition-colors">
+                      <button
+                        onClick={() => setSelectedTraining(training)}
+                        className="text-blue-400 hover:text-blue-300 text-sm font-medium transition-colors"
+                      >
                         View →
                       </button>
                     </div>
@@ -475,6 +493,27 @@ export default function PhishingSimulation() {
                 </div>
               </div>
             ))}
+          </div>
+        )}
+
+        {/* Training Detail Modal */}
+        {selectedTraining && (
+          <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+            <div className="bg-gray-800 border border-gray-700 rounded-lg p-8 max-w-md w-full dark:bg-gray-800 dark:border-gray-700">
+              <div className="flex justify-between items-center mb-6">
+                <h2 className="text-xl font-bold text-white">{selectedTraining.title}</h2>
+                <button onClick={() => setSelectedTraining(null)} className="text-gray-400 hover:text-white transition-colors">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+              <div className="space-y-4">
+                <div><p className="text-sm text-gray-400">Training ID</p><p className="text-white font-mono">{selectedTraining.id}</p></div>
+                <div><p className="text-sm text-gray-400">Duration</p><p className="text-white">{selectedTraining.duration}</p></div>
+                <div><p className="text-sm text-gray-400">Completions</p><p className="text-2xl font-bold text-white">{selectedTraining.completions.toLocaleString()}</p></div>
+                <div><p className="text-sm text-gray-400">Certification</p><p className="text-white">{selectedTraining.certification ? 'Yes' : 'No'}</p></div>
+              </div>
+              <button onClick={() => setSelectedTraining(null)} className="w-full bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded mt-6 transition-colors">Close</button>
+            </div>
           </div>
         )}
 
@@ -530,7 +569,15 @@ export default function PhishingSimulation() {
                     Cancel
                   </button>
                   <button
-                    onClick={() => setShowModal(false)}
+                    onClick={async () => {
+                      try {
+                        await phishingApi.createCampaign({});
+                      } catch (err) {
+                        console.error('Create campaign failed:', err);
+                      } finally {
+                        setShowModal(false);
+                      }
+                    }}
                     className="flex-1 bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded transition-colors"
                   >
                     Create Campaign

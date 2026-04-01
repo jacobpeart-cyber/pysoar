@@ -642,8 +642,14 @@ function ScanResultsTab({
                   {new Date(scan.date).toLocaleDateString()}
                 </td>
                 <td className="px-6 py-4 text-center">
-                  <button className="text-blue-600 dark:text-blue-400 hover:underline text-sm">
-                    Export
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setExpandedScan(scan.id);
+                    }}
+                    className="text-blue-600 dark:text-blue-400 hover:underline text-sm"
+                  >
+                    View Details
                   </button>
                 </td>
               </tr>
@@ -718,6 +724,8 @@ function RemediationTab({
   onAutoRemediate: () => void;
   catIFindings: number;
 }) {
+  const [selectedRemediation, setSelectedRemediation] = useState<Remediation | null>(null);
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
@@ -728,6 +736,24 @@ function RemediationTab({
 
   return (
     <div className="space-y-6">
+      {/* Remediation Detail Modal */}
+      {selectedRemediation && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-white dark:bg-gray-800 rounded-lg shadow-xl w-full max-w-md p-6">
+            <h2 className="text-xl font-semibold text-gray-900 dark:text-white mb-4">Remediation Details</h2>
+            <div className="space-y-3 text-sm">
+              <div><span className="text-gray-500">Finding:</span> <span className="text-gray-900 dark:text-white font-medium">{selectedRemediation.finding}</span></div>
+              <div><span className="text-gray-500">Severity:</span> <span className={clsx('px-2 py-1 rounded text-xs font-medium', getSeverityColor(selectedRemediation.severity))}>{selectedRemediation.severity}</span></div>
+              <div><span className="text-gray-500">Host:</span> <span className="font-mono text-gray-900 dark:text-white">{selectedRemediation.host}</span></div>
+              <div><span className="text-gray-500">Status:</span> {selectedRemediation.status}</div>
+              <div><span className="text-gray-500">Assigned To:</span> {selectedRemediation.assignedTo}</div>
+              <div><span className="text-gray-500">Due Date:</span> {new Date(selectedRemediation.dueDate).toLocaleDateString()}</div>
+            </div>
+            <button onClick={() => setSelectedRemediation(null)} className="mt-6 w-full px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700">Close</button>
+          </div>
+        </div>
+      )}
+
       {/* Filter and Action Buttons */}
       <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
         <div className="flex items-center justify-between gap-4">
@@ -825,7 +851,10 @@ function RemediationTab({
                   {new Date(remediation.dueDate).toLocaleDateString()}
                 </td>
                 <td className="px-6 py-4 text-center">
-                  <button className="text-blue-600 dark:text-blue-400 hover:underline text-sm">
+                  <button
+                    onClick={() => setSelectedRemediation(remediation)}
+                    className="text-blue-600 dark:text-blue-400 hover:underline text-sm"
+                  >
                     Details
                   </button>
                 </td>

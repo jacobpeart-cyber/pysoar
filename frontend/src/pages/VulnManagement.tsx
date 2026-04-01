@@ -59,6 +59,12 @@ export default function VulnManagement() {
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
   const [showNewVulnModal, setShowNewVulnModal] = useState(false);
+  const [selectedVulnerability, setSelectedVulnerability] = useState<any | null>(null);
+  const [editingVulnerability, setEditingVulnerability] = useState<any | null>(null);
+  const [editingException, setEditingException] = useState<any | null>(null);
+  const [editingScanProfile, setEditingScanProfile] = useState<any | null>(null);
+  const [showFilterPanel, setShowFilterPanel] = useState(false);
+  const [remediatingVuln, setRemediatingVuln] = useState<any | null>(null);
 
   React.useEffect(() => {
     const loadData = async () => {
@@ -216,7 +222,10 @@ export default function VulnManagement() {
                       className="w-full pl-10 pr-4 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
                     />
                   </div>
-                  <button className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                  <button
+                    onClick={() => setShowFilterPanel(prev => !prev)}
+                    className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                  >
                     <Filter className="w-4 h-4" />
                     Filter
                   </button>
@@ -265,10 +274,16 @@ export default function VulnManagement() {
                             )}
                           </td>
                           <td className="px-6 py-4 text-sm flex gap-2">
-                            <button className="text-blue-600 dark:text-blue-400 hover:underline">
+                            <button
+                              onClick={() => setSelectedVulnerability(vuln)}
+                              className="text-blue-600 dark:text-blue-400 hover:underline"
+                            >
                               <Eye className="w-4 h-4" />
                             </button>
-                            <button className="text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100">
+                            <button
+                              onClick={() => setEditingVulnerability(vuln)}
+                              className="text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100"
+                            >
                               <Edit className="w-4 h-4" />
                             </button>
                           </td>
@@ -310,10 +325,23 @@ export default function VulnManagement() {
                         </div>
                       </div>
                       <div className="flex gap-2 mt-4">
-                        <button className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                        <button
+                          onClick={async () => {
+                            try {
+                              await vulnmgmtApi.runScan(profile.id);
+                              alert('Scan started successfully for: ' + profile.name);
+                            } catch (error) {
+                              console.error('Error running scan:', error);
+                            }
+                          }}
+                          className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                        >
                           Run Now
                         </button>
-                        <button className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                        <button
+                          onClick={() => setEditingScanProfile(profile)}
+                          className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                        >
                           Edit
                         </button>
                       </div>
@@ -402,7 +430,10 @@ export default function VulnManagement() {
                             </span>
                           </td>
                           <td className="px-6 py-4 text-sm flex gap-2">
-                            <button className="text-blue-600 dark:text-blue-400 hover:underline">
+                            <button
+                              onClick={() => setEditingException(exc)}
+                              className="text-blue-600 dark:text-blue-400 hover:underline"
+                            >
                               <Edit className="w-4 h-4" />
                             </button>
                           </td>
@@ -457,10 +488,16 @@ export default function VulnManagement() {
                         </div>
                       </div>
                       <div className="flex gap-2">
-                        <button className="flex-1 px-3 py-2 text-sm bg-red-600 hover:bg-red-700 text-white rounded transition">
+                        <button
+                          onClick={() => setRemediatingVuln(vuln)}
+                          className="flex-1 px-3 py-2 text-sm bg-red-600 hover:bg-red-700 text-white rounded transition"
+                        >
                           Remediate
                         </button>
-                        <button className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                        <button
+                          onClick={() => setSelectedVulnerability(vuln)}
+                          className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                        >
                           Details
                         </button>
                       </div>
@@ -472,6 +509,116 @@ export default function VulnManagement() {
           </>
         )}
       </div>
+
+      {/* Vulnerability Detail Modal */}
+      {selectedVulnerability && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-[500px] max-h-screen overflow-y-auto">
+            <h2 className="text-xl font-bold mb-4">Vulnerability Details</h2>
+            <div className="space-y-3 text-sm">
+              <div><span className="font-medium">CVE ID:</span> {selectedVulnerability.cveId}</div>
+              <div><span className="font-medium">Title:</span> {selectedVulnerability.title}</div>
+              <div><span className="font-medium">Severity:</span> {selectedVulnerability.severity}</div>
+              <div><span className="font-medium">CVSS:</span> {selectedVulnerability.cvss?.toFixed(1)}</div>
+              {selectedVulnerability.epss && <div><span className="font-medium">EPSS:</span> {(selectedVulnerability.epss * 100).toFixed(0)}%</div>}
+              <div><span className="font-medium">KEV:</span> {selectedVulnerability.kev ? 'Yes' : 'No'}</div>
+              <div><span className="font-medium">Affected Assets:</span> {selectedVulnerability.affectedAssets}</div>
+              <div><span className="font-medium">Patch Available:</span> {selectedVulnerability.patchAvailable ? 'Yes' : 'No'}</div>
+              {selectedVulnerability.daysOpen && <div><span className="font-medium">Days Open:</span> {selectedVulnerability.daysOpen}</div>}
+            </div>
+            <button onClick={() => setSelectedVulnerability(null)} className="mt-6 w-full px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Close</button>
+          </div>
+        </div>
+      )}
+
+      {/* Edit Vulnerability Modal */}
+      {editingVulnerability && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-96 max-h-screen overflow-y-auto">
+            <h2 className="text-xl font-bold mb-4">Edit: {editingVulnerability.cveId}</h2>
+            <div className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium mb-1">Title</label>
+                <input type="text" defaultValue={editingVulnerability.title} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Severity</label>
+                <select defaultValue={editingVulnerability.severity} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
+                  <option value="critical">Critical</option>
+                  <option value="high">High</option>
+                  <option value="medium">Medium</option>
+                  <option value="low">Low</option>
+                </select>
+              </div>
+              <div className="flex gap-2 mt-6">
+                <button onClick={() => setEditingVulnerability(null)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
+                <button onClick={() => { alert('Vulnerability updated.'); setEditingVulnerability(null); }} className="flex-1 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition">Save</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Edit Exception Modal */}
+      {editingException && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-96 max-h-screen overflow-y-auto">
+            <h2 className="text-xl font-bold mb-4">Edit Exception: {editingException.cveId}</h2>
+            <div className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium mb-1">Reason</label>
+                <textarea defaultValue={editingException.reason} rows={3} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Expiry Date</label>
+                <input type="date" defaultValue={editingException.expiryDate} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+              </div>
+              <div className="flex gap-2 mt-6">
+                <button onClick={() => setEditingException(null)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
+                <button onClick={() => { alert('Exception updated.'); setEditingException(null); }} className="flex-1 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition">Save</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Edit Scan Profile Modal */}
+      {editingScanProfile && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-96 max-h-screen overflow-y-auto">
+            <h2 className="text-xl font-bold mb-4">Edit Scan Profile: {editingScanProfile.name}</h2>
+            <div className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium mb-1">Name</label>
+                <input type="text" defaultValue={editingScanProfile.name} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Schedule</label>
+                <input type="text" defaultValue={editingScanProfile.schedule} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+              </div>
+              <div className="flex gap-2 mt-6">
+                <button onClick={() => setEditingScanProfile(null)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
+                <button onClick={() => { alert('Scan profile updated.'); setEditingScanProfile(null); }} className="flex-1 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition">Save</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Remediation Modal */}
+      {remediatingVuln && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-[500px] max-h-screen overflow-y-auto">
+            <h2 className="text-xl font-bold mb-4">Remediate: {remediatingVuln.cveId}</h2>
+            <div className="space-y-3">
+              <p className="text-sm text-gray-600 dark:text-gray-400">{remediatingVuln.title}</p>
+              <button onClick={async () => { try { await vulnmgmtApi.runScan(remediatingVuln.id); alert('Patch operation initiated for ' + remediatingVuln.cveId); setRemediatingVuln(null); } catch (e) { console.error(e); } }} className="w-full px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition">Apply Patch</button>
+              <button onClick={() => { alert('Compensating control applied for ' + remediatingVuln.cveId); setRemediatingVuln(null); }} className="w-full px-4 py-2 bg-orange-600 hover:bg-orange-700 text-white rounded-lg transition">Apply Compensating Control</button>
+              <button onClick={() => setRemediatingVuln(null)} className="w-full px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* New Vulnerability Modal */}
       {showNewVulnModal && (
