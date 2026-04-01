@@ -64,6 +64,10 @@ export default function DLPDashboard() {
   const [error, setError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [showNewPolicyModal, setShowNewPolicyModal] = useState(false);
+  const [selectedPolicy, setSelectedPolicy] = useState<any | null>(null);
+  const [selectedIncident, setSelectedIncident] = useState<any | null>(null);
+  const [selectedClassification, setSelectedClassification] = useState<string | null>(null);
+  const [showFilter, setShowFilter] = useState(false);
 
   React.useEffect(() => {
     const loadData = async () => {
@@ -126,7 +130,19 @@ export default function DLPDashboard() {
             <h1 className="text-3xl font-bold">Data Loss Prevention</h1>
           </div>
           <div className="flex items-center gap-3">
-            <button className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+            <button
+              onClick={() => {
+                const data = { policies, incidents, classifications };
+                const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'dlp-export.json';
+                a.click();
+                URL.revokeObjectURL(url);
+              }}
+              className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+            >
               <Download className="w-4 h-4" />
               Export
             </button>
@@ -224,7 +240,10 @@ export default function DLPDashboard() {
                       className="w-full pl-10 pr-4 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
                     />
                   </div>
-                  <button className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                  <button
+                    onClick={() => setShowFilter((prev) => !prev)}
+                    className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                  >
                     <Filter className="w-4 h-4" />
                     Filter
                   </button>
@@ -290,10 +309,16 @@ export default function DLPDashboard() {
                                 : 'Never'}
                             </td>
                             <td className="px-6 py-4 text-sm flex gap-2">
-                              <button className="text-blue-600 dark:text-blue-400 hover:underline">
+                              <button
+                                onClick={() => setSelectedPolicy(policy)}
+                                className="text-blue-600 dark:text-blue-400 hover:underline"
+                              >
                                 <Eye className="w-4 h-4" />
                               </button>
-                              <button className="text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100">
+                              <button
+                                onClick={() => setSelectedPolicy(policy)}
+                                className="text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100"
+                              >
                                 <Edit className="w-4 h-4" />
                               </button>
                             </td>
@@ -348,7 +373,10 @@ export default function DLPDashboard() {
                       className="w-full pl-10 pr-4 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
                     />
                   </div>
-                  <button className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                  <button
+                    onClick={() => setShowFilter((prev) => !prev)}
+                    className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                  >
                     <Filter className="w-4 h-4" />
                     Filter
                   </button>
@@ -397,10 +425,16 @@ export default function DLPDashboard() {
                                 : '—'}
                             </td>
                             <td className="px-6 py-4 text-sm flex gap-2">
-                              <button className="text-blue-600 dark:text-blue-400 hover:underline">
+                              <button
+                                onClick={() => setSelectedIncident(incident)}
+                                className="text-blue-600 dark:text-blue-400 hover:underline"
+                              >
                                 <Eye className="w-4 h-4" />
                               </button>
-                              <button className="text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100">
+                              <button
+                                onClick={() => setSelectedIncident(incident)}
+                                className="text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100"
+                              >
                                 <Edit className="w-4 h-4" />
                               </button>
                             </td>
@@ -450,10 +484,16 @@ export default function DLPDashboard() {
                           </div>
                         </div>
                         <div className="flex gap-2 mt-4">
-                          <button className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                          <button
+                            onClick={() => setSelectedClassification(classification)}
+                            className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                          >
                             View Details
                           </button>
-                          <button className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                          <button
+                            onClick={() => setSelectedClassification(classification)}
+                            className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                          >
                             Edit
                           </button>
                         </div>
@@ -530,13 +570,49 @@ export default function DLPDashboard() {
                       <h3 className="font-semibold text-lg">Export Reports</h3>
                     </div>
                     <div className="space-y-3">
-                      <button className="w-full px-4 py-2 text-sm text-left border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                      <button
+                        onClick={() => {
+                          const blob = new Blob([JSON.stringify({ policies, incidents, classifications }, null, 2)], { type: 'application/json' });
+                          const url = URL.createObjectURL(blob);
+                          const a = document.createElement('a');
+                          a.href = url;
+                          a.download = 'dlp-summary-report.json';
+                          a.click();
+                          URL.revokeObjectURL(url);
+                        }}
+                        className="w-full px-4 py-2 text-sm text-left border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                      >
                         DLP Summary Report (PDF)
                       </button>
-                      <button className="w-full px-4 py-2 text-sm text-left border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                      <button
+                        onClick={() => {
+                          const headers = ['ID', 'User', 'Action', 'Policy', 'Severity', 'Status', 'Date'];
+                          const rows = incidents.map((i) => [i.id, i.user || i.userName || '', i.action || i.description || '', i.policyName || i.policy_name || '', i.severity || '', i.status || '', i.createdAt || i.created_at || ''].join(','));
+                          const csv = [headers.join(','), ...rows].join('\n');
+                          const blob = new Blob([csv], { type: 'text/csv' });
+                          const url = URL.createObjectURL(blob);
+                          const a = document.createElement('a');
+                          a.href = url;
+                          a.download = 'dlp-incident-details.csv';
+                          a.click();
+                          URL.revokeObjectURL(url);
+                        }}
+                        className="w-full px-4 py-2 text-sm text-left border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                      >
                         Incident Details (CSV)
                       </button>
-                      <button className="w-full px-4 py-2 text-sm text-left border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                      <button
+                        onClick={() => {
+                          const blob = new Blob([JSON.stringify({ policies, classifications }, null, 2)], { type: 'application/json' });
+                          const url = URL.createObjectURL(blob);
+                          const a = document.createElement('a');
+                          a.href = url;
+                          a.download = 'dlp-policy-compliance-report.json';
+                          a.click();
+                          URL.revokeObjectURL(url);
+                        }}
+                        className="w-full px-4 py-2 text-sm text-left border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                      >
                         Policy Compliance Report (PDF)
                       </button>
                     </div>

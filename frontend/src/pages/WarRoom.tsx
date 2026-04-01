@@ -24,6 +24,8 @@ export default function WarRoom() {
   const [selectedRoom, setSelectedRoom] = useState<WarRoom | null>(null);
   const [showModal, setShowModal] = useState(false);
   const [newMessage, setNewMessage] = useState('');
+  const [selectedPostMortem, setSelectedPostMortem] = useState<PostMortem | null>(null);
+  const [pinnedMessages, setPinnedMessages] = useState<number[]>([]);
   const [messages, setMessages] = useState([
     { id: 1, author: 'Alice Johnson', text: 'Database node 3 is unresponsive, initiating failover', time: '13:47' },
     { id: 2, author: 'Bob Smith', text: 'Confirmed, switching to replica. ETA 5 minutes', time: '13:48' },
@@ -221,7 +223,10 @@ export default function WarRoom() {
                   >
                     Impact: {room.impact}
                   </span>
-                  <button className="text-blue-400 hover:text-blue-300 text-sm font-medium transition-colors">
+                  <button
+                    onClick={(e) => { e.stopPropagation(); setSelectedRoom(room); }}
+                    className="text-blue-400 hover:text-blue-300 text-sm font-medium transition-colors"
+                  >
                     View Details →
                   </button>
                 </div>
@@ -359,7 +364,10 @@ export default function WarRoom() {
                     </div>
                   </div>
 
-                  <button className="mt-4 text-blue-400 hover:text-blue-300 text-sm font-medium transition-colors">
+                  <button
+                    onClick={() => setSelectedPostMortem(pm)}
+                    className="mt-4 text-blue-400 hover:text-blue-300 text-sm font-medium transition-colors"
+                  >
                     View Full Report →
                   </button>
                 </div>
@@ -416,9 +424,17 @@ export default function WarRoom() {
                 </div>
 
                 <div className="flex gap-2">
-                  <button className="flex-1 bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded text-sm transition-colors flex items-center justify-center gap-2">
+                  <button
+                    onClick={() => {
+                      const lastMsg = messages[messages.length - 1];
+                      if (lastMsg && !pinnedMessages.includes(lastMsg.id)) {
+                        setPinnedMessages([...pinnedMessages, lastMsg.id]);
+                      }
+                    }}
+                    className="flex-1 bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded text-sm transition-colors flex items-center justify-center gap-2"
+                  >
                     <Pin className="w-4 h-4" />
-                    Pin Important
+                    Pin Important ({pinnedMessages.length})
                   </button>
                   <button
                     onClick={() => setSelectedRoom(null)}
@@ -428,6 +444,30 @@ export default function WarRoom() {
                   </button>
                 </div>
               </div>
+            </div>
+          </div>
+        )}
+
+        {/* Post-Mortem Detail Modal */}
+        {selectedPostMortem && !selectedRoom && (
+          <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+            <div className="bg-gray-800 border border-gray-700 rounded-lg p-8 max-w-lg w-full dark:bg-gray-800 dark:border-gray-700">
+              <div className="flex justify-between items-center mb-6">
+                <h2 className="text-xl font-bold text-white">{selectedPostMortem.title}</h2>
+                <button onClick={() => setSelectedPostMortem(null)} className="text-gray-400 hover:text-white transition-colors">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+              <div className="space-y-4">
+                <div><p className="text-sm text-gray-400">Timeline</p><p className="text-white">{selectedPostMortem.timeline}</p></div>
+                <div><p className="text-sm text-gray-400">Severity</p><p className="text-white">{selectedPostMortem.severity}</p></div>
+                <div className="grid grid-cols-3 gap-4">
+                  <div className="bg-gray-700/50 rounded p-3"><p className="text-xs text-gray-400 mb-1">MTTD</p><p className="text-xl font-bold text-blue-400">{selectedPostMortem.mttd}</p></div>
+                  <div className="bg-gray-700/50 rounded p-3"><p className="text-xs text-gray-400 mb-1">MTTR</p><p className="text-xl font-bold text-green-400">{selectedPostMortem.mttr}</p></div>
+                  <div className="bg-gray-700/50 rounded p-3"><p className="text-xs text-gray-400 mb-1">MTTC</p><p className="text-xl font-bold text-purple-400">{selectedPostMortem.mttc}</p></div>
+                </div>
+              </div>
+              <button onClick={() => setSelectedPostMortem(null)} className="w-full bg-orange-600 hover:bg-orange-700 text-white px-4 py-2 rounded mt-6 transition-colors">Close</button>
             </div>
           </div>
         )}

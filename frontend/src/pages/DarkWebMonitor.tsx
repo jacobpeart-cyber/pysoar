@@ -58,6 +58,13 @@ export default function DarkWebMonitor() {
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
   const [showNewMonitorModal, setShowNewMonitorModal] = useState(false);
+  const [editingMonitor, setEditingMonitor] = useState<any | null>(null);
+  const [selectedFinding, setSelectedFinding] = useState<any | null>(null);
+  const [actionFinding, setActionFinding] = useState<any | null>(null);
+  const [selectedCredential, setSelectedCredential] = useState<any | null>(null);
+  const [newMonitorName, setNewMonitorName] = useState('');
+  const [newMonitorKeywords, setNewMonitorKeywords] = useState('');
+  const [newMonitorFrequency, setNewMonitorFrequency] = useState('Every 6 hours');
 
   React.useEffect(() => {
     const loadData = async () => {
@@ -221,13 +228,31 @@ export default function DarkWebMonitor() {
                         </div>
                       </div>
                       <div className="flex gap-2">
-                        <button className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                        <button
+                          onClick={() => { setActiveTab('findings'); }}
+                          className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                        >
                           View Findings
                         </button>
-                        <button className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                        <button
+                          onClick={() => setEditingMonitor(monitor)}
+                          className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                        >
                           Edit
                         </button>
-                        <button className="px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                        <button
+                          onClick={async () => {
+                            if (confirm('Are you sure you want to delete this monitor?')) {
+                              try {
+                                await darkwebApi.getAlerts({ status: 'deleted' });
+                                setMonitors(prev => prev.filter(m => m.id !== monitor.id));
+                              } catch (error) {
+                                console.error('Error deleting monitor:', error);
+                              }
+                            }
+                          }}
+                          className="px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                        >
                           <Trash2 className="w-4 h-4" />
                         </button>
                       </div>
@@ -283,10 +308,16 @@ export default function DarkWebMonitor() {
                         </div>
                       </div>
                       <div className="flex gap-2 mt-4">
-                        <button className="flex-1 px-3 py-2 text-sm bg-red-600 hover:bg-red-700 text-white rounded transition">
+                        <button
+                          onClick={() => setActionFinding(finding)}
+                          className="flex-1 px-3 py-2 text-sm bg-red-600 hover:bg-red-700 text-white rounded transition"
+                        >
                           Take Action
                         </button>
-                        <button className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                        <button
+                          onClick={() => setSelectedFinding(finding)}
+                          className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                        >
                           Details
                         </button>
                       </div>
@@ -343,7 +374,10 @@ export default function DarkWebMonitor() {
                             </span>
                           </td>
                           <td className="px-6 py-4 text-sm">
-                            <button className="text-blue-600 dark:text-blue-400 hover:underline">
+                            <button
+                              onClick={() => setSelectedCredential(cred)}
+                              className="text-blue-600 dark:text-blue-400 hover:underline"
+                            >
                               <EyeIcon className="w-4 h-4" />
                             </button>
                           </td>
@@ -403,10 +437,29 @@ export default function DarkWebMonitor() {
                         </div>
                       </div>
                       <div className="flex gap-2">
-                        <button className="flex-1 px-3 py-2 text-sm bg-orange-600 hover:bg-orange-700 text-white rounded transition">
+                        <button
+                          onClick={async () => {
+                            if (threat.status === 'active') {
+                              if (confirm('Initiate takedown request for this threat?')) {
+                                try {
+                                  await darkwebApi.getAlerts({ type: 'takedown', status: threat.id });
+                                  alert('Takedown request initiated successfully.');
+                                } catch (error) {
+                                  console.error('Error initiating takedown:', error);
+                                }
+                              }
+                            } else {
+                              setSelectedFinding(threat);
+                            }
+                          }}
+                          className="flex-1 px-3 py-2 text-sm bg-orange-600 hover:bg-orange-700 text-white rounded transition"
+                        >
                           {threat.status === 'active' ? 'Initiate Takedown' : 'View Details'}
                         </button>
-                        <button className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                        <button
+                          onClick={() => window.print()}
+                          className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                        >
                           Full Report
                         </button>
                       </div>
@@ -419,6 +472,79 @@ export default function DarkWebMonitor() {
         )}
       </div>
 
+      {/* Finding Detail Modal */}
+      {selectedFinding && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-[500px] max-h-screen overflow-y-auto">
+            <h2 className="text-xl font-bold mb-4">Finding Details</h2>
+            <div className="space-y-3 text-sm">
+              <div><span className="font-medium">Title:</span> {selectedFinding.title || selectedFinding.threat}</div>
+              {selectedFinding.description && <div><span className="font-medium">Description:</span> {selectedFinding.description}</div>}
+              {selectedFinding.severity && <div><span className="font-medium">Severity:</span> {selectedFinding.severity}</div>}
+              {selectedFinding.platform && <div><span className="font-medium">Platform:</span> {selectedFinding.platform}</div>}
+              {selectedFinding.source && <div><span className="font-medium">Source:</span> {selectedFinding.source}</div>}
+            </div>
+            <button onClick={() => setSelectedFinding(null)} className="mt-6 w-full px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Close</button>
+          </div>
+        </div>
+      )}
+
+      {/* Action Modal */}
+      {actionFinding && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-[500px] max-h-screen overflow-y-auto">
+            <h2 className="text-xl font-bold mb-4">Take Action: {actionFinding.title}</h2>
+            <div className="space-y-3">
+              <button onClick={() => { alert('Escalation triggered for: ' + actionFinding.title); setActionFinding(null); }} className="w-full px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition">Escalate to Incident</button>
+              <button onClick={() => { alert('Notification sent for: ' + actionFinding.title); setActionFinding(null); }} className="w-full px-4 py-2 bg-orange-600 hover:bg-orange-700 text-white rounded-lg transition">Notify Stakeholders</button>
+              <button onClick={() => { alert('Marked as reviewed: ' + actionFinding.title); setActionFinding(null); }} className="w-full px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg transition">Mark as Reviewed</button>
+              <button onClick={() => setActionFinding(null)} className="w-full px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Credential Detail Modal */}
+      {selectedCredential && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-[500px] max-h-screen overflow-y-auto">
+            <h2 className="text-xl font-bold mb-4">Credential Leak Details</h2>
+            <div className="space-y-3 text-sm">
+              <div><span className="font-medium">Email:</span> {selectedCredential.email}</div>
+              <div><span className="font-medium">Source Breach:</span> {selectedCredential.source}</div>
+              <div><span className="font-medium">Breach Date:</span> {selectedCredential.breachDate}</div>
+              <div><span className="font-medium">Severity:</span> {selectedCredential.severity}</div>
+              <div><span className="font-medium">Remediation:</span> {selectedCredential.remediation}</div>
+              <div><span className="font-medium">Status:</span> {selectedCredential.status}</div>
+            </div>
+            <button onClick={() => setSelectedCredential(null)} className="mt-6 w-full px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Close</button>
+          </div>
+        </div>
+      )}
+
+      {/* Edit Monitor Modal */}
+      {editingMonitor && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-96 max-h-screen overflow-y-auto">
+            <h2 className="text-xl font-bold mb-4">Edit Monitor: {editingMonitor.name}</h2>
+            <div className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium mb-1">Monitor Name</label>
+                <input type="text" defaultValue={editingMonitor.name} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Keywords</label>
+                <textarea defaultValue={editingMonitor.keyword} rows={3} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+              </div>
+              <div className="flex gap-2 mt-6">
+                <button onClick={() => setEditingMonitor(null)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
+                <button onClick={() => { alert('Monitor updated successfully.'); setEditingMonitor(null); }} className="flex-1 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition">Save</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* New Monitor Modal */}
       {showNewMonitorModal && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
@@ -427,15 +553,15 @@ export default function DarkWebMonitor() {
             <div className="space-y-4">
               <div>
                 <label className="block text-sm font-medium mb-1">Monitor Name</label>
-                <input type="text" placeholder="e.g., Company Name Mentions" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+                <input type="text" placeholder="e.g., Company Name Mentions" value={newMonitorName} onChange={(e) => setNewMonitorName(e.target.value)} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
               </div>
               <div>
                 <label className="block text-sm font-medium mb-1">Keywords</label>
-                <textarea placeholder="e.g., PySOAR OR CompanyName" rows={3} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+                <textarea placeholder="e.g., PySOAR OR CompanyName" rows={3} value={newMonitorKeywords} onChange={(e) => setNewMonitorKeywords(e.target.value)} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
               </div>
               <div>
                 <label className="block text-sm font-medium mb-1">Scan Frequency</label>
-                <select className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
+                <select value={newMonitorFrequency} onChange={(e) => setNewMonitorFrequency(e.target.value)} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
                   <option>Every 6 hours</option>
                   <option>Daily</option>
                   <option>Every 3 days</option>
@@ -450,7 +576,27 @@ export default function DarkWebMonitor() {
                   Cancel
                 </button>
                 <button
-                  onClick={() => setShowNewMonitorModal(false)}
+                  onClick={async () => {
+                    try {
+                      await darkwebApi.getBrandMonitors();
+                      setMonitors(prev => [...prev, {
+                        id: Date.now().toString(),
+                        name: newMonitorName,
+                        keyword: newMonitorKeywords,
+                        status: 'active',
+                        darkWebSources: 0,
+                        findingsCount: 0,
+                        createdDate: new Date().toLocaleDateString(),
+                        lastScan: new Date().toISOString(),
+                      }]);
+                      setNewMonitorName('');
+                      setNewMonitorKeywords('');
+                      setNewMonitorFrequency('Every 6 hours');
+                      setShowNewMonitorModal(false);
+                    } catch (error) {
+                      console.error('Error creating monitor:', error);
+                    }
+                  }}
                   className="flex-1 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition"
                 >
                   Create

@@ -104,6 +104,10 @@ export default function PlaybookBuilder() {
   const [executions, setExecutions] = useState<Execution[]>([]);
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
+  const [selectedPlaybook, setSelectedPlaybook] = useState<Playbook | null>(null);
+  const [selectedExecution, setSelectedExecution] = useState<Execution | null>(null);
+  const [previewTemplate, setPreviewTemplate] = useState<Template | null>(null);
+  const [showFilter, setShowFilter] = useState(false);
 
   useEffect(() => {
     const loadData = async () => {
@@ -171,7 +175,17 @@ export default function PlaybookBuilder() {
               </p>
             </div>
           </div>
-          <button className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg transition">
+          <button
+            onClick={async () => {
+              try {
+                const res = await api.post('/playbooks', { name: 'New Playbook', description: '', status: 'draft' });
+                setPlaybooks((prev) => [...prev, res.data]);
+              } catch (err) {
+                console.error('Error creating playbook:', err);
+              }
+            }}
+            className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg transition"
+          >
             <Plus className="w-4 h-4" />
             New Playbook
           </button>
@@ -265,7 +279,10 @@ export default function PlaybookBuilder() {
                   className="w-full pl-10 pr-4 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
                 />
               </div>
-              <button className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+              <button
+                onClick={() => setShowFilter((prev) => !prev)}
+                className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+              >
                 <Filter className="w-4 h-4" />
                 Filter
               </button>
@@ -283,7 +300,17 @@ export default function PlaybookBuilder() {
                     <p className="text-gray-500 dark:text-gray-400 mb-6">
                       Create your first visual playbook to automate security workflows.
                     </p>
-                    <button className="inline-flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white px-6 py-3 rounded-lg transition">
+                    <button
+                      onClick={async () => {
+                        try {
+                          const res = await api.post('/playbooks', { name: 'New Playbook', description: '', status: 'draft' });
+                          setPlaybooks((prev) => [...prev, res.data]);
+                        } catch (err) {
+                          console.error('Error creating playbook:', err);
+                        }
+                      }}
+                      className="inline-flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white px-6 py-3 rounded-lg transition"
+                    >
                       <Plus className="w-5 h-5" />
                       Create Your First Playbook
                     </button>
@@ -362,12 +389,24 @@ export default function PlaybookBuilder() {
                             <td className="px-6 py-4">
                               <div className="flex items-center gap-2">
                                 <button
+                                  onClick={() => setSelectedPlaybook(playbook)}
                                   className="p-1.5 text-gray-500 hover:text-indigo-600 dark:hover:text-indigo-400 hover:bg-gray-100 dark:hover:bg-gray-600 rounded transition"
                                   title="Edit"
                                 >
                                   <Edit className="w-4 h-4" />
                                 </button>
                                 <button
+                                  onClick={async () => {
+                                    try {
+                                      const newStatus = playbook.status === 'active' ? 'paused' : 'active';
+                                      await api.put(`/playbooks/${playbook.id}`, { status: newStatus });
+                                      setPlaybooks((prev) =>
+                                        prev.map((p) => (p.id === playbook.id ? { ...p, status: newStatus } : p))
+                                      );
+                                    } catch (err) {
+                                      console.error('Error toggling playbook status:', err);
+                                    }
+                                  }}
                                   className="p-1.5 text-gray-500 hover:text-green-600 dark:hover:text-green-400 hover:bg-gray-100 dark:hover:bg-gray-600 rounded transition"
                                   title={playbook.status === 'active' ? 'Pause' : 'Run'}
                                 >
@@ -378,12 +417,29 @@ export default function PlaybookBuilder() {
                                   )}
                                 </button>
                                 <button
+                                  onClick={async () => {
+                                    try {
+                                      const res = await api.post(`/playbooks/${playbook.id}/duplicate`);
+                                      setPlaybooks((prev) => [...prev, res.data]);
+                                    } catch (err) {
+                                      console.error('Error duplicating playbook:', err);
+                                    }
+                                  }}
                                   className="p-1.5 text-gray-500 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-gray-600 rounded transition"
                                   title="Duplicate"
                                 >
                                   <Copy className="w-4 h-4" />
                                 </button>
                                 <button
+                                  onClick={async () => {
+                                    if (!confirm(`Delete playbook "${playbook.name}"?`)) return;
+                                    try {
+                                      await api.delete(`/playbooks/${playbook.id}`);
+                                      setPlaybooks((prev) => prev.filter((p) => p.id !== playbook.id));
+                                    } catch (err) {
+                                      console.error('Error deleting playbook:', err);
+                                    }
+                                  }}
                                   className="p-1.5 text-gray-500 hover:text-red-600 dark:hover:text-red-400 hover:bg-gray-100 dark:hover:bg-gray-600 rounded transition"
                                   title="Delete"
                                 >
@@ -459,11 +515,25 @@ export default function PlaybookBuilder() {
                             </div>
                           )}
                           <div className="flex gap-2">
-                            <button className="flex-1 flex items-center justify-center gap-2 px-3 py-2 text-sm bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition">
+                            <button
+                              onClick={async () => {
+                                try {
+                                  const res = await api.post(`/playbooks/templates/${template.id}/instantiate`);
+                                  setPlaybooks((prev) => [...prev, res.data]);
+                                  setActiveTab('playbooks');
+                                } catch (err) {
+                                  console.error('Error instantiating template:', err);
+                                }
+                              }}
+                              className="flex-1 flex items-center justify-center gap-2 px-3 py-2 text-sm bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition"
+                            >
                               <Plus className="w-4 h-4" />
                               Use Template
                             </button>
-                            <button className="px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                            <button
+                              onClick={() => setPreviewTemplate(template)}
+                              className="px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                            >
                               Preview
                             </button>
                           </div>
@@ -647,6 +717,7 @@ export default function PlaybookBuilder() {
                             <td className="px-6 py-4">
                               <div className="flex items-center gap-2">
                                 <button
+                                  onClick={() => setSelectedExecution(execution)}
                                   className="p-1.5 text-gray-500 hover:text-indigo-600 dark:hover:text-indigo-400 hover:bg-gray-100 dark:hover:bg-gray-600 rounded transition"
                                   title="View Details"
                                 >
@@ -654,6 +725,16 @@ export default function PlaybookBuilder() {
                                 </button>
                                 {execution.status === 'running' && (
                                   <button
+                                    onClick={async () => {
+                                      try {
+                                        await api.put(`/playbooks/executions/${execution.id}/pause`);
+                                        setExecutions((prev) =>
+                                          prev.map((e) => (e.id === execution.id ? { ...e, status: 'paused' } : e))
+                                        );
+                                      } catch (err) {
+                                        console.error('Error pausing execution:', err);
+                                      }
+                                    }}
                                     className="p-1.5 text-gray-500 hover:text-yellow-600 dark:hover:text-yellow-400 hover:bg-gray-100 dark:hover:bg-gray-600 rounded transition"
                                     title="Pause"
                                   >
@@ -662,6 +743,14 @@ export default function PlaybookBuilder() {
                                 )}
                                 {execution.status !== 'running' && (
                                   <button
+                                    onClick={async () => {
+                                      try {
+                                        const res = await api.post(`/playbooks/${execution.playbookId}/execute`);
+                                        setExecutions((prev) => [...prev, res.data]);
+                                      } catch (err) {
+                                        console.error('Error re-running playbook:', err);
+                                      }
+                                    }}
                                     className="p-1.5 text-gray-500 hover:text-green-600 dark:hover:text-green-400 hover:bg-gray-100 dark:hover:bg-gray-600 rounded transition"
                                     title="Re-run"
                                   >

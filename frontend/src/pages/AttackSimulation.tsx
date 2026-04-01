@@ -121,6 +121,7 @@ export default function AttackSimulation() {
   const [platformFilter, setPlatformFilter] = useState('all');
   const [safeOnly, setSafeOnly] = useState(false);
   const [expandedTechnique, setExpandedTechnique] = useState<string | null>(null);
+  const [showNewSimulationModal, setShowNewSimulationModal] = useState(false);
 
   // Fetch simulation dashboard
   const { data: dashboard } = useQuery({
@@ -343,7 +344,10 @@ export default function AttackSimulation() {
       {/* Simulations Tab */}
       {activeTab === 'simulations' && (
         <div className="space-y-6">
-          <button className="px-4 py-2 rounded-lg bg-red-600 dark:bg-red-700 text-white hover:bg-red-700 dark:hover:bg-red-600 font-medium transition-colors">
+          <button
+            onClick={() => setShowNewSimulationModal(true)}
+            className="px-4 py-2 rounded-lg bg-red-600 dark:bg-red-700 text-white hover:bg-red-700 dark:hover:bg-red-600 font-medium transition-colors"
+          >
             New Simulation
           </button>
 
@@ -501,7 +505,18 @@ export default function AttackSimulation() {
                       <p className="text-xs font-semibold text-gray-900 dark:text-white mb-1">Test Command</p>
                       <p className="text-xs text-gray-600 dark:text-gray-400 font-mono bg-gray-50 dark:bg-gray-700 p-2 rounded truncate">{technique.test_command}</p>
                     </div>
-                    <button className="w-full px-3 py-2 rounded-lg bg-red-600 dark:bg-red-700 text-white hover:bg-red-700 dark:hover:bg-red-600 text-xs font-medium transition-colors">
+                    <button
+                      onClick={async (e) => {
+                        e.stopPropagation();
+                        try {
+                          await api.post(`/simulation/techniques/${technique.id}/run`);
+                          alert('Test started for technique: ' + technique.name);
+                        } catch (error) {
+                          console.error('Error running test:', error);
+                        }
+                      }}
+                      className="w-full px-3 py-2 rounded-lg bg-red-600 dark:bg-red-700 text-white hover:bg-red-700 dark:hover:bg-red-600 text-xs font-medium transition-colors"
+                    >
                       Run Test
                     </button>
                   </div>
@@ -571,7 +586,17 @@ export default function AttackSimulation() {
                 </div>
               </div>
 
-              <button className="w-full px-4 py-2 rounded-lg bg-red-600 dark:bg-red-700 text-white hover:bg-red-700 dark:hover:bg-red-600 font-medium text-sm transition-colors">
+              <button
+                onClick={async () => {
+                  try {
+                    await api.post(`/simulation/adversaries/${adversary.id}/emulate`);
+                    alert('Simulation started for adversary: ' + adversary.name);
+                  } catch (error) {
+                    console.error('Error starting simulation:', error);
+                  }
+                }}
+                className="w-full px-4 py-2 rounded-lg bg-red-600 dark:bg-red-700 text-white hover:bg-red-700 dark:hover:bg-red-600 font-medium text-sm transition-colors"
+              >
                 Emulate
               </button>
             </div>
@@ -688,6 +713,46 @@ export default function AttackSimulation() {
               </p>
             </div>
           )}
+        </div>
+      )}
+      {/* New Simulation Modal */}
+      {showNewSimulationModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-96 max-h-screen overflow-y-auto">
+            <h2 className="text-xl font-bold text-gray-900 dark:text-white mb-4">Launch New Simulation</h2>
+            <div className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-900 dark:text-white mb-1">Simulation Name</label>
+                <input type="text" placeholder="e.g., Ransomware Attack Chain" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-900 dark:text-white mb-1">Type</label>
+                <select className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
+                  <option value="atomic">Atomic</option>
+                  <option value="chain">Attack Chain</option>
+                  <option value="adversary">Adversary Emulation</option>
+                  <option value="purple">Purple Team</option>
+                </select>
+              </div>
+              <div className="flex gap-2 mt-6">
+                <button onClick={() => setShowNewSimulationModal(false)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
+                <button
+                  onClick={async () => {
+                    try {
+                      await api.post('/simulation/campaigns', { name: 'New Simulation', type: 'atomic', targets: [] });
+                      alert('Simulation launched successfully.');
+                      setShowNewSimulationModal(false);
+                    } catch (error) {
+                      console.error('Error launching simulation:', error);
+                    }
+                  }}
+                  className="flex-1 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition"
+                >
+                  Launch
+                </button>
+              </div>
+            </div>
+          </div>
         </div>
       )}
     </div>

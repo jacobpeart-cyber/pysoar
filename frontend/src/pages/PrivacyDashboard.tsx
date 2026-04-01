@@ -472,7 +472,15 @@ export default function PrivacyDashboard() {
                     Cancel
                   </button>
                   <button
-                    onClick={() => setShowModal(false)}
+                    onClick={async () => {
+                      try {
+                        await privacyApi.createDSR({});
+                      } catch (err) {
+                        console.error('Create DSR failed:', err);
+                      } finally {
+                        setShowModal(false);
+                      }
+                    }}
                     className="flex-1 bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded transition-colors"
                   >
                     Create

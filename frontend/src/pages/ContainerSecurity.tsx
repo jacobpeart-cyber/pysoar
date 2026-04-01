@@ -70,6 +70,10 @@ export default function ContainerSecurity() {
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
   const [showNewPolicyModal, setShowNewPolicyModal] = useState(false);
+  const [selectedImage, setSelectedImage] = useState<any>(null);
+  const [selectedScan, setSelectedScan] = useState<any>(null);
+  const [rescanning, setRescanning] = useState<string | null>(null);
+  const [showFilterPanel, setShowFilterPanel] = useState(false);
 
   useEffect(() => {
     const loadData = async () => {
@@ -299,11 +303,31 @@ export default function ContainerSecurity() {
                             <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">{image.size || 'N/A'}</td>
                             <td className="px-6 py-4 text-sm">
                               <div className="flex gap-2">
-                                <button className="text-blue-600 dark:text-blue-400 hover:underline" title="View Details">
+                                <button
+                                  onClick={(e) => { e.stopPropagation(); setSelectedImage(image); }}
+                                  className="text-blue-600 dark:text-blue-400 hover:underline"
+                                  title="View Details"
+                                >
                                   <Eye className="w-4 h-4" />
                                 </button>
-                                <button className="text-cyan-600 dark:text-cyan-400 hover:underline" title="Re-scan">
-                                  <RefreshCw className="w-4 h-4" />
+                                <button
+                                  onClick={async (e) => {
+                                    e.stopPropagation();
+                                    setRescanning(image.id);
+                                    try {
+                                      await containerApi.scanImage(image.id);
+                                      const scansData = await containerApi.getScans();
+                                      setScans(scansData.data || []);
+                                    } catch (err) {
+                                      console.error('Re-scan failed:', err);
+                                    } finally {
+                                      setRescanning(null);
+                                    }
+                                  }}
+                                  className="text-cyan-600 dark:text-cyan-400 hover:underline"
+                                  title="Re-scan"
+                                >
+                                  <RefreshCw className={`w-4 h-4 ${rescanning === image.id ? 'animate-spin' : ''}`} />
                                 </button>
                               </div>
                             </td>
@@ -439,10 +463,32 @@ export default function ContainerSecurity() {
                             <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">{scan.duration || 'N/A'}</td>
                             <td className="px-6 py-4 text-sm">
                               <div className="flex gap-2">
-                                <button className="text-blue-600 dark:text-blue-400 hover:underline" title="View Report">
+                                <button
+                                  onClick={(e) => { e.stopPropagation(); setSelectedScan(scan); }}
+                                  className="text-blue-600 dark:text-blue-400 hover:underline"
+                                  title="View Report"
+                                >
                                   <Eye className="w-4 h-4" />
                                 </button>
-                                <button className="text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100" title="Download Report">
+                                <button
+                                  onClick={async (e) => {
+                                    e.stopPropagation();
+                                    try {
+                                      const response = await containerApi.getScanReport(scan.id);
+                                      const blob = new Blob([JSON.stringify(response, null, 2)], { type: 'application/json' });
+                                      const url = URL.createObjectURL(blob);
+                                      const a = document.createElement('a');
+                                      a.href = url;
+                                      a.download = `scan-report-${scan.id}.json`;
+                                      a.click();
+                                      URL.revokeObjectURL(url);
+                                    } catch (err) {
+                                      console.error('Download failed:', err);
+                                    }
+                                  }}
+                                  className="text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100"
+                                  title="Download Report"
+                                >
                                   <Download className="w-4 h-4" />
                                 </button>
                               </div>
@@ -643,6 +689,56 @@ export default function ContainerSecurity() {
           </>
         )}
       </div>
+
+      {/* Image Detail Modal */}
+      {selectedImage && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-[480px] max-h-[80vh] overflow-y-auto shadow-xl">
+            <div className="flex justify-between items-center mb-4">
+              <h2 className="text-xl font-bold">Image Details</h2>
+              <button onClick={() => setSelectedImage(null)} className="text-gray-400 hover:text-gray-200">
+                <Plus className="w-5 h-5 rotate-45" />
+              </button>
+            </div>
+            <div className="space-y-3 text-sm">
+              <div><span className="text-gray-400">Name:</span> <span className="font-mono font-medium">{selectedImage.name}</span></div>
+              <div><span className="text-gray-400">Tag:</span> <span className="font-mono">{selectedImage.tag || 'latest'}</span></div>
+              <div><span className="text-gray-400">Registry:</span> {selectedImage.registry || 'docker.io'}</div>
+              <div><span className="text-gray-400">Status:</span> <span className={`px-2 py-1 rounded text-xs font-medium ${getStatusColor(selectedImage.status)}`}>{selectedImage.status}</span></div>
+              <div><span className="text-gray-400">Vulnerabilities:</span> <span className="font-semibold">{selectedImage.vulnerabilities || 0}</span></div>
+              <div><span className="text-gray-400">Size:</span> {selectedImage.size || 'N/A'}</div>
+              <div><span className="text-gray-400">Last Scanned:</span> {selectedImage.lastScanned ? new Date(selectedImage.lastScanned).toLocaleString() : 'Never'}</div>
+            </div>
+            <button onClick={() => setSelectedImage(null)} className="mt-6 w-full px-4 py-2 bg-cyan-600 hover:bg-cyan-700 text-white rounded-lg transition">Close</button>
+          </div>
+        </div>
+      )}
+
+      {/* Scan Report Modal */}
+      {selectedScan && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-[480px] max-h-[80vh] overflow-y-auto shadow-xl">
+            <div className="flex justify-between items-center mb-4">
+              <h2 className="text-xl font-bold">Scan Report</h2>
+              <button onClick={() => setSelectedScan(null)} className="text-gray-400 hover:text-gray-200">
+                <Plus className="w-5 h-5 rotate-45" />
+              </button>
+            </div>
+            <div className="space-y-3 text-sm">
+              <div><span className="text-gray-400">Scan ID:</span> <span className="font-mono">{selectedScan.id}</span></div>
+              <div><span className="text-gray-400">Image:</span> {selectedScan.imageName || selectedScan.image || 'N/A'}</div>
+              <div><span className="text-gray-400">Status:</span> <span className={`px-2 py-1 rounded text-xs font-medium ${getStatusColor(selectedScan.status)}`}>{selectedScan.status}</span></div>
+              <div><span className="text-gray-400">Critical:</span> <span className="text-red-500 font-semibold">{selectedScan.criticalCount || 0}</span></div>
+              <div><span className="text-gray-400">High:</span> <span className="text-orange-500 font-semibold">{selectedScan.highCount || 0}</span></div>
+              <div><span className="text-gray-400">Medium:</span> <span className="text-yellow-500 font-semibold">{selectedScan.mediumCount || 0}</span></div>
+              <div><span className="text-gray-400">Low:</span> {selectedScan.lowCount || 0}</div>
+              <div><span className="text-gray-400">Started:</span> {selectedScan.startedAt ? new Date(selectedScan.startedAt).toLocaleString() : 'N/A'}</div>
+              <div><span className="text-gray-400">Duration:</span> {selectedScan.duration || 'N/A'}</div>
+            </div>
+            <button onClick={() => setSelectedScan(null)} className="mt-6 w-full px-4 py-2 bg-cyan-600 hover:bg-cyan-700 text-white rounded-lg transition">Close</button>
+          </div>
+        </div>
+      )}
 
       {/* New Policy Modal */}
       {showNewPolicyModal && (
