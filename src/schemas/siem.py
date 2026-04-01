@@ -229,10 +229,14 @@ class SIEMStatsResponse(BaseModel):
 
     total_logs: int
     logs_today: int
-    logs_by_type: dict[str, int]
-    logs_by_severity: dict[str, int]
-    logs_by_source: dict[str, int]
+    events_per_second: float = 0.0
     active_rules: int
+    alerts_triggered_24h: int = 0
+    active_data_sources: int = 0
+    logs_by_type: list[dict[str, Any]]
+    logs_by_severity: list[dict[str, Any]]
+    logs_by_source: list[dict[str, Any]]
+    recent_detections: list[dict[str, Any]] = []
     rule_matches_today: int
     active_correlations: int
     ingestion_rate_per_hour: float
@@ -245,7 +249,7 @@ class DataSourceCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
     description: Optional[str] = None
     source_type: str
-    connection_config: dict[str, Any]
+    connection_config: dict[str, Any] = {}
     parser_config: Optional[dict[str, Any]] = None
     enabled: bool = True
 
