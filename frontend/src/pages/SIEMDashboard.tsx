@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { useQuery, useMutation } from '@tanstack/react-query';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   AreaChart,
   Area,
@@ -70,6 +70,13 @@ export default function SIEMDashboard() {
   const [selectedSource, setSelectedSource] = useState<any>(null);
   const [sourceModalMode, setSourceModalMode] = useState<'view' | 'config' | 'add'>('view');
   const [newSourceForm, setNewSourceForm] = useState({ name: '', description: '', source_type: 'syslog' });
+  const [showCreateRuleModal, setShowCreateRuleModal] = useState(false);
+  const [newRuleForm, setNewRuleForm] = useState({ name: '', title: '', description: '', severity: 'medium', condition: '' });
+  const [testLogs, setTestLogs] = useState('');
+  const [testResult, setTestResult] = useState<any>(null);
+  const [selectedCorrelation, setSelectedCorrelation] = useState<any>(null);
+
+  const queryClient = useQueryClient();
 
   // Fetch dashboard stats
   const { data: stats, isLoading: statsLoading } = useQuery({
@@ -84,10 +91,15 @@ export default function SIEMDashboard() {
   const { data: logsData, isLoading: logsLoading } = useQuery({
     queryKey: ['siem-logs', searchQuery, timeRange, sourceTypeFilter, severityFilter, searchPage],
     queryFn: async () => {
+      const now = new Date();
+      const timeMap: Record<string, number> = { '1h': 1, '6h': 6, '24h': 24, '7d': 168, '30d': 720 };
+      const hours = timeMap[timeRange] || 24;
+      const time_start = new Date(now.getTime() - hours * 3600000).toISOString();
       const response = await api.post('/siem/logs/search', {
         query: searchQuery || undefined,
         source_types: sourceTypeFilter ? [sourceTypeFilter] : undefined,
         severities: severityFilter ? [severityFilter] : undefined,
+        time_start: timeRange !== 'custom' ? time_start : undefined,
         page: searchPage,
         size: 15,
       });
@@ -191,7 +203,7 @@ export default function SIEMDashboard() {
           <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
             <StatsCard
               title="Total Logs"
-              value={statsLoading ? '-' : (stats?.total_logs_ingested || 0).toLocaleString()}
+              value={statsLoading ? '-' : (stats?.total_logs || 0).toLocaleString()}
               subtext="24 hours"
               icon={Activity}
             />
@@ -203,7 +215,7 @@ export default function SIEMDashboard() {
             />
             <StatsCard
               title="Active Rules"
-              value={statsLoading ? '-' : stats?.active_detection_rules || 0}
+              value={statsLoading ? '-' : stats?.active_rules || 0}
               subtext="Detection rules"
               icon={Zap}
             />
@@ -226,19 +238,19 @@ export default function SIEMDashboard() {
             {/* Log Ingestion Chart */}
             <div className="bg-white rounded-lg border border-gray-200 p-6">
               <h3 className="text-lg font-semibold text-gray-900 mb-4">Log Ingestion Volume (24h)</h3>
-              {stats?.log_ingestion_chart ? (
+              {stats?.logs_by_type && stats.logs_by_type.length > 0 ? (
                 <ResponsiveContainer width="100%" height={300}>
-                  <AreaChart data={stats.log_ingestion_chart}>
+                  <AreaChart data={stats.logs_by_type}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
-                    <XAxis dataKey="time" stroke="#6b7280" />
+                    <XAxis dataKey="name" stroke="#6b7280" />
                     <YAxis stroke="#6b7280" />
                     <Tooltip />
-                    <Area type="monotone" dataKey="count" stroke="#3b82f6" fill="#3b82f6" fillOpacity={0.1} />
+                    <Area type="monotone" dataKey="value" stroke="#3b82f6" fill="#3b82f6" fillOpacity={0.1} />
                   </AreaChart>
                 </ResponsiveContainer>
               ) : (
                 <div className="h-[300px] bg-gray-50 rounded flex items-center justify-center">
-                  <p className="text-gray-500">Loading chart...</p>
+                  <p className="text-gray-500">No log data available</p>
                 </div>
               )}
             </div>
@@ -246,19 +258,19 @@ export default function SIEMDashboard() {
             {/* Events by Severity */}
             <div className="bg-white rounded-lg border border-gray-200 p-6">
               <h3 className="text-lg font-semibold text-gray-900 mb-4">Events by Severity</h3>
-              {stats?.events_by_severity ? (
+              {stats?.logs_by_severity && stats.logs_by_severity.length > 0 ? (
                 <ResponsiveContainer width="100%" height={300}>
-                  <BarChart data={stats.events_by_severity}>
+                  <BarChart data={stats.logs_by_severity}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
-                    <XAxis dataKey="severity" stroke="#6b7280" />
+                    <XAxis dataKey="name" stroke="#6b7280" />
                     <YAxis stroke="#6b7280" />
                     <Tooltip />
-                    <Bar dataKey="count" fill="#3b82f6" />
+                    <Bar dataKey="value" fill="#3b82f6" />
                   </BarChart>
                 </ResponsiveContainer>
               ) : (
                 <div className="h-[300px] bg-gray-50 rounded flex items-center justify-center">
-                  <p className="text-gray-500">Loading chart...</p>
+                  <p className="text-gray-500">No severity data available</p>
                 </div>
               )}
             </div>
@@ -266,19 +278,19 @@ export default function SIEMDashboard() {
             {/* Events by Source Type */}
             <div className="bg-white rounded-lg border border-gray-200 p-6">
               <h3 className="text-lg font-semibold text-gray-900 mb-4">Events by Source Type</h3>
-              {stats?.events_by_source ? (
+              {stats?.logs_by_source && stats.logs_by_source.length > 0 ? (
                 <ResponsiveContainer width="100%" height={300}>
                   <PieChart>
                     <Pie
-                      data={stats.events_by_source}
-                      dataKey="count"
-                      nameKey="source_type"
+                      data={stats.logs_by_source}
+                      dataKey="value"
+                      nameKey="name"
                       cx="50%"
                       cy="50%"
                       outerRadius={100}
                       label
                     >
-                      {stats.events_by_source.map((_: any, index: number) => (
+                      {stats.logs_by_source.map((_: any, index: number) => (
                         <Cell key={`cell-${index}`} fill={chartColors[index % chartColors.length]} />
                       ))}
                     </Pie>
@@ -287,7 +299,7 @@ export default function SIEMDashboard() {
                 </ResponsiveContainer>
               ) : (
                 <div className="h-[300px] bg-gray-50 rounded flex items-center justify-center">
-                  <p className="text-gray-500">Loading chart...</p>
+                  <p className="text-gray-500">No source data available</p>
                 </div>
               )}
             </div>
@@ -342,7 +354,10 @@ export default function SIEMDashboard() {
                   placeholder="Enter search query..."
                   className="flex-1 px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                 />
-                <button className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 flex items-center gap-2">
+                <button
+                  onClick={() => { setSearchPage(1); queryClient.invalidateQueries({ queryKey: ['siem-logs'] }); }}
+                  className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 flex items-center gap-2"
+                >
                   <Search className="w-5 h-5" />
                   Search
                 </button>
@@ -454,7 +469,7 @@ export default function SIEMDashboard() {
                         <td className="px-6 py-4 text-sm text-gray-500">
                           {new Date(log.timestamp).toLocaleString()}
                         </td>
-                        <td className="px-6 py-4 text-sm font-medium text-gray-900">{log.source}</td>
+                        <td className="px-6 py-4 text-sm font-medium text-gray-900">{log.source_name}</td>
                         <td className="px-6 py-4">
                           <span
                             className={clsx(
@@ -467,7 +482,7 @@ export default function SIEMDashboard() {
                         </td>
                         <td className="px-6 py-4 text-sm text-gray-900 max-w-xs truncate">{log.message}</td>
                         <td className="px-6 py-4 text-sm font-mono text-gray-600">{log.source_ip}</td>
-                        <td className="px-6 py-4 text-sm font-mono text-gray-600">{log.dest_ip}</td>
+                        <td className="px-6 py-4 text-sm font-mono text-gray-600">{log.destination_address}</td>
                         <td className="px-6 py-4 text-right">
                           <button
                             onClick={() => setSelectedLogDetail(log)}
@@ -533,7 +548,7 @@ export default function SIEMDashboard() {
                     </div>
                     <div>
                       <label className="block text-sm font-medium text-gray-500 mb-1">Source</label>
-                      <p className="text-gray-900">{selectedLogDetail.source}</p>
+                      <p className="text-gray-900">{selectedLogDetail.source_name}</p>
                     </div>
                   </div>
                   <div>
@@ -558,7 +573,7 @@ export default function SIEMDashboard() {
                     </div>
                     <div>
                       <label className="block text-sm font-medium text-gray-500 mb-1">Destination IP</label>
-                      <p className="text-gray-900 font-mono">{selectedLogDetail.dest_ip}</p>
+                      <p className="text-gray-900 font-mono">{selectedLogDetail.destination_address}</p>
                     </div>
                   </div>
                   {selectedLogDetail.raw_data && (
@@ -580,6 +595,7 @@ export default function SIEMDashboard() {
       {activeTab === 'rules' && (
         <div className="space-y-6">
           {/* Filter Buttons */}
+          <div className="flex items-center gap-2 justify-between">
           <div className="flex items-center gap-2">
             <Filter className="w-5 h-5 text-gray-500" />
             <button
@@ -608,6 +624,14 @@ export default function SIEMDashboard() {
               )}
             >
               Disabled
+            </button>
+          </div>
+            <button
+              onClick={() => { setShowCreateRuleModal(true); setNewRuleForm({ name: '', title: '', description: '', severity: 'medium', condition: '' }); }}
+              className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+            >
+              <Plus className="w-5 h-5" />
+              Create Rule
             </button>
           </div>
 
@@ -665,7 +689,7 @@ export default function SIEMDashboard() {
                             {rule.severity}
                           </span>
                         </td>
-                        <td className="px-6 py-4 text-sm text-gray-600">{rule.mitre_tactic || '-'}</td>
+                        <td className="px-6 py-4 text-sm text-gray-600">{(() => { try { const t = rule.mitre_tactics; return Array.isArray(t) ? t.join(', ') : typeof t === 'string' ? JSON.parse(t).join(', ') : '-'; } catch { return rule.mitre_tactics || '-'; } })()}</td>
                         <td className="px-6 py-4">
                           <button
                             onClick={() => {
@@ -690,17 +714,30 @@ export default function SIEMDashboard() {
                           </button>
                         </td>
                         <td className="px-6 py-4 text-sm text-gray-600">
-                          {rule.last_triggered ? new Date(rule.last_triggered).toLocaleDateString() : '-'}
+                          {rule.last_matched_at ? new Date(rule.last_matched_at).toLocaleDateString() : '-'}
                         </td>
-                        <td className="px-6 py-4 text-sm font-medium text-gray-900">{rule.hit_count || 0}</td>
+                        <td className="px-6 py-4 text-sm font-medium text-gray-900">{rule.match_count || 0}</td>
                         <td className="px-6 py-4 text-right">
                           <div className="flex items-center justify-end gap-2">
                             <button
-                              onClick={() => setSelectedRule(rule)}
+                              onClick={() => { setSelectedRule(rule); setTestLogs(''); setTestResult(null); }}
                               className="flex items-center gap-1 px-3 py-1 text-sm bg-blue-50 text-blue-600 rounded hover:bg-blue-100"
                             >
                               <Play className="w-4 h-4" />
                               Test
+                            </button>
+                            <button
+                              onClick={async () => {
+                                if (confirm('Are you sure you want to delete this rule?')) {
+                                  try {
+                                    await api.delete(`/siem/rules/${rule.id}`);
+                                    queryClient.invalidateQueries({ queryKey: ['siem-rules'] });
+                                  } catch {}
+                                }
+                              }}
+                              className="flex items-center gap-1 px-3 py-1 text-sm bg-red-50 text-red-600 rounded hover:bg-red-100"
+                            >
+                              Delete
                             </button>
                           </div>
                         </td>
@@ -710,6 +747,100 @@ export default function SIEMDashboard() {
               </table>
             )}
           </div>
+
+          {/* Create Rule Modal */}
+          {showCreateRuleModal && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50">
+              <div className="bg-white rounded-lg shadow-xl w-full max-w-lg mx-4 max-h-[80vh] overflow-y-auto">
+                <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200">
+                  <h2 className="text-lg font-semibold text-gray-900">Create Detection Rule</h2>
+                  <button
+                    onClick={() => setShowCreateRuleModal(false)}
+                    className="text-gray-400 hover:text-gray-600"
+                  >
+                    ✕
+                  </button>
+                </div>
+                <div className="p-6 space-y-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Name *</label>
+                    <input
+                      type="text"
+                      value={newRuleForm.name}
+                      onChange={(e) => setNewRuleForm({ ...newRuleForm, name: e.target.value })}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                      placeholder="rule_name"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Title *</label>
+                    <input
+                      type="text"
+                      value={newRuleForm.title}
+                      onChange={(e) => setNewRuleForm({ ...newRuleForm, title: e.target.value })}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                      placeholder="Rule Title"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Description</label>
+                    <textarea
+                      value={newRuleForm.description}
+                      onChange={(e) => setNewRuleForm({ ...newRuleForm, description: e.target.value })}
+                      rows={3}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                      placeholder="Describe the detection rule..."
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Severity</label>
+                    <select
+                      value={newRuleForm.severity}
+                      onChange={(e) => setNewRuleForm({ ...newRuleForm, severity: e.target.value })}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                    >
+                      <option value="critical">Critical</option>
+                      <option value="high">High</option>
+                      <option value="medium">Medium</option>
+                      <option value="low">Low</option>
+                      <option value="informational">Informational</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Condition</label>
+                    <input
+                      type="text"
+                      value={newRuleForm.condition}
+                      onChange={(e) => setNewRuleForm({ ...newRuleForm, condition: e.target.value })}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent font-mono text-sm"
+                      placeholder="e.g., selection AND NOT filter"
+                    />
+                  </div>
+                  <div className="flex justify-end gap-3 pt-2 border-t">
+                    <button
+                      onClick={() => setShowCreateRuleModal(false)}
+                      className="px-4 py-2 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      disabled={!newRuleForm.name || !newRuleForm.title}
+                      onClick={async () => {
+                        try {
+                          await api.post('/siem/rules', newRuleForm);
+                          setShowCreateRuleModal(false);
+                          queryClient.invalidateQueries({ queryKey: ['siem-rules'] });
+                        } catch {}
+                      }}
+                      className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
+                    >
+                      Create Rule
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
 
           {/* Test Rule Modal */}
           {selectedRule && (
@@ -726,21 +857,50 @@ export default function SIEMDashboard() {
                 </div>
                 <div className="p-6 space-y-4">
                   <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-2">Test Log Data</label>
+                    <label className="block text-sm font-medium text-gray-700 mb-2">Test Log Data (one log per line)</label>
                     <textarea
                       rows={6}
-                      placeholder="Enter test log data (JSON format)"
+                      value={testLogs}
+                      onChange={(e) => setTestLogs(e.target.value)}
+                      placeholder="Enter test log data (one log per line)"
                       className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent font-mono text-sm"
                     />
                   </div>
+                  {testResult && (
+                    <div className="bg-gray-50 rounded-lg p-4 space-y-2">
+                      <h4 className="text-sm font-semibold text-gray-900">Test Results</h4>
+                      <div className="grid grid-cols-3 gap-4 text-sm">
+                        <div>
+                          <span className="text-gray-500">Samples:</span>{' '}
+                          <span className="font-medium">{testResult.sample_count}</span>
+                        </div>
+                        <div>
+                          <span className="text-gray-500">Matches:</span>{' '}
+                          <span className="font-medium">{testResult.match_count}</span>
+                        </div>
+                        <div>
+                          <span className="text-gray-500">Match Rate:</span>{' '}
+                          <span className="font-medium">{(testResult.match_rate * 100).toFixed(1)}%</span>
+                        </div>
+                      </div>
+                    </div>
+                  )}
                   <div className="flex justify-end gap-3">
                     <button
-                      onClick={() => setSelectedRule(null)}
+                      onClick={() => { setSelectedRule(null); setTestResult(null); setTestLogs(''); }}
                       className="px-4 py-2 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50"
                     >
                       Cancel
                     </button>
-                    <button className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700">
+                    <button
+                      onClick={async () => {
+                        try {
+                          const response = await api.post(`/siem/rules/${selectedRule.id}/test`, { sample_logs: testLogs.split('\n').filter((l: string) => l.trim()) });
+                          setTestResult(response.data);
+                        } catch {}
+                      }}
+                      className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+                    >
                       Run Test
                     </button>
                   </div>
@@ -932,7 +1092,7 @@ export default function SIEMDashboard() {
                                   await api.put(`/siem/sources/${selectedSource.id}`, newSourceForm);
                                 }
                                 setSelectedSource(null);
-                                window.location.reload();
+                                queryClient.invalidateQueries({ queryKey: ['siem-sources'] });
                               } catch {}
                             }}
                             disabled={!newSourceForm.name}
@@ -1060,9 +1220,9 @@ export default function SIEMDashboard() {
                   {correlations.map((correlation: any) => (
                     <tr key={correlation.id} className="hover:bg-gray-50">
                       <td className="px-6 py-4 text-sm text-gray-500">
-                        {new Date(correlation.time).toLocaleString()}
+                        {new Date(correlation.created_at).toLocaleString()}
                       </td>
-                      <td className="px-6 py-4 text-sm font-medium text-gray-900">{correlation.type}</td>
+                      <td className="px-6 py-4 text-sm font-medium text-gray-900">{correlation.name}</td>
                       <td className="px-6 py-4">
                         <span
                           className={clsx(
@@ -1073,15 +1233,18 @@ export default function SIEMDashboard() {
                           {correlation.severity}
                         </span>
                       </td>
-                      <td className="px-6 py-4 text-sm text-gray-600">{correlation.matched_rules_count || 0}</td>
-                      <td className="px-6 py-4 text-sm text-gray-600">{correlation.related_events_count || 0}</td>
+                      <td className="px-6 py-4 text-sm text-gray-600">{correlation.rule_ids?.length || (correlation.rule_id ? 1 : 0)}</td>
+                      <td className="px-6 py-4 text-sm text-gray-600">{correlation.event_count || 0}</td>
                       <td className="px-6 py-4">
                         <span className="px-2 py-1 text-xs font-medium rounded-full bg-blue-100 text-blue-700">
                           {correlation.status}
                         </span>
                       </td>
                       <td className="px-6 py-4 text-right">
-                        <button className="text-blue-600 hover:text-blue-800 text-sm font-medium flex items-center gap-1 ml-auto">
+                        <button
+                          onClick={() => setSelectedCorrelation(correlation)}
+                          className="text-blue-600 hover:text-blue-800 text-sm font-medium flex items-center gap-1 ml-auto"
+                        >
                           <Eye className="w-4 h-4" />
                           View
                         </button>
@@ -1092,6 +1255,96 @@ export default function SIEMDashboard() {
               </table>
             )}
           </div>
+
+          {/* Correlation Detail Modal */}
+          {selectedCorrelation && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50">
+              <div className="bg-white rounded-lg shadow-xl w-full max-w-2xl mx-4 max-h-[80vh] overflow-y-auto">
+                <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200 sticky top-0 bg-white">
+                  <h2 className="text-lg font-semibold text-gray-900">Correlation Details</h2>
+                  <button
+                    onClick={() => setSelectedCorrelation(null)}
+                    className="text-gray-400 hover:text-gray-600"
+                  >
+                    ✕
+                  </button>
+                </div>
+                <div className="p-6 space-y-4">
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-sm font-medium text-gray-500 mb-1">Name</label>
+                      <p className="text-gray-900 font-medium">{selectedCorrelation.name}</p>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-500 mb-1">Correlation ID</label>
+                      <p className="text-gray-900 font-mono text-sm">{selectedCorrelation.correlation_id}</p>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-sm font-medium text-gray-500 mb-1">Severity</label>
+                      <span className={clsx('px-2 py-1 text-xs font-medium rounded-full border capitalize', severityColors[selectedCorrelation.severity] || severityColors.info)}>
+                        {selectedCorrelation.severity}
+                      </span>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-500 mb-1">Status</label>
+                      <span className="px-2 py-1 text-xs font-medium rounded-full bg-blue-100 text-blue-700">
+                        {selectedCorrelation.status}
+                      </span>
+                    </div>
+                  </div>
+                  {selectedCorrelation.description && (
+                    <div>
+                      <label className="block text-sm font-medium text-gray-500 mb-1">Description</label>
+                      <p className="text-gray-900 text-sm">{selectedCorrelation.description}</p>
+                    </div>
+                  )}
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-sm font-medium text-gray-500 mb-1">Event Count</label>
+                      <p className="text-gray-900">{selectedCorrelation.event_count || 0}</p>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-500 mb-1">Alert Generated</label>
+                      <p className="text-gray-900">{selectedCorrelation.alert_generated ? 'Yes' : 'No'}</p>
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-sm font-medium text-gray-500 mb-1">Timespan Start</label>
+                      <p className="text-gray-900 text-sm">{selectedCorrelation.timespan_start ? new Date(selectedCorrelation.timespan_start).toLocaleString() : '-'}</p>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-500 mb-1">Timespan End</label>
+                      <p className="text-gray-900 text-sm">{selectedCorrelation.timespan_end ? new Date(selectedCorrelation.timespan_end).toLocaleString() : '-'}</p>
+                    </div>
+                  </div>
+                  {selectedCorrelation.source_addresses && selectedCorrelation.source_addresses.length > 0 && (
+                    <div>
+                      <label className="block text-sm font-medium text-gray-500 mb-1">Source Addresses</label>
+                      <p className="text-gray-900 font-mono text-sm">{selectedCorrelation.source_addresses.join(', ')}</p>
+                    </div>
+                  )}
+                  {selectedCorrelation.mitre_tactics && selectedCorrelation.mitre_tactics.length > 0 && (
+                    <div>
+                      <label className="block text-sm font-medium text-gray-500 mb-1">MITRE Tactics</label>
+                      <p className="text-gray-900 text-sm">{selectedCorrelation.mitre_tactics.join(', ')}</p>
+                    </div>
+                  )}
+                  <div className="border-t pt-4">
+                    <label className="block text-sm font-medium text-gray-500 mb-1">Created At</label>
+                    <p className="text-gray-600 text-sm">{selectedCorrelation.created_at ? new Date(selectedCorrelation.created_at).toLocaleString() : '-'}</p>
+                  </div>
+                  <div className="flex justify-end pt-2">
+                    <button onClick={() => setSelectedCorrelation(null)} className="px-4 py-2 bg-gray-100 text-gray-700 rounded-lg text-sm font-medium hover:bg-gray-200">
+                      Close
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       )}
     </div>

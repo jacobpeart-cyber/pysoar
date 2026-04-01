@@ -5,7 +5,7 @@ import math
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Body, HTTPException, Query, status
 from sqlalchemy import asc, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -272,26 +272,33 @@ async def get_siem_stats(
     total_result = await db.execute(select(func.count(LogEntry.id)))
     total_logs = total_result.scalar() or 0
 
-    logs_today_result = await db.execute(select(func.count(LogEntry.id)))
+    # Filter logs_today by today's date
+    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    logs_today_result = await db.execute(
+        select(func.count(LogEntry.id)).where(LogEntry.timestamp >= today_start.isoformat())
+    )
     logs_today = logs_today_result.scalar() or 0
+
+    # Events per second based on total logs over 24 hours
+    events_per_second = total_logs / (24 * 3600) if total_logs > 0 else 0.0
 
     type_result = await db.execute(
         select(LogEntry.log_type, func.count(LogEntry.id))
         .group_by(LogEntry.log_type)
     )
-    logs_by_type = dict(type_result.all())
+    logs_by_type = [{"name": row[0] or "unknown", "value": row[1]} for row in type_result.all()]
 
     severity_result = await db.execute(
         select(LogEntry.severity, func.count(LogEntry.id))
         .group_by(LogEntry.severity)
     )
-    logs_by_severity = dict(severity_result.all())
+    logs_by_severity = [{"name": row[0] or "unknown", "value": row[1]} for row in severity_result.all()]
 
     source_result = await db.execute(
         select(LogEntry.source_name, func.count(LogEntry.id))
         .group_by(LogEntry.source_name)
     )
-    logs_by_source = dict(source_result.all())
+    logs_by_source = [{"name": row[0] or "unknown", "value": row[1]} for row in source_result.all()]
 
     rules_result = await db.execute(
         select(func.count(DetectionRule.id)).where(DetectionRule.enabled == True)
@@ -301,19 +308,61 @@ async def get_siem_stats(
     matches_result = await db.execute(select(func.sum(DetectionRule.match_count)))
     rule_matches_today = matches_result.scalar() or 0
 
+    # Alerts triggered in last 24 hours (correlation events with alert_generated=True)
+    twenty_four_hours_ago = datetime.now(timezone.utc).replace(microsecond=0)
+    twenty_four_hours_ago = twenty_four_hours_ago.replace(
+        hour=twenty_four_hours_ago.hour,
+    )
+    alerts_result = await db.execute(
+        select(func.count(CorrelationEvent.id)).where(
+            CorrelationEvent.alert_generated == True
+        )
+    )
+    alerts_triggered_24h = alerts_result.scalar() or 0
+
+    # Active data sources count
+    sources_result = await db.execute(
+        select(func.count(SIEMDataSource.id)).where(SIEMDataSource.enabled == True)
+    )
+    active_data_sources = sources_result.scalar() or 0
+
     corr_result = await db.execute(select(func.count(CorrelationEvent.id)))
     active_correlations = corr_result.scalar() or 0
+
+    # Recent detections - last 5 correlation events
+    recent_corr_result = await db.execute(
+        select(CorrelationEvent)
+        .order_by(CorrelationEvent.created_at.desc())
+        .limit(5)
+    )
+    recent_corr = list(recent_corr_result.scalars().all())
+    recent_detections = [
+        {
+            "rule_name": c.name,
+            "severity": c.severity,
+            "timestamp": c.created_at.isoformat() if c.created_at else "",
+            "status": c.status,
+        }
+        for c in recent_corr
+    ]
+
+    # Ingestion rate per hour
+    ingestion_rate = logs_today / max(datetime.now(timezone.utc).hour, 1)
 
     return SIEMStatsResponse(
         total_logs=total_logs,
         logs_today=logs_today,
+        events_per_second=round(events_per_second, 2),
+        active_rules=active_rules,
+        alerts_triggered_24h=alerts_triggered_24h,
+        active_data_sources=active_data_sources,
         logs_by_type=logs_by_type,
         logs_by_severity=logs_by_severity,
         logs_by_source=logs_by_source,
-        active_rules=active_rules,
+        recent_detections=recent_detections,
         rule_matches_today=int(rule_matches_today) if rule_matches_today else 0,
         active_correlations=active_correlations,
-        ingestion_rate_per_hour=0.0,
+        ingestion_rate_per_hour=round(ingestion_rate, 2),
     )
 
 
@@ -477,12 +526,13 @@ async def delete_rule(
 @router.post("/rules/{rule_id}/test", response_model=None)
 async def test_rule(
     rule_id: str,
-    sample_logs: list[str],
+    test_data: dict = Body(...),
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Test a detection rule against sample logs"""
     rule = await get_rule_or_404(db, rule_id)
+    sample_logs = test_data.get("sample_logs", [])
 
     # Simplified test: count how many logs would match
     matches = 0
@@ -568,7 +618,7 @@ async def get_correlation(
 @router.put("/correlations/{correlation_id}/status", response_model=CorrelationEventResponse)
 async def update_correlation_status(
     correlation_id: str,
-    status_update: dict,
+    status_update: dict = Body(...),
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
