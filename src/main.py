@@ -116,6 +116,30 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Add rate limiting middleware
+from starlette.middleware.base import BaseHTTPMiddleware
+from src.core.rate_limiter import InMemoryRateLimiter
+
+_global_limiter = InMemoryRateLimiter()
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    """Global API rate limiting - 100 requests per minute per IP."""
+    async def dispatch(self, request, call_next):
+        if request.url.path.startswith("/api/"):
+            client_ip = request.client.host if request.client else "unknown"
+            key = f"global:{client_ip}"
+            allowed, info = _global_limiter.check_rate_limit(key, max_requests=100, window_seconds=60)
+            if not allowed:
+                from fastapi.responses import JSONResponse
+                return JSONResponse(
+                    status_code=429,
+                    content={"detail": "Rate limit exceeded. Please slow down."},
+                    headers={"Retry-After": str(info.get("retry_after", 60))},
+                )
+        return await call_next(request)
+
+app.add_middleware(RateLimitMiddleware)
+
 # Add audit logging middleware
 app.add_middleware(AuditLoggingMiddleware)
 
