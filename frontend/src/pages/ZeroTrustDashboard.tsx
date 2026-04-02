@@ -32,61 +32,64 @@ interface Pillar {
 }
 
 interface DashboardData {
-  maturityLevel: MaturityLevel;
-  pillars: Pillar[];
-  accessDecisions24h: {
-    allowed: number;
-    denied: number;
-    challenged: number;
-  };
-  recentDecisions: AccessDecision[];
+  total_policies: number;
+  enabled_policies: number;
+  total_devices: number;
+  compliant_devices: number;
+  non_compliant_devices: number;
+  average_device_trust_score: number;
+  total_access_decisions: number;
+  allowed_decisions: number;
+  denied_decisions: number;
+  challenged_decisions: number;
+  total_segments: number;
+  active_segments: number;
+  violation_count: number;
+  maturity_score: number;
+  maturity_level: string;
+  last_updated: string;
 }
 
 interface AccessDecision {
   id: string;
-  time: string;
-  subject: string;
-  resource: string;
-  decision: 'allow' | 'deny' | 'challenge';
-  riskScore: number;
+  created_at: string;
+  decision: string;
+  risk_score: number;
+  risk_factors: string[];
   reason: string;
 }
 
 interface Device {
   id: string;
   hostname: string;
-  type: 'laptop' | 'desktop' | 'mobile' | 'server';
-  os: string;
-  trustScore: number;
-  compliant: boolean;
-  checks: {
-    patch: boolean;
-    av: boolean;
-    encryption: boolean;
-    firewall: boolean;
-  };
-  lastSeen: string;
+  device_type: string;
+  os_type: string;
+  trust_score: number;
+  is_compliant: boolean;
+  compliance_checks: Record<string, boolean>;
+  last_seen: string;
+  status: string;
 }
 
 interface Segment {
   id: string;
   name: string;
-  type: 'network' | 'application' | 'data';
-  memberCount: number;
-  allowedProtocols: string[];
-  violationCount: number;
-  status: 'healthy' | 'at-risk';
+  segment_type: string;
+  member_count: number;
+  allowed_protocols: string[];
+  violation_count: number;
+  status: string;
 }
 
 interface Policy {
   id: string;
   name: string;
-  type: string;
-  riskThreshold: number;
-  mfaRequired: boolean;
-  deviceTrustRequired: boolean;
-  hitCount: number;
-  status: 'active' | 'inactive';
+  policy_type: string;
+  risk_threshold: number;
+  mfa_required: boolean;
+  device_trust_required: boolean;
+  decision_count: number;
+  is_enabled: boolean;
 }
 
 interface DeviceStats {
@@ -119,29 +122,32 @@ export default function ZeroTrustDashboard() {
     },
   });
 
-  const { data: devices, isLoading: devicesLoading } = useQuery<Device[]>({
+  const { data: devicesRaw, isLoading: devicesLoading } = useQuery<any>({
     queryKey: ['zerotrust-devices'],
     queryFn: async () => {
       const response = await api.get('/zerotrust/devices');
       return response.data;
     },
   });
+  const devices: Device[] = Array.isArray(devicesRaw) ? devicesRaw : (devicesRaw?.devices || devicesRaw?.items || []);
 
-  const { data: segments, isLoading: segmentsLoading } = useQuery<Segment[]>({
+  const { data: segmentsRaw, isLoading: segmentsLoading } = useQuery<any>({
     queryKey: ['zerotrust-segments'],
     queryFn: async () => {
       const response = await api.get('/zerotrust/segments');
       return response.data;
     },
   });
+  const segments: Segment[] = Array.isArray(segmentsRaw) ? segmentsRaw : (segmentsRaw?.segments || segmentsRaw?.items || []);
 
-  const { data: policies, isLoading: policiesLoading } = useQuery<Policy[]>({
+  const { data: policiesRaw, isLoading: policiesLoading } = useQuery<any>({
     queryKey: ['zerotrust-policies'],
     queryFn: async () => {
       const response = await api.get('/zerotrust/policies');
       return response.data;
     },
   });
+  const policies: Policy[] = Array.isArray(policiesRaw) ? policiesRaw : (policiesRaw?.policies || policiesRaw?.items || []);
 
   const assessDevicesMutation = useMutation({
     mutationFn: async () => {
@@ -232,8 +238,8 @@ export default function ZeroTrustDashboard() {
       {/* Access Control Tab */}
       {activeTab === 'access-control' && (
         <AccessControlTab
-          recentDecisions={dashboardData?.recentDecisions || []}
-          accessDecisions24h={dashboardData?.accessDecisions24h}
+          recentDecisions={[]}
+          accessDecisions24h={{ allowed: dashboardData?.allowed_decisions || 0, denied: dashboardData?.denied_decisions || 0, challenged: dashboardData?.challenged_decisions || 0 }}
           loading={dashboardLoading}
           decisionFilter={decisionFilter}
           setDecisionFilter={setDecisionFilter}
@@ -287,6 +293,8 @@ function OverviewTab({
     );
   }
 
+  const pillarArray = Array.isArray(data?.pillars) ? data.pillars : Object.entries(data?.pillars || {}).map(([k, v]: [string, any]) => ({ name: k, score: v?.score || 0, status: (v?.score || 0) >= 70 ? 'healthy' : 'at-risk' }));
+
   const maturityLevels = (() => {
     const levels: { level: MaturityLevel; label: string; pillarCount: number }[] = [
       { level: 'traditional', label: 'Traditional', pillarCount: 0 },
@@ -294,8 +302,9 @@ function OverviewTab({
       { level: 'advanced', label: 'Advanced', pillarCount: 0 },
       { level: 'optimal', label: 'Optimal', pillarCount: 0 },
     ];
-    if (data?.pillars) {
-      data.pillars.forEach((pillar) => {
+    const pillarArray = Array.isArray(data?.pillars) ? data.pillars : Object.entries(data?.pillars || {}).map(([k, v]: [string, any]) => ({ name: k, score: v?.score || 0, status: (v?.score || 0) >= 70 ? 'healthy' : 'at-risk' }));
+    if (pillarArray.length > 0) {
+      pillarArray.forEach((pillar: any) => {
         if (pillar.score >= 90) levels[3].pillarCount += 1;
         else if (pillar.score >= 70) levels[2].pillarCount += 1;
         else if (pillar.score >= 40) levels[1].pillarCount += 1;
@@ -318,7 +327,7 @@ function OverviewTab({
               key={item.level}
               className={clsx(
                 'flex-1 px-4 py-3 rounded-lg border-2 text-center font-medium transition-all',
-                data?.maturityLevel === item.level
+                (data?.maturity_level || "traditional") as MaturityLevel === item.level
                   ? `${getMaturityColor(item.level)} border-current`
                   : 'bg-gray-50 dark:bg-gray-700/50 border-gray-200 dark:border-gray-600 text-gray-600 dark:text-gray-400'
               )}
@@ -334,7 +343,7 @@ function OverviewTab({
 
       {/* Pillar Cards */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-4">
-        {data?.pillars.map((pillar) => (
+        {pillarArray.map((pillar: any) => (
           <div
             key={pillar.name}
             className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-5"
@@ -389,19 +398,19 @@ function OverviewTab({
         <div className="grid grid-cols-3 gap-4">
           <DecisionChart
             label="Allowed"
-            value={data?.accessDecisions24h.allowed || 0}
+            value={data?.allowed_decisions || 0}
             icon={CheckCircle}
             color="green"
           />
           <DecisionChart
             label="Denied"
-            value={data?.accessDecisions24h.denied || 0}
+            value={data?.denied_decisions || 0}
             icon={AlertTriangle}
             color="red"
           />
           <DecisionChart
             label="Challenged"
-            value={data?.accessDecisions24h.challenged || 0}
+            value={data?.challenged_decisions || 0}
             icon={Clock}
             color="yellow"
           />
@@ -414,17 +423,17 @@ function OverviewTab({
           Recent Access Decisions
         </h2>
         <div className="space-y-2">
-          {(data?.recentDecisions || []).slice(0, 5).map((decision) => (
+          {(([] as AccessDecision[]) || []).slice(0, 5).map((decision) => (
             <div
               key={decision.id}
               className="flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-700/50 rounded-lg"
             >
               <div className="flex-1">
                 <div className="text-sm font-medium text-gray-900 dark:text-white">
-                  {decision.subject} → {decision.resource}
+                  {(decision as any).subject_id || "user"} → {(decision as any).resource_id || "resource"}
                 </div>
                 <div className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
-                  {new Date(decision.time).toLocaleTimeString()} • Risk: {decision.riskScore}%
+                  {new Date(decision.created_at).toLocaleTimeString()} • Risk: {decision.risk_score}%
                 </div>
               </div>
               <span
@@ -612,13 +621,13 @@ function AccessControlTab({
             {recentDecisions.map((decision) => (
               <tr key={decision.id} className="hover:bg-gray-50 dark:hover:bg-gray-700/50">
                 <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                  {new Date(decision.time).toLocaleTimeString()}
+                  {new Date(decision.created_at).toLocaleTimeString()}
                 </td>
                 <td className="px-6 py-4 text-sm text-gray-900 dark:text-white font-mono">
-                  {decision.subject}
+                  {(decision as any).subject_id || "user"}
                 </td>
                 <td className="px-6 py-4 text-sm text-gray-900 dark:text-white">
-                  {decision.resource}
+                  {(decision as any).resource_id || "resource"}
                 </td>
                 <td className="px-6 py-4 text-sm">
                   <span
@@ -640,17 +649,17 @@ function AccessControlTab({
                       <div
                         className={clsx(
                           'h-full',
-                          decision.riskScore >= 70
+                          decision.risk_score >= 70
                             ? 'bg-red-500'
-                            : decision.riskScore >= 40
+                            : decision.risk_score >= 40
                             ? 'bg-yellow-500'
                             : 'bg-green-500'
                         )}
-                        style={{ width: `${decision.riskScore}%` }}
+                        style={{ width: `${decision.risk_score}%` }}
                       />
                     </div>
                     <span className="text-xs text-gray-600 dark:text-gray-400">
-                      {decision.riskScore}%
+                      {decision.risk_score}%
                     </span>
                   </div>
                 </td>
@@ -716,7 +725,7 @@ function DeviceTrustTab({
             key={device.id}
             className={clsx(
               'rounded-lg border p-5 cursor-pointer transition-all',
-              device.compliant
+              device.is_compliant
                 ? 'bg-white dark:bg-gray-800 border-gray-200 dark:border-gray-700 hover:border-blue-400 dark:hover:border-blue-600'
                 : 'bg-red-50 dark:bg-red-900/20 border-red-200 dark:border-red-800'
             )}
@@ -728,18 +737,18 @@ function DeviceTrustTab({
                   {device.hostname}
                 </h3>
                 <p className="text-xs text-gray-600 dark:text-gray-400 mt-1">
-                  {device.type.charAt(0).toUpperCase() + device.type.slice(1)} • {device.os}
+                  {device.device_type.charAt(0).toUpperCase() + device.device_type.slice(1)} • {device.os_type}
                 </p>
               </div>
               <span
                 className={clsx(
                   'inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium',
-                  device.compliant
+                  device.is_compliant
                     ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400'
                     : 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400'
                 )}
               >
-                {device.compliant ? 'Compliant' : 'Non-Compliant'}
+                {device.is_compliant ? 'Compliant' : 'Non-Compliant'}
               </span>
             </div>
 
@@ -748,20 +757,20 @@ function DeviceTrustTab({
               <div className="flex items-end justify-between mb-1">
                 <span className="text-xs text-gray-600 dark:text-gray-400">Trust Score</span>
                 <span className="text-sm font-bold text-gray-900 dark:text-white">
-                  {device.trustScore}%
+                  {device.trust_score}%
                 </span>
               </div>
               <div className="h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
                 <div
                   className={clsx(
                     'h-full rounded-full',
-                    device.trustScore >= 80
+                    device.trust_score >= 80
                       ? 'bg-green-500'
-                      : device.trustScore >= 60
+                      : device.trust_score >= 60
                       ? 'bg-yellow-500'
                       : 'bg-red-500'
                   )}
-                  style={{ width: `${device.trustScore}%` }}
+                  style={{ width: `${device.trust_score}%` }}
                 />
               </div>
             </div>
@@ -776,7 +785,7 @@ function DeviceTrustTab({
 
             {/* Last Seen */}
             <div className="text-xs text-gray-500 dark:text-gray-400 mt-3 pt-3 border-t border-gray-200 dark:border-gray-700">
-              Last seen: {new Date(device.lastSeen).toLocaleTimeString()}
+              Last seen: {new Date(device.last_seen).toLocaleTimeString()}
             </div>
 
             {/* Expanded Details */}
@@ -852,13 +861,13 @@ function SegmentationTab({
               <div className="flex items-center justify-between text-gray-600 dark:text-gray-400">
                 <span>Members</span>
                 <span className="font-medium text-gray-900 dark:text-white">
-                  {segment.memberCount}
+                  {segment.member_count}
                 </span>
               </div>
               <div>
                 <span className="text-gray-600 dark:text-gray-400">Allowed Protocols</span>
                 <div className="flex flex-wrap gap-1 mt-1">
-                  {segment.allowedProtocols.map((protocol) => (
+                  {(segment.allowed_protocols || []).map((protocol) => (
                     <span
                       key={protocol}
                       className="inline-flex items-center px-2 py-1 rounded text-xs bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-400 font-mono"
@@ -868,9 +877,9 @@ function SegmentationTab({
                   ))}
                 </div>
               </div>
-              {segment.violationCount > 0 && (
+              {segment.violation_count > 0 && (
                 <div className="text-sm text-red-600 dark:text-red-400 font-medium">
-                  {segment.violationCount} policy violations
+                  {segment.violation_count} policy violations
                 </div>
               )}
             </div>
@@ -942,30 +951,30 @@ function PoliciesTab({
                   {policy.type}
                 </td>
                 <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                  {policy.riskThreshold}%
+                  {policy.risk_threshold}%
                 </td>
                 <td className="px-6 py-4 text-sm">
-                  {policy.mfaRequired ? (
+                  {policy.mfa_required ? (
                     <CheckCircle className="w-4 h-4 text-green-600 dark:text-green-400" />
                   ) : (
                     <AlertCircle className="w-4 h-4 text-gray-400" />
                   )}
                 </td>
                 <td className="px-6 py-4 text-sm">
-                  {policy.deviceTrustRequired ? (
+                  {policy.device_trust_required ? (
                     <CheckCircle className="w-4 h-4 text-green-600 dark:text-green-400" />
                   ) : (
                     <AlertCircle className="w-4 h-4 text-gray-400" />
                   )}
                 </td>
                 <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                  {policy.hitCount}
+                  {policy.decision_count}
                 </td>
                 <td className="px-6 py-4 text-sm">
                   <span
                     className={clsx(
                       'inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium',
-                      policy.status === 'active'
+                      policy.is_enabled
                         ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400'
                         : 'bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-400'
                     )}
