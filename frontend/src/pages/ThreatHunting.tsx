@@ -1238,46 +1238,56 @@ export default function ThreatHunting() {
                     <label className="block text-sm font-medium text-gray-500 mb-1">Description</label>
                     <p className="text-gray-900">{selectedFinding.description}</p>
                   </div>
-                  {selectedFinding.evidence && selectedFinding.evidence.length > 0 && (
-                    <div>
-                      <label className="block text-sm font-medium text-gray-500 mb-1">Evidence</label>
-                      <ul className="list-disc list-inside text-sm text-gray-900">
-                        {selectedFinding.evidence.map((e: string, i: number) => (
-                          <li key={i}>{e}</li>
-                        ))}
-                      </ul>
-                    </div>
-                  )}
-                  {selectedFinding.affected_assets && selectedFinding.affected_assets.length > 0 && (
-                    <div>
-                      <label className="block text-sm font-medium text-gray-500 mb-1">Affected Assets</label>
-                      <div className="flex flex-wrap gap-1">
-                        {selectedFinding.affected_assets.map((a: string, i: number) => (
-                          <span key={i} className="px-2 py-1 text-xs bg-gray-100 text-gray-700 rounded">{a}</span>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                  {selectedFinding.iocs_found && selectedFinding.iocs_found.length > 0 && (
-                    <div>
-                      <label className="block text-sm font-medium text-gray-500 mb-1">IOCs Found</label>
-                      <div className="flex flex-wrap gap-1">
-                        {selectedFinding.iocs_found.map((ioc: string, i: number) => (
-                          <span key={i} className="px-2 py-1 text-xs bg-red-50 text-red-700 rounded font-mono">{ioc}</span>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                  {selectedFinding.mitre_techniques && selectedFinding.mitre_techniques.length > 0 && (
-                    <div>
-                      <label className="block text-sm font-medium text-gray-500 mb-1">MITRE Techniques</label>
-                      <div className="flex flex-wrap gap-1">
-                        {selectedFinding.mitre_techniques.map((t: string, i: number) => (
-                          <span key={i} className="px-2 py-1 text-xs bg-blue-50 text-blue-700 rounded">{t}</span>
-                        ))}
-                      </div>
-                    </div>
-                  )}
+                  {(() => {
+                    const evidence = typeof selectedFinding.evidence === 'string' ? (() => { try { return JSON.parse(selectedFinding.evidence); } catch { return []; } })() : (selectedFinding.evidence || []);
+                    const assets = typeof selectedFinding.affected_assets === 'string' ? (() => { try { return JSON.parse(selectedFinding.affected_assets); } catch { return []; } })() : (selectedFinding.affected_assets || []);
+                    const iocs = typeof selectedFinding.iocs_found === 'string' ? (() => { try { return JSON.parse(selectedFinding.iocs_found); } catch { return []; } })() : (selectedFinding.iocs_found || []);
+                    const techniques = typeof selectedFinding.mitre_techniques === 'string' ? (() => { try { return JSON.parse(selectedFinding.mitre_techniques); } catch { return []; } })() : (selectedFinding.mitre_techniques || []);
+                    return (
+                      <>
+                        {Array.isArray(evidence) && evidence.length > 0 && (
+                          <div>
+                            <label className="block text-sm font-medium text-gray-500 mb-1">Evidence</label>
+                            <ul className="list-disc list-inside text-sm text-gray-900">
+                              {evidence.map((e: any, i: number) => (
+                                <li key={i}>{typeof e === 'object' ? JSON.stringify(e) : String(e)}</li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+                        {Array.isArray(assets) && assets.length > 0 && (
+                          <div>
+                            <label className="block text-sm font-medium text-gray-500 mb-1">Affected Assets</label>
+                            <div className="flex flex-wrap gap-1">
+                              {assets.map((a: any, i: number) => (
+                                <span key={i} className="px-2 py-1 text-xs bg-gray-100 text-gray-700 rounded">{String(a)}</span>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                        {Array.isArray(iocs) && iocs.length > 0 && (
+                          <div>
+                            <label className="block text-sm font-medium text-gray-500 mb-1">IOCs Found</label>
+                            <div className="flex flex-wrap gap-1">
+                              {iocs.map((ioc: any, i: number) => (
+                                <span key={i} className="px-2 py-1 text-xs bg-red-50 text-red-700 rounded font-mono">{String(ioc)}</span>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                        {Array.isArray(techniques) && techniques.length > 0 && (
+                          <div>
+                            <label className="block text-sm font-medium text-gray-500 mb-1">MITRE Techniques</label>
+                            <div className="flex flex-wrap gap-1">
+                              {techniques.map((t: any, i: number) => (
+                                <span key={i} className="px-2 py-1 text-xs bg-blue-50 text-blue-700 rounded">{String(t)}</span>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                      </>
+                    );
+                  })()}
                   <div>
                     <label className="block text-sm font-medium text-gray-500 mb-1">Escalated</label>
                     <p className="text-gray-900 font-medium">
