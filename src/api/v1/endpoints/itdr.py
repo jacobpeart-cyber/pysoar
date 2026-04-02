@@ -114,6 +114,11 @@ async def list_identities(
     """List identity profiles with filtering and pagination"""
     query = select(IdentityProfile)
 
+    # Filter by organization
+    org_id = getattr(current_user, "organization_id", None)
+    if org_id:
+        query = query.where(IdentityProfile.organization_id == org_id)
+
     # Apply filters
     if search:
         search_filter = f"%{search}%"
@@ -283,6 +288,11 @@ async def list_threats(
     """List identity threats with filtering"""
     query = select(IdentityThreat)
 
+    # Filter by organization
+    org_id = getattr(current_user, "organization_id", None)
+    if org_id:
+        query = query.where(IdentityThreat.organization_id == org_id)
+
     if threat_type:
         query = query.where(IdentityThreat.threat_type == threat_type)
 
@@ -450,6 +460,11 @@ async def list_exposures(
     """List credential exposures"""
     query = select(CredentialExposure)
 
+    # Filter by organization
+    org_id = getattr(current_user, "organization_id", None)
+    if org_id:
+        query = query.where(CredentialExposure.organization_id == org_id)
+
     if credential_type:
         query = query.where(CredentialExposure.credential_type == credential_type)
 
@@ -562,6 +577,11 @@ async def list_anomalies(
     """List access anomalies"""
     query = select(AccessAnomaly)
 
+    # Filter by organization
+    org_id = getattr(current_user, "organization_id", None)
+    if org_id:
+        query = query.where(AccessAnomaly.organization_id == org_id)
+
     if anomaly_type:
         query = query.where(AccessAnomaly.anomaly_type == anomaly_type)
 
@@ -671,6 +691,11 @@ async def list_privileged_events(
 ):
     """List privileged access events"""
     query = select(PrivilegedAccessEvent)
+
+    # Filter by organization
+    org_id = getattr(current_user, "organization_id", None)
+    if org_id:
+        query = query.where(PrivilegedAccessEvent.organization_id == org_id)
 
     if event_type:
         query = query.where(PrivilegedAccessEvent.event_type == event_type)
@@ -816,62 +841,61 @@ async def get_dashboard_metrics(
     db: DatabaseSession = None,
 ):
     """Get ITDR dashboard metrics"""
-    identities_result = await db.execute(
-        select(func.count()).select_from(IdentityProfile)
-    )
+    org_id = getattr(current_user, "organization_id", None)
+
+    identity_base = select(func.count()).select_from(IdentityProfile)
+    threat_base = select(func.count()).select_from(IdentityThreat)
+    exposure_base = select(func.count()).select_from(CredentialExposure)
+    anomaly_base = select(func.count()).select_from(AccessAnomaly)
+    priv_base = select(func.count()).select_from(PrivilegedAccessEvent)
+
+    if org_id:
+        identity_base = identity_base.where(IdentityProfile.organization_id == org_id)
+        threat_base = threat_base.where(IdentityThreat.organization_id == org_id)
+        exposure_base = exposure_base.where(CredentialExposure.organization_id == org_id)
+        anomaly_base = anomaly_base.where(AccessAnomaly.organization_id == org_id)
+        priv_base = priv_base.where(PrivilegedAccessEvent.organization_id == org_id)
+
+    identities_result = await db.execute(identity_base)
     total_identities = identities_result.scalar() or 0
 
     at_risk_result = await db.execute(
-        select(func.count()).select_from(IdentityProfile).where(IdentityProfile.risk_score >= 50)
+        identity_base.where(IdentityProfile.risk_score >= 50)
     )
     at_risk = at_risk_result.scalar() or 0
 
     critical_threats_result = await db.execute(
-        select(func.count()).select_from(IdentityThreat).where(
-            IdentityThreat.severity == "critical"
-        )
+        threat_base.where(IdentityThreat.severity == "critical")
     )
     critical_threats = critical_threats_result.scalar() or 0
 
     high_threats_result = await db.execute(
-        select(func.count()).select_from(IdentityThreat).where(
-            IdentityThreat.severity == "high"
-        )
+        threat_base.where(IdentityThreat.severity == "high")
     )
     high_threats = high_threats_result.scalar() or 0
 
     exposures_result = await db.execute(
-        select(func.count()).select_from(CredentialExposure).where(
-            CredentialExposure.is_remediated == False
-        )
+        exposure_base.where(CredentialExposure.is_remediated == False)
     )
     exposures = exposures_result.scalar() or 0
 
     anomalies_result = await db.execute(
-        select(func.count()).select_from(AccessAnomaly).where(
-            AccessAnomaly.is_reviewed == False
-        )
+        anomaly_base.where(AccessAnomaly.is_reviewed == False)
     )
     anomalies = anomalies_result.scalar() or 0
 
     service_accounts_result = await db.execute(
-        select(func.count()).select_from(IdentityProfile).where(
-            IdentityProfile.is_service_account == True
-        )
+        identity_base.where(IdentityProfile.is_service_account == True)
     )
     service_accounts = service_accounts_result.scalar() or 0
 
     dormant_result = await db.execute(
-        select(func.count()).select_from(IdentityProfile).where(
-            IdentityProfile.is_dormant == True
-        )
+        identity_base.where(IdentityProfile.is_dormant == True)
     )
     dormant = dormant_result.scalar() or 0
 
     jit_result = await db.execute(
-        select(func.count()).select_from(PrivilegedAccessEvent).where(
-            PrivilegedAccessEvent.event_type == "just_in_time_access"
-        )
+        priv_base.where(PrivilegedAccessEvent.event_type == "just_in_time_access")
     )
     jit_active = jit_result.scalar() or 0
 
@@ -898,17 +922,19 @@ async def get_risk_overview(
     db: DatabaseSession = None,
 ):
     """Get ITDR risk overview"""
+    org_id = getattr(current_user, "organization_id", None)
+
+    threat_base = select(func.count()).select_from(IdentityThreat)
+    if org_id:
+        threat_base = threat_base.where(IdentityThreat.organization_id == org_id)
+
     critical_threats_result = await db.execute(
-        select(func.count()).select_from(IdentityThreat).where(
-            IdentityThreat.severity == "critical"
-        )
+        threat_base.where(IdentityThreat.severity == "critical")
     )
     critical_count = critical_threats_result.scalar() or 0
 
     high_threats_result = await db.execute(
-        select(func.count()).select_from(IdentityThreat).where(
-            IdentityThreat.severity == "high"
-        )
+        threat_base.where(IdentityThreat.severity == "high")
     )
     high_count = high_threats_result.scalar() or 0
 
