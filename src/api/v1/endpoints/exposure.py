@@ -248,9 +248,10 @@ async def list_assets(
     max_risk_score: Optional[float] = Query(None, le=100.0),
 ):
     """List exposure assets with filtering and pagination"""
-    query = select(ExposureAsset).where(
-        ExposureAsset.organization_id == current_user.organization_id
-    )
+    org_id = getattr(current_user, "organization_id", None)
+    query = select(ExposureAsset)
+    if org_id is not None:
+        query = query.where(ExposureAsset.organization_id == org_id)
 
     if search:
         search_filter = f"%{search}%"
@@ -430,14 +431,13 @@ async def get_asset_vulnerabilities(
     severity: Optional[str] = None,
 ):
     """Get vulnerabilities affecting a specific asset"""
-    await get_asset_or_404(db, asset_id, current_user.organization_id)
+    org_id = getattr(current_user, "organization_id", None)
+    await get_asset_or_404(db, asset_id, org_id)
 
-    query = select(AssetVulnerability).where(
-        and_(
-            AssetVulnerability.asset_id == asset_id,
-            AssetVulnerability.organization_id == current_user.organization_id,
-        )
-    )
+    conditions = [AssetVulnerability.asset_id == asset_id]
+    if org_id is not None:
+        conditions.append(AssetVulnerability.organization_id == org_id)
+    query = select(AssetVulnerability).where(and_(*conditions))
 
     if status:
         query = query.where(AssetVulnerability.status == status)
@@ -516,9 +516,10 @@ async def list_vulnerabilities(
     exploited_in_wild: Optional[bool] = None,
 ):
     """List vulnerabilities with filtering"""
-    query = select(Vulnerability).where(
-        Vulnerability.organization_id == current_user.organization_id
-    )
+    org_id = getattr(current_user, "organization_id", None)
+    query = select(Vulnerability)
+    if org_id is not None:
+        query = query.where(Vulnerability.organization_id == org_id)
 
     if search:
         search_filter = f"%{search}%"
@@ -833,9 +834,10 @@ async def list_scans(
     date_from: Optional[str] = Query(None),
 ):
     """List exposure scans with filtering"""
-    query = select(ExposureScan).where(
-        ExposureScan.organization_id == current_user.organization_id
-    )
+    org_id = getattr(current_user, "organization_id", None)
+    query = select(ExposureScan)
+    if org_id is not None:
+        query = query.where(ExposureScan.organization_id == org_id)
 
     if scan_type:
         query = query.where(ExposureScan.scan_type == scan_type)
@@ -980,9 +982,10 @@ async def list_remediation_tickets(
     overdue_only: Optional[bool] = False,
 ):
     """List remediation tickets with filtering"""
-    query = select(RemediationTicket).where(
-        RemediationTicket.organization_id == current_user.organization_id
-    )
+    org_id = getattr(current_user, "organization_id", None)
+    query = select(RemediationTicket)
+    if org_id is not None:
+        query = query.where(RemediationTicket.organization_id == org_id)
 
     if status:
         query = query.where(RemediationTicket.status == status)
@@ -1155,9 +1158,10 @@ async def list_attack_surfaces(
     surface_type: Optional[str] = None,
 ):
     """List attack surfaces"""
-    query = select(AttackSurface).where(
-        AttackSurface.organization_id == current_user.organization_id
-    )
+    org_id = getattr(current_user, "organization_id", None)
+    query = select(AttackSurface)
+    if org_id is not None:
+        query = query.where(AttackSurface.organization_id == org_id)
 
     if surface_type:
         query = query.where(AttackSurface.surface_type == surface_type)
@@ -1265,67 +1269,68 @@ async def get_dashboard_statistics(
     db: DatabaseSession = None,
 ):
     """Get exposure management dashboard statistics"""
-    org_id = current_user.organization_id
+    org_id = getattr(current_user, "organization_id", None)
 
     # Total and active assets
+    asset_conditions = [ExposureAsset.organization_id == org_id] if org_id is not None else []
     total_assets_result = await db.execute(
-        select(func.count(ExposureAsset.id)).where(ExposureAsset.organization_id == org_id)
+        select(func.count(ExposureAsset.id)).where(*asset_conditions) if asset_conditions else select(func.count(ExposureAsset.id))
     )
     total_assets = total_assets_result.scalar() or 0
 
+    active_conditions = [ExposureAsset.is_active == True]
+    if org_id is not None:
+        active_conditions.append(ExposureAsset.organization_id == org_id)
     active_assets_result = await db.execute(
-        select(func.count(ExposureAsset.id)).where(
-            and_(ExposureAsset.organization_id == org_id, ExposureAsset.is_active == True)
-        )
+        select(func.count(ExposureAsset.id)).where(and_(*active_conditions))
     )
     active_assets = active_assets_result.scalar() or 0
 
+    inet_conditions = [ExposureAsset.is_internet_facing == True]
+    if org_id is not None:
+        inet_conditions.append(ExposureAsset.organization_id == org_id)
     internet_facing_result = await db.execute(
-        select(func.count(ExposureAsset.id)).where(
-            and_(ExposureAsset.organization_id == org_id, ExposureAsset.is_internet_facing == True)
-        )
+        select(func.count(ExposureAsset.id)).where(and_(*inet_conditions))
     )
     internet_facing_assets = internet_facing_result.scalar() or 0
 
     # Vulnerability counts by severity
-    total_vulns_result = await db.execute(
-        select(func.count(Vulnerability.id)).where(Vulnerability.organization_id == org_id)
-    )
+    vuln_query = select(func.count(Vulnerability.id))
+    if org_id is not None:
+        vuln_query = vuln_query.where(Vulnerability.organization_id == org_id)
+    total_vulns_result = await db.execute(vuln_query)
     total_vulnerabilities = total_vulns_result.scalar() or 0
 
-    severity_result = await db.execute(
-        select(Vulnerability.severity, func.count(Vulnerability.id))
-        .where(Vulnerability.organization_id == org_id)
-        .group_by(Vulnerability.severity)
-    )
+    sev_query = select(Vulnerability.severity, func.count(Vulnerability.id))
+    if org_id is not None:
+        sev_query = sev_query.where(Vulnerability.organization_id == org_id)
+    severity_result = await db.execute(sev_query.group_by(Vulnerability.severity))
     severity_counts = dict(severity_result.all())
 
     # Overdue tickets
+    overdue_conditions = [
+        RemediationTicket.due_date < datetime.now(timezone.utc),
+        RemediationTicket.status.notin_(["closed", "verification"]),
+    ]
+    if org_id is not None:
+        overdue_conditions.append(RemediationTicket.organization_id == org_id)
     overdue_result = await db.execute(
-        select(func.count(RemediationTicket.id)).where(
-            and_(
-                RemediationTicket.organization_id == org_id,
-                RemediationTicket.due_date < datetime.now(timezone.utc),
-                RemediationTicket.status.notin_(["closed", "verification"]),
-            )
-        )
+        select(func.count(RemediationTicket.id)).where(and_(*overdue_conditions))
     )
     overdue_tickets = overdue_result.scalar() or 0
 
     # Assets by criticality
-    criticality_result = await db.execute(
-        select(ExposureAsset.criticality, func.count(ExposureAsset.id))
-        .where(ExposureAsset.organization_id == org_id)
-        .group_by(ExposureAsset.criticality)
-    )
+    crit_query = select(ExposureAsset.criticality, func.count(ExposureAsset.id))
+    if org_id is not None:
+        crit_query = crit_query.where(ExposureAsset.organization_id == org_id)
+    criticality_result = await db.execute(crit_query.group_by(ExposureAsset.criticality))
     assets_by_criticality = dict(criticality_result.all())
 
     # Vulns by status
-    vuln_status_result = await db.execute(
-        select(AssetVulnerability.status, func.count(AssetVulnerability.id))
-        .where(AssetVulnerability.organization_id == org_id)
-        .group_by(AssetVulnerability.status)
-    )
+    vs_query = select(AssetVulnerability.status, func.count(AssetVulnerability.id))
+    if org_id is not None:
+        vs_query = vs_query.where(AssetVulnerability.organization_id == org_id)
+    vuln_status_result = await db.execute(vs_query.group_by(AssetVulnerability.status))
     vulns_by_status = dict(vuln_status_result.all())
 
     return {
@@ -1391,14 +1396,13 @@ async def get_compliance_status(
     db: DatabaseSession = None,
 ):
     """Get compliance status summary"""
-    org_id = current_user.organization_id
+    org_id = getattr(current_user, "organization_id", None)
 
     # Count assets with compliance data
-    total_result = await db.execute(
-        select(func.count(ExposureAsset.id)).where(
-            ExposureAsset.organization_id == org_id
-        )
-    )
+    compliance_query = select(func.count(ExposureAsset.id))
+    if org_id is not None:
+        compliance_query = compliance_query.where(ExposureAsset.organization_id == org_id)
+    total_result = await db.execute(compliance_query)
     total_checks = total_result.scalar() or 0
 
     return {
