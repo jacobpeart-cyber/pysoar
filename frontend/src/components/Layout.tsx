@@ -54,6 +54,7 @@ import {
   Database,
   MessageSquare,
   Mail,
+  Ticket,
 } from 'lucide-react';
 import { useState } from 'react';
 import clsx from 'clsx';
@@ -95,6 +96,7 @@ const navigation = [
   { name: 'API Security', href: '/api-security', icon: Code },
   { name: 'Data Lake', href: '/data-lake', icon: Database },
   { name: 'War Room', href: '/warroom', icon: MessageSquare },
+  { name: 'Ticket Hub', href: '/ticket-hub', icon: Ticket },
   { name: 'Phishing Sim', href: '/phishing', icon: Mail },
   { name: 'Playbooks', href: '/playbooks', icon: Zap },
   { name: 'Assets', href: '/assets', icon: Server },
