@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import {
   Workflow,
   Play,
@@ -68,11 +68,11 @@ interface Playbook {
   id: string;
   name: string;
   description: string;
-  nodeCount: number;
+  nodes?: unknown[];
   status: string;
-  lastModified: string;
-  author: string;
-  executionCount: number;
+  updated_at: string;
+  created_by: string;
+  execution_count: number;
 }
 
 interface Template {
@@ -108,21 +108,24 @@ export default function PlaybookBuilder() {
   const [selectedExecution, setSelectedExecution] = useState<Execution | null>(null);
   const [previewTemplate, setPreviewTemplate] = useState<Template | null>(null);
   const [showFilter, setShowFilter] = useState(false);
+  const [actionLoading, setActionLoading] = useState<string | null>(null);
+  const [notification, setNotification] = useState<{ type: string; text: string } | null>(null);
 
   useEffect(() => {
     const loadData = async () => {
       setLoading(true);
       try {
-        const [playbooksRes, templatesRes, executionsRes] = await Promise.all([
-          api.get('/playbooks').catch(() => ({ data: [] })),
-          api.get('/playbooks/templates').catch(() => ({ data: [] })),
-          api.get('/playbooks/executions').catch(() => ({ data: [] })),
+        const [playbooksRes, templatesRes] = await Promise.all([
+          api.get('/playbook-builder').catch(() => ({ data: { items: [] } })),
+          api.get('/playbook-builder/templates').catch(() => ({ data: { items: [] } })),
         ]);
-        setPlaybooks(Array.isArray(playbooksRes.data) ? playbooksRes.data : []);
-        setTemplates(Array.isArray(templatesRes.data) ? templatesRes.data : []);
-        setExecutions(Array.isArray(executionsRes.data) ? executionsRes.data : []);
+        const pbItems = playbooksRes.data?.items || playbooksRes.data;
+        setPlaybooks(Array.isArray(pbItems) ? pbItems : []);
+        const tplItems = templatesRes.data?.items || templatesRes.data;
+        setTemplates(Array.isArray(tplItems) ? tplItems : []);
+        setExecutions([]);
       } catch (error) {
-        console.error('Error loading playbook data:', error);
+        setNotification({ type: 'error', text: 'Failed to load playbook data' });
         setPlaybooks([]);
         setTemplates([]);
         setExecutions([]);
@@ -176,17 +179,22 @@ export default function PlaybookBuilder() {
             </div>
           </div>
           <button
+            disabled={actionLoading === 'create'}
             onClick={async () => {
+              setActionLoading('create');
               try {
-                const res = await api.post('/playbooks', { name: 'New Playbook', description: '', status: 'draft' });
+                const res = await api.post('/playbook-builder', { name: 'New Playbook', description: '', status: 'draft' });
                 setPlaybooks((prev) => [...prev, res.data]);
+                setNotification({ type: 'success', text: 'Playbook created' });
               } catch (err) {
-                console.error('Error creating playbook:', err);
+                setNotification({ type: 'error', text: 'Failed to create playbook' });
+              } finally {
+                setActionLoading(null);
               }
             }}
-            className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg transition"
+            className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg transition disabled:opacity-50"
           >
-            <Plus className="w-4 h-4" />
+            {actionLoading === 'create' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
             New Playbook
           </button>
         </div>
@@ -301,17 +309,22 @@ export default function PlaybookBuilder() {
                       Create your first visual playbook to automate security workflows.
                     </p>
                     <button
+                      disabled={actionLoading === 'create-first'}
                       onClick={async () => {
+                        setActionLoading('create-first');
                         try {
-                          const res = await api.post('/playbooks', { name: 'New Playbook', description: '', status: 'draft' });
+                          const res = await api.post('/playbook-builder', { name: 'New Playbook', description: '', status: 'draft' });
                           setPlaybooks((prev) => [...prev, res.data]);
+                          setNotification({ type: 'success', text: 'Playbook created' });
                         } catch (err) {
-                          console.error('Error creating playbook:', err);
+                          setNotification({ type: 'error', text: 'Failed to create playbook' });
+                        } finally {
+                          setActionLoading(null);
                         }
                       }}
-                      className="inline-flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white px-6 py-3 rounded-lg transition"
+                      className="inline-flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white px-6 py-3 rounded-lg transition disabled:opacity-50"
                     >
-                      <Plus className="w-5 h-5" />
+                      {actionLoading === 'create-first' ? <Loader2 className="w-5 h-5 animate-spin" /> : <Plus className="w-5 h-5" />}
                       Create Your First Playbook
                     </button>
                   </div>
@@ -363,7 +376,7 @@ export default function PlaybookBuilder() {
                             <td className="px-6 py-4 text-sm">
                               <span className="inline-flex items-center gap-1">
                                 <Workflow className="w-3.5 h-3.5 text-gray-400" />
-                                {playbook.nodeCount}
+                                {playbook.nodes?.length ?? 0}
                               </span>
                             </td>
                             <td className="px-6 py-4">
@@ -379,13 +392,13 @@ export default function PlaybookBuilder() {
                             <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
                               <span className="inline-flex items-center gap-1">
                                 <Clock className="w-3.5 h-3.5" />
-                                {new Date(playbook.lastModified).toLocaleDateString()}
+                                {new Date(playbook.updated_at).toLocaleDateString()}
                               </span>
                             </td>
                             <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                              {playbook.author}
+                              {playbook.created_by}
                             </td>
-                            <td className="px-6 py-4 text-sm font-medium">{playbook.executionCount}</td>
+                            <td className="px-6 py-4 text-sm font-medium">{playbook.execution_count ?? 0}</td>
                             <td className="px-6 py-4">
                               <div className="flex items-center gap-2">
                                 <button
@@ -399,12 +412,12 @@ export default function PlaybookBuilder() {
                                   onClick={async () => {
                                     try {
                                       const newStatus = playbook.status === 'active' ? 'paused' : 'active';
-                                      await api.put(`/playbooks/${playbook.id}`, { status: newStatus });
+                                      await api.put(`/playbook-builder/${playbook.id}`, { status: newStatus });
                                       setPlaybooks((prev) =>
                                         prev.map((p) => (p.id === playbook.id ? { ...p, status: newStatus } : p))
                                       );
                                     } catch (err) {
-                                      console.error('Error toggling playbook status:', err);
+                                      setNotification({ type: 'error', text: 'Failed to update playbook status' });
                                     }
                                   }}
                                   className="p-1.5 text-gray-500 hover:text-green-600 dark:hover:text-green-400 hover:bg-gray-100 dark:hover:bg-gray-600 rounded transition"
@@ -419,10 +432,11 @@ export default function PlaybookBuilder() {
                                 <button
                                   onClick={async () => {
                                     try {
-                                      const res = await api.post(`/playbooks/${playbook.id}/duplicate`);
+                                      const res = await api.post(`/playbook-builder/${playbook.id}/clone`, { new_name: `${playbook.name} (Copy)` });
                                       setPlaybooks((prev) => [...prev, res.data]);
+                                      setNotification({ type: 'success', text: 'Playbook duplicated' });
                                     } catch (err) {
-                                      console.error('Error duplicating playbook:', err);
+                                      setNotification({ type: 'error', text: 'Failed to duplicate playbook' });
                                     }
                                   }}
                                   className="p-1.5 text-gray-500 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-gray-600 rounded transition"
@@ -434,10 +448,11 @@ export default function PlaybookBuilder() {
                                   onClick={async () => {
                                     if (!confirm(`Delete playbook "${playbook.name}"?`)) return;
                                     try {
-                                      await api.delete(`/playbooks/${playbook.id}`);
+                                      await api.delete(`/playbook-builder/${playbook.id}`);
                                       setPlaybooks((prev) => prev.filter((p) => p.id !== playbook.id));
+                                      setNotification({ type: 'success', text: 'Playbook deleted' });
                                     } catch (err) {
-                                      console.error('Error deleting playbook:', err);
+                                      setNotification({ type: 'error', text: 'Failed to delete playbook' });
                                     }
                                   }}
                                   className="p-1.5 text-gray-500 hover:text-red-600 dark:hover:text-red-400 hover:bg-gray-100 dark:hover:bg-gray-600 rounded transition"
@@ -516,18 +531,23 @@ export default function PlaybookBuilder() {
                           )}
                           <div className="flex gap-2">
                             <button
+                              disabled={actionLoading === `template-${template.id}`}
                               onClick={async () => {
+                                setActionLoading(`template-${template.id}`);
                                 try {
-                                  const res = await api.post(`/playbooks/templates/${template.id}/instantiate`);
+                                  const res = await api.post(`/playbook-builder/templates/${template.id}/create`, { playbook_name: template.name });
                                   setPlaybooks((prev) => [...prev, res.data]);
                                   setActiveTab('playbooks');
+                                  setNotification({ type: 'success', text: 'Playbook created from template' });
                                 } catch (err) {
-                                  console.error('Error instantiating template:', err);
+                                  setNotification({ type: 'error', text: 'Failed to create playbook from template' });
+                                } finally {
+                                  setActionLoading(null);
                                 }
                               }}
-                              className="flex-1 flex items-center justify-center gap-2 px-3 py-2 text-sm bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition"
+                              className="flex-1 flex items-center justify-center gap-2 px-3 py-2 text-sm bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition disabled:opacity-50"
                             >
-                              <Plus className="w-4 h-4" />
+                              {actionLoading === `template-${template.id}` ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
                               Use Template
                             </button>
                             <button
@@ -727,12 +747,12 @@ export default function PlaybookBuilder() {
                                   <button
                                     onClick={async () => {
                                       try {
-                                        await api.put(`/playbooks/executions/${execution.id}/pause`);
+                                        await api.put(`/playbook-builder/executions/${execution.id}/pause`);
                                         setExecutions((prev) =>
                                           prev.map((e) => (e.id === execution.id ? { ...e, status: 'paused' } : e))
                                         );
                                       } catch (err) {
-                                        console.error('Error pausing execution:', err);
+                                        setNotification({ type: 'error', text: 'Failed to pause execution' });
                                       }
                                     }}
                                     className="p-1.5 text-gray-500 hover:text-yellow-600 dark:hover:text-yellow-400 hover:bg-gray-100 dark:hover:bg-gray-600 rounded transition"
@@ -745,10 +765,11 @@ export default function PlaybookBuilder() {
                                   <button
                                     onClick={async () => {
                                       try {
-                                        const res = await api.post(`/playbooks/${execution.playbookId}/execute`);
+                                        const res = await api.post(`/playbook-builder/${execution.playbookId}/execute`, {});
                                         setExecutions((prev) => [...prev, res.data]);
+                                        setNotification({ type: 'success', text: 'Playbook execution started' });
                                       } catch (err) {
-                                        console.error('Error re-running playbook:', err);
+                                        setNotification({ type: 'error', text: 'Failed to re-run playbook' });
                                       }
                                     }}
                                     className="p-1.5 text-gray-500 hover:text-green-600 dark:hover:text-green-400 hover:bg-gray-100 dark:hover:bg-gray-600 rounded transition"
