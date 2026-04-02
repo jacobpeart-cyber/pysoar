@@ -50,6 +50,7 @@ from src.api.v1.endpoints import (
     vulnmgmt,
     websocket,
     zerotrust,
+    tickethub,
 )
 
 api_router = APIRouter()
@@ -108,3 +109,6 @@ api_router.include_router(api_security.router, tags=["api-security"])
 api_router.include_router(data_lake.router, tags=["data-lake"])
 api_router.include_router(collaboration.router, tags=["collaboration"])
 api_router.include_router(phishing_sim.router, tags=["phishing-simulation"])
+
+# --- Unified Ticket Hub ---
+api_router.include_router(tickethub.router, tags=["ticket-hub"])
