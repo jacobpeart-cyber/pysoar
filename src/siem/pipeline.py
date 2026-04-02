@@ -187,6 +187,19 @@ async def process_log(
                 except Exception:
                     pass  # Non-critical if rule update fails
 
+                # Send email notification for critical/high alerts
+                if match.severity in ("critical", "high"):
+                    try:
+                        from src.workers.tasks import send_notification_task
+                        send_notification_task.delay(
+                            channel="email",
+                            recipients=[],  # Will use admin email from config
+                            subject=f"[{match.severity.upper()}] SIEM Detection: {match.rule_title}",
+                            message=f"Detection rule '{match.rule_title}' fired.\nSource: {source_name} ({source_ip})\nSeverity: {match.severity}\nLog: {raw_log[:200]}",
+                        )
+                    except Exception:
+                        pass  # Non-critical
+
     except Exception as e:
         logger.error(f"Rule evaluation failed: {e}")
 

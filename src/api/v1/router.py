@@ -51,6 +51,7 @@ from src.api.v1.endpoints import (
     websocket,
     zerotrust,
     tickethub,
+    backup,
 )
 
 api_router = APIRouter()
@@ -112,3 +113,6 @@ api_router.include_router(phishing_sim.router, tags=["phishing-simulation"])
 
 # --- Unified Ticket Hub ---
 api_router.include_router(tickethub.router, tags=["ticket-hub"])
+
+# --- Backup & Restore ---
+api_router.include_router(backup.router, tags=["backup-restore"])
