@@ -2,6 +2,7 @@
 
 import json
 import math
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Path, HTTPException, Query, status
@@ -545,7 +546,11 @@ async def list_pending_approvals(
     items = []
     for action in actions:
         inv = await db.get(Investigation, action.investigation_id)
+        if not inv or inv.organization_id != current_user.organization_id:
+            continue
         agent = await db.get(SOCAgent, inv.agent_id)
+        if not agent or agent.organization_id != current_user.organization_id:
+            continue
         items.append(ActionPendingApproval(
             action_id=action.id,
             action_type=action.action_type,
@@ -968,7 +973,3 @@ async def clear_agent_memory(
         "status": "cleared",
         "memories_deleted": len(memories),
     }
-
-
-# Import datetime for timestamp
-from datetime import datetime, timezone
