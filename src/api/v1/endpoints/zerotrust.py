@@ -4,7 +4,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, HTTPException, Query, Response, status
 from sqlalchemy import and_, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -71,7 +71,8 @@ async def evaluate_access_request(
     )
 
     try:
-        pdp = PolicyDecisionPoint(db, current_user.organization_id)
+        org_id = getattr(current_user, "organization_id", None)
+        pdp = PolicyDecisionPoint(db, org_id)
 
         decision = await pdp.evaluate_access_request(
             subject_type=request.subject_type,
@@ -114,6 +115,16 @@ async def evaluate_access_request(
         )
 
 
+@router.post("/evaluate-access", response_model=AccessDecisionResponse)
+async def evaluate_access_alias(
+    request: AccessRequestSchema,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
+) -> AccessDecisionResponse:
+    """Alias for /evaluate — evaluate access request and return decision"""
+    return await evaluate_access_request(request, db, current_user)
+
+
 @router.post("/continuous-eval/{session_id}", response_model=AccessDecisionResponse)
 async def continuous_session_evaluation(
     session_id: str,
@@ -128,7 +139,8 @@ async def continuous_session_evaluation(
     logger.info("api_continuous_evaluation", session_id=session_id)
 
     try:
-        pdp = PolicyDecisionPoint(db, current_user.organization_id)
+        org_id = getattr(current_user, "organization_id", None)
+        pdp = PolicyDecisionPoint(db, org_id)
 
         new_decision = await pdp.continuous_evaluation(session_id)
 
@@ -159,7 +171,7 @@ async def continuous_session_evaluation(
         )
 
 
-@router.get("/decisions", response_model=list[str, Any])
+@router.get("/decisions", response_model=None)
 async def list_access_decisions(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
@@ -170,8 +182,10 @@ async def list_access_decisions(
     """List access decisions (audit trail)"""
     logger.info("api_list_access_decisions", skip=skip, limit=limit)
 
+    org_id = getattr(current_user, "organization_id", None)
+
     query = select(AccessDecision).where(
-        AccessDecision.organization_id == current_user.organization_id
+        AccessDecision.organization_id == org_id
     )
 
     if decision_filter:
@@ -180,7 +194,7 @@ async def list_access_decisions(
     # Get total count
     count_result = await db.execute(
         select(func.count(AccessDecision.id)).where(
-            AccessDecision.organization_id == current_user.organization_id
+            AccessDecision.organization_id == org_id
         )
     )
     total = count_result.scalar_one()
@@ -223,6 +237,8 @@ async def create_policy(
     """Create a new Zero Trust policy"""
     logger.info("api_create_policy", name=policy.name, type=policy.policy_type)
 
+    org_id = getattr(current_user, "organization_id", None)
+
     db_policy = ZeroTrustPolicy(
         name=policy.name,
         policy_type=policy.policy_type,
@@ -241,7 +257,7 @@ async def create_policy(
         is_enabled=policy.is_enabled,
         priority=policy.priority,
         tags=json.dumps(policy.tags),
-        organization_id=current_user.organization_id,
+        organization_id=org_id,
     )
 
     db.add(db_policy)
@@ -251,7 +267,7 @@ async def create_policy(
     return ZeroTrustPolicyResponse.from_orm(db_policy)
 
 
-@router.get("/policies", response_model=list[str, Any])
+@router.get("/policies", response_model=None)
 async def list_policies(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
@@ -260,8 +276,10 @@ async def list_policies(
     enabled_only: bool = Query(True),
 ) -> dict[str, Any]:
     """List Zero Trust policies"""
+    org_id = getattr(current_user, "organization_id", None)
+
     query = select(ZeroTrustPolicy).where(
-        ZeroTrustPolicy.organization_id == current_user.organization_id
+        ZeroTrustPolicy.organization_id == org_id
     )
 
     if enabled_only:
@@ -270,7 +288,7 @@ async def list_policies(
     # Get total count
     count_result = await db.execute(
         select(func.count(ZeroTrustPolicy.id)).where(
-            ZeroTrustPolicy.organization_id == current_user.organization_id
+            ZeroTrustPolicy.organization_id == org_id
         )
     )
     total = count_result.scalar_one()
@@ -296,11 +314,12 @@ async def get_policy(
     current_user: CurrentUser = None,
 ) -> ZeroTrustPolicyResponse:
     """Get policy details"""
+    org_id = getattr(current_user, "organization_id", None)
     result = await db.execute(
         select(ZeroTrustPolicy).where(
             and_(
                 ZeroTrustPolicy.id == policy_id,
-                ZeroTrustPolicy.organization_id == current_user.organization_id,
+                ZeroTrustPolicy.organization_id == org_id,
             )
         )
     )
@@ -322,11 +341,12 @@ async def update_policy(
     current_user: CurrentUser = None,
 ) -> ZeroTrustPolicyResponse:
     """Update Zero Trust policy"""
+    org_id = getattr(current_user, "organization_id", None)
     result = await db.execute(
         select(ZeroTrustPolicy).where(
             and_(
                 ZeroTrustPolicy.id == policy_id,
-                ZeroTrustPolicy.organization_id == current_user.organization_id,
+                ZeroTrustPolicy.organization_id == org_id,
             )
         )
     )
@@ -360,11 +380,12 @@ async def delete_policy(
     current_user: CurrentUser = None,
 ) -> None:
     """Delete Zero Trust policy"""
+    org_id = getattr(current_user, "organization_id", None)
     result = await db.execute(
         select(ZeroTrustPolicy).where(
             and_(
                 ZeroTrustPolicy.id == policy_id,
-                ZeroTrustPolicy.organization_id == current_user.organization_id,
+                ZeroTrustPolicy.organization_id == org_id,
             )
         )
     )
@@ -387,11 +408,12 @@ async def test_policy(
     current_user: CurrentUser = None,
 ) -> dict[str, Any]:
     """Test policy against sample access request"""
+    org_id = getattr(current_user, "organization_id", None)
     result = await db.execute(
         select(ZeroTrustPolicy).where(
             and_(
                 ZeroTrustPolicy.id == policy_id,
-                ZeroTrustPolicy.organization_id == current_user.organization_id,
+                ZeroTrustPolicy.organization_id == org_id,
             )
         )
     )
@@ -403,7 +425,7 @@ async def test_policy(
         )
 
     # Evaluate test request
-    pdp = PolicyDecisionPoint(db, current_user.organization_id)
+    pdp = PolicyDecisionPoint(db, org_id)
     decision = await pdp.evaluate_access_request(
         subject_type=test_request.subject_type,
         subject_id=test_request.subject_id,
@@ -425,7 +447,103 @@ async def test_policy(
 # ============================================================================
 
 
-@router.get("/devices", response_model=list[str, Any])
+@router.get("/device-stats", response_model=None)
+async def get_device_stats(
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
+) -> dict[str, Any]:
+    """Get aggregate device trust stats"""
+    org_id = getattr(current_user, "organization_id", None)
+
+    total_result = await db.execute(
+        select(func.count(DeviceTrustProfile.id)).where(
+            DeviceTrustProfile.organization_id == org_id
+        )
+    )
+    total = total_result.scalar_one() or 0
+
+    trusted_result = await db.execute(
+        select(func.count(DeviceTrustProfile.id)).where(
+            and_(
+                DeviceTrustProfile.organization_id == org_id,
+                DeviceTrustProfile.trust_level == "trusted",
+            )
+        )
+    )
+    trusted = trusted_result.scalar_one() or 0
+
+    conditional_result = await db.execute(
+        select(func.count(DeviceTrustProfile.id)).where(
+            and_(
+                DeviceTrustProfile.organization_id == org_id,
+                DeviceTrustProfile.trust_level == "conditional",
+            )
+        )
+    )
+    conditional = conditional_result.scalar_one() or 0
+
+    untrusted_result = await db.execute(
+        select(func.count(DeviceTrustProfile.id)).where(
+            and_(
+                DeviceTrustProfile.organization_id == org_id,
+                DeviceTrustProfile.trust_level == "untrusted",
+            )
+        )
+    )
+    untrusted = untrusted_result.scalar_one() or 0
+
+    blocked_result = await db.execute(
+        select(func.count(DeviceTrustProfile.id)).where(
+            and_(
+                DeviceTrustProfile.organization_id == org_id,
+                DeviceTrustProfile.trust_level == "blocked",
+            )
+        )
+    )
+    blocked = blocked_result.scalar_one() or 0
+
+    return {
+        "total": total,
+        "trusted": trusted,
+        "conditional": conditional,
+        "untrusted": untrusted,
+        "blocked": blocked,
+    }
+
+
+@router.post("/assess-devices", response_model=None)
+async def assess_all_devices(
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
+) -> dict[str, Any]:
+    """Trigger assessment of all devices"""
+    org_id = getattr(current_user, "organization_id", None)
+    assessor = DeviceTrustAssessor(db, org_id)
+
+    result = await db.execute(
+        select(DeviceTrustProfile.device_id).where(
+            DeviceTrustProfile.organization_id == org_id
+        )
+    )
+    device_ids = [row[0] for row in result.all()]
+
+    assessed = 0
+    failed = 0
+    for device_id in device_ids:
+        try:
+            await assessor.assess_device(device_id)
+            assessed += 1
+        except Exception:
+            failed += 1
+
+    return {
+        "assessed": assessed,
+        "failed": failed,
+        "total": len(device_ids),
+    }
+
+
+@router.get("/devices", response_model=None)
 async def list_devices(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
@@ -434,8 +552,10 @@ async def list_devices(
     trust_level: str = Query(None, description="trusted, conditional, untrusted, blocked"),
 ) -> dict[str, Any]:
     """List devices with trust scores"""
+    org_id = getattr(current_user, "organization_id", None)
+
     query = select(DeviceTrustProfile).where(
-        DeviceTrustProfile.organization_id == current_user.organization_id
+        DeviceTrustProfile.organization_id == org_id
     )
 
     if trust_level:
@@ -444,7 +564,7 @@ async def list_devices(
     # Get total count
     count_result = await db.execute(
         select(func.count(DeviceTrustProfile.id)).where(
-            DeviceTrustProfile.organization_id == current_user.organization_id
+            DeviceTrustProfile.organization_id == org_id
         )
     )
     total = count_result.scalar_one()
@@ -474,6 +594,31 @@ async def list_devices(
     }
 
 
+@router.get("/devices/non-compliant", response_model=None)
+async def list_non_compliant_devices(
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
+) -> dict[str, Any]:
+    """Get devices below compliance threshold"""
+    org_id = getattr(current_user, "organization_id", None)
+    assessor = DeviceTrustAssessor(db, org_id)
+    non_compliant = await assessor.get_non_compliant_devices()
+
+    return {
+        "count": len(non_compliant),
+        "devices": [
+            {
+                "id": d.id,
+                "device_id": d.device_id,
+                "hostname": d.hostname,
+                "trust_score": d.trust_score,
+                "trust_level": d.trust_level,
+            }
+            for d in non_compliant
+        ],
+    }
+
+
 @router.get("/devices/{device_id}", response_model=DeviceTrustProfileResponse)
 async def get_device(
     device_id: str,
@@ -481,11 +626,12 @@ async def get_device(
     current_user: CurrentUser = None,
 ) -> DeviceTrustProfileResponse:
     """Get device trust details"""
+    org_id = getattr(current_user, "organization_id", None)
     result = await db.execute(
         select(DeviceTrustProfile).where(
             and_(
                 DeviceTrustProfile.device_id == device_id,
-                DeviceTrustProfile.organization_id == current_user.organization_id,
+                DeviceTrustProfile.organization_id == org_id,
             )
         )
     )
@@ -506,7 +652,8 @@ async def assess_device(
     current_user: CurrentUser = None,
 ) -> DeviceTrustProfileResponse:
     """Assess device compliance and trust score"""
-    assessor = DeviceTrustAssessor(db, current_user.organization_id)
+    org_id = getattr(current_user, "organization_id", None)
+    assessor = DeviceTrustAssessor(db, org_id)
 
     device = await assessor.assess_device(device_id)
 
@@ -521,36 +668,13 @@ async def update_device_compliance(
     current_user: CurrentUser = None,
 ) -> DeviceTrustProfileResponse:
     """Update device compliance data"""
-    assessor = DeviceTrustAssessor(db, current_user.organization_id)
+    org_id = getattr(current_user, "organization_id", None)
+    assessor = DeviceTrustAssessor(db, org_id)
 
     compliance_data = compliance.dict(exclude_unset=True, exclude_none=True)
     device = await assessor.update_device_compliance(device_id, compliance_data)
 
     return DeviceTrustProfileResponse.from_orm(device)
-
-
-@router.get("/devices/non-compliant", response_model=list[str, Any])
-async def list_non_compliant_devices(
-    db: DatabaseSession = None,
-    current_user: CurrentUser = None,
-) -> dict[str, Any]:
-    """Get devices below compliance threshold"""
-    assessor = DeviceTrustAssessor(db, current_user.organization_id)
-    non_compliant = await assessor.get_non_compliant_devices()
-
-    return {
-        "count": len(non_compliant),
-        "devices": [
-            {
-                "id": d.id,
-                "device_id": d.device_id,
-                "hostname": d.hostname,
-                "trust_score": d.trust_score,
-                "trust_level": d.trust_level,
-            }
-            for d in non_compliant
-        ],
-    }
 
 
 # ============================================================================
@@ -565,7 +689,8 @@ async def create_segment(
     current_user: CurrentUser = None,
 ) -> MicroSegmentResponse:
     """Create a new micro-segment"""
-    engine = MicroSegmentationEngine(db, current_user.organization_id)
+    org_id = getattr(current_user, "organization_id", None)
+    engine = MicroSegmentationEngine(db, org_id)
 
     seg = await engine.create_segment(
         name=segment.name,
@@ -576,7 +701,7 @@ async def create_segment(
     return MicroSegmentResponse.from_orm(seg)
 
 
-@router.get("/segments", response_model=list[str, Any])
+@router.get("/segments", response_model=None)
 async def list_segments(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
@@ -584,14 +709,16 @@ async def list_segments(
     limit: int = Query(20, ge=1, le=100),
 ) -> dict[str, Any]:
     """List micro-segments"""
+    org_id = getattr(current_user, "organization_id", None)
+
     query = select(MicroSegment).where(
-        MicroSegment.organization_id == current_user.organization_id
+        MicroSegment.organization_id == org_id
     )
 
     # Get total count
     count_result = await db.execute(
         select(func.count(MicroSegment.id)).where(
-            MicroSegment.organization_id == current_user.organization_id
+            MicroSegment.organization_id == org_id
         )
     )
     total = count_result.scalar_one()
@@ -617,11 +744,12 @@ async def get_segment(
     current_user: CurrentUser = None,
 ) -> MicroSegmentResponse:
     """Get segment details"""
+    org_id = getattr(current_user, "organization_id", None)
     result = await db.execute(
         select(MicroSegment).where(
             and_(
                 MicroSegment.id == segment_id,
-                MicroSegment.organization_id == current_user.organization_id,
+                MicroSegment.organization_id == org_id,
             )
         )
     )
@@ -643,11 +771,12 @@ async def update_segment(
     current_user: CurrentUser = None,
 ) -> MicroSegmentResponse:
     """Update micro-segment"""
+    org_id = getattr(current_user, "organization_id", None)
     result = await db.execute(
         select(MicroSegment).where(
             and_(
                 MicroSegment.id == segment_id,
-                MicroSegment.organization_id == current_user.organization_id,
+                MicroSegment.organization_id == org_id,
             )
         )
     )
@@ -681,11 +810,12 @@ async def delete_segment(
     current_user: CurrentUser = None,
 ) -> None:
     """Delete micro-segment"""
+    org_id = getattr(current_user, "organization_id", None)
     result = await db.execute(
         select(MicroSegment).where(
             and_(
                 MicroSegment.id == segment_id,
-                MicroSegment.organization_id == current_user.organization_id,
+                MicroSegment.organization_id == org_id,
             )
         )
     )
@@ -708,7 +838,8 @@ async def evaluate_segment_traffic(
     current_user: CurrentUser = None,
 ) -> SegmentTrafficResponse:
     """Evaluate if traffic is allowed within segment"""
-    engine = MicroSegmentationEngine(db, current_user.organization_id)
+    org_id = getattr(current_user, "organization_id", None)
+    engine = MicroSegmentationEngine(db, org_id)
 
     result = await engine.evaluate_traffic(
         source=traffic.source,
@@ -720,27 +851,29 @@ async def evaluate_segment_traffic(
     return SegmentTrafficResponse(**result)
 
 
-@router.get("/segments/{segment_id}/violations", response_model=list[str, Any])
+@router.get("/segments/{segment_id}/violations", response_model=None)
 async def get_segment_violations(
     segment_id: str,
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
 ) -> dict[str, Any]:
     """Get policy violations for segment"""
-    engine = MicroSegmentationEngine(db, current_user.organization_id)
+    org_id = getattr(current_user, "organization_id", None)
+    engine = MicroSegmentationEngine(db, org_id)
 
     violations = await engine.get_segment_violations(segment_id)
 
     return {"segment_id": segment_id, "violations": violations}
 
 
-@router.get("/topology", response_model=list[str, Any])
+@router.get("/topology", response_model=None)
 async def get_segment_topology(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
 ) -> dict[str, Any]:
     """Get network topology visualization"""
-    engine = MicroSegmentationEngine(db, current_user.organization_id)
+    org_id = getattr(current_user, "organization_id", None)
+    engine = MicroSegmentationEngine(db, org_id)
 
     return await engine.visualize_segments()
 
@@ -757,7 +890,8 @@ async def initiate_verification(
     current_user: CurrentUser = None,
 ) -> IdentityVerificationResponse:
     """Initiate identity verification"""
-    auth_engine = ContinuousAuthEngine(db, current_user.organization_id)
+    org_id = getattr(current_user, "organization_id", None)
+    auth_engine = ContinuousAuthEngine(db, org_id)
 
     v = await auth_engine.initiate_verification(
         user_id=verification.user_id,
@@ -772,7 +906,7 @@ async def initiate_verification(
     return IdentityVerificationResponse.from_orm(v)
 
 
-@router.post("/step-up/{session_id}", response_model=list[str, Any])
+@router.post("/step-up/{session_id}", response_model=None)
 async def step_up_authentication(
     session_id: str,
     db: DatabaseSession = None,
@@ -780,12 +914,13 @@ async def step_up_authentication(
     required_level: str = Query(..., description="mfa, biometric, password"),
 ) -> dict[str, Any]:
     """Initiate step-up authentication"""
-    auth_engine = ContinuousAuthEngine(db, current_user.organization_id)
+    org_id = getattr(current_user, "organization_id", None)
+    auth_engine = ContinuousAuthEngine(db, org_id)
 
     return await auth_engine.step_up_authentication(session_id, required_level)
 
 
-@router.get("/verifications", response_model=list[str, Any])
+@router.get("/verifications", response_model=None)
 async def list_verifications(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
@@ -794,8 +929,10 @@ async def list_verifications(
     limit: int = Query(20, ge=1, le=100),
 ) -> dict[str, Any]:
     """Get verification history"""
+    org_id = getattr(current_user, "organization_id", None)
+
     query = select(IdentityVerification).where(
-        IdentityVerification.organization_id == current_user.organization_id
+        IdentityVerification.organization_id == org_id
     )
 
     if user_id:
@@ -804,7 +941,7 @@ async def list_verifications(
     # Get total count
     count_result = await db.execute(
         select(func.count(IdentityVerification.id)).where(
-            IdentityVerification.organization_id == current_user.organization_id
+            IdentityVerification.organization_id == org_id
         )
     )
     total = count_result.scalar_one()
@@ -836,7 +973,8 @@ async def get_maturity_score(
     current_user: CurrentUser = None,
 ) -> ZeroTrustMaturityResponse:
     """Get Zero Trust maturity score and assessment"""
-    scorer = ZeroTrustScorer(db, current_user.organization_id)
+    org_id = getattr(current_user, "organization_id", None)
+    scorer = ZeroTrustScorer(db, org_id)
 
     maturity = await scorer.calculate_maturity_score()
 
@@ -849,26 +987,28 @@ async def get_maturity_score(
     )
 
 
-@router.get("/maturity/pillars", response_model=list[str, Any])
+@router.get("/maturity/pillars", response_model=None)
 async def get_maturity_pillars(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
 ) -> dict[str, Any]:
     """Get per-pillar maturity breakdown"""
-    scorer = ZeroTrustScorer(db, current_user.organization_id)
+    org_id = getattr(current_user, "organization_id", None)
+    scorer = ZeroTrustScorer(db, org_id)
 
     maturity = await scorer.calculate_maturity_score()
 
     return {"pillars": maturity["pillars"]}
 
 
-@router.get("/recommendations", response_model=list[str, Any])
+@router.get("/recommendations", response_model=None)
 async def get_recommendations(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
 ) -> dict[str, Any]:
     """Get improvement recommendations"""
-    scorer = ZeroTrustScorer(db, current_user.organization_id)
+    org_id = getattr(current_user, "organization_id", None)
+    scorer = ZeroTrustScorer(db, org_id)
 
     maturity = await scorer.calculate_maturity_score()
 
@@ -891,10 +1031,12 @@ async def get_dashboard_stats(
     """Get Zero Trust dashboard statistics"""
     logger.info("api_get_dashboard_stats")
 
+    org_id = getattr(current_user, "organization_id", None)
+
     # Get policy stats
     policy_result = await db.execute(
         select(func.count(ZeroTrustPolicy.id)).where(
-            ZeroTrustPolicy.organization_id == current_user.organization_id
+            ZeroTrustPolicy.organization_id == org_id
         )
     )
     total_policies = policy_result.scalar_one() or 0
@@ -902,7 +1044,7 @@ async def get_dashboard_stats(
     enabled_result = await db.execute(
         select(func.count(ZeroTrustPolicy.id)).where(
             and_(
-                ZeroTrustPolicy.organization_id == current_user.organization_id,
+                ZeroTrustPolicy.organization_id == org_id,
                 ZeroTrustPolicy.is_enabled == True,
             )
         )
@@ -912,7 +1054,7 @@ async def get_dashboard_stats(
     # Get device stats
     device_result = await db.execute(
         select(func.count(DeviceTrustProfile.id)).where(
-            DeviceTrustProfile.organization_id == current_user.organization_id
+            DeviceTrustProfile.organization_id == org_id
         )
     )
     total_devices = device_result.scalar_one() or 0
@@ -920,7 +1062,7 @@ async def get_dashboard_stats(
     compliant_result = await db.execute(
         select(func.count(DeviceTrustProfile.id)).where(
             and_(
-                DeviceTrustProfile.organization_id == current_user.organization_id,
+                DeviceTrustProfile.organization_id == org_id,
                 DeviceTrustProfile.trust_level.in_(["trusted", "conditional"]),
             )
         )
@@ -931,7 +1073,7 @@ async def get_dashboard_stats(
     # Get average device trust
     avg_trust_result = await db.execute(
         select(func.avg(DeviceTrustProfile.trust_score)).where(
-            DeviceTrustProfile.organization_id == current_user.organization_id
+            DeviceTrustProfile.organization_id == org_id
         )
     )
     avg_trust = avg_trust_result.scalar_one() or 0.0
@@ -939,7 +1081,7 @@ async def get_dashboard_stats(
     # Get decision stats
     decision_result = await db.execute(
         select(func.count(AccessDecision.id)).where(
-            AccessDecision.organization_id == current_user.organization_id
+            AccessDecision.organization_id == org_id
         )
     )
     total_decisions = decision_result.scalar_one() or 0
@@ -947,7 +1089,7 @@ async def get_dashboard_stats(
     allowed_result = await db.execute(
         select(func.count(AccessDecision.id)).where(
             and_(
-                AccessDecision.organization_id == current_user.organization_id,
+                AccessDecision.organization_id == org_id,
                 AccessDecision.decision == "allow",
             )
         )
@@ -957,7 +1099,7 @@ async def get_dashboard_stats(
     denied_result = await db.execute(
         select(func.count(AccessDecision.id)).where(
             and_(
-                AccessDecision.organization_id == current_user.organization_id,
+                AccessDecision.organization_id == org_id,
                 AccessDecision.decision == "deny",
             )
         )
@@ -967,7 +1109,7 @@ async def get_dashboard_stats(
     challenged_result = await db.execute(
         select(func.count(AccessDecision.id)).where(
             and_(
-                AccessDecision.organization_id == current_user.organization_id,
+                AccessDecision.organization_id == org_id,
                 AccessDecision.decision.in_(["challenge", "step_up"]),
             )
         )
@@ -977,7 +1119,7 @@ async def get_dashboard_stats(
     # Get segment stats
     segment_result = await db.execute(
         select(func.count(MicroSegment.id)).where(
-            MicroSegment.organization_id == current_user.organization_id
+            MicroSegment.organization_id == org_id
         )
     )
     total_segments = segment_result.scalar_one() or 0
@@ -985,7 +1127,7 @@ async def get_dashboard_stats(
     active_result = await db.execute(
         select(func.count(MicroSegment.id)).where(
             and_(
-                MicroSegment.organization_id == current_user.organization_id,
+                MicroSegment.organization_id == org_id,
                 MicroSegment.is_active == True,
             )
         )
@@ -994,13 +1136,13 @@ async def get_dashboard_stats(
 
     violation_result = await db.execute(
         select(func.sum(MicroSegment.violation_count)).where(
-            MicroSegment.organization_id == current_user.organization_id
+            MicroSegment.organization_id == org_id
         )
     )
     violations = violation_result.scalar_one() or 0
 
     # Get maturity score
-    scorer = ZeroTrustScorer(db, current_user.organization_id)
+    scorer = ZeroTrustScorer(db, org_id)
     maturity = await scorer.calculate_maturity_score()
 
     return ZeroTrustDashboardStats(
