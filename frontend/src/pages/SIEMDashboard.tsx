@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef, useCallback } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   AreaChart,
@@ -32,6 +32,12 @@ import {
   Clock,
   TrendingUp,
   Eye,
+  Download,
+  Save,
+  Upload,
+  Pause,
+  Square,
+  BookmarkPlus,
 } from 'lucide-react';
 import { api } from '../lib/api';
 import clsx from 'clsx';
@@ -55,10 +61,18 @@ const sourceStatusColors = {
   disabled: 'bg-gray-100 text-gray-700',
 };
 
+const severityRowColors: Record<string, string> = {
+  critical: 'bg-red-50',
+  high: 'bg-orange-50',
+  medium: 'bg-yellow-50',
+  low: 'bg-blue-50',
+  info: 'bg-white',
+};
+
 const chartColors = ['#3b82f6', '#ef4444', '#f59e0b', '#10b981', '#8b5cf6', '#ec4899'];
 
 export default function SIEMDashboard() {
-  const [activeTab, setActiveTab] = useState<'overview' | 'search' | 'rules' | 'sources' | 'correlation'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'search' | 'rules' | 'sources' | 'correlation' | 'live'>('overview');
   const [searchQuery, setSearchQuery] = useState('');
   const [timeRange, setTimeRange] = useState('24h');
   const [sourceTypeFilter, setSourceTypeFilter] = useState('');
@@ -75,6 +89,25 @@ export default function SIEMDashboard() {
   const [testLogs, setTestLogs] = useState('');
   const [testResult, setTestResult] = useState<any>(null);
   const [selectedCorrelation, setSelectedCorrelation] = useState<any>(null);
+
+  // Live Tail state
+  const [isTailing, setIsTailing] = useState(false);
+  const [liveLogs, setLiveLogs] = useState<any[]>([]);
+  const [liveSeverityFilter, setLiveSeverityFilter] = useState<string[]>([]);
+  const liveTailRef = useRef<HTMLDivElement>(null);
+  const tailIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Saved Searches state
+  const [showSaveSearchModal, setShowSaveSearchModal] = useState(false);
+  const [saveSearchName, setSaveSearchName] = useState('');
+  const [selectedSavedSearch, setSelectedSavedSearch] = useState('');
+
+  // Import Rule state
+  const [showImportRuleModal, setShowImportRuleModal] = useState(false);
+  const [importYaml, setImportYaml] = useState('');
+
+  // Collector state
+  const [collectorStatus, setCollectorStatus] = useState<any>(null);
 
   const queryClient = useQueryClient();
 
@@ -146,12 +179,130 @@ export default function SIEMDashboard() {
     },
   });
 
+  // Saved searches query
+  const { data: savedSearchesData } = useQuery({
+    queryKey: ['siem-saved-searches'],
+    queryFn: async () => {
+      const response = await api.get('/siem/saved-searches');
+      return response.data;
+    },
+    enabled: activeTab === 'search',
+  });
+  const savedSearches = Array.isArray(savedSearchesData) ? savedSearchesData : (savedSearchesData?.items || []);
+
+  // Save search mutation
+  const saveSearchMutation = useMutation({
+    mutationFn: async (name: string) => {
+      const response = await api.post('/siem/saved-searches', {
+        name,
+        query: searchQuery,
+        filters: { time_range: timeRange, source_type: sourceTypeFilter, severity: severityFilter },
+      });
+      return response.data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['siem-saved-searches'] });
+      setShowSaveSearchModal(false);
+      setSaveSearchName('');
+    },
+  });
+
+  // Run saved search mutation
+  const runSavedSearchMutation = useMutation({
+    mutationFn: async (id: string) => {
+      const response = await api.post(`/siem/saved-searches/${id}/run`);
+      return response.data;
+    },
+  });
+
+  // Import rule mutation
+  const importRuleMutation = useMutation({
+    mutationFn: async (yaml: string) => {
+      const response = await api.post('/siem/rules/import', { yaml });
+      return response.data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['siem-rules'] });
+      setShowImportRuleModal(false);
+      setImportYaml('');
+    },
+  });
+
+  // Collector status query
+  const { data: collectorData } = useQuery({
+    queryKey: ['siem-collector-status'],
+    queryFn: async () => {
+      const response = await api.get('/siem/collector/status');
+      return response.data;
+    },
+    enabled: activeTab === 'sources',
+  });
+
+  useEffect(() => {
+    if (collectorData) setCollectorStatus(collectorData);
+  }, [collectorData]);
+
+  // Collector start/stop mutations
+  const collectorStartMutation = useMutation({
+    mutationFn: async () => {
+      const response = await api.post('/siem/collector/start');
+      return response.data;
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['siem-collector-status'] }),
+  });
+
+  const collectorStopMutation = useMutation({
+    mutationFn: async () => {
+      const response = await api.post('/siem/collector/stop');
+      return response.data;
+    },
+    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['siem-collector-status'] }),
+  });
+
+  // Live Tail polling
+  const fetchLiveLogs = useCallback(async () => {
+    try {
+      const response = await api.get('/siem/logs/search', {
+        params: { sort_order: 'desc', size: 20 },
+      });
+      const items = response.data?.items || response.data || [];
+      setLiveLogs(items);
+    } catch {
+      // silently ignore polling errors
+    }
+  }, []);
+
+  useEffect(() => {
+    if (isTailing && activeTab === 'live') {
+      fetchLiveLogs();
+      tailIntervalRef.current = setInterval(fetchLiveLogs, 3000);
+    }
+    return () => {
+      if (tailIntervalRef.current) {
+        clearInterval(tailIntervalRef.current);
+        tailIntervalRef.current = null;
+      }
+    };
+  }, [isTailing, activeTab, fetchLiveLogs]);
+
+  // Auto-scroll live tail to bottom
+  useEffect(() => {
+    if (isTailing && liveTailRef.current) {
+      liveTailRef.current.scrollTop = liveTailRef.current.scrollHeight;
+    }
+  }, [liveLogs, isTailing]);
+
+  const filteredLiveLogs = liveSeverityFilter.length > 0
+    ? liveLogs.filter((log: any) => liveSeverityFilter.includes(log.severity))
+    : liveLogs;
+
   const tabs = [
     { id: 'overview', label: 'Overview', icon: Activity },
     { id: 'search', label: 'Log Search', icon: Search },
     { id: 'rules', label: 'Detection Rules', icon: Zap },
     { id: 'sources', label: 'Data Sources', icon: Server },
     { id: 'correlation', label: 'Correlation', icon: TrendingUp },
+    { id: 'live', label: 'Live Tail', icon: Activity },
   ];
 
   const logs = logsData?.items || [];
@@ -333,6 +484,64 @@ export default function SIEMDashboard() {
               )}
             </div>
           </div>
+
+          {/* Pipeline Status & Top Alerting Rules */}
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+            {/* Pipeline Status */}
+            <div className="bg-white rounded-lg border border-gray-200 p-6">
+              <div className="flex items-center justify-between mb-4">
+                <h3 className="text-lg font-semibold text-gray-900">Pipeline Status</h3>
+                <span className="px-3 py-1 text-xs font-semibold rounded-full bg-green-100 text-green-700">
+                  Pipeline Active
+                </span>
+              </div>
+              <div className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <span className="text-sm text-gray-600">Ingestion</span>
+                  <span className="text-sm font-medium text-green-600">Running</span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm text-gray-600">Normalization</span>
+                  <span className="text-sm font-medium text-green-600">Running</span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm text-gray-600">Detection Engine</span>
+                  <span className="text-sm font-medium text-green-600">Running</span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-sm text-gray-600">Correlation Engine</span>
+                  <span className="text-sm font-medium text-green-600">Running</span>
+                </div>
+              </div>
+            </div>
+
+            {/* Top Alerting Rules */}
+            <div className="bg-white rounded-lg border border-gray-200 p-6">
+              <h3 className="text-lg font-semibold text-gray-900 mb-4">Top Alerting Rules</h3>
+              {stats?.top_rules && stats.top_rules.length > 0 ? (
+                <div className="space-y-3">
+                  {stats.top_rules.slice(0, 8).map((rule: any, idx: number) => (
+                    <div key={idx} className="flex items-center justify-between pb-3 border-b border-gray-100 last:border-0">
+                      <div className="flex items-center gap-3">
+                        <span className="text-xs font-mono text-gray-400 w-5">#{idx + 1}</span>
+                        <div>
+                          <p className="text-sm font-medium text-gray-900">{rule.name || rule.rule_name}</p>
+                          <span className={clsx('px-2 py-0.5 text-xs font-medium rounded-full border capitalize', severityColors[rule.severity] || severityColors.info)}>
+                            {rule.severity}
+                          </span>
+                        </div>
+                      </div>
+                      <span className="text-sm font-bold text-gray-900">{rule.match_count || 0}</span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="text-center py-8 text-gray-500">
+                  <p>No alerting rules data yet</p>
+                </div>
+              )}
+            </div>
+          </div>
         </div>
       )}
 
@@ -361,6 +570,51 @@ export default function SIEMDashboard() {
                   <Search className="w-5 h-5" />
                   Search
                 </button>
+                <button
+                  onClick={() => { setShowSaveSearchModal(true); setSaveSearchName(''); }}
+                  className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 flex items-center gap-2"
+                >
+                  <BookmarkPlus className="w-5 h-5" />
+                  Save Search
+                </button>
+              </div>
+              {/* Saved Searches */}
+              <div className="flex items-center gap-2 mt-2">
+                <label className="text-sm font-medium text-gray-700">Saved Searches:</label>
+                <select
+                  value={selectedSavedSearch}
+                  onChange={(e) => {
+                    const id = e.target.value;
+                    setSelectedSavedSearch(id);
+                    if (id) {
+                      const saved = savedSearches.find((s: any) => s.id === id);
+                      if (saved) {
+                        setSearchQuery(saved.query || '');
+                        if (saved.filters) {
+                          if (saved.filters.time_range) setTimeRange(saved.filters.time_range);
+                          if (saved.filters.source_type) setSourceTypeFilter(saved.filters.source_type);
+                          if (saved.filters.severity) setSeverityFilter(saved.filters.severity);
+                        }
+                        setSearchPage(1);
+                      }
+                    }
+                  }}
+                  className="px-3 py-1.5 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                >
+                  <option value="">-- Select a saved search --</option>
+                  {savedSearches.map((s: any) => (
+                    <option key={s.id} value={s.id}>{s.name}</option>
+                  ))}
+                </select>
+                {selectedSavedSearch && (
+                  <button
+                    onClick={() => runSavedSearchMutation.mutate(selectedSavedSearch)}
+                    className="px-3 py-1.5 bg-blue-50 text-blue-600 rounded-lg text-sm font-medium hover:bg-blue-100 flex items-center gap-1"
+                  >
+                    <Play className="w-4 h-4" />
+                    Run
+                  </button>
+                )}
               </div>
             </div>
 
@@ -588,6 +842,54 @@ export default function SIEMDashboard() {
               </div>
             </div>
           )}
+
+          {/* Save Search Modal */}
+          {showSaveSearchModal && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50">
+              <div className="bg-white rounded-lg shadow-xl w-full max-w-md mx-4">
+                <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200">
+                  <h2 className="text-lg font-semibold text-gray-900">Save Search</h2>
+                  <button onClick={() => setShowSaveSearchModal(false)} className="text-gray-400 hover:text-gray-600">
+                    ✕
+                  </button>
+                </div>
+                <div className="p-6 space-y-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Search Name *</label>
+                    <input
+                      type="text"
+                      value={saveSearchName}
+                      onChange={(e) => setSaveSearchName(e.target.value)}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                      placeholder="e.g., Failed SSH Logins"
+                    />
+                  </div>
+                  <div className="bg-gray-50 rounded-lg p-3 text-sm text-gray-600 space-y-1">
+                    <p><span className="font-medium">Query:</span> {searchQuery || '(empty)'}</p>
+                    <p><span className="font-medium">Time Range:</span> {timeRange}</p>
+                    <p><span className="font-medium">Source:</span> {sourceTypeFilter || 'All'}</p>
+                    <p><span className="font-medium">Severity:</span> {severityFilter || 'All'}</p>
+                  </div>
+                  <div className="flex justify-end gap-3 pt-2 border-t">
+                    <button
+                      onClick={() => setShowSaveSearchModal(false)}
+                      className="px-4 py-2 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      disabled={!saveSearchName.trim()}
+                      onClick={() => saveSearchMutation.mutate(saveSearchName.trim())}
+                      className="px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50 flex items-center gap-2"
+                    >
+                      <Save className="w-4 h-4" />
+                      Save
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -626,13 +928,22 @@ export default function SIEMDashboard() {
               Disabled
             </button>
           </div>
-            <button
-              onClick={() => { setShowCreateRuleModal(true); setNewRuleForm({ name: '', title: '', description: '', severity: 'medium', condition: '' }); }}
-              className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
-            >
-              <Plus className="w-5 h-5" />
-              Create Rule
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => { setShowImportRuleModal(true); setImportYaml(''); }}
+                className="flex items-center gap-2 px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700"
+              >
+                <Upload className="w-5 h-5" />
+                Import Rule
+              </button>
+              <button
+                onClick={() => { setShowCreateRuleModal(true); setNewRuleForm({ name: '', title: '', description: '', severity: 'medium', condition: '' }); }}
+                className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+              >
+                <Plus className="w-5 h-5" />
+                Create Rule
+              </button>
+            </div>
           </div>
 
           {/* Rules Table */}
@@ -719,6 +1030,27 @@ export default function SIEMDashboard() {
                         <td className="px-6 py-4 text-sm font-medium text-gray-900">{rule.match_count || 0}</td>
                         <td className="px-6 py-4 text-right">
                           <div className="flex items-center justify-end gap-2">
+                            <button
+                              onClick={async () => {
+                                try {
+                                  const response = await api.get(`/siem/rules/${rule.id}/export`);
+                                  const yamlContent = typeof response.data === 'string' ? response.data : JSON.stringify(response.data, null, 2);
+                                  const blob = new Blob([yamlContent], { type: 'application/x-yaml' });
+                                  const url = URL.createObjectURL(blob);
+                                  const a = document.createElement('a');
+                                  a.href = url;
+                                  a.download = `${rule.name || 'rule'}.yml`;
+                                  document.body.appendChild(a);
+                                  a.click();
+                                  document.body.removeChild(a);
+                                  URL.revokeObjectURL(url);
+                                } catch {}
+                              }}
+                              className="flex items-center gap-1 px-2 py-1 text-sm bg-gray-50 text-gray-600 rounded hover:bg-gray-100"
+                              title="Export as YAML"
+                            >
+                              <Download className="w-4 h-4" />
+                            </button>
                             <button
                               onClick={() => { setSelectedRule(rule); setTestLogs(''); setTestResult(null); }}
                               className="flex items-center gap-1 px-3 py-1 text-sm bg-blue-50 text-blue-600 rounded hover:bg-blue-100"
@@ -908,12 +1240,105 @@ export default function SIEMDashboard() {
               </div>
             </div>
           )}
+
+          {/* Import Rule Modal */}
+          {showImportRuleModal && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50">
+              <div className="bg-white rounded-lg shadow-xl w-full max-w-lg mx-4">
+                <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200">
+                  <h2 className="text-lg font-semibold text-gray-900">Import Rule (YAML)</h2>
+                  <button onClick={() => setShowImportRuleModal(false)} className="text-gray-400 hover:text-gray-600">
+                    ✕
+                  </button>
+                </div>
+                <div className="p-6 space-y-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Paste YAML Rule Definition</label>
+                    <textarea
+                      rows={12}
+                      value={importYaml}
+                      onChange={(e) => setImportYaml(e.target.value)}
+                      placeholder={"title: My Detection Rule\nstatus: experimental\ndescription: Detects suspicious activity\nlogsource:\n  category: process_creation\ndetection:\n  selection:\n    CommandLine|contains: 'mimikatz'\n  condition: selection\nlevel: high"}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent font-mono text-sm"
+                    />
+                  </div>
+                  <div className="flex justify-end gap-3 pt-2 border-t">
+                    <button
+                      onClick={() => setShowImportRuleModal(false)}
+                      className="px-4 py-2 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      disabled={!importYaml.trim() || importRuleMutation.isPending}
+                      onClick={() => importRuleMutation.mutate(importYaml)}
+                      className="px-4 py-2 bg-purple-600 text-white rounded-lg hover:bg-purple-700 disabled:opacity-50 flex items-center gap-2"
+                    >
+                      <Upload className="w-4 h-4" />
+                      {importRuleMutation.isPending ? 'Importing...' : 'Import Rule'}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       )}
 
       {/* Data Sources Tab */}
       {activeTab === 'sources' && (
         <div className="space-y-6">
+          {/* Syslog Collector Status Card */}
+          <div className="bg-white rounded-lg border border-gray-200 p-6">
+            <div className="flex items-center justify-between mb-4">
+              <div className="flex items-center gap-3">
+                <Server className="w-6 h-6 text-purple-600" />
+                <div>
+                  <h3 className="font-semibold text-gray-900">Syslog Collector</h3>
+                  <p className="text-sm text-gray-500">Central log collection service</p>
+                </div>
+              </div>
+              <span className={clsx(
+                'px-3 py-1 text-xs font-semibold rounded-full',
+                collectorStatus?.status === 'running' ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-600'
+              )}>
+                {collectorStatus?.status === 'running' ? 'Running' : 'Stopped'}
+              </span>
+            </div>
+            <div className="grid grid-cols-3 gap-4 mb-4">
+              <div>
+                <span className="text-sm text-gray-500">Port</span>
+                <p className="text-sm font-medium text-gray-900">{collectorStatus?.port || 514}</p>
+              </div>
+              <div>
+                <span className="text-sm text-gray-500">Protocol</span>
+                <p className="text-sm font-medium text-gray-900">{collectorStatus?.protocol || 'UDP/TCP'}</p>
+              </div>
+              <div>
+                <span className="text-sm text-gray-500">Messages Received</span>
+                <p className="text-sm font-medium text-gray-900">{collectorStatus?.messages_received?.toLocaleString() || 0}</p>
+              </div>
+            </div>
+            <div className="flex gap-2">
+              <button
+                onClick={() => collectorStartMutation.mutate()}
+                disabled={collectorStatus?.status === 'running' || collectorStartMutation.isPending}
+                className="px-4 py-2 bg-green-600 text-white rounded-lg text-sm font-medium hover:bg-green-700 disabled:opacity-50 flex items-center gap-2"
+              >
+                <Play className="w-4 h-4" />
+                Start
+              </button>
+              <button
+                onClick={() => collectorStopMutation.mutate()}
+                disabled={collectorStatus?.status !== 'running' || collectorStopMutation.isPending}
+                className="px-4 py-2 bg-red-600 text-white rounded-lg text-sm font-medium hover:bg-red-700 disabled:opacity-50 flex items-center gap-2"
+              >
+                <Square className="w-4 h-4" />
+                Stop
+              </button>
+            </div>
+          </div>
+
           <button
             onClick={() => { setSourceModalMode('add'); setSelectedSource({}); setNewSourceForm({ name: '', description: '', source_type: 'syslog' }); }}
             className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
@@ -1345,6 +1770,144 @@ export default function SIEMDashboard() {
               </div>
             </div>
           )}
+        </div>
+      )}
+
+      {/* Live Tail Tab */}
+      {activeTab === 'live' && (
+        <div className="space-y-6">
+          {/* Controls */}
+          <div className="bg-white rounded-lg border border-gray-200 p-6">
+            <div className="flex items-center justify-between mb-4">
+              <div className="flex items-center gap-4">
+                <button
+                  onClick={() => setIsTailing(!isTailing)}
+                  className={clsx(
+                    'px-4 py-2 rounded-lg text-sm font-medium flex items-center gap-2',
+                    isTailing
+                      ? 'bg-red-600 text-white hover:bg-red-700'
+                      : 'bg-green-600 text-white hover:bg-green-700'
+                  )}
+                >
+                  {isTailing ? (
+                    <>
+                      <Pause className="w-4 h-4" />
+                      Stop Tailing
+                    </>
+                  ) : (
+                    <>
+                      <Play className="w-4 h-4" />
+                      Start Tailing
+                    </>
+                  )}
+                </button>
+                {!isTailing && (
+                  <span className="px-3 py-1 text-xs font-semibold rounded-full bg-yellow-100 text-yellow-700">
+                    Paused
+                  </span>
+                )}
+                <span className="px-3 py-1 text-xs font-semibold rounded-full bg-blue-100 text-blue-700">
+                  {filteredLiveLogs.length} logs
+                </span>
+              </div>
+            </div>
+
+            {/* Severity Filter Chips */}
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="text-sm font-medium text-gray-600">Filter:</span>
+              {['critical', 'high', 'medium', 'low', 'info'].map((sev) => (
+                <button
+                  key={sev}
+                  onClick={() => {
+                    setLiveSeverityFilter((prev) =>
+                      prev.includes(sev) ? prev.filter((s) => s !== sev) : [...prev, sev]
+                    );
+                  }}
+                  className={clsx(
+                    'px-3 py-1 rounded-full text-xs font-medium transition-colors capitalize border',
+                    liveSeverityFilter.includes(sev)
+                      ? severityColors[sev]
+                      : 'bg-gray-100 text-gray-500 border-gray-200 hover:bg-gray-200'
+                  )}
+                >
+                  {sev}
+                </button>
+              ))}
+              {liveSeverityFilter.length > 0 && (
+                <button
+                  onClick={() => setLiveSeverityFilter([])}
+                  className="text-xs text-gray-500 hover:text-gray-700 underline ml-1"
+                >
+                  Clear
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* Live Log Stream */}
+          <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
+            <div
+              ref={liveTailRef}
+              className="max-h-[600px] overflow-y-auto"
+            >
+              {filteredLiveLogs.length === 0 ? (
+                <div className="flex flex-col items-center justify-center h-64 text-gray-500">
+                  <Activity className="w-12 h-12 mb-4 text-gray-300" />
+                  <p>{isTailing ? 'Waiting for logs...' : 'Press "Start Tailing" to begin'}</p>
+                </div>
+              ) : (
+                <table className="w-full">
+                  <thead className="bg-gray-50 border-b border-gray-200 sticky top-0">
+                    <tr>
+                      <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-48">
+                        Timestamp
+                      </th>
+                      <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-24">
+                        Severity
+                      </th>
+                      <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-32">
+                        Source
+                      </th>
+                      <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
+                        Message
+                      </th>
+                      <th className="px-4 py-2 text-left text-xs font-medium text-gray-500 uppercase tracking-wider w-32">
+                        Source IP
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-gray-100 font-mono text-xs">
+                    {filteredLiveLogs.map((log: any, idx: number) => (
+                      <tr
+                        key={log.id || idx}
+                        className={clsx(
+                          'transition-colors',
+                          severityRowColors[log.severity] || 'bg-white'
+                        )}
+                      >
+                        <td className="px-4 py-2 text-gray-500 whitespace-nowrap">
+                          {new Date(log.timestamp).toLocaleTimeString()}
+                        </td>
+                        <td className="px-4 py-2">
+                          <span
+                            className={clsx(
+                              'px-2 py-0.5 text-xs font-medium rounded-full border capitalize',
+                              severityColors[log.severity] || severityColors.info
+                            )}
+                          >
+                            {log.severity}
+                          </span>
+                        </td>
+                        <td className="px-4 py-2 text-gray-700">{log.source_name}</td>
+                        <td className="px-4 py-2 text-gray-900 truncate max-w-md">{log.message}</td>
+                        <td className="px-4 py-2 text-gray-600">{log.source_ip}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          </div>
         </div>
       )}
     </div>
