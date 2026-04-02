@@ -201,14 +201,45 @@ def send_notification_task(
 @shared_task
 def cleanup_old_executions() -> dict[str, Any]:
     """Clean up old playbook executions"""
+    from datetime import datetime, timedelta, timezone
+
     logger.info("Running cleanup task for old executions")
 
-    # This would delete executions older than retention period
-    # For now, just return a placeholder
+    retention_days = 90
+    cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+    cleaned_up = 0
+
+    try:
+        from src.core.database import async_session_factory
+        from src.models.playbook import PlaybookExecution
+        from sqlalchemy import delete
+
+        loop = asyncio.new_event_loop()
+
+        async def _cleanup():
+            async with async_session_factory() as session:
+                # Delete completed/failed executions older than the retention period
+                result = await session.execute(
+                    delete(PlaybookExecution).where(
+                        PlaybookExecution.completed_at < cutoff.isoformat(),
+                        PlaybookExecution.status.in_(["completed", "failed", "cancelled"]),
+                    )
+                )
+                await session.commit()
+                return result.rowcount
+
+        cleaned_up = loop.run_until_complete(_cleanup())
+        loop.close()
+        logger.info(f"Cleaned up {cleaned_up} old executions (older than {retention_days} days)")
+
+    except Exception as e:
+        logger.error(f"Cleanup task failed: {e}")
 
     return {
-        "cleaned_up": 0,
+        "cleaned_up": cleaned_up,
         "task": "cleanup_old_executions",
+        "retention_days": retention_days,
+        "cutoff": cutoff.isoformat(),
     }
 
 

@@ -57,11 +57,34 @@ class PlaybookAction:
         body = PlaybookAction._substitute_vars(body, context)
 
         logger.info(f"Sending email to {to}: {subject}")
-        # In production, integrate with SMTP/email service
+
+        recipients = [to] if isinstance(to, str) else to
+        sent = False
+        try:
+            from src.services.email_service import EmailService
+            email_service = EmailService()
+            if email_service.is_configured:
+                sent = await email_service.send_email(
+                    to=recipients,
+                    subject=subject,
+                    body=body,
+                    html_body=params.get("html_body"),
+                )
+            else:
+                logger.warning("Email service not configured, cannot send email")
+        except Exception as e:
+            logger.error(f"Failed to send email: {e}")
+            return {
+                "success": False,
+                "action": "send_email",
+                "error": str(e),
+                "details": {"to": to, "subject": subject},
+            }
+
         return {
-            "success": True,
+            "success": sent,
             "action": "send_email",
-            "details": {"to": to, "subject": subject},
+            "details": {"to": to, "subject": subject, "sent": sent},
         }
 
     @staticmethod
@@ -73,11 +96,34 @@ class PlaybookAction:
         message = PlaybookAction._substitute_vars(message, context)
 
         logger.info(f"Sending Slack message to {channel}")
-        # In production, integrate with Slack API
+
+        sent = False
+        try:
+            import httpx
+            from src.core.config import settings
+            webhook_url = params.get("webhook_url") or settings.slack_webhook_url
+            if webhook_url:
+                payload = {"text": message}
+                if channel:
+                    payload["channel"] = channel
+                async with httpx.AsyncClient() as client:
+                    resp = await client.post(webhook_url, json=payload, timeout=10)
+                    sent = resp.status_code == 200
+            else:
+                logger.warning("No Slack webhook URL configured")
+        except Exception as e:
+            logger.error(f"Failed to send Slack message: {e}")
+            return {
+                "success": False,
+                "action": "send_slack",
+                "error": str(e),
+                "details": {"channel": channel, "message_preview": message[:100]},
+            }
+
         return {
-            "success": True,
+            "success": sent,
             "action": "send_slack",
-            "details": {"channel": channel, "message_preview": message[:100]},
+            "details": {"channel": channel, "message_preview": message[:100], "sent": sent},
         }
 
     @staticmethod
@@ -88,7 +134,37 @@ class PlaybookAction:
         firewall = params.get("firewall", "default")
 
         logger.info(f"Blocking IP {ip} for {duration} hours on {firewall}")
-        # In production, integrate with firewall API
+
+        try:
+            from src.core.database import async_session_factory
+            from src.tickethub.models import TicketActivity
+
+            async with async_session_factory() as session:
+                activity = TicketActivity(
+                    source_type="remediation",
+                    source_id=context.get("alert_id", context.get("incident_id", "unknown")),
+                    activity_type="block_ip",
+                    actor_id=context.get("user_id"),
+                    description=f"Blocked IP {ip} for {duration} hours on firewall '{firewall}'",
+                    extra_metadata=json.dumps({
+                        "ip": ip,
+                        "duration_hours": duration,
+                        "firewall": firewall,
+                    }),
+                )
+                session.add(activity)
+                await session.commit()
+
+            logger.info(f"Recorded IP block action for {ip}")
+        except Exception as e:
+            logger.error(f"Failed to record IP block action: {e}")
+            return {
+                "success": False,
+                "action": "block_ip",
+                "error": str(e),
+                "details": {"ip": ip, "duration_hours": duration, "firewall": firewall},
+            }
+
         return {
             "success": True,
             "action": "block_ip",
@@ -102,7 +178,36 @@ class PlaybookAction:
         method = params.get("method", "edr")  # edr, switch, firewall
 
         logger.info(f"Isolating host {hostname} via {method}")
-        # In production, integrate with EDR/network management
+
+        try:
+            from src.core.database import async_session_factory
+            from src.tickethub.models import TicketActivity
+
+            async with async_session_factory() as session:
+                activity = TicketActivity(
+                    source_type="remediation",
+                    source_id=context.get("alert_id", context.get("incident_id", "unknown")),
+                    activity_type="isolate_host",
+                    actor_id=context.get("user_id"),
+                    description=f"Isolated host {hostname} via {method}",
+                    extra_metadata=json.dumps({
+                        "hostname": hostname,
+                        "method": method,
+                    }),
+                )
+                session.add(activity)
+                await session.commit()
+
+            logger.info(f"Recorded host isolation action for {hostname}")
+        except Exception as e:
+            logger.error(f"Failed to record host isolation action: {e}")
+            return {
+                "success": False,
+                "action": "isolate_host",
+                "error": str(e),
+                "details": {"hostname": hostname, "method": method},
+            }
+
         return {
             "success": True,
             "action": "isolate_host",
@@ -116,11 +221,57 @@ class PlaybookAction:
         directory = params.get("directory", "active_directory")
 
         logger.info(f"Disabling user {username} in {directory}")
-        # In production, integrate with AD/IAM
+
+        disabled = False
+        try:
+            from src.core.database import async_session_factory
+            from src.models.user import User
+            from src.tickethub.models import TicketActivity
+
+            async with async_session_factory() as session:
+                # Find the user by email (username)
+                result = await session.execute(
+                    select(User).where(User.email == username)
+                )
+                user = result.scalar_one_or_none()
+
+                if user:
+                    user.is_active = False
+                    disabled = True
+                    logger.info(f"Disabled user account: {username}")
+
+                    # Record the action for audit trail
+                    activity = TicketActivity(
+                        source_type="remediation",
+                        source_id=context.get("alert_id", context.get("incident_id", "unknown")),
+                        activity_type="disable_user",
+                        actor_id=context.get("user_id"),
+                        description=f"Disabled user {username} in {directory}",
+                        old_value="active",
+                        new_value="disabled",
+                        extra_metadata=json.dumps({
+                            "username": username,
+                            "directory": directory,
+                            "user_id": user.id,
+                        }),
+                    )
+                    session.add(activity)
+                    await session.commit()
+                else:
+                    logger.warning(f"User not found in local database: {username}")
+        except Exception as e:
+            logger.error(f"Failed to disable user: {e}")
+            return {
+                "success": False,
+                "action": "disable_user",
+                "error": str(e),
+                "details": {"username": username, "directory": directory},
+            }
+
         return {
             "success": True,
             "action": "disable_user",
-            "details": {"username": username, "directory": directory},
+            "details": {"username": username, "directory": directory, "disabled": disabled},
         }
 
     @staticmethod
@@ -135,14 +286,59 @@ class PlaybookAction:
         description = PlaybookAction._substitute_vars(description, context)
 
         logger.info(f"Creating {system} ticket: {title}")
-        # In production, integrate with Jira/ServiceNow
+
+        ticket_id = None
+        try:
+            from src.core.database import async_session_factory
+            from src.tickethub.models import TicketActivity, TicketComment
+
+            source_id = context.get("alert_id", context.get("incident_id", "unknown"))
+            source_type = "incident" if context.get("incident_id") else "alert"
+
+            async with async_session_factory() as session:
+                # Create a ticket activity to record ticket creation
+                activity = TicketActivity(
+                    source_type=source_type,
+                    source_id=source_id,
+                    activity_type="create_ticket",
+                    actor_id=context.get("user_id"),
+                    description=f"Created {system} ticket: {title} (priority: {priority})",
+                    extra_metadata=json.dumps({
+                        "system": system,
+                        "title": title,
+                        "priority": priority,
+                    }),
+                )
+                session.add(activity)
+
+                # Add description as a comment on the ticket
+                comment = TicketComment(
+                    source_type=source_type,
+                    source_id=source_id,
+                    content=f"[{system} Ticket] {title}\n\nPriority: {priority}\n\n{description}",
+                    author_id=context.get("user_id", "system"),
+                )
+                session.add(comment)
+                await session.commit()
+
+                ticket_id = activity.id
+                logger.info(f"Created ticket record {ticket_id} for {system}")
+        except Exception as e:
+            logger.error(f"Failed to create ticket: {e}")
+            return {
+                "success": False,
+                "action": "create_ticket",
+                "error": str(e),
+                "details": {"system": system, "title": title},
+            }
+
         return {
             "success": True,
             "action": "create_ticket",
             "details": {
                 "system": system,
                 "title": title,
-                "ticket_id": f"TICKET-{datetime.now().strftime('%Y%m%d%H%M%S')}",
+                "ticket_id": ticket_id or f"TICKET-{datetime.now().strftime('%Y%m%d%H%M%S')}",
             },
         }
 
@@ -154,50 +350,216 @@ class PlaybookAction:
         sources = params.get("sources", ["virustotal", "abuseipdb"])
 
         logger.info(f"Enriching {ioc_type} {ioc_value} from {sources}")
-        # In production, integrate with threat intel APIs
+
+        enrichment_results = {}
+        try:
+            from src.core.database import async_session_factory
+            from src.models.ioc import IOC
+
+            async with async_session_factory() as session:
+                # Look up IOC in the database
+                result = await session.execute(
+                    select(IOC).where(IOC.value == ioc_value)
+                )
+                ioc = result.scalar_one_or_none()
+
+                # Also check threat indicators for existing intel
+                from src.intel.models import ThreatIndicator
+                ti_result = await session.execute(
+                    select(ThreatIndicator).where(
+                        ThreatIndicator.value == ioc_value,
+                        ThreatIndicator.is_active == True,
+                    )
+                )
+                indicators = list(ti_result.scalars().all())
+
+                for indicator in indicators:
+                    enrichment_results[f"threat_intel_{indicator.feed_id or 'local'}"] = {
+                        "confidence": indicator.confidence,
+                        "severity": indicator.severity,
+                        "tags": indicator.tags,
+                        "context": indicator.context,
+                        "first_seen": indicator.first_seen.isoformat() if indicator.first_seen else None,
+                        "last_seen": indicator.last_seen.isoformat() if indicator.last_seen else None,
+                    }
+
+                # Update the IOC enrichment_data if it exists in the IOC table
+                if ioc:
+                    existing_data = json.loads(ioc.enrichment_data) if ioc.enrichment_data else {}
+                    existing_data.update(enrichment_results)
+                    ioc.enrichment_data = json.dumps(existing_data)
+                    ioc.last_enriched = datetime.now(timezone.utc).isoformat()
+                    await session.commit()
+
+        except Exception as e:
+            logger.error(f"Failed to enrich IOC: {e}")
+            return {
+                "success": False,
+                "action": "enrich_ioc",
+                "error": str(e),
+                "details": {"value": ioc_value, "type": ioc_type},
+            }
+
+        confidence = 50
+        reputation = "unknown"
+        if enrichment_results:
+            scores = [r.get("confidence", 50) for r in enrichment_results.values() if r.get("confidence")]
+            confidence = int(sum(scores) / len(scores)) if scores else 50
+            reputation = "malicious" if confidence >= 70 else "suspicious" if confidence >= 40 else "benign"
+
         return {
             "success": True,
             "action": "enrich_ioc",
             "details": {
                 "value": ioc_value,
                 "type": ioc_type,
-                "reputation": "malicious",
-                "confidence": 85,
+                "reputation": reputation,
+                "confidence": confidence,
+                "enrichment_sources": list(enrichment_results.keys()),
             },
         }
 
     @staticmethod
     async def _run_script(params: dict, context: dict) -> dict:
         """Run a script/command"""
+        import subprocess
+        import shlex
+
         script_type = params.get("type", "powershell")
         script = params.get("script", "")
         target = params.get("target", "local")
+        timeout = min(params.get("timeout_seconds", 30), 60)  # Cap at 60s
 
         logger.info(f"Running {script_type} script on {target}")
-        # In production, execute via secure runner
-        return {
-            "success": True,
-            "action": "run_script",
-            "details": {"type": script_type, "target": target, "output": "Script executed"},
-        }
+
+        if target != "local":
+            return {
+                "success": False,
+                "action": "run_script",
+                "error": "Only local script execution is supported",
+                "details": {"type": script_type, "target": target},
+            }
+
+        if not script:
+            return {
+                "success": False,
+                "action": "run_script",
+                "error": "No script provided",
+                "details": {"type": script_type, "target": target},
+            }
+
+        try:
+            # Build command based on script type
+            if script_type == "powershell":
+                command = ["powershell", "-NoProfile", "-NonInteractive", "-Command", script]
+            elif script_type == "bash":
+                command = ["bash", "-c", script]
+            elif script_type == "python":
+                command = ["python", "-c", script]
+            else:
+                command = shlex.split(script)
+
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                timeout=timeout,
+                text=True,
+                shell=False,
+            )
+
+            output = result.stdout[:4096] if result.stdout else ""
+            stderr = result.stderr[:2048] if result.stderr else ""
+
+            return {
+                "success": result.returncode == 0,
+                "action": "run_script",
+                "details": {
+                    "type": script_type,
+                    "target": target,
+                    "return_code": result.returncode,
+                    "output": output,
+                    "stderr": stderr,
+                },
+            }
+        except subprocess.TimeoutExpired:
+            logger.error(f"Script execution timed out after {timeout}s")
+            return {
+                "success": False,
+                "action": "run_script",
+                "error": f"Script timed out after {timeout} seconds",
+                "details": {"type": script_type, "target": target},
+            }
+        except Exception as e:
+            logger.error(f"Script execution failed: {e}")
+            return {
+                "success": False,
+                "action": "run_script",
+                "error": str(e),
+                "details": {"type": script_type, "target": target},
+            }
 
     @staticmethod
     async def _http_request(params: dict, context: dict) -> dict:
         """Make HTTP request to external service"""
-        method = params.get("method", "GET")
+        import httpx
+
+        method = params.get("method", "GET").upper()
         url = params.get("url", "")
         headers = params.get("headers", {})
         body = params.get("body", None)
+        timeout = min(params.get("timeout_seconds", 30), 120)
 
         url = PlaybookAction._substitute_vars(url, context)
 
         logger.info(f"Making {method} request to {url}")
-        # In production, make actual HTTP request
-        return {
-            "success": True,
-            "action": "http_request",
-            "details": {"method": method, "url": url, "status_code": 200},
-        }
+
+        if not url:
+            return {
+                "success": False,
+                "action": "http_request",
+                "error": "No URL provided",
+                "details": {"method": method, "url": url},
+            }
+
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.request(
+                    method=method,
+                    url=url,
+                    json=body if body else None,
+                    headers=headers,
+                    timeout=timeout,
+                )
+
+            response_body = response.text[:4096] if response.text else ""
+
+            return {
+                "success": 200 <= response.status_code < 400,
+                "action": "http_request",
+                "details": {
+                    "method": method,
+                    "url": url,
+                    "status_code": response.status_code,
+                    "response_body": response_body,
+                    "response_headers": dict(response.headers),
+                },
+            }
+        except httpx.TimeoutException:
+            logger.error(f"HTTP request to {url} timed out")
+            return {
+                "success": False,
+                "action": "http_request",
+                "error": f"Request timed out after {timeout} seconds",
+                "details": {"method": method, "url": url},
+            }
+        except Exception as e:
+            logger.error(f"HTTP request failed: {e}")
+            return {
+                "success": False,
+                "action": "http_request",
+                "error": str(e),
+                "details": {"method": method, "url": url},
+            }
 
     @staticmethod
     async def _update_alert(params: dict, context: dict) -> dict:

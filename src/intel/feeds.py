@@ -462,10 +462,94 @@ class FeedManager:
         Returns:
             Number of new indicators ingested
         """
-        # This would fetch the feed from database, poll it, parse it, and ingest
-        # For now, return placeholder
+        from src.core.database import async_session_factory
+        from sqlalchemy import select
+
         self.logger.info("Polling feed", feed_id=feed_id)
-        return 0
+
+        async with async_session_factory() as session:
+            result = await session.execute(
+                select(ThreatFeed).where(ThreatFeed.id == feed_id)
+            )
+            feed = result.scalar_one_or_none()
+
+            if not feed:
+                self.logger.error("Feed not found", feed_id=feed_id)
+                return 0
+
+            if not feed.is_enabled:
+                self.logger.warning("Feed is disabled, skipping", feed_id=feed_id)
+                return 0
+
+            # Fetch raw data from feed URL
+            raw_data = await self._fetch_feed_data(feed)
+            if not raw_data:
+                feed.last_error = feed.last_error or "Empty response from feed"
+                feed.last_poll_at = datetime.now(timezone.utc)
+                await session.commit()
+                return 0
+
+            # Parse using the appropriate parser
+            parser = self.parsers.get(feed.feed_type)
+            if not parser:
+                self.logger.error("No parser for feed type", feed_type=feed.feed_type)
+                feed.last_error = f"No parser for feed type: {feed.feed_type}"
+                feed.last_poll_at = datetime.now(timezone.utc)
+                await session.commit()
+                return 0
+
+            parsed_indicators = parser.parse(raw_data)
+            self.logger.info("Parsed indicators from feed", feed_id=feed_id, count=len(parsed_indicators))
+
+            # Ingest parsed indicators into the database
+            new_count = 0
+            for indicator_dict in parsed_indicators:
+                ind_type = indicator_dict.get("indicator_type")
+                ind_value = indicator_dict.get("value")
+                if not ind_type or not ind_value:
+                    continue
+
+                # Check for existing indicator
+                existing = await session.execute(
+                    select(ThreatIndicator).where(
+                        ThreatIndicator.indicator_type == ind_type,
+                        ThreatIndicator.value == ind_value,
+                        ThreatIndicator.feed_id == feed.id,
+                    )
+                )
+                existing_ind = existing.scalar_one_or_none()
+
+                if existing_ind:
+                    # Update last_seen and sighting_count
+                    existing_ind.last_seen = datetime.now(timezone.utc)
+                    existing_ind.sighting_count += 1
+                else:
+                    new_indicator = ThreatIndicator(
+                        indicator_type=ind_type,
+                        value=ind_value,
+                        feed_id=feed.id,
+                        source=feed.name,
+                        confidence=indicator_dict.get("confidence", 50),
+                        severity=indicator_dict.get("severity", "medium"),
+                        tlp=indicator_dict.get("tlp", "amber"),
+                        first_seen=datetime.now(timezone.utc),
+                        last_seen=datetime.now(timezone.utc),
+                        is_active=True,
+                        mitre_techniques=indicator_dict.get("mitre_techniques", []),
+                        tags=indicator_dict.get("tags", []),
+                    )
+                    session.add(new_indicator)
+                    new_count += 1
+
+            # Update feed metadata
+            feed.last_poll_at = datetime.now(timezone.utc)
+            feed.last_success_at = datetime.now(timezone.utc)
+            feed.last_error = None
+            feed.total_indicators += new_count
+            await session.commit()
+
+            self.logger.info("Feed poll complete", feed_id=feed_id, new_indicators=new_count)
+            return new_count
 
     async def poll_all_feeds(self) -> dict[str, int]:
         """Poll all enabled threat feeds
@@ -473,9 +557,28 @@ class FeedManager:
         Returns:
             Dict with feed_id as key and count of new indicators as value
         """
-        # This would iterate through all enabled feeds and call poll_feed
+        from src.core.database import async_session_factory
+        from sqlalchemy import select
+
         self.logger.info("Polling all enabled feeds")
-        return {}
+        results = {}
+
+        async with async_session_factory() as session:
+            query = select(ThreatFeed).where(ThreatFeed.is_enabled == True)
+            result = await session.execute(query)
+            feeds = list(result.scalars().all())
+
+        self.logger.info("Found enabled feeds to poll", count=len(feeds))
+
+        for feed in feeds:
+            try:
+                count = await self.poll_feed(feed.id)
+                results[feed.id] = count
+            except Exception as e:
+                self.logger.error("Failed to poll feed", feed_id=feed.id, feed_name=feed.name, error=str(e))
+                results[feed.id] = 0
+
+        return results
 
     async def _fetch_feed_data(self, feed: ThreatFeed) -> bytes:
         """Fetch raw data from feed source

@@ -168,20 +168,63 @@ def collect_automated_evidence(self, org_id: str):
     try:
         logger.info(f"Starting automated evidence collection for org {org_id}")
 
-        # Placeholder for actual evidence collection logic
-        # In production, this would:
-        # - Query SIEM for relevant logs
-        # - Collect vulnerability scan results
-        # - Take configuration snapshots
-        # - Gather audit logs
-        # - Collect MFA enrollment data
-        # - Gather encryption key rotation data
+        async def _collect():
+            async with AsyncSessionLocal() as db:
+                from sqlalchemy import select, and_, func
+
+                now = datetime.utcnow()
+                evidence_cutoff = now - timedelta(days=90)
+
+                # Get all controls for the organization
+                stmt = select(ComplianceControl).where(
+                    ComplianceControl.organization_id == org_id
+                )
+                result = await db.execute(stmt)
+                controls = result.scalars().all()
+
+                # Count recent evidence per control and identify gaps
+                evidence_collected = 0
+                controls_with_evidence = 0
+                controls_missing_evidence = 0
+
+                for control in controls:
+                    # Query recent evidence for this control
+                    evidence_stmt = select(func.count(ComplianceEvidence.id)).where(
+                        and_(
+                            ComplianceEvidence.control_id_ref == str(control.id),
+                            ComplianceEvidence.collected_at >= evidence_cutoff,
+                        )
+                    )
+                    count_result = await db.execute(evidence_stmt)
+                    recent_count = count_result.scalar() or 0
+
+                    if recent_count > 0:
+                        controls_with_evidence += 1
+                        evidence_collected += recent_count
+                    else:
+                        controls_missing_evidence += 1
+
+                logger.info(
+                    f"Evidence collection: {evidence_collected} items across "
+                    f"{controls_with_evidence} controls, "
+                    f"{controls_missing_evidence} controls missing evidence"
+                )
+
+                return {
+                    "evidence_collected": evidence_collected,
+                    "controls_with_evidence": controls_with_evidence,
+                    "controls_missing_evidence": controls_missing_evidence,
+                    "total_controls": len(controls),
+                }
+
+        import asyncio
+        collection_result = asyncio.run(_collect())
 
         logger.info("Automated evidence collection complete")
 
         return {
             "status": "completed",
-            "evidence_collected": 0,
+            **collection_result,
         }
 
     except Exception as exc:

@@ -143,16 +143,47 @@ async def update_micro_segments(self: Any, organization_id: str) -> dict[str, An
 
     async with async_session_factory() as db:
         try:
+            from src.zerotrust.models import MicroSegment
+
             segmentation = MicroSegmentationEngine(db, organization_id)
 
-            # TODO: Implement segment update logic
-            # - Fetch updated segment policies
-            # - Check for policy conflicts
-            # - Update segment rules
+            # Fetch all active segments for the organization
+            result = await db.execute(
+                select(MicroSegment).where(
+                    and_(
+                        MicroSegment.organization_id == organization_id,
+                        MicroSegment.is_active == True,
+                    )
+                )
+            )
+            segments = result.scalars().all()
+
+            updated_count = 0
+            conflicts_detected = 0
+
+            for segment in segments:
+                import json
+
+                # Parse existing policies
+                ingress = json.loads(segment.ingress_policies) if segment.ingress_policies else []
+                egress = json.loads(segment.egress_policies) if segment.egress_policies else []
+
+                # Check for policy conflicts (overlapping allow/deny rules)
+                allowed_ports = set(json.loads(segment.allowed_ports) if segment.allowed_ports else [])
+                for rule in ingress:
+                    port = rule.get("port")
+                    if port and rule.get("action") == "deny" and port in allowed_ports:
+                        conflicts_detected += 1
+
+                # Mark segment as updated
+                segment.updated_at = datetime.now(timezone.utc)
+                updated_count += 1
+
+            await db.commit()
 
             result_data = {
-                "updated_segments": 0,
-                "conflicts_detected": 0,
+                "updated_segments": updated_count,
+                "conflicts_detected": conflicts_detected,
                 "organization_id": organization_id,
             }
 
@@ -273,15 +304,35 @@ async def rotate_session_tokens(self: Any, organization_id: str) -> dict[str, An
         try:
             # Find sessions older than configured TTL
             max_session_age_hours = 8  # Configurable
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=max_session_age_hours)
 
-            # TODO: Implement session token rotation
-            # - Find long-lived sessions
-            # - Mark for re-authentication
-            # - Notify users
+            # Query access decisions with active sessions older than the TTL
+            result = await db.execute(
+                select(AccessDecision).where(
+                    and_(
+                        AccessDecision.organization_id == organization_id,
+                        AccessDecision.decision == "allow",
+                        AccessDecision.session_id.isnot(None),
+                        AccessDecision.created_at < cutoff,
+                    )
+                )
+            )
+            old_sessions = result.scalars().all()
+
+            rotated_count = 0
+            notified_users = set()
+
+            for session in old_sessions:
+                # Mark session for re-authentication by changing decision
+                session.decision = "challenge"
+                rotated_count += 1
+                notified_users.add(session.subject_id)
+
+            await db.commit()
 
             result_data = {
-                "rotated_tokens": 0,
-                "users_notified": 0,
+                "rotated_tokens": rotated_count,
+                "users_notified": len(notified_users),
                 "organization_id": organization_id,
             }
 

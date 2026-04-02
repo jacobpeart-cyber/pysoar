@@ -322,10 +322,44 @@ async def enrich_ioc(
     db: DatabaseSession = None,
 ):
     """Enrich an IOC with threat intelligence"""
+    from src.intel.models import ThreatIndicator
+
     ioc = await get_ioc_or_404(db, ioc_id)
 
-    # In production, this would call threat intelligence integrations
-    # For now, we just mark it as enriched
+    # Query threat indicators that match this IOC value
+    ti_result = await db.execute(
+        select(ThreatIndicator).where(
+            ThreatIndicator.value == ioc.value,
+            ThreatIndicator.is_active == True,
+        )
+    )
+    indicators = list(ti_result.scalars().all())
+
+    # Build enrichment data from matching threat indicators
+    enrichment = json.loads(ioc.enrichment_data) if ioc.enrichment_data else {}
+
+    for indicator in indicators:
+        source_key = f"threat_feed_{indicator.feed_id}" if indicator.feed_id else f"local_{indicator.id}"
+        enrichment[source_key] = {
+            "confidence": indicator.confidence,
+            "severity": indicator.severity,
+            "tags": indicator.tags,
+            "context": indicator.context,
+            "first_seen": indicator.first_seen.isoformat() if indicator.first_seen else None,
+            "last_seen": indicator.last_seen.isoformat() if indicator.last_seen else None,
+            "sighting_count": indicator.sighting_count,
+            "mitre_tactics": indicator.mitre_tactics,
+            "mitre_techniques": indicator.mitre_techniques,
+        }
+
+    # If we found matching indicators, update confidence based on them
+    if indicators:
+        scores = [ind.confidence for ind in indicators if ind.confidence is not None]
+        if scores:
+            enrichment["composite_confidence"] = int(sum(scores) / len(scores))
+            enrichment["source_count"] = len(indicators)
+
+    ioc.enrichment_data = json.dumps(enrichment)
     ioc.last_enriched = datetime.now(timezone.utc).isoformat()
     await db.flush()
     await db.refresh(ioc)

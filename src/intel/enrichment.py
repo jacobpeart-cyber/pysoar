@@ -34,7 +34,9 @@ class IndicatorEnricher:
         Returns:
             Dictionary with enrichment results
         """
-        # Would fetch indicator from database and call external APIs
+        from src.core.database import async_session_factory
+        from sqlalchemy import select
+
         self.logger.info("Enriching indicator", indicator_id=indicator_id)
 
         enrichment_data = {
@@ -44,7 +46,98 @@ class IndicatorEnricher:
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
 
-        # Mock enrichment results
+        async with async_session_factory() as session:
+            result = await session.execute(
+                select(ThreatIndicator).where(ThreatIndicator.id == indicator_id)
+            )
+            indicator = result.scalar_one_or_none()
+
+            if not indicator:
+                self.logger.warning("Indicator not found", indicator_id=indicator_id)
+                enrichment_data["error"] = "Indicator not found"
+                return enrichment_data
+
+            # Query external providers based on indicator type
+            import httpx
+
+            if indicator.indicator_type in ("ipv4", "ipv6") and self.vt_available:
+                try:
+                    async with httpx.AsyncClient() as client:
+                        resp = await client.get(
+                            f"https://www.virustotal.com/api/v3/ip_addresses/{indicator.value}",
+                            headers={"x-apikey": settings.virustotal_api_key},
+                            timeout=15,
+                        )
+                        if resp.status_code == 200:
+                            vt_data = resp.json()
+                            stats = vt_data.get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
+                            malicious = stats.get("malicious", 0)
+                            total = sum(stats.values()) if stats else 1
+                            enrichment_data["sources"].append({
+                                "provider": "virustotal",
+                                "score": int((malicious / max(total, 1)) * 100),
+                                "malicious_count": malicious,
+                                "total_engines": total,
+                            })
+                except Exception as e:
+                    self.logger.warning("VirusTotal enrichment failed", error=str(e))
+
+            if indicator.indicator_type in ("ipv4",) and self.abuseipdb_available:
+                try:
+                    async with httpx.AsyncClient() as client:
+                        resp = await client.get(
+                            "https://api.abuseipdb.com/api/v2/check",
+                            params={"ipAddress": indicator.value, "maxAgeInDays": 90},
+                            headers={"Key": settings.abuseipdb_api_key, "Accept": "application/json"},
+                            timeout=15,
+                        )
+                        if resp.status_code == 200:
+                            abuse_data = resp.json().get("data", {})
+                            enrichment_data["sources"].append({
+                                "provider": "abuseipdb",
+                                "score": abuse_data.get("abuseConfidenceScore", 0),
+                                "total_reports": abuse_data.get("totalReports", 0),
+                                "country_code": abuse_data.get("countryCode"),
+                                "isp": abuse_data.get("isp"),
+                            })
+                except Exception as e:
+                    self.logger.warning("AbuseIPDB enrichment failed", error=str(e))
+
+            if indicator.indicator_type == "domain" and self.vt_available:
+                try:
+                    async with httpx.AsyncClient() as client:
+                        resp = await client.get(
+                            f"https://www.virustotal.com/api/v3/domains/{indicator.value}",
+                            headers={"x-apikey": settings.virustotal_api_key},
+                            timeout=15,
+                        )
+                        if resp.status_code == 200:
+                            vt_data = resp.json()
+                            stats = vt_data.get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
+                            malicious = stats.get("malicious", 0)
+                            total = sum(stats.values()) if stats else 1
+                            enrichment_data["sources"].append({
+                                "provider": "virustotal",
+                                "score": int((malicious / max(total, 1)) * 100),
+                                "malicious_count": malicious,
+                                "total_engines": total,
+                            })
+                except Exception as e:
+                    self.logger.warning("VirusTotal domain enrichment failed", error=str(e))
+
+            # Calculate composite score from all provider results
+            if enrichment_data["sources"]:
+                scores = [s["score"] for s in enrichment_data["sources"] if "score" in s]
+                enrichment_data["composite_score"] = int(sum(scores) / len(scores)) if scores else 0
+
+            # Persist enrichment data back to the indicator
+            existing_context = indicator.context or {}
+            for source in enrichment_data["sources"]:
+                existing_context[source["provider"]] = source
+            indicator.context = existing_context
+            indicator.last_seen = datetime.now(timezone.utc)
+            await session.commit()
+
         return enrichment_data
 
     async def auto_enrich_batch(self, indicator_ids: list[str]) -> dict[str, Any]:
@@ -130,12 +223,28 @@ class IndicatorEnricher:
         Returns:
             Number of indicators marked as expired
         """
-        # Would query indicators where expires_at < now and is_active = True
-        # Then mark them as is_active = False
-        self.logger.info("Checking for expired indicators")
-        expired_count = 0
+        from src.core.database import async_session_factory
+        from sqlalchemy import select, update
 
-        # Placeholder implementation
+        self.logger.info("Checking for expired indicators")
+
+        now = datetime.now(timezone.utc)
+
+        async with async_session_factory() as session:
+            # Find all active indicators that have expired
+            result = await session.execute(
+                update(ThreatIndicator)
+                .where(
+                    ThreatIndicator.is_active == True,
+                    ThreatIndicator.expires_at != None,
+                    ThreatIndicator.expires_at < now,
+                )
+                .values(is_active=False)
+            )
+            expired_count = result.rowcount
+            await session.commit()
+
+        self.logger.info("Expired indicators marked inactive", expired_count=expired_count)
         return expired_count
 
     async def check_false_positives(self, indicator_id: str, threshold: int = 5) -> bool:
