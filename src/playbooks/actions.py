@@ -138,12 +138,18 @@ class SendNotificationAction(PlaybookAction):
             message = message.replace(f"{{{{{key}}}}}", str(value))
             subject = subject.replace(f"{{{{{key}}}}}", str(value))
 
-        # In production, this would actually send notifications
-        logger.info(
-            f"Sending notification via {channel}",
-            recipients=recipients,
-            subject=subject,
-        )
+        # Send notification via Celery task
+        try:
+            from src.workers.tasks import send_notification_task
+            send_notification_task.delay(
+                channel=channel,
+                recipients=recipients,
+                subject=subject,
+                message=message,
+            )
+            logger.info(f"Notification queued via {channel} to {recipients}")
+        except Exception as e:
+            logger.error(f"Failed to queue notification: {e}")
 
         return {
             "success": True,

@@ -133,21 +133,68 @@ def send_notification_task(
     recipients: list[str],
     subject: str,
     message: str,
+    html_message: str = None,
 ) -> dict[str, Any]:
-    """Send a notification via various channels"""
+    """Send a notification via email, Slack, or Teams."""
+    import asyncio
+
     logger.info(
         "Sending notification",
         channel=channel,
         recipients=recipients,
     )
 
-    # This would integrate with email, Slack, Teams, etc.
-    # For now, just log and return success
+    sent = False
+
+    if channel == "email" and recipients:
+        try:
+            from src.services.email_service import EmailService
+            email_service = EmailService()
+            if email_service.is_configured:
+                loop = asyncio.new_event_loop()
+                sent = loop.run_until_complete(
+                    email_service.send_email(
+                        to=recipients,
+                        subject=subject,
+                        body=message,
+                        html_body=html_message,
+                    )
+                )
+                loop.close()
+                logger.info(f"Email sent to {recipients}: {sent}")
+            else:
+                logger.warning("Email not configured, skipping")
+        except Exception as e:
+            logger.error(f"Email send failed: {e}")
+
+    elif channel == "slack":
+        try:
+            import httpx
+            from src.core.config import settings
+            webhook_url = settings.slack_webhook_url
+            if webhook_url:
+                resp = httpx.post(webhook_url, json={"text": f"*{subject}*\n{message}"}, timeout=10)
+                sent = resp.status_code == 200
+                logger.info(f"Slack notification sent: {sent}")
+        except Exception as e:
+            logger.error(f"Slack send failed: {e}")
+
+    elif channel == "teams":
+        try:
+            import httpx
+            from src.core.config import settings
+            webhook_url = settings.teams_webhook_url
+            if webhook_url:
+                resp = httpx.post(webhook_url, json={"text": f"**{subject}**\n\n{message}"}, timeout=10)
+                sent = resp.status_code == 200
+                logger.info(f"Teams notification sent: {sent}")
+        except Exception as e:
+            logger.error(f"Teams send failed: {e}")
 
     return {
         "channel": channel,
         "recipients": recipients,
-        "sent": True,
+        "sent": sent,
     }
 
 
