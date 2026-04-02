@@ -312,7 +312,17 @@ function ReadinessTab() {
   if (error) return <ErrorState message="Failed to load readiness data." />;
   if (!data) return <EmptyState icon={<BarChart3 className="w-10 h-10" />} title="No Data" description="No readiness assessment has been performed yet." />;
 
-  const { score, controlFamilyBreakdown, gapSummary, recommendations } = data;
+  const score = data?.overall_readiness_score ?? data?.score ?? 0;
+  // Transform family_readiness dict to array for rendering
+  const familyData = data?.family_readiness ?? data?.controlFamilyBreakdown ?? {};
+  const controlFamilyBreakdown = Array.isArray(familyData) ? familyData : Object.entries(familyData).map(([key, val]: [string, any]) => ({
+    family: key,
+    percentImplemented: val?.readiness_pct ?? 0,
+    implemented: val?.implemented ?? 0,
+    total: val?.total ?? 0,
+  }));
+  const gapSummary = data?.status_breakdown ?? data?.gap_analysis ?? data?.gapSummary ?? {};
+  const recommendations = data?.recommendations ?? [];
   const maxBarWidth = 100;
 
   return (
@@ -338,10 +348,10 @@ function ReadinessTab() {
           <h3 className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-4">Gap Summary</h3>
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-6">
             {[
-              { label: 'Implemented', count: gapSummary.implemented, color: 'text-green-600 dark:text-green-400', bg: 'bg-green-50 dark:bg-green-900/20' },
-              { label: 'Partial', count: gapSummary.partial, color: 'text-yellow-600 dark:text-yellow-400', bg: 'bg-yellow-50 dark:bg-yellow-900/20' },
-              { label: 'Planned', count: gapSummary.planned ?? 0, color: 'text-blue-600 dark:text-blue-400', bg: 'bg-blue-50 dark:bg-blue-900/20' },
-              { label: 'Not Implemented', count: gapSummary.not_implemented, color: 'text-red-600 dark:text-red-400', bg: 'bg-red-50 dark:bg-red-900/20' },
+              { label: 'Implemented', count: gapSummary.implemented ?? 0, color: 'text-green-600 dark:text-green-400', bg: 'bg-green-50 dark:bg-green-900/20' },
+              { label: 'Partial', count: gapSummary.partially_implemented ?? gapSummary.partial ?? 0, color: 'text-yellow-600 dark:text-yellow-400', bg: 'bg-yellow-50 dark:bg-yellow-900/20' },
+              { label: 'Planned', count: gapSummary.planned ?? gapSummary.not_assessed ?? 0, color: 'text-blue-600 dark:text-blue-400', bg: 'bg-blue-50 dark:bg-blue-900/20' },
+              { label: 'Not Implemented', count: gapSummary.not_implemented ?? gapSummary.alternative ?? 0, color: 'text-red-600 dark:text-red-400', bg: 'bg-red-50 dark:bg-red-900/20' },
             ].map((item) => (
               <div key={item.label} className={clsx('rounded-lg p-4 text-center', item.bg)}>
                 <p className={clsx('text-2xl font-bold', item.color)}>{item.count}</p>
@@ -350,7 +360,7 @@ function ReadinessTab() {
             ))}
           </div>
           <div className="text-xs text-gray-500 dark:text-gray-400">
-            Total Controls: <span className="font-semibold text-gray-700 dark:text-gray-300">{gapSummary.total}</span>
+            Total Controls: <span className="font-semibold text-gray-700 dark:text-gray-300">{data?.total_controls ?? gapSummary.total ?? 0}</span>
           </div>
         </div>
       </div>
@@ -439,10 +449,11 @@ function ControlsTab() {
   const [searchTerm, setSearchTerm] = useState('');
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
-  const { data: controls, isLoading, error } = useQuery<FedRAMPControl[]>({
+  const { data: controlsRaw, isLoading, error } = useQuery<any>({
     queryKey: ['fedramp', 'controls'],
     queryFn: () => api.get('/fedramp/controls').then((r) => r.data),
   });
+  const controls: FedRAMPControl[] = Array.isArray(controlsRaw) ? controlsRaw : (controlsRaw?.controls || []);
 
   const updateStatus = useMutation({
     mutationFn: ({ id, status }: { id: string; status: ImplementationStatus }) =>
@@ -588,7 +599,7 @@ function ControlRow({
         <td className="px-4 py-3 text-gray-400">
           {isExpanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
         </td>
-        <td className="px-4 py-3 font-mono font-medium text-gray-900 dark:text-gray-100">{control.controlId}</td>
+        <td className="px-4 py-3 font-mono font-medium text-gray-900 dark:text-gray-100">{control.id}</td>
         <td className="px-4 py-3 text-gray-600 dark:text-gray-400">{control.family}</td>
         <td className="px-4 py-3 text-gray-800 dark:text-gray-200 max-w-xs truncate">{control.title}</td>
         <td className="px-4 py-3">
@@ -604,12 +615,12 @@ function ControlRow({
           </span>
         </td>
         <td className="px-4 py-3">
-          <span className={clsx('inline-flex items-center px-2 py-0.5 rounded text-xs font-medium', statusColor(control.status))}>
-            {statusLabel(control.status)}
+          <span className={clsx('inline-flex items-center px-2 py-0.5 rounded text-xs font-medium', statusColor(((control as any).implementation_status || control.status)))}>
+            {statusLabel(((control as any).implementation_status || control.status))}
           </span>
         </td>
         <td className="px-4 py-3 text-gray-500 dark:text-gray-400 text-xs">
-          {control.pysoarMapping || <span className="text-gray-300 dark:text-gray-600">--</span>}
+          {(control as any).pysoar_mapping || <span className="text-gray-300 dark:text-gray-600">--</span>}
         </td>
         <td className="px-4 py-3">
           <Info className="w-4 h-4 text-gray-400" />
@@ -628,20 +639,20 @@ function ControlRow({
               <div>
                 <h4 className="font-semibold text-gray-700 dark:text-gray-300 mb-1">Implementation Guidance</h4>
                 <p className="text-gray-600 dark:text-gray-400 text-xs leading-relaxed">
-                  {control.guidance || 'No guidance available.'}
+                  {(control as any).guidance || 'No guidance available.'}
                 </p>
               </div>
-              {control.responsibleRole && (
+              {(control as any).responsible_role && (
                 <div>
                   <h4 className="font-semibold text-gray-700 dark:text-gray-300 mb-1">Responsible Role</h4>
-                  <p className="text-gray-600 dark:text-gray-400 text-xs">{control.responsibleRole}</p>
+                  <p className="text-gray-600 dark:text-gray-400 text-xs">{(control as any).responsible_role}</p>
                 </div>
               )}
-              {control.evidenceRequired && control.evidenceRequired.length > 0 && (
+              {(control as any).evidence_required && (control as any).evidence_required.length > 0 && (
                 <div>
                   <h4 className="font-semibold text-gray-700 dark:text-gray-300 mb-1">Required Evidence</h4>
                   <ul className="list-disc list-inside text-xs text-gray-600 dark:text-gray-400 space-y-0.5">
-                    {control.evidenceRequired.map((ev, i) => (
+                    {(control as any).evidence_required.map((ev, i) => (
                       <li key={i}>{ev}</li>
                     ))}
                   </ul>
@@ -934,8 +945,8 @@ function EvidenceTab() {
               {fam.controls.length > 0 && (
                 <div className="mt-3 pt-3 border-t border-gray-100 dark:border-gray-700 space-y-1.5 max-h-32 overflow-y-auto">
                   {fam.controls.map((ctrl) => (
-                    <div key={ctrl.controlId} className="flex items-center justify-between text-xs">
-                      <span className="font-mono text-gray-600 dark:text-gray-400">{ctrl.controlId}</span>
+                    <div key={ctrl.id} className="flex items-center justify-between text-xs">
+                      <span className="font-mono text-gray-600 dark:text-gray-400">{ctrl.id}</span>
                       {ctrl.hasEvidence ? (
                         <span className="flex items-center gap-1 text-green-600 dark:text-green-400">
                           <CheckCircle2 className="w-3 h-3" /> Collected
