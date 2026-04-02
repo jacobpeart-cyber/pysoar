@@ -453,8 +453,26 @@ class EvidenceCollector:
         Returns:
             True if hash matches, False otherwise
         """
-        # Placeholder for actual hash verification
-        return True
+        try:
+            from src.audit_evidence.models import AutomatedEvidenceRule
+            stmt = select(AutomatedEvidenceRule).where(AutomatedEvidenceRule.id == evidence_id)
+            result = await self.db.execute(stmt)
+            evidence = result.scalar_one_or_none()
+            if not evidence:
+                logger.warning(f"Evidence {evidence_id} not found for integrity check")
+                return False
+            # If evidence has a stored hash, verify it hasn't been tampered
+            stored_hash = getattr(evidence, "evidence_hash", None)
+            if stored_hash:
+                import hashlib
+                content = str(getattr(evidence, "evidence_data", "") or "")
+                computed_hash = hashlib.sha256(content.encode()).hexdigest()
+                return computed_hash == stored_hash
+            # No hash stored — integrity cannot be verified but not failed
+            return True
+        except Exception as e:
+            logger.error(f"Evidence integrity check failed: {e}")
+            return False
 
     async def generate_evidence_report(self, package_id: str) -> dict[str, Any]:
         """
