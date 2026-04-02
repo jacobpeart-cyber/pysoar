@@ -74,9 +74,9 @@ export default function VulnManagement() {
           vulnmgmtApi.getVulnerabilities(),
           vulnmgmtApi.getPatchOperations(),
         ]);
-        setVulnerabilities(vulnsData.data || []);
+        setVulnerabilities(Array.isArray(vulnsData) ? vulnsData : (vulnsData?.items || vulnsData?.data || []));
         setScanProfiles([]);
-        setPatchOps(patchData.data || []);
+        setPatchOps(Array.isArray(patchData) ? patchData : (patchData?.items || patchData?.data || []));
         setExceptions([]);
       } catch (error) {
         console.error('Error loading vulnerability data:', error);

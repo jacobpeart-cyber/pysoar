@@ -96,8 +96,8 @@ export default function OTSecurityDashboard() {
           otsecurityApi.getZones(),
           otsecurityApi.getPurdueMap(),
         ]);
-        setAssets(assetsData.data || []);
-        setAlerts(alertsData.data || []);
+        setAssets(Array.isArray(assetsData) ? assetsData : (assetsData?.items || assetsData?.data || []));
+        setAlerts(Array.isArray(alertsData) ? alertsData : (alertsData?.items || alertsData?.data || []));
         setZones(Array.isArray(zonesData) ? zonesData : zonesData.data || []);
         setPurdueMap(purdueData || null);
       } catch (error) {
