@@ -1,9 +1,25 @@
 """Hunting module schemas for API request/response validation"""
 
+import json as json_mod
 from datetime import datetime
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+def _parse_json_list(v):
+    """Parse JSON string to list, or return as-is if already a list"""
+    if v is None:
+        return None
+    if isinstance(v, list):
+        return v
+    if isinstance(v, str):
+        try:
+            parsed = json_mod.loads(v)
+            return parsed if isinstance(parsed, list) else [str(parsed)]
+        except (json_mod.JSONDecodeError, TypeError):
+            return [v] if v else None
+    return v
 
 
 class HuntHypothesisBase(BaseModel):
@@ -11,13 +27,33 @@ class HuntHypothesisBase(BaseModel):
 
     title: str = Field(..., min_length=1, max_length=500)
     description: str = Field(..., min_length=1)
-    priority: int = Field(default=3, ge=1, le=5)
-    hunt_type: str = "behavioral"  # behavioral, ioc_sweep, malware_hunt, etc.
+    priority: Any = Field(default=3)
+    hunt_type: str = "behavioral"
     mitre_tactics: Optional[list[str]] = None
     mitre_techniques: Optional[list[str]] = None
     data_sources: Optional[list[str]] = None
     expected_evidence: Optional[list[str]] = None
     tags: Optional[list[str]] = None
+
+    @field_validator("priority", mode="before")
+    @classmethod
+    def parse_priority(cls, v):
+        if isinstance(v, int):
+            return v
+        if isinstance(v, str):
+            mapping = {"CRITICAL": 1, "HIGH": 2, "MEDIUM": 3, "LOW": 4, "INFO": 5}
+            if v.upper() in mapping:
+                return mapping[v.upper()]
+            try:
+                return int(v)
+            except ValueError:
+                return 3
+        return 3
+
+    @field_validator("mitre_tactics", "mitre_techniques", "data_sources", "expected_evidence", "tags", mode="before")
+    @classmethod
+    def parse_json_lists(cls, v):
+        return _parse_json_list(v)
 
 
 class HuntHypothesisCreate(HuntHypothesisBase):
@@ -113,11 +149,16 @@ class HuntFindingCreate(BaseModel):
     title: str = Field(..., min_length=1, max_length=500)
     description: str
     severity: str  # critical, high, medium, low, info
-    evidence: Optional[list[str]] = None
+    evidence: Optional[list[Any]] = None
     affected_assets: Optional[list[str]] = None
     iocs_found: Optional[list[str]] = None
     mitre_techniques: Optional[list[str]] = None
     analyst_notes: Optional[str] = None
+
+    @field_validator("evidence", "affected_assets", "iocs_found", "mitre_techniques", mode="before")
+    @classmethod
+    def parse_json_lists(cls, v):
+        return _parse_json_list(v)
 
 
 class HuntFindingUpdate(BaseModel):
