@@ -25,6 +25,7 @@ export default function DataLakeDashboard() {
   const [selectedPipeline, setSelectedPipeline] = useState<Pipeline | null>(null);
   const [showModal, setShowModal] = useState(false);
   const [queryLanguage, setQueryLanguage] = useState<'sql' | 'kql' | 'spl'>('sql');
+  const [queryInput, setQueryInput] = useState('');
 
   const { data: sources = [] } = useQuery({ queryKey: ['dataSources'], queryFn: datalakeApi.getDataSources });
   const { data: pipelines = [] } = useQuery({ queryKey: ['pipelines'], queryFn: datalakeApi.getPipelines });
@@ -359,6 +360,8 @@ export default function DataLakeDashboard() {
               <div>
                 <label className="block text-sm font-medium text-gray-300 mb-2">Query</label>
                 <textarea
+                  value={queryInput}
+                  onChange={(e) => setQueryInput(e.target.value)}
                   className="w-full bg-gray-700 border border-gray-600 rounded px-4 py-3 text-white font-mono text-sm placeholder-gray-500 dark:bg-gray-700 dark:border-gray-600"
                   placeholder={queryLanguage === 'sql' ? 'SELECT * FROM user_events WHERE date > \'2026-03-20\'' : 'Type your query here...'}
                   rows={6}
@@ -366,7 +369,10 @@ export default function DataLakeDashboard() {
               </div>
 
               <div className="flex gap-4 mt-4">
-                <button className="bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded transition-colors">
+                <button
+                  onClick={() => setQueryInput('')}
+                  className="bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded transition-colors"
+                >
                   Clear
                 </button>
                 <button className="bg-emerald-600 hover:bg-emerald-700 text-white px-6 py-2 rounded transition-colors font-medium">
