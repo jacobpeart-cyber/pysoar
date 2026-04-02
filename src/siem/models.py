@@ -328,3 +328,27 @@ class SIEMDataSource(BaseModel):
 
     def __repr__(self) -> str:
         return f"<SIEMDataSource {self.id}: {self.name}>"
+
+
+class SavedSearch(BaseModel):
+    """Saved search queries for reuse and scheduled alerting"""
+
+    __tablename__ = "siem_saved_searches"
+
+    name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    query: Mapped[str] = mapped_column(Text, nullable=False)
+    filters: Mapped[Optional[str]] = mapped_column(Text, nullable=True)  # JSON
+    time_range: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    is_alert: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    alert_threshold: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    schedule_cron: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    last_run_at: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    last_result_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    organization_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("organizations.id"), nullable=True
+    )
+    created_by: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+
+    def __repr__(self) -> str:
+        return f"<SavedSearch {self.id}: {self.name}>"
