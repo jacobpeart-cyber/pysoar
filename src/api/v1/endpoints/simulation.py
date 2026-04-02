@@ -819,7 +819,7 @@ async def get_dashboard_stats(
         avg_detection = detection_result.scalar() or 0.0
 
         posture_result = await session.execute(
-            select(func.avg(AttackSimulation.posture_score)).where(
+            select(func.avg(AttackSimulation.overall_score)).where(
                 AttackSimulation.status == "completed"
             )
         )
