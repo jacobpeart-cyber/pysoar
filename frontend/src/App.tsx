@@ -52,6 +52,7 @@ import DataLakeDashboard from './pages/DataLakeDashboard'
 import WarRoom from './pages/WarRoom'
 import PhishingSimulation from './pages/PhishingSimulation'
 import TicketHub from './pages/TicketHub'
+import FedRAMP from './pages/FedRAMP'
 import NotFound from './pages/NotFound'
 
 import React from 'react'
@@ -193,6 +194,7 @@ function AppRoutes() {
         <Route path="warroom" element={<WarRoom />} />
         <Route path="phishing" element={<PhishingSimulation />} />
         <Route path="ticket-hub" element={<TicketHub />} />
+        <Route path="fedramp" element={<FedRAMP />} />
       </Route>
       <Route path="*" element={<NotFound />} />
     </Routes>
