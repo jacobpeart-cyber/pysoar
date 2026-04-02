@@ -83,6 +83,15 @@ export default function ThreatHunting() {
   const [newHypothesisTitle, setNewHypothesisTitle] = useState('');
   const [newHypothesisDescription, setNewHypothesisDescription] = useState('');
   const [newHypothesisPriority, setNewHypothesisPriority] = useState(3);
+  const [selectedNotebook, setSelectedNotebook] = useState<any>(null);
+  const [showCreateNotebookModal, setShowCreateNotebookModal] = useState(false);
+  const [newNotebookTitle, setNewNotebookTitle] = useState('');
+  const [newNotebookDescription, setNewNotebookDescription] = useState('');
+  const [newNotebookSessionId, setNewNotebookSessionId] = useState('');
+  const [editingHypothesis, setEditingHypothesis] = useState<any>(null);
+  const [editHypothesisTitle, setEditHypothesisTitle] = useState('');
+  const [editHypothesisDescription, setEditHypothesisDescription] = useState('');
+  const [editHypothesisPriority, setEditHypothesisPriority] = useState(3);
 
   // Fetch hunting stats
   const { data: stats, isLoading: statsLoading } = useQuery({
@@ -111,7 +120,7 @@ export default function ThreatHunting() {
     queryFn: async () => {
       const response = await api.get('/hunting/hypotheses', {
         params: {
-          ...(mitreFilterTab && { mitre_tactic: mitreFilterTab }),
+          ...(mitreFilterTab && { search: mitreFilterTab }),
           ...(priorityFilterTab && { priority: priorityFilterTab }),
           ...(hypothesisStatusFilter && { status: hypothesisStatusFilter }),
         },
@@ -234,6 +243,68 @@ export default function ThreatHunting() {
     },
   });
 
+  // Update hypothesis mutation
+  const updateHypothesisMutation = useMutation({
+    mutationFn: async ({ id, data }: { id: string; data: { title: string; description: string; priority: number } }) => {
+      const response = await api.put(`/hunting/hypotheses/${id}`, data);
+      return response.data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['hunting-hypotheses'] });
+      setEditingHypothesis(null);
+    },
+  });
+
+  // Delete hypothesis mutation
+  const deleteHypothesisMutation = useMutation({
+    mutationFn: async (id: string) => {
+      await api.delete(`/hunting/hypotheses/${id}`);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['hunting-hypotheses'] });
+    },
+  });
+
+  // Activate hypothesis mutation
+  const activateHypothesisMutation = useMutation({
+    mutationFn: async (id: string) => {
+      const r = await api.post(`/hunting/hypotheses/${id}/activate`);
+      return r.data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['hunting-hypotheses'] });
+    },
+  });
+
+  // Create notebook mutation
+  const createNotebookMutation = useMutation({
+    mutationFn: async (data: { title: string; description: string; session_id: string }) => {
+      const response = await api.post('/hunting/notebooks', data);
+      return response.data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['hunting-notebooks'] });
+      setShowCreateNotebookModal(false);
+      setNewNotebookTitle('');
+      setNewNotebookDescription('');
+      setNewNotebookSessionId('');
+    },
+  });
+
+  // Duplicate notebook mutation
+  const duplicateNotebookMutation = useMutation({
+    mutationFn: async (notebook: any) => {
+      const response = await api.post('/hunting/notebooks', {
+        title: `${notebook.title} (Copy)`,
+        session_id: notebook.session_id,
+      });
+      return response.data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['hunting-notebooks'] });
+    },
+  });
+
   const tabs = [
     { id: 'hunts', label: 'Hunts', icon: Zap },
     { id: 'hypotheses', label: 'Hypotheses', icon: Lightbulb },
@@ -326,28 +397,28 @@ export default function ThreatHunting() {
               All
             </button>
             <button
-              onClick={() => setHuntFilter('active')}
+              onClick={() => setHuntFilter('RUNNING')}
               className={clsx(
                 'px-3 py-1 rounded-full text-sm font-medium transition-colors',
-                huntFilter === 'active' ? 'bg-green-600 text-white' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+                huntFilter === 'RUNNING' ? 'bg-green-600 text-white' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
               )}
             >
               Active
             </button>
             <button
-              onClick={() => setHuntFilter('paused')}
+              onClick={() => setHuntFilter('PAUSED')}
               className={clsx(
                 'px-3 py-1 rounded-full text-sm font-medium transition-colors',
-                huntFilter === 'paused' ? 'bg-yellow-600 text-white' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+                huntFilter === 'PAUSED' ? 'bg-yellow-600 text-white' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
               )}
             >
               Paused
             </button>
             <button
-              onClick={() => setHuntFilter('completed')}
+              onClick={() => setHuntFilter('COMPLETED')}
               className={clsx(
                 'px-3 py-1 rounded-full text-sm font-medium transition-colors',
-                huntFilter === 'completed' ? 'bg-blue-500 text-white' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+                huntFilter === 'COMPLETED' ? 'bg-blue-500 text-white' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
               )}
             >
               Completed
@@ -660,16 +731,16 @@ export default function ThreatHunting() {
             <div className="h-6 border-r border-gray-300" />
 
             <span className="text-xs text-gray-500 font-medium">Priority:</span>
-            {['High', 'Medium', 'Low'].map((priority) => (
+            {([{ label: 'High', value: '1' }, { label: 'Medium', value: '3' }, { label: 'Low', value: '4' }]).map((priority) => (
               <button
-                key={priority}
-                onClick={() => setPriorityFilterTab(priorityFilterTab === priority ? '' : priority)}
+                key={priority.value}
+                onClick={() => setPriorityFilterTab(priorityFilterTab === priority.value ? '' : priority.value)}
                 className={clsx(
                   'px-2 py-1 rounded text-xs font-medium transition-colors',
-                  priorityFilterTab === priority ? 'bg-blue-600 text-white' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
+                  priorityFilterTab === priority.value ? 'bg-blue-600 text-white' : 'bg-gray-200 text-gray-700 hover:bg-gray-300'
                 )}
               >
-                {priority}
+                {priority.label}
               </button>
             ))}
 
@@ -746,6 +817,37 @@ export default function ThreatHunting() {
                     </span>
                   </div>
 
+                  <div className="flex gap-2 mb-2">
+                    <button
+                      onClick={() => {
+                        setEditingHypothesis(hypothesis);
+                        setEditHypothesisTitle(hypothesis.title);
+                        setEditHypothesisDescription(hypothesis.description || '');
+                        setEditHypothesisPriority(hypothesis.priority || 3);
+                      }}
+                      className="flex-1 px-3 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 text-sm font-medium"
+                    >
+                      Edit
+                    </button>
+                    {hypothesis.status === 'DRAFT' && (
+                      <button
+                        onClick={() => activateHypothesisMutation.mutate(hypothesis.id)}
+                        className="flex-1 px-3 py-2 bg-green-50 text-green-600 rounded-lg hover:bg-green-100 text-sm font-medium"
+                      >
+                        Activate
+                      </button>
+                    )}
+                    <button
+                      onClick={() => {
+                        if (confirm('Are you sure you want to delete this hypothesis?')) {
+                          deleteHypothesisMutation.mutate(hypothesis.id);
+                        }
+                      }}
+                      className="px-3 py-2 border border-red-300 text-red-600 rounded-lg hover:bg-red-50"
+                    >
+                      <Trash2 className="w-4 h-4" />
+                    </button>
+                  </div>
                   <button
                     onClick={() => {
                       setNewHuntHypothesisId(hypothesis.id);
@@ -835,6 +937,88 @@ export default function ThreatHunting() {
                       )}
                     >
                       {createHypothesisMutation.isPending ? 'Creating...' : 'Create Hypothesis'}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Edit Hypothesis Modal */}
+          {editingHypothesis && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50">
+              <div className="bg-white rounded-lg shadow-xl w-full max-w-md mx-4">
+                <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200">
+                  <h2 className="text-lg font-semibold text-gray-900">Edit Hypothesis</h2>
+                  <button
+                    onClick={() => setEditingHypothesis(null)}
+                    className="text-gray-400 hover:text-gray-600"
+                  >
+                    <X className="w-5 h-5" />
+                  </button>
+                </div>
+                <div className="p-6 space-y-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Title</label>
+                    <input
+                      type="text"
+                      value={editHypothesisTitle}
+                      onChange={(e) => setEditHypothesisTitle(e.target.value)}
+                      className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-blue-500 focus:border-blue-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Description</label>
+                    <textarea
+                      value={editHypothesisDescription}
+                      onChange={(e) => setEditHypothesisDescription(e.target.value)}
+                      rows={3}
+                      className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-blue-500 focus:border-blue-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Priority (1=highest, 5=lowest)</label>
+                    <select
+                      value={editHypothesisPriority}
+                      onChange={(e) => setEditHypothesisPriority(Number(e.target.value))}
+                      className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-blue-500 focus:border-blue-500"
+                    >
+                      <option value={1}>1 - Critical</option>
+                      <option value={2}>2 - High</option>
+                      <option value={3}>3 - Medium</option>
+                      <option value={4}>4 - Low</option>
+                      <option value={5}>5 - Info</option>
+                    </select>
+                  </div>
+                  <div className="flex justify-end gap-2">
+                    <button
+                      onClick={() => setEditingHypothesis(null)}
+                      className="px-4 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 text-sm font-medium"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      onClick={() => {
+                        if (editHypothesisTitle && editHypothesisDescription) {
+                          updateHypothesisMutation.mutate({
+                            id: editingHypothesis.id,
+                            data: {
+                              title: editHypothesisTitle,
+                              description: editHypothesisDescription,
+                              priority: editHypothesisPriority,
+                            },
+                          });
+                        }
+                      }}
+                      disabled={!editHypothesisTitle || !editHypothesisDescription || updateHypothesisMutation.isPending}
+                      className={clsx(
+                        'px-4 py-2 rounded-lg text-sm font-medium text-white',
+                        !editHypothesisTitle || !editHypothesisDescription || updateHypothesisMutation.isPending
+                          ? 'bg-blue-400 cursor-not-allowed'
+                          : 'bg-blue-600 hover:bg-blue-700'
+                      )}
+                    >
+                      {updateHypothesisMutation.isPending ? 'Saving...' : 'Save Changes'}
                     </button>
                   </div>
                 </div>
@@ -1110,7 +1294,10 @@ export default function ThreatHunting() {
       {/* Notebooks Tab */}
       {activeTab === 'notebooks' && (
         <div className="space-y-6">
-          <button className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700">
+          <button
+            onClick={() => setShowCreateNotebookModal(true)}
+            className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+          >
             <Plus className="w-5 h-5" />
             Create Notebook
           </button>
@@ -1145,20 +1332,158 @@ export default function ThreatHunting() {
                   </div>
 
                   <div className="flex gap-2">
-                    <button className="flex-1 px-3 py-2 bg-blue-50 text-blue-600 rounded-lg hover:bg-blue-100 text-sm font-medium flex items-center justify-center gap-1">
+                    <button
+                      onClick={() => setSelectedNotebook(notebook)}
+                      className="flex-1 px-3 py-2 bg-blue-50 text-blue-600 rounded-lg hover:bg-blue-100 text-sm font-medium flex items-center justify-center gap-1"
+                    >
                       <Eye className="w-4 h-4" />
                       Open
                     </button>
-                    <button className="flex-1 px-3 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 text-sm font-medium flex items-center justify-center gap-1">
+                    <button
+                      onClick={() => duplicateNotebookMutation.mutate(notebook)}
+                      className="flex-1 px-3 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 text-sm font-medium flex items-center justify-center gap-1"
+                    >
                       <Copy className="w-4 h-4" />
                       Duplicate
                     </button>
-                    <button className="px-3 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50">
+                    <button
+                      onClick={async () => {
+                        try {
+                          const response = await api.get(`/hunting/notebooks/${notebook.id}/export`);
+                          const blob = new Blob([JSON.stringify(response.data, null, 2)], { type: 'application/json' });
+                          const url = URL.createObjectURL(blob);
+                          const a = document.createElement('a');
+                          a.href = url;
+                          a.download = `notebook-${notebook.id.slice(0, 8)}.json`;
+                          a.click();
+                          URL.revokeObjectURL(url);
+                        } catch (err) {
+                          console.error('Export failed:', err);
+                        }
+                      }}
+                      className="px-3 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50"
+                    >
                       <Download className="w-4 h-4" />
                     </button>
                   </div>
                 </div>
               ))}
+            </div>
+          )}
+
+          {/* Create Notebook Modal */}
+          {showCreateNotebookModal && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50">
+              <div className="bg-white rounded-lg shadow-xl w-full max-w-md mx-4">
+                <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200">
+                  <h2 className="text-lg font-semibold text-gray-900">Create New Notebook</h2>
+                  <button
+                    onClick={() => setShowCreateNotebookModal(false)}
+                    className="text-gray-400 hover:text-gray-600"
+                  >
+                    <X className="w-5 h-5" />
+                  </button>
+                </div>
+                <div className="p-6 space-y-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Title</label>
+                    <input
+                      type="text"
+                      value={newNotebookTitle}
+                      onChange={(e) => setNewNotebookTitle(e.target.value)}
+                      placeholder="Notebook title"
+                      className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-blue-500 focus:border-blue-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Description</label>
+                    <textarea
+                      value={newNotebookDescription}
+                      onChange={(e) => setNewNotebookDescription(e.target.value)}
+                      placeholder="Notebook description"
+                      rows={3}
+                      className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-blue-500 focus:border-blue-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Session ID</label>
+                    <input
+                      type="text"
+                      value={newNotebookSessionId}
+                      onChange={(e) => setNewNotebookSessionId(e.target.value)}
+                      placeholder="Session ID to link"
+                      className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-blue-500 focus:border-blue-500"
+                    />
+                  </div>
+                  <div className="flex justify-end gap-2">
+                    <button
+                      onClick={() => setShowCreateNotebookModal(false)}
+                      className="px-4 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 text-sm font-medium"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      onClick={() => {
+                        if (newNotebookTitle && newNotebookSessionId) {
+                          createNotebookMutation.mutate({
+                            title: newNotebookTitle,
+                            description: newNotebookDescription,
+                            session_id: newNotebookSessionId,
+                          });
+                        }
+                      }}
+                      disabled={!newNotebookTitle || !newNotebookSessionId || createNotebookMutation.isPending}
+                      className={clsx(
+                        'px-4 py-2 rounded-lg text-sm font-medium text-white',
+                        !newNotebookTitle || !newNotebookSessionId || createNotebookMutation.isPending
+                          ? 'bg-blue-400 cursor-not-allowed'
+                          : 'bg-blue-600 hover:bg-blue-700'
+                      )}
+                    >
+                      {createNotebookMutation.isPending ? 'Creating...' : 'Create Notebook'}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Notebook Detail Modal */}
+          {selectedNotebook && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50">
+              <div className="bg-white rounded-lg shadow-xl w-full max-w-2xl mx-4 max-h-[80vh] overflow-y-auto">
+                <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200 sticky top-0 bg-white">
+                  <h2 className="text-lg font-semibold text-gray-900">{selectedNotebook.title}</h2>
+                  <button
+                    onClick={() => setSelectedNotebook(null)}
+                    className="text-gray-400 hover:text-gray-600"
+                  >
+                    <X className="w-5 h-5" />
+                  </button>
+                </div>
+                <div className="p-6 space-y-4">
+                  <div className="grid grid-cols-2 gap-4">
+                    <div>
+                      <label className="block text-sm font-medium text-gray-500 mb-1">Session ID</label>
+                      <p className="text-gray-900 font-mono text-sm">{selectedNotebook.session_id || '-'}</p>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium text-gray-500 mb-1">Version</label>
+                      <p className="text-gray-900">{selectedNotebook.version || 1}</p>
+                    </div>
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-500 mb-1">Status</label>
+                    <p className="text-gray-900">{selectedNotebook.is_published ? 'Published' : 'Draft'}</p>
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-500 mb-1">Content ({selectedNotebook.content?.length || 0} cells)</label>
+                    <pre className="bg-gray-50 rounded-lg p-4 text-sm text-gray-800 overflow-x-auto max-h-64 overflow-y-auto">
+                      {JSON.stringify(selectedNotebook.content, null, 2) || '[]'}
+                    </pre>
+                  </div>
+                </div>
+              </div>
             </div>
           )}
         </div>

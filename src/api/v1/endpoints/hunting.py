@@ -5,7 +5,7 @@ import math
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Body, HTTPException, Query, status
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -98,6 +98,22 @@ async def get_notebook_or_404(db: AsyncSession, notebook_id: str) -> HuntNoteboo
     return notebook
 
 
+async def get_sessions_count(db: AsyncSession, hypothesis_id: str) -> int:
+    """Get the number of sessions for a hypothesis"""
+    result = await db.execute(
+        select(func.count(HuntSession.id)).where(HuntSession.hypothesis_id == hypothesis_id)
+    )
+    return result.scalar() or 0
+
+
+async def hypothesis_to_response(db: AsyncSession, hypothesis: HuntHypothesis) -> HuntHypothesisResponse:
+    """Convert hypothesis model to response with sessions_count"""
+    sessions_count = await get_sessions_count(db, hypothesis.id)
+    data = HuntHypothesisResponse.model_validate(hypothesis)
+    data.sessions_count = sessions_count
+    return data
+
+
 async def execute_hunt_session(session_id: str):
     """Background task to execute a hunt session"""
     async with async_session_factory() as db:
@@ -184,8 +200,10 @@ async def list_hypotheses(
     result = await db.execute(query)
     hypotheses = list(result.scalars().all())
 
+    items = [await hypothesis_to_response(db, h) for h in hypotheses]
+
     return HuntHypothesisListResponse(
-        items=[HuntHypothesisResponse.model_validate(h) for h in hypotheses],
+        items=items,
         total=total,
         page=page,
         size=size,
@@ -218,7 +236,7 @@ async def create_hypothesis(
     await db.flush()
     await db.refresh(hypothesis)
 
-    return HuntHypothesisResponse.model_validate(hypothesis)
+    return await hypothesis_to_response(db, hypothesis)
 
 
 @router.get("/hypotheses/{hypothesis_id}", response_model=HuntHypothesisResponse)
@@ -229,7 +247,7 @@ async def get_hypothesis(
 ):
     """Get a hypothesis by ID"""
     hypothesis = await get_hypothesis_or_404(db, hypothesis_id)
-    return HuntHypothesisResponse.model_validate(hypothesis)
+    return await hypothesis_to_response(db, hypothesis)
 
 
 @router.put("/hypotheses/{hypothesis_id}", response_model=HuntHypothesisResponse)
@@ -263,7 +281,7 @@ async def update_hypothesis(
     await db.flush()
     await db.refresh(hypothesis)
 
-    return HuntHypothesisResponse.model_validate(hypothesis)
+    return await hypothesis_to_response(db, hypothesis)
 
 
 @router.delete("/hypotheses/{hypothesis_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -305,7 +323,7 @@ async def activate_hypothesis(
     await db.flush()
     await db.refresh(hypothesis)
 
-    return HuntHypothesisResponse.model_validate(hypothesis)
+    return await hypothesis_to_response(db, hypothesis)
 
 
 # ============================================================================
@@ -353,7 +371,7 @@ async def list_sessions(
         query = query.where(HuntSession.hypothesis_id == hypothesis_id)
 
     if session_status:
-        query = query.where(HuntSession.status == session_status)
+        query = query.where(func.upper(HuntSession.status) == session_status.upper())
 
     # Get total count
     count_result = await db.execute(
@@ -659,7 +677,7 @@ async def get_template(
 @router.post("/templates/{template_id}/instantiate", response_model=HuntHypothesisResponse, status_code=status.HTTP_201_CREATED)
 async def instantiate_template(
     template_id: str,
-    parameters: dict,
+    parameters: dict = Body(default={}),
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
@@ -692,7 +710,7 @@ async def instantiate_template(
     await db.flush()
     await db.refresh(hypothesis)
 
-    return HuntHypothesisResponse.model_validate(hypothesis)
+    return await hypothesis_to_response(db, hypothesis)
 
 
 # ============================================================================
@@ -876,12 +894,21 @@ async def export_notebook(
     format: str = Query("json", pattern="^(json|markdown|html)$"),
 ):
     """Export a notebook in the specified format"""
-    # Note: In a real implementation, this would use the NotebookService
+    notebook = await get_notebook_or_404(db, notebook_id)
+
+    cells = json.loads(notebook.content) if isinstance(notebook.content, str) else (notebook.content or [])
+    tags = json.loads(notebook.tags) if isinstance(notebook.tags, str) and notebook.tags else (notebook.tags or [])
+
     return {
         "status": "success",
         "notebook_id": notebook_id,
         "format": format,
-        "data": None,
+        "data": {
+            "title": notebook.title,
+            "description": getattr(notebook, "description", None),
+            "cells": cells,
+            "tags": tags,
+        },
     }
 
 
