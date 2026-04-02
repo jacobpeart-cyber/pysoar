@@ -23,7 +23,7 @@ import {
   ResponsiveContainer,
 } from 'recharts';
 import clsx from 'clsx';
-import { agenticApi } from '../api/endpoints';
+import { api } from '../api/client';
 
 const AgenticSOC: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'agents' | 'investigations' | 'reasoning' | 'approvals'>(
@@ -37,6 +37,8 @@ const AgenticSOC: React.FC = () => {
   const [chatInput, setChatInput] = useState('');
   const [approvalModal, setApprovalModal] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [chatLoading, setChatLoading] = useState(false);
 
   // State for API data
   const [agents, setAgents] = useState<any[]>([]);
@@ -54,16 +56,17 @@ const AgenticSOC: React.FC = () => {
   useEffect(() => {
     const loadData = async () => {
       setLoading(true);
+      setError(null);
       try {
         const [agentsRes, investigationsRes, actionsRes] = await Promise.all([
-          agenticApi.getAgents().catch(() => ({ data: [] })),
-          agenticApi.getInvestigations().catch(() => ({ data: [] })),
-          agenticApi.getActions({ status: 'pending_approval' }).catch(() => ({ data: [] })),
+          api.get('/agentic/agents').catch(() => ({ data: { items: [] } })),
+          api.get('/agentic/investigations').catch(() => ({ data: { items: [] } })),
+          api.get('/agentic/actions/pending-approval').catch(() => ({ data: { items: [] } })),
         ]);
 
-        const agentList = Array.isArray(agentsRes?.data) ? agentsRes.data : (Array.isArray(agentsRes) ? agentsRes : []);
-        const invList = Array.isArray(investigationsRes?.data) ? investigationsRes.data : (Array.isArray(investigationsRes) ? investigationsRes : []);
-        const actionList = Array.isArray(actionsRes?.data) ? actionsRes.data : (Array.isArray(actionsRes) ? actionsRes : []);
+        const agentList = agentsRes?.data?.items || (Array.isArray(agentsRes?.data) ? agentsRes.data : []);
+        const invList = investigationsRes?.data?.items || (Array.isArray(investigationsRes?.data) ? investigationsRes.data : []);
+        const actionList = actionsRes?.data?.items || (Array.isArray(actionsRes?.data) ? actionsRes.data : []);
 
         setAgents(agentList);
         setInvestigations(invList);
@@ -73,7 +76,7 @@ const AgenticSOC: React.FC = () => {
         const activeCount = agentList.filter((a: any) => a.status === 'active').length;
         const openInv = invList.filter((i: any) => i.status !== 'completed' && i.status !== 'closed').length;
         const avgConf = invList.length > 0
-          ? Math.round(invList.reduce((sum: number, i: any) => sum + (i.confidence_score || i.confidence || 0), 0) / invList.length * 10) / 10
+          ? Math.round(invList.reduce((sum: number, i: any) => sum + (i.confidence_score || 0), 0) / invList.length * 10) / 10
           : 0;
 
         setAgentMetrics({
@@ -84,27 +87,55 @@ const AgenticSOC: React.FC = () => {
         });
 
         // Build timeline from investigation timestamps
-        setTimelineData([
-          { time: '00:00', investigationsOpen: Math.max(1, invList.length - 2) },
-          { time: '04:00', investigationsOpen: Math.max(1, invList.length - 1) },
-          { time: '08:00', investigationsOpen: invList.length },
-          { time: '12:00', investigationsOpen: invList.length },
-          { time: '16:00', investigationsOpen: Math.max(1, invList.length + 1) },
-          { time: '20:00', investigationsOpen: invList.length },
-        ]);
+        const timelineMap: Record<string, number> = {};
+        invList.forEach((inv: any) => {
+          if (inv.created_at) {
+            const hour = new Date(inv.created_at).getHours();
+            const bucket = `${String(Math.floor(hour / 4) * 4).padStart(2, '0')}:00`;
+            timelineMap[bucket] = (timelineMap[bucket] || 0) + 1;
+          }
+        });
+        const buckets = ['00:00', '04:00', '08:00', '12:00', '16:00', '20:00'];
+        setTimelineData(
+          buckets.map((time) => ({ time, investigationsOpen: timelineMap[time] || 0 }))
+        );
 
-        // Set reasoning from first investigation if available
+        // Fetch reasoning chain from first investigation if available
         if (invList.length > 0) {
-          const inv = invList[0];
-          setReasoningChain([
-            { step: 1, stage: 'Observation', description: inv.title || inv.name || 'Initial detection', confidence: inv.confidence_score || 95 },
-            { step: 2, stage: 'Orientation', description: 'Correlating with threat intelligence and asset data', confidence: 90 },
-            { step: 3, stage: 'Decision', description: 'Recommending containment action based on analysis', confidence: 85 },
-            { step: 4, stage: 'Action', description: 'Awaiting approval to implement recommended actions', confidence: 85 },
-          ]);
+          try {
+            const stepsRes = await api.get(`/agentic/investigations/${invList[0].id}/reasoning-chain`);
+            const steps = stepsRes?.data?.steps || [];
+            if (steps.length > 0) {
+              setReasoningChain(
+                steps.map((s: any, idx: number) => ({
+                  step: s.step_number || idx + 1,
+                  stage: s.step_type || 'Analysis',
+                  description: s.thought_process || s.observation || 'Processing',
+                  confidence: s.confidence_delta != null ? Math.max(0, Math.min(100, 80 + (s.confidence_delta || 0))) : 80,
+                }))
+              );
+            } else {
+              // Fallback: derive from investigation data
+              const inv = invList[0];
+              setReasoningChain([
+                { step: 1, stage: 'Observation', description: inv.title || 'Initial detection', confidence: inv.confidence_score || 80 },
+                { step: 2, stage: 'Orientation', description: 'Correlating with threat intelligence and asset data', confidence: 85 },
+                { step: 3, stage: 'Decision', description: 'Recommending containment action based on analysis', confidence: 85 },
+                { step: 4, stage: 'Action', description: 'Awaiting approval to implement recommended actions', confidence: inv.confidence_score || 80 },
+              ]);
+            }
+          } catch {
+            const inv = invList[0];
+            setReasoningChain([
+              { step: 1, stage: 'Observation', description: inv.title || 'Initial detection', confidence: inv.confidence_score || 80 },
+              { step: 2, stage: 'Orientation', description: 'Correlating with threat intelligence and asset data', confidence: 85 },
+              { step: 3, stage: 'Decision', description: 'Recommending containment action based on analysis', confidence: 85 },
+              { step: 4, stage: 'Action', description: 'Awaiting approval to implement recommended actions', confidence: inv.confidence_score || 80 },
+            ]);
+          }
         }
-      } catch (error) {
-        // Use empty state on error
+      } catch (err) {
+        setError('Failed to load Agentic SOC data. Please try again.');
       } finally {
         setLoading(false);
       }
@@ -112,30 +143,40 @@ const AgenticSOC: React.FC = () => {
     loadData();
   }, []);
 
-  const handleChatSend = () => {
-    if (chatInput.trim()) {
-      setChatMessages([
-        ...chatMessages,
-        { role: 'user', text: chatInput },
-        { role: 'system', text: 'Processing your request...' },
-      ]);
-      setChatInput('');
+  const handleChatSend = async () => {
+    if (!chatInput.trim() || chatLoading) return;
+    const userMessage = chatInput;
+    setChatMessages((prev) => [...prev, { role: 'user', text: userMessage }]);
+    setChatInput('');
+    setChatLoading(true);
+    try {
+      const response = await api.post('/agentic/chat', { query: userMessage });
+      const reply = response.data?.response || response.data?.answer || 'No response';
+      setChatMessages((prev) => [...prev, { role: 'system', text: reply }]);
+    } catch {
+      setChatMessages((prev) => [...prev, { role: 'system', text: 'Sorry, something went wrong. Please try again.' }]);
+    } finally {
+      setChatLoading(false);
     }
   };
 
   const handleApprove = async (id: string) => {
     try {
-      await agenticApi.approveAction(id).catch(() => {});
-      setPendingApprovals(prev => prev.filter(a => a.id !== id));
-    } catch {}
+      await api.post(`/agentic/actions/${id}/approve`, { approved: true });
+      setPendingApprovals(prev => prev.filter(a => (a.action_id || a.id) !== id));
+    } catch {
+      setError('Failed to approve action.');
+    }
     setApprovalModal(null);
   };
 
   const handleDeny = async (id: string) => {
     try {
-      await agenticApi.rejectAction(id).catch(() => {});
-      setPendingApprovals(prev => prev.filter(a => a.id !== id));
-    } catch {}
+      await api.post(`/agentic/actions/${id}/approve`, { approved: false });
+      setPendingApprovals(prev => prev.filter(a => (a.action_id || a.id) !== id));
+    } catch {
+      setError('Failed to deny action.');
+    }
     setApprovalModal(null);
   };
 
@@ -153,6 +194,24 @@ const AgenticSOC: React.FC = () => {
             AI-powered security operations with autonomous agents and intelligent reasoning
           </p>
         </div>
+
+        {/* Error Toast */}
+        {error && (
+          <div className="mb-4 p-4 bg-red-100 dark:bg-red-900 border border-red-300 dark:border-red-700 rounded-lg flex items-center justify-between">
+            <p className="text-red-800 dark:text-red-200 text-sm">{error}</p>
+            <button onClick={() => setError(null)} className="text-red-600 dark:text-red-300 hover:text-red-800 dark:hover:text-red-100">
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        )}
+
+        {/* Loading State */}
+        {loading && (
+          <div className="mb-8 flex items-center justify-center py-12">
+            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600 dark:border-blue-400"></div>
+            <span className="ml-3 text-gray-600 dark:text-gray-400">Loading Agentic SOC data...</span>
+          </div>
+        )}
 
         {/* Summary Cards */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
@@ -248,7 +307,7 @@ const AgenticSOC: React.FC = () => {
                           {agent.name}
                         </h3>
                         <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
-                          {agent.type.replace(/_/g, ' ')}
+                          {(agent.agent_type || '').replace(/_/g, ' ')}
                         </p>
                       </div>
                       <span
@@ -265,24 +324,21 @@ const AgenticSOC: React.FC = () => {
 
                     <div className="space-y-2 text-sm">
                       <div className="flex justify-between">
-                        <span className="text-gray-600 dark:text-gray-400">Workload</span>
-                        <div className="w-24 bg-gray-200 dark:bg-gray-700 rounded-full h-2">
-                          <div
-                            className="bg-blue-600 dark:bg-blue-500 h-2 rounded-full"
-                            style={{ width: `${agent.workload}%` }}
-                          ></div>
-                        </div>
+                        <span className="text-gray-600 dark:text-gray-400">Investigations</span>
+                        <span className="font-medium text-gray-900 dark:text-white">
+                          {agent.total_investigations ?? 0}
+                        </span>
                       </div>
                       <div className="flex justify-between">
                         <span className="text-gray-600 dark:text-gray-400">Accuracy</span>
                         <span className="font-medium text-gray-900 dark:text-white">
-                          {agent.accuracy}%
+                          {agent.accuracy_score != null ? `${agent.accuracy_score}%` : 'N/A'}
                         </span>
                       </div>
                       <div className="flex justify-between">
-                        <span className="text-gray-600 dark:text-gray-400">Resolution Time</span>
+                        <span className="text-gray-600 dark:text-gray-400">Avg Resolution</span>
                         <span className="font-medium text-gray-900 dark:text-white">
-                          {agent.resolutionTime}
+                          {agent.avg_resolution_time_minutes != null ? `${Math.round(agent.avg_resolution_time_minutes)}m` : 'N/A'}
                         </span>
                       </div>
                     </div>
@@ -333,27 +389,27 @@ const AgenticSOC: React.FC = () => {
                     <div className="flex items-center justify-between">
                       <div className="flex-1">
                         <h3 className="font-semibold text-gray-900 dark:text-white">
-                          {inv.name}
+                          {inv.title || 'Untitled Investigation'}
                         </h3>
                         <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
-                          Started {inv.startTime}
+                          Started {inv.created_at ? new Date(inv.created_at).toLocaleString() : 'Unknown'}
                         </p>
                       </div>
                       <div className="text-right">
                         <div
                           className={clsx(
                             'px-3 py-1 text-xs font-medium rounded mb-2',
-                            inv.confidence >= 95
+                            (inv.confidence_score || 0) >= 95
                               ? 'bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-200'
-                              : inv.confidence >= 85
+                              : (inv.confidence_score || 0) >= 85
                                 ? 'bg-blue-100 dark:bg-blue-900 text-blue-800 dark:text-blue-200'
                                 : 'bg-orange-100 dark:bg-orange-900 text-orange-800 dark:text-orange-200'
                           )}
                         >
-                          {inv.confidence}% Confidence
+                          {inv.confidence_score ?? 0}% Confidence
                         </div>
                         <p className="text-sm font-medium text-gray-700 dark:text-gray-300">
-                          {inv.stage}
+                          {inv.status || 'Unknown'}
                         </p>
                       </div>
                     </div>
@@ -438,26 +494,26 @@ const AgenticSOC: React.FC = () => {
                   <tbody>
                     {pendingApprovals.map((approval) => (
                       <tr
-                        key={approval.id}
+                        key={approval.action_id || approval.id}
                         className="border-b border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700"
                       >
                         <td className="py-3 px-4 text-gray-900 dark:text-white">
-                          {approval.action}
+                          {(approval.action_type || 'Unknown').replace(/_/g, ' ')}
                         </td>
                         <td className="py-3 px-4 text-gray-600 dark:text-gray-400">
-                          {approval.investigation}
+                          {approval.investigation_title || 'N/A'}
                         </td>
                         <td className="py-3 px-4">
                           <span className="inline-block px-2 py-1 bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-200 rounded text-xs font-medium">
-                            {approval.confidence}%
+                            {approval.confidence_score ?? 0}%
                           </span>
                         </td>
                         <td className="py-3 px-4 font-medium text-gray-900 dark:text-white">
-                          {approval.riskScore}
+                          {approval.confidence_score ?? 'N/A'}
                         </td>
                         <td className="py-3 px-4 text-right">
                           <button
-                            onClick={() => setApprovalModal(approval.id)}
+                            onClick={() => setApprovalModal(approval.action_id || approval.id)}
                             className="text-blue-600 dark:text-blue-400 hover:text-blue-900 dark:hover:text-blue-200 font-medium text-xs"
                           >
                             Review
@@ -539,13 +595,13 @@ const AgenticSOC: React.FC = () => {
             </div>
 
             {pendingApprovals
-              .filter((a) => a.id === approvalModal)
+              .filter((a) => (a.action_id || a.id) === approvalModal)
               .map((approval) => (
-                <div key={approval.id} className="space-y-4">
+                <div key={approval.action_id || approval.id} className="space-y-4">
                   <div className="bg-gray-50 dark:bg-gray-900 rounded-lg p-4">
                     <p className="text-sm text-gray-600 dark:text-gray-400 mb-1">Action</p>
                     <p className="font-semibold text-gray-900 dark:text-white">
-                      {approval.action}
+                      {(approval.action_type || 'Unknown').replace(/_/g, ' ')}
                     </p>
                   </div>
 
@@ -553,7 +609,7 @@ const AgenticSOC: React.FC = () => {
                     <div className="bg-gray-50 dark:bg-gray-900 rounded-lg p-4">
                       <p className="text-sm text-gray-600 dark:text-gray-400 mb-1">Investigation</p>
                       <p className="font-semibold text-gray-900 dark:text-white">
-                        {approval.investigation}
+                        {approval.investigation_title || 'N/A'}
                       </p>
                     </div>
                     <div className="bg-gray-50 dark:bg-gray-900 rounded-lg p-4">
@@ -561,27 +617,27 @@ const AgenticSOC: React.FC = () => {
                         Confidence Score
                       </p>
                       <p className="font-semibold text-green-600 dark:text-green-400">
-                        {approval.confidence}%
+                        {approval.confidence_score ?? 0}%
                       </p>
                     </div>
                   </div>
 
                   <div className="bg-gray-50 dark:bg-gray-900 rounded-lg p-4">
-                    <p className="text-sm text-gray-600 dark:text-gray-400 mb-1">Risk Score</p>
+                    <p className="text-sm text-gray-600 dark:text-gray-400 mb-1">Agent</p>
                     <p className="font-semibold text-gray-900 dark:text-white">
-                      {approval.riskScore}/10
+                      {approval.agent_name || 'N/A'}
                     </p>
                   </div>
 
                   <div className="flex gap-3 pt-4">
                     <button
-                      onClick={() => handleDeny(approval.id)}
+                      onClick={() => handleDeny(approval.action_id || approval.id)}
                       className="flex-1 px-4 py-2 border border-gray-200 dark:border-gray-700 text-gray-900 dark:text-white rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700 transition"
                     >
                       Deny
                     </button>
                     <button
-                      onClick={() => handleApprove(approval.id)}
+                      onClick={() => handleApprove(approval.action_id || approval.id)}
                       className="flex-1 px-4 py-2 bg-green-600 dark:bg-green-500 text-white rounded-lg hover:bg-green-700 dark:hover:bg-green-600 transition"
                     >
                       Approve
