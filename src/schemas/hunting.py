@@ -123,7 +123,7 @@ class HuntSessionResponse(BaseModel):
     query_count: int = 0
     events_analyzed: int = 0
     findings_count: int = 0
-    queries_executed: int = 0
+    queries_executed: Optional[int] = 0
     error_message: Optional[str] = None
     created_by: str
     created_at: datetime
