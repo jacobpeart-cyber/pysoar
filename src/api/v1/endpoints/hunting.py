@@ -966,14 +966,27 @@ async def get_hunting_stats(
     avg_duration_seconds = avg_dur_result.scalar() or 0
     avg_hunt_duration_minutes = avg_duration_seconds / 60 if avg_duration_seconds else 0
 
-    # Top MITRE techniques
+    # Top MITRE techniques - cast JSON to text for grouping
+    from sqlalchemy import cast, String
     top_mitre_result = await db.execute(
-        select(HuntFinding.mitre_techniques, func.count(HuntFinding.id))
-        .group_by(HuntFinding.mitre_techniques)
+        select(cast(HuntFinding.mitre_techniques, String), func.count(HuntFinding.id))
+        .where(HuntFinding.mitre_techniques.isnot(None))
+        .group_by(cast(HuntFinding.mitre_techniques, String))
         .order_by(func.count(HuntFinding.id).desc())
         .limit(10)
     )
-    top_mitre_techniques = [t[0] for t in top_mitre_result.all() if t[0]]
+    top_mitre_techniques = []
+    for row in top_mitre_result.all():
+        if row[0]:
+            import json as json_mod
+            try:
+                techniques = json_mod.loads(row[0]) if isinstance(row[0], str) else row[0]
+                if isinstance(techniques, list):
+                    top_mitre_techniques.extend(techniques)
+                else:
+                    top_mitre_techniques.append(str(techniques))
+            except (json_mod.JSONDecodeError, TypeError):
+                top_mitre_techniques.append(str(row[0]))
 
     return HuntStatsResponse(
         total_hypotheses=total_hypotheses,
