@@ -85,7 +85,9 @@ async def list_playbooks(
 
     # Get total count
     count_result = await db.execute(
-        select(func.count(VisualPlaybook.id)).select_from(VisualPlaybook)
+        select(func.count(VisualPlaybook.id)).where(
+            VisualPlaybook.organization_id == current_user.organization_id
+        )
     )
     total = count_result.scalar() or 0
 
@@ -225,7 +227,7 @@ async def clone_playbook(
     cloned = designer.clone_playbook(
         playbook,
         request.new_name,
-        request.organization_id or current_user.organization_id,
+        getattr(request, "organization_id", None) or current_user.organization_id,
     )
 
     db.add(cloned)
@@ -487,7 +489,9 @@ async def list_executions(
 
     # Get total count
     count_result = await db.execute(
-        select(func.count(VisualPlaybookExecution.id)).select_from(VisualPlaybookExecution)
+        select(func.count(VisualPlaybookExecution.id)).where(
+            VisualPlaybookExecution.playbook_id == playbook.id
+        )
     )
     total = count_result.scalar() or 0
 
@@ -533,9 +537,19 @@ async def get_execution_status(
     )
     node_executions = result.scalars().all()
 
-    progress = (len(node_executions) / max(1, len(node_executions))) * 100
-    if execution.status != "completed":
-        progress = min(progress, 99)
+    # Get total node count from the playbook to calculate real progress
+    playbook_result = await db.execute(
+        select(func.count(PlaybookNode.id)).where(
+            PlaybookNode.playbook_id == execution.playbook_id
+        )
+    )
+    total_nodes = playbook_result.scalar() or 0
+    completed_nodes = len([ne for ne in node_executions if ne.status == "completed"])
+    progress = (completed_nodes / max(1, total_nodes)) * 100
+    if execution.status == "completed":
+        progress = 100.0
+    elif execution.status != "completed":
+        progress = min(progress, 99.0)
 
     return PlaybookExecutionStatusResponse(
         execution_id=execution.id,
@@ -605,7 +619,7 @@ async def create_from_template(
 
     designer = PlaybookDesigner()
     playbook = designer.import_playbook_json(
-        request.organization_id or current_user.organization_id,
+        getattr(request, "organization_id", None) or current_user.organization_id,
         {**template_data, "name": request.playbook_name},
     )
 
@@ -676,9 +690,9 @@ async def get_dashboard(
 
 # Helper functions
 async def _get_playbook_or_404(
+    db: AsyncSession,
     playbook_id: str,
     organization_id: str,
-    db: AsyncSession,
 ) -> VisualPlaybook:
     """Get playbook or raise 404"""
     result = await db.execute(
