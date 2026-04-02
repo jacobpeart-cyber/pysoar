@@ -929,31 +929,125 @@ async def export_rule_yaml(
 # SYSLOG COLLECTOR CONTROL ENDPOINTS
 # ============================================================================
 
-_collector_running = False
+_collector_instance = None
+_collector_task = None
+
+
+async def _syslog_batch_handler(messages: list):
+    """Process a batch of syslog messages through the SIEM pipeline."""
+    from src.siem.pipeline import process_log
+    from src.core.database import async_session_factory
+
+    async with async_session_factory() as db:
+        for msg in messages:
+            try:
+                raw_log = msg.get("raw", "") if isinstance(msg, dict) else str(msg)
+                source_ip = msg.get("source_ip", "0.0.0.0") if isinstance(msg, dict) else "0.0.0.0"
+                await process_log(
+                    raw_log=raw_log,
+                    source_type="syslog",
+                    source_name="syslog-collector",
+                    source_ip=source_ip,
+                    db=db,
+                )
+            except Exception as e:
+                logger.error(f"Syslog pipeline error: {e}")
+        await db.commit()
 
 
 @router.get("/collector/status", response_model=None)
 async def get_collector_status(current_user: CurrentUser = None):
     """Get syslog collector status"""
+    global _collector_instance
+    if _collector_instance:
+        health = _collector_instance.get_health()
+        return {
+            "running": _collector_instance._running,
+            "listen_port": _collector_instance.udp_port,
+            "protocol": "udp+tcp",
+            "messages_received": health.get("messages_received", 0),
+            "messages_processed": health.get("messages_processed", 0),
+            "errors": health.get("errors", 0),
+            "uptime_seconds": health.get("uptime_seconds", 0),
+            "messages_per_second": health.get("messages_per_second", 0),
+        }
     return {
-        "running": _collector_running,
-        "listen_port": 514,
+        "running": False,
+        "listen_port": 5514,
         "protocol": "udp+tcp",
         "messages_received": 0,
+        "messages_processed": 0,
+        "errors": 0,
+        "uptime_seconds": 0,
+        "messages_per_second": 0,
     }
 
 
 @router.post("/collector/start", response_model=None)
-async def start_collector(current_user: CurrentUser = None):
-    """Start the syslog collector"""
-    global _collector_running
-    _collector_running = True
-    return {"status": "started", "message": "Syslog collector started on port 514"}
+async def start_collector(
+    current_user: CurrentUser = None,
+    port: int = 5514,
+):
+    """Start the syslog collector on specified port."""
+    import asyncio
+    global _collector_instance, _collector_task
+
+    if _collector_instance and _collector_instance._running:
+        return {"status": "already_running", "message": f"Collector already running on port {_collector_instance.udp_port}"}
+
+    try:
+        from src.siem.syslog_receiver import SyslogReceiver
+
+        _collector_instance = SyslogReceiver(
+            host="0.0.0.0",
+            udp_port=port,
+            tcp_port=port,
+            batch_size=50,
+            flush_interval=3,
+            message_handler=_syslog_batch_handler,
+        )
+
+        _collector_task = asyncio.create_task(_collector_instance.start())
+
+        return {
+            "status": "started",
+            "message": f"Syslog collector started on UDP+TCP port {port}",
+            "port": port,
+        }
+    except Exception as e:
+        logger.error(f"Failed to start collector: {e}")
+        return {
+            "status": "error",
+            "message": f"Failed to start: {str(e)}",
+        }
 
 
 @router.post("/collector/stop", response_model=None)
 async def stop_collector(current_user: CurrentUser = None):
     """Stop the syslog collector"""
-    global _collector_running
-    _collector_running = False
-    return {"status": "stopped", "message": "Syslog collector stopped"}
+    global _collector_instance, _collector_task
+
+    if not _collector_instance or not _collector_instance._running:
+        return {"status": "not_running", "message": "Collector is not running"}
+
+    try:
+        await _collector_instance.stop()
+        if _collector_task:
+            _collector_task.cancel()
+            _collector_task = None
+
+        stats = _collector_instance.stats.copy()
+        _collector_instance = None
+
+        return {
+            "status": "stopped",
+            "message": "Syslog collector stopped",
+            "final_stats": {
+                "messages_received": stats.get("messages_received", 0),
+                "messages_processed": stats.get("messages_processed", 0),
+                "errors": stats.get("errors", 0),
+            },
+        }
+    except Exception as e:
+        logger.error(f"Failed to stop collector: {e}")
+        return {"status": "error", "message": f"Failed to stop: {str(e)}"}
