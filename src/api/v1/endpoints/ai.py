@@ -234,6 +234,14 @@ async def natural_language_query(
             for i in range(min(results_count, 20))
         ]
 
+        # Resolve org_id
+        org_id = getattr(current_user, "organization_id", None)
+        if not org_id:
+            from src.models.organization import Organization
+            org_result = await db.execute(select(Organization).limit(1))
+            org = org_result.scalars().first()
+            org_id = org.id if org else None
+
         # Persist to database
         nl_query = NLQuery(
             natural_language=request.natural_language,
@@ -245,7 +253,7 @@ async def natural_language_query(
             execution_time_ms=execution_time_ms,
             user_id=current_user.id,
             was_helpful=None,
-            organization_id=getattr(current_user, "organization_id", None),
+            organization_id=org_id or "",
         )
         db.add(nl_query)
         await db.flush()
