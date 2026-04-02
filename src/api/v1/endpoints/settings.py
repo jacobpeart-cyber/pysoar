@@ -89,15 +89,44 @@ async def update_settings(
 ) -> SettingsResponse:
     """Update application settings (admin only)
 
-    Note: In production, this would persist to database or config file.
-    Currently returns the proposed settings for demonstration.
+    Persists settings by updating the runtime config object.
+    Changes take effect immediately but do not survive a restart
+    unless also written to environment or .env file.
     """
-    # In a real implementation, we would:
-    # 1. Validate the settings
-    # 2. Store them in a settings table or config file
-    # 3. Reload the application configuration
+    update_data = settings_update.model_dump(exclude_unset=True, exclude_none=True)
 
-    # For now, just return what would be set
+    # Apply SMTP settings
+    if settings_update.smtp:
+        smtp = settings_update.smtp
+        if smtp.host is not None:
+            app_settings.smtp_host = smtp.host
+        if smtp.port is not None:
+            app_settings.smtp_port = smtp.port
+        if smtp.username is not None:
+            app_settings.smtp_user = smtp.username
+        if smtp.password is not None:
+            app_settings.smtp_password = smtp.password
+        if smtp.from_address is not None:
+            app_settings.smtp_from = smtp.from_address
+        if smtp.use_tls is not None:
+            app_settings.smtp_tls = smtp.use_tls
+
+    # Apply notification settings
+    if settings_update.notifications:
+        notif = settings_update.notifications
+        if notif.slack_webhook_url is not None:
+            app_settings.slack_webhook_url = notif.slack_webhook_url
+        if notif.teams_webhook_url is not None:
+            app_settings.teams_webhook_url = notif.teams_webhook_url
+
+    # Apply general settings
+    if settings_update.general:
+        gen = settings_update.general
+        if gen.app_name is not None:
+            app_settings.app_name = gen.app_name
+        if gen.session_timeout_minutes is not None:
+            app_settings.access_token_expire_minutes = gen.session_timeout_minutes
+
     return await get_settings(current_user)
 
 
@@ -112,7 +141,27 @@ async def test_email_settings(
             detail="Email is not configured"
         )
 
-    # In production, this would actually send a test email
+    from src.services.email_service import EmailService
+    email_service = EmailService()
+
+    if not email_service.is_configured:
+        raise HTTPException(
+            status_code=400,
+            detail="Email service is not fully configured (missing credentials)"
+        )
+
+    sent = await email_service.send_email(
+        to=[current_user.email],
+        subject="[PySOAR] Test Email",
+        body="This is a test email from PySOAR to verify your SMTP configuration is working correctly.",
+    )
+
+    if not sent:
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to send test email. Check SMTP configuration and server logs."
+        )
+
     return {"message": "Test email sent successfully", "to": current_user.email}
 
 

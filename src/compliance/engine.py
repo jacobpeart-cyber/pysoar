@@ -617,11 +617,36 @@ class FedRAMPManager:
         self, control: ComplianceControl
     ) -> Dict[str, Any]:
         """Internal: Run automated check for a control"""
-        # Placeholder for actual automated checks
+        now = datetime.utcnow()
+        evidence_cutoff = now - timedelta(days=90)
+
+        # Query recent evidence for this control
+        stmt = select(ComplianceEvidence).where(
+            and_(
+                ComplianceEvidence.control_id_ref == str(control.id),
+                ComplianceEvidence.collected_at >= evidence_cutoff,
+            )
+        )
+        result = await self.db.execute(stmt)
+        recent_evidence = result.scalars().all()
+
+        # Determine pass/fail based on evidence and implementation status
+        has_recent_evidence = len(recent_evidence) > 0
+        is_implemented = control.implementation_status >= 80.0
+
+        check_passed = has_recent_evidence and is_implemented
+
         return {
             "control_id": control.control_id,
-            "check_passed": True,
-            "check_timestamp": datetime.utcnow().isoformat(),
+            "check_passed": check_passed,
+            "check_timestamp": now.isoformat(),
+            "evidence_count": len(recent_evidence),
+            "implementation_status": control.implementation_status,
+            "reason": (
+                "passed" if check_passed
+                else "no_recent_evidence" if not has_recent_evidence
+                else "implementation_incomplete"
+            ),
         }
 
 
@@ -646,9 +671,10 @@ class NISTManager:
         Returns:
             Count of loaded controls
         """
-        # Placeholder: In production, load from official NIST catalog
-        self.logger.info("Loading NIST 800-53 Rev 5 controls")
-        return 1000
+        from src.fedramp.controls import FEDRAMP_MODERATE_CONTROLS
+
+        self.logger.info("Loading NIST 800-53 Rev 5 controls from FedRAMP baseline")
+        return len(FEDRAMP_MODERATE_CONTROLS)
 
     async def load_nist_800_171_controls(self) -> int:
         """

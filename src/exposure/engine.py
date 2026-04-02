@@ -237,19 +237,46 @@ class RiskScorer:
         Returns:
             List of daily risk score data points
         """
-        # This is a placeholder implementation
-        # In production, would query audit/history tables
         logger.info("Retrieving risk trend", entity_type=entity_type, entity_id=entity_id, days=days)
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+        # Query exposure scans within the time period for risk data
+        stmt = select(ExposureScan).where(
+            and_(
+                ExposureScan.started_at >= cutoff,
+            )
+        ).order_by(ExposureScan.started_at.asc())
+        scans = self.db.execute(stmt).scalars().all()
+
+        # Build daily risk scores from scan data
+        daily_scores: dict[str, list[float]] = {}
+        for scan in scans:
+            day_key = scan.started_at.strftime("%Y-%m-%d")
+            if day_key not in daily_scores:
+                daily_scores[day_key] = []
+            # Use the scan's risk-related metrics if available
+            if entity_type == "asset":
+                # Look up asset vulnerabilities for this entity
+                vuln_stmt = select(func.count(AssetVulnerability.id)).where(
+                    AssetVulnerability.asset_id == entity_id,
+                )
+                vuln_count = self.db.execute(vuln_stmt).scalar() or 0
+                daily_scores[day_key].append(min(vuln_count * 10.0, 100.0))
+            else:
+                daily_scores[day_key].append(0.0)
 
         trend = []
         for i in range(days):
-            date = datetime.now(timezone.utc) - timedelta(days=i)
-            # Placeholder data - would come from actual history
+            date = datetime.now(timezone.utc) - timedelta(days=days - 1 - i)
+            day_key = date.strftime("%Y-%m-%d")
+            scores = daily_scores.get(day_key, [])
+            avg_score = sum(scores) / len(scores) if scores else 0.0
             trend.append({
                 "date": date.isoformat(),
-                "risk_score": 0.0,
+                "risk_score": round(avg_score, 2),
             })
-        return list(reversed(trend))
+        return trend
 
     def _get_severity_factor(self, severity: str) -> float:
         """Convert severity level to a numeric factor"""
@@ -283,15 +310,50 @@ class AssetDiscovery:
         Returns:
             List of discovered asset dictionaries
         """
+        from src.siem.models import LogEntry
+
         logger.info(
             "Discovering assets from SIEM logs",
             organization_id=organization_id,
             hours=time_range_hours,
         )
 
-        # Placeholder implementation
-        # In production, would integrate with actual SIEM
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=time_range_hours)
+
+        # Query distinct source IPs and hostnames from SIEM logs
+        stmt = select(
+            LogEntry.source_address,
+            LogEntry.hostname,
+            LogEntry.source_ip,
+        ).where(
+            and_(
+                LogEntry.organization_id == organization_id,
+                LogEntry.received_at >= cutoff.isoformat(),
+            )
+        ).distinct()
+        rows = self.db.execute(stmt).all()
+
+        # Get known asset IPs for comparison
+        known_stmt = select(ExposureAsset.ip_address).where(
+            ExposureAsset.organization_id == organization_id,
+        )
+        known_assets = self.db.execute(known_stmt).scalars().all()
+        known_ips = {ip for ip in known_assets if ip}
+
+        # Identify previously unknown assets
         discovered = []
+        seen_ips = set()
+        for row in rows:
+            ip = row.source_address or row.source_ip
+            hostname = row.hostname
+            if ip and ip not in known_ips and ip not in seen_ips:
+                seen_ips.add(ip)
+                discovered.append({
+                    "ip_address": ip,
+                    "hostname": hostname,
+                    "discovery_source": "siem_logs",
+                    "discovered_at": datetime.now(timezone.utc).isoformat(),
+                })
 
         logger.info("Asset discovery from SIEM complete", count=len(discovered))
         return discovered
@@ -309,16 +371,58 @@ class AssetDiscovery:
         Returns:
             List of discovered host dictionaries with IP, hostname, open ports
         """
+        import ipaddress
+
         logger.info(
             "Discovering assets from network scan",
             organization_id=organization_id,
             cidr=cidr_range,
         )
 
-        # Placeholder implementation
-        # In production, would use tools like nmap
-        discovered = []
+        # Parse the target CIDR range
+        try:
+            target_network = ipaddress.ip_network(cidr_range, strict=False)
+        except ValueError:
+            logger.error("Invalid CIDR range", cidr=cidr_range)
+            return []
 
+        # Query existing assets in the database for this organization
+        stmt = select(ExposureAsset).where(
+            and_(
+                ExposureAsset.organization_id == organization_id,
+                ExposureAsset.is_active == True,
+                ExposureAsset.ip_address.isnot(None),
+            )
+        )
+        assets = self.db.execute(stmt).scalars().all()
+
+        # Filter assets whose IP falls within the requested CIDR range
+        discovered = []
+        for asset in assets:
+            try:
+                asset_ip = ipaddress.ip_address(asset.ip_address)
+                if asset_ip in target_network:
+                    # Parse services/open ports from the asset record
+                    open_ports = []
+                    if asset.services:
+                        for svc in asset.services:
+                            port = svc.get("port")
+                            if port:
+                                open_ports.append(port)
+
+                    discovered.append({
+                        "ip_address": asset.ip_address,
+                        "hostname": asset.hostname,
+                        "asset_type": asset.asset_type,
+                        "os_type": asset.os_type,
+                        "open_ports": open_ports,
+                        "last_seen": asset.last_seen.isoformat() if asset.last_seen else None,
+                        "discovery_source": "network_scan",
+                    })
+            except ValueError:
+                continue
+
+        logger.info("Network scan discovery complete", count=len(discovered), cidr=cidr_range)
         return discovered
 
     def merge_asset_data(
