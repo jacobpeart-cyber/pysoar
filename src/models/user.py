@@ -3,7 +3,7 @@
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
-from sqlalchemy import Boolean, String, Text
+from sqlalchemy import Boolean, ForeignKey, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.core.encryption import EncryptedType, EncryptedJSON
@@ -45,6 +45,11 @@ class User(BaseModel):
     is_superuser: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     force_password_change: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     mfa_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    # Organization
+    organization_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("organizations.id"), nullable=True, index=True
+    )
 
     # Optional fields
     phone: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
