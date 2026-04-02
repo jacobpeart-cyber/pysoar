@@ -37,7 +37,7 @@ class TicketActivity(BaseModel):
     description: Mapped[str] = mapped_column(String(500), nullable=False)
     old_value: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     new_value: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    metadata: Mapped[Optional[str]] = mapped_column(JSON, nullable=True)
+    extra_metadata: Mapped[Optional[str]] = mapped_column("metadata", JSON, nullable=True)
     organization_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
 
 
