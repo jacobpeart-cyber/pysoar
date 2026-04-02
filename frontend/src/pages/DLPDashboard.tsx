@@ -79,9 +79,9 @@ export default function DLPDashboard() {
           dlpApi.getIncidents(),
           dlpApi.getClassifications(),
         ]);
-        setPolicies(policiesData || []);
-        setIncidents(incidentsData.data || []);
-        setClassifications(classificationsData || []);
+        setPolicies(Array.isArray(policiesData) ? policiesData : (policiesData?.items || []));
+        setIncidents(Array.isArray(incidentsData) ? incidentsData : (incidentsData?.items || incidentsData?.data || []));
+        setClassifications(Array.isArray(classificationsData) ? classificationsData : (classificationsData?.items || []));
       } catch (err) {
         console.error('Error loading DLP data:', err);
         setError('Failed to load DLP data. Please try again.');
@@ -301,11 +301,11 @@ export default function DLPDashboard() {
                                 {(policy.severity || 'medium').toUpperCase()}
                               </span>
                             </td>
-                            <td className="px-6 py-4 text-sm">{policy.rules?.length || policy.ruleCount || 0}</td>
-                            <td className="px-6 py-4 text-sm font-semibold">{policy.matchCount || policy.matches || 0}</td>
+                            <td className="px-6 py-4 text-sm">{policy.rules?.length || policy.rule_count || 0}</td>
+                            <td className="px-6 py-4 text-sm font-semibold">{policy.trigger_count || policy.match_count || 0}</td>
                             <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                              {policy.lastTriggered || policy.last_triggered
-                                ? new Date(policy.lastTriggered || policy.last_triggered).toLocaleDateString()
+                              {policy.last_triggered
+                                ? new Date(policy.last_triggered).toLocaleDateString()
                                 : 'Never'}
                             </td>
                             <td className="px-6 py-4 text-sm flex gap-2">
