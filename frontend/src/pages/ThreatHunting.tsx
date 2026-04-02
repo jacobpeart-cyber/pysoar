@@ -1129,7 +1129,7 @@ export default function ThreatHunting() {
                   {findings.map((finding: any) => (
                     <tr key={finding.id} className="hover:bg-gray-50">
                       <td className="px-6 py-4 text-sm text-gray-500">
-                        {new Date(finding.created_at).toLocaleString()}
+                        {finding.created_at ? new Date(finding.created_at).toLocaleString() : '-'}
                       </td>
                       <td className="px-6 py-4 text-sm font-medium text-gray-900">{finding.title}</td>
                       <td className="px-6 py-4 text-sm text-gray-600 font-mono">
@@ -1147,7 +1147,7 @@ export default function ThreatHunting() {
                       </td>
                       <td className="px-6 py-4 text-sm text-gray-600 max-w-xs truncate">{finding.description}</td>
                       <td className="px-6 py-4 text-sm font-medium text-gray-900">
-                        {finding.evidence?.length || 0}
+                        {Array.isArray(finding.evidence) ? finding.evidence.length : 0}
                       </td>
                       <td className="px-6 py-4">
                         <span
@@ -1189,11 +1189,39 @@ export default function ThreatHunting() {
           </div>
 
           {/* Finding Details Modal */}
-          {selectedFinding && (
-            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50">
-              <div className="bg-white rounded-lg shadow-xl w-full max-w-2xl mx-4 max-h-[80vh] overflow-y-auto">
+          {selectedFinding && (() => {
+            // Pre-parse all fields safely outside JSX to avoid render crashes
+            const sfTitle = selectedFinding.title || 'Untitled Finding';
+            const sfClassification = selectedFinding.classification || '';
+            const sfSeverity = selectedFinding.severity || 'info';
+            const sfSessionId = selectedFinding.session_id || '-';
+            const sfDescription = selectedFinding.description || 'No description available';
+            const sfEscalated = !!selectedFinding.escalated_to_case;
+            const sfCaseId = selectedFinding.case_id || '';
+
+            const safeParseArray = (val: any): any[] => {
+              try {
+                if (Array.isArray(val)) return val;
+                if (typeof val === 'string' && val.trim()) {
+                  const parsed = JSON.parse(val);
+                  return Array.isArray(parsed) ? parsed : [];
+                }
+                return [];
+              } catch {
+                return [];
+              }
+            };
+
+            const evidence = safeParseArray(selectedFinding.evidence);
+            const assets = safeParseArray(selectedFinding.affected_assets);
+            const iocs = safeParseArray(selectedFinding.iocs_found);
+            const techniques = safeParseArray(selectedFinding.mitre_techniques);
+
+            return (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50" onClick={() => setSelectedFinding(null)}>
+              <div className="bg-white rounded-lg shadow-xl w-full max-w-2xl mx-4 max-h-[80vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
                 <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200 sticky top-0 bg-white">
-                  <h2 className="text-lg font-semibold text-gray-900">Finding: {selectedFinding.title}</h2>
+                  <h2 className="text-lg font-semibold text-gray-900">Finding: {sfTitle}</h2>
                   <button
                     onClick={() => setSelectedFinding(null)}
                     className="text-gray-400 hover:text-gray-600"
@@ -1208,14 +1236,14 @@ export default function ThreatHunting() {
                       <span
                         className={clsx(
                           'px-2 py-1 text-xs font-medium rounded-full capitalize',
-                          selectedFinding.classification === 'true_positive'
+                          sfClassification === 'true_positive'
                             ? 'text-green-600 bg-green-50'
-                            : selectedFinding.classification === 'false_positive'
+                            : sfClassification === 'false_positive'
                               ? 'text-purple-600 bg-purple-50'
                               : 'text-gray-600 bg-gray-50'
                         )}
                       >
-                        {selectedFinding.classification ? selectedFinding.classification.replace(/_/g, ' ') : 'unclassified'}
+                        {sfClassification ? sfClassification.replace(/_/g, ' ') : 'unclassified'}
                       </span>
                     </div>
                     <div>
@@ -1223,81 +1251,78 @@ export default function ThreatHunting() {
                       <span
                         className={clsx(
                           'px-2 py-1 text-xs font-medium rounded-full border capitalize',
-                          severityColors[selectedFinding.severity]
+                          severityColors[sfSeverity] || severityColors.info
                         )}
                       >
-                        {selectedFinding.severity}
+                        {sfSeverity}
                       </span>
                     </div>
                   </div>
                   <div>
                     <label className="block text-sm font-medium text-gray-500 mb-1">Session ID</label>
-                    <p className="text-gray-900 font-mono text-sm">{selectedFinding.session_id || '-'}</p>
+                    <p className="text-gray-900 font-mono text-sm">{sfSessionId}</p>
                   </div>
                   <div>
                     <label className="block text-sm font-medium text-gray-500 mb-1">Description</label>
-                    <p className="text-gray-900">{selectedFinding.description}</p>
+                    <p className="text-gray-900">{sfDescription}</p>
                   </div>
-                  {(() => {
-                    const evidence = typeof selectedFinding.evidence === 'string' ? (() => { try { return JSON.parse(selectedFinding.evidence); } catch { return []; } })() : (selectedFinding.evidence || []);
-                    const assets = typeof selectedFinding.affected_assets === 'string' ? (() => { try { return JSON.parse(selectedFinding.affected_assets); } catch { return []; } })() : (selectedFinding.affected_assets || []);
-                    const iocs = typeof selectedFinding.iocs_found === 'string' ? (() => { try { return JSON.parse(selectedFinding.iocs_found); } catch { return []; } })() : (selectedFinding.iocs_found || []);
-                    const techniques = typeof selectedFinding.mitre_techniques === 'string' ? (() => { try { return JSON.parse(selectedFinding.mitre_techniques); } catch { return []; } })() : (selectedFinding.mitre_techniques || []);
-                    return (
-                      <>
-                        {Array.isArray(evidence) && evidence.length > 0 && (
-                          <div>
-                            <label className="block text-sm font-medium text-gray-500 mb-1">Evidence</label>
-                            <ul className="list-disc list-inside text-sm text-gray-900">
-                              {evidence.map((e: any, i: number) => (
-                                <li key={i}>{typeof e === 'object' ? JSON.stringify(e) : String(e)}</li>
-                              ))}
-                            </ul>
-                          </div>
-                        )}
-                        {Array.isArray(assets) && assets.length > 0 && (
-                          <div>
-                            <label className="block text-sm font-medium text-gray-500 mb-1">Affected Assets</label>
-                            <div className="flex flex-wrap gap-1">
-                              {assets.map((a: any, i: number) => (
-                                <span key={i} className="px-2 py-1 text-xs bg-gray-100 text-gray-700 rounded">{String(a)}</span>
-                              ))}
-                            </div>
-                          </div>
-                        )}
-                        {Array.isArray(iocs) && iocs.length > 0 && (
-                          <div>
-                            <label className="block text-sm font-medium text-gray-500 mb-1">IOCs Found</label>
-                            <div className="flex flex-wrap gap-1">
-                              {iocs.map((ioc: any, i: number) => (
-                                <span key={i} className="px-2 py-1 text-xs bg-red-50 text-red-700 rounded font-mono">{String(ioc)}</span>
-                              ))}
-                            </div>
-                          </div>
-                        )}
-                        {Array.isArray(techniques) && techniques.length > 0 && (
-                          <div>
-                            <label className="block text-sm font-medium text-gray-500 mb-1">MITRE Techniques</label>
-                            <div className="flex flex-wrap gap-1">
-                              {techniques.map((t: any, i: number) => (
-                                <span key={i} className="px-2 py-1 text-xs bg-blue-50 text-blue-700 rounded">{String(t)}</span>
-                              ))}
-                            </div>
-                          </div>
-                        )}
-                      </>
-                    );
-                  })()}
+                  {evidence.length > 0 && (
+                    <div>
+                      <label className="block text-sm font-medium text-gray-500 mb-1">Evidence</label>
+                      <ul className="list-disc list-inside text-sm text-gray-900">
+                        {evidence.map((e: any, i: number) => (
+                          <li key={i}>{typeof e === 'object' && e !== null ? JSON.stringify(e) : String(e ?? '')}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {assets.length > 0 && (
+                    <div>
+                      <label className="block text-sm font-medium text-gray-500 mb-1">Affected Assets</label>
+                      <div className="flex flex-wrap gap-1">
+                        {assets.map((a: any, i: number) => (
+                          <span key={i} className="px-2 py-1 text-xs bg-gray-100 text-gray-700 rounded">{String(a ?? '')}</span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {iocs.length > 0 && (
+                    <div>
+                      <label className="block text-sm font-medium text-gray-500 mb-1">IOCs Found</label>
+                      <div className="flex flex-wrap gap-1">
+                        {iocs.map((ioc: any, i: number) => (
+                          <span key={i} className="px-2 py-1 text-xs bg-red-50 text-red-700 rounded font-mono">{String(ioc ?? '')}</span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {techniques.length > 0 && (
+                    <div>
+                      <label className="block text-sm font-medium text-gray-500 mb-1">MITRE Techniques</label>
+                      <div className="flex flex-wrap gap-1">
+                        {techniques.map((t: any, i: number) => (
+                          <span key={i} className="px-2 py-1 text-xs bg-blue-50 text-blue-700 rounded">{String(t ?? '')}</span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                  {selectedFinding.analyst_notes && (
+                    <div>
+                      <label className="block text-sm font-medium text-gray-500 mb-1">Analyst Notes</label>
+                      <p className="text-gray-900 text-sm whitespace-pre-wrap">{selectedFinding.analyst_notes}</p>
+                    </div>
+                  )}
                   <div>
                     <label className="block text-sm font-medium text-gray-500 mb-1">Escalated</label>
                     <p className="text-gray-900 font-medium">
-                      {selectedFinding.escalated_to_case ? `Yes (Case: ${selectedFinding.case_id?.slice(0, 8)})` : 'No'}
+                      {sfEscalated ? `Yes (Case: ${sfCaseId.slice(0, 8) || 'N/A'})` : 'No'}
                     </p>
                   </div>
                 </div>
               </div>
             </div>
-          )}
+            );
+          })()}
         </div>
       )}
 

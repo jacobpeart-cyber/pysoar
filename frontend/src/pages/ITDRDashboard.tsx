@@ -70,6 +70,13 @@ export default function ITDRDashboard() {
     confidence_score: 80,
   });
   const [submitting, setSubmitting] = useState(false);
+  const [selectedThreat, setSelectedThreat] = useState<any | null>(null);
+  const [selectedExposure, setSelectedExposure] = useState<any | null>(null);
+  const [selectedAnomaly, setSelectedAnomaly] = useState<any | null>(null);
+  const [selectedAccess, setSelectedAccess] = useState<any | null>(null);
+  const [detailMode, setDetailMode] = useState<'view' | 'edit'>('view');
+  const [showFilterPanel, setShowFilterPanel] = useState(false);
+  const [severityFilter, setSeverityFilter] = useState('all');
 
   React.useEffect(() => {
     const loadData = async () => {
@@ -112,27 +119,33 @@ export default function ITDRDashboard() {
   };
 
   const handleViewThreat = (threatId: string) => {
-    console.log('View threat:', threatId);
+    const threat = identityThreats.find(t => t.id === threatId);
+    if (threat) { setSelectedThreat(threat); setDetailMode('view'); }
   };
 
   const handleEditThreat = (threatId: string) => {
-    console.log('Edit threat:', threatId);
+    const threat = identityThreats.find(t => t.id === threatId);
+    if (threat) { setSelectedThreat(threat); setDetailMode('edit'); }
   };
 
   const handleViewExposure = (exposureId: string) => {
-    console.log('View exposure:', exposureId);
+    const exposure = credentialExposures.find(c => c.id === exposureId);
+    if (exposure) { setSelectedExposure(exposure); }
   };
 
   const handleViewAnomaly = (anomalyId: string) => {
-    console.log('View anomaly:', anomalyId);
+    const anomaly = accessAnomalies.find(a => a.id === anomalyId);
+    if (anomaly) { setSelectedAnomaly(anomaly); }
   };
 
   const handleViewAccess = (accessId: string) => {
-    console.log('View access:', accessId);
+    const access = privilegedAccess.find(p => p.id === accessId);
+    if (access) { setSelectedAccess(access); setDetailMode('view'); }
   };
 
   const handleEditAccess = (accessId: string) => {
-    console.log('Edit access:', accessId);
+    const access = privilegedAccess.find(p => p.id === accessId);
+    if (access) { setSelectedAccess(access); setDetailMode('edit'); }
   };
 
   const activeThreats = identityThreats.filter(t => t.status === 'investigating').length;
@@ -151,10 +164,12 @@ export default function ITDRDashboard() {
     { id: 'privileged-access', label: 'Privileged Access', icon: Lock },
   ];
 
-  const filteredThreats = identityThreats.filter(t =>
-    (t.threat_type ?? '').toLowerCase().includes(searchQuery.toLowerCase()) ||
-    (t.identity_id ?? '').toLowerCase().includes(searchQuery.toLowerCase())
-  );
+  const filteredThreats = identityThreats.filter(t => {
+    const matchesSearch = (t.threat_type ?? '').toLowerCase().includes(searchQuery.toLowerCase()) ||
+      (t.identity_id ?? '').toLowerCase().includes(searchQuery.toLowerCase());
+    const matchesSeverity = severityFilter === 'all' || t.severity === severityFilter;
+    return matchesSearch && matchesSeverity;
+  });
 
   const filteredCredentials = credentialExposures.filter(c =>
     (c.exposure_source ?? '').toLowerCase().includes(searchQuery.toLowerCase()) ||
@@ -272,13 +287,33 @@ export default function ITDRDashboard() {
                     />
                   </div>
                   <button
-                    onClick={() => console.log('Open threat filters')}
-                    className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                    onClick={() => setShowFilterPanel(prev => !prev)}
+                    className={clsx(
+                      'flex items-center gap-2 px-4 py-2 border rounded-lg transition',
+                      showFilterPanel
+                        ? 'border-orange-500 bg-orange-50 dark:bg-orange-900/20 text-orange-600'
+                        : 'border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-700'
+                    )}
                   >
                     <Filter className="w-4 h-4" />
                     Filter
                   </button>
                 </div>
+
+                {showFilterPanel && (
+                  <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4 flex gap-4">
+                    <div>
+                      <label className="block text-sm font-medium mb-1">Severity</label>
+                      <select value={severityFilter} onChange={(e) => setSeverityFilter(e.target.value)} className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-sm">
+                        <option value="all">All</option>
+                        <option value="critical">Critical</option>
+                        <option value="high">High</option>
+                        <option value="medium">Medium</option>
+                        <option value="low">Low</option>
+                      </select>
+                    </div>
+                  </div>
+                )}
 
                 {filteredThreats.length === 0 ? (
                   renderEmptyState('No identity threats found')
@@ -545,6 +580,31 @@ export default function ITDRDashboard() {
           </>
         )}
       </div>
+
+      {/* Detail Modal */}
+      {(selectedThreat || selectedExposure || selectedAnomaly || selectedAccess) && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" onClick={() => { setSelectedThreat(null); setSelectedExposure(null); setSelectedAnomaly(null); setSelectedAccess(null); }}>
+          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-[32rem] max-h-[80vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+            <h2 className="text-xl font-bold mb-4">
+              {selectedThreat ? `${detailMode === 'edit' ? 'Edit' : 'View'} Threat` : ''}
+              {selectedExposure ? 'Credential Exposure Details' : ''}
+              {selectedAnomaly ? 'Access Anomaly Details' : ''}
+              {selectedAccess ? `${detailMode === 'edit' ? 'Edit' : 'View'} Privileged Access` : ''}
+            </h2>
+            <pre className="text-xs bg-gray-100 dark:bg-gray-900 rounded p-4 overflow-auto max-h-96">
+              {JSON.stringify(selectedThreat || selectedExposure || selectedAnomaly || selectedAccess, null, 2)}
+            </pre>
+            <div className="mt-4 flex justify-end">
+              <button
+                onClick={() => { setSelectedThreat(null); setSelectedExposure(null); setSelectedAnomaly(null); setSelectedAccess(null); }}
+                className="px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* New Threat Modal */}
       {showNewThreatModal && (

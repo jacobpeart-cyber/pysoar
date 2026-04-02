@@ -53,6 +53,7 @@ export default function Incidents() {
       const params: Record<string, any> = { page, size: pageSize }
       if (statusFilter) params.status = statusFilter
       if (severityFilter) params.severity = severityFilter
+      if (search) params.search = search
       const response = await incidentsApi.list(params)
       setIncidents(response.items)
       setTotal(response.total)
@@ -74,7 +75,7 @@ export default function Incidents() {
 
   useEffect(() => {
     fetchIncidents()
-  }, [page, statusFilter, severityFilter])
+  }, [page, statusFilter, severityFilter, search])
 
   useEffect(() => {
     if (showCreateModal) {

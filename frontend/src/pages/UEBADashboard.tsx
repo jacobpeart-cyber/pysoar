@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../lib/api';
 import {
   Users,
@@ -97,6 +97,7 @@ const eventTypeColors = {
 };
 
 export default function UEBADashboard() {
+  const queryClient = useQueryClient();
   const [activeTab, setActiveTab] = useState<'overview' | 'entities' | 'alerts' | 'peers' | 'timeline'>('overview');
   const [searchQuery, setSearchQuery] = useState('');
   const [entityTypeFilter, setEntityTypeFilter] = useState('all');
@@ -435,18 +436,28 @@ export default function UEBADashboard() {
                   </td>
                   <td className="px-6 py-4 flex gap-2">
                     <button
-                      onClick={() => {
-                        api.put(`/ueba/alerts/${alert.id}/status`, { status: 'investigating' });
+                      onClick={async () => {
+                        try {
+                          await api.put(`/ueba/alerts/${alert.id}/status`, { status: 'investigating' });
+                          queryClient.invalidateQueries({ queryKey: ['ueba-alerts'] });
+                        } catch (err) {
+                          console.error('Failed to update alert status:', err);
+                        }
                       }}
                       className="text-xs px-2 py-1 rounded bg-blue-50 dark:bg-blue-900/20 text-blue-600 dark:text-blue-400 hover:bg-blue-100 dark:hover:bg-blue-900/40 transition-colors"
                     >
                       Investigate
                     </button>
                     <button
-                      onClick={() => {
+                      onClick={async () => {
                         const incidentId = prompt('Enter incident ID to escalate to:');
                         if (incidentId) {
-                          api.post(`/ueba/alerts/${alert.id}/escalate?incident_id=${encodeURIComponent(incidentId)}`);
+                          try {
+                            await api.post(`/ueba/alerts/${alert.id}/escalate?incident_id=${encodeURIComponent(incidentId)}`);
+                            queryClient.invalidateQueries({ queryKey: ['ueba-alerts'] });
+                          } catch (err) {
+                            console.error('Failed to escalate alert:', err);
+                          }
                         }
                       }}
                       className="text-xs px-2 py-1 rounded bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400 hover:bg-red-100 dark:hover:bg-red-900/40 transition-colors"
@@ -471,8 +482,13 @@ export default function UEBADashboard() {
       {activeTab === 'peers' && (
         <div className="space-y-6">
           <button
-            onClick={() => {
-              api.post('/ueba/peer-groups/auto-cluster');
+            onClick={async () => {
+              try {
+                await api.post('/ueba/peer-groups/auto-cluster');
+                queryClient.invalidateQueries({ queryKey: ['ueba-peer-groups'] });
+              } catch (err) {
+                console.error('Failed to auto-cluster peer groups:', err);
+              }
             }}
             className="px-4 py-2 rounded-lg bg-purple-600 dark:bg-purple-700 text-white hover:bg-purple-700 dark:hover:bg-purple-600 font-medium transition-colors"
           >

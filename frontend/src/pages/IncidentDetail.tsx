@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useRef } from 'react';
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
@@ -120,6 +120,59 @@ export default function IncidentDetail() {
       setShowPlaybookModal(false);
     },
   });
+
+  // TODO: Verify POST /incidents/{id}/notes endpoint exists on backend
+  const addNoteMutation = useMutation({
+    mutationFn: async (content: string) => {
+      const response = await api.post(`/incidents/${id}/notes`, { content, note_type: 'general' });
+      return response.data;
+    },
+    onSuccess: () => {
+      setNewNote('');
+      queryClient.invalidateQueries({ queryKey: ['incident', id] });
+    },
+  });
+
+  // TODO: Verify POST /incidents/{id}/tasks endpoint exists on backend
+  const addTaskMutation = useMutation({
+    mutationFn: async (title: string) => {
+      const response = await api.post(`/incidents/${id}/tasks`, { title, status: 'pending' });
+      return response.data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['incident', id] });
+    },
+  });
+
+  // TODO: Verify PATCH /incidents/{id}/tasks/{taskId} endpoint exists on backend
+  const updateTaskMutation = useMutation({
+    mutationFn: async ({ taskId, status }: { taskId: string; status: string }) => {
+      const response = await api.patch(`/incidents/${id}/tasks/${taskId}`, { status });
+      return response.data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['incident', id] });
+    },
+  });
+
+  // TODO: Verify POST /incidents/{id}/attachments endpoint exists on backend
+  const uploadFileMutation = useMutation({
+    mutationFn: async (file: File) => {
+      const formData = new FormData();
+      formData.append('file', file);
+      const response = await api.post(`/incidents/${id}/attachments`, formData, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      });
+      return response.data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['incident', id] });
+    },
+  });
+
+  const [newTaskTitle, setNewTaskTitle] = useState('');
+  const [showAddTaskForm, setShowAddTaskForm] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   if (isLoading) {
     return (
@@ -315,7 +368,8 @@ export default function IncidentDetail() {
                       className="flex-1 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
                     />
                     <button
-                      disabled={!newNote.trim()}
+                      disabled={!newNote.trim() || addNoteMutation.isPending}
+                      onClick={() => { if (newNote.trim()) addNoteMutation.mutate(newNote.trim()); }}
                       className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 self-end"
                     >
                       <Send className="w-4 h-4" />
@@ -354,16 +408,54 @@ export default function IncidentDetail() {
                 <div className="space-y-4">
                   <div className="flex justify-between items-center">
                     <h3 className="font-medium text-gray-900 dark:text-white">Tasks</h3>
-                    <button className="flex items-center gap-1 text-sm text-blue-600 hover:text-blue-700">
+                    <button
+                      onClick={() => setShowAddTaskForm(true)}
+                      className="flex items-center gap-1 text-sm text-blue-600 hover:text-blue-700"
+                    >
                       <Plus className="w-4 h-4" />
                       Add Task
                     </button>
                   </div>
 
+                  {showAddTaskForm && (
+                    <div className="flex gap-2">
+                      <input
+                        type="text"
+                        value={newTaskTitle}
+                        onChange={(e) => setNewTaskTitle(e.target.value)}
+                        placeholder="Task title..."
+                        className="flex-1 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm"
+                      />
+                      <button
+                        disabled={!newTaskTitle.trim() || addTaskMutation.isPending}
+                        onClick={() => {
+                          if (newTaskTitle.trim()) {
+                            addTaskMutation.mutate(newTaskTitle.trim());
+                            setNewTaskTitle('');
+                            setShowAddTaskForm(false);
+                          }
+                        }}
+                        className="px-3 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 text-sm"
+                      >
+                        Add
+                      </button>
+                      <button
+                        onClick={() => { setShowAddTaskForm(false); setNewTaskTitle(''); }}
+                        className="px-3 py-2 border border-gray-300 rounded-lg hover:bg-gray-50 text-sm"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  )}
+
                   {/* Task List */}
                   <div className="space-y-2">
                     <div className="flex items-center gap-3 p-3 bg-gray-50 dark:bg-gray-700/50 rounded-lg">
-                      <input type="checkbox" className="rounded border-gray-300 text-blue-600" />
+                      <input
+                        type="checkbox"
+                        className="rounded border-gray-300 text-blue-600"
+                        onChange={(e) => updateTaskMutation.mutate({ taskId: 'task-1', status: e.target.checked ? 'completed' : 'pending' })}
+                      />
                       <div className="flex-1">
                         <p className="text-sm font-medium text-gray-900 dark:text-white">Collect forensic evidence</p>
                         <p className="text-xs text-gray-500">Due: Not set</p>
@@ -371,7 +463,11 @@ export default function IncidentDetail() {
                       <span className="px-2 py-1 text-xs bg-yellow-100 text-yellow-700 rounded">Pending</span>
                     </div>
                     <div className="flex items-center gap-3 p-3 bg-gray-50 dark:bg-gray-700/50 rounded-lg">
-                      <input type="checkbox" className="rounded border-gray-300 text-blue-600" />
+                      <input
+                        type="checkbox"
+                        className="rounded border-gray-300 text-blue-600"
+                        onChange={(e) => updateTaskMutation.mutate({ taskId: 'task-2', status: e.target.checked ? 'completed' : 'pending' })}
+                      />
                       <div className="flex-1">
                         <p className="text-sm font-medium text-gray-900 dark:text-white">Notify affected users</p>
                         <p className="text-xs text-gray-500">Due: Not set</p>
@@ -411,9 +507,23 @@ export default function IncidentDetail() {
                 <div className="space-y-4">
                   <div className="flex justify-between items-center">
                     <h3 className="font-medium text-gray-900 dark:text-white">Attachments</h3>
-                    <button className="flex items-center gap-1 text-sm text-blue-600 hover:text-blue-700">
+                    <input
+                      ref={fileInputRef}
+                      type="file"
+                      className="hidden"
+                      onChange={(e) => {
+                        const file = e.target.files?.[0];
+                        if (file) uploadFileMutation.mutate(file);
+                        e.target.value = '';
+                      }}
+                    />
+                    <button
+                      onClick={() => fileInputRef.current?.click()}
+                      disabled={uploadFileMutation.isPending}
+                      className="flex items-center gap-1 text-sm text-blue-600 hover:text-blue-700 disabled:opacity-50"
+                    >
                       <Plus className="w-4 h-4" />
-                      Upload File
+                      {uploadFileMutation.isPending ? 'Uploading...' : 'Upload File'}
                     </button>
                   </div>
                   <div className="text-center py-8 text-gray-500">

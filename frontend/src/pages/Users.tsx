@@ -37,7 +37,9 @@ export default function Users() {
   const fetchUsers = async () => {
     setLoading(true)
     try {
-      const response = await usersApi.list({ page, size: pageSize })
+      const params: Record<string, any> = { page, size: pageSize }
+      if (search) params.search = search
+      const response = await usersApi.list(params)
       setUsers(response.items)
       setTotal(response.total)
     } catch (error) {
@@ -49,7 +51,7 @@ export default function Users() {
 
   useEffect(() => {
     fetchUsers()
-  }, [page])
+  }, [page, search])
 
   const handleDelete = async (id: string) => {
     if (!confirm('Are you sure you want to delete this user?')) return

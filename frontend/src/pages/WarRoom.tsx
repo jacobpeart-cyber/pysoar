@@ -1,5 +1,5 @@
 import React, { useState, useMemo } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   Shield,
   MessageSquare,
@@ -32,9 +32,27 @@ export default function WarRoom() {
     { id: 3, author: 'Carol White', text: 'Monitoring DNS propagation, all clear', time: '13:49' },
   ]);
 
+  const [actionTitle, setActionTitle] = useState('');
+  const [actionPriority, setActionPriority] = useState('Critical');
+
+  const queryClient = useQueryClient();
   const { data: warRooms = [] } = useQuery({ queryKey: ['warRooms'], queryFn: collaborationApi.getWarRooms });
   const { data: actionItems = [] } = useQuery({ queryKey: ['actionItems'], queryFn: collaborationApi.getActionItems });
   const { data: postMortems = [] } = useQuery({ queryKey: ['postMortems'], queryFn: collaborationApi.getPostMortems });
+
+  const createActionMutation = useMutation({
+    mutationFn: (data: { title: string; priority: string }) => collaborationApi.createActionItem(data),
+    onSuccess: () => { queryClient.invalidateQueries({ queryKey: ['actionItems'] }); },
+  });
+
+  const sendMessageMutation = useMutation({
+    mutationFn: (data: { warRoomId: string; text: string }) => collaborationApi.sendMessage(data.warRoomId, { text: data.text }),
+  });
+
+  const closeRoomMutation = useMutation({
+    mutationFn: (warRoomId: string) => collaborationApi.closeWarRoom(warRoomId),
+    onSuccess: () => { queryClient.invalidateQueries({ queryKey: ['warRooms'] }); },
+  });
 
   const stats = useMemo(() => {
     const activeRooms = warRooms.filter((r: WarRoom) => r.status === 'Active').length;
@@ -62,7 +80,8 @@ export default function WarRoom() {
   }, [postMortems]);
 
   const handleSendMessage = () => {
-    if (newMessage.trim()) {
+    if (newMessage.trim() && selectedRoom) {
+      sendMessageMutation.mutate({ warRoomId: selectedRoom.id, text: newMessage });
       setMessages([
         ...messages,
         { id: messages.length + 1, author: 'You', text: newMessage, time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) },

@@ -152,6 +152,7 @@ export default function ExposureManagement() {
   const [ticketStatusFilter, setTicketStatusFilter] = useState<string[]>([]);
   const [showImportModal, setShowImportModal] = useState(false);
   const [showCreateTicketModal, setShowCreateTicketModal] = useState(false);
+  const [selectedAsset, setSelectedAsset] = useState<Asset | null>(null);
 
   const { data: stats, isLoading: statsLoading } = useQuery<DashboardStats>({
     queryKey: ['exposure', 'dashboard'],
@@ -577,7 +578,7 @@ export default function ExposureManagement() {
                       </td>
                       <td className="px-4 py-3">
                         <button
-                          onClick={() => alert(`Asset: ${asset.hostname}\nIP: ${asset.ip_address}\nType: ${asset.asset_type}\nCriticality: ${asset.criticality}\nRisk Score: ${asset.risk_score}\nVulnerabilities: ${asset.vulnerability_count}`)}
+                          onClick={() => setSelectedAsset(asset)}
                           className="text-blue-600 dark:text-blue-400 hover:text-blue-700 text-sm font-medium"
                         >
                           View Details
@@ -901,7 +902,14 @@ export default function ExposureManagement() {
                   </div>
                 </div>
                 <button
-                  onClick={() => api.post('/exposure/attack-surface/assess', null, { params: { surface_id: surface.id } })}
+                  onClick={async () => {
+                    try {
+                      await api.post('/exposure/attack-surface/assess', null, { params: { surface_id: surface.id } });
+                      queryClient.invalidateQueries({ queryKey: ['attackSurfaces'] });
+                    } catch (err) {
+                      console.error('Failed to assess attack surface:', err);
+                    }
+                  }}
                   className="w-full mt-4 px-4 py-2 bg-blue-50 dark:bg-blue-900/20 text-blue-600 dark:text-blue-400 rounded-lg hover:bg-blue-100 dark:hover:bg-blue-900/40 text-sm font-medium"
                 >
                   Assess Now

@@ -55,6 +55,7 @@ export default function IOCs() {
       const params: Record<string, any> = { page, size: pageSize }
       if (typeFilter) params.ioc_type = typeFilter
       if (threatLevelFilter) params.threat_level = threatLevelFilter
+      if (search) params.search = search
       const response = await iocsApi.list(params)
       setIocs(response.items)
       setTotal(response.total)
@@ -67,7 +68,7 @@ export default function IOCs() {
 
   useEffect(() => {
     fetchIOCs()
-  }, [page, typeFilter, threatLevelFilter])
+  }, [page, typeFilter, threatLevelFilter, search])
 
   const handleDelete = async (id: string) => {
     if (!confirm('Are you sure you want to delete this IOC?')) return

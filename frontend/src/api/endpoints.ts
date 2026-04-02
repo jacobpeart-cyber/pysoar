@@ -626,6 +626,16 @@ export const supplychainApi = {
     const response = await api.get('/supplychain/vendor-assessments', { params });
     return response.data;
   },
+
+  addComponent: async (data: { name: string; version: string; license: string }): Promise<any> => {
+    const response = await api.post('/supplychain/components', data);
+    return response.data;
+  },
+
+  downloadSBOM: async (sbomId: string): Promise<any> => {
+    const response = await api.get(`/supplychain/sboms/${sbomId}/export`);
+    return response.data;
+  },
 };
 
 // Dark Web
@@ -652,6 +662,25 @@ export const darkwebApi = {
     const response = await api.get('/darkweb/brand-monitors');
     return response.data;
   },
+
+  deleteMonitor: async (monitorId: string): Promise<void> => {
+    await api.delete(`/darkweb/brand-monitors/${monitorId}`);
+  },
+
+  updateMonitor: async (monitorId: string, data: { name?: string; keyword?: string }): Promise<any> => {
+    const response = await api.put(`/darkweb/brand-monitors/${monitorId}`, data);
+    return response.data;
+  },
+
+  createMonitor: async (data: { name: string; keyword: string; frequency: string }): Promise<any> => {
+    const response = await api.post('/darkweb/brand-monitors', data);
+    return response.data;
+  },
+
+  requestTakedown: async (threatId: string): Promise<any> => {
+    const response = await api.post(`/darkweb/brand-monitors/${threatId}/takedown`);
+    return response.data;
+  },
 };
 
 // Integrations
@@ -673,6 +702,21 @@ export const integrationsApi = {
 
   executeAction: async (connectorId: string, action: string, params: Record<string, any>): Promise<any> => {
     const response = await api.post(`/integrations/connectors/${connectorId}/execute`, { action, params });
+    return response.data;
+  },
+
+  configureConnector: async (connectorId: string, config: Record<string, any>): Promise<any> => {
+    const response = await api.put(`/integrations/connectors/${connectorId}/config`, config);
+    return response.data;
+  },
+
+  testConnector: async (connectorId: string): Promise<any> => {
+    const response = await api.post(`/integrations/connectors/${connectorId}/test`);
+    return response.data;
+  },
+
+  createWebhook: async (data: { name: string; url: string; event: string }): Promise<any> => {
+    const response = await api.post('/integrations/webhooks', data);
     return response.data;
   },
 };
@@ -773,6 +817,11 @@ export const riskquantApi = {
     const response = await api.get('/riskquant/loss-exceedance');
     return response.data;
   },
+
+  createScenario: async (data: { name: string; description: string; loss_magnitude: number }): Promise<any> => {
+    const response = await api.post('/riskquant/scenarios', data);
+    return response.data;
+  },
 };
 
 // OT Security
@@ -810,32 +859,63 @@ export const containerApi = {
   getImages: async (params?: {
     page?: number;
     size?: number;
-  }): Promise<PaginatedResponse<ContainerImage>> => {
-    const response = await api.get('/container/images', { params });
+    compliance_status?: string;
+  }): Promise<ContainerImage[]> => {
+    const response = await api.get('/container-security/images', { params });
     return response.data;
   },
 
-  getScans: async (params?: {
+  getClusters: async (params?: {
     page?: number;
     size?: number;
-    status?: string;
-  }): Promise<PaginatedResponse<ContainerScan>> => {
-    const response = await api.get('/container/scans', { params });
+    provider?: string;
+  }): Promise<any[]> => {
+    const response = await api.get('/container-security/clusters', { params });
     return response.data;
   },
 
-  getK8sPolicies: async (): Promise<any[]> => {
-    const response = await api.get('/container/k8s-policies');
+  getFindings: async (params?: {
+    page?: number;
+    size?: number;
+    severity?: string;
+    status?: string;
+  }): Promise<any[]> => {
+    const response = await api.get('/container-security/findings', { params });
+    return response.data;
+  },
+
+  getRuntimeAlerts: async (params?: {
+    page?: number;
+    size?: number;
+    severity?: string;
+    status?: string;
+  }): Promise<any[]> => {
+    const response = await api.get('/container-security/runtime-alerts', { params });
+    return response.data;
+  },
+
+  getDashboard: async (): Promise<any> => {
+    const response = await api.get('/container-security/dashboard/overview');
     return response.data;
   },
 
   scanImage: async (imageId: string): Promise<any> => {
-    const response = await api.post(`/container/images/${imageId}/scan`);
+    const response = await api.post(`/container-security/images/${imageId}/scan`);
     return response.data;
   },
 
-  getScanReport: async (scanId: string): Promise<any> => {
-    const response = await api.get(`/container/scans/${scanId}/report`);
+  auditCluster: async (clusterId: string): Promise<any> => {
+    const response = await api.post(`/container-security/clusters/${clusterId}/audit`);
+    return response.data;
+  },
+
+  remediateFinding: async (findingId: string): Promise<any> => {
+    const response = await api.post(`/container-security/findings/${findingId}/remediate`);
+    return response.data;
+  },
+
+  getComplianceMatrix: async (): Promise<any> => {
+    const response = await api.get('/container-security/dashboard/compliance-matrix');
     return response.data;
   },
 };
@@ -958,6 +1038,16 @@ export const apisecurityApi = {
     const response = await api.get('/apisecurity/anomalies', { params });
     return response.data;
   },
+
+  getPolicies: async (): Promise<any[]> => {
+    const response = await api.get('/apisecurity/policies');
+    return response.data;
+  },
+
+  registerAPI: async (data: { name: string; method: string }): Promise<any> => {
+    const response = await api.post('/apisecurity/endpoints', data);
+    return response.data;
+  },
 };
 
 // Data Lake
@@ -980,6 +1070,16 @@ export const datalakeApi = {
 
   runQuery: async (query: string): Promise<any> => {
     const response = await api.post('/datalake/query', { query });
+    return response.data;
+  },
+
+  getCatalog: async (): Promise<any[]> => {
+    const response = await api.get('/datalake/catalog');
+    return response.data;
+  },
+
+  createDataSource: async (data: { name: string; connection_string: string }): Promise<any> => {
+    const response = await api.post('/datalake/sources', data);
     return response.data;
   },
 };
@@ -1009,6 +1109,21 @@ export const collaborationApi = {
 
   getActionItems: async (warRoomId: string): Promise<ActionItem[]> => {
     const response = await api.get(`/collaboration/warrooms/${warRoomId}/action-items`);
+    return response.data;
+  },
+
+  createActionItem: async (data: { title: string; priority: string }): Promise<any> => {
+    const response = await api.post('/collaboration/action-items', data);
+    return response.data;
+  },
+
+  sendMessage: async (warRoomId: string, data: { text: string }): Promise<any> => {
+    const response = await api.post(`/collaboration/warrooms/${warRoomId}/messages`, data);
+    return response.data;
+  },
+
+  closeWarRoom: async (warRoomId: string): Promise<any> => {
+    const response = await api.post(`/collaboration/warrooms/${warRoomId}/close`);
     return response.data;
   },
 };

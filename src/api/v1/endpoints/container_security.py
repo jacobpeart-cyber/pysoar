@@ -5,7 +5,7 @@ Complete API for managing container images, Kubernetes clusters,
 security findings, runtime alerts, and compliance.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Dict, Any
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query
@@ -205,12 +205,14 @@ async def scan_image(
     """
     Trigger image vulnerability scan.
 
-    Scans image for known vulnerabilities and updates risk score.
+    Runs the scanner against the known CVE catalog and any existing DB
+    vulnerability records, then updates the image's vuln counts and risk score.
     """
+    org_id = getattr(current_user, "organization_id", None)
     stmt = select(ContainerImage).where(
         and_(
             ContainerImage.id == image_id,
-            ContainerImage.organization_id == getattr(current_user, "organization_id", None),
+            ContainerImage.organization_id == org_id,
         )
     )
     result = await db.execute(stmt)
@@ -219,16 +221,65 @@ async def scan_image(
     if not image:
         raise HTTPException(status_code=404, detail="Image not found")
 
-    # Queue async scan task
-    scheduled_image_scan.delay(image_id, getattr(current_user, "organization_id", None))
+    # Run the actual scanner
+    scanner = ImageScanner()
+    scan_result = await scanner.scan_image(
+        registry=image.registry or "docker.io",
+        repository=image.repository or "",
+        tag=image.tag or "latest",
+        digest=image.digest_sha256 or "",
+        db=db,
+    )
 
-    logger.info(f"Queued scan for image {image_id}")
+    # Persist new vulnerabilities that aren't already in the DB
+    existing_stmt = select(ImageVulnerability.cve_id).where(
+        ImageVulnerability.image_id == image_id
+    )
+    existing_result = await db.execute(existing_stmt)
+    existing_cves = {r[0] for r in existing_result.all()}
+
+    for vuln in scan_result.get("vulnerabilities", []):
+        if vuln["cve_id"] not in existing_cves:
+            db.add(ImageVulnerability(
+                image_id=image_id,
+                cve_id=vuln["cve_id"],
+                package_name=vuln.get("package", ""),
+                package_version=vuln.get("version", ""),
+                fixed_version=vuln.get("fixed_version"),
+                severity=vuln.get("severity", "medium"),
+                cvss_score=vuln.get("cvss", 0.0),
+                exploit_available=vuln.get("exploit_available", False),
+                description=vuln.get("description", ""),
+                organization_id=org_id,
+            ))
+
+    # Update image record with scan results
+    image.critical_count = scan_result["vulnerability_count_critical"]
+    image.high_count = scan_result["vulnerability_count_high"]
+    image.medium_count = scan_result["vulnerability_count_medium"]
+    image.low_count = scan_result["vulnerability_count_low"]
+    image.scanned_at = scan_result["scanned_at"]
+    image.risk_score = scanner.calculate_image_risk_score(
+        image.critical_count, image.high_count, image.medium_count,
+        bool(image.is_signed), bool(image.sbom_generated),
+    )
+    image.compliance_status = (
+        "compliant" if image.critical_count == 0 and image.high_count == 0
+        else "non_compliant"
+    )
+
+    await db.commit()
+    await db.refresh(image)
+
+    logger.info(
+        f"Scan complete for image {image_id}: "
+        f"{scan_result['total_vulnerabilities']} vulns, risk={image.risk_score}"
+    )
 
     return ImageScanResponse(
-        status="queued",
+        status="completed",
         image_id=image_id,
-        vulnerabilities=image.vulnerability_count_critical
-        + image.vulnerability_count_high,
+        vulnerabilities=scan_result["total_vulnerabilities"],
         risk_score=image.risk_score,
         compliance_status=image.compliance_status,
     )
@@ -471,18 +522,45 @@ async def audit_cluster(
     if not cluster:
         raise HTTPException(status_code=404, detail="Cluster not found")
 
-    # Queue async audit task
-    cluster_security_audit.delay(cluster_id, getattr(current_user, "organization_id", None))
+    # Run the actual auditor
+    auditor = K8sSecurityAuditor()
+    audit_result = await auditor.audit_cluster_config(cluster)
+    cis_result = await auditor.check_cis_k8s_benchmark(cluster)
 
-    logger.info(f"Queued audit for cluster {cluster_id}")
+    # Persist new findings to DB
+    org_id = getattr(current_user, "organization_id", None)
+    for finding in audit_result.get("findings", []):
+        db.add(K8sSecurityFinding(
+            cluster_id=cluster_id,
+            finding_type=finding["type"],
+            severity=finding["severity"],
+            description=finding.get("message", ""),
+            status="open",
+            detected_at=datetime.now(timezone.utc),
+            organization_id=org_id,
+        ))
+
+    # Update cluster scores
+    cluster.compliance_score = int(cis_result.get("compliance_percentage", 0))
+    findings_count = audit_result.get("findings_count", 0)
+    cluster.risk_score = min(100, findings_count * 15)
+    cluster.last_audit = datetime.now(timezone.utc)
+
+    await db.commit()
+    await db.refresh(cluster)
+
+    logger.info(
+        f"Audit complete for cluster {cluster_id}: "
+        f"{findings_count} findings, CIS {cis_result['compliance_percentage']}%"
+    )
 
     return ClusterAuditResponse(
-        status="queued",
+        status="completed",
         cluster_id=cluster_id,
-        findings=0,
+        findings=findings_count,
         risk_score=cluster.risk_score,
         compliance_score=cluster.compliance_score,
-        cis_compliance=0.0,
+        cis_compliance=cis_result["compliance_percentage"],
     )
 
 
@@ -505,13 +583,19 @@ async def check_cluster_compliance(
     if not cluster:
         raise HTTPException(status_code=404, detail="Cluster not found")
 
-    # Queue compliance check
-    compliance_check.delay(cluster_id, getattr(current_user, "organization_id", None))
+    # Run compliance checks
+    checker = ComplianceChecker()
+    matrix = await checker.generate_compliance_matrix(cluster)
+
+    # Update cluster compliance score
+    cluster.compliance_score = matrix.get("overall_compliance", 0)
+    await db.commit()
 
     return {
-        "status": "queued",
+        "status": "completed",
         "cluster_id": cluster_id,
-        "current_compliance_score": cluster.compliance_score,
+        "compliance_score": cluster.compliance_score,
+        "frameworks": matrix.get("frameworks", {}),
     }
 
 

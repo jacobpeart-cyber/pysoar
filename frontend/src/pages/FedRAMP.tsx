@@ -24,7 +24,7 @@ import {
   Info,
   AlertCircle,
 } from 'lucide-react';
-import { api } from '../api/client';
+import { api } from '../lib/api';
 import clsx from 'clsx';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
@@ -296,7 +296,7 @@ function ScoreGauge({ score, size = 180 }: { score: number; size?: number }) {
 // ─── Tab: Readiness Dashboard ────────────────────────────────────────────────
 
 function ReadinessTab() {
-  const { data, isLoading, error } = useQuery<ReadinessData>({
+  const { data: rawData, isLoading, error } = useQuery<any>({
     queryKey: ['fedramp', 'readiness'],
     queryFn: () => api.get('/fedramp/readiness').then((r) => r.data),
   });
@@ -310,19 +310,38 @@ function ReadinessTab() {
 
   if (isLoading) return <LoadingState message="Calculating readiness..." />;
   if (error) return <ErrorState message="Failed to load readiness data." />;
-  if (!data) return <EmptyState icon={<BarChart3 className="w-10 h-10" />} title="No Data" description="No readiness assessment has been performed yet." />;
+  if (!rawData) return <EmptyState icon={<BarChart3 className="w-10 h-10" />} title="No Data" description="No readiness assessment has been performed yet." />;
 
-  const score = data?.overall_readiness_score ?? data?.score ?? 0;
+  // Safely extract data - backend returns snake_case keys
+  const data = rawData as any;
+  const score = Number(data?.overall_readiness_score ?? data?.score ?? 0) || 0;
+  const totalControls = Number(data?.total_controls ?? 0) || 0;
+
   // Transform family_readiness dict to array for rendering
   const familyData = data?.family_readiness ?? data?.controlFamilyBreakdown ?? {};
-  const controlFamilyBreakdown = Array.isArray(familyData) ? familyData : Object.entries(familyData).map(([key, val]: [string, any]) => ({
-    family: key,
-    percentImplemented: val?.readiness_pct ?? 0,
-    implemented: val?.implemented ?? 0,
-    total: val?.total ?? 0,
-  }));
+  const controlFamilyBreakdown: { family: string; percentImplemented: number; implemented: number; total: number }[] =
+    Array.isArray(familyData)
+      ? familyData
+      : Object.entries(familyData || {}).map(([key, val]: [string, any]) => ({
+          family: key,
+          percentImplemented: Number(val?.readiness_pct ?? 0) || 0,
+          implemented: Number(val?.implemented ?? 0) || 0,
+          total: Number(val?.total ?? 0) || 0,
+        }));
+
   const gapSummary = data?.status_breakdown ?? data?.gap_analysis ?? data?.gapSummary ?? {};
-  const recommendations = data?.recommendations ?? [];
+
+  // Backend returns [{priority: "Critical", action: "..."}] — normalize to display format
+  const rawRecs: any[] = Array.isArray(data?.recommendations) ? data.recommendations : [];
+  const recommendations = rawRecs.map((rec: any, i: number) => ({
+    id: rec?.id ?? `rec-${i}`,
+    priority: rec?.priority ?? 'Medium',
+    title: rec?.title ?? rec?.action ?? 'Recommendation',
+    description: rec?.description ?? rec?.action ?? '',
+    controlFamily: rec?.controlFamily ?? rec?.control_family ?? '',
+    effort: rec?.effort ?? '',
+  }));
+
   const maxBarWidth = 100;
 
   return (
@@ -348,10 +367,10 @@ function ReadinessTab() {
           <h3 className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-4">Gap Summary</h3>
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-6">
             {[
-              { label: 'Implemented', count: gapSummary.implemented ?? 0, color: 'text-green-600 dark:text-green-400', bg: 'bg-green-50 dark:bg-green-900/20' },
-              { label: 'Partial', count: gapSummary.partially_implemented ?? gapSummary.partial ?? 0, color: 'text-yellow-600 dark:text-yellow-400', bg: 'bg-yellow-50 dark:bg-yellow-900/20' },
-              { label: 'Planned', count: gapSummary.planned ?? gapSummary.not_assessed ?? 0, color: 'text-blue-600 dark:text-blue-400', bg: 'bg-blue-50 dark:bg-blue-900/20' },
-              { label: 'Not Implemented', count: gapSummary.not_implemented ?? gapSummary.alternative ?? 0, color: 'text-red-600 dark:text-red-400', bg: 'bg-red-50 dark:bg-red-900/20' },
+              { label: 'Implemented', count: gapSummary?.implemented ?? 0, color: 'text-green-600 dark:text-green-400', bg: 'bg-green-50 dark:bg-green-900/20' },
+              { label: 'Partial', count: gapSummary?.partially_implemented ?? gapSummary?.partial ?? 0, color: 'text-yellow-600 dark:text-yellow-400', bg: 'bg-yellow-50 dark:bg-yellow-900/20' },
+              { label: 'Planned', count: gapSummary?.planned ?? gapSummary?.not_assessed ?? 0, color: 'text-blue-600 dark:text-blue-400', bg: 'bg-blue-50 dark:bg-blue-900/20' },
+              { label: 'Not Implemented', count: gapSummary?.not_implemented ?? gapSummary?.alternative ?? 0, color: 'text-red-600 dark:text-red-400', bg: 'bg-red-50 dark:bg-red-900/20' },
             ].map((item) => (
               <div key={item.label} className={clsx('rounded-lg p-4 text-center', item.bg)}>
                 <p className={clsx('text-2xl font-bold', item.color)}>{item.count}</p>
@@ -360,37 +379,39 @@ function ReadinessTab() {
             ))}
           </div>
           <div className="text-xs text-gray-500 dark:text-gray-400">
-            Total Controls: <span className="font-semibold text-gray-700 dark:text-gray-300">{data?.total_controls ?? gapSummary.total ?? 0}</span>
+            Total Controls: <span className="font-semibold text-gray-700 dark:text-gray-300">{totalControls}</span>
           </div>
         </div>
       </div>
 
       {/* Control family breakdown */}
-      <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
-        <h3 className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-4">Control Family Breakdown</h3>
-        <div className="space-y-3">
-          {controlFamilyBreakdown.map((cf) => (
-            <div key={cf.family} className="flex items-center gap-3">
-              <span className="w-10 text-xs font-mono font-semibold text-gray-600 dark:text-gray-400">{cf.family}</span>
-              <div className="flex-1 bg-gray-100 dark:bg-gray-700 rounded-full h-5 overflow-hidden">
-                <div
-                  className={clsx(
-                    'h-full rounded-full transition-all duration-500',
-                    cf.percentImplemented >= 80 ? 'bg-green-500' : cf.percentImplemented >= 50 ? 'bg-yellow-500' : 'bg-red-500'
-                  )}
-                  style={{ width: `${Math.min(cf.percentImplemented, maxBarWidth)}%` }}
-                />
+      {controlFamilyBreakdown.length > 0 && (
+        <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
+          <h3 className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-4">Control Family Breakdown</h3>
+          <div className="space-y-3">
+            {controlFamilyBreakdown.map((cf, idx) => (
+              <div key={cf.family || idx} className="flex items-center gap-3">
+                <span className="w-10 text-xs font-mono font-semibold text-gray-600 dark:text-gray-400">{cf.family}</span>
+                <div className="flex-1 bg-gray-100 dark:bg-gray-700 rounded-full h-5 overflow-hidden">
+                  <div
+                    className={clsx(
+                      'h-full rounded-full transition-all duration-500',
+                      cf.percentImplemented >= 80 ? 'bg-green-500' : cf.percentImplemented >= 50 ? 'bg-yellow-500' : 'bg-red-500'
+                    )}
+                    style={{ width: `${Math.min(cf.percentImplemented, maxBarWidth)}%` }}
+                  />
+                </div>
+                <span className="w-14 text-xs text-right font-medium text-gray-600 dark:text-gray-400">
+                  {cf.percentImplemented}%
+                </span>
+                <span className="w-16 text-xs text-right text-gray-400 dark:text-gray-500">
+                  {cf.implemented}/{cf.total}
+                </span>
               </div>
-              <span className="w-14 text-xs text-right font-medium text-gray-600 dark:text-gray-400">
-                {cf.percentImplemented}%
-              </span>
-              <span className="w-16 text-xs text-right text-gray-400 dark:text-gray-500">
-                {cf.implemented}/{cf.total}
-              </span>
-            </div>
-          ))}
+            ))}
+          </div>
         </div>
-      </div>
+      )}
 
       {/* Recommendations */}
       <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
@@ -406,9 +427,10 @@ function ReadinessTab() {
               >
                 <span
                   className={clsx(
-                    'shrink-0 mt-0.5 inline-flex items-center justify-center w-7 h-7 rounded text-xs font-bold',
-                    rec.priority === 'P1' ? 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400' :
-                    rec.priority === 'P2' ? 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400' :
+                    'shrink-0 mt-0.5 inline-flex items-center justify-center px-2 py-1 rounded text-xs font-bold',
+                    rec.priority === 'Critical' || rec.priority === 'P1' ? 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400' :
+                    rec.priority === 'High' || rec.priority === 'P2' ? 'bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-400' :
+                    rec.priority === 'Medium' ? 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400' :
                     'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400'
                   )}
                 >
@@ -416,20 +438,27 @@ function ReadinessTab() {
                 </span>
                 <div className="flex-1 min-w-0">
                   <p className="text-sm font-medium text-gray-800 dark:text-gray-200">{rec.title}</p>
-                  <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">{rec.description}</p>
-                  <div className="flex items-center gap-3 mt-1.5">
-                    <span className="text-xs text-gray-400 dark:text-gray-500">Family: {rec.controlFamily}</span>
-                    <span className={clsx(
-                      'text-xs px-1.5 py-0.5 rounded',
-                      rec.effort === 'low' ? 'bg-green-50 text-green-700 dark:bg-green-900/20 dark:text-green-400' :
-                      rec.effort === 'medium' ? 'bg-yellow-50 text-yellow-700 dark:bg-yellow-900/20 dark:text-yellow-400' :
-                      'bg-red-50 text-red-700 dark:bg-red-900/20 dark:text-red-400'
-                    )}>
-                      {rec.effort} effort
-                    </span>
-                  </div>
+                  {rec.description && rec.description !== rec.title && (
+                    <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">{rec.description}</p>
+                  )}
+                  {(rec.controlFamily || rec.effort) && (
+                    <div className="flex items-center gap-3 mt-1.5">
+                      {rec.controlFamily && (
+                        <span className="text-xs text-gray-400 dark:text-gray-500">Family: {rec.controlFamily}</span>
+                      )}
+                      {rec.effort && (
+                        <span className={clsx(
+                          'text-xs px-1.5 py-0.5 rounded',
+                          rec.effort === 'low' ? 'bg-green-50 text-green-700 dark:bg-green-900/20 dark:text-green-400' :
+                          rec.effort === 'medium' ? 'bg-yellow-50 text-yellow-700 dark:bg-yellow-900/20 dark:text-yellow-400' :
+                          'bg-red-50 text-red-700 dark:bg-red-900/20 dark:text-red-400'
+                        )}>
+                          {rec.effort} effort
+                        </span>
+                      )}
+                    </div>
+                  )}
                 </div>
-                <ArrowUpRight className="w-4 h-4 text-gray-400 shrink-0" />
               </div>
             ))}
           </div>
@@ -466,13 +495,19 @@ function ControlsTab() {
 
   const filtered = useMemo(() => {
     if (!controls) return [];
-    return controls.filter((c) => {
-      if (familyFilter && c.family !== familyFilter) return false;
-      if (statusFilter && c.status !== statusFilter) return false;
-      if (priorityFilter && c.priority !== priorityFilter) return false;
+    return controls.filter((c: any) => {
+      const cFamily = c.family || '';
+      const cStatus = c.implementation_status || c.status || '';
+      const cPriority = c.priority || '';
+      const cId = c.controlId || c.id || '';
+      const cTitle = c.title || '';
+      // Family filter: backend returns full name like "Access Control", filter uses short code like "AC"
+      if (familyFilter && !cId.startsWith(familyFilter + '-') && cFamily !== familyFilter) return false;
+      if (statusFilter && cStatus !== statusFilter) return false;
+      if (priorityFilter && cPriority !== priorityFilter) return false;
       if (searchTerm) {
         const term = searchTerm.toLowerCase();
-        if (!c.controlId.toLowerCase().includes(term) && !c.title.toLowerCase().includes(term)) return false;
+        if (!cId.toLowerCase().includes(term) && !cTitle.toLowerCase().includes(term)) return false;
       }
       return true;
     });
@@ -599,9 +634,9 @@ function ControlRow({
         <td className="px-4 py-3 text-gray-400">
           {isExpanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
         </td>
-        <td className="px-4 py-3 font-mono font-medium text-gray-900 dark:text-gray-100">{control.id}</td>
+        <td className="px-4 py-3 font-mono font-medium text-gray-900 dark:text-gray-100">{(control as any).controlId || control.id}</td>
         <td className="px-4 py-3 text-gray-600 dark:text-gray-400">{control.family}</td>
-        <td className="px-4 py-3 text-gray-800 dark:text-gray-200 max-w-xs truncate">{control.title}</td>
+        <td className="px-4 py-3 text-gray-800 dark:text-gray-200 max-w-xs truncate">{control.title || 'Untitled'}</td>
         <td className="px-4 py-3">
           <span
             className={clsx(
@@ -713,8 +748,12 @@ function POAMTab() {
   if (error) return <ErrorState message="Failed to load POA&M report." />;
   if (!data) return <EmptyState icon={<ClipboardList className="w-10 h-10" />} title="No POA&Ms" description="No plan of action and milestones items found." />;
 
-  const { items, summary, timelineData } = data;
-  const maxTimelineValue = Math.max(...timelineData.flatMap((t) => [t.open, t.closed, t.new]), 1);
+  const items: any[] = Array.isArray(data?.items) ? data.items : [];
+  const summary = data?.summary ?? { total: 0, open: 0, inProgress: 0, in_progress: 0, closed: 0, delayed: 0, overdue: 0 };
+  // Normalize in_progress vs inProgress
+  if (summary.inProgress === undefined) summary.inProgress = summary.in_progress ?? 0;
+  const timelineData: any[] = Array.isArray(data?.timelineData ?? data?.timeline_data) ? (data.timelineData ?? data.timeline_data) : [];
+  const maxTimelineValue = timelineData.length > 0 ? Math.max(...timelineData.flatMap((t: any) => [t.open ?? 0, t.closed ?? 0, t.new ?? 0]), 1) : 1;
 
   return (
     <div className="space-y-6">
@@ -808,27 +847,30 @@ function POAMTab() {
                   </td>
                 </tr>
               ) : (
-                items.map((item) => {
-                  const isOverdue = new Date(item.scheduledCompletionDate) < new Date() && item.status !== 'closed';
+                items.map((item: any, idx: number) => {
+                  const dueDate = item.scheduledCompletionDate ?? item.scheduled_completion_date ?? '';
+                  const itemStatus = item.status ?? 'open';
+                  const isOverdue = dueDate && new Date(dueDate) < new Date() && itemStatus !== 'closed';
+                  const riskLvl = item.riskLevel ?? item.risk_level ?? item.severity ?? 'moderate';
                   return (
-                    <tr key={item.id} className="hover:bg-gray-50 dark:hover:bg-gray-700/40 transition-colors">
-                      <td className="px-4 py-3 font-mono text-xs font-medium text-gray-900 dark:text-gray-100">{item.poamId}</td>
-                      <td className="px-4 py-3 font-mono text-xs text-gray-600 dark:text-gray-400">{item.controlId}</td>
-                      <td className="px-4 py-3 text-gray-800 dark:text-gray-200 max-w-xs truncate">{item.weakness}</td>
+                    <tr key={item.id ?? idx} className="hover:bg-gray-50 dark:hover:bg-gray-700/40 transition-colors">
+                      <td className="px-4 py-3 font-mono text-xs font-medium text-gray-900 dark:text-gray-100">{item.poamId ?? item.poam_id ?? '-'}</td>
+                      <td className="px-4 py-3 font-mono text-xs text-gray-600 dark:text-gray-400">{item.controlId ?? item.control_id ?? '-'}</td>
+                      <td className="px-4 py-3 text-gray-800 dark:text-gray-200 max-w-xs truncate">{item.weakness ?? item.weakness_description ?? '-'}</td>
                       <td className="px-4 py-3">
-                        <span className={clsx('inline-flex items-center px-2 py-0.5 rounded text-xs font-medium capitalize', riskColor(item.riskLevel))}>
-                          {item.riskLevel}
+                        <span className={clsx('inline-flex items-center px-2 py-0.5 rounded text-xs font-medium capitalize', riskColor(riskLvl))}>
+                          {riskLvl}
                         </span>
                       </td>
                       <td className="px-4 py-3">
-                        <span className={clsx('inline-flex items-center px-2 py-0.5 rounded text-xs font-medium', poamStatusColor(item.status))}>
-                          {item.status.replace('_', ' ')}
+                        <span className={clsx('inline-flex items-center px-2 py-0.5 rounded text-xs font-medium', poamStatusColor(itemStatus))}>
+                          {String(itemStatus).replace('_', ' ')}
                         </span>
                       </td>
-                      <td className="px-4 py-3 text-xs text-gray-600 dark:text-gray-400">{item.assignedTo}</td>
+                      <td className="px-4 py-3 text-xs text-gray-600 dark:text-gray-400">{item.assignedTo ?? item.assigned_to ?? item.responsible_party ?? '-'}</td>
                       <td className="px-4 py-3">
                         <span className={clsx('text-xs', isOverdue ? 'text-red-600 dark:text-red-400 font-semibold' : 'text-gray-600 dark:text-gray-400')}>
-                          {item.scheduledCompletionDate}
+                          {dueDate || '-'}
                           {isOverdue && <AlertTriangle className="w-3 h-3 inline ml-1" />}
                         </span>
                       </td>
@@ -864,7 +906,9 @@ function EvidenceTab() {
   if (error) return <ErrorState message="Failed to load evidence status." />;
   if (!data) return <EmptyState icon={<FolderOpen className="w-10 h-10" />} title="No Evidence Data" description="Evidence collection has not been configured." />;
 
-  const { families, overallCollected, overallRequired } = data;
+  const families: any[] = Array.isArray(data?.families) ? data.families : [];
+  const overallCollected = Number(data?.overallCollected ?? data?.overall_collected ?? 0) || 0;
+  const overallRequired = Number(data?.overallRequired ?? data?.overall_required ?? 0) || 0;
   const overallPercent = overallRequired > 0 ? Math.round((overallCollected / overallRequired) * 100) : 0;
 
   return (
@@ -944,9 +988,9 @@ function EvidenceTab() {
               {/* Control-level detail */}
               {fam.controls.length > 0 && (
                 <div className="mt-3 pt-3 border-t border-gray-100 dark:border-gray-700 space-y-1.5 max-h-32 overflow-y-auto">
-                  {fam.controls.map((ctrl) => (
-                    <div key={ctrl.id} className="flex items-center justify-between text-xs">
-                      <span className="font-mono text-gray-600 dark:text-gray-400">{ctrl.id}</span>
+                  {fam.controls.map((ctrl: any, idx: number) => (
+                    <div key={ctrl.id ?? ctrl.controlId ?? idx} className="flex items-center justify-between text-xs">
+                      <span className="font-mono text-gray-600 dark:text-gray-400">{ctrl.controlId ?? ctrl.id ?? '-'}</span>
                       {ctrl.hasEvidence ? (
                         <span className="flex items-center gap-1 text-green-600 dark:text-green-400">
                           <CheckCircle2 className="w-3 h-3" /> Collected
@@ -1078,15 +1122,18 @@ function DocumentsTab() {
 export default function FedRAMP() {
   const [activeTab, setActiveTab] = useState<TabType>('readiness');
 
-  const { data: readinessData } = useQuery<ReadinessData>({
+  const { data: readinessData } = useQuery<any>({
     queryKey: ['fedramp', 'readiness'],
     queryFn: () => api.get('/fedramp/readiness').then((r) => r.data),
     staleTime: 60_000,
   });
 
-  const badge = readinessData?.badge ?? 'Not Ready';
-  const lastAssessment = readinessData?.lastAssessmentDate
-    ? new Date(readinessData.lastAssessmentDate).toLocaleDateString('en-US', {
+  // Derive badge from score since backend doesn't return a badge field
+  const readinessScore = Number(readinessData?.overall_readiness_score ?? readinessData?.score ?? 0) || 0;
+  const badge: ReadinessBadge = readinessScore >= 80 ? 'Ready' : readinessScore >= 40 ? 'In Progress' : 'Not Ready';
+  const generatedAt = readinessData?.generated_at ?? readinessData?.lastAssessmentDate;
+  const lastAssessment = generatedAt
+    ? new Date(generatedAt).toLocaleDateString('en-US', {
         year: 'numeric',
         month: 'short',
         day: 'numeric',
