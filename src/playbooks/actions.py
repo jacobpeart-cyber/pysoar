@@ -180,11 +180,34 @@ class UpdateAlertAction(PlaybookAction):
             if k in ["status", "severity", "assigned_to", "resolution_notes"]
         }
 
-        # In production, this would update the database
-        logger.info(f"Updating alert {alert_id}", updates=updates)
+        try:
+            import asyncio
+            from src.core.database import async_session_factory
+            from src.models.alert import Alert
+            from sqlalchemy import select
+
+            async def _update():
+                async with async_session_factory() as db:
+                    result = await db.execute(select(Alert).where(Alert.id == alert_id))
+                    alert = result.scalars().first()
+                    if alert:
+                        for key, value in updates.items():
+                            if hasattr(alert, key):
+                                setattr(alert, key, value)
+                        await db.commit()
+                        return True
+                    return False
+
+            loop = asyncio.new_event_loop()
+            updated = loop.run_until_complete(_update())
+            loop.close()
+            logger.info(f"Updated alert {alert_id}: {updated}")
+        except Exception as e:
+            logger.error(f"Failed to update alert {alert_id}: {e}")
+            updated = False
 
         return {
-            "success": True,
+            "success": updated,
             "alert_id": alert_id,
             "updates": updates,
         }
@@ -204,12 +227,37 @@ class CreateIncidentAction(PlaybookAction):
         title = parameters.get("title") or context.get("alert_title", "New Incident")
         severity = parameters.get("severity") or context.get("severity", "medium")
 
-        # In production, this would create in database
-        logger.info(f"Creating incident: {title}")
+        try:
+            import asyncio, uuid
+            from src.core.database import async_session_factory
+            from src.models.incident import Incident
+
+            async def _create():
+                async with async_session_factory() as db:
+                    incident = Incident(
+                        id=str(uuid.uuid4()),
+                        title=title,
+                        description=parameters.get("description", f"Auto-created from playbook. Alert: {context.get('alert_id', 'N/A')}"),
+                        severity=severity,
+                        status="open",
+                        incident_type=parameters.get("type", "other"),
+                    )
+                    db.add(incident)
+                    await db.commit()
+                    return incident.id
+
+            loop = asyncio.new_event_loop()
+            incident_id = loop.run_until_complete(_create())
+            loop.close()
+            logger.info(f"Created incident {incident_id}: {title}")
+        except Exception as e:
+            logger.error(f"Failed to create incident: {e}")
+            incident_id = None
 
         return {
-            "success": True,
-            "incident_created": True,
+            "success": incident_id is not None,
+            "incident_created": incident_id is not None,
+            "incident_id": incident_id,
             "title": title,
             "severity": severity,
         }
@@ -232,14 +280,33 @@ class RunScriptAction(PlaybookAction):
         if not script_name:
             return {"success": False, "error": "No script name provided"}
 
-        # In production, this would execute approved scripts
-        logger.info(f"Executing script: {script_name}", arguments=script_args)
+        import subprocess
+        try:
+            cmd = [script_name] + [str(v) for v in script_args.values()] if script_args else [script_name]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60, shell=False)
+            logger.info(f"Script {script_name} completed with return code {result.returncode}")
+            output = result.stdout[:2000] if result.stdout else ""
+            error = result.stderr[:500] if result.stderr else ""
+        except subprocess.TimeoutExpired:
+            output = ""
+            error = "Script timed out after 60 seconds"
+            result = type("R", (), {"returncode": -1})()
+        except FileNotFoundError:
+            output = ""
+            error = f"Script not found: {script_name}"
+            result = type("R", (), {"returncode": -1})()
+        except Exception as e:
+            output = ""
+            error = str(e)
+            result = type("R", (), {"returncode": -1})()
 
         return {
-            "success": True,
+            "success": result.returncode == 0,
             "script": script_name,
             "arguments": script_args,
-            "output": "Script execution simulated",
+            "return_code": result.returncode,
+            "output": output,
+            "error": error,
         }
 
 

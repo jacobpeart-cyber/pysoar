@@ -268,11 +268,21 @@ class LogStorageManager:
                 logs_to_archive = archive_result.scalars().all()
 
                 if logs_to_archive:
-                    # Export to Parquet (placeholder for actual implementation)
+                    # Export archived logs to compressed JSON file
+                    import json, gzip, os
+                    from datetime import datetime, timezone
+                    archive_dir = os.environ.get("ARCHIVE_DIR", "/app/archives")
+                    os.makedirs(archive_dir, exist_ok=True)
+                    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+                    archive_path = os.path.join(archive_dir, f"logs_archive_{timestamp}.json.gz")
+                    archived_data = [
+                        {"id": log.id, "timestamp": log.timestamp, "raw_log": log.raw_log, "severity": log.severity, "source_name": log.source_name}
+                        for log in logs_to_archive
+                    ]
+                    with gzip.open(archive_path, "wt", encoding="utf-8") as f:
+                        json.dump(archived_data, f)
                     archived_count = len(logs_to_archive)
-                    print(
-                        f"Archived {archived_count} logs to cold storage"
-                    )
+                    logger.info(f"Archived {archived_count} logs to {archive_path}")
 
             except Exception as e:
                 print(f"Error archiving logs: {e}")

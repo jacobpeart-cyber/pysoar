@@ -133,15 +133,23 @@ def firmware_audit(self, organization_id: str):
 
         assessor = OTVulnerabilityAssessor(organization_id)
 
-        async def _audit():
-            # In production, fetch assets from database
-            assets = []
-            vulnerabilities = await assessor.scan_firmware_versions(assets)
-            logger.info(f"Found {len(vulnerabilities)} firmware vulnerabilities")
-            return {"vulnerabilities": len(vulnerabilities)}
+        from src.core.database import async_session_factory
+        from src.ot_security.models import OTAsset
+        from sqlalchemy import select
+        import asyncio
 
-        logger.info(f"Firmware audit task for {organization_id} queued")
-        return {"status": "queued"}
+        async def _audit():
+            async with async_session_factory() as db:
+                result = await db.execute(select(OTAsset).where(OTAsset.organization_id == organization_id).limit(500))
+                assets = list(result.scalars().all())
+                vulnerabilities = await assessor.scan_firmware_versions(assets)
+                logger.info(f"Found {len(vulnerabilities)} firmware vulnerabilities across {len(assets)} assets")
+                return {"vulnerabilities": len(vulnerabilities), "assets_scanned": len(assets)}
+
+        loop = asyncio.new_event_loop()
+        audit_result = loop.run_until_complete(_audit())
+        loop.close()
+        return {"status": "completed", **audit_result}
 
     except Exception as exc:
         logger.error(f"Firmware audit failed: {str(exc)}")
@@ -168,8 +176,12 @@ def zone_compliance_check(self, organization_id: str):
         enforcer = PurdueModelEnforcer(organization_id)
 
         async def _check():
-            # In production, fetch zones from database
-            zones = []
+            from src.core.database import async_session_factory
+            from src.ot_security.models import OTZone
+            from sqlalchemy import select
+            async with async_session_factory() as db:
+                result = await db.execute(select(OTZone).where(OTZone.organization_id == organization_id))
+                zones = list(result.scalars().all())
             report = await enforcer.generate_zone_compliance_report(zones)
             logger.info(
                 f"Zone compliance: {report.get('maturity_level')}, "
@@ -205,8 +217,15 @@ def safety_system_check(self, organization_id: str):
         safety_mgr = SafetyManager(organization_id)
 
         async def _check():
-            # In production, fetch safety-critical assets from database
-            assets = []
+            from src.core.database import async_session_factory
+            from src.ot_security.models import OTAsset
+            from sqlalchemy import select
+            async with async_session_factory() as db:
+                result = await db.execute(select(OTAsset).where(
+                    OTAsset.organization_id == organization_id,
+                    OTAsset.criticality == "safety_critical",
+                ).limit(200))
+                assets = list(result.scalars().all())
             monitoring = await safety_mgr.monitor_safety_systems(assets)
             logger.info(
                 f"Safety system check: {len(monitoring.get('safety_systems', []))} "
@@ -214,8 +233,11 @@ def safety_system_check(self, organization_id: str):
             )
             return monitoring
 
-        logger.info(f"Safety system check task for {organization_id} queued")
-        return {"status": "queued"}
+        import asyncio
+        loop = asyncio.new_event_loop()
+        check_result = loop.run_until_complete(_check())
+        loop.close()
+        return {"status": "completed", **check_result}
 
     except Exception as exc:
         logger.error(f"Safety system check failed: {str(exc)}")
