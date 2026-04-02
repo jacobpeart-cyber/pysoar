@@ -23,63 +23,60 @@ import clsx from 'clsx';
 
 type TabType = 'overview' | 'controls' | 'poams' | 'cui' | 'cisa';
 
-interface Framework {
-  id: string;
-  name: string;
-  score: number;
-  status: 'compliant' | 'partially' | 'non-compliant';
-  controlsImplemented: number;
-  controlsTotal: number;
-  lastAssessment: string;
-}
-
 interface DashboardData {
-  overallScore: number;
-  frameworks: Framework[];
-  overduePOAMs: number;
+  overall_compliance_score: number;
+  frameworks_total: number;
+  frameworks_compliant: number;
+  framework_scores: Array<{ name: string; score: number }>;
+  overdue_poams: number;
+  upcoming_poams?: number;
+  upcoming_assessments: number;
+  control_status_breakdown: { total: number; implemented: number };
+  active_cisa_directives: number;
+  cui_assets_total: number;
+  cui_assets_active?: number;
   trends: Array<{ date: string; score: number }>;
-  upcomingAssessments: Array<{ framework: string; date: string }>;
+  last_updated?: string;
 }
 
 interface Control {
   id: string;
   title: string;
-  family: string;
+  control_family: string;
   status: 'implemented' | 'partially' | 'planned' | 'not_implemented';
-  implementationPercentage: number;
+  implementation_status: string;
   baseline: 'L' | 'M' | 'H';
-  lastAssessed: string;
-  evidenceCount: number;
+  last_assessed_at: string;
+  evidence_ids: string[];
   description?: string;
   relatedControls?: string[];
 }
 
 interface POAM {
   id: string;
-  weakness: string;
-  riskLevel: 'high' | 'medium' | 'low';
+  weakness_name: string;
+  risk_level: 'high' | 'medium' | 'low';
   status: 'open' | 'in_progress' | 'completed';
-  scheduledDate: string;
-  assignedTo: string;
-  daysRemaining: number;
+  scheduled_completion_date: string;
+  assigned_to: string;
 }
 
 interface CUIAsset {
   id: string;
-  asset: string;
-  type: string;
-  cuiCategory: string;
-  designation: string;
-  disseminationControls: string;
-  classificationAuthority: string;
+  asset_id: string;
+  asset_type: string;
+  cui_category: string;
+  cui_designation: string;
+  dissemination_controls: string[];
+  classification_authority: string;
 }
 
 interface CISADirective {
   id: string;
   title: string;
-  deadline: string;
+  compliance_deadline: string;
   status: 'open' | 'in_progress' | 'completed';
-  actionsTaken: number;
+  actions_taken: string[];
 }
 
 export default function ComplianceDashboard() {
@@ -104,7 +101,7 @@ export default function ComplianceDashboard() {
     queryKey: ['compliance-controls', frameworkFilter, familyFilter, statusFilter],
     queryFn: async () => {
       const params = new URLSearchParams();
-      if (frameworkFilter !== 'all') params.append('framework', frameworkFilter);
+      if (frameworkFilter !== 'all') params.append('framework_id', frameworkFilter);
       if (familyFilter !== 'all') params.append('family', familyFilter);
       if (statusFilter !== 'all') params.append('status', statusFilter);
       const response = await api.get(`/compliance/controls?${params}`);
@@ -117,7 +114,7 @@ export default function ComplianceDashboard() {
     queryFn: async () => {
       const params = new URLSearchParams();
       if (poamStatusFilter !== 'all') params.append('status', poamStatusFilter);
-      if (riskLevelFilter !== 'all') params.append('riskLevel', riskLevelFilter);
+      if (riskLevelFilter !== 'all') params.append('risk_level', riskLevelFilter);
       const response = await api.get(`/compliance/poams?${params}`);
       return response.data;
     },
@@ -218,7 +215,6 @@ export default function ComplianceDashboard() {
         <OverviewTab
           data={dashboardData}
           loading={dashboardLoading}
-          frameworks={dashboardData?.frameworks || []}
         />
       )}
 
@@ -235,7 +231,7 @@ export default function ComplianceDashboard() {
           setFamilyFilter={setFamilyFilter}
           statusFilter={statusFilter}
           setStatusFilter={setStatusFilter}
-          frameworks={dashboardData?.frameworks || []}
+          frameworkScores={dashboardData?.framework_scores || []}
         />
       )}
 
@@ -249,7 +245,7 @@ export default function ComplianceDashboard() {
           riskLevelFilter={riskLevelFilter}
           setRiskLevelFilter={setRiskLevelFilter}
           onDeletePOAM={(id) => deletePOAMMutation.mutate(id)}
-          overduePOAMs={dashboardData?.overduePOAMs || 0}
+          overduePOAMs={dashboardData?.overdue_poams || 0}
         />
       )}
 
@@ -275,11 +271,9 @@ export default function ComplianceDashboard() {
 function OverviewTab({
   data,
   loading,
-  frameworks,
 }: {
   data?: DashboardData;
   loading: boolean;
-  frameworks: Framework[];
 }) {
   if (loading) {
     return (
@@ -316,12 +310,12 @@ function OverviewTab({
                   fill="none"
                   stroke="currentColor"
                   strokeWidth="8"
-                  strokeDasharray={`${(data?.overallScore || 0) * 3.4} 340`}
+                  strokeDasharray={`${(data?.overall_compliance_score || 0) * 3.4} 340`}
                   className={clsx(
                     'transition-all duration-500',
-                    (data?.overallScore || 0) >= 80
+                    (data?.overall_compliance_score || 0) >= 80
                       ? 'text-green-500'
-                      : (data?.overallScore || 0) >= 60
+                      : (data?.overall_compliance_score || 0) >= 60
                       ? 'text-yellow-500'
                       : 'text-red-500'
                   )}
@@ -330,7 +324,7 @@ function OverviewTab({
               <div className="absolute inset-0 flex items-center justify-center">
                 <div className="text-center">
                   <div className="text-3xl font-bold text-gray-900 dark:text-white">
-                    {data?.overallScore || 0}
+                    {data?.overall_compliance_score || 0}
                   </div>
                   <div className="text-xs text-gray-500 dark:text-gray-400">%</div>
                 </div>
@@ -353,34 +347,37 @@ function OverviewTab({
       </div>
 
       {/* Overdue POA&Ms Alert */}
-      {data && data.overduePOAMs > 0 && (
+      {data && data.overdue_poams > 0 && (
         <div className="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg p-4 flex items-start gap-3">
           <AlertTriangle className="w-5 h-5 text-red-600 dark:text-red-400 flex-shrink-0 mt-0.5" />
           <div>
             <h3 className="font-semibold text-red-800 dark:text-red-400">Overdue POA&Ms</h3>
             <p className="text-sm text-red-700 dark:text-red-300">
-              {data.overduePOAMs} Plan of Action and Milestones are overdue. Review and update schedules immediately.
+              {data.overdue_poams} Plan of Action and Milestones are overdue. Review and update schedules immediately.
             </p>
           </div>
         </div>
       )}
 
-      {/* Framework Cards Grid */}
+      {/* Stat Cards */}
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+        <StatCard label="Frameworks" value={data?.frameworks_total ?? 0} icon={FileText} color="blue" />
+        <StatCard label="Compliant" value={data?.frameworks_compliant ?? 0} icon={CheckCircle} color="green" />
+        <StatCard label="Overdue POA&Ms" value={data?.overdue_poams ?? 0} icon={AlertTriangle} color="red" />
+        <StatCard label="CISA Directives" value={data?.active_cisa_directives ?? 0} icon={AlertCircle} color="orange" />
+      </div>
+
+      {/* Framework Score Cards */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-        {frameworks.map((framework) => (
+        {(data?.framework_scores ?? []).map((fw) => (
           <div
-            key={framework.id}
+            key={fw.name}
             className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-5"
           >
             <div className="flex items-start justify-between mb-4">
-              <div>
-                <h3 className="font-semibold text-gray-900 dark:text-white">
-                  {framework.name}
-                </h3>
-              </div>
-              <span className={clsx('text-xs font-semibold px-2.5 py-1 rounded-full', getStatusBadgeColor(framework.status))}>
-                {framework.status.replace(/-/g, ' ').replace('non compliant', 'Non-Compliant')}
-              </span>
+              <h3 className="font-semibold text-gray-900 dark:text-white">
+                {fw.name}
+              </h3>
             </div>
 
             <div className="space-y-3">
@@ -388,37 +385,23 @@ function OverviewTab({
               <div>
                 <div className="flex items-end justify-between mb-1">
                   <span className="text-xs text-gray-600 dark:text-gray-400">Score</span>
-                  <span className={clsx('text-lg font-bold', getScoreColor(framework.score))}>
-                    {framework.score}
+                  <span className={clsx('text-lg font-bold', getScoreColor(fw.score ?? 0))}>
+                    {fw.score ?? 0}
                   </span>
                 </div>
                 <div className="h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
                   <div
                     className={clsx(
                       'h-full rounded-full transition-all duration-300',
-                      framework.score >= 80
+                      (fw.score ?? 0) >= 80
                         ? 'bg-green-500'
-                        : framework.score >= 60
+                        : (fw.score ?? 0) >= 60
                         ? 'bg-yellow-500'
                         : 'bg-red-500'
                     )}
-                    style={{ width: `${framework.score}%` }}
+                    style={{ width: `${fw.score ?? 0}%` }}
                   />
                 </div>
-              </div>
-
-              {/* Control Counts */}
-              <div className="text-sm">
-                <div className="text-gray-600 dark:text-gray-400">
-                  Controls: <span className="font-semibold text-gray-900 dark:text-white">
-                    {framework.controlsImplemented}/{framework.controlsTotal}
-                  </span>
-                </div>
-              </div>
-
-              {/* Last Assessment */}
-              <div className="text-xs text-gray-500 dark:text-gray-400">
-                Last assessed: {new Date(framework.lastAssessment).toLocaleDateString()}
               </div>
             </div>
           </div>
@@ -451,28 +434,16 @@ function OverviewTab({
         <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">
           Upcoming Assessments
         </h2>
-        <div className="space-y-3">
-          {(data?.upcomingAssessments || []).map((assessment, idx) => (
-            <div
-              key={idx}
-              className="flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-700/50 rounded-lg"
-            >
-              <div className="flex items-center gap-3">
-                <Calendar className="w-5 h-5 text-blue-600 dark:text-blue-400" />
-                <div>
-                  <div className="font-medium text-gray-900 dark:text-white">
-                    {assessment.framework}
-                  </div>
-                  <div className="text-sm text-gray-500 dark:text-gray-400">
-                    {new Date(assessment.date).toLocaleDateString()}
-                  </div>
-                </div>
-              </div>
-              <button className="text-blue-600 dark:text-blue-400 hover:underline text-sm font-medium">
-                Schedule
-              </button>
+        <div className="flex items-center gap-3 p-3 bg-gray-50 dark:bg-gray-700/50 rounded-lg">
+          <Calendar className="w-5 h-5 text-blue-600 dark:text-blue-400" />
+          <div>
+            <div className="font-medium text-gray-900 dark:text-white">
+              {data?.upcoming_assessments ?? 0} planned assessments
             </div>
-          ))}
+            <div className="text-sm text-gray-500 dark:text-gray-400">
+              Controls: {data?.control_status_breakdown?.implemented ?? 0}/{data?.control_status_breakdown?.total ?? 0} implemented
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -490,7 +461,7 @@ function ControlsTab({
   setFamilyFilter,
   statusFilter,
   setStatusFilter,
-  frameworks,
+  frameworkScores,
 }: {
   controls: Control[];
   loading: boolean;
@@ -502,7 +473,7 @@ function ControlsTab({
   setFamilyFilter: (value: string) => void;
   statusFilter: string;
   setStatusFilter: (value: string) => void;
-  frameworks: Framework[];
+  frameworkScores: Array<{ name: string; score: number }>;
 }) {
   if (loading) {
     return (
@@ -535,8 +506,8 @@ function ControlsTab({
               className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm"
             >
               <option value="all">All Frameworks</option>
-              {frameworks.map((fw) => (
-                <option key={fw.id} value={fw.id}>
+              {frameworkScores.map((fw) => (
+                <option key={fw.name} value={fw.name}>
                   {fw.name}
                 </option>
               ))}
@@ -632,7 +603,7 @@ function ControlsTab({
                   {control.title}
                 </td>
                 <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                  {control.family}
+                  {control.control_family ?? ''}
                 </td>
                 <td className="px-6 py-4 text-sm">
                   <span
@@ -650,22 +621,14 @@ function ControlsTab({
                     {control.status}
                   </span>
                 </td>
-                <td className="px-6 py-4 text-sm">
-                  <div className="w-16 h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
-                    <div
-                      className="h-full bg-blue-500 dark:bg-blue-600"
-                      style={{ width: `${control.implementationPercentage}%` }}
-                    />
-                  </div>
-                  <span className="text-xs text-gray-500 dark:text-gray-400 ml-2">
-                    {control.implementationPercentage}%
-                  </span>
+                <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
+                  {control.implementation_status ?? 'N/A'}
                 </td>
                 <td className="px-6 py-4 text-sm font-medium text-gray-900 dark:text-white">
                   {control.baseline}
                 </td>
                 <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                  {control.evidenceCount}
+                  {control.evidence_ids?.length ?? 0}
                 </td>
               </tr>
             ))}
@@ -701,13 +664,13 @@ function ControlExpandedDetails({ control }: { control: Control }) {
         <div>
           <h4 className="text-sm font-medium text-gray-700 dark:text-gray-300">Last Assessed</h4>
           <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
-            {new Date(control.lastAssessed).toLocaleDateString()}
+            {control.last_assessed_at ? new Date(control.last_assessed_at).toLocaleDateString() : 'Never'}
           </p>
         </div>
         <div>
           <h4 className="text-sm font-medium text-gray-700 dark:text-gray-300">Evidence Items</h4>
           <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
-            {control.evidenceCount} files
+            {control.evidence_ids?.length ?? 0} files
           </p>
         </div>
       </div>
@@ -729,11 +692,17 @@ function ControlExpandedDetails({ control }: { control: Control }) {
       )}
 
       <div className="pt-4 border-t border-blue-200 dark:border-blue-800 flex gap-2">
-        <button className="inline-flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium">
+        <button
+          onClick={() => { /* TODO: navigate to evidence list for this control */ }}
+          className="inline-flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium"
+        >
           <FileText className="w-4 h-4" />
           View Evidence
         </button>
-        <button className="inline-flex items-center gap-2 px-4 py-2 bg-white dark:bg-gray-700 text-gray-900 dark:text-white border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-600 text-sm font-medium">
+        <button
+          onClick={() => { /* TODO: open control edit modal */ }}
+          className="inline-flex items-center gap-2 px-4 py-2 bg-white dark:bg-gray-700 text-gray-900 dark:text-white border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-600 text-sm font-medium"
+        >
           <Edit2 className="w-4 h-4" />
           Edit
         </button>
@@ -776,7 +745,7 @@ function POAMsTab({
   const stats = {
     open: poams.filter((p) => p.status === 'open').length,
     overdue: overduePOAMs,
-    high_risk: poams.filter((p) => p.riskLevel === 'high').length,
+    high_risk: poams.filter((p) => p.risk_level === 'high').length,
     completed: poams.filter((p) => p.status === 'completed').length,
   };
 
@@ -893,20 +862,20 @@ function POAMsTab({
                   {poam.id}
                 </td>
                 <td className="px-6 py-4 text-sm text-gray-900 dark:text-white">
-                  {poam.weakness}
+                  {poam.weakness_name ?? ''}
                 </td>
                 <td className="px-6 py-4 text-sm">
                   <span
                     className={clsx(
                       'inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium',
-                      poam.riskLevel === 'high'
+                      poam.risk_level === 'high'
                         ? 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400'
-                        : poam.riskLevel === 'medium'
+                        : poam.risk_level === 'medium'
                         ? 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-400'
                         : 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400'
                     )}
                   >
-                    {poam.riskLevel}
+                    {poam.risk_level}
                   </span>
                 </td>
                 <td className="px-6 py-4 text-sm">
@@ -924,26 +893,34 @@ function POAMsTab({
                   </span>
                 </td>
                 <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                  {new Date(poam.scheduledDate).toLocaleDateString()}
+                  {poam.scheduled_completion_date ? new Date(poam.scheduled_completion_date).toLocaleDateString() : 'N/A'}
                 </td>
                 <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                  {poam.assignedTo}
+                  {poam.assigned_to ?? ''}
                 </td>
                 <td className="px-6 py-4 text-sm">
-                  <span
-                    className={clsx(
-                      'font-medium',
-                      poam.daysRemaining < 0
-                        ? 'text-red-600 dark:text-red-400'
-                        : poam.daysRemaining < 7
-                        ? 'text-orange-600 dark:text-orange-400'
-                        : 'text-gray-600 dark:text-gray-400'
-                    )}
-                  >
-                    {poam.daysRemaining < 0
-                      ? `${Math.abs(poam.daysRemaining)} days overdue`
-                      : `${poam.daysRemaining} days`}
-                  </span>
+                  {(() => {
+                    if (!poam.scheduled_completion_date) return <span className="text-gray-400">N/A</span>;
+                    const daysRemaining = Math.ceil(
+                      (new Date(poam.scheduled_completion_date).getTime() - Date.now()) / (1000 * 60 * 60 * 24)
+                    );
+                    return (
+                      <span
+                        className={clsx(
+                          'font-medium',
+                          daysRemaining < 0
+                            ? 'text-red-600 dark:text-red-400'
+                            : daysRemaining < 7
+                            ? 'text-orange-600 dark:text-orange-400'
+                            : 'text-gray-600 dark:text-gray-400'
+                        )}
+                      >
+                        {daysRemaining < 0
+                          ? `${Math.abs(daysRemaining)} days overdue`
+                          : `${daysRemaining} days`}
+                      </span>
+                    );
+                  })()}
                 </td>
                 <td className="px-6 py-4 text-center">
                   <button
@@ -991,13 +968,13 @@ function CUITab({
         <StatCard label="CUI Assets" value={assets.length} icon={FileText} color="blue" />
         <StatCard
           label="Active Markings"
-          value={assets.filter((a) => a.designation).length}
+          value={assets.filter((a) => a.cui_designation).length}
           icon={CheckCircle}
           color="green"
         />
         <StatCard
           label="Categories Tracked"
-          value={new Set(assets.map((a) => a.cuiCategory)).size}
+          value={new Set(assets.map((a) => a.cui_category)).size}
           icon={AlertTriangle}
           color="orange"
         />
@@ -1032,22 +1009,22 @@ function CUITab({
             {assets.map((asset) => (
               <tr key={asset.id} className="hover:bg-gray-50 dark:hover:bg-gray-700/50">
                 <td className="px-6 py-4 text-sm font-medium text-gray-900 dark:text-white">
-                  {asset.asset}
+                  {asset.asset_id ?? ''}
                 </td>
                 <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                  {asset.type}
+                  {asset.asset_type ?? ''}
                 </td>
                 <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                  {asset.cuiCategory}
+                  {asset.cui_category ?? ''}
                 </td>
                 <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                  {asset.designation}
+                  {asset.cui_designation ?? ''}
                 </td>
                 <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                  {asset.disseminationControls}
+                  {Array.isArray(asset.dissemination_controls) ? asset.dissemination_controls.join(', ') : ''}
                 </td>
                 <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                  {asset.classificationAuthority}
+                  {asset.classification_authority ?? ''}
                 </td>
               </tr>
             ))}
@@ -1056,7 +1033,10 @@ function CUITab({
       </div>
 
       {/* Mark as CUI Button */}
-      <button className="inline-flex items-center gap-2 px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium">
+      <button
+        onClick={() => { /* TODO: open CUI marking modal */ }}
+        className="inline-flex items-center gap-2 px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium"
+      >
         <Plus className="w-5 h-5" />
         Mark as CUI
       </button>
@@ -1107,21 +1087,24 @@ function CISATab({
                     : 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400'
                 )}
               >
-                {directive.status.replace(/_/g, ' ')}
+                {(directive.status ?? '').replace(/_/g, ' ')}
               </span>
             </div>
 
             <div className="space-y-2 mb-4">
               <div className="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-400">
                 <Calendar className="w-4 h-4" />
-                Deadline: {new Date(directive.deadline).toLocaleDateString()}
+                Deadline: {directive.compliance_deadline ? new Date(directive.compliance_deadline).toLocaleDateString() : 'N/A'}
               </div>
               <div className="text-sm text-gray-600 dark:text-gray-400">
-                {directive.actionsTaken} actions taken
+                {Array.isArray(directive.actions_taken) ? directive.actions_taken.length : 0} actions taken
               </div>
             </div>
 
-            <button className="w-full px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium">
+            <button
+              onClick={() => api.post(`/compliance/cisa/directives/${directive.id}/check`)}
+              className="w-full px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium"
+            >
               Check Compliance
             </button>
           </div>
