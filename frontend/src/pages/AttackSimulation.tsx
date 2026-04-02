@@ -1,5 +1,5 @@
-import { useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useState, useCallback } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../lib/api';
 import {
   Target,
@@ -20,31 +20,55 @@ import { LineChart, Line, BarChart, Bar, RadarChart, Radar, PolarAngleAxis, Pola
 import clsx from 'clsx';
 
 interface SimulationDashboard {
-  simulations_run: number;
-  detection_rate: number;
-  posture_score: number;
-  techniques_tested: number;
-  posture_trend: TrendPoint[];
-  detection_by_tactic: TacticData[];
+  total_simulations: number;
+  completed_simulations: number;
+  running_simulations: number;
+  average_detection_rate: number;
+  average_posture_score: number;
+  techniques_in_library: number;
+  adversary_profiles: number;
+  top_tactics: TacticData[];
   recent_simulations: Simulation[];
+  security_trends: { scores: number[]; detection_rates: number[] };
 }
 
 interface Simulation {
   id: string;
   name: string;
-  type: 'atomic' | 'chain' | 'adversary' | 'purple';
+  simulation_type: 'atomic' | 'chain' | 'adversary' | 'purple';
   status: 'draft' | 'running' | 'completed' | 'failed';
   tests_passed: number;
   tests_failed: number;
   tests_blocked: number;
   detection_rate: number;
   score: number;
-  date: string;
+  started_at: string | null;
+  completed_at: string | null;
+  duration_seconds: number | null;
   progress?: number;
+}
+
+interface PaginatedSimulations {
+  total: number;
+  page: number;
+  page_size: number;
+  simulations: Simulation[];
+}
+
+interface PaginatedTechniques {
+  total: number;
+  techniques: MITRETechnique[];
+  facets: Record<string, any>;
+}
+
+interface PaginatedAdversaries {
+  total: number;
+  adversaries: AdversaryProfile[];
 }
 
 interface MITRETechnique {
   id: string;
+  mitre_id: string;
   name: string;
   tactic: string;
   platforms: string[];
@@ -75,6 +99,16 @@ interface AttackStep {
 interface PostureData {
   tactic: string;
   score: number;
+}
+
+interface PostureResponse {
+  simulation_id: string;
+  score_type: string;
+  score: number;
+  max_score: number;
+  breakdown: PostureData[];
+  assessed_at: string;
+  recommendations?: GapAnalysis[];
 }
 
 interface GapAnalysis {
@@ -115,7 +149,34 @@ const sophisticationColors = {
   expert: 'bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400',
 };
 
+function formatDuration(startedAt: string | null, completedAt: string | null, durationSeconds: number | null): string {
+  if (durationSeconds != null) {
+    const h = Math.floor(durationSeconds / 3600);
+    const m = Math.floor((durationSeconds % 3600) / 60);
+    if (h > 0) return `${h}h ${m}m`;
+    return `${m}m`;
+  }
+  if (startedAt && completedAt) {
+    const diff = Math.floor((new Date(completedAt).getTime() - new Date(startedAt).getTime()) / 1000);
+    const h = Math.floor(diff / 3600);
+    const m = Math.floor((diff % 3600) / 60);
+    if (h > 0) return `${h}h ${m}m`;
+    return `${m}m`;
+  }
+  return '--';
+}
+
+function showNotification(message: string, type: 'success' | 'error' = 'success') {
+  // Use a simple alert-based notification; could be replaced with toast library
+  if (type === 'error') {
+    alert('Error: ' + message);
+  } else {
+    alert(message);
+  }
+}
+
 export default function AttackSimulation() {
+  const queryClient = useQueryClient();
   const [activeTab, setActiveTab] = useState<'dashboard' | 'simulations' | 'techniques' | 'adversaries' | 'posture'>('dashboard');
   const [tacticFilter, setTacticFilter] = useState('all');
   const [platformFilter, setPlatformFilter] = useState('all');
@@ -123,8 +184,16 @@ export default function AttackSimulation() {
   const [expandedTechnique, setExpandedTechnique] = useState<string | null>(null);
   const [showNewSimulationModal, setShowNewSimulationModal] = useState(false);
 
+  // Form state for new simulation modal
+  const [newSimName, setNewSimName] = useState('');
+  const [newSimType, setNewSimType] = useState<string>('atomic');
+  const [newSimDescription, setNewSimDescription] = useState('');
+  const [newSimEnvironment, setNewSimEnvironment] = useState('lab');
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [runningTests, setRunningTests] = useState<Set<string>>(new Set());
+
   // Fetch simulation dashboard
-  const { data: dashboard } = useQuery({
+  const { data: dashboard, isLoading: dashboardLoading, error: dashboardError } = useQuery({
     queryKey: ['simulationDashboard'],
     queryFn: async () => {
       const response = await api.get<SimulationDashboard>('/simulation/dashboard');
@@ -133,42 +202,48 @@ export default function AttackSimulation() {
   });
 
   // Fetch simulations
-  const { data: simulations } = useQuery({
+  const { data: simulations, isLoading: simulationsLoading } = useQuery({
     queryKey: ['simulations'],
     queryFn: async () => {
-      const response = await api.get<Simulation[]>('/simulation/simulations');
-      return response.data;
+      const response = await api.get<PaginatedSimulations | Simulation[]>('/simulation/simulations');
+      const data = response.data;
+      if (Array.isArray(data)) return data;
+      return data.simulations ?? [];
     },
   });
 
   // Fetch MITRE techniques
-  const { data: techniques } = useQuery({
-    queryKey: ['techniques', tacticFilter, platformFilter],
+  const { data: techniques, isLoading: techniquesLoading } = useQuery({
+    queryKey: ['techniques', tacticFilter, platformFilter, safeOnly],
     queryFn: async () => {
       const params: Record<string, any> = {};
       if (tacticFilter !== 'all') params.tactic = tacticFilter;
       if (platformFilter !== 'all') params.platform = platformFilter;
-      if (safeOnly) params.is_safe = true;
+      if (safeOnly) params.safe_only = true;
 
-      const response = await api.get<MITRETechnique[]>('/simulation/techniques', { params });
-      return response.data;
+      const response = await api.get<PaginatedTechniques | MITRETechnique[]>('/simulation/techniques', { params });
+      const data = response.data;
+      if (Array.isArray(data)) return data;
+      return data.techniques ?? [];
     },
   });
 
   // Fetch adversary profiles
-  const { data: adversaries } = useQuery({
+  const { data: adversaries, isLoading: adversariesLoading } = useQuery({
     queryKey: ['adversaries'],
     queryFn: async () => {
-      const response = await api.get<AdversaryProfile[]>('/simulation/adversaries');
-      return response.data;
+      const response = await api.get<PaginatedAdversaries | AdversaryProfile[]>('/simulation/adversaries');
+      const data = response.data;
+      if (Array.isArray(data)) return data;
+      return data.adversaries ?? [];
     },
   });
 
   // Fetch posture analysis
-  const { data: posture } = useQuery({
+  const { data: posture, isLoading: postureLoading } = useQuery({
     queryKey: ['postureAnalysis'],
     queryFn: async () => {
-      const response = await api.get<{ score: number; by_tactic: PostureData[]; gaps: GapAnalysis[]; improvement: string }>('/simulation/posture');
+      const response = await api.get<PostureResponse>('/simulation/posture');
       return response.data;
     },
   });
@@ -219,23 +294,29 @@ export default function AttackSimulation() {
       {/* Dashboard Tab */}
       {activeTab === 'dashboard' && (
         <div className="space-y-6">
+          {dashboardLoading && (
+            <div className="text-center py-8 text-gray-500 dark:text-gray-400">Loading dashboard...</div>
+          )}
+          {dashboardError && (
+            <div className="text-center py-8 text-red-500 dark:text-red-400">Failed to load dashboard data. Please try again.</div>
+          )}
           {/* Stats */}
           <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
               <p className="text-gray-600 dark:text-gray-400 text-sm">Simulations Run</p>
-              <p className="text-3xl font-bold text-gray-900 dark:text-white mt-2">{dashboard?.simulations_run || 0}</p>
+              <p className="text-3xl font-bold text-gray-900 dark:text-white mt-2">{dashboard?.total_simulations ?? 0}</p>
             </div>
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
               <p className="text-gray-600 dark:text-gray-400 text-sm">Detection Rate</p>
-              <p className="text-3xl font-bold text-green-600 dark:text-green-400 mt-2">{dashboard?.detection_rate?.toFixed(1) || 0}%</p>
+              <p className="text-3xl font-bold text-green-600 dark:text-green-400 mt-2">{dashboard?.average_detection_rate?.toFixed(1) ?? 0}%</p>
             </div>
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
               <p className="text-gray-600 dark:text-gray-400 text-sm">Security Posture</p>
-              <p className="text-3xl font-bold text-blue-600 dark:text-blue-400 mt-2">{dashboard?.posture_score || 0}/100</p>
+              <p className="text-3xl font-bold text-blue-600 dark:text-blue-400 mt-2">{dashboard?.average_posture_score ?? 0}/100</p>
             </div>
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
-              <p className="text-gray-600 dark:text-gray-400 text-sm">Techniques Tested</p>
-              <p className="text-3xl font-bold text-purple-600 dark:text-purple-400 mt-2">{dashboard?.techniques_tested || 0}</p>
+              <p className="text-gray-600 dark:text-gray-400 text-sm">Techniques in Library</p>
+              <p className="text-3xl font-bold text-purple-600 dark:text-purple-400 mt-2">{dashboard?.techniques_in_library ?? 0}</p>
             </div>
           </div>
 
@@ -311,30 +392,36 @@ export default function AttackSimulation() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
-                {dashboard?.recent_simulations?.slice(0, 10).map((sim) => (
-                  <tr key={sim.id} className="hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors">
-                    <td className="px-6 py-4 font-medium text-gray-900 dark:text-white">{sim.name}</td>
-                    <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400 capitalize">{sim.type}</td>
-                    <td className="px-6 py-4">
-                      <span className={clsx('px-3 py-1 rounded-full text-xs font-medium', statusColors[sim.status])}>
-                        {sim.status.charAt(0).toUpperCase() + sim.status.slice(1)}
-                      </span>
-                    </td>
-                    <td className="px-6 py-4">
-                      <div className="flex items-center gap-2">
-                        <div className="w-16 bg-gray-200 dark:bg-gray-700 rounded-full h-2">
-                          <div
-                            className="bg-green-500 h-2 rounded-full"
-                            style={{ width: `${sim.detection_rate}%` }}
-                          />
+                {dashboard?.recent_simulations && dashboard.recent_simulations.length > 0 ? (
+                  dashboard.recent_simulations.slice(0, 10).map((sim) => (
+                    <tr key={sim.id} className="hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors">
+                      <td className="px-6 py-4 font-medium text-gray-900 dark:text-white">{sim.name}</td>
+                      <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400 capitalize">{sim.simulation_type}</td>
+                      <td className="px-6 py-4">
+                        <span className={clsx('px-3 py-1 rounded-full text-xs font-medium', statusColors[sim.status] ?? '')}>
+                          {sim.status ? sim.status.charAt(0).toUpperCase() + sim.status.slice(1) : '--'}
+                        </span>
+                      </td>
+                      <td className="px-6 py-4">
+                        <div className="flex items-center gap-2">
+                          <div className="w-16 bg-gray-200 dark:bg-gray-700 rounded-full h-2">
+                            <div
+                              className="bg-green-500 h-2 rounded-full"
+                              style={{ width: `${sim.detection_rate ?? 0}%` }}
+                            />
+                          </div>
+                          <span className="text-sm font-medium text-gray-900 dark:text-white">{(sim.detection_rate ?? 0).toFixed(0)}%</span>
                         </div>
-                        <span className="text-sm font-medium text-gray-900 dark:text-white">{sim.detection_rate.toFixed(0)}%</span>
-                      </div>
-                    </td>
-                    <td className="px-6 py-4 font-medium text-gray-900 dark:text-white">{sim.score}</td>
-                    <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">{new Date(sim.date).toLocaleDateString()}</td>
+                      </td>
+                      <td className="px-6 py-4 font-medium text-gray-900 dark:text-white">{sim.score ?? '--'}</td>
+                      <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">{sim.completed_at ? new Date(sim.completed_at).toLocaleDateString() : '--'}</td>
+                    </tr>
+                  ))
+                ) : (
+                  <tr>
+                    <td colSpan={6} className="px-6 py-8 text-center text-gray-500 dark:text-gray-400">No recent simulations found.</td>
                   </tr>
-                ))}
+                )}
               </tbody>
             </table>
           </div>
@@ -364,16 +451,26 @@ export default function AttackSimulation() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
+                {simulationsLoading && (
+                  <tr>
+                    <td colSpan={6} className="px-6 py-8 text-center text-gray-500 dark:text-gray-400">Loading simulations...</td>
+                  </tr>
+                )}
+                {!simulationsLoading && (!simulations || simulations.length === 0) && (
+                  <tr>
+                    <td colSpan={6} className="px-6 py-8 text-center text-gray-500 dark:text-gray-400">No simulations found. Create one to get started.</td>
+                  </tr>
+                )}
                 {simulations?.map((sim) => (
                   <tr key={sim.id} className="hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors">
                     <td className="px-6 py-4 font-medium text-gray-900 dark:text-white">{sim.name}</td>
-                    <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400 capitalize">{sim.type}</td>
+                    <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400 capitalize">{sim.simulation_type}</td>
                     <td className="px-6 py-4">
                       <div className="flex items-center gap-2">
-                        <span className={clsx('px-3 py-1 rounded-full text-xs font-medium', statusColors[sim.status])}>
-                          {sim.status.charAt(0).toUpperCase() + sim.status.slice(1)}
+                        <span className={clsx('px-3 py-1 rounded-full text-xs font-medium', statusColors[sim.status] ?? '')}>
+                          {sim.status ? sim.status.charAt(0).toUpperCase() + sim.status.slice(1) : '--'}
                         </span>
-                        {sim.status === 'running' && sim.progress && (
+                        {sim.status === 'running' && sim.progress != null && (
                           <div className="w-24 bg-gray-200 dark:bg-gray-700 rounded-full h-2">
                             <div
                               className="bg-blue-500 h-2 rounded-full transition-all"
@@ -385,11 +482,11 @@ export default function AttackSimulation() {
                     </td>
                     <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
                       <div className="flex gap-2">
-                        <span className="text-green-600 dark:text-green-400 font-medium">{sim.tests_passed}</span>
+                        <span className="text-green-600 dark:text-green-400 font-medium">{sim.tests_passed ?? 0}</span>
                         <span className="text-gray-400 dark:text-gray-500">/</span>
-                        <span className="text-red-600 dark:text-red-400 font-medium">{sim.tests_failed}</span>
+                        <span className="text-red-600 dark:text-red-400 font-medium">{sim.tests_failed ?? 0}</span>
                         <span className="text-gray-400 dark:text-gray-500">/</span>
-                        <span className="text-orange-600 dark:text-orange-400 font-medium">{sim.tests_blocked}</span>
+                        <span className="text-orange-600 dark:text-orange-400 font-medium">{sim.tests_blocked ?? 0}</span>
                       </div>
                     </td>
                     <td className="px-6 py-4">
@@ -397,13 +494,13 @@ export default function AttackSimulation() {
                         <div className="w-16 bg-gray-200 dark:bg-gray-700 rounded-full h-2">
                           <div
                             className="bg-green-500 h-2 rounded-full"
-                            style={{ width: `${sim.detection_rate}%` }}
+                            style={{ width: `${sim.detection_rate ?? 0}%` }}
                           />
                         </div>
-                        <span className="text-sm font-medium text-gray-900 dark:text-white">{sim.detection_rate.toFixed(0)}%</span>
+                        <span className="text-sm font-medium text-gray-900 dark:text-white">{(sim.detection_rate ?? 0).toFixed(0)}%</span>
                       </div>
                     </td>
-                    <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">2h 15m</td>
+                    <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">{formatDuration(sim.started_at, sim.completed_at, sim.duration_seconds)}</td>
                   </tr>
                 ))}
               </tbody>
@@ -459,17 +556,23 @@ export default function AttackSimulation() {
           </div>
 
           {/* Techniques Grid */}
+          {techniquesLoading && (
+            <div className="text-center py-8 text-gray-500 dark:text-gray-400">Loading techniques...</div>
+          )}
+          {!techniquesLoading && (!techniques || techniques.length === 0) && (
+            <div className="text-center py-8 text-gray-500 dark:text-gray-400">No techniques found matching the current filters.</div>
+          )}
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
             {techniques?.slice(0, 15).map((technique) => (
               <div
-                key={technique.id}
-                onClick={() => setExpandedTechnique(expandedTechnique === technique.id ? null : technique.id)}
+                key={technique.mitre_id ?? technique.id}
+                onClick={() => setExpandedTechnique(expandedTechnique === (technique.mitre_id ?? technique.id) ? null : (technique.mitre_id ?? technique.id))}
                 className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6 space-y-4 cursor-pointer hover:border-gray-300 dark:hover:border-gray-600 transition-colors"
               >
                 <div>
                   <div className="flex items-start justify-between gap-2">
                     <div className="flex-1">
-                      <p className="text-sm text-gray-600 dark:text-gray-400 font-medium">{technique.id}</p>
+                      <p className="text-sm text-gray-600 dark:text-gray-400 font-medium">{technique.mitre_id ?? technique.id}</p>
                       <h3 className="font-semibold text-gray-900 dark:text-white mt-1">{technique.name}</h3>
                     </div>
                     {technique.is_safe && (
@@ -482,7 +585,7 @@ export default function AttackSimulation() {
                 </div>
 
                 <div className="flex flex-wrap gap-1">
-                  {technique.platforms.map((platform) => (
+                  {technique.platforms?.map((platform) => (
                     <span key={platform} className="px-2 py-1 rounded text-xs bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300">
                       {platform}
                     </span>
@@ -490,34 +593,50 @@ export default function AttackSimulation() {
                 </div>
 
                 <div>
-                  <span className={clsx('px-3 py-1 rounded-full text-xs font-medium', riskLevelColors[technique.risk_level])}>
-                    {technique.risk_level.charAt(0).toUpperCase() + technique.risk_level.slice(1)}
+                  <span className={clsx('px-3 py-1 rounded-full text-xs font-medium', riskLevelColors[technique.risk_level] ?? '')}>
+                    {technique.risk_level ? technique.risk_level.charAt(0).toUpperCase() + technique.risk_level.slice(1) : '--'}
                   </span>
                 </div>
 
-                {expandedTechnique === technique.id && (
+                {expandedTechnique === (technique.mitre_id ?? technique.id) && (
                   <div className="pt-4 border-t border-gray-200 dark:border-gray-700 space-y-3">
                     <div>
                       <p className="text-xs font-semibold text-gray-900 dark:text-white mb-1">Description</p>
                       <p className="text-xs text-gray-600 dark:text-gray-400">{technique.description}</p>
                     </div>
-                    <div>
-                      <p className="text-xs font-semibold text-gray-900 dark:text-white mb-1">Test Command</p>
-                      <p className="text-xs text-gray-600 dark:text-gray-400 font-mono bg-gray-50 dark:bg-gray-700 p-2 rounded truncate">{technique.test_command}</p>
-                    </div>
+                    {technique.test_command && (
+                      <div>
+                        <p className="text-xs font-semibold text-gray-900 dark:text-white mb-1">Test Command</p>
+                        <p className="text-xs text-gray-600 dark:text-gray-400 font-mono bg-gray-50 dark:bg-gray-700 p-2 rounded truncate">{technique.test_command}</p>
+                      </div>
+                    )}
                     <button
+                      disabled={runningTests.has(technique.mitre_id ?? technique.id)}
                       onClick={async (e) => {
                         e.stopPropagation();
+                        const techId = technique.mitre_id ?? technique.id;
+                        setRunningTests((prev) => new Set(prev).add(techId));
                         try {
-                          await api.post(`/simulation/techniques/${technique.id}/run`);
-                          alert('Test started for technique: ' + technique.name);
-                        } catch (error) {
-                          console.error('Error running test:', error);
+                          await api.post(`/simulation/techniques/${technique.mitre_id}/test`);
+                          showNotification('Test started for technique: ' + technique.name);
+                        } catch (error: any) {
+                          showNotification(error?.response?.data?.detail ?? 'Failed to start test.', 'error');
+                        } finally {
+                          setRunningTests((prev) => {
+                            const next = new Set(prev);
+                            next.delete(techId);
+                            return next;
+                          });
                         }
                       }}
-                      className="w-full px-3 py-2 rounded-lg bg-red-600 dark:bg-red-700 text-white hover:bg-red-700 dark:hover:bg-red-600 text-xs font-medium transition-colors"
+                      className={clsx(
+                        'w-full px-3 py-2 rounded-lg text-white text-xs font-medium transition-colors',
+                        runningTests.has(technique.mitre_id ?? technique.id)
+                          ? 'bg-gray-400 cursor-not-allowed'
+                          : 'bg-red-600 dark:bg-red-700 hover:bg-red-700 dark:hover:bg-red-600'
+                      )}
                     >
-                      Run Test
+                      {runningTests.has(technique.mitre_id ?? technique.id) ? 'Running...' : 'Run Test'}
                     </button>
                   </div>
                 )}
@@ -529,6 +648,13 @@ export default function AttackSimulation() {
 
       {/* Adversary Profiles Tab */}
       {activeTab === 'adversaries' && (
+        <div className="space-y-6">
+          {adversariesLoading && (
+            <div className="text-center py-8 text-gray-500 dark:text-gray-400">Loading adversary profiles...</div>
+          )}
+          {!adversariesLoading && (!adversaries || adversaries.length === 0) && (
+            <div className="text-center py-8 text-gray-500 dark:text-gray-400">No adversary profiles found.</div>
+          )}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
           {adversaries?.map((adversary) => (
             <div key={adversary.id} className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6 space-y-4">
@@ -590,9 +716,10 @@ export default function AttackSimulation() {
                 onClick={async () => {
                   try {
                     await api.post(`/simulation/adversaries/${adversary.id}/emulate`);
-                    alert('Simulation started for adversary: ' + adversary.name);
-                  } catch (error) {
-                    console.error('Error starting simulation:', error);
+                    showNotification('Simulation started for adversary: ' + adversary.name);
+                    queryClient.invalidateQueries({ queryKey: ['simulations'] });
+                  } catch (error: any) {
+                    showNotification(error?.response?.data?.detail ?? 'Failed to start adversary emulation.', 'error');
                   }
                 }}
                 className="w-full px-4 py-2 rounded-lg bg-red-600 dark:bg-red-700 text-white hover:bg-red-700 dark:hover:bg-red-600 font-medium text-sm transition-colors"
@@ -602,11 +729,15 @@ export default function AttackSimulation() {
             </div>
           ))}
         </div>
+        </div>
       )}
 
       {/* Security Posture Tab */}
       {activeTab === 'posture' && (
         <div className="space-y-6">
+          {postureLoading && (
+            <div className="text-center py-8 text-gray-500 dark:text-gray-400">Loading security posture...</div>
+          )}
           {/* Posture Gauge */}
           <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
             <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-6">Overall Security Posture</h3>
@@ -642,11 +773,11 @@ export default function AttackSimulation() {
           </div>
 
           {/* Score by Tactic */}
-          {posture?.by_tactic && posture.by_tactic.length > 0 && (
+          {posture?.breakdown && posture.breakdown.length > 0 && (
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
               <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">Coverage by Tactic</h3>
               <ResponsiveContainer width="100%" height={300}>
-                <RadarChart data={posture.by_tactic}>
+                <RadarChart data={posture.breakdown}>
                   <PolarAngleAxis dataKey="tactic" stroke="#6b7280" />
                   <PolarRadiusAxis stroke="#6b7280" />
                   <Radar name="Score" dataKey="score" stroke="#3b82f6" fill="#3b82f6" fillOpacity={0.6} />
@@ -656,7 +787,7 @@ export default function AttackSimulation() {
           )}
 
           {/* Gap Analysis */}
-          {posture?.gaps && posture.gaps.length > 0 && (
+          {posture?.recommendations && posture.recommendations.length > 0 && (
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
               <div className="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
                 <h3 className="text-lg font-semibold text-gray-900 dark:text-white">Gap Analysis</h3>
@@ -671,7 +802,7 @@ export default function AttackSimulation() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
-                  {posture.gaps.slice(0, 10).map((gap, idx) => (
+                  {posture.recommendations.slice(0, 10).map((gap, idx) => (
                     <tr key={idx} className="hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors">
                       <td className="px-6 py-4 font-medium text-gray-900 dark:text-white text-sm">{gap.technique}</td>
                       <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">{gap.tactic}</td>
@@ -695,21 +826,21 @@ export default function AttackSimulation() {
             </div>
           )}
 
-          {/* Improvement */}
-          {posture?.improvement && (
+          {/* Score Summary */}
+          {posture && (
             <div className={clsx(
               'p-4 rounded-lg border',
-              posture.improvement.includes('improved')
+              (posture.score / (posture.max_score || 100)) > 0.7
                 ? 'bg-green-50 dark:bg-green-900/20 border-green-200 dark:border-green-700'
                 : 'bg-red-50 dark:bg-red-900/20 border-red-200 dark:border-red-700'
             )}>
               <p className={clsx(
                 'text-sm font-medium',
-                posture.improvement.includes('improved')
+                (posture.score / (posture.max_score || 100)) > 0.7
                   ? 'text-green-800 dark:text-green-200'
                   : 'text-red-800 dark:text-red-200'
               )}>
-                {posture.improvement}
+                Security posture score: {posture.score} / {posture.max_score || 100} ({posture.score_type})
               </p>
             </div>
           )}
@@ -723,32 +854,96 @@ export default function AttackSimulation() {
             <div className="space-y-4">
               <div>
                 <label className="block text-sm font-medium text-gray-900 dark:text-white mb-1">Simulation Name</label>
-                <input type="text" placeholder="e.g., Ransomware Attack Chain" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+                <input
+                  type="text"
+                  value={newSimName}
+                  onChange={(e) => setNewSimName(e.target.value)}
+                  placeholder="e.g., Ransomware Attack Chain"
+                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+                />
               </div>
               <div>
                 <label className="block text-sm font-medium text-gray-900 dark:text-white mb-1">Type</label>
-                <select className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
+                <select
+                  value={newSimType}
+                  onChange={(e) => setNewSimType(e.target.value)}
+                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+                >
                   <option value="atomic">Atomic</option>
                   <option value="chain">Attack Chain</option>
                   <option value="adversary">Adversary Emulation</option>
                   <option value="purple">Purple Team</option>
                 </select>
               </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-900 dark:text-white mb-1">Description</label>
+                <textarea
+                  value={newSimDescription}
+                  onChange={(e) => setNewSimDescription(e.target.value)}
+                  placeholder="Describe the simulation objective..."
+                  rows={3}
+                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-900 dark:text-white mb-1">Target Environment</label>
+                <select
+                  value={newSimEnvironment}
+                  onChange={(e) => setNewSimEnvironment(e.target.value)}
+                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+                >
+                  <option value="lab">Lab</option>
+                  <option value="staging">Staging</option>
+                  <option value="production">Production</option>
+                </select>
+              </div>
               <div className="flex gap-2 mt-6">
-                <button onClick={() => setShowNewSimulationModal(false)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
                 <button
+                  onClick={() => {
+                    setShowNewSimulationModal(false);
+                    setNewSimName('');
+                    setNewSimType('atomic');
+                    setNewSimDescription('');
+                    setNewSimEnvironment('lab');
+                  }}
+                  className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 text-gray-900 dark:text-white transition"
+                >
+                  Cancel
+                </button>
+                <button
+                  disabled={isSubmitting || !newSimName.trim()}
                   onClick={async () => {
+                    setIsSubmitting(true);
                     try {
-                      await api.post('/simulation/campaigns', { name: 'New Simulation', type: 'atomic', targets: [] });
-                      alert('Simulation launched successfully.');
+                      await api.post('/simulation/simulations', {
+                        simulation_type: newSimType,
+                        name: newSimName.trim(),
+                        description: newSimDescription.trim(),
+                        techniques: [],
+                        target_environment: newSimEnvironment,
+                      });
+                      showNotification('Simulation created successfully.');
                       setShowNewSimulationModal(false);
-                    } catch (error) {
-                      console.error('Error launching simulation:', error);
+                      setNewSimName('');
+                      setNewSimType('atomic');
+                      setNewSimDescription('');
+                      setNewSimEnvironment('lab');
+                      queryClient.invalidateQueries({ queryKey: ['simulations'] });
+                      queryClient.invalidateQueries({ queryKey: ['simulationDashboard'] });
+                    } catch (error: any) {
+                      showNotification(error?.response?.data?.detail ?? 'Failed to create simulation.', 'error');
+                    } finally {
+                      setIsSubmitting(false);
                     }
                   }}
-                  className="flex-1 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition"
+                  className={clsx(
+                    'flex-1 px-4 py-2 text-white rounded-lg transition',
+                    isSubmitting || !newSimName.trim()
+                      ? 'bg-gray-400 cursor-not-allowed'
+                      : 'bg-red-600 hover:bg-red-700'
+                  )}
                 >
-                  Launch
+                  {isSubmitting ? 'Creating...' : 'Launch'}
                 </button>
               </div>
             </div>
