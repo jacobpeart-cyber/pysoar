@@ -114,12 +114,13 @@ async def list_policies(
     enabled_only: bool = Query(default=True),
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, ge=1, le=500),
-    current_user = Depends(get_current_active_user),
+    current_user: CurrentUser = None,
 ):
     """List remediation policies with optional filtering."""
-    query = select(RemediationPolicy).where(
-        RemediationPolicy.organization_id == current_user.organization_id
-    )
+    org_id = getattr(current_user, "organization_id", None)
+    query = select(RemediationPolicy)
+    if org_id:
+        query = query.where(RemediationPolicy.organization_id == org_id)
 
     if policy_type:
         query = query.where(RemediationPolicy.policy_type == policy_type)
@@ -131,6 +132,33 @@ async def list_policies(
     query = query.order_by(desc(RemediationPolicy.priority)).offset(skip).limit(limit)
     result = await db.execute(query)
     return result.scalars().all()
+
+
+@router.get("/policies/builtin")
+async def list_builtin_policies(
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
+):
+    """List built-in remediation policies."""
+    return {
+        "builtin_policies": [
+            {
+                "name": "Block Malicious IPs",
+                "description": "Auto-block IPs matched by threat intel",
+                "policy_type": "auto_block",
+            },
+            {
+                "name": "Isolate Compromised Hosts",
+                "description": "Isolate hosts with confirmed malware",
+                "policy_type": "auto_isolate",
+            },
+            {
+                "name": "Disable Compromised Accounts",
+                "description": "Disable accounts with impossible travel",
+                "policy_type": "auto_disable",
+            },
+        ]
+    }
 
 
 @router.get("/policies/{policy_id}", response_model=RemediationPolicyResponse)
@@ -207,34 +235,6 @@ async def test_policy(
         "policy_id": policy_id,
         "matches": policy_id in [p.id for p in matched],
         "matched_policies": len(matched),
-    }
-
-
-@router.get("/policies/builtin")
-async def list_builtin_policies(
-    db: DatabaseSession = None,
-    current_user = Depends(get_current_active_user),
-):
-    """List built-in remediation policies."""
-    # Return metadata about available built-in policies
-    return {
-        "builtin_policies": [
-            {
-                "name": "Block Malicious IPs",
-                "description": "Auto-block IPs matched by threat intel",
-                "policy_type": "auto_block",
-            },
-            {
-                "name": "Isolate Compromised Hosts",
-                "description": "Isolate hosts with confirmed malware",
-                "policy_type": "auto_isolate",
-            },
-            {
-                "name": "Disable Compromised Accounts",
-                "description": "Disable accounts with impossible travel",
-                "policy_type": "auto_disable",
-            },
-        ]
     }
 
 
@@ -339,12 +339,13 @@ async def list_executions(
     days: int = Query(default=7, ge=1, le=90),
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, ge=1, le=500),
-    current_user = Depends(get_current_active_user),
+    current_user: CurrentUser = None,
 ):
     """List remediation executions."""
-    query = select(RemediationExecution).where(
-        RemediationExecution.organization_id == current_user.organization_id
-    )
+    org_id = getattr(current_user, "organization_id", None)
+    query = select(RemediationExecution)
+    if org_id:
+        query = query.where(RemediationExecution.organization_id == org_id)
 
     cutoff = utc_now() - timedelta(days=days)
     query = query.where(RemediationExecution.created_at >= cutoff)
@@ -357,6 +358,43 @@ async def list_executions(
     query = query.order_by(desc(RemediationExecution.created_at)).offset(skip).limit(limit)
     result = await db.execute(query)
     return result.scalars().all()
+
+
+@router.get("/executions/pending")
+async def get_pending_approvals(
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
+):
+    """Get pending approvals for current organization."""
+    org_id = getattr(current_user, "organization_id", None)
+    query = select(RemediationExecution).where(
+        RemediationExecution.approval_status == "pending",
+    )
+    if org_id:
+        query = query.where(RemediationExecution.organization_id == org_id)
+    result = await db.execute(query)
+    pending = result.scalars().all()
+
+    return {
+        "count": len(pending),
+        "executions": pending,
+    }
+
+
+@router.get("/quick-actions")
+async def list_quick_actions(
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
+):
+    """List recent quick actions (block IP, isolate host, etc.)."""
+    org_id = getattr(current_user, "organization_id", None)
+    query = select(RemediationExecution).where(
+        RemediationExecution.trigger_source.in_(["manual", "quick_action"])
+    ).order_by(desc(RemediationExecution.created_at)).limit(20)
+    if org_id:
+        query = query.where(RemediationExecution.organization_id == org_id)
+    result = await db.execute(query)
+    return list(result.scalars().all())
 
 
 @router.get("/executions/{execution_id}", response_model=RemediationExecutionResponse)
@@ -489,27 +527,6 @@ async def cancel_execution(
     await db.commit()
 
     return {"execution_id": execution_id, "status": "cancelled"}
-
-
-@router.get("/executions/pending")
-async def get_pending_approvals(
-    db: DatabaseSession = None,
-    current_user = Depends(get_current_active_user),
-):
-    """Get pending approvals for current organization."""
-    query = select(RemediationExecution).where(
-        and_(
-            RemediationExecution.organization_id == current_user.organization_id,
-            RemediationExecution.approval_status == "pending",
-        )
-    )
-    result = await db.execute(query)
-    pending = result.scalars().all()
-
-    return {
-        "count": len(pending),
-        "executions": pending,
-    }
 
 
 # ============================================================================
@@ -724,12 +741,13 @@ async def execute_playbook(
 async def list_integrations(
     db: DatabaseSession = None,
     integration_type: Optional[str] = Query(None),
-    current_user = Depends(get_current_active_user),
+    current_user: CurrentUser = None,
 ):
     """List remediation integrations."""
-    query = select(RemediationIntegration).where(
-        RemediationIntegration.organization_id == current_user.organization_id
-    )
+    org_id = getattr(current_user, "organization_id", None)
+    query = select(RemediationIntegration)
+    if org_id:
+        query = query.where(RemediationIntegration.organization_id == org_id)
 
     if integration_type:
         query = query.where(RemediationIntegration.integration_type == integration_type)
@@ -830,17 +848,17 @@ async def get_integration_health(
 async def get_dashboard_stats(
     db: DatabaseSession = None,
     days: int = Query(default=7, ge=1, le=90),
-    current_user = Depends(get_current_active_user),
+    current_user: CurrentUser = None,
 ):
     """Get remediation dashboard statistics."""
+    org_id = getattr(current_user, "organization_id", None)
     cutoff = utc_now() - timedelta(days=days)
 
     query = select(RemediationExecution).where(
-        and_(
-            RemediationExecution.organization_id == current_user.organization_id,
-            RemediationExecution.created_at >= cutoff,
-        )
+        RemediationExecution.created_at >= cutoff,
     )
+    if org_id:
+        query = query.where(RemediationExecution.organization_id == org_id)
     result = await db.execute(query)
     executions = result.scalars().all()
 
@@ -852,7 +870,7 @@ async def get_dashboard_stats(
     return RemediationDashboardStats(
         period_start=cutoff,
         period_end=utc_now(),
-        organization_id=current_user.organization_id,
+        organization_id=org_id or "",
         total_executions=total,
         successful_executions=successful,
         failed_executions=failed,
@@ -871,23 +889,23 @@ async def get_dashboard_stats(
 async def get_remediation_timeline(
     db: DatabaseSession = None,
     days: int = Query(default=7, ge=1, le=90),
-    current_user = Depends(get_current_active_user),
+    current_user: CurrentUser = None,
 ):
     """Get recent remediation timeline."""
+    org_id = getattr(current_user, "organization_id", None)
     cutoff = utc_now() - timedelta(days=days)
 
     query = select(RemediationExecution).where(
-        and_(
-            RemediationExecution.organization_id == current_user.organization_id,
-            RemediationExecution.created_at >= cutoff,
-        )
+        RemediationExecution.created_at >= cutoff,
     ).order_by(desc(RemediationExecution.completed_at))
+    if org_id:
+        query = query.where(RemediationExecution.organization_id == org_id)
 
     result = await db.execute(query)
     executions = result.scalars().all()
 
     return RemediationTimelineResponse(
-        organization_id=current_user.organization_id,
+        organization_id=org_id or "",
         period=f"last_{days}_days",
         events=[],
         total_count=len(executions),
