@@ -839,17 +839,17 @@ export default function ExposureManagement() {
                       </td>
                       <td className="px-4 py-3">
                         <span className={clsx('px-2 py-1 text-xs font-medium rounded-full', getStatusColor(ticket.status))}>
-                          {ticket.status.replace('_', ' ')}
+                          {(ticket.status || 'open').replace('_', ' ')}
                         </span>
                       </td>
-                      <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">{ticket.assigned_to}</td>
-                      <td className="px-4 py-3 text-sm text-gray-900 dark:text-white">{ticket.affected_assets}</td>
+                      <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">{ticket.assigned_to || '-'}</td>
+                      <td className="px-4 py-3 text-sm text-gray-900 dark:text-white">{ticket.affected_assets?.length ?? ticket.affected_assets ?? 0}</td>
                       <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">
-                        {new Date(ticket.due_date).toLocaleDateString()}
+                        {ticket.due_date ? new Date(ticket.due_date).toLocaleDateString() : '-'}
                       </td>
                       <td className="px-4 py-3">
-                        <span className={clsx('px-2 py-1 text-xs font-medium rounded-full', getStatusColor(ticket.sla_status))}>
-                          {ticket.sla_status.replace('_', ' ')}
+                        <span className={clsx('px-2 py-1 text-xs font-medium rounded-full', getStatusColor(ticket.sla_status || 'on_track'))}>
+                          {(ticket.sla_status || 'on_track').replace('_', ' ')}
                         </span>
                       </td>
                     </tr>
