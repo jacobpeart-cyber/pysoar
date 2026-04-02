@@ -952,6 +952,113 @@ export default function ExposureManagement() {
           </div>
         </div>
       )}
+      {/* Create Ticket Modal */}
+      {showCreateTicketModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50">
+          <div className="bg-white dark:bg-gray-800 rounded-lg shadow-xl w-full max-w-lg mx-4">
+            <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200 dark:border-gray-700">
+              <h2 className="text-lg font-semibold text-gray-900 dark:text-white">Create Remediation Ticket</h2>
+              <button onClick={() => setShowCreateTicketModal(false)} className="text-gray-400 hover:text-gray-600">✕</button>
+            </div>
+            <form onSubmit={async (e) => {
+              e.preventDefault();
+              const form = e.target as HTMLFormElement;
+              const formData = new FormData(form);
+              try {
+                await api.post('/exposure/tickets', {
+                  title: formData.get('title'),
+                  description: formData.get('description'),
+                  priority: formData.get('priority'),
+                  assigned_to: formData.get('assigned_to') || undefined,
+                  due_date: formData.get('due_date') || undefined,
+                });
+                setShowCreateTicketModal(false);
+                queryClient.invalidateQueries({ queryKey: ['exposure'] });
+              } catch (err) {
+                alert('Failed to create ticket');
+              }
+            }} className="p-6 space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Title *</label>
+                <input name="title" required className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white" placeholder="Remediation ticket title" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Description</label>
+                <textarea name="description" rows={3} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white" placeholder="Describe the remediation needed..." />
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Priority *</label>
+                  <select name="priority" required className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white">
+                    <option value="critical">Critical</option>
+                    <option value="high">High</option>
+                    <option value="medium" selected>Medium</option>
+                    <option value="low">Low</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Due Date</label>
+                  <input name="due_date" type="date" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white" />
+                </div>
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Assigned To</label>
+                <input name="assigned_to" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white" placeholder="Username or email" />
+              </div>
+              <div className="flex gap-3 pt-2">
+                <button type="submit" className="flex-1 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 font-medium">Create Ticket</button>
+                <button type="button" onClick={() => setShowCreateTicketModal(false)} className="flex-1 px-4 py-2 bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-200">Cancel</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Import Scan Results Modal */}
+      {showImportModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50">
+          <div className="bg-white dark:bg-gray-800 rounded-lg shadow-xl w-full max-w-lg mx-4">
+            <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200 dark:border-gray-700">
+              <h2 className="text-lg font-semibold text-gray-900 dark:text-white">Import Scan Results</h2>
+              <button onClick={() => setShowImportModal(false)} className="text-gray-400 hover:text-gray-600">✕</button>
+            </div>
+            <form onSubmit={async (e) => {
+              e.preventDefault();
+              const form = e.target as HTMLFormElement;
+              const formData = new FormData(form);
+              try {
+                await api.post('/exposure/scans/import', {
+                  scanner_type: formData.get('scanner_type'),
+                  scan_data: formData.get('scan_data'),
+                });
+                setShowImportModal(false);
+                queryClient.invalidateQueries({ queryKey: ['exposure'] });
+              } catch (err) {
+                alert('Failed to import scan results');
+              }
+            }} className="p-6 space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Scanner Type *</label>
+                <select name="scanner_type" required className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white">
+                  <option value="nessus">Nessus</option>
+                  <option value="qualys">Qualys</option>
+                  <option value="rapid7">Rapid7</option>
+                  <option value="openvas">OpenVAS</option>
+                  <option value="custom">Custom</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Scan Data (JSON) *</label>
+                <textarea name="scan_data" required rows={8} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white font-mono text-sm" placeholder='{"vulnerabilities": [...], "assets": [...]}' />
+              </div>
+              <div className="flex gap-3 pt-2">
+                <button type="submit" className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium">Import</button>
+                <button type="button" onClick={() => setShowImportModal(false)} className="flex-1 px-4 py-2 bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 rounded-lg hover:bg-gray-200">Cancel</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
