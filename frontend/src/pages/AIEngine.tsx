@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useQuery, useMutation } from '@tanstack/react-query';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '../lib/api';
 import {
   Brain,
@@ -19,16 +19,23 @@ import { LineChart, Line, BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, R
 import clsx from 'clsx';
 
 interface AIDashboard {
-  alerts_auto_triaged: number;
-  triage_accuracy_rate: number;
+  total_analyses: number;
+  analyses_today: number;
+  average_confidence: number;
+  accuracy_rate: number;
   false_positive_rate: number;
-  avg_triage_time_ms: number;
-  anomalies_detected_24h: number;
-  active_ml_models: number;
-  model_accuracy: number;
-  ml_false_positive_rate: number;
-  entities_at_risk: number;
-  avg_risk_score: number;
+  total_anomalies_detected: number;
+  anomalies_confirmed_rate: number;
+  models_deployed: number;
+  models_in_training: number;
+  avg_model_drift: number;
+  models_needing_retrain: number;
+  active_threat_predictions: number;
+  critical_risk_entities: number;
+  queries_processed: number;
+  queries_today: number;
+  avg_query_accuracy: number;
+  last_updated: string;
 }
 
 interface TriagedAlert {
@@ -42,38 +49,52 @@ interface TriagedAlert {
 
 interface Anomaly {
   id: string;
-  timestamp: string;
-  entity_name: string;
+  created_at: string;
+  entity_id: string;
   entity_type: string;
-  type: string;
+  anomaly_type: string;
   anomaly_score: number;
+  confidence: number;
   severity: 'critical' | 'high' | 'medium' | 'low';
   description: string;
-  status: 'active' | 'confirmed' | 'dismissed';
+  is_confirmed: boolean | null;
+  is_false_positive: boolean;
 }
 
 interface Prediction {
+  id: string;
   entity_id: string;
-  entity_name: string;
   entity_type: string;
+  prediction_type: string;
   risk_score: number;
   probability: number;
-  time_horizon_days: number;
+  time_horizon_hours: number;
   contributing_factors: string[];
   recommended_actions: string[];
+  mitre_techniques: string[];
+  expires_at: string;
+  was_accurate: boolean | null;
+  created_at: string;
 }
 
 interface MLModel {
   id: string;
   name: string;
-  type: string;
+  model_type: string;
   algorithm: string;
+  version: string;
   status: 'training' | 'ready' | 'deployed' | 'retired';
-  accuracy: number;
-  f1_score: number;
-  last_trained: string;
-  predictions_made: number;
+  description: string | null;
+  feature_columns: string[];
+  hyperparameters: Record<string, unknown>;
+  training_metrics: Record<string, number>;
+  training_data_size: number;
+  last_trained_at: string;
+  last_prediction_at: string | null;
+  prediction_count: number;
   drift_score: number;
+  tags: string[];
+  created_at: string;
 }
 
 interface Query {
@@ -99,13 +120,8 @@ const severityColors = {
   low: 'text-blue-600 dark:text-blue-400',
 };
 
-const statusDots = {
-  active: 'bg-green-500',
-  confirmed: 'bg-orange-500',
-  dismissed: 'bg-gray-400',
-};
-
 export default function AIEngine() {
+  const queryClient = useQueryClient();
   const [activeTab, setActiveTab] = useState<'ask' | 'triage' | 'anomalies' | 'predictions' | 'models'>('ask');
   const [queryInput, setQueryInput] = useState('');
   const [recentQueries, setRecentQueries] = useState<Query[]>([]);
@@ -136,10 +152,10 @@ export default function AIEngine() {
   const { data: anomalies } = useQuery({
     queryKey: ['aiAnomalies', anomalyFilter],
     queryFn: async () => {
-      const response = await api.get<Anomaly[]>('/ai/anomalies', {
+      const response = await api.get<{ anomalies: Anomaly[]; total: number }>('/ai/anomalies', {
         params: anomalyFilter !== 'all' ? { status: anomalyFilter } : {},
       });
-      return response.data;
+      return response.data?.anomalies ?? [];
     },
   });
 
@@ -169,7 +185,7 @@ export default function AIEngine() {
   // Submit query mutation
   const queryMutation = useMutation({
     mutationFn: async (query: string) => {
-      const response = await api.post<Query>('/ai/query', { query });
+      const response = await api.post<Query>('/ai/query', { natural_language: query });
       return response.data;
     },
     onSuccess: (data) => {
@@ -196,8 +212,12 @@ export default function AIEngine() {
 
   const handleAnomalyAction = async (anomalyId: string, action: 'confirm' | 'dismiss') => {
     try {
-      await api.post(`/ai/anomalies/${anomalyId}/${action}`);
-      // Refetch anomalies
+      const body = action === 'confirm'
+        ? { is_confirmed: true }
+        : { is_false_positive: true };
+      await api.post(`/ai/anomalies/${anomalyId}/feedback`, body);
+      queryClient.invalidateQueries({ queryKey: ['aiAnomalies'] });
+      queryClient.invalidateQueries({ queryKey: ['aiDashboard'] });
     } catch (error) {
       console.error('Error updating anomaly:', error);
     }
@@ -338,20 +358,20 @@ export default function AIEngine() {
           {/* Stats */}
           <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
-              <p className="text-gray-600 dark:text-gray-400 text-sm">Alerts Auto-Triaged</p>
-              <p className="text-3xl font-bold text-gray-900 dark:text-white mt-2">{dashboard?.alerts_auto_triaged || 0}</p>
+              <p className="text-gray-600 dark:text-gray-400 text-sm">Total Analyses</p>
+              <p className="text-3xl font-bold text-gray-900 dark:text-white mt-2">{dashboard?.total_analyses ?? 0}</p>
             </div>
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
               <p className="text-gray-600 dark:text-gray-400 text-sm">Accuracy Rate</p>
-              <p className="text-3xl font-bold text-green-600 dark:text-green-400 mt-2">{dashboard?.triage_accuracy_rate?.toFixed(1) || 0}%</p>
+              <p className="text-3xl font-bold text-green-600 dark:text-green-400 mt-2">{((dashboard?.accuracy_rate ?? 0) * 100).toFixed(1)}%</p>
             </div>
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
               <p className="text-gray-600 dark:text-gray-400 text-sm">False Positive Rate</p>
-              <p className="text-3xl font-bold text-orange-600 dark:text-orange-400 mt-2">{dashboard?.false_positive_rate?.toFixed(1) || 0}%</p>
+              <p className="text-3xl font-bold text-orange-600 dark:text-orange-400 mt-2">{((dashboard?.false_positive_rate ?? 0) * 100).toFixed(1)}%</p>
             </div>
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
-              <p className="text-gray-600 dark:text-gray-400 text-sm">Avg Triage Time</p>
-              <p className="text-3xl font-bold text-blue-600 dark:text-blue-400 mt-2">{dashboard?.avg_triage_time_ms || 0}ms</p>
+              <p className="text-gray-600 dark:text-gray-400 text-sm">Avg Confidence</p>
+              <p className="text-3xl font-bold text-blue-600 dark:text-blue-400 mt-2">{((dashboard?.average_confidence ?? 0) * 100).toFixed(1)}%</p>
             </div>
           </div>
 
@@ -374,8 +394,8 @@ export default function AIEngine() {
                       <p className="text-gray-900 dark:text-white font-medium">{alert.title}</p>
                     </td>
                     <td className="px-6 py-4">
-                      <span className={clsx('px-3 py-1 rounded-full text-sm font-medium', priorityColors[alert.ai_priority])}>
-                        {alert.ai_priority.charAt(0).toUpperCase() + alert.ai_priority.slice(1)}
+                      <span className={clsx('px-3 py-1 rounded-full text-sm font-medium', priorityColors[alert.ai_priority ?? 'medium'])}>
+                        {(alert.ai_priority ?? 'medium').charAt(0).toUpperCase() + (alert.ai_priority ?? 'medium').slice(1)}
                       </span>
                     </td>
                     <td className="px-6 py-4">
@@ -408,7 +428,9 @@ export default function AIEngine() {
           <button
             onClick={async () => {
               try {
-                await api.post('/ai/alerts/triage');
+                await api.post('/ai/triage/batch', { alert_ids: [], limit: 10 });
+                queryClient.invalidateQueries({ queryKey: ['triagedAlerts'] });
+                queryClient.invalidateQueries({ queryKey: ['aiDashboard'] });
               } catch (err) {
                 console.error('Triage failed:', err);
               }
@@ -426,20 +448,20 @@ export default function AIEngine() {
           {/* Stats */}
           <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
-              <p className="text-gray-600 dark:text-gray-400 text-sm">Anomalies (24h)</p>
-              <p className="text-3xl font-bold text-gray-900 dark:text-white mt-2">{dashboard?.anomalies_detected_24h || 0}</p>
+              <p className="text-gray-600 dark:text-gray-400 text-sm">Anomalies Detected</p>
+              <p className="text-3xl font-bold text-gray-900 dark:text-white mt-2">{dashboard?.total_anomalies_detected ?? 0}</p>
             </div>
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
-              <p className="text-gray-600 dark:text-gray-400 text-sm">Active ML Models</p>
-              <p className="text-3xl font-bold text-blue-600 dark:text-blue-400 mt-2">{dashboard?.active_ml_models || 0}</p>
+              <p className="text-gray-600 dark:text-gray-400 text-sm">Models Deployed</p>
+              <p className="text-3xl font-bold text-blue-600 dark:text-blue-400 mt-2">{dashboard?.models_deployed ?? 0}</p>
             </div>
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
-              <p className="text-gray-600 dark:text-gray-400 text-sm">Model Accuracy</p>
-              <p className="text-3xl font-bold text-green-600 dark:text-green-400 mt-2">{dashboard?.model_accuracy?.toFixed(1) || 0}%</p>
+              <p className="text-gray-600 dark:text-gray-400 text-sm">Avg Model Drift</p>
+              <p className="text-3xl font-bold text-green-600 dark:text-green-400 mt-2">{((dashboard?.avg_model_drift ?? 0) * 100).toFixed(1)}%</p>
             </div>
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
               <p className="text-gray-600 dark:text-gray-400 text-sm">False Positive Rate</p>
-              <p className="text-3xl font-bold text-orange-600 dark:text-orange-400 mt-2">{dashboard?.ml_false_positive_rate?.toFixed(1) || 0}%</p>
+              <p className="text-3xl font-bold text-orange-600 dark:text-orange-400 mt-2">{((dashboard?.false_positive_rate ?? 0) * 100).toFixed(1)}%</p>
             </div>
           </div>
 
@@ -479,9 +501,9 @@ export default function AIEngine() {
                 {anomalies?.slice(0, 10).map((anomaly) => (
                   <tr key={anomaly.id} className="hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors">
                     <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                      {new Date(anomaly.timestamp).toLocaleString()}
+                      {anomaly.created_at ? new Date(anomaly.created_at).toLocaleString() : 'N/A'}
                     </td>
-                    <td className="px-6 py-4 text-sm font-medium text-gray-900 dark:text-white">{anomaly.entity_name}</td>
+                    <td className="px-6 py-4 text-sm font-medium text-gray-900 dark:text-white">{anomaly.entity_id}</td>
                     <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">{anomaly.entity_type}</td>
                     <td className="px-6 py-4">
                       <div className="w-16 bg-gray-200 dark:bg-gray-700 rounded-full h-2">
@@ -492,8 +514,8 @@ export default function AIEngine() {
                       </div>
                     </td>
                     <td className="px-6 py-4">
-                      <span className={clsx('text-sm font-medium', severityColors[anomaly.severity])}>
-                        {anomaly.severity.charAt(0).toUpperCase() + anomaly.severity.slice(1)}
+                      <span className={clsx('text-sm font-medium', severityColors[anomaly.severity ?? 'medium'])}>
+                        {(anomaly.severity ?? 'medium').charAt(0).toUpperCase() + (anomaly.severity ?? 'medium').slice(1)}
                       </span>
                     </td>
                     <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400 truncate">{anomaly.description}</td>
@@ -558,10 +580,10 @@ export default function AIEngine() {
           {/* Prediction Cards */}
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
             {predictions?.slice(0, 9).map((prediction) => (
-              <div key={prediction.entity_id} className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6 space-y-4">
+              <div key={prediction.id ?? prediction.entity_id} className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6 space-y-4">
                 <div>
                   <p className="text-sm text-gray-600 dark:text-gray-400">Entity</p>
-                  <p className="font-semibold text-gray-900 dark:text-white mt-1">{prediction.entity_name}</p>
+                  <p className="font-semibold text-gray-900 dark:text-white mt-1">{prediction.entity_id}</p>
                   <p className="text-xs text-gray-500 dark:text-gray-500 mt-1">{prediction.entity_type}</p>
                 </div>
 
@@ -572,12 +594,12 @@ export default function AIEngine() {
                       <div
                         className={clsx(
                           'h-full transition-all',
-                          prediction.risk_score > 0.7 ? 'bg-red-500' : prediction.risk_score > 0.5 ? 'bg-orange-500' : 'bg-green-500'
+                          prediction.risk_score > 70 ? 'bg-red-500' : prediction.risk_score > 50 ? 'bg-orange-500' : 'bg-green-500'
                         )}
-                        style={{ width: `${prediction.risk_score * 100}%` }}
+                        style={{ width: `${Math.min(prediction.risk_score, 100)}%` }}
                       />
                     </div>
-                    <span className="text-lg font-bold text-gray-900 dark:text-white">{(prediction.risk_score * 100).toFixed(0)}</span>
+                    <span className="text-lg font-bold text-gray-900 dark:text-white">{(prediction.risk_score ?? 0).toFixed(0)}</span>
                   </div>
                 </div>
 
@@ -588,14 +610,14 @@ export default function AIEngine() {
                   </div>
                   <div className="p-3 rounded-lg bg-gray-50 dark:bg-gray-700">
                     <p className="text-xs text-gray-600 dark:text-gray-400">Time Horizon</p>
-                    <p className="text-lg font-bold text-gray-900 dark:text-white mt-1">{prediction.time_horizon_days}d</p>
+                    <p className="text-lg font-bold text-gray-900 dark:text-white mt-1">{prediction.time_horizon_hours}h</p>
                   </div>
                 </div>
 
                 <div>
                   <p className="text-sm font-semibold text-gray-900 dark:text-white mb-2">Factors</p>
                   <ul className="space-y-1">
-                    {prediction.contributing_factors.slice(0, 2).map((factor, idx) => (
+                    {(prediction.contributing_factors ?? []).slice(0, 2).map((factor, idx) => (
                       <li key={idx} className="text-xs text-gray-600 dark:text-gray-400 flex items-start gap-2">
                         <span className="text-blue-600 dark:text-blue-400 mt-1">•</span>
                         <span>{factor}</span>
@@ -607,7 +629,7 @@ export default function AIEngine() {
                 <div>
                   <p className="text-sm font-semibold text-gray-900 dark:text-white mb-2">Recommended Actions</p>
                   <ul className="space-y-1">
-                    {prediction.recommended_actions.slice(0, 2).map((action, idx) => (
+                    {(prediction.recommended_actions ?? []).slice(0, 2).map((action, idx) => (
                       <li key={idx} className="text-xs text-gray-600 dark:text-gray-400 flex items-start gap-2">
                         <span className="text-green-600 dark:text-green-400 mt-1">→</span>
                         <span>{action}</span>
@@ -627,7 +649,9 @@ export default function AIEngine() {
           <button
             onClick={async () => {
               try {
-                await api.post('/ai/models/train');
+                await api.post('/ai/models/train', { model_type: 'anomaly_detection', algorithm: 'isolation_forest' });
+                queryClient.invalidateQueries({ queryKey: ['mlModels'] });
+                queryClient.invalidateQueries({ queryKey: ['aiDashboard'] });
               } catch (err) {
                 console.error('Training failed:', err);
               }
@@ -655,35 +679,35 @@ export default function AIEngine() {
                   </div>
 
                   <div className="flex items-center justify-between">
-                    <span className="text-sm text-gray-600 dark:text-gray-400">{model.type}</span>
-                    <span className={clsx('px-3 py-1 rounded-full text-xs font-medium', statusColor[model.status])}>
-                      {model.status.charAt(0).toUpperCase() + model.status.slice(1)}
+                    <span className="text-sm text-gray-600 dark:text-gray-400">{model.model_type}</span>
+                    <span className={clsx('px-3 py-1 rounded-full text-xs font-medium', statusColor[model.status ?? 'ready'])}>
+                      {(model.status ?? 'ready').charAt(0).toUpperCase() + (model.status ?? 'ready').slice(1)}
                     </span>
                   </div>
 
                   <div className="grid grid-cols-2 gap-4">
                     <div className="p-3 rounded-lg bg-gray-50 dark:bg-gray-700">
                       <p className="text-xs text-gray-600 dark:text-gray-400">Accuracy</p>
-                      <p className="text-lg font-bold text-gray-900 dark:text-white mt-1">{(model.accuracy * 100).toFixed(1)}%</p>
+                      <p className="text-lg font-bold text-gray-900 dark:text-white mt-1">{((model.training_metrics?.accuracy ?? 0) * 100).toFixed(1)}%</p>
                     </div>
                     <div className="p-3 rounded-lg bg-gray-50 dark:bg-gray-700">
                       <p className="text-xs text-gray-600 dark:text-gray-400">F1 Score</p>
-                      <p className="text-lg font-bold text-gray-900 dark:text-white mt-1">{(model.f1_score * 100).toFixed(1)}%</p>
+                      <p className="text-lg font-bold text-gray-900 dark:text-white mt-1">{((model.training_metrics?.f1 ?? 0) * 100).toFixed(1)}%</p>
                     </div>
                   </div>
 
                   <div className="space-y-2 text-sm">
                     <div className="flex justify-between">
                       <span className="text-gray-600 dark:text-gray-400">Last Trained</span>
-                      <span className="text-gray-900 dark:text-white font-medium">{new Date(model.last_trained).toLocaleDateString()}</span>
+                      <span className="text-gray-900 dark:text-white font-medium">{model.last_trained_at ? new Date(model.last_trained_at).toLocaleDateString() : 'N/A'}</span>
                     </div>
                     <div className="flex justify-between">
                       <span className="text-gray-600 dark:text-gray-400">Predictions</span>
-                      <span className="text-gray-900 dark:text-white font-medium">{model.predictions_made}</span>
+                      <span className="text-gray-900 dark:text-white font-medium">{model.prediction_count ?? 0}</span>
                     </div>
                     <div className="flex justify-between">
                       <span className="text-gray-600 dark:text-gray-400">Drift Score</span>
-                      <span className="text-gray-900 dark:text-white font-medium">{(model.drift_score * 100).toFixed(1)}%</span>
+                      <span className="text-gray-900 dark:text-white font-medium">{((model.drift_score ?? 0) * 100).toFixed(1)}%</span>
                     </div>
                   </div>
                 </div>
