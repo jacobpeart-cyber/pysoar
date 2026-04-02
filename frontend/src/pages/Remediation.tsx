@@ -64,43 +64,48 @@ interface StatCard {
 interface Policy {
   id: string;
   name: string;
-  type: string;
-  trigger: string;
-  enabled: boolean;
+  policy_type: string;
+  trigger_type: string;
+  is_enabled: boolean;
   requires_approval: boolean;
-  executions: number;
-  success_rate: number;
-  last_executed: string;
+  execution_count: number;
+  success_rate: number | null;
+  last_executed_at: string | null;
 }
 
 interface Execution {
   id: string;
-  time: string;
-  trigger: string;
-  target: string;
-  policy: string;
+  created_at: string;
+  trigger_source: string;
+  target_entity: string;
+  target_type: string;
+  policy_id: string | null;
   status: string;
-  duration: number;
-  actions_completed?: string;
-  analyst?: string;
+  overall_result: string | null;
+  actions_completed: any[];
+  actions_planned: any[];
+  created_by: string | null;
+  started_at: string | null;
+  completed_at: string | null;
 }
 
 interface QuickAction {
   id: string;
-  type: string;
-  target: string;
-  timestamp: string;
+  trigger_source: string;
+  target_entity: string;
+  created_at: string;
   status: string;
 }
 
 interface Integration {
   id: string;
   name: string;
-  type: string;
-  vendor: string;
-  status: string;
+  integration_type: string;
+  vendor: string | null;
+  is_connected: boolean;
+  health_status: string;
   capabilities: string[];
-  last_health_check: string;
+  last_health_check: string | null;
 }
 
 const tabs: Tab[] = [
@@ -295,24 +300,26 @@ export default function Remediation() {
 
   // Derive chart data from executions API response
   const executionTimelineData = useMemo(() => {
-    const executions: Execution[] = executionsData || [];
+    const rawData = Array.isArray(executionsData) ? executionsData : (executionsData?.items || executionsData?.executions || []);
+    const executions: Execution[] = rawData;
     if (executions.length === 0) return [];
     const grouped: Record<string, { successful: number; failed: number }> = {};
     executions.forEach((exec) => {
-      const day = new Date(exec.time).toLocaleDateString('en-US', { weekday: 'short' });
+      const day = new Date(exec.created_at).toLocaleDateString('en-US', { weekday: 'short' });
       if (!grouped[day]) grouped[day] = { successful: 0, failed: 0 };
-      if (exec.status === 'completed') grouped[day].successful += 1;
-      else if (exec.status === 'failed') grouped[day].failed += 1;
+      if (exec.overall_result === 'success' || exec.status === 'completed') grouped[day].successful += 1;
+      else if (exec.overall_result === 'failure' || exec.status === 'failed') grouped[day].failed += 1;
     });
     return Object.entries(grouped).map(([date, counts]) => ({ date, ...counts }));
   }, [executionsData]);
 
   const actionTypeData = useMemo(() => {
-    const executions: Execution[] = executionsData || [];
+    const rawData = Array.isArray(executionsData) ? executionsData : (executionsData?.items || executionsData?.executions || []);
+    const executions: Execution[] = rawData;
     if (executions.length === 0) return [];
     const counts: Record<string, number> = {};
     executions.forEach((exec) => {
-      const type = exec.trigger || 'unknown';
+      const type = exec.trigger_source || 'unknown';
       counts[type] = (counts[type] || 0) + 1;
     });
     return Object.entries(counts).map(([type, count]) => ({ type, count }));
@@ -333,7 +340,7 @@ export default function Remediation() {
       },
       {
         label: 'Success Rate',
-        value: `${dashboardData?.success_rate || '94.2'}%`,
+        value: `${dashboardData?.overall_success_rate ?? dashboardData?.success_rate ?? '94.2'}%`,
         icon: <CheckCircle2 className="w-6 h-6 text-green-500" />,
       },
       {
@@ -344,7 +351,7 @@ export default function Remediation() {
       },
       {
         label: 'Avg Remediation Time',
-        value: `${dashboardData?.avg_remediation_time || '2.4'}m`,
+        value: `${dashboardData?.avg_execution_minutes ?? dashboardData?.avg_remediation_time ?? '2.4'}m`,
         icon: <Clock className="w-6 h-6 text-orange-500" />,
       },
       {
@@ -529,7 +536,7 @@ export default function Remediation() {
       return <LoadingState />;
     }
 
-    const allPolicies = policiesData?.policies || [];
+    const allPolicies: Policy[] = Array.isArray(policiesData) ? policiesData : (policiesData?.items || policiesData?.policies || []);
 
     return (
       <div className="space-y-6">
@@ -619,18 +626,18 @@ export default function Remediation() {
                       <span
                         className={clsx(
                           'inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium border',
-                          policyTypeColors[policy.type] || 'bg-gray-100 text-gray-700'
+                          policyTypeColors[policy.policy_type] || 'bg-gray-100 text-gray-700'
                         )}
                       >
-                        {policy.type}
+                        {policy.policy_type}
                       </span>
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
-                      {policy.trigger}
+                      {policy.trigger_type}
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap">
                       <button className="flex items-center gap-2 px-3 py-1 rounded-lg transition">
-                        {policy.enabled ? (
+                        {policy.is_enabled ? (
                           <>
                             <ToggleRight className="w-5 h-5 text-green-600" />
                             <span className="text-sm font-medium text-green-600">Enabled</span>
@@ -657,21 +664,21 @@ export default function Remediation() {
                       )}
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
-                      {policy.executions}
+                      {policy.execution_count}
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-sm">
                       <div className="flex items-center gap-2">
                         <div className="w-16 h-1.5 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
                           <div
                             className="h-full bg-green-500"
-                            style={{ width: `${policy.success_rate}%` }}
+                            style={{ width: `${policy.success_rate ?? 0}%` }}
                           />
                         </div>
-                        <span className="text-gray-600 dark:text-gray-400">{policy.success_rate}%</span>
+                        <span className="text-gray-600 dark:text-gray-400">{policy.success_rate ?? 0}%</span>
                       </div>
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
-                      {policy.last_executed}
+                      {policy.last_executed_at || 'Never'}
                     </td>
                   </tr>
                 ))}
@@ -689,8 +696,8 @@ export default function Remediation() {
       return <LoadingState />;
     }
 
-    const allExecutions = executionsData?.executions || [];
-    const pendingApprovals = pendingApprovalsData?.pending || [];
+    const allExecutions: Execution[] = Array.isArray(executionsData) ? executionsData : (executionsData?.items || executionsData?.executions || []);
+    const pendingApprovals = pendingApprovalsData?.executions || [];
 
     return (
       <div className="space-y-6">
@@ -805,21 +812,21 @@ export default function Remediation() {
                       }
                     >
                       <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-white">
-                        {execution.time}
+                        {new Date(execution.created_at).toLocaleString()}
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap">
                         <div className="flex items-center gap-2">
-                          {triggerIcons[execution.trigger] || <AlertCircle className="w-4 h-4" />}
+                          {triggerIcons[execution.trigger_source] || <AlertCircle className="w-4 h-4" />}
                           <span className="text-sm text-gray-600 dark:text-gray-400">
-                            {execution.trigger}
+                            {execution.trigger_source}
                           </span>
                         </div>
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
-                        {execution.target}
+                        {execution.target_entity}
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
-                        {execution.policy}
+                        {execution.policy_id || 'Manual'}
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap">
                         <span
@@ -835,13 +842,15 @@ export default function Remediation() {
                         </span>
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
-                        {execution.actions_completed}
+                        {execution.actions_completed?.length || 0}/{execution.actions_planned?.length || 0}
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
-                        {execution.duration}s
+                        {execution.started_at && execution.completed_at
+                          ? `${((new Date(execution.completed_at).getTime() - new Date(execution.started_at).getTime()) / 1000).toFixed(1)}s`
+                          : execution.started_at ? 'Running' : '-'}
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
-                        {execution.analyst || 'System'}
+                        {execution.created_by || 'System'}
                       </td>
                       <td className="px-6 py-4 text-right">
                         <ChevronRight
@@ -1091,16 +1100,16 @@ export default function Remediation() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
-                {quickActionsData?.recent?.map((action: QuickAction, idx: number) => (
+                {(Array.isArray(quickActionsData) ? quickActionsData : (quickActionsData?.recent || [])).map((action: QuickAction, idx: number) => (
                   <tr key={idx} className="hover:bg-gray-50 dark:hover:bg-gray-700 transition">
                     <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900 dark:text-white">
-                      {action.type}
+                      {action.trigger_source}
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
-                      {action.target}
+                      {action.target_entity}
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
-                      {action.timestamp}
+                      {action.created_at ? new Date(action.created_at).toLocaleString() : '-'}
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap">
                       <span
@@ -1128,7 +1137,7 @@ export default function Remediation() {
       return <LoadingState />;
     }
 
-    const integrations = integrationsData?.integrations || [];
+    const integrations: Integration[] = Array.isArray(integrationsData) ? integrationsData : (integrationsData?.items || integrationsData?.integrations || []);
 
     return (
       <div className="space-y-6">
@@ -1160,9 +1169,9 @@ export default function Remediation() {
                   <div
                     className={clsx(
                       'w-3 h-3 rounded-full',
-                      integration.status === 'connected'
+                      integration.is_connected
                         ? 'bg-green-500'
-                        : integration.status === 'error'
+                        : integration.health_status === 'error'
                           ? 'bg-red-500'
                           : 'bg-gray-400'
                     )}
@@ -1174,10 +1183,10 @@ export default function Remediation() {
                 <span
                   className={clsx(
                     'inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium border',
-                    integrationTypeColors[integration.type] || 'bg-gray-100 text-gray-700'
+                    integrationTypeColors[integration.integration_type] || 'bg-gray-100 text-gray-700'
                   )}
                 >
-                  {integration.type}
+                  {integration.integration_type}
                 </span>
               </div>
 
@@ -1199,7 +1208,7 @@ export default function Remediation() {
 
               <div className="mb-4 pb-4 border-b border-gray-200 dark:border-gray-700">
                 <p className="text-xs text-gray-600 dark:text-gray-400">
-                  Last health check: {integration.last_health_check}
+                  Last health check: {integration.last_health_check ? new Date(integration.last_health_check).toLocaleString() : 'Never'}
                 </p>
               </div>
 
