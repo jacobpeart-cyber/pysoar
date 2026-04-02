@@ -61,27 +61,28 @@ async def get_threat_intel_stats(
 ) -> dict:
     """
     Get threat intelligence stats for the frontend dashboard cards.
-    Returns total_indicators, malicious_ips, malicious_domains, malicious_hashes,
-    feeds_active, and last_update.
     """
-    org_id = current_user.organization_id
+    org_id = getattr(current_user, "organization_id", None)
+
+    # Build org filter - if no org_id, query all
+    def org_filter(model):
+        if org_id:
+            return model.organization_id == org_id
+        return True
 
     total_indicators = (
         await db.execute(
-            select(func.count(ThreatIndicator.id)).where(
-                ThreatIndicator.organization_id == org_id
-            )
+            select(func.count(ThreatIndicator.id)).where(org_filter(ThreatIndicator))
         )
     ).scalar() or 0
 
-    # Count indicators by type where severity suggests malicious
     malicious_severities = ("critical", "high")
 
     malicious_ips = (
         await db.execute(
             select(func.count(ThreatIndicator.id)).where(
                 and_(
-                    ThreatIndicator.organization_id == org_id,
+                    org_filter(ThreatIndicator),
                     ThreatIndicator.indicator_type.in_(["ipv4", "ipv6", "ip"]),
                     ThreatIndicator.severity.in_(malicious_severities),
                 )
@@ -93,7 +94,7 @@ async def get_threat_intel_stats(
         await db.execute(
             select(func.count(ThreatIndicator.id)).where(
                 and_(
-                    ThreatIndicator.organization_id == org_id,
+                    org_filter(ThreatIndicator),
                     ThreatIndicator.indicator_type == "domain",
                     ThreatIndicator.severity.in_(malicious_severities),
                 )
@@ -105,7 +106,7 @@ async def get_threat_intel_stats(
         await db.execute(
             select(func.count(ThreatIndicator.id)).where(
                 and_(
-                    ThreatIndicator.organization_id == org_id,
+                    org_filter(ThreatIndicator),
                     ThreatIndicator.indicator_type.in_(["md5", "sha1", "sha256", "hash"]),
                     ThreatIndicator.severity.in_(malicious_severities),
                 )
@@ -117,19 +118,16 @@ async def get_threat_intel_stats(
         await db.execute(
             select(func.count(ThreatFeed.id)).where(
                 and_(
-                    ThreatFeed.organization_id == org_id,
+                    org_filter(ThreatFeed),
                     ThreatFeed.is_enabled == True,
                 )
             )
         )
     ).scalar() or 0
 
-    # Get the most recent last_seen across all indicators
     last_update_result = (
         await db.execute(
-            select(func.max(ThreatIndicator.last_seen)).where(
-                ThreatIndicator.organization_id == org_id
-            )
+            select(func.max(ThreatIndicator.last_seen)).where(org_filter(ThreatIndicator))
         )
     ).scalar()
 
@@ -162,12 +160,13 @@ async def lookup_ioc(
             detail="indicator is required",
         )
 
-    org_id = current_user.organization_id
+    org_id = getattr(current_user, "organization_id", None)
 
     # Query matching indicators
+    org_clause = ThreatIndicator.organization_id == org_id if org_id else True
     query = select(ThreatIndicator).where(
         and_(
-            ThreatIndicator.organization_id == org_id,
+            org_clause,
             ThreatIndicator.value == indicator_value,
         )
     )
