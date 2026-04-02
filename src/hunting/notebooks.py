@@ -285,13 +285,44 @@ class NotebookService:
         if cell.cell_type != "query":
             raise ValueError(f"Cell {cell_index} is not a query cell")
 
-        # TODO: Execute query against SIEM service
+        import asyncio
         import time
 
         start_time = time.time()
 
-        # Simulate query execution
-        cell.output = "Query execution results would appear here"
+        # Execute query against SIEM search service
+        try:
+            from src.siem.search import LogSearchService, SearchQuery
+            from src.core.database import async_session_factory
+
+            query_text = cell.content.strip()
+
+            async def _run_query():
+                async with async_session_factory() as db:
+                    search_service = LogSearchService()
+                    search_query = SearchQuery(
+                        query_text=query_text,
+                        size=100,
+                        sort_by="timestamp",
+                        sort_order="desc",
+                    )
+                    result = await search_service.search(db, search_query)
+                    return result
+
+            search_result = asyncio.run(_run_query())
+
+            # Format results for notebook display
+            output_lines = [f"Query: {query_text}", f"Total results: {search_result.total}"]
+            for item in search_result.items[:50]:
+                ts = item.get("timestamp", "")
+                msg = item.get("message", item.get("raw_log", ""))
+                output_lines.append(f"  [{ts}] {msg}")
+
+            cell.output = "\n".join(output_lines)
+
+        except Exception as e:
+            cell.output = f"Query execution error: {str(e)}"
+
         cell.executed_at = datetime.now(datetime.timezone.utc)
         cell.execution_time_ms = (time.time() - start_time) * 1000
 
