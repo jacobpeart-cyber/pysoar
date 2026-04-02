@@ -6,45 +6,44 @@ import {
   TrendingUp,
   AlertTriangle,
   Eye,
-  Activity,
   Search,
-  Filter,
   Clock,
-  Zap,
   BarChart3,
 } from 'lucide-react';
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend, BarChart, Bar } from 'recharts';
+import { XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar } from 'recharts';
 import clsx from 'clsx';
 
 interface UEBADashboard {
-  entities_monitored: number;
-  high_risk_entities: number;
-  alerts_24h: number;
-  avg_risk_score: number;
-  top_entities: Entity[];
-  risk_trend: TrendPoint[];
-  heatmap_data: HeatmapData;
+  total_entities: number;
+  watched_entities: number;
+  high_risk_entities: Entity[];
+  risk_distribution: { level: string; count: number }[];
+  alert_distribution: { severity: string; count: number }[];
+  alerts_last_7d: number;
+  alerts_last_30d: number;
+  anomalies_last_7d: number;
+  anomalies_last_30d: number;
+  updated_at: string;
 }
 
 interface Entity {
   id: string;
   name: string;
-  type: 'user' | 'host' | 'service_account';
+  entity_type: 'user' | 'host' | 'service_account';
   department?: string;
   risk_score: number;
   risk_level: 'critical' | 'high' | 'medium' | 'low';
   anomaly_count_30d: number;
-  last_activity: string;
+  last_activity_at: string;
   is_watched: boolean;
+  current_behavior?: Record<string, any>;
   behavior_timeline?: BehaviorEvent[];
-  risk_factors?: string[];
 }
 
 interface RiskAlert {
   id: string;
-  timestamp: string;
-  entity_name: string;
-  entity_type: string;
+  created_at: string;
+  entity_profile_id: string;
   alert_type: string;
   severity: 'critical' | 'high' | 'medium' | 'low';
   description: string;
@@ -54,11 +53,10 @@ interface RiskAlert {
 interface PeerGroup {
   id: string;
   name: string;
-  type: string;
+  group_type: string;
   member_count: number;
-  avg_risk: number;
-  highest_risk_member: string;
-  highest_risk_score: number;
+  risk_threshold: number;
+  members?: Entity[];
 }
 
 interface BehaviorEvent {
@@ -69,16 +67,6 @@ interface BehaviorEvent {
   severity?: string;
 }
 
-interface TrendPoint {
-  date: string;
-  risk_score: number;
-}
-
-interface HeatmapData {
-  entity_types: string[];
-  risk_levels: string[];
-  matrix: Record<string, Record<string, number>>;
-}
 
 const riskLevelColors = {
   critical: 'text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20',
@@ -130,7 +118,7 @@ export default function UEBADashboard() {
     queryKey: ['ueba-entities', entityTypeFilter, riskLevelFilter, searchQuery],
     queryFn: async () => {
       const params: Record<string, any> = {};
-      if (entityTypeFilter !== 'all') params.type = entityTypeFilter;
+      if (entityTypeFilter !== 'all') params.entity_type = entityTypeFilter;
       if (riskLevelFilter !== 'all') params.risk_level = riskLevelFilter;
       if (searchQuery) params.search = searchQuery;
 
@@ -207,30 +195,30 @@ export default function UEBADashboard() {
           <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
               <p className="text-gray-600 dark:text-gray-400 text-sm">Entities Monitored</p>
-              <p className="text-3xl font-bold text-gray-900 dark:text-white mt-2">{dashboard?.entities_monitored || 0}</p>
+              <p className="text-3xl font-bold text-gray-900 dark:text-white mt-2">{dashboard?.total_entities ?? 0}</p>
             </div>
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
               <p className="text-gray-600 dark:text-gray-400 text-sm">High-Risk Entities</p>
-              <p className="text-3xl font-bold text-red-600 dark:text-red-400 mt-2">{dashboard?.high_risk_entities || 0}</p>
+              <p className="text-3xl font-bold text-red-600 dark:text-red-400 mt-2">{Array.isArray(dashboard?.high_risk_entities) ? dashboard.high_risk_entities.length : 0}</p>
             </div>
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
-              <p className="text-gray-600 dark:text-gray-400 text-sm">Alerts (24h)</p>
-              <p className="text-3xl font-bold text-orange-600 dark:text-orange-400 mt-2">{dashboard?.alerts_24h || 0}</p>
+              <p className="text-gray-600 dark:text-gray-400 text-sm">Alerts (7d)</p>
+              <p className="text-3xl font-bold text-orange-600 dark:text-orange-400 mt-2">{dashboard?.alerts_last_7d ?? 0}</p>
             </div>
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
-              <p className="text-gray-600 dark:text-gray-400 text-sm">Avg Risk Score</p>
-              <p className="text-3xl font-bold text-blue-600 dark:text-blue-400 mt-2">{dashboard?.avg_risk_score?.toFixed(2) || 0}</p>
+              <p className="text-gray-600 dark:text-gray-400 text-sm">Anomalies (7d)</p>
+              <p className="text-3xl font-bold text-blue-600 dark:text-blue-400 mt-2">{dashboard?.anomalies_last_7d ?? 0}</p>
             </div>
           </div>
 
-          {/* Risk Trend Chart */}
-          {dashboard?.risk_trend && dashboard.risk_trend.length > 0 && (
+          {/* Risk Distribution Chart */}
+          {Array.isArray(dashboard?.risk_distribution) && dashboard.risk_distribution.length > 0 && (
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
-              <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">Risk Trend (7 Days)</h3>
+              <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">Risk Distribution</h3>
               <ResponsiveContainer width="100%" height={300}>
-                <LineChart data={dashboard.risk_trend}>
+                <BarChart data={dashboard.risk_distribution}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
-                  <XAxis dataKey="date" stroke="#6b7280" />
+                  <XAxis dataKey="level" stroke="#6b7280" />
                   <YAxis stroke="#6b7280" />
                   <Tooltip
                     contentStyle={{
@@ -240,14 +228,8 @@ export default function UEBADashboard() {
                       color: '#fff',
                     }}
                   />
-                  <Line
-                    type="monotone"
-                    dataKey="risk_score"
-                    stroke="#9333ea"
-                    strokeWidth={2}
-                    dot={{ fill: '#9333ea', r: 4 }}
-                  />
-                </LineChart>
+                  <Bar dataKey="count" fill="#9333ea" radius={[4, 4, 0, 0]} />
+                </BarChart>
               </ResponsiveContainer>
             </div>
           )}
@@ -269,35 +251,43 @@ export default function UEBADashboard() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
-                {dashboard?.top_entities?.slice(0, 10).map((entity) => (
+                {(Array.isArray(dashboard?.high_risk_entities) && dashboard.high_risk_entities.length > 0) ? dashboard.high_risk_entities.slice(0, 10).map((entity) => (
                   <tr key={entity.id} className="hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors">
-                    <td className="px-6 py-4 font-medium text-gray-900 dark:text-white">{entity.name}</td>
-                    <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400 capitalize">{entity.type}</td>
+                    <td className="px-6 py-4 font-medium text-gray-900 dark:text-white">{entity.name ?? '—'}</td>
+                    <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400 capitalize">{entity.entity_type ?? '—'}</td>
                     <td className="px-6 py-4">
                       <div className="flex items-center gap-2">
                         <div className="w-24 bg-gray-200 dark:bg-gray-700 rounded-full h-2">
                           <div
                             className={clsx(
                               'h-2 rounded-full',
-                              entity.risk_score > 0.7 ? 'bg-red-500' : entity.risk_score > 0.5 ? 'bg-orange-500' : 'bg-yellow-500'
+                              (entity.risk_score ?? 0) > 70 ? 'bg-red-500' : (entity.risk_score ?? 0) > 50 ? 'bg-orange-500' : 'bg-yellow-500'
                             )}
-                            style={{ width: `${entity.risk_score * 100}%` }}
+                            style={{ width: `${Math.min(entity.risk_score ?? 0, 100)}%` }}
                           />
                         </div>
-                        <span className="text-sm font-medium text-gray-900 dark:text-white">{(entity.risk_score * 100).toFixed(0)}</span>
+                        <span className="text-sm font-medium text-gray-900 dark:text-white">{(entity.risk_score ?? 0).toFixed(0)}</span>
                       </div>
                     </td>
                     <td className="px-6 py-4">
-                      <span className={clsx('px-3 py-1 rounded-full text-xs font-medium', riskLevelColors[entity.risk_level])}>
-                        {entity.risk_level.charAt(0).toUpperCase() + entity.risk_level.slice(1)}
-                      </span>
+                      {entity.risk_level ? (
+                        <span className={clsx('px-3 py-1 rounded-full text-xs font-medium', riskLevelColors[entity.risk_level])}>
+                          {entity.risk_level.charAt(0).toUpperCase() + entity.risk_level.slice(1)}
+                        </span>
+                      ) : '—'}
                     </td>
-                    <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">{entity.anomaly_count_30d}</td>
+                    <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">{entity.anomaly_count_30d ?? 0}</td>
                     <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                      {new Date(entity.last_activity).toLocaleString()}
+                      {entity.last_activity_at ? new Date(entity.last_activity_at).toLocaleString() : '—'}
                     </td>
                   </tr>
-                ))}
+                )) : (
+                  <tr>
+                    <td colSpan={6} className="px-6 py-8 text-center text-gray-500 dark:text-gray-400">
+                      No high-risk entities found.
+                    </td>
+                  </tr>
+                )}
               </tbody>
             </table>
           </div>
@@ -357,16 +347,16 @@ export default function UEBADashboard() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
-                {entities?.slice(0, 15).map((entity) => (
+                {entities && entities.length > 0 ? entities.slice(0, 15).map((entity) => (
                   <tr
                     key={entity.id}
                     onClick={() => setExpandedEntity(expandedEntity === entity.id ? null : entity.id)}
                     className="hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors cursor-pointer"
                   >
                     <td className="px-6 py-4">
-                      <p className="font-medium text-gray-900 dark:text-white">{entity.name}</p>
+                      <p className="font-medium text-gray-900 dark:text-white">{entity.name ?? '—'}</p>
                     </td>
-                    <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400 capitalize">{entity.type}</td>
+                    <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400 capitalize">{entity.entity_type ?? '—'}</td>
                     <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">{entity.department || '—'}</td>
                     <td className="px-6 py-4">
                       <div className="flex items-center gap-2">
@@ -374,25 +364,31 @@ export default function UEBADashboard() {
                           <div
                             className={clsx(
                               'h-2 rounded-full',
-                              entity.risk_score > 0.7 ? 'bg-red-500' : entity.risk_score > 0.5 ? 'bg-orange-500' : 'bg-green-500'
+                              (entity.risk_score ?? 0) > 70 ? 'bg-red-500' : (entity.risk_score ?? 0) > 50 ? 'bg-orange-500' : 'bg-green-500'
                             )}
-                            style={{ width: `${entity.risk_score * 100}%` }}
+                            style={{ width: `${Math.min(entity.risk_score ?? 0, 100)}%` }}
                           />
                         </div>
-                        <span className="text-sm font-medium text-gray-900 dark:text-white">{(entity.risk_score * 100).toFixed(0)}</span>
+                        <span className="text-sm font-medium text-gray-900 dark:text-white">{(entity.risk_score ?? 0).toFixed(0)}</span>
                       </div>
                     </td>
-                    <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">{entity.anomaly_count_30d}</td>
+                    <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">{entity.anomaly_count_30d ?? 0}</td>
                     <td className="px-6 py-4">
                       {entity.is_watched && (
                         <Eye className="w-5 h-5 text-blue-600 dark:text-blue-400" />
                       )}
                     </td>
                     <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                      {new Date(entity.last_activity).toLocaleDateString()}
+                      {entity.last_activity_at ? new Date(entity.last_activity_at).toLocaleDateString() : '—'}
                     </td>
                   </tr>
-                ))}
+                )) : (
+                  <tr>
+                    <td colSpan={7} className="px-6 py-8 text-center text-gray-500 dark:text-gray-400">
+                      {entities === undefined ? 'Loading entities...' : 'No entities found.'}
+                    </td>
+                  </tr>
+                )}
               </tbody>
             </table>
           </div>
@@ -415,34 +411,57 @@ export default function UEBADashboard() {
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
-              {alerts?.slice(0, 20).map((alert) => (
+              {alerts && alerts.length > 0 ? alerts.slice(0, 20).map((alert) => (
                 <tr key={alert.id} className="hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors">
                   <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                    {new Date(alert.timestamp).toLocaleString()}
+                    {alert.created_at ? new Date(alert.created_at).toLocaleString() : '—'}
                   </td>
-                  <td className="px-6 py-4 font-medium text-gray-900 dark:text-white">{alert.entity_name}</td>
-                  <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">{alert.alert_type}</td>
+                  <td className="px-6 py-4 font-medium text-gray-900 dark:text-white">{alert.entity_profile_id ?? '—'}</td>
+                  <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">{alert.alert_type ?? '—'}</td>
                   <td className="px-6 py-4">
-                    <span className={clsx('text-sm font-medium', severityColors[alert.severity])}>
-                      {alert.severity.charAt(0).toUpperCase() + alert.severity.slice(1)}
-                    </span>
+                    {alert.severity ? (
+                      <span className={clsx('text-sm font-medium', severityColors[alert.severity])}>
+                        {alert.severity.charAt(0).toUpperCase() + alert.severity.slice(1)}
+                      </span>
+                    ) : '—'}
                   </td>
-                  <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400 truncate">{alert.description}</td>
+                  <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400 truncate">{alert.description ?? '—'}</td>
                   <td className="px-6 py-4">
-                    <span className={clsx('px-3 py-1 rounded-full text-xs font-medium', statusBadgeColors[alert.status])}>
-                      {alert.status.charAt(0).toUpperCase() + alert.status.slice(1)}
-                    </span>
+                    {alert.status ? (
+                      <span className={clsx('px-3 py-1 rounded-full text-xs font-medium', statusBadgeColors[alert.status])}>
+                        {alert.status.charAt(0).toUpperCase() + alert.status.slice(1)}
+                      </span>
+                    ) : '—'}
                   </td>
                   <td className="px-6 py-4 flex gap-2">
-                    <button className="text-xs px-2 py-1 rounded bg-blue-50 dark:bg-blue-900/20 text-blue-600 dark:text-blue-400 hover:bg-blue-100 dark:hover:bg-blue-900/40 transition-colors">
+                    <button
+                      onClick={() => {
+                        api.put(`/ueba/alerts/${alert.id}/status`, { status: 'investigating' });
+                      }}
+                      className="text-xs px-2 py-1 rounded bg-blue-50 dark:bg-blue-900/20 text-blue-600 dark:text-blue-400 hover:bg-blue-100 dark:hover:bg-blue-900/40 transition-colors"
+                    >
                       Investigate
                     </button>
-                    <button className="text-xs px-2 py-1 rounded bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400 hover:bg-red-100 dark:hover:bg-red-900/40 transition-colors">
+                    <button
+                      onClick={() => {
+                        const incidentId = prompt('Enter incident ID to escalate to:');
+                        if (incidentId) {
+                          api.post(`/ueba/alerts/${alert.id}/escalate?incident_id=${encodeURIComponent(incidentId)}`);
+                        }
+                      }}
+                      className="text-xs px-2 py-1 rounded bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400 hover:bg-red-100 dark:hover:bg-red-900/40 transition-colors"
+                    >
                       Escalate
                     </button>
                   </td>
                 </tr>
-              ))}
+              )) : (
+                <tr>
+                  <td colSpan={7} className="px-6 py-8 text-center text-gray-500 dark:text-gray-400">
+                    {alerts === undefined ? 'Loading alerts...' : 'No alerts found.'}
+                  </td>
+                </tr>
+              )}
             </tbody>
           </table>
         </div>
@@ -451,42 +470,42 @@ export default function UEBADashboard() {
       {/* Peer Groups Tab */}
       {activeTab === 'peers' && (
         <div className="space-y-6">
-          <button className="px-4 py-2 rounded-lg bg-purple-600 dark:bg-purple-700 text-white hover:bg-purple-700 dark:hover:bg-purple-600 font-medium transition-colors">
+          <button
+            onClick={() => {
+              api.post('/ueba/peer-groups/auto-cluster');
+            }}
+            className="px-4 py-2 rounded-lg bg-purple-600 dark:bg-purple-700 text-white hover:bg-purple-700 dark:hover:bg-purple-600 font-medium transition-colors"
+          >
             Auto-Cluster
           </button>
 
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-            {peerGroups?.map((group) => (
-              <div key={group.id} className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6 space-y-4">
-                <div>
-                  <h3 className="font-semibold text-gray-900 dark:text-white">{group.name}</h3>
-                  <p className="text-xs text-gray-600 dark:text-gray-400 mt-1">{group.type}</p>
-                </div>
+          {peerGroups && peerGroups.length > 0 ? (
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+              {peerGroups.map((group) => (
+                <div key={group.id} className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6 space-y-4">
+                  <div>
+                    <h3 className="font-semibold text-gray-900 dark:text-white">{group.name ?? '—'}</h3>
+                    <p className="text-xs text-gray-600 dark:text-gray-400 mt-1">{group.group_type ?? '—'}</p>
+                  </div>
 
-                <div className="grid grid-cols-2 gap-4">
-                  <div className="p-3 rounded-lg bg-gray-50 dark:bg-gray-700">
-                    <p className="text-xs text-gray-600 dark:text-gray-400">Members</p>
-                    <p className="text-lg font-bold text-gray-900 dark:text-white mt-1">{group.member_count}</p>
-                  </div>
-                  <div className="p-3 rounded-lg bg-gray-50 dark:bg-gray-700">
-                    <p className="text-xs text-gray-600 dark:text-gray-400">Avg Risk</p>
-                    <p className="text-lg font-bold text-gray-900 dark:text-white mt-1">{(group.avg_risk * 100).toFixed(0)}</p>
-                  </div>
-                </div>
-
-                <div className="pt-4 border-t border-gray-200 dark:border-gray-700">
-                  <p className="text-xs text-gray-600 dark:text-gray-400 mb-2">Highest Risk Member</p>
-                  <p className="font-medium text-gray-900 dark:text-white">{group.highest_risk_member}</p>
-                  <div className="mt-2 w-full bg-gray-200 dark:bg-gray-700 rounded-full h-2">
-                    <div
-                      className="bg-red-500 h-2 rounded-full"
-                      style={{ width: `${group.highest_risk_score * 100}%` }}
-                    />
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="p-3 rounded-lg bg-gray-50 dark:bg-gray-700">
+                      <p className="text-xs text-gray-600 dark:text-gray-400">Members</p>
+                      <p className="text-lg font-bold text-gray-900 dark:text-white mt-1">{group.member_count ?? 0}</p>
+                    </div>
+                    <div className="p-3 rounded-lg bg-gray-50 dark:bg-gray-700">
+                      <p className="text-xs text-gray-600 dark:text-gray-400">Risk Threshold</p>
+                      <p className="text-lg font-bold text-gray-900 dark:text-white mt-1">{(group.risk_threshold ?? 0).toFixed(0)}</p>
+                    </div>
                   </div>
                 </div>
-              </div>
-            ))}
-          </div>
+              ))}
+            </div>
+          ) : (
+            <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-8 text-center text-gray-500 dark:text-gray-400">
+              {peerGroups === undefined ? 'Loading peer groups...' : 'No peer groups found. Click Auto-Cluster to create groups.'}
+            </div>
+          )}
         </div>
       )}
 
@@ -497,45 +516,55 @@ export default function UEBADashboard() {
             <label className="block text-sm font-medium text-gray-900 dark:text-white mb-2">Select Entity</label>
             <select
               onChange={(e) => {
-                const entity = entities?.find(e => e.id === e.target.value);
-                setSelectedEntity(entity || null);
+                const selected = entities?.find(ent => ent.id === e.target.value);
+                setSelectedEntity(selected || null);
               }}
               className="w-full md:w-64 px-4 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-purple-500"
             >
               <option value="">Choose an entity...</option>
-              {entities?.map((entity) => (
-                <option key={entity.id} value={entity.id}>{entity.name}</option>
+              {(entities ?? []).map((entity) => (
+                <option key={entity.id} value={entity.id}>{entity.name ?? entity.id}</option>
               ))}
             </select>
           </div>
 
-          {selectedEntity?.behavior_timeline && selectedEntity.behavior_timeline.length > 0 && (
-            <div className="space-y-4">
-              {selectedEntity.behavior_timeline.map((event, idx) => {
-                const eventColor = eventTypeColors[event.event_type as keyof typeof eventTypeColors] || 'bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300';
-                return (
-                  <div key={idx} className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4 flex gap-4">
-                    <div className="flex-shrink-0">
-                      <div className={clsx('w-10 h-10 rounded-full flex items-center justify-center font-semibold text-xs', eventColor)}>
-                        {event.event_type.charAt(0).toUpperCase()}
-                      </div>
-                    </div>
-                    <div className="flex-1">
-                      <div className="flex items-start justify-between">
-                        <div>
-                          <p className="font-medium text-gray-900 dark:text-white">{event.description}</p>
-                          <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">{new Date(event.timestamp).toLocaleString()}</p>
+          {selectedEntity ? (
+            selectedEntity.behavior_timeline && selectedEntity.behavior_timeline.length > 0 ? (
+              <div className="space-y-4">
+                {selectedEntity.behavior_timeline.map((event, idx) => {
+                  const eventColor = eventTypeColors[event.event_type as keyof typeof eventTypeColors] || 'bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300';
+                  return (
+                    <div key={idx} className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4 flex gap-4">
+                      <div className="flex-shrink-0">
+                        <div className={clsx('w-10 h-10 rounded-full flex items-center justify-center font-semibold text-xs', eventColor)}>
+                          {event.event_type ? event.event_type.charAt(0).toUpperCase() : '?'}
                         </div>
-                        {event.is_anomaly && (
-                          <span className="px-2 py-1 rounded-full text-xs font-medium bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400">
-                            Anomaly
-                          </span>
-                        )}
+                      </div>
+                      <div className="flex-1">
+                        <div className="flex items-start justify-between">
+                          <div>
+                            <p className="font-medium text-gray-900 dark:text-white">{event.description ?? '—'}</p>
+                            <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">{event.timestamp ? new Date(event.timestamp).toLocaleString() : '—'}</p>
+                          </div>
+                          {event.is_anomaly && (
+                            <span className="px-2 py-1 rounded-full text-xs font-medium bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400">
+                              Anomaly
+                            </span>
+                          )}
+                        </div>
                       </div>
                     </div>
-                  </div>
-                );
-              })}
+                  );
+                })}
+              </div>
+            ) : (
+              <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-8 text-center text-gray-500 dark:text-gray-400">
+                No behavior events found for this entity.
+              </div>
+            )
+          ) : (
+            <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-8 text-center text-gray-500 dark:text-gray-400">
+              Select an entity above to view its behavior timeline.
             </div>
           )}
         </div>
