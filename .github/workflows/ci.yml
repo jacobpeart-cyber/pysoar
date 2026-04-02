@@ -148,11 +148,20 @@ jobs:
         env:
           DATABASE_URL: postgresql+asyncpg://pysoar:pysoar@localhost:5432/pysoar_test
           REDIS_URL: redis://localhost:6379/0
-          SECRET_KEY: test-secret-key-for-ci
+          CELERY_BROKER_URL: redis://localhost:6379/1
+          CELERY_RESULT_BACKEND: redis://localhost:6379/2
+          SECRET_KEY: test-secret-key-for-ci-pipeline-only
+          JWT_SECRET_KEY: test-jwt-secret-for-ci-pipeline-only
+          APP_ENV: testing
+          ENCRYPTION_MASTER_KEY: dGVzdC1lbmNyeXB0aW9uLWtleS1mb3ItY2k=
+          FIRST_ADMIN_EMAIL: admin@test.local
+          FIRST_ADMIN_PASSWORD: TestPassword123!
         run: |
-          pytest tests/ -v --cov=src --cov-report=xml --cov-report=term-missing
+          pytest tests/ -v --cov=src --cov-report=xml --cov-report=term-missing --timeout=60 -x
 
       - name: Check coverage threshold
+        env:
+          DATABASE_URL: postgresql+asyncpg://pysoar:pysoar@localhost:5432/pysoar_test
         run: |
           coverage report --fail-under=50
 

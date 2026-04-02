@@ -1,7 +1,7 @@
 """Audit log endpoints"""
 
 import math
-from typing import Optional
+from typing import Any, Optional
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select, func, desc
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -166,3 +166,119 @@ async def get_audit_stats(
         "by_action": by_action,
         "by_resource_type": by_resource,
     }
+
+
+@router.get("/export")
+async def export_audit_logs(
+    db: DatabaseSession = None,
+    current_user: User = Depends(get_current_superuser),
+    format: str = Query("csv", pattern="^(csv|json|xml)$"),
+    days: int = Query(30, ge=1, le=365),
+    action: Optional[str] = None,
+    resource_type: Optional[str] = None,
+) -> Any:
+    """
+    Export audit logs as CSV, JSON, or XML file download.
+
+    For government compliance (FedRAMP, NIST 800-53 AU controls).
+    """
+    from datetime import datetime, timedelta, timezone
+    from fastapi.responses import StreamingResponse
+    import io
+    import csv
+    import json
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    query = select(AuditLog).where(AuditLog.created_at >= cutoff)
+    if action:
+        query = query.where(AuditLog.action == action)
+    if resource_type:
+        query = query.where(AuditLog.resource_type == resource_type)
+    query = query.order_by(desc(AuditLog.created_at))
+
+    result = await db.execute(query)
+    logs = result.scalars().all()
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+
+    if format == "csv":
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow([
+            "Timestamp", "User", "Action", "Resource Type", "Resource ID",
+            "Description", "IP Address", "Success", "Request ID"
+        ])
+        for log in logs:
+            writer.writerow([
+                log.created_at.isoformat() if log.created_at else "",
+                getattr(log, "user_email", None) or getattr(log, "user_id", ""),
+                log.action,
+                log.resource_type,
+                log.resource_id or "",
+                log.description or "",
+                log.ip_address or "",
+                "Yes" if log.success else "No",
+                log.request_id or "",
+            ])
+        content = output.getvalue()
+        return StreamingResponse(
+            io.BytesIO(content.encode("utf-8")),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename=pysoar_audit_{timestamp}.csv"},
+        )
+
+    elif format == "json":
+        data = {
+            "export_timestamp": datetime.now(timezone.utc).isoformat(),
+            "period_days": days,
+            "total_records": len(logs),
+            "records": [
+                {
+                    "timestamp": log.created_at.isoformat() if log.created_at else None,
+                    "user": getattr(log, "user_email", None) or getattr(log, "user_id", ""),
+                    "action": log.action,
+                    "resource_type": log.resource_type,
+                    "resource_id": log.resource_id,
+                    "description": log.description,
+                    "ip_address": log.ip_address,
+                    "success": log.success,
+                    "old_value": log.old_value,
+                    "new_value": log.new_value,
+                    "request_id": log.request_id,
+                }
+                for log in logs
+            ],
+        }
+        content = json.dumps(data, indent=2)
+        return StreamingResponse(
+            io.BytesIO(content.encode("utf-8")),
+            media_type="application/json",
+            headers={"Content-Disposition": f"attachment; filename=pysoar_audit_{timestamp}.json"},
+        )
+
+    elif format == "xml":
+        lines = ['<?xml version="1.0" encoding="UTF-8"?>', '<AuditExport>']
+        lines.append(f'  <ExportTimestamp>{datetime.now(timezone.utc).isoformat()}</ExportTimestamp>')
+        lines.append(f'  <PeriodDays>{days}</PeriodDays>')
+        lines.append(f'  <TotalRecords>{len(logs)}</TotalRecords>')
+        lines.append('  <Records>')
+        for log in logs:
+            lines.append('    <Record>')
+            lines.append(f'      <Timestamp>{log.created_at.isoformat() if log.created_at else ""}</Timestamp>')
+            lines.append(f'      <User>{getattr(log, "user_email", "") or getattr(log, "user_id", "")}</User>')
+            lines.append(f'      <Action>{log.action or ""}</Action>')
+            lines.append(f'      <ResourceType>{log.resource_type or ""}</ResourceType>')
+            lines.append(f'      <ResourceID>{log.resource_id or ""}</ResourceID>')
+            lines.append(f'      <Description>{log.description or ""}</Description>')
+            lines.append(f'      <IPAddress>{log.ip_address or ""}</IPAddress>')
+            lines.append(f'      <Success>{"true" if log.success else "false"}</Success>')
+            lines.append(f'      <RequestID>{log.request_id or ""}</RequestID>')
+            lines.append('    </Record>')
+        lines.append('  </Records>')
+        lines.append('</AuditExport>')
+        content = "\n".join(lines)
+        return StreamingResponse(
+            io.BytesIO(content.encode("utf-8")),
+            media_type="application/xml",
+            headers={"Content-Disposition": f"attachment; filename=pysoar_audit_{timestamp}.xml"},
+        )
