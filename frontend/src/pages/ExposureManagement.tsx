@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   Search,
   ShieldAlert,
@@ -31,16 +31,17 @@ import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, Responsive
 interface DashboardStats {
   total_assets: number;
   internet_facing_assets: number;
-  critical_vulnerabilities: number;
-  open_tickets: number;
-  risk_score: number;
-  mtta: number;
+  critical_vulns: number;
+  overdue_tickets: number;
+  overall_risk_score: number;
+  mean_time_to_remediate_days: number;
+  exposure_trend?: Array<{ date: string; exposures: number }>;
 }
 
 interface Asset {
   id: string;
   hostname: string;
-  ip: string;
+  ip_address: string;
   type: string;
   environment: string;
   criticality: 'critical' | 'high' | 'medium' | 'low';
@@ -138,6 +139,7 @@ const getStatusColor = (status: string) => {
 };
 
 export default function ExposureManagement() {
+  const queryClient = useQueryClient();
   const [activeTab, setActiveTab] = useState<'dashboard' | 'assets' | 'vulnerabilities' | 'remediation' | 'attack-surface' | 'compliance'>('dashboard');
   const [assetSearch, setAssetSearch] = useState('');
   const [assetTypeFilter, setAssetTypeFilter] = useState('all');
@@ -148,6 +150,8 @@ export default function ExposureManagement() {
   const [exploitFilter, setExploitFilter] = useState('all');
   const [priorityFilter, setPriorityFilter] = useState<string[]>([]);
   const [ticketStatusFilter, setTicketStatusFilter] = useState<string[]>([]);
+  const [showImportModal, setShowImportModal] = useState(false);
+  const [showCreateTicketModal, setShowCreateTicketModal] = useState(false);
 
   const { data: stats, isLoading: statsLoading } = useQuery<DashboardStats>({
     queryKey: ['exposure', 'dashboard'],
@@ -163,10 +167,10 @@ export default function ExposureManagement() {
       const response = await api.get('/exposure/assets', {
         params: {
           search: assetSearch,
-          type: assetTypeFilter !== 'all' ? assetTypeFilter : undefined,
+          asset_type: assetTypeFilter !== 'all' ? assetTypeFilter : undefined,
           environment: environmentFilter !== 'all' ? environmentFilter : undefined,
           criticality: criticalityFilter !== 'all' ? criticalityFilter : undefined,
-          internet_facing: internetFacingFilter ? true : undefined,
+          is_internet_facing: internetFacingFilter ? true : undefined,
         },
       });
       return response.data;
@@ -211,7 +215,19 @@ export default function ExposureManagement() {
     queryKey: ['exposure', 'compliance'],
     queryFn: async () => {
       const response = await api.get('/exposure/compliance');
-      return response.data;
+      const data = response.data;
+      // Backend returns ComplianceSummary object; transform frameworks map into array
+      if (data.frameworks && !Array.isArray(data.frameworks)) {
+        return Object.entries(data.frameworks).map(([key, value]: [string, any]) => ({
+          id: key,
+          name: value.name || key,
+          pass_percentage: value.pass_percentage ?? (value.passed_checks && value.total_controls ? Math.round((value.passed_checks / value.total_controls) * 100) : 0),
+          total_controls: value.total_controls || 0,
+        }));
+      }
+      // If it's already an array, return as-is
+      if (Array.isArray(data)) return data;
+      return [];
     },
   });
 
@@ -231,10 +247,12 @@ export default function ExposureManagement() {
     .slice(0, 10)
     .map(a => ({ name: a.hostname, risk: a.risk_score })) || [];
 
-  const trendData = Array.from({ length: 30 }, (_, i) => ({
-    date: new Date(Date.now() - (29 - i) * 24 * 60 * 60 * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
-    exposures: Math.floor(Math.random() * 100) + 50,
-  }));
+  const trendData = stats?.exposure_trend && stats.exposure_trend.length > 0
+    ? stats.exposure_trend
+    : Array.from({ length: 30 }, (_, i) => ({
+        date: new Date(Date.now() - (29 - i) * 24 * 60 * 60 * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
+        exposures: stats?.critical_vulns ?? 0,
+      }));
 
   const colors = ['#ef4444', '#f97316', '#eab308', '#3b82f6'];
 
@@ -257,7 +275,10 @@ export default function ExposureManagement() {
             Comprehensive cyber risk and threat exposure platform
           </p>
         </div>
-        <button className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700">
+        <button
+          onClick={() => queryClient.invalidateQueries({ queryKey: ['exposure'] })}
+          className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+        >
           <RefreshCw className="w-4 h-4" />
           Refresh
         </button>
@@ -328,7 +349,7 @@ export default function ExposureManagement() {
                 <div>
                   <p className="text-sm text-gray-500 dark:text-gray-400">Critical Vulns</p>
                   <p className="text-2xl font-semibold text-gray-900 dark:text-white">
-                    {stats?.critical_vulnerabilities || 0}
+                    {stats?.critical_vulns || 0}
                   </p>
                 </div>
               </div>
@@ -340,9 +361,9 @@ export default function ExposureManagement() {
                   <Zap className="w-5 h-5 text-yellow-600 dark:text-yellow-400" />
                 </div>
                 <div>
-                  <p className="text-sm text-gray-500 dark:text-gray-400">Open Tickets</p>
+                  <p className="text-sm text-gray-500 dark:text-gray-400">Overdue Tickets</p>
                   <p className="text-2xl font-semibold text-gray-900 dark:text-white">
-                    {stats?.open_tickets || 0}
+                    {stats?.overdue_tickets || 0}
                   </p>
                 </div>
               </div>
@@ -356,11 +377,11 @@ export default function ExposureManagement() {
                 <div>
                   <p className="text-sm text-gray-500 dark:text-gray-400">Overall Risk Score</p>
                   <p className="text-4xl font-bold text-gray-900 dark:text-white mt-2">
-                    {stats?.risk_score || 0}
+                    {stats?.overall_risk_score || 0}
                   </p>
                 </div>
-                <div className={clsx('w-20 h-20 rounded-full flex items-center justify-center text-2xl font-bold', getRiskColor(stats?.risk_score || 0))}>
-                  {stats?.risk_score || 0}
+                <div className={clsx('w-20 h-20 rounded-full flex items-center justify-center text-2xl font-bold', getRiskColor(stats?.overall_risk_score || 0))}>
+                  {stats?.overall_risk_score || 0}
                 </div>
               </div>
             </div>
@@ -370,7 +391,7 @@ export default function ExposureManagement() {
                 <div>
                   <p className="text-sm text-gray-500 dark:text-gray-400">Mean Time to Remediate</p>
                   <p className="text-4xl font-bold text-gray-900 dark:text-white mt-2">
-                    {stats?.mtta || 0}
+                    {stats?.mean_time_to_remediate_days || 0}
                   </p>
                   <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">days</p>
                 </div>
@@ -519,7 +540,7 @@ export default function ExposureManagement() {
                   {assets?.map((asset) => (
                     <tr key={asset.id} className="hover:bg-gray-50 dark:hover:bg-gray-700/50">
                       <td className="px-4 py-3 text-sm text-gray-900 dark:text-white font-medium">{asset.hostname}</td>
-                      <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">{asset.ip}</td>
+                      <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">{asset.ip_address}</td>
                       <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">{asset.type}</td>
                       <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">{asset.environment}</td>
                       <td className="px-4 py-3">
@@ -588,7 +609,10 @@ export default function ExposureManagement() {
                     </button>
                   ))}
                 </div>
-                <button className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm">
+                <button
+                  onClick={() => setShowImportModal(true)}
+                  className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm"
+                >
                   <Download className="w-4 h-4" />
                   Import Scan Results
                 </button>
@@ -686,7 +710,11 @@ export default function ExposureManagement() {
             </div>
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
               <p className="text-sm text-gray-500 dark:text-gray-400">Avg SLA Compliance</p>
-              <p className="text-2xl font-semibold text-gray-900 dark:text-white mt-1">85%</p>
+              <p className="text-2xl font-semibold text-gray-900 dark:text-white mt-1">
+                {tickets && tickets.length > 0
+                  ? `${Math.round(tickets.filter(t => t.sla_status !== 'overdue').length / tickets.length * 100)}%`
+                  : '0%'}
+              </p>
             </div>
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
               <p className="text-sm text-gray-500 dark:text-gray-400">Closed This Week</p>
@@ -752,7 +780,10 @@ export default function ExposureManagement() {
                     </div>
                   </div>
                 </div>
-                <button className="flex items-center gap-2 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 text-sm">
+                <button
+                  onClick={() => setShowCreateTicketModal(true)}
+                  className="flex items-center gap-2 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 text-sm"
+                >
                   <Plus className="w-4 h-4" />
                   Create Ticket
                 </button>
@@ -847,7 +878,10 @@ export default function ExposureManagement() {
                     Last assessed: {new Date(surface.last_assessed).toLocaleDateString()}
                   </div>
                 </div>
-                <button className="w-full mt-4 px-4 py-2 bg-blue-50 dark:bg-blue-900/20 text-blue-600 dark:text-blue-400 rounded-lg hover:bg-blue-100 dark:hover:bg-blue-900/40 text-sm font-medium">
+                <button
+                  onClick={() => api.post('/exposure/attack-surface/assess', null, { params: { surface_id: surface.id } })}
+                  className="w-full mt-4 px-4 py-2 bg-blue-50 dark:bg-blue-900/20 text-blue-600 dark:text-blue-400 rounded-lg hover:bg-blue-100 dark:hover:bg-blue-900/40 text-sm font-medium"
+                >
                   Assess Now
                 </button>
               </div>
@@ -885,7 +919,7 @@ export default function ExposureManagement() {
           <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
             <h4 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">Compliance Trend</h4>
             <ResponsiveContainer width="100%" height={300}>
-              <AreaChart data={trendData.map(d => ({ ...d, compliance: Math.floor(Math.random() * 40) + 60 }))}>
+              <AreaChart data={trendData.map(d => ({ ...d, compliance: compliance && compliance.length > 0 ? Math.round(compliance.reduce((sum, f) => sum + f.pass_percentage, 0) / compliance.length) : 0 }))}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
                 <XAxis dataKey="date" tick={{ fontSize: 12 }} />
                 <YAxis tick={{ fontSize: 12 }} domain={[0, 100]} />
