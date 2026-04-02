@@ -71,10 +71,10 @@ export default function SupplyChainDashboard() {
           supplychainApi.getVendorAssessments(),
           supplychainApi.getSupplyChainRisks(),
         ]);
-        setSBOMs(sbomData.data || []);
+        setSBOMs(Array.isArray(sbomData) ? sbomData : (sbomData?.items || sbomData?.data || []));
         setComponents([]);
-        setVendors(vendorData.data || []);
-        setRisks(riskData.findings || []);
+        setVendors(Array.isArray(vendorData) ? vendorData : (vendorData?.items || vendorData?.data || []));
+        setRisks(Array.isArray(riskData) ? riskData : (riskData?.items || riskData?.findings || []));
       } catch (error) {
         console.error('Error loading supply chain data:', error);
       } finally {
