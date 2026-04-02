@@ -95,7 +95,7 @@ async def create_dsr(
     - automated_decision: Right to human review (GDPR Article 22)
     """
     try:
-        processor = DSRProcessor(db, user.organization_id)
+        processor = DSRProcessor(db, getattr(current_user, "organization_id", None))
         request = await processor.receive_request(
             request_type=dsr.request_type.value,
             regulation=dsr.regulation.value,
@@ -132,7 +132,7 @@ async def list_dsrs(
     """
     try:
         stmt = select(DataSubjectRequest).where(
-            DataSubjectRequest.organization_id == user.organization_id
+            DataSubjectRequest.organization_id == getattr(current_user, "organization_id", None)
         )
 
         if status:
@@ -143,7 +143,7 @@ async def list_dsrs(
 
         # Count total
         count_stmt = select(func.count()).select_from(DataSubjectRequest).where(
-            DataSubjectRequest.organization_id == user.organization_id
+            DataSubjectRequest.organization_id == getattr(current_user, "organization_id", None)
         )
         count_result = await db.execute(count_stmt)
         total = count_result.scalar()
@@ -178,7 +178,7 @@ async def get_dsr(
         stmt = select(DataSubjectRequest).where(
             and_(
                 DataSubjectRequest.id == request_id,
-                DataSubjectRequest.organization_id == user.organization_id,
+                DataSubjectRequest.organization_id == getattr(current_user, "organization_id", None),
             )
         )
         result = await db.execute(stmt)
@@ -212,7 +212,7 @@ async def update_dsr(
         stmt = select(DataSubjectRequest).where(
             and_(
                 DataSubjectRequest.id == request_id,
-                DataSubjectRequest.organization_id == user.organization_id,
+                DataSubjectRequest.organization_id == getattr(current_user, "organization_id", None),
             )
         )
         result = await db.execute(stmt)
@@ -251,7 +251,7 @@ async def verify_dsr_identity(
 ):
     """Verify Data Subject identity."""
     try:
-        processor = DSRProcessor(db, user.organization_id)
+        processor = DSRProcessor(db, getattr(current_user, "organization_id", None))
         success = await processor.verify_identity(request_id, verification_method)
 
         if not success:
@@ -278,7 +278,7 @@ async def search_data_systems(
 ):
     """Search data systems for subject data."""
     try:
-        processor = DSRProcessor(db, user.organization_id)
+        processor = DSRProcessor(db, getattr(current_user, "organization_id", None))
         results = await processor.search_data_systems(request_id, systems)
 
         await db.commit()
@@ -300,7 +300,7 @@ async def compile_data_package(
 ):
     """Compile data package for portability/access requests."""
     try:
-        processor = DSRProcessor(db, user.organization_id)
+        processor = DSRProcessor(db, getattr(current_user, "organization_id", None))
         package = await processor.compile_data_package(request_id, format_type)
 
         await db.commit()
@@ -320,7 +320,7 @@ async def get_deadline_alerts(
 ) -> List[DSRDeadlineAlert]:
     """Get DSR deadline compliance alerts."""
     try:
-        processor = DSRProcessor(db, user.organization_id)
+        processor = DSRProcessor(db, getattr(current_user, "organization_id", None))
         alerts = await processor.track_deadline_compliance()
         return alerts
 
@@ -352,7 +352,7 @@ async def create_pia(
     - legitimate_interest: Legitimate Interest Assessment (Article 6(1)(f))
     """
     try:
-        engine = PIAEngine(db, user.organization_id)
+        engine = PIAEngine(db, getattr(current_user, "organization_id", None))
         assessment = await engine.create_assessment(
             name=pia.name,
             project_name=pia.project_name,
@@ -379,7 +379,7 @@ async def list_pias(
     """List Privacy Impact Assessments."""
     try:
         stmt = select(PrivacyImpactAssessment).where(
-            PrivacyImpactAssessment.organization_id == user.organization_id
+            PrivacyImpactAssessment.organization_id == getattr(current_user, "organization_id", None)
         )
 
         if status:
@@ -412,7 +412,7 @@ async def get_pia(
         stmt = select(PrivacyImpactAssessment).where(
             and_(
                 PrivacyImpactAssessment.id == assessment_id,
-                PrivacyImpactAssessment.organization_id == user.organization_id,
+                PrivacyImpactAssessment.organization_id == getattr(current_user, "organization_id", None),
             )
         )
         result = await db.execute(stmt)
@@ -442,7 +442,7 @@ async def assess_pia_risks(
 ):
     """Assess risks to data subjects."""
     try:
-        engine = PIAEngine(db, user.organization_id)
+        engine = PIAEngine(db, getattr(current_user, "organization_id", None))
         assessment = await engine.assess_risks(
             assessment_id, data_subjects_count, processing_scope
         )
@@ -465,7 +465,7 @@ async def recommend_mitigations(
 ):
     """Get recommended mitigations for PIA."""
     try:
-        engine = PIAEngine(db, user.organization_id)
+        engine = PIAEngine(db, getattr(current_user, "organization_id", None))
         mitigations = await engine.recommend_mitigations(assessment_id)
 
         await db.commit()
@@ -486,7 +486,7 @@ async def submit_pia_for_dpo_review(
 ):
     """Submit PIA for Data Protection Officer review."""
     try:
-        engine = PIAEngine(db, user.organization_id)
+        engine = PIAEngine(db, getattr(current_user, "organization_id", None))
         success = await engine.submit_for_dpo_review(assessment_id)
 
         if not success:
@@ -527,7 +527,7 @@ async def create_consent_record(
     - legitimate_interest: Legitimate interests (Article 6(1)(f))
     """
     try:
-        manager = ConsentManager(db, user.organization_id)
+        manager = ConsentManager(db, getattr(current_user, "organization_id", None))
         record = await manager.record_consent(
             subject_id=consent.subject_id,
             purpose=consent.purpose,
@@ -555,7 +555,7 @@ async def get_consent_records(
     try:
         stmt = select(ConsentRecord).where(
             and_(
-                ConsentRecord.organization_id == user.organization_id,
+                ConsentRecord.organization_id == getattr(current_user, "organization_id", None),
                 ConsentRecord.subject_id == subject_id,
             )
         )
@@ -578,7 +578,7 @@ async def withdraw_consent(
 ):
     """Withdraw previously given consent (GDPR Article 7(3))."""
     try:
-        manager = ConsentManager(db, user.organization_id)
+        manager = ConsentManager(db, getattr(current_user, "organization_id", None))
         success = await manager.withdraw_consent(record_id)
 
         if not success:
@@ -616,7 +616,7 @@ async def create_processing_record(
     Required for all organizations processing personal data.
     """
     try:
-        governance = DataGovernance(db, user.organization_id)
+        governance = DataGovernance(db, getattr(current_user, "organization_id", None))
         processing_record = await governance.create_processing_record(
             name=record.name,
             purpose=record.purpose,
@@ -645,7 +645,7 @@ async def list_processing_records(
     """List Record of Processing Activities."""
     try:
         stmt = select(DataProcessingRecord).where(
-            DataProcessingRecord.organization_id == user.organization_id
+            DataProcessingRecord.organization_id == getattr(current_user, "organization_id", None)
         )
 
         stmt = stmt.offset((page - 1) * size).limit(size).order_by(
@@ -671,7 +671,7 @@ async def get_retention_violations(
 ):
     """Check for data retention compliance violations."""
     try:
-        governance = DataGovernance(db, user.organization_id)
+        governance = DataGovernance(db, getattr(current_user, "organization_id", None))
         violations = await governance.check_retention_compliance()
         return violations
 
@@ -689,7 +689,7 @@ async def generate_ropa(
 ):
     """Generate complete ROPA document per GDPR Article 30."""
     try:
-        governance = DataGovernance(db, user.organization_id)
+        governance = DataGovernance(db, getattr(current_user, "organization_id", None))
         ropa = await governance.generate_ropa()
         return {"document": ropa, "generated_at": datetime.utcnow().isoformat()}
 
@@ -720,7 +720,7 @@ async def report_privacy_incident(
     notification workflows, as well as CCPA § 1798.82 requirements.
     """
     try:
-        incident_mgr = PrivacyIncidentManager(db, user.organization_id)
+        incident_mgr = PrivacyIncidentManager(db, getattr(current_user, "organization_id", None))
         privacy_incident = await incident_mgr.report_incident(
             title=incident.title,
             description=incident.description,
@@ -733,7 +733,7 @@ async def report_privacy_incident(
         # Trigger escalation task
         from src.privacy.tasks import privacy_incident_escalation
 
-        privacy_incident_escalation.delay(privacy_incident.id, user.organization_id)
+        privacy_incident_escalation.delay(privacy_incident.id, getattr(current_user, "organization_id", None))
 
         await db.commit()
         return privacy_incident
@@ -756,7 +756,7 @@ async def list_incidents(
     """List privacy incidents."""
     try:
         stmt = select(PrivacyIncident).where(
-            PrivacyIncident.organization_id == user.organization_id
+            PrivacyIncident.organization_id == getattr(current_user, "organization_id", None)
         )
 
         if status:
@@ -791,7 +791,7 @@ async def get_incident(
         stmt = select(PrivacyIncident).where(
             and_(
                 PrivacyIncident.id == incident_id,
-                PrivacyIncident.organization_id == user.organization_id,
+                PrivacyIncident.organization_id == getattr(current_user, "organization_id", None),
             )
         )
         result = await db.execute(stmt)
@@ -819,7 +819,7 @@ async def get_notification_deadlines(
 ):
     """Get regulatory notification deadlines for incident."""
     try:
-        incident_mgr = PrivacyIncidentManager(db, user.organization_id)
+        incident_mgr = PrivacyIncidentManager(db, getattr(current_user, "organization_id", None))
         deadlines = await incident_mgr.calculate_notification_deadlines(incident_id)
 
         await db.commit()
@@ -840,7 +840,7 @@ async def mark_incident_notified(
 ):
     """Mark notifications as sent."""
     try:
-        incident_mgr = PrivacyIncidentManager(db, user.organization_id)
+        incident_mgr = PrivacyIncidentManager(db, getattr(current_user, "organization_id", None))
         success = await incident_mgr.track_notifications(incident_id)
 
         if not success:
@@ -872,13 +872,13 @@ async def get_privacy_stats(
     try:
         # Count DSRs
         dsr_stmt = select(func.count()).select_from(DataSubjectRequest).where(
-            DataSubjectRequest.organization_id == user.organization_id
+            DataSubjectRequest.organization_id == getattr(current_user, "organization_id", None)
         )
         total_dsrs = (await db.execute(dsr_stmt)).scalar() or 0
 
         pending_dsr_stmt = select(func.count()).select_from(DataSubjectRequest).where(
             and_(
-                DataSubjectRequest.organization_id == user.organization_id,
+                DataSubjectRequest.organization_id == getattr(current_user, "organization_id", None),
                 DataSubjectRequest.status != DSRStatus.COMPLETED.value,
             )
         )
@@ -886,19 +886,19 @@ async def get_privacy_stats(
 
         # Count PIAs
         pia_stmt = select(func.count()).select_from(PrivacyImpactAssessment).where(
-            PrivacyImpactAssessment.organization_id == user.organization_id
+            PrivacyImpactAssessment.organization_id == getattr(current_user, "organization_id", None)
         )
         active_pias = (await db.execute(pia_stmt)).scalar() or 0
 
         # Count Consents
         consent_stmt = select(func.count()).select_from(ConsentRecord).where(
-            ConsentRecord.organization_id == user.organization_id
+            ConsentRecord.organization_id == getattr(current_user, "organization_id", None)
         )
         total_consents = (await db.execute(consent_stmt)).scalar() or 0
 
         # Count Incidents
         incident_stmt = select(func.count()).select_from(PrivacyIncident).where(
-            PrivacyIncident.organization_id == user.organization_id
+            PrivacyIncident.organization_id == getattr(current_user, "organization_id", None)
         )
         total_incidents = (await db.execute(incident_stmt)).scalar() or 0
 
@@ -938,7 +938,7 @@ async def trigger_dsr_deadline_check(
 ):
     """Manually trigger DSR deadline monitoring task."""
     try:
-        dsr_deadline_monitor.delay(user.organization_id)
+        dsr_deadline_monitor.delay(getattr(current_user, "organization_id", None))
         return {"status": "monitoring_triggered"}
 
     except Exception as e:
@@ -954,7 +954,7 @@ async def trigger_retention_check(
 ):
     """Manually trigger retention enforcement task."""
     try:
-        retention_enforcement.delay(user.organization_id)
+        retention_enforcement.delay(getattr(current_user, "organization_id", None))
         return {"status": "retention_check_triggered"}
 
     except Exception as e:
@@ -970,7 +970,7 @@ async def trigger_consent_check(
 ):
     """Manually trigger consent expiry check task."""
     try:
-        consent_expiry_check.delay(user.organization_id)
+        consent_expiry_check.delay(getattr(current_user, "organization_id", None))
         return {"status": "consent_check_triggered"}
 
     except Exception as e:
@@ -986,7 +986,7 @@ async def trigger_pia_reminder(
 ):
     """Manually trigger PIA review reminder task."""
     try:
-        pia_review_reminder.delay(user.organization_id)
+        pia_review_reminder.delay(getattr(current_user, "organization_id", None))
         return {"status": "pia_reminder_triggered"}
 
     except Exception as e:

@@ -75,10 +75,10 @@ export default function DarkWebMonitor() {
           darkwebApi.getCredentialLeaks(),
           darkwebApi.getBrandMonitors(),
         ]);
-        setMonitors([]);
-        setFindings(alertsData.data || []);
-        setCredentials(credentialsData.data || []);
-        setThreats(brandData || []);
+        setMonitors(Array.isArray(brandData) ? brandData : (brandData?.items || []));
+        setFindings(Array.isArray(alertsData) ? alertsData : (alertsData?.items || alertsData?.data || []));
+        setCredentials(Array.isArray(credentialsData) ? credentialsData : (credentialsData?.items || credentialsData?.data || []));
+        setThreats(Array.isArray(brandData) ? brandData : (brandData?.items || []));
       } catch (error) {
         console.error('Error loading dark web data:', error);
       } finally {
