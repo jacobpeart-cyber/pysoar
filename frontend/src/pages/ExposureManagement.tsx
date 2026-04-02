@@ -161,7 +161,7 @@ export default function ExposureManagement() {
     },
   });
 
-  const { data: assets, isLoading: assetsLoading } = useQuery<Asset[]>({
+  const { data: assetsData, isLoading: assetsLoading } = useQuery<any>({
     queryKey: ['exposure', 'assets', assetSearch, assetTypeFilter, environmentFilter, criticalityFilter, internetFacingFilter],
     queryFn: async () => {
       const response = await api.get('/exposure/assets', {
@@ -176,8 +176,9 @@ export default function ExposureManagement() {
       return response.data;
     },
   });
+  const assets: Asset[] = Array.isArray(assetsData) ? assetsData : (assetsData?.items || []);
 
-  const { data: vulnerabilities, isLoading: vulnLoading } = useQuery<Vulnerability[]>({
+  const { data: vulnData, isLoading: vulnLoading } = useQuery<any>({
     queryKey: ['exposure', 'vulnerabilities', severityFilter, exploitFilter],
     queryFn: async () => {
       const response = await api.get('/exposure/vulnerabilities', {
@@ -189,8 +190,9 @@ export default function ExposureManagement() {
       return response.data;
     },
   });
+  const vulnerabilities: Vulnerability[] = Array.isArray(vulnData) ? vulnData : (vulnData?.items || []);
 
-  const { data: tickets, isLoading: ticketsLoading } = useQuery<RemediationTicket[]>({
+  const { data: ticketData, isLoading: ticketsLoading } = useQuery<any>({
     queryKey: ['exposure', 'tickets', priorityFilter, ticketStatusFilter],
     queryFn: async () => {
       const response = await api.get('/exposure/tickets', {
@@ -202,14 +204,16 @@ export default function ExposureManagement() {
       return response.data;
     },
   });
+  const tickets: RemediationTicket[] = Array.isArray(ticketData) ? ticketData : (ticketData?.items || []);
 
-  const { data: attackSurfaces } = useQuery<AttackSurface[]>({
+  const { data: surfaceData } = useQuery<any>({
     queryKey: ['exposure', 'attack-surface'],
     queryFn: async () => {
       const response = await api.get('/exposure/attack-surface');
       return response.data;
     },
   });
+  const attackSurfaces: AttackSurface[] = Array.isArray(surfaceData) ? surfaceData : (surfaceData?.items || []);
 
   const { data: compliance } = useQuery<ComplianceFramework[]>({
     queryKey: ['exposure', 'compliance'],
