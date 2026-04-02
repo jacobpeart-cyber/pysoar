@@ -480,9 +480,11 @@ export const dfirApi = {
   },
 
   createCase: async (data: {
+    case_number: string;
     title: string;
     description: string;
     severity: string;
+    case_type?: string;
   }): Promise<DFIRCase> => {
     const response = await api.post('/dfir/cases', data);
     return response.data;
@@ -496,8 +498,21 @@ export const dfirApi = {
     return response.data;
   },
 
-  getTimeline: async (caseId: string): Promise<DFIRTimeline[]> => {
+  getTimeline: async (caseId: string): Promise<any> => {
     const response = await api.get(`/dfir/cases/${caseId}/timeline`);
+    return response.data;
+  },
+
+  getLegalHolds: async (caseId: string, params?: {
+    page?: number;
+    size?: number;
+  }): Promise<any> => {
+    const response = await api.get(`/dfir/cases/${caseId}/legal-holds`, { params });
+    return response.data;
+  },
+
+  getDashboardMetrics: async (): Promise<any> => {
+    const response = await api.get('/dfir/dashboard/metrics');
     return response.data;
   },
 };
@@ -513,15 +528,49 @@ export const itdrApi = {
     return response.data;
   },
 
+  createThreat: async (data: {
+    threat_type: string;
+    identity_id: string;
+    severity: string;
+    confidence_score?: number;
+  }): Promise<IdentityThreat> => {
+    const response = await api.post('/itdr/threats', data);
+    return response.data;
+  },
+
+  getCredentialExposures: async (params?: {
+    page?: number;
+    size?: number;
+  }): Promise<PaginatedResponse<any>> => {
+    const response = await api.get('/itdr/credential-exposures', { params });
+    return response.data;
+  },
+
+  getAccessAnomalies: async (params?: {
+    page?: number;
+    size?: number;
+  }): Promise<PaginatedResponse<any>> => {
+    const response = await api.get('/itdr/anomalies', { params });
+    return response.data;
+  },
+
   getCredentialMonitors: async (): Promise<CredentialMonitor[]> => {
     const response = await api.get('/itdr/credential-monitors');
+    return response.data;
+  },
+
+  getIdentities: async (params?: {
+    page?: number;
+    size?: number;
+  }): Promise<PaginatedResponse<any>> => {
+    const response = await api.get('/itdr/identities', { params });
     return response.data;
   },
 
   getPrivilegedAccess: async (params?: {
     page?: number;
     size?: number;
-  }): Promise<PaginatedResponse<{ account: string; access_level: string; risk_score: number }>> => {
+  }): Promise<PaginatedResponse<any>> => {
     const response = await api.get('/itdr/privileged-access', { params });
     return response.data;
   },

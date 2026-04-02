@@ -129,6 +129,11 @@ async def list_cases(
         selectinload(ForensicCase.evidence),
     )
 
+    # Filter by organization
+    org_id = getattr(current_user, "organization_id", None)
+    if org_id:
+        query = query.where(ForensicCase.organization_id == org_id)
+
     # Apply filters
     if search:
         search_filter = f"%{search}%"
@@ -291,6 +296,11 @@ async def list_evidence(
     await get_case_or_404(db, case_id)
 
     query = select(ForensicEvidence).where(ForensicEvidence.case_id == case_id)
+
+    # Filter by organization
+    org_id = getattr(current_user, "organization_id", None)
+    if org_id:
+        query = query.where(ForensicEvidence.organization_id == org_id)
 
     if evidence_type:
         query = query.where(ForensicEvidence.evidence_type == evidence_type)
@@ -460,6 +470,11 @@ async def get_timeline(
 
     query = select(ForensicTimeline).where(ForensicTimeline.case_id == case_id)
 
+    # Filter by organization
+    org_id = getattr(current_user, "organization_id", None)
+    if org_id:
+        query = query.where(ForensicTimeline.organization_id == org_id)
+
     if event_type:
         query = query.where(ForensicTimeline.event_type == event_type)
 
@@ -564,6 +579,11 @@ async def list_artifacts(
     await get_case_or_404(db, case_id)
 
     query = select(ForensicArtifact).where(ForensicArtifact.case_id == case_id)
+
+    # Filter by organization
+    org_id = getattr(current_user, "organization_id", None)
+    if org_id:
+        query = query.where(ForensicArtifact.organization_id == org_id)
 
     if artifact_type:
         query = query.where(ForensicArtifact.artifact_type == artifact_type)
@@ -724,6 +744,11 @@ async def list_legal_holds(
 
     query = select(LegalHold).where(LegalHold.case_id == case_id)
 
+    # Filter by organization
+    org_id = getattr(current_user, "organization_id", None)
+    if org_id:
+        query = query.where(LegalHold.organization_id == org_id)
+
     count_query = select(func.count()).select_from(
         select(LegalHold.id).where(query.whereclause) if query.whereclause is not None else select(LegalHold.id)
     )
@@ -870,41 +895,58 @@ async def get_dfir_dashboard(
     db: DatabaseSession = None,
 ):
     """Get DFIR dashboard metrics"""
+    org_id = getattr(current_user, "organization_id", None)
+
     # Count cases by status
-    all_cases = await db.execute(select(func.count()).select_from(ForensicCase))
+    cases_query = select(func.count()).select_from(ForensicCase)
+    if org_id:
+        cases_query = cases_query.where(ForensicCase.organization_id == org_id)
+    all_cases = await db.execute(cases_query)
     total_cases = all_cases.scalar() or 0
 
-    active_cases = await db.execute(
-        select(func.count()).select_from(ForensicCase).where(
-            ForensicCase.status.in_([CaseStatus.OPEN.value, CaseStatus.IN_PROGRESS.value])
-        )
+    active_query = select(func.count()).select_from(ForensicCase).where(
+        ForensicCase.status.in_([CaseStatus.OPEN.value, CaseStatus.IN_PROGRESS.value])
     )
+    if org_id:
+        active_query = active_query.where(ForensicCase.organization_id == org_id)
+    active_cases = await db.execute(active_query)
     active_count = active_cases.scalar() or 0
 
-    analysis_cases = await db.execute(
-        select(func.count()).select_from(ForensicCase).where(ForensicCase.status == CaseStatus.ANALYSIS.value)
+    analysis_query = select(func.count()).select_from(ForensicCase).where(
+        ForensicCase.status == CaseStatus.ANALYSIS.value
     )
+    if org_id:
+        analysis_query = analysis_query.where(ForensicCase.organization_id == org_id)
+    analysis_cases = await db.execute(analysis_query)
     analysis_count = analysis_cases.scalar() or 0
 
     # Count evidence
-    total_evidence = await db.execute(select(func.count()).select_from(ForensicEvidence))
+    evidence_query = select(func.count()).select_from(ForensicEvidence)
+    if org_id:
+        evidence_query = evidence_query.where(ForensicEvidence.organization_id == org_id)
+    total_evidence = await db.execute(evidence_query)
     evidence_count = total_evidence.scalar() or 0
 
     # Count artifacts
-    total_artifacts = await db.execute(select(func.count()).select_from(ForensicArtifact))
+    artifacts_query = select(func.count()).select_from(ForensicArtifact)
+    if org_id:
+        artifacts_query = artifacts_query.where(ForensicArtifact.organization_id == org_id)
+    total_artifacts = await db.execute(artifacts_query)
     artifacts_count = total_artifacts.scalar() or 0
 
     # Count legal holds
-    active_holds = await db.execute(
-        select(func.count()).select_from(LegalHold).where(LegalHold.status == "active")
-    )
+    holds_query = select(func.count()).select_from(LegalHold).where(LegalHold.status == "active")
+    if org_id:
+        holds_query = holds_query.where(LegalHold.organization_id == org_id)
+    active_holds = await db.execute(holds_query)
     holds_count = active_holds.scalar() or 0
 
-    cases_with_holds = await db.execute(
-        select(func.count()).select_from(select(ForensicCase.id).distinct()).where(
-            ForensicCase.legal_hold_active == True
-        )
+    holds_cases_query = select(func.count()).select_from(ForensicCase).where(
+        ForensicCase.legal_hold_active == True
     )
+    if org_id:
+        holds_cases_query = holds_cases_query.where(ForensicCase.organization_id == org_id)
+    cases_with_holds = await db.execute(holds_cases_query)
     holds_cases = cases_with_holds.scalar() or 0
 
     return DFIRDashboardResponse(
