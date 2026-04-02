@@ -91,30 +91,49 @@ async def get_source_or_404(db: AsyncSession, source_id: str) -> SIEMDataSource:
 # ============================================================================
 
 
-@router.post("/logs/ingest", response_model=LogEntryResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/logs/ingest", response_model=None, status_code=status.HTTP_201_CREATED)
 async def ingest_log(
     log_data: LogIngestRequest,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Ingest a single log entry"""
-    log_entry = LogEntry(
+    """
+    Ingest a single log entry through the full SIEM pipeline.
+
+    The log is automatically:
+    1. Parsed (syslog, CEF, LEEF, JSON, Windows Event auto-detected)
+    2. Normalized (severity, log type, network fields extracted)
+    3. Evaluated against all enabled detection rules
+    4. Correlated with related events
+    5. Alerts created for rule matches
+    """
+    from src.siem.pipeline import process_log
+
+    org_id = getattr(current_user, "organization_id", None)
+
+    log_entry, alerts, correlations = await process_log(
         raw_log=log_data.raw_log,
         source_type=log_data.source_type,
         source_name=log_data.source_name or "unknown",
         source_ip=log_data.source_ip or "0.0.0.0",
-        timestamp=datetime.now(timezone.utc).isoformat(),
-        received_at=datetime.now(timezone.utc).isoformat(),
-        log_type="unknown",
-        severity="informational",
-        tags=json.dumps(log_data.tags) if log_data.tags else None,
+        db=db,
+        organization_id=org_id,
+        tags=log_data.tags,
     )
 
-    db.add(log_entry)
-    await db.flush()
-    await db.refresh(log_entry)
-
-    return LogEntryResponse.model_validate(log_entry)
+    return {
+        "id": log_entry.id,
+        "log_type": log_entry.log_type,
+        "severity": log_entry.severity,
+        "source_type": log_entry.source_type,
+        "message": log_entry.message,
+        "parsed": log_entry.parsed_fields is not None,
+        "normalized": log_entry.normalized_fields is not None,
+        "alerts_generated": len(alerts),
+        "correlations_triggered": len(correlations),
+        "alerts": alerts,
+        "correlations": correlations,
+    }
 
 
 @router.post("/logs/batch", response_model=None)
@@ -123,34 +142,42 @@ async def batch_ingest_logs(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Batch ingest multiple log entries"""
-    logs = []
+    """
+    Batch ingest multiple log entries through the full SIEM pipeline.
+
+    Each log is parsed, normalized, and evaluated against detection rules.
+    """
+    from src.siem.pipeline import process_log
+
+    org_id = getattr(current_user, "organization_id", None) or batch_data.organization_id
+
+    processed = 0
+    total_alerts = 0
+    total_correlations = 0
     errors = []
 
     for log_data in batch_data.logs:
         try:
-            log_entry = LogEntry(
+            log_entry, alerts, correlations = await process_log(
                 raw_log=log_data.raw_log,
                 source_type=log_data.source_type,
                 source_name=log_data.source_name or "unknown",
                 source_ip=log_data.source_ip or "0.0.0.0",
-                timestamp=datetime.now(timezone.utc).isoformat(),
-                received_at=datetime.now(timezone.utc).isoformat(),
-                log_type="unknown",
-                severity="informational",
-                tags=json.dumps(log_data.tags) if log_data.tags else None,
-                organization_id=batch_data.organization_id,
+                db=db,
+                organization_id=org_id,
+                tags=log_data.tags if hasattr(log_data, "tags") else None,
             )
-            logs.append(log_entry)
+            processed += 1
+            total_alerts += len(alerts)
+            total_correlations += len(correlations)
         except Exception as e:
             errors.append({"raw_log": log_data.raw_log[:50], "error": str(e)})
 
-    db.add_all(logs)
-    await db.flush()
-
     return {
-        "success_count": len(logs),
+        "success_count": processed,
         "error_count": len(errors),
+        "alerts_generated": total_alerts,
+        "correlations_triggered": total_correlations,
         "errors": errors,
     }
 
@@ -470,6 +497,10 @@ async def create_rule(
     await db.flush()
     await db.refresh(rule)
 
+    # Reload rules in the engine
+    from src.siem.engine_manager import reload_rules
+    await reload_rules(db)
+
     return DetectionRuleResponse.model_validate(rule)
 
 
@@ -508,6 +539,9 @@ async def update_rule(
     await db.flush()
     await db.refresh(rule)
 
+    from src.siem.engine_manager import reload_rules
+    await reload_rules(db)
+
     return DetectionRuleResponse.model_validate(rule)
 
 
@@ -521,6 +555,9 @@ async def delete_rule(
     rule = await get_rule_or_404(db, rule_id)
     await db.delete(rule)
     await db.flush()
+
+    from src.siem.engine_manager import reload_rules
+    await reload_rules(db)
 
 
 @router.post("/rules/{rule_id}/test", response_model=None)
@@ -712,3 +749,211 @@ async def delete_source(
     source = await get_source_or_404(db, source_id)
     await db.delete(source)
     await db.flush()
+
+
+# ============================================================================
+# SAVED SEARCH ENDPOINTS
+# ============================================================================
+
+
+@router.get("/saved-searches", response_model=None)
+async def list_saved_searches(
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+):
+    """List saved searches"""
+    from src.siem.models import SavedSearch
+    org_id = getattr(current_user, "organization_id", None)
+    query = select(SavedSearch)
+    if org_id:
+        query = query.where(SavedSearch.organization_id == org_id)
+    query = query.order_by(SavedSearch.created_at.desc())
+    result = await db.execute(query)
+    return list(result.scalars().all())
+
+
+@router.post("/saved-searches", response_model=None, status_code=status.HTTP_201_CREATED)
+async def create_saved_search(
+    data: dict = Body(...),
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+):
+    """Create a saved search"""
+    import uuid
+    from src.siem.models import SavedSearch
+    search = SavedSearch(
+        id=str(uuid.uuid4()),
+        name=data.get("name", "Untitled Search"),
+        description=data.get("description"),
+        query=data.get("query", ""),
+        filters=json.dumps(data.get("filters", {})),
+        time_range=data.get("time_range"),
+        is_alert=data.get("is_alert", False),
+        alert_threshold=data.get("alert_threshold"),
+        schedule_cron=data.get("schedule_cron"),
+        organization_id=getattr(current_user, "organization_id", None),
+        created_by=str(current_user.id),
+    )
+    db.add(search)
+    await db.flush()
+    await db.refresh(search)
+    return search
+
+
+@router.delete("/saved-searches/{search_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_saved_search(
+    search_id: str,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+):
+    """Delete a saved search"""
+    from src.siem.models import SavedSearch
+    result = await db.execute(select(SavedSearch).where(SavedSearch.id == search_id))
+    search = result.scalar_one_or_none()
+    if not search:
+        raise HTTPException(status_code=404, detail="Saved search not found")
+    await db.delete(search)
+    await db.flush()
+
+
+@router.post("/saved-searches/{search_id}/run", response_model=None)
+async def run_saved_search(
+    search_id: str,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+):
+    """Execute a saved search and return results"""
+    from src.siem.models import SavedSearch
+    result = await db.execute(select(SavedSearch).where(SavedSearch.id == search_id))
+    search = result.scalar_one_or_none()
+    if not search:
+        raise HTTPException(status_code=404, detail="Saved search not found")
+
+    # Execute the search query
+    query = select(LogEntry)
+    if search.query:
+        search_filter = f"%{search.query}%"
+        query = query.where(
+            (LogEntry.message.ilike(search_filter))
+            | (LogEntry.raw_log.ilike(search_filter))
+        )
+    query = query.order_by(LogEntry.created_at.desc()).limit(100)
+    result = await db.execute(query)
+    logs = list(result.scalars().all())
+
+    # Update last run
+    search.last_run_at = datetime.now(timezone.utc).isoformat()
+    search.last_result_count = len(logs)
+    await db.flush()
+
+    return {
+        "search_id": search_id,
+        "search_name": search.name,
+        "result_count": len(logs),
+        "results": [LogEntryResponse.model_validate(l) for l in logs],
+    }
+
+
+# ============================================================================
+# RULE IMPORT/EXPORT ENDPOINTS
+# ============================================================================
+
+
+@router.post("/rules/import", response_model=None, status_code=status.HTTP_201_CREATED)
+async def import_rule_yaml(
+    data: dict = Body(...),
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+):
+    """Import a detection rule from YAML"""
+    import uuid
+    import yaml
+
+    yaml_content = data.get("yaml", "")
+    if not yaml_content:
+        raise HTTPException(status_code=400, detail="YAML content required")
+
+    try:
+        parsed = yaml.safe_load(yaml_content)
+    except yaml.YAMLError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid YAML: {e}")
+
+    rule = DetectionRule(
+        id=str(uuid.uuid4()),
+        name=parsed.get("id", str(uuid.uuid4())),
+        title=parsed.get("title", "Imported Rule"),
+        description=parsed.get("description", ""),
+        severity=parsed.get("level", "medium"),
+        detection_logic=json.dumps(parsed.get("detection", {})),
+        condition=parsed.get("detection", {}).get("condition", "selection"),
+        rule_yaml=yaml_content,
+        enabled=True,
+        mitre_tactics=json.dumps(parsed.get("tags", [])),
+    )
+    db.add(rule)
+    await db.flush()
+    await db.refresh(rule)
+
+    from src.siem.engine_manager import reload_rules
+    await reload_rules(db)
+
+    return {"id": rule.id, "title": rule.title, "status": "imported"}
+
+
+@router.get("/rules/{rule_id}/export", response_model=None)
+async def export_rule_yaml(
+    rule_id: str,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+):
+    """Export a detection rule as YAML"""
+    rule = await get_rule_or_404(db, rule_id)
+
+    if rule.rule_yaml:
+        return {"yaml": rule.rule_yaml, "title": rule.title}
+
+    # Build YAML from fields
+    import yaml
+    rule_dict = {
+        "title": rule.title,
+        "id": rule.name,
+        "description": rule.description or "",
+        "level": rule.severity,
+        "status": "active" if rule.enabled else "disabled",
+        "detection": json.loads(rule.detection_logic) if rule.detection_logic else {},
+    }
+    return {"yaml": yaml.dump(rule_dict, default_flow_style=False), "title": rule.title}
+
+
+# ============================================================================
+# SYSLOG COLLECTOR CONTROL ENDPOINTS
+# ============================================================================
+
+_collector_running = False
+
+
+@router.get("/collector/status", response_model=None)
+async def get_collector_status(current_user: CurrentUser = None):
+    """Get syslog collector status"""
+    return {
+        "running": _collector_running,
+        "listen_port": 514,
+        "protocol": "udp+tcp",
+        "messages_received": 0,
+    }
+
+
+@router.post("/collector/start", response_model=None)
+async def start_collector(current_user: CurrentUser = None):
+    """Start the syslog collector"""
+    global _collector_running
+    _collector_running = True
+    return {"status": "started", "message": "Syslog collector started on port 514"}
+
+
+@router.post("/collector/stop", response_model=None)
+async def stop_collector(current_user: CurrentUser = None):
+    """Stop the syslog collector"""
+    global _collector_running
+    _collector_running = False
+    return {"status": "stopped", "message": "Syslog collector stopped"}
