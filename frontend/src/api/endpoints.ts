@@ -779,6 +779,16 @@ export const containerApi = {
     const response = await api.get('/container/k8s-policies');
     return response.data;
   },
+
+  scanImage: async (imageId: string): Promise<any> => {
+    const response = await api.post(`/container/images/${imageId}/scan`);
+    return response.data;
+  },
+
+  getScanReport: async (scanId: string): Promise<any> => {
+    const response = await api.get(`/container/scans/${scanId}/report`);
+    return response.data;
+  },
 };
 
 // Privacy
@@ -815,6 +825,22 @@ export const privacyApi = {
     const response = await api.get('/privacy/consent-records', { params });
     return response.data;
   },
+
+  getProcessingRecords: async (params?: {
+    page?: number;
+    size?: number;
+  }): Promise<any[]> => {
+    const response = await api.get('/privacy/processing-records', { params });
+    return response.data;
+  },
+
+  getIncidents: async (params?: {
+    page?: number;
+    size?: number;
+  }): Promise<any[]> => {
+    const response = await api.get('/privacy/incidents', { params });
+    return response.data;
+  },
 };
 
 // Threat Modeling
@@ -839,6 +865,21 @@ export const threatmodelApi = {
 
   getMitigations: async (modelId: string): Promise<any[]> => {
     const response = await api.get(`/threatmodel/models/${modelId}/mitigations`);
+    return response.data;
+  },
+
+  getSTRIDEAnalysis: async (): Promise<any[]> => {
+    const response = await api.get('/threatmodel/stride');
+    return response.data;
+  },
+
+  getThreats: async (): Promise<any[]> => {
+    const response = await api.get('/threatmodel/threats');
+    return response.data;
+  },
+
+  createModel: async (data: any): Promise<any> => {
+    const response = await api.post('/threatmodel/models', data);
     return response.data;
   },
 };
@@ -953,6 +994,21 @@ export const phishingApi = {
 
   getAwarenessScores: async (): Promise<{ user_email: string; awareness_score: number }[]> => {
     const response = await api.get('/phishing/awareness-scores');
+    return response.data;
+  },
+
+  getTemplates: async (): Promise<any[]> => {
+    const response = await api.get('/phishing/templates');
+    return response.data;
+  },
+
+  getTargetGroups: async (): Promise<any[]> => {
+    const response = await api.get('/phishing/target-groups');
+    return response.data;
+  },
+
+  launchCampaign: async (groupId: string): Promise<any> => {
+    const response = await api.post(`/phishing/campaigns/launch`, { target_group_id: groupId });
     return response.data;
   },
 };

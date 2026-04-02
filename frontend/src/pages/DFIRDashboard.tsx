@@ -53,6 +53,9 @@ export default function DFIRDashboard() {
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedCase, setSelectedCase] = useState<any>(null);
   const [showNewCaseModal, setShowNewCaseModal] = useState(false);
+  const [showFilterPanel, setShowFilterPanel] = useState(false);
+  const [severityFilter, setSeverityFilter] = useState('all');
+  const [statusFilter, setStatusFilter] = useState('all');
 
   const { data: cases = [], isLoading: casesLoading, error: casesError } = useQuery({
     queryKey: ['dfir-cases'],
@@ -188,11 +191,43 @@ export default function DFIRDashboard() {
                       className="w-full pl-10 pr-4 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
                     />
                   </div>
-                  <button className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                  <button
+                    onClick={() => setShowFilterPanel(!showFilterPanel)}
+                    className={clsx(
+                      'flex items-center gap-2 px-4 py-2 border rounded-lg transition',
+                      showFilterPanel
+                        ? 'border-red-500 bg-red-50 dark:bg-red-900/20 text-red-600'
+                        : 'border-gray-300 dark:border-gray-600 hover:bg-gray-100 dark:hover:bg-gray-700'
+                    )}
+                  >
                     <Filter className="w-4 h-4" />
                     Filter
                   </button>
                 </div>
+
+                {showFilterPanel && (
+                  <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4 flex gap-4">
+                    <div>
+                      <label className="block text-sm font-medium mb-1">Severity</label>
+                      <select value={severityFilter} onChange={(e) => setSeverityFilter(e.target.value)} className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-sm">
+                        <option value="all">All</option>
+                        <option value="critical">Critical</option>
+                        <option value="high">High</option>
+                        <option value="medium">Medium</option>
+                        <option value="low">Low</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-sm font-medium mb-1">Status</label>
+                      <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} className="px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-sm">
+                        <option value="all">All</option>
+                        <option value="active">Active</option>
+                        <option value="in-progress">In Progress</option>
+                        <option value="closed">Closed</option>
+                      </select>
+                    </div>
+                  </div>
+                )}
 
                 <div className="bg-white dark:bg-gray-800 rounded-lg overflow-hidden border border-gray-200 dark:border-gray-700">
                   <table className="w-full">
