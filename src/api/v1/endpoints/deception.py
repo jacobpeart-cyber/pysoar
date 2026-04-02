@@ -139,7 +139,8 @@ async def deploy_decoy(
     """Deploy a new decoy asset."""
     try:
         data = request.model_dump()
-        data["deployed_by"] = data.get("deployed_by") or str(current_user.id)
+        user_id = str(getattr(current_user, 'id', '')) if current_user else ''
+        data["deployed_by"] = data.get("deployed_by") or user_id
         data["deployed_at"] = datetime.now(timezone.utc)
         data["status"] = "active"
 
@@ -153,7 +154,7 @@ async def deploy_decoy(
             extra={
                 "decoy_id": decoy.id,
                 "decoy_type": decoy.decoy_type,
-                "user_id": str(current_user.id),
+                "user_id": str(getattr(current_user, 'id', '')) if current_user else '',
             },
         )
 
@@ -286,7 +287,7 @@ async def update_decoy(
 
         logger.info(
             f"Updated decoy: {decoy_id}",
-            extra={"decoy_id": str(decoy_id), "user_id": str(current_user.id)},
+            extra={"decoy_id": str(decoy_id), "user_id": str(getattr(current_user, 'id', '')) if current_user else ''},
         )
 
         return DecoyResponse.model_validate(decoy)
@@ -316,7 +317,7 @@ async def disable_decoy(
 
         logger.info(
             f"Disabled decoy: {decoy_id}",
-            extra={"decoy_id": str(decoy_id), "user_id": str(current_user.id)},
+            extra={"decoy_id": str(decoy_id), "user_id": str(getattr(current_user, 'id', '')) if current_user else ''},
         )
 
     except HTTPException:
@@ -348,7 +349,7 @@ async def rotate_decoy(
 
         logger.info(
             f"Rotated decoy: {decoy_id}",
-            extra={"decoy_id": str(decoy_id), "user_id": str(current_user.id)},
+            extra={"decoy_id": str(decoy_id), "user_id": str(getattr(current_user, 'id', '')) if current_user else ''},
         )
 
         return DecoyResponse.model_validate(decoy)
@@ -377,7 +378,7 @@ async def undeploy_decoy(
 
         logger.info(
             f"Undeployed decoy: {decoy_id}",
-            extra={"decoy_id": str(decoy_id), "user_id": str(current_user.id)},
+            extra={"decoy_id": str(decoy_id), "user_id": str(getattr(current_user, 'id', '')) if current_user else ''},
         )
 
     except HTTPException:
@@ -434,7 +435,7 @@ async def generate_token(
             token_hash=token_hash,
             status="active",
             organization_id=data.get("organization_id"),
-            deployed_by=data.get("deployed_by") or str(current_user.id),
+            deployed_by=data.get("deployed_by") or (str(getattr(current_user, 'id', '')) if current_user else ''),
         )
 
         db.add(token)
@@ -446,7 +447,7 @@ async def generate_token(
             extra={
                 "token_id": token.id,
                 "token_type": token_type,
-                "user_id": str(current_user.id),
+                "user_id": str(getattr(current_user, 'id', '')) if current_user else '',
             },
         )
 
@@ -580,7 +581,7 @@ async def delete_token(
 
         logger.info(
             f"Deleted token: {token_id}",
-            extra={"token_id": str(token_id), "user_id": str(current_user.id)},
+            extra={"token_id": str(token_id), "user_id": str(getattr(current_user, 'id', '')) if current_user else ''},
         )
 
     except HTTPException:
@@ -850,7 +851,7 @@ async def investigate_interaction(
             f"Investigated interaction: {interaction_id}",
             extra={
                 "interaction_id": str(interaction_id),
-                "user_id": str(current_user.id),
+                "user_id": str(getattr(current_user, 'id', '')) if current_user else '',
             },
         )
 
@@ -903,7 +904,7 @@ async def create_campaign(
             decoy_ids=[],
             status="active",
             started_at=datetime.now(timezone.utc),
-            created_by=request.created_by or str(current_user.id),
+            created_by=request.created_by or (str(getattr(current_user, 'id', '')) if current_user else ''),
             organization_id=request.organization_id,
         )
 
@@ -916,7 +917,7 @@ async def create_campaign(
             extra={
                 "campaign_id": campaign.id,
                 "objective": request.objective,
-                "user_id": str(current_user.id),
+                "user_id": str(getattr(current_user, 'id', '')) if current_user else '',
             },
         )
 
@@ -1053,7 +1054,7 @@ async def update_campaign_status(
             extra={
                 "campaign_id": str(campaign_id),
                 "status": request.status,
-                "user_id": str(current_user.id),
+                "user_id": str(getattr(current_user, 'id', '')) if current_user else '',
             },
         )
 
