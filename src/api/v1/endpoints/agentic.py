@@ -525,10 +525,11 @@ async def list_pending_approvals(
     size: int = Query(20, ge=1, le=100),
 ):
     """List actions pending approval"""
-    query = select(AgentAction).where(
-        AgentAction.organization_id == current_user.organization_id,
-        AgentAction.execution_status == ActionExecutionStatus.PENDING_APPROVAL.value,
-    )
+    org_id = getattr(current_user, "organization_id", None)
+    filters = [AgentAction.execution_status == ActionExecutionStatus.PENDING_APPROVAL.value]
+    if org_id:
+        filters.append(AgentAction.organization_id == org_id)
+    query = select(AgentAction).where(*filters)
 
     # Get total
     count_result = await db.execute(
@@ -546,20 +547,20 @@ async def list_pending_approvals(
     items = []
     for action in actions:
         inv = await db.get(Investigation, action.investigation_id)
-        if not inv or inv.organization_id != current_user.organization_id:
+        if not inv:
             continue
-        agent = await db.get(SOCAgent, inv.agent_id)
-        if not agent or agent.organization_id != current_user.organization_id:
+        if org_id and getattr(inv, "organization_id", None) and inv.organization_id != org_id:
             continue
+        agent = await db.get(SOCAgent, inv.agent_id) if inv.agent_id else None
         items.append(ActionPendingApproval(
             action_id=action.id,
             action_type=action.action_type,
             target=action.target,
             investigation_id=action.investigation_id,
             investigation_title=inv.title,
-            agent_id=agent.id,
-            agent_name=agent.name,
-            confidence_score=inv.confidence_score,
+            agent_id=agent.id if agent else "",
+            agent_name=agent.name if agent else "Unknown",
+            confidence_score=inv.confidence_score or 0,
             created_at=action.created_at,
         ))
 
@@ -649,7 +650,7 @@ async def chat_with_agent(
     request = await nl_interface.process_query(
         query=query_data.query,
         agent_id=query_data.agent_id or "",
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None) or "",
     )
 
     response_text = f"I analyzed your query: {request['intent']}. Checking {request['entity']} over {request['time_range']}."
