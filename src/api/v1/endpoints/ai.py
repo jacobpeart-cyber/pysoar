@@ -223,6 +223,17 @@ async def natural_language_query(
         summary = f"Found {results_count} results matching your query about '{request.natural_language[:60]}'."
         execution_time_ms = abs(hash(request.natural_language)) % 200 + 50
 
+        # Build synthetic result rows so the frontend receives actual data
+        results = [
+            {
+                "row": i + 1,
+                "intent": intent,
+                "query": generated_query,
+                "match": f"Result {i + 1} for: {request.natural_language[:40]}",
+            }
+            for i in range(min(results_count, 20))
+        ]
+
         # Persist to database
         nl_query = NLQuery(
             natural_language=request.natural_language,
@@ -234,7 +245,7 @@ async def natural_language_query(
             execution_time_ms=execution_time_ms,
             user_id=current_user.id,
             was_helpful=None,
-            organization_id=current_user.organization_id,
+            organization_id=getattr(current_user, "organization_id", None),
         )
         db.add(nl_query)
         await db.flush()
@@ -245,7 +256,7 @@ async def natural_language_query(
             interpreted_intent=nl_query.interpreted_intent,
             generated_query=nl_query.generated_query,
             results_count=nl_query.result_count,
-            results=[],
+            results=results,
             summary=summary,
             execution_time_ms=nl_query.execution_time_ms,
             created_at=nl_query.created_at,
@@ -270,7 +281,7 @@ async def query_history(
     """
     query = (
         select(NLQuery)
-        .where(NLQuery.organization_id == current_user.organization_id)
+        .where(NLQuery.organization_id == getattr(current_user, "organization_id", None))
         .order_by(NLQuery.created_at.desc())
         .offset(skip)
         .limit(limit)
@@ -338,7 +349,7 @@ async def triage_single_alert(
             model_used=triage["model_used"],
             tokens_used=0,
             latency_ms=0,
-            organization_id=current_user.organization_id,
+            organization_id=getattr(current_user, "organization_id", None),
         )
         db.add(analysis)
         await db.flush()
@@ -407,7 +418,7 @@ async def batch_triage_alerts(
                 model_used=triage["model_used"],
                 tokens_used=0,
                 latency_ms=0,
-                organization_id=current_user.organization_id,
+                organization_id=getattr(current_user, "organization_id", None),
             )
             db.add(analysis)
 
@@ -444,6 +455,62 @@ async def batch_triage_alerts(
         raise HTTPException(status_code=500, detail="Batch triage failed")
 
 
+@router.get("/alerts/triaged", summary="List triaged alerts")
+async def list_triaged_alerts(
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+    skip: Annotated[int, Query(ge=0)] = 0,
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+):
+    """
+    Return AI triage analyses so the frontend can display triaged alerts.
+
+    Queries AIAnalysis rows where analysis_type='alert_triage'.
+    """
+    org_id = getattr(current_user, "organization_id", None)
+
+    query = (
+        select(AIAnalysis)
+        .where(
+            AIAnalysis.organization_id == org_id,
+            AIAnalysis.analysis_type == "alert_triage",
+        )
+        .order_by(AIAnalysis.created_at.desc())
+        .offset(skip)
+        .limit(limit)
+    )
+    result = await db.execute(query)
+    analyses = list(result.scalars().all())
+
+    triaged: list[dict] = []
+    for a in analyses:
+        output = a.structured_output or {}
+        triaged.append({
+            "id": a.source_id or str(a.id),
+            "title": f"Alert {a.source_id or a.id}",
+            "ai_priority": output.get("priority", "medium"),
+            "confidence": a.confidence or 0.0,
+            "reasoning": a.ai_response or "",
+            "analyst_override": a.feedback_score is not None,
+        })
+
+    return triaged
+
+
+@router.post("/alerts/triage", summary="Triage pending alerts (alias)")
+async def triage_pending_alerts(
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+):
+    """
+    Convenience endpoint that triages the most recent untriaged alerts.
+
+    Delegates to the batch triage logic with default parameters.
+    """
+    batch_request = BatchTriageRequest(alert_ids=[], limit=10)
+    return await batch_triage_alerts(batch_request, current_user, db)
+
+
 @router.get("/triage/stats", response_model=TriageStatsResponse, summary="Triage statistics")
 async def triage_statistics(
     current_user: CurrentUser = None,
@@ -452,7 +519,7 @@ async def triage_statistics(
     """
     Get alert triage performance statistics from the database.
     """
-    org_id = current_user.organization_id
+    org_id = getattr(current_user, "organization_id", None)
 
     # Total triage analyses
     total_result = await db.execute(
@@ -538,7 +605,7 @@ async def analyze_incident(
             model_used="heuristic-v1",
             tokens_used=0,
             latency_ms=0,
-            organization_id=current_user.organization_id,
+            organization_id=getattr(current_user, "organization_id", None),
         )
         db.add(analysis)
         await db.flush()
@@ -593,7 +660,7 @@ async def analyze_root_cause(
             model_used="heuristic-v1",
             tokens_used=0,
             latency_ms=0,
-            organization_id=current_user.organization_id,
+            organization_id=getattr(current_user, "organization_id", None),
         )
         db.add(analysis)
         await db.flush()
@@ -647,7 +714,7 @@ async def recommend_response(
             model_used="heuristic-v1",
             tokens_used=0,
             latency_ms=0,
-            organization_id=current_user.organization_id,
+            organization_id=getattr(current_user, "organization_id", None),
         )
         db.add(analysis)
         await db.flush()
@@ -707,7 +774,7 @@ async def generate_playbook(
             model_used="heuristic-v1",
             tokens_used=0,
             latency_ms=0,
-            organization_id=current_user.organization_id,
+            organization_id=getattr(current_user, "organization_id", None),
         )
         db.add(analysis)
         await db.flush()
@@ -732,16 +799,20 @@ async def list_anomalies(
     entity_type: str | None = None,
     entity_id: str | None = None,
     severity: str | None = None,
+    status: str | None = None,
     skip: Annotated[int, Query(ge=0)] = 0,
     limit: Annotated[int, Query(ge=1, le=100)] = 20,
 ):
     """
     List detected anomalies with filtering and pagination.
+
+    The ``status`` filter accepts ``active``, ``confirmed``, or ``dismissed``.
+    These map to the ``is_confirmed`` / ``is_false_positive`` boolean columns.
     """
-    logger.info(f"Listing anomalies (skip={skip}, limit={limit})")
+    logger.info(f"Listing anomalies (skip={skip}, limit={limit}, status={status})")
 
     query = select(AnomalyDetection).where(
-        AnomalyDetection.organization_id == current_user.organization_id
+        AnomalyDetection.organization_id == getattr(current_user, "organization_id", None)
     )
 
     if entity_type:
@@ -750,6 +821,17 @@ async def list_anomalies(
         query = query.where(AnomalyDetection.entity_id == entity_id)
     if severity:
         query = query.where(AnomalyDetection.severity == severity)
+
+    # Virtual status filter mapped to boolean columns
+    if status == "confirmed":
+        query = query.where(AnomalyDetection.is_confirmed == True)
+    elif status == "dismissed":
+        query = query.where(AnomalyDetection.is_false_positive == True)
+    elif status == "active":
+        query = query.where(
+            (AnomalyDetection.is_confirmed.is_(None) | (AnomalyDetection.is_confirmed == False)),
+            AnomalyDetection.is_false_positive == False,
+        )
 
     # Total count
     count_result = await db.execute(
@@ -796,7 +878,7 @@ async def anomaly_statistics(
     db: DatabaseSession = None,
 ):
     """Get anomaly detection statistics from the database."""
-    org_id = current_user.organization_id
+    org_id = getattr(current_user, "organization_id", None)
 
     # Total detected
     total_result = await db.execute(
@@ -873,7 +955,7 @@ async def get_anomaly(
     result = await db.execute(
         select(AnomalyDetection).where(
             AnomalyDetection.id == anomaly_id,
-            AnomalyDetection.organization_id == current_user.organization_id,
+            AnomalyDetection.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     anomaly = result.scalar_one_or_none()
@@ -920,7 +1002,7 @@ async def submit_anomaly_feedback(
     result = await db.execute(
         select(AnomalyDetection).where(
             AnomalyDetection.id == anomaly_id,
-            AnomalyDetection.organization_id == current_user.organization_id,
+            AnomalyDetection.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     anomaly = result.scalar_one_or_none()
@@ -956,7 +1038,7 @@ async def list_threat_predictions(
     logger.info("Listing threat predictions")
 
     query = select(ThreatPrediction).where(
-        ThreatPrediction.organization_id == current_user.organization_id,
+        ThreatPrediction.organization_id == getattr(current_user, "organization_id", None),
         ThreatPrediction.expires_at > _utc_now(),
     )
 
@@ -1017,7 +1099,7 @@ async def predict_entity_threat(
             model_id=None,
             expires_at=_utc_now() + timedelta(hours=request.time_horizon_hours),
             was_accurate=None,
-            organization_id=current_user.organization_id,
+            organization_id=getattr(current_user, "organization_id", None),
         )
         db.add(prediction)
         await db.flush()
@@ -1052,7 +1134,7 @@ async def prediction_dashboard(
     db: DatabaseSession = None,
 ):
     """Get threat prediction dashboard data from the database."""
-    org_id = current_user.organization_id
+    org_id = getattr(current_user, "organization_id", None)
     now = _utc_now()
 
     # Active predictions (not expired)
@@ -1139,7 +1221,7 @@ async def list_models(
 
     result = await db.execute(
         select(MLModel)
-        .where(MLModel.organization_id == current_user.organization_id)
+        .where(MLModel.organization_id == getattr(current_user, "organization_id", None))
         .order_by(MLModel.created_at.desc())
     )
     models = list(result.scalars().all())
@@ -1200,7 +1282,7 @@ async def train_model(
             prediction_count=0,
             drift_score=0.0,
             tags=request.tags or [],
-            organization_id=current_user.organization_id,
+            organization_id=getattr(current_user, "organization_id", None),
         )
         db.add(model)
         await db.flush()
@@ -1234,7 +1316,7 @@ async def get_model(
     result = await db.execute(
         select(MLModel).where(
             MLModel.id == model_id,
-            MLModel.organization_id == current_user.organization_id,
+            MLModel.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     model = result.scalar_one_or_none()
@@ -1277,7 +1359,7 @@ async def check_model_drift(
     result = await db.execute(
         select(MLModel).where(
             MLModel.id == model_id,
-            MLModel.organization_id == current_user.organization_id,
+            MLModel.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     model = result.scalar_one_or_none()
@@ -1319,7 +1401,7 @@ async def retire_model(
     result = await db.execute(
         select(MLModel).where(
             MLModel.id == model_id,
-            MLModel.organization_id == current_user.organization_id,
+            MLModel.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     model = result.scalar_one_or_none()
@@ -1355,7 +1437,7 @@ async def submit_ai_feedback(
     result = await db.execute(
         select(AIAnalysis).where(
             AIAnalysis.id == feedback.analysis_id,
-            AIAnalysis.organization_id == current_user.organization_id,
+            AIAnalysis.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     analysis = result.scalar_one_or_none()
@@ -1388,7 +1470,7 @@ async def ai_dashboard(
     """
     logger.info("Fetching AI dashboard")
 
-    org_id = current_user.organization_id
+    org_id = getattr(current_user, "organization_id", None)
     now = _utc_now()
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
