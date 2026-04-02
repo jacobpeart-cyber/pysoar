@@ -29,6 +29,7 @@ from src.schemas.simulation import (
     AttackTechniqueSchema,
     AdversaryProfileSchema,
     SecurityPostureScoreSchema,
+    SimulationTestSchema,
     SimulationCreateRequest,
     SimulationProgressResponse,
     PostureScoreResponse,
@@ -74,6 +75,7 @@ async def create_simulation(
         Created simulation object
     """
     try:
+        org_id = getattr(current_user, "organization_id", None)
         orchestrator = SimulationOrchestrator(session)
         simulation = await orchestrator.create_simulation(
             name=request.name,
@@ -82,7 +84,7 @@ async def create_simulation(
             scope=request.scope,
             target_environment=request.target_environment,
             created_by=current_user,
-            organization_id=current_user.split("|")[0],  # Extract org from user ID
+            organization_id=org_id,
             description=request.description,
             tags=request.tags,
         )
@@ -118,12 +120,16 @@ async def list_simulations(
         List of simulations
     """
     try:
-        from sqlalchemy import select, and_
+        from sqlalchemy import select, and_, func
+
+        org_id = getattr(current_user, "organization_id", None)
 
         stmt = select(AttackSimulation)
 
         # Add filters
         filters = []
+        if org_id is not None:
+            filters.append(AttackSimulation.organization_id == org_id)
         if status:
             filters.append(AttackSimulation.status == status)
         if environment:
@@ -132,10 +138,14 @@ async def list_simulations(
         if filters:
             stmt = stmt.where(and_(*filters))
 
+        # Get total count with proper query
+        count_stmt = select(func.count()).select_from(stmt.subquery())
+        total_result = await session.execute(count_stmt)
+        total = total_result.scalar() or 0
+
         result = await session.execute(stmt.offset(skip).limit(limit))
         simulations = result.scalars().all()
 
-        total = len(simulations) + skip  # Approximate
         return SimulationListResponse(
             total=total,
             page=skip // limit,
@@ -191,7 +201,7 @@ async def get_simulation_detail(
 
         return SimulationDetailResponse(
             simulation=AttackSimulationSchema.from_orm(simulation),
-            tests=[SimulationTest.__class__.__module__ for t in tests],  # Convert to schemas
+            tests=[SimulationTestSchema.from_orm(t) for t in tests],
             posture_score=SecurityPostureScoreSchema.from_orm(posture_score) if posture_score else None,
             execution_summary={
                 "total_tests": simulation.total_tests,
@@ -227,11 +237,12 @@ async def start_simulation(
         Execution start status
     """
     try:
+        org_id = getattr(current_user, "organization_id", None)
         orchestrator = SimulationOrchestrator(session)
         result = await orchestrator.start_simulation(simulation_id)
 
         # Queue async execution task
-        execute_simulation.delay(simulation_id, current_user.split("|")[0])
+        execute_simulation.delay(simulation_id, org_id)
 
         return result
 
@@ -414,6 +425,50 @@ async def list_techniques(
         raise HTTPException(status_code=400, detail="Operation failed. Please try again or contact support.")
 
 
+@router.get("/techniques/coverage")
+async def get_coverage_map(
+    current_user: str = Depends(get_current_user),
+    session: AsyncSession = Depends(get_async_session),
+) -> dict:
+    """
+    Get detection coverage map of techniques.
+
+    Returns which techniques are detected by existing rules.
+
+    Args:
+        session: Database session
+        current_user: Current user ID
+
+    Returns:
+        Coverage map by tactic and technique
+    """
+    try:
+        library = AtomicTestLibrary(session)
+        techniques = await library.get_safe_techniques()
+
+        coverage = {}
+        for technique in techniques:
+            if technique.tactic not in coverage:
+                coverage[technique.tactic] = {"total": 0, "detected": 0, "techniques": []}
+
+            coverage[technique.tactic]["total"] += 1
+            detected = bool(technique.detection_sources)
+            if detected:
+                coverage[technique.tactic]["detected"] += 1
+
+            coverage[technique.tactic]["techniques"].append({
+                "mitre_id": technique.mitre_id,
+                "name": technique.name,
+                "detection_sources": technique.detection_sources,
+            })
+
+        return coverage
+
+    except Exception as e:
+        logger.error(f"Error getting coverage: {str(e)}")
+        raise HTTPException(status_code=400, detail="Operation failed. Please try again or contact support.")
+
+
 @router.get("/techniques/{mitre_id}", response_model=AttackTechniqueSchema)
 async def get_technique(
     mitre_id: str,
@@ -474,6 +529,7 @@ async def test_technique(
             raise HTTPException(status_code=404, detail="Technique not found")
 
         # Create ad-hoc simulation with single technique
+        org_id = getattr(current_user, "organization_id", None)
         orchestrator = SimulationOrchestrator(session)
         simulation = await orchestrator.create_simulation(
             name=f"Single Test: {mitre_id}",
@@ -482,7 +538,7 @@ async def test_technique(
             scope={"target_host": target_host},
             target_environment="lab",
             created_by=current_user,
-            organization_id=current_user.split("|")[0],
+            organization_id=org_id,
         )
 
         await orchestrator.start_simulation(simulation.id)
@@ -498,50 +554,6 @@ async def test_technique(
         raise
     except Exception as e:
         logger.error(f"Error testing technique: {str(e)}")
-        raise HTTPException(status_code=400, detail="Operation failed. Please try again or contact support.")
-
-
-@router.get("/techniques/coverage")
-async def get_coverage_map(
-    current_user: str = Depends(get_current_user),
-    session: AsyncSession = Depends(get_async_session),
-) -> dict:
-    """
-    Get detection coverage map of techniques.
-
-    Returns which techniques are detected by existing rules.
-
-    Args:
-        session: Database session
-        current_user: Current user ID
-
-    Returns:
-        Coverage map by tactic and technique
-    """
-    try:
-        library = AtomicTestLibrary(session)
-        techniques = await library.get_safe_techniques()
-
-        coverage = {}
-        for technique in techniques:
-            if technique.tactic not in coverage:
-                coverage[technique.tactic] = {"total": 0, "detected": 0, "techniques": []}
-
-            coverage[technique.tactic]["total"] += 1
-            detected = bool(technique.detection_sources)
-            if detected:
-                coverage[technique.tactic]["detected"] += 1
-
-            coverage[technique.tactic]["techniques"].append({
-                "mitre_id": technique.mitre_id,
-                "name": technique.name,
-                "detection_sources": technique.detection_sources,
-            })
-
-        return coverage
-
-    except Exception as e:
-        logger.error(f"Error getting coverage: {str(e)}")
         raise HTTPException(status_code=400, detail="Operation failed. Please try again or contact support.")
 
 
@@ -641,10 +653,11 @@ async def create_emulation_plan(
         Created simulation
     """
     try:
+        org_id = getattr(current_user, "organization_id", None)
         emulator = AdversaryEmulator(session)
         simulation = await emulator.create_emulation_plan(
             adversary_id,
-            current_user.split("|")[0]
+            org_id
         )
 
         return SimulationDetailResponse(
@@ -776,32 +789,36 @@ async def get_dashboard_stats(
         from sqlalchemy import select, func
 
         # Count simulations by status
-        total_sims = len(await session.execute(select(AttackSimulation)))
-        completed = len(await session.execute(
-            select(AttackSimulation).where(AttackSimulation.status == "completed")
-        ))
-        running = len(await session.execute(
-            select(AttackSimulation).where(AttackSimulation.status == "running")
-        ))
+        total_result = await session.execute(select(func.count()).select_from(AttackSimulation))
+        total_sims = total_result.scalar() or 0
+
+        completed_result = await session.execute(
+            select(func.count()).select_from(AttackSimulation).where(AttackSimulation.status == "completed")
+        )
+        completed = completed_result.scalar() or 0
+
+        running_result = await session.execute(
+            select(func.count()).select_from(AttackSimulation).where(AttackSimulation.status == "running")
+        )
+        running = running_result.scalar() or 0
 
         # Get technique count
-        techniques = await session.execute(select(AttackTechnique))
-        technique_count = len(techniques.scalars().all())
+        technique_result = await session.execute(select(func.count()).select_from(AttackTechnique))
+        technique_count = technique_result.scalar() or 0
 
-        # Get adversary profiles
-        adversaries = await session.execute(select(AdversaryProfile))
-        adversary_count = len(adversaries.scalars().all())
+        # Get adversary profiles count
+        adversary_result = await session.execute(select(func.count()).select_from(AdversaryProfile))
+        adversary_count = adversary_result.scalar() or 0
 
         # Calculate average detection rate from completed simulations
-        from src.simulation.models import AttackSimulation
-        detection_result = await db.execute(
+        detection_result = await session.execute(
             select(func.avg(AttackSimulation.detection_rate)).where(
                 AttackSimulation.status == "completed"
             )
         )
         avg_detection = detection_result.scalar() or 0.0
 
-        posture_result = await db.execute(
+        posture_result = await session.execute(
             select(func.avg(AttackSimulation.posture_score)).where(
                 AttackSimulation.status == "completed"
             )
