@@ -52,6 +52,7 @@ from src.api.v1.endpoints import (
     zerotrust,
     tickethub,
     backup,
+    fedramp,
 )
 
 api_router = APIRouter()
@@ -116,3 +117,6 @@ api_router.include_router(tickethub.router, tags=["ticket-hub"])
 
 # --- Backup & Restore ---
 api_router.include_router(backup.router, tags=["backup-restore"])
+
+# --- FedRAMP Compliance ---
+api_router.include_router(fedramp.router, tags=["fedramp"])

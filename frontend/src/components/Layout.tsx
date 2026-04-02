@@ -97,6 +97,7 @@ const navigation = [
   { name: 'Data Lake', href: '/data-lake', icon: Database },
   { name: 'War Room', href: '/warroom', icon: MessageSquare },
   { name: 'Ticket Hub', href: '/ticket-hub', icon: Ticket },
+  { name: 'FedRAMP', href: '/fedramp', icon: Shield },
   { name: 'Phishing Sim', href: '/phishing', icon: Mail },
   { name: 'Playbooks', href: '/playbooks', icon: Zap },
   { name: 'Assets', href: '/assets', icon: Server },
