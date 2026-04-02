@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useCallback } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '../lib/api';
 import {
@@ -210,6 +210,15 @@ export default function AIEngine() {
     'High-risk user activities',
   ];
 
+  const [statusMsg, setStatusMsg] = useState<{ type: 'success' | 'error' | 'loading'; text: string } | null>(null);
+  const [triageLoading, setTriageLoading] = useState(false);
+  const [trainLoading, setTrainLoading] = useState(false);
+
+  const showStatus = useCallback((type: 'success' | 'error', text: string) => {
+    setStatusMsg({ type, text });
+    setTimeout(() => setStatusMsg(null), 4000);
+  }, []);
+
   const handleAnomalyAction = async (anomalyId: string, action: 'confirm' | 'dismiss') => {
     try {
       const body = action === 'confirm'
@@ -218,8 +227,38 @@ export default function AIEngine() {
       await api.post(`/ai/anomalies/${anomalyId}/feedback`, body);
       queryClient.invalidateQueries({ queryKey: ['aiAnomalies'] });
       queryClient.invalidateQueries({ queryKey: ['aiDashboard'] });
+      showStatus('success', `Anomaly ${action === 'confirm' ? 'confirmed' : 'dismissed'} successfully`);
     } catch (error) {
-      console.error('Error updating anomaly:', error);
+      showStatus('error', `Failed to ${action} anomaly`);
+    }
+  };
+
+  const handleTriage = async () => {
+    setTriageLoading(true);
+    try {
+      const res = await api.post('/ai/triage/batch', { alert_ids: [], limit: 10 });
+      queryClient.invalidateQueries({ queryKey: ['triagedAlerts'] });
+      queryClient.invalidateQueries({ queryKey: ['aiDashboard'] });
+      const count = res.data?.results?.length || res.data?.triaged_count || 0;
+      showStatus('success', `Triaged ${count} alerts successfully`);
+    } catch (err) {
+      showStatus('error', 'Alert triage failed — check API connection');
+    } finally {
+      setTriageLoading(false);
+    }
+  };
+
+  const handleTrainModel = async () => {
+    setTrainLoading(true);
+    try {
+      await api.post('/ai/models/train', { model_type: 'anomaly_detection', algorithm: 'isolation_forest', description: 'Auto-trained anomaly detection model' });
+      queryClient.invalidateQueries({ queryKey: ['mlModels'] });
+      queryClient.invalidateQueries({ queryKey: ['aiDashboard'] });
+      showStatus('success', 'Model training initiated successfully');
+    } catch (err) {
+      showStatus('error', 'Model training failed — check API connection');
+    } finally {
+      setTrainLoading(false);
     }
   };
 
@@ -229,10 +268,18 @@ export default function AIEngine() {
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-3xl font-bold text-gray-900 dark:text-white">AI Security Engine</h1>
-          <p className="text-gray-600 dark:text-gray-400 mt-1">Intelligent threat detection and analysis</p>
+          <p className="text-gray-600 dark:text-gray-400 mt-1">Intelligent threat detection and analysis powered by heuristic AI models</p>
         </div>
         <Brain className="w-10 h-10 text-blue-600 dark:text-blue-400" />
       </div>
+
+      {/* Status Toast */}
+      {statusMsg && (
+        <div className={clsx('p-4 rounded-lg flex items-center gap-3 text-sm font-medium', statusMsg.type === 'success' ? 'bg-green-50 dark:bg-green-900/20 text-green-700 dark:text-green-400 border border-green-200 dark:border-green-800' : 'bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-400 border border-red-200 dark:border-red-800')}>
+          {statusMsg.type === 'success' ? <CheckCircle className="w-5 h-5" /> : <AlertCircle className="w-5 h-5" />}
+          {statusMsg.text}
+        </div>
+      )}
 
       {/* Tabs */}
       <div className="border-b border-gray-200 dark:border-gray-700">
@@ -426,18 +473,12 @@ export default function AIEngine() {
           </div>
 
           <button
-            onClick={async () => {
-              try {
-                await api.post('/ai/triage/batch', { alert_ids: [], limit: 10 });
-                queryClient.invalidateQueries({ queryKey: ['triagedAlerts'] });
-                queryClient.invalidateQueries({ queryKey: ['aiDashboard'] });
-              } catch (err) {
-                console.error('Triage failed:', err);
-              }
-            }}
-            className="px-4 py-2 rounded-lg bg-blue-600 dark:bg-blue-700 text-white hover:bg-blue-700 dark:hover:bg-blue-600 font-medium transition-colors"
+            onClick={handleTriage}
+            disabled={triageLoading}
+            className="px-4 py-2 rounded-lg bg-blue-600 dark:bg-blue-700 text-white hover:bg-blue-700 dark:hover:bg-blue-600 font-medium transition-colors disabled:opacity-50 flex items-center gap-2"
           >
-            Triage Pending Alerts
+            {triageLoading ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Zap className="w-4 h-4" />}
+            {triageLoading ? 'Triaging...' : 'Triage Pending Alerts'}
           </button>
         </div>
       )}
@@ -647,18 +688,12 @@ export default function AIEngine() {
       {activeTab === 'models' && (
         <div className="space-y-6">
           <button
-            onClick={async () => {
-              try {
-                await api.post('/ai/models/train', { model_type: 'anomaly_detection', algorithm: 'isolation_forest' });
-                queryClient.invalidateQueries({ queryKey: ['mlModels'] });
-                queryClient.invalidateQueries({ queryKey: ['aiDashboard'] });
-              } catch (err) {
-                console.error('Training failed:', err);
-              }
-            }}
-            className="px-4 py-2 rounded-lg bg-blue-600 dark:bg-blue-700 text-white hover:bg-blue-700 dark:hover:bg-blue-600 font-medium transition-colors"
+            onClick={handleTrainModel}
+            disabled={trainLoading}
+            className="px-4 py-2 rounded-lg bg-blue-600 dark:bg-blue-700 text-white hover:bg-blue-700 dark:hover:bg-blue-600 font-medium transition-colors disabled:opacity-50 flex items-center gap-2"
           >
-            Train New Model
+            {trainLoading ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Brain className="w-4 h-4" />}
+            {trainLoading ? 'Training...' : 'Train New Model'}
           </button>
 
           {/* Models Grid */}
