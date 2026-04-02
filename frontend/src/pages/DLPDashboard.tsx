@@ -347,17 +347,17 @@ export default function DLPDashboard() {
                   <div className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4">
                     <h3 className="font-semibold mb-3">Top Violation Types</h3>
                     <div className="space-y-2 text-sm">
-                      <div className="flex justify-between"><span>Email Exfiltration</span><span className="font-semibold">—</span></div>
-                      <div className="flex justify-between"><span>USB Transfer</span><span className="font-semibold">—</span></div>
-                      <div className="flex justify-between"><span>Cloud Upload</span><span className="font-semibold">—</span></div>
+                      <div className="flex justify-between"><span>Email Exfiltration</span><span className="font-semibold">{incidents.filter(i => (i.action || i.description || '').toLowerCase().includes('email')).length}</span></div>
+                      <div className="flex justify-between"><span>USB Transfer</span><span className="font-semibold">{incidents.filter(i => (i.action || i.description || '').toLowerCase().includes('usb')).length}</span></div>
+                      <div className="flex justify-between"><span>Cloud Upload</span><span className="font-semibold">{incidents.filter(i => (i.action || i.description || '').toLowerCase().includes('cloud')).length}</span></div>
                     </div>
                   </div>
                   <div className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4">
                     <h3 className="font-semibold mb-3">Response Status</h3>
                     <div className="space-y-2 text-sm">
-                      <div className="flex justify-between"><span>Auto-Blocked</span><span className="font-semibold text-green-600">—</span></div>
-                      <div className="flex justify-between"><span>Quarantined</span><span className="font-semibold text-yellow-600">—</span></div>
-                      <div className="flex justify-between"><span>Pending Review</span><span className="font-semibold text-red-600">—</span></div>
+                      <div className="flex justify-between"><span>Auto-Blocked</span><span className="font-semibold text-green-600">{incidents.filter(i => i.status === 'blocked' || i.status === 'auto-blocked').length}</span></div>
+                      <div className="flex justify-between"><span>Quarantined</span><span className="font-semibold text-yellow-600">{incidents.filter(i => i.status === 'quarantined').length}</span></div>
+                      <div className="flex justify-between"><span>Pending Review</span><span className="font-semibold text-red-600">{incidents.filter(i => i.status === 'open' || i.status === 'investigating').length}</span></div>
                     </div>
                   </div>
                 </div>
@@ -623,6 +623,68 @@ export default function DLPDashboard() {
           </>
         )}
       </div>
+
+      {/* Policy Detail Modal */}
+      {selectedPolicy && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" onClick={() => setSelectedPolicy(null)}>
+          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-[32rem] max-h-[80vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+            <h2 className="text-xl font-bold mb-4">Policy Details</h2>
+            <div className="space-y-3 text-sm">
+              <div><span className="font-medium text-gray-600 dark:text-gray-400">Name:</span> <span className="ml-2">{selectedPolicy.name}</span></div>
+              <div><span className="font-medium text-gray-600 dark:text-gray-400">Description:</span> <span className="ml-2">{selectedPolicy.description || 'N/A'}</span></div>
+              <div><span className="font-medium text-gray-600 dark:text-gray-400">Status:</span> <span className="ml-2">{selectedPolicy.enabled !== false ? 'Enabled' : 'Disabled'}</span></div>
+              <div><span className="font-medium text-gray-600 dark:text-gray-400">Severity:</span> <span className="ml-2">{(selectedPolicy.severity || 'medium').toUpperCase()}</span></div>
+              <div><span className="font-medium text-gray-600 dark:text-gray-400">Rules:</span> <span className="ml-2">{selectedPolicy.rules?.length || selectedPolicy.rule_count || 0}</span></div>
+              <div><span className="font-medium text-gray-600 dark:text-gray-400">Matches:</span> <span className="ml-2">{selectedPolicy.trigger_count || selectedPolicy.match_count || 0}</span></div>
+            </div>
+            <pre className="text-xs bg-gray-100 dark:bg-gray-900 rounded p-4 overflow-auto max-h-48 mt-4">
+              {JSON.stringify(selectedPolicy, null, 2)}
+            </pre>
+            <div className="mt-4 flex justify-end">
+              <button onClick={() => setSelectedPolicy(null)} className="px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Close</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Incident Detail Modal */}
+      {selectedIncident && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" onClick={() => setSelectedIncident(null)}>
+          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-[32rem] max-h-[80vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+            <h2 className="text-xl font-bold mb-4">Incident Details</h2>
+            <div className="space-y-3 text-sm">
+              <div><span className="font-medium text-gray-600 dark:text-gray-400">ID:</span> <span className="ml-2 font-mono">{selectedIncident.id}</span></div>
+              <div><span className="font-medium text-gray-600 dark:text-gray-400">User:</span> <span className="ml-2">{selectedIncident.user || selectedIncident.userName || 'Unknown'}</span></div>
+              <div><span className="font-medium text-gray-600 dark:text-gray-400">Action:</span> <span className="ml-2">{selectedIncident.action || selectedIncident.description || 'N/A'}</span></div>
+              <div><span className="font-medium text-gray-600 dark:text-gray-400">Policy:</span> <span className="ml-2">{selectedIncident.policyName || selectedIncident.policy_name || 'N/A'}</span></div>
+              <div><span className="font-medium text-gray-600 dark:text-gray-400">Severity:</span> <span className="ml-2">{(selectedIncident.severity || 'medium').toUpperCase()}</span></div>
+              <div><span className="font-medium text-gray-600 dark:text-gray-400">Status:</span> <span className="ml-2">{selectedIncident.status || 'open'}</span></div>
+            </div>
+            <pre className="text-xs bg-gray-100 dark:bg-gray-900 rounded p-4 overflow-auto max-h-48 mt-4">
+              {JSON.stringify(selectedIncident, null, 2)}
+            </pre>
+            <div className="mt-4 flex justify-end">
+              <button onClick={() => setSelectedIncident(null)} className="px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Close</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Classification Detail Modal */}
+      {selectedClassification && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" onClick={() => setSelectedClassification(null)}>
+          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-[32rem] max-h-[80vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+            <h2 className="text-xl font-bold mb-4">Classification: {selectedClassification}</h2>
+            <div className="space-y-3 text-sm">
+              <div><span className="font-medium text-gray-600 dark:text-gray-400">Policies using this classification:</span> <span className="ml-2 font-semibold">{policies.filter(p => p.classification === selectedClassification || p.dataType === selectedClassification).length}</span></div>
+              <div><span className="font-medium text-gray-600 dark:text-gray-400">Related incidents:</span> <span className="ml-2 font-semibold">{incidents.filter(i => i.classification === selectedClassification || i.dataType === selectedClassification).length}</span></div>
+            </div>
+            <div className="mt-4 flex justify-end">
+              <button onClick={() => setSelectedClassification(null)} className="px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Close</button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* New Policy Modal */}
       {showNewPolicyModal && (

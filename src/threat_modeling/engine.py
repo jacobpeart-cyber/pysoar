@@ -126,14 +126,27 @@ class STRIDEAnalyzer:
         )
 
         for category in stride_categories:
+            # Derive likelihood from trust_level
+            trust_level = getattr(component, "trust_level", None) or ""
+            if trust_level.lower() in ("external", "untrusted"):
+                likelihood = LikelihoodLevel.HIGH.value
+            else:
+                likelihood = LikelihoodLevel.MEDIUM.value
+
+            # Derive impact from component_type
+            if component_type in (ComponentType.DATABASE.value, ComponentType.DATA_STORE.value):
+                impact = ImpactLevel.HIGH.value
+            else:
+                impact = ImpactLevel.MEDIUM.value
+
             threat = {
                 "category": category.value,
                 "description": self.THREAT_DESCRIPTIONS[category],
                 "component_id": component.id,
                 "component_type": component_type,
                 "technology": component.technology_stack,
-                "likelihood": LikelihoodLevel.MEDIUM.value,
-                "impact": ImpactLevel.MEDIUM.value,
+                "likelihood": likelihood,
+                "impact": impact,
                 "cwe_ids": self.CWE_MAPPINGS.get(category, []),
                 "attack_vectors": self._get_attack_vectors(component_type, category),
             }
@@ -279,20 +292,37 @@ class PASTAEngine:
             "objectives": ["Identify threats", "Assess risk", "Plan mitigations"],
         }
 
-    def stage2_define_technical_scope(self, model: ThreatModel) -> dict[str, Any]:
+    def stage2_define_technical_scope(
+        self, model: ThreatModel, components: list[ThreatModelComponent] | None = None,
+    ) -> dict[str, Any]:
         """
         Stage 2: Define technical scope
 
         Returns:
             Technical scope and architecture
         """
+        components = components or []
+        comp_list = [
+            {"id": c.id, "name": c.name, "type": c.component_type}
+            for c in components
+        ]
+        data_flows = [
+            {"id": c.id, "name": c.name}
+            for c in components
+            if c.component_type == ComponentType.DATA_FLOW.value
+        ]
+        trust_boundaries = [
+            {"id": c.id, "name": c.name}
+            for c in components
+            if c.component_type == ComponentType.TRUST_BOUNDARY.value
+        ]
         return {
             "stage": 2,
             "name": "Define Technical Scope",
             "architecture": model.architecture_description,
-            "components": [],
-            "data_flows": [],
-            "trust_boundaries": [],
+            "components": comp_list,
+            "data_flows": data_flows,
+            "trust_boundaries": trust_boundaries,
         }
 
     def stage3_decompose_application(
@@ -315,7 +345,7 @@ class PASTAEngine:
         }
 
     def stage4_threat_analysis(
-        self, model: ThreatModel
+        self, model: ThreatModel, threats: list[IdentifiedThreat] | None = None,
     ) -> dict[str, Any]:
         """
         Stage 4: Threat analysis
@@ -323,11 +353,15 @@ class PASTAEngine:
         Returns:
             Threat analysis results
         """
+        threats = threats or []
+        categories_found = {t.stride_category for t in threats if t.stride_category}
         return {
             "stage": 4,
             "name": "Threat Analysis",
             "methodology": model.methodology,
-            "status": "in_progress",
+            "threat_count": len(threats),
+            "stride_categories_covered": list(categories_found),
+            "status": "completed" if threats else "in_progress",
         }
 
     def stage5_vulnerability_analysis(
@@ -355,11 +389,27 @@ class PASTAEngine:
         Returns:
             Attack model data
         """
+        likelihood_order = {
+            LikelihoodLevel.VERY_LOW.value: 1,
+            LikelihoodLevel.LOW.value: 2,
+            LikelihoodLevel.MEDIUM.value: 3,
+            LikelihoodLevel.HIGH.value: 4,
+            LikelihoodLevel.VERY_HIGH.value: 5,
+        }
+        reverse_order = {v: k for k, v in likelihood_order.items()}
+        if threats:
+            avg_val = sum(
+                likelihood_order.get(t.likelihood, 3) for t in threats
+            ) / len(threats)
+            avg_likelihood = reverse_order.get(round(avg_val), LikelihoodLevel.MEDIUM.value)
+        else:
+            avg_likelihood = LikelihoodLevel.MEDIUM.value
+
         return {
             "stage": 6,
             "name": "Attack Modeling",
             "attack_scenarios": len(threats),
-            "average_likelihood": "medium",
+            "average_likelihood": avg_likelihood,
         }
 
     def stage7_risk_and_impact(
@@ -396,9 +446,9 @@ class PASTAEngine:
         """
         return {
             "stage_1": self.stage1_define_objectives(model),
-            "stage_2": self.stage2_define_technical_scope(model),
+            "stage_2": self.stage2_define_technical_scope(model, components),
             "stage_3": self.stage3_decompose_application(components),
-            "stage_4": self.stage4_threat_analysis(model),
+            "stage_4": self.stage4_threat_analysis(model, threats),
             "stage_5": self.stage5_vulnerability_analysis(threats),
             "stage_6": self.stage6_attack_modeling(threats),
             "stage_7": self.stage7_risk_and_impact(threats),
@@ -513,19 +563,101 @@ class AttackTreeGenerator:
         return max(path_count, 1)
 
     def find_minimum_cost_path(self, tree: dict[str, Any]) -> dict[str, Any]:
-        """Find lowest cost attack path"""
+        """Find lowest cost attack path by summing leaf node costs on the cheapest path"""
+        if not tree or not tree.get("children"):
+            return {
+                "path": [],
+                "cost_usd": 0,
+                "required_skill": "unknown",
+                "explanation": "No tree structure available to calculate cost path",
+            }
+
+        def _min_cost(node: dict) -> tuple[float, list[str]]:
+            """Return (cost, path) for the minimum-cost path through this node."""
+            node_cost = node.get("cost_usd", node.get("risk_score", 0) * 100)
+            node_label = node.get("goal", "unknown")[:80]
+            children = node.get("children", [])
+            if not children:
+                return (node_cost, [node_label])
+            node_type = node.get("type", "OR")
+            if node_type == "OR":
+                # Pick the cheapest child branch
+                best_cost, best_path = min(
+                    (_min_cost(c) for c in children), key=lambda x: x[0]
+                )
+                return (node_cost + best_cost, [node_label] + best_path)
+            else:  # AND — must traverse all children
+                total = node_cost
+                path = [node_label]
+                for c in children:
+                    c_cost, c_path = _min_cost(c)
+                    total += c_cost
+                    path.extend(c_path)
+                return (total, path)
+
+        cost, path = _min_cost(tree)
         return {
-            "path": ["Spoofing", "Elevation of Privilege"],
-            "cost_usd": 3000,
+            "path": path,
+            "cost_usd": cost,
             "required_skill": "medium",
         }
 
     def find_highest_probability_path(self, tree: dict[str, Any]) -> dict[str, Any]:
-        """Find most likely attack path"""
+        """Find most likely attack path by calculating from tree structure"""
+        if not tree or not tree.get("children"):
+            return {
+                "path": [],
+                "probability": 0.0,
+                "likelihood": "none",
+                "explanation": "No tree structure available to calculate probability path",
+            }
+
+        likelihood_prob = {
+            LikelihoodLevel.VERY_LOW.value: 0.1,
+            LikelihoodLevel.LOW.value: 0.3,
+            LikelihoodLevel.MEDIUM.value: 0.5,
+            LikelihoodLevel.HIGH.value: 0.7,
+            LikelihoodLevel.VERY_HIGH.value: 0.9,
+        }
+
+        def _max_prob(node: dict) -> tuple[float, list[str]]:
+            """Return (probability, path) for the highest-probability path."""
+            node_prob = likelihood_prob.get(
+                node.get("likelihood", ""), 0.5
+            )
+            node_label = node.get("goal", "unknown")[:80]
+            children = node.get("children", [])
+            if not children:
+                return (node_prob, [node_label])
+            node_type = node.get("type", "OR")
+            if node_type == "OR":
+                # Pick the most likely child branch
+                best_prob, best_path = max(
+                    (_max_prob(c) for c in children), key=lambda x: x[0]
+                )
+                return (node_prob * best_prob, [node_label] + best_path)
+            else:  # AND — multiply all children probabilities
+                combined_prob = node_prob
+                path = [node_label]
+                for c in children:
+                    c_prob, c_path = _max_prob(c)
+                    combined_prob *= c_prob
+                    path.extend(c_path)
+                return (combined_prob, path)
+
+        prob, path = _max_prob(tree)
+
+        if prob >= 0.7:
+            level = "high"
+        elif prob >= 0.4:
+            level = "medium"
+        else:
+            level = "low"
+
         return {
-            "path": ["Information Disclosure", "Denial of Service"],
-            "probability": 0.85,
-            "likelihood": "high",
+            "path": path,
+            "probability": round(prob, 4),
+            "likelihood": level,
         }
 
     def visualize_tree_data(self, tree: dict[str, Any]) -> dict[str, Any]:

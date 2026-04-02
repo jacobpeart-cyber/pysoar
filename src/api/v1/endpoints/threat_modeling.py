@@ -224,7 +224,7 @@ async def get_threat_model(
     model_id: str = Path(...),
 ):
     """Get threat model by ID"""
-    model = await get_threat_model_or_404(db, model_id, current_user.organization_id)
+    model = await get_threat_model_or_404(model_id, current_user.organization_id, db)
     return model
 
 
@@ -236,7 +236,7 @@ async def update_threat_model(
     model_id: str = Path(...),
 ):
     """Update threat model"""
-    model = await get_threat_model_or_404(db, model_id, current_user.organization_id)
+    model = await get_threat_model_or_404(model_id, current_user.organization_id, db)
 
     for key, value in data.dict(exclude_unset=True).items():
         setattr(model, key, value)
@@ -253,7 +253,7 @@ async def delete_threat_model(
     model_id: str = Path(...),
 ):
     """Delete threat model"""
-    model = await get_threat_model_or_404(db, model_id, current_user.organization_id)
+    model = await get_threat_model_or_404(model_id, current_user.organization_id, db)
     await db.delete(model)
     await db.commit()
 
@@ -268,7 +268,7 @@ async def create_component(
     model_id: str = Path(...),
 ):
     """Create component in threat model"""
-    model = await get_threat_model_or_404(db, model_id, current_user.organization_id)
+    model = await get_threat_model_or_404(model_id, current_user.organization_id, db)
 
     component = ThreatModelComponent(
         organization_id=current_user.organization_id,
@@ -295,7 +295,7 @@ async def list_components(
     model_id: str = Path(...),
 ):
     """List components in threat model"""
-    model = await get_threat_model_or_404(db, model_id, current_user.organization_id)
+    model = await get_threat_model_or_404(model_id, current_user.organization_id, db)
 
     result = await db.execute(
         select(ThreatModelComponent).where(
@@ -314,7 +314,7 @@ async def update_component(
     component_id: str = Path(...),
 ):
     """Update component"""
-    component = await get_component_or_404(db, component_id, current_user.organization_id)
+    component = await get_component_or_404(component_id, current_user.organization_id, db)
 
     for key, value in data.dict(exclude_unset=True).items():
         setattr(component, key, value)
@@ -332,7 +332,7 @@ async def delete_component(
     component_id: str = Path(...),
 ):
     """Delete component"""
-    component = await get_component_or_404(db, component_id, current_user.organization_id)
+    component = await get_component_or_404(component_id, current_user.organization_id, db)
     await db.delete(component)
     await db.commit()
 
@@ -347,7 +347,7 @@ async def create_threat(
     model_id: str = Path(...),
 ):
     """Create identified threat"""
-    model = await get_threat_model_or_404(db, model_id, current_user.organization_id)
+    model = await get_threat_model_or_404(model_id, current_user.organization_id, db)
 
     # Calculate risk score
     analyzer = STRIDEAnalyzer()
@@ -396,7 +396,7 @@ async def list_threats(
     sort_order: str = "desc",
 ):
     """List threats in model"""
-    model = await get_threat_model_or_404(db, model_id, current_user.organization_id)
+    model = await get_threat_model_or_404(model_id, current_user.organization_id, db)
 
     query = select(IdentifiedThreat).where(
         IdentifiedThreat.model_id == model_id
@@ -445,7 +445,7 @@ async def get_threat(
     threat_id: str = Path(...),
 ):
     """Get threat by ID"""
-    threat = await get_threat_or_404(db, threat_id, current_user.organization_id)
+    threat = await get_threat_or_404(threat_id, current_user.organization_id, db)
     return threat
 
 
@@ -458,7 +458,7 @@ async def update_threat(
     threat_id: str = Path(...),
 ):
     """Update threat"""
-    threat = await get_threat_or_404(db, threat_id, current_user.organization_id)
+    threat = await get_threat_or_404(threat_id, current_user.organization_id, db)
 
     for key, value in data.dict(exclude_unset=True).items():
         setattr(threat, key, value)
@@ -484,12 +484,12 @@ async def delete_threat(
     threat_id: str = Path(...),
 ):
     """Delete threat"""
-    threat = await get_threat_or_404(db, threat_id, current_user.organization_id)
+    threat = await get_threat_or_404(threat_id, current_user.organization_id, db)
     await db.delete(threat)
     await db.commit()
 
     # Update model threat count
-    model = await get_threat_model_or_404(db, model_id, current_user.organization_id)
+    model = await get_threat_model_or_404(model_id, current_user.organization_id, db)
     model.threats_count = max(0, (model.threats_count or 0) - 1)
     await db.commit()
 
@@ -505,7 +505,7 @@ async def create_mitigation(
     threat_id: str = Path(...),
 ):
     """Create mitigation for threat"""
-    threat = await get_threat_or_404(db, threat_id, current_user.organization_id)
+    threat = await get_threat_or_404(threat_id, current_user.organization_id, db)
 
     mitigation = ThreatMitigation(
         organization_id=current_user.organization_id,
@@ -526,7 +526,7 @@ async def create_mitigation(
     await db.refresh(mitigation)
 
     # Update model mitigation count
-    model = await get_threat_model_or_404(db, model_id, current_user.organization_id)
+    model = await get_threat_model_or_404(model_id, current_user.organization_id, db)
     model.mitigations_count = (model.mitigations_count or 0) + 1
     await db.commit()
 
@@ -543,7 +543,7 @@ async def list_mitigations(
     size: int = Query(20, ge=1, le=100),
 ):
     """List mitigations for threat"""
-    threat = await get_threat_or_404(db, threat_id, current_user.organization_id)
+    threat = await get_threat_or_404(threat_id, current_user.organization_id, db)
 
     query = select(ThreatMitigation).where(
         ThreatMitigation.threat_id == threat_id
@@ -612,7 +612,7 @@ async def run_stride_analysis(
     model_id: str = Path(...),
 ):
     """Run STRIDE analysis on threat model"""
-    model = await get_threat_model_or_404(db, model_id, current_user.organization_id)
+    model = await get_threat_model_or_404(model_id, current_user.organization_id, db)
 
     analyzer = STRIDEAnalyzer()
     components_result = await db.execute(
@@ -624,8 +624,33 @@ async def run_stride_analysis(
 
     if request.auto_generate:
         threats_data = analyzer.auto_generate_threats(model, components)
-        # In real implementation, would create IdentifiedThreat records
         threats_count = len(threats_data)
+
+        # Persist generated threats as IdentifiedThreat records
+        for threat_data in threats_data:
+            risk_score = analyzer.calculate_risk_score(
+                threat_data["likelihood"], threat_data["impact"]
+            )
+            threat_record = IdentifiedThreat(
+                organization_id=current_user.organization_id,
+                model_id=model_id,
+                component_id=threat_data.get("component_id"),
+                stride_category=threat_data.get("category"),
+                threat_description=threat_data.get("description", ""),
+                attack_vector=", ".join(threat_data.get("attack_vectors", [])),
+                likelihood=threat_data["likelihood"],
+                impact=threat_data["impact"],
+                risk_score=risk_score,
+                cwe_ids=threat_data.get("cwe_ids", []),
+                status=ThreatStatus.IDENTIFIED.value,
+            )
+            db.add(threat_record)
+
+        await db.commit()
+
+        # Update model threat count
+        model.threats_count = (model.threats_count or 0) + threats_count
+        await db.commit()
     else:
         threats_count = 0
 
@@ -633,7 +658,7 @@ async def run_stride_analysis(
         status="success",
         model_id=model_id,
         threats_generated=threats_count,
-        timestamp=str(__import__("datetime").datetime.utcnow().isoformat()),
+        timestamp=datetime.utcnow().isoformat(),
     )
 
 
@@ -645,7 +670,7 @@ async def run_pasta_analysis(
     model_id: str = Path(...),
 ):
     """Run PASTA analysis on threat model"""
-    model = await get_threat_model_or_404(db, model_id, current_user.organization_id)
+    model = await get_threat_model_or_404(model_id, current_user.organization_id, db)
 
     pasta = PASTAEngine()
     components_result = await db.execute(
@@ -664,11 +689,17 @@ async def run_pasta_analysis(
 
     analysis_result = pasta.run_full_pasta(model, components, threats)
 
+    # Count stages that returned non-empty results
+    stages_completed = sum(
+        1 for key, value in analysis_result.items()
+        if key.startswith("stage_") and value
+    )
+
     return PASTAAnalysisResponse(
         status="success",
         model_id=model_id,
-        stages_completed=7,
-        timestamp=str(__import__("datetime").datetime.utcnow().isoformat()),
+        stages_completed=stages_completed,
+        timestamp=datetime.utcnow().isoformat(),
     )
 
 
@@ -680,7 +711,7 @@ async def validate_model(
     model_id: str = Path(...),
 ):
     """Validate threat model completeness"""
-    model = await get_threat_model_or_404(db, model_id, current_user.organization_id)
+    model = await get_threat_model_or_404(model_id, current_user.organization_id, db)
 
     components_result = await db.execute(
         select(ThreatModelComponent).where(
@@ -719,7 +750,7 @@ async def get_mitigation_recommendations(
     threat_id: str = Path(...),
 ):
     """Get recommended mitigations for threat"""
-    threat = await get_threat_or_404(db, threat_id, current_user.organization_id)
+    threat = await get_threat_or_404(threat_id, current_user.organization_id, db)
 
     recommender = MitigationRecommender()
     recommendations = recommender.recommend_mitigations(threat)
@@ -744,7 +775,7 @@ async def get_dashboard(
     model_id: str = Path(...),
 ):
     """Get threat modeling dashboard data"""
-    model = await get_threat_model_or_404(db, model_id, current_user.organization_id)
+    model = await get_threat_model_or_404(model_id, current_user.organization_id, db)
 
     threats_result = await db.execute(
         select(IdentifiedThreat).where(

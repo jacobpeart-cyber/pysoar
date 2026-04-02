@@ -902,6 +902,75 @@ async def get_privacy_stats(
         )
         total_incidents = (await db.execute(incident_stmt)).scalar() or 0
 
+        org_id = getattr(current_user, "organization_id", None)
+
+        # PIAs requiring review
+        pias_review_stmt = select(func.count()).select_from(PrivacyImpactAssessment).where(
+            and_(
+                PrivacyImpactAssessment.organization_id == org_id,
+                PrivacyImpactAssessment.status == PIAStatus.IN_REVIEW.value,
+            )
+        )
+        pias_requiring_review = (await db.execute(pias_review_stmt)).scalar() or 0
+
+        # Withdrawn consents
+        withdrawn_stmt = select(func.count()).select_from(ConsentRecord).where(
+            and_(
+                ConsentRecord.organization_id == org_id,
+                ConsentRecord.withdrawal_date != None,
+            )
+        )
+        withdrawn_consents = (await db.execute(withdrawn_stmt)).scalar() or 0
+
+        # Processing records count
+        proc_stmt = select(func.count()).select_from(DataProcessingRecord).where(
+            DataProcessingRecord.organization_id == org_id,
+        )
+        processing_records = (await db.execute(proc_stmt)).scalar() or 0
+
+        # Pending incidents (reported or under investigation)
+        pending_inc_stmt = select(func.count()).select_from(PrivacyIncident).where(
+            and_(
+                PrivacyIncident.organization_id == org_id,
+                or_(
+                    PrivacyIncident.status == "reported",
+                    PrivacyIncident.status == "under_investigation",
+                ),
+            )
+        )
+        pending_incidents = (await db.execute(pending_inc_stmt)).scalar() or 0
+
+        # Incidents created in the last 30 days
+        thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+        month_inc_stmt = select(func.count()).select_from(PrivacyIncident).where(
+            and_(
+                PrivacyIncident.organization_id == org_id,
+                PrivacyIncident.created_at >= thirty_days_ago,
+            )
+        )
+        incidents_this_month = (await db.execute(month_inc_stmt)).scalar() or 0
+
+        # Average incident resolution days (from created_at to updated_at for closed/remediated)
+        resolution_stmt = select(
+            func.avg(
+                func.julianday(PrivacyIncident.updated_at) - func.julianday(PrivacyIncident.created_at)
+            )
+        ).where(
+            and_(
+                PrivacyIncident.organization_id == org_id,
+                or_(
+                    PrivacyIncident.status == "closed",
+                    PrivacyIncident.status == "remediated",
+                ),
+            )
+        )
+        try:
+            avg_resolution = (await db.execute(resolution_stmt)).scalar()
+            avg_incident_resolution_days = round(float(avg_resolution), 1) if avg_resolution else 0.0
+        except Exception:
+            # julianday may not be available on all DB backends; fall back to 0
+            avg_incident_resolution_days = 0.0
+
         stats = PrivacyDashboardStats(
             total_dsrs=total_dsrs,
             pending_dsrs=pending_dsrs,
@@ -909,13 +978,13 @@ async def get_privacy_stats(
             if total_dsrs > 0
             else 0,
             active_pias=active_pias,
-            pias_requiring_review=0,
+            pias_requiring_review=pias_requiring_review,
             total_consents=total_consents,
-            withdrawn_consents=0,
-            processing_records=0,
-            pending_incidents=0,
-            incidents_this_month=0,
-            avg_incident_resolution_days=0.0,
+            withdrawn_consents=withdrawn_consents,
+            processing_records=processing_records,
+            pending_incidents=pending_incidents,
+            incidents_this_month=incidents_this_month,
+            avg_incident_resolution_days=avg_incident_resolution_days,
         )
 
         return stats

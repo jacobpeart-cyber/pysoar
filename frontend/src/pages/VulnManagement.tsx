@@ -101,8 +101,8 @@ export default function VulnManagement() {
   ];
 
   const filteredVulns = vulnerabilities.filter(v =>
-    v.cveId.toLowerCase().includes(searchQuery.toLowerCase()) ||
-    v.title.toLowerCase().includes(searchQuery.toLowerCase())
+    (v.cveId ?? '').toLowerCase().includes(searchQuery.toLowerCase()) ||
+    (v.title ?? '').toLowerCase().includes(searchQuery.toLowerCase())
   );
 
   const kevVulns = vulnerabilities.filter(v => v.kev);
@@ -256,8 +256,8 @@ export default function VulnManagement() {
                               {vuln.severity.toUpperCase()}
                             </span>
                           </td>
-                          <td className="px-6 py-4 text-sm font-semibold">{vuln.cvss.toFixed(1)}</td>
-                          <td className="px-6 py-4 text-sm">{(vuln.epss * 100).toFixed(0)}%</td>
+                          <td className="px-6 py-4 text-sm font-semibold">{vuln.cvss?.toFixed(1) ?? 'N/A'}</td>
+                          <td className="px-6 py-4 text-sm">{((vuln.epss ?? 0) * 100).toFixed(0)}%</td>
                           <td className="px-6 py-4">
                             {vuln.kev ? (
                               <AlertTriangle className="w-5 h-5 text-red-600" />

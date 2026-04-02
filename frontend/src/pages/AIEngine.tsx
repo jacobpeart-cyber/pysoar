@@ -236,7 +236,8 @@ export default function AIEngine() {
   const handleTriage = async () => {
     setTriageLoading(true);
     try {
-      const res = await api.post('/ai/triage/batch', { alert_ids: [], limit: 10 });
+      const alertIds = (triagedAlerts ?? []).map((a) => a.id);
+      const res = await api.post('/ai/triage/batch', { alert_ids: alertIds, limit: 10 });
       queryClient.invalidateQueries({ queryKey: ['triagedAlerts'] });
       queryClient.invalidateQueries({ queryKey: ['aiDashboard'] });
       const count = res.data?.results?.length || res.data?.triaged_count || 0;
