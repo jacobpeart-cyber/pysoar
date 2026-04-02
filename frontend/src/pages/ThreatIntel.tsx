@@ -27,10 +27,10 @@ interface ThreatFeed {
   id: string;
   name: string;
   provider: string;
-  type: string;
-  enabled: boolean;
-  last_updated: string | null;
-  indicator_count: number;
+  feed_type: string;
+  is_enabled: boolean;
+  last_poll_at: string | null;
+  total_indicators: number;
   status: 'active' | 'error' | 'disabled';
 }
 
@@ -77,10 +77,96 @@ const indicatorTypeIcons: Record<string, typeof Server> = {
   process: Activity,
 };
 
+function IndicatorDetailContent({ indicatorId }: { indicatorId: string }) {
+  const { data, isLoading, error } = useQuery<{
+    id: string;
+    indicator_type: string;
+    value: string;
+    severity: string | null;
+    source: string | null;
+    confidence: number | null;
+    first_seen: string | null;
+    last_seen: string | null;
+    tags: string[];
+    is_active: boolean;
+    sighting_count: number;
+    tlp: string | null;
+    context: Record<string, unknown>;
+  }>({
+    queryKey: ['threat-intel', 'indicator-detail', indicatorId],
+    queryFn: async () => {
+      const response = await api.get(`/threat-intel/indicators/${indicatorId}`);
+      return response.data;
+    },
+  });
+
+  if (isLoading) return <div className="flex justify-center py-8"><Loader2 className="w-6 h-6 animate-spin text-gray-400" /></div>;
+  if (error || !data) return <p className="text-sm text-red-500">Failed to load indicator details.</p>;
+
+  return (
+    <div className="space-y-3 text-sm">
+      <div>
+        <span className="text-gray-500 dark:text-gray-400">Value:</span>
+        <code className="ml-2 text-gray-900 dark:text-white break-all">{data.value}</code>
+      </div>
+      <div>
+        <span className="text-gray-500 dark:text-gray-400">Type:</span>
+        <span className="ml-2 text-gray-900 dark:text-white">{data.indicator_type}</span>
+      </div>
+      <div>
+        <span className="text-gray-500 dark:text-gray-400">Severity:</span>
+        <span className="ml-2 text-gray-900 dark:text-white">{data.severity || 'N/A'}</span>
+      </div>
+      <div>
+        <span className="text-gray-500 dark:text-gray-400">Confidence:</span>
+        <span className="ml-2 text-gray-900 dark:text-white">{data.confidence ?? 'N/A'}%</span>
+      </div>
+      <div>
+        <span className="text-gray-500 dark:text-gray-400">Source:</span>
+        <span className="ml-2 text-gray-900 dark:text-white">{data.source || 'N/A'}</span>
+      </div>
+      <div>
+        <span className="text-gray-500 dark:text-gray-400">TLP:</span>
+        <span className="ml-2 text-gray-900 dark:text-white">{data.tlp || 'N/A'}</span>
+      </div>
+      <div>
+        <span className="text-gray-500 dark:text-gray-400">Active:</span>
+        <span className="ml-2 text-gray-900 dark:text-white">{data.is_active ? 'Yes' : 'No'}</span>
+      </div>
+      <div>
+        <span className="text-gray-500 dark:text-gray-400">Sightings:</span>
+        <span className="ml-2 text-gray-900 dark:text-white">{data.sighting_count}</span>
+      </div>
+      <div>
+        <span className="text-gray-500 dark:text-gray-400">First Seen:</span>
+        <span className="ml-2 text-gray-900 dark:text-white">{data.first_seen ? new Date(data.first_seen).toLocaleString() : 'N/A'}</span>
+      </div>
+      <div>
+        <span className="text-gray-500 dark:text-gray-400">Last Seen:</span>
+        <span className="ml-2 text-gray-900 dark:text-white">{data.last_seen ? new Date(data.last_seen).toLocaleString() : 'N/A'}</span>
+      </div>
+      {data.tags.length > 0 && (
+        <div>
+          <span className="text-gray-500 dark:text-gray-400">Tags:</span>
+          <div className="flex flex-wrap gap-1 mt-1">
+            {data.tags.map((tag, idx) => (
+              <span key={idx} className="px-2 py-0.5 text-xs bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300 rounded">{tag}</span>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function ThreatIntel() {
   const [searchQuery, setSearchQuery] = useState('');
   const [searchType, setSearchType] = useState('auto');
   const [activeTab, setActiveTab] = useState<'lookup' | 'feeds' | 'iocs'>('lookup');
+  const [iocTypeFilter, setIocTypeFilter] = useState('all');
+  const [iocReputationFilter, setIocReputationFilter] = useState('all');
+  const [iocPage, setIocPage] = useState(1);
+  const [selectedIndicatorId, setSelectedIndicatorId] = useState<string | null>(null);
 
   const { data: stats } = useQuery<ThreatStats>({
     queryKey: ['threat-intel', 'stats'],
@@ -120,6 +206,37 @@ export default function ThreatIntel() {
       const response = await api.get('/threat-intel/feeds');
       return response.data;
     },
+  });
+
+  const iocQueryParams = useMemo(() => {
+    const params: Record<string, string | number> = { page: iocPage, size: 50 };
+    if (iocTypeFilter !== 'all') params.indicator_type = iocTypeFilter;
+    if (iocReputationFilter !== 'all') params.severity = iocReputationFilter === 'malicious' ? 'critical' : iocReputationFilter === 'suspicious' ? 'medium' : 'low';
+    return params;
+  }, [iocPage, iocTypeFilter, iocReputationFilter]);
+
+  const { data: iocData, isLoading: iocLoading } = useQuery<{
+    items: Array<{
+      id: string;
+      indicator_type: string;
+      value: string;
+      severity: string | null;
+      source: string | null;
+      confidence: number | null;
+      last_seen: string | null;
+      first_seen: string | null;
+      tags: string[];
+    }>;
+    total: number;
+    page: number;
+    pages: number;
+  }>({
+    queryKey: ['threat-intel', 'ioc-database', iocQueryParams],
+    queryFn: async () => {
+      const response = await api.get('/threat-intel/indicators', { params: iocQueryParams });
+      return response.data;
+    },
+    enabled: activeTab === 'iocs',
   });
 
   const lookupMutation = useMutation<IOCLookupResult, Error, { indicator: string; type: string }>({
@@ -361,10 +478,27 @@ export default function ThreatIntel() {
                     </p>
                   </div>
                   <div className="flex items-center gap-2">
-                    <button className="p-2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700">
+                    <button
+                      onClick={() => setSelectedIndicatorId(lookupMutation.data?.indicator || null)}
+                      title="View indicator detail"
+                      className="p-2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700"
+                    >
                       <Eye className="w-4 h-4" />
                     </button>
-                    <button className="p-2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700">
+                    <button
+                      onClick={() => {
+                        if (!lookupMutation.data) return;
+                        const blob = new Blob([JSON.stringify(lookupMutation.data, null, 2)], { type: 'application/json' });
+                        const url = URL.createObjectURL(blob);
+                        const a = document.createElement('a');
+                        a.href = url;
+                        a.download = `ioc-${lookupMutation.data.indicator}.json`;
+                        a.click();
+                        URL.revokeObjectURL(url);
+                      }}
+                      title="Download as JSON"
+                      className="p-2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700"
+                    >
                       <Download className="w-4 h-4" />
                     </button>
                   </div>
@@ -472,11 +606,11 @@ export default function ThreatIntel() {
                     <div className="flex items-center gap-2">
                       <p className="font-medium text-gray-900 dark:text-white">{feed.name}</p>
                       <span className="px-2 py-0.5 text-xs bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-400 rounded">
-                        {feed.type}
+                        {feed.feed_type}
                       </span>
                     </div>
                     <p className="text-sm text-gray-500 dark:text-gray-400">
-                      {feed.provider} | {feed.indicator_count.toLocaleString()} indicators
+                      {feed.provider} | {(feed.total_indicators || 0).toLocaleString()} indicators
                     </p>
                   </div>
                 </div>
@@ -484,8 +618,8 @@ export default function ThreatIntel() {
                   <div className="text-right">
                     <p className="text-xs text-gray-500 dark:text-gray-400">Last Updated</p>
                     <p className="text-sm text-gray-900 dark:text-white">
-                      {feed.last_updated
-                        ? new Date(feed.last_updated).toLocaleString()
+                      {feed.last_poll_at
+                        ? new Date(feed.last_poll_at).toLocaleString()
                         : 'Never'}
                     </p>
                   </div>
@@ -520,20 +654,46 @@ export default function ThreatIntel() {
           <div className="p-4 border-b border-gray-200 dark:border-gray-700 flex items-center justify-between">
             <h3 className="font-medium text-gray-900 dark:text-white">IOC Database</h3>
             <div className="flex items-center gap-2">
-              <select className="text-sm border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 rounded-lg px-3 py-1.5 text-gray-700 dark:text-gray-300">
+              <select
+                value={iocTypeFilter}
+                onChange={(e) => { setIocTypeFilter(e.target.value); setIocPage(1); }}
+                className="text-sm border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 rounded-lg px-3 py-1.5 text-gray-700 dark:text-gray-300"
+              >
                 <option value="all">All Types</option>
-                <option value="ip">IP Addresses</option>
+                <option value="ipv4">IP Addresses</option>
                 <option value="domain">Domains</option>
-                <option value="hash">File Hashes</option>
+                <option value="md5">MD5 Hashes</option>
+                <option value="sha256">SHA256 Hashes</option>
                 <option value="url">URLs</option>
+                <option value="email">Email</option>
               </select>
-              <select className="text-sm border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 rounded-lg px-3 py-1.5 text-gray-700 dark:text-gray-300">
+              <select
+                value={iocReputationFilter}
+                onChange={(e) => { setIocReputationFilter(e.target.value); setIocPage(1); }}
+                className="text-sm border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 rounded-lg px-3 py-1.5 text-gray-700 dark:text-gray-300"
+              >
                 <option value="all">All Reputation</option>
                 <option value="malicious">Malicious</option>
                 <option value="suspicious">Suspicious</option>
                 <option value="clean">Clean</option>
               </select>
-              <button className="flex items-center gap-2 px-3 py-1.5 text-sm text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg">
+              <button
+                onClick={() => {
+                  const items = iocData?.items || [];
+                  if (items.length === 0) return;
+                  const headers = ['Indicator', 'Type', 'Severity', 'Source', 'Last Seen'];
+                  const rows = items.map((i) => [i.value, i.indicator_type, i.severity || '', i.source || '', i.last_seen || '']);
+                  const csv = [headers.join(','), ...rows.map((r) => r.map((c) => `"${c}"`).join(','))].join('\n');
+                  const blob = new Blob([csv], { type: 'text/csv' });
+                  const url = URL.createObjectURL(blob);
+                  const a = document.createElement('a');
+                  a.href = url;
+                  a.download = 'ioc-export.csv';
+                  a.click();
+                  URL.revokeObjectURL(url);
+                }}
+                className="flex items-center gap-2 px-3 py-1.5 text-sm text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg"
+              >
                 <Download className="w-4 h-4" />
                 Export
               </button>
@@ -564,105 +724,113 @@ export default function ThreatIntel() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
-                {/* Sample data - in production this would come from an API */}
-                <tr className="hover:bg-gray-50 dark:hover:bg-gray-700/50">
-                  <td className="px-4 py-3">
-                    <code className="text-sm text-gray-900 dark:text-white">192.168.1.100</code>
-                  </td>
-                  <td className="px-4 py-3">
-                    <span className="px-2 py-0.5 text-xs bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-400 rounded">
-                      IP
-                    </span>
-                  </td>
-                  <td className="px-4 py-3">
-                    <span className="px-2 py-1 text-xs font-medium bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400 rounded-full">
-                      Malicious
-                    </span>
-                  </td>
-                  <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">
-                    AbuseIPDB
-                  </td>
-                  <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">
-                    2 hours ago
-                  </td>
-                  <td className="px-4 py-3">
-                    <button className="text-blue-600 dark:text-blue-400 hover:text-blue-700 text-sm">
-                      Details
-                    </button>
-                  </td>
-                </tr>
-                <tr className="hover:bg-gray-50 dark:hover:bg-gray-700/50">
-                  <td className="px-4 py-3">
-                    <code className="text-sm text-gray-900 dark:text-white">malware.example.com</code>
-                  </td>
-                  <td className="px-4 py-3">
-                    <span className="px-2 py-0.5 text-xs bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-400 rounded">
-                      Domain
-                    </span>
-                  </td>
-                  <td className="px-4 py-3">
-                    <span className="px-2 py-1 text-xs font-medium bg-yellow-100 dark:bg-yellow-900/30 text-yellow-700 dark:text-yellow-400 rounded-full">
-                      Suspicious
-                    </span>
-                  </td>
-                  <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">
-                    VirusTotal
-                  </td>
-                  <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">
-                    1 day ago
-                  </td>
-                  <td className="px-4 py-3">
-                    <button className="text-blue-600 dark:text-blue-400 hover:text-blue-700 text-sm">
-                      Details
-                    </button>
-                  </td>
-                </tr>
-                <tr className="hover:bg-gray-50 dark:hover:bg-gray-700/50">
-                  <td className="px-4 py-3">
-                    <code className="text-sm text-gray-900 dark:text-white truncate max-w-[200px] block">
-                      d41d8cd98f00b204e9800998ecf8427e
-                    </code>
-                  </td>
-                  <td className="px-4 py-3">
-                    <span className="px-2 py-0.5 text-xs bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-400 rounded">
-                      MD5
-                    </span>
-                  </td>
-                  <td className="px-4 py-3">
-                    <span className="px-2 py-1 text-xs font-medium bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400 rounded-full">
-                      Clean
-                    </span>
-                  </td>
-                  <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">
-                    VirusTotal
-                  </td>
-                  <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">
-                    3 days ago
-                  </td>
-                  <td className="px-4 py-3">
-                    <button className="text-blue-600 dark:text-blue-400 hover:text-blue-700 text-sm">
-                      Details
-                    </button>
-                  </td>
-                </tr>
+                {iocLoading ? (
+                  <tr>
+                    <td colSpan={6} className="px-4 py-8 text-center text-gray-500 dark:text-gray-400">
+                      <Loader2 className="w-6 h-6 animate-spin mx-auto mb-2" />
+                      Loading indicators...
+                    </td>
+                  </tr>
+                ) : (iocData?.items || []).length === 0 ? (
+                  <tr>
+                    <td colSpan={6} className="px-4 py-8 text-center text-gray-500 dark:text-gray-400">
+                      <Shield className="w-12 h-12 mx-auto mb-3 opacity-50" />
+                      <p>No indicators found</p>
+                    </td>
+                  </tr>
+                ) : (
+                  (iocData?.items || []).map((ioc) => {
+                    const severityMap: Record<string, { label: string; cls: string }> = {
+                      critical: { label: 'Malicious', cls: 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400' },
+                      high: { label: 'Malicious', cls: 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400' },
+                      medium: { label: 'Suspicious', cls: 'bg-yellow-100 dark:bg-yellow-900/30 text-yellow-700 dark:text-yellow-400' },
+                      low: { label: 'Clean', cls: 'bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400' },
+                      informational: { label: 'Clean', cls: 'bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-400' },
+                    };
+                    const rep = severityMap[ioc.severity || ''] || { label: 'Unknown', cls: 'bg-gray-100 dark:bg-gray-600 text-gray-700 dark:text-gray-300' };
+                    return (
+                      <tr key={ioc.id} className="hover:bg-gray-50 dark:hover:bg-gray-700/50">
+                        <td className="px-4 py-3">
+                          <code className="text-sm text-gray-900 dark:text-white truncate max-w-[200px] block">
+                            {ioc.value}
+                          </code>
+                        </td>
+                        <td className="px-4 py-3">
+                          <span className="px-2 py-0.5 text-xs bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-400 rounded">
+                            {ioc.indicator_type}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3">
+                          <span className={clsx('px-2 py-1 text-xs font-medium rounded-full', rep.cls)}>
+                            {rep.label}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">
+                          {ioc.source || '-'}
+                        </td>
+                        <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">
+                          {ioc.last_seen ? new Date(ioc.last_seen).toLocaleDateString() : '-'}
+                        </td>
+                        <td className="px-4 py-3">
+                          <button
+                            onClick={() => setSelectedIndicatorId(ioc.id)}
+                            className="text-blue-600 dark:text-blue-400 hover:text-blue-700 text-sm"
+                          >
+                            Details
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })
+                )}
               </tbody>
             </table>
           </div>
           <div className="p-4 border-t border-gray-200 dark:border-gray-700 flex items-center justify-between">
             <p className="text-sm text-gray-500 dark:text-gray-400">
-              Showing 1-3 of {stats?.total_indicators?.toLocaleString() || 0} indicators
+              Showing page {iocData?.page || 1} of {iocData?.pages || 1} ({iocData?.total?.toLocaleString() || 0} total indicators)
             </p>
             <div className="flex gap-2">
               <button
-                disabled
-                className="px-3 py-1 text-sm border border-gray-300 dark:border-gray-600 rounded-lg text-gray-400 cursor-not-allowed"
+                disabled={iocPage <= 1}
+                onClick={() => setIocPage((p) => Math.max(1, p - 1))}
+                className={clsx(
+                  'px-3 py-1 text-sm border border-gray-300 dark:border-gray-600 rounded-lg',
+                  iocPage <= 1
+                    ? 'text-gray-400 cursor-not-allowed'
+                    : 'text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700'
+                )}
               >
                 Previous
               </button>
-              <button className="px-3 py-1 text-sm border border-gray-300 dark:border-gray-600 rounded-lg text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700">
+              <button
+                disabled={iocPage >= (iocData?.pages || 1)}
+                onClick={() => setIocPage((p) => p + 1)}
+                className={clsx(
+                  'px-3 py-1 text-sm border border-gray-300 dark:border-gray-600 rounded-lg',
+                  iocPage >= (iocData?.pages || 1)
+                    ? 'text-gray-400 cursor-not-allowed'
+                    : 'text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700'
+                )}
+              >
                 Next
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Indicator Detail Modal */}
+      {selectedIndicatorId && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50" onClick={() => setSelectedIndicatorId(null)}>
+          <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 w-full max-w-lg mx-4 p-6" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="text-lg font-semibold text-gray-900 dark:text-white">Indicator Details</h3>
+              <button onClick={() => setSelectedIndicatorId(null)} className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300">
+                <XCircle className="w-5 h-5" />
+              </button>
+            </div>
+            <IndicatorDetailContent indicatorId={selectedIndicatorId} />
           </div>
         </div>
       )}

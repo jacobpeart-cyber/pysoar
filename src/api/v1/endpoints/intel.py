@@ -46,7 +46,192 @@ from src.schemas.intel import (
     ThreatIndicatorUpdate,
 )
 
-router = APIRouter(prefix="/intel", tags=["Threat Intelligence"])
+router = APIRouter(prefix="/threat-intel", tags=["Threat Intelligence"])
+
+
+# ============================================================================
+# STATS AND LOOKUP ENDPOINTS (consumed by frontend ThreatIntel.tsx)
+# ============================================================================
+
+
+@router.get("/stats", response_model=None, operation_id="get_threat_intel_stats")
+async def get_threat_intel_stats(
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+) -> dict:
+    """
+    Get threat intelligence stats for the frontend dashboard cards.
+    Returns total_indicators, malicious_ips, malicious_domains, malicious_hashes,
+    feeds_active, and last_update.
+    """
+    org_id = current_user.organization_id
+
+    total_indicators = (
+        await db.execute(
+            select(func.count(ThreatIndicator.id)).where(
+                ThreatIndicator.organization_id == org_id
+            )
+        )
+    ).scalar() or 0
+
+    # Count indicators by type where severity suggests malicious
+    malicious_severities = ("critical", "high")
+
+    malicious_ips = (
+        await db.execute(
+            select(func.count(ThreatIndicator.id)).where(
+                and_(
+                    ThreatIndicator.organization_id == org_id,
+                    ThreatIndicator.indicator_type.in_(["ipv4", "ipv6", "ip"]),
+                    ThreatIndicator.severity.in_(malicious_severities),
+                )
+            )
+        )
+    ).scalar() or 0
+
+    malicious_domains = (
+        await db.execute(
+            select(func.count(ThreatIndicator.id)).where(
+                and_(
+                    ThreatIndicator.organization_id == org_id,
+                    ThreatIndicator.indicator_type == "domain",
+                    ThreatIndicator.severity.in_(malicious_severities),
+                )
+            )
+        )
+    ).scalar() or 0
+
+    malicious_hashes = (
+        await db.execute(
+            select(func.count(ThreatIndicator.id)).where(
+                and_(
+                    ThreatIndicator.organization_id == org_id,
+                    ThreatIndicator.indicator_type.in_(["md5", "sha1", "sha256", "hash"]),
+                    ThreatIndicator.severity.in_(malicious_severities),
+                )
+            )
+        )
+    ).scalar() or 0
+
+    feeds_active = (
+        await db.execute(
+            select(func.count(ThreatFeed.id)).where(
+                and_(
+                    ThreatFeed.organization_id == org_id,
+                    ThreatFeed.is_enabled == True,
+                )
+            )
+        )
+    ).scalar() or 0
+
+    # Get the most recent last_seen across all indicators
+    last_update_result = (
+        await db.execute(
+            select(func.max(ThreatIndicator.last_seen)).where(
+                ThreatIndicator.organization_id == org_id
+            )
+        )
+    ).scalar()
+
+    return {
+        "total_indicators": total_indicators,
+        "malicious_ips": malicious_ips,
+        "malicious_domains": malicious_domains,
+        "malicious_hashes": malicious_hashes,
+        "feeds_active": feeds_active,
+        "last_update": last_update_result.isoformat() if last_update_result else None,
+    }
+
+
+@router.post("/lookup", response_model=None, operation_id="lookup_ioc")
+async def lookup_ioc(
+    payload: dict,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+) -> dict:
+    """
+    Look up an IOC indicator and return reputation information.
+    Frontend POSTs { indicator: string, type: string }.
+    """
+    indicator_value = payload.get("indicator", "")
+    indicator_type = payload.get("type", "auto")
+
+    if not indicator_value:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="indicator is required",
+        )
+
+    org_id = current_user.organization_id
+
+    # Query matching indicators
+    query = select(ThreatIndicator).where(
+        and_(
+            ThreatIndicator.organization_id == org_id,
+            ThreatIndicator.value == indicator_value,
+        )
+    )
+    if indicator_type and indicator_type != "auto":
+        query = query.where(ThreatIndicator.indicator_type == indicator_type)
+
+    result = await db.execute(query.order_by(desc(ThreatIndicator.last_seen)))
+    indicators = result.scalars().all()
+
+    if not indicators:
+        return {
+            "indicator": indicator_value,
+            "type": indicator_type,
+            "reputation": "unknown",
+            "confidence": 0,
+            "sources": [],
+            "tags": [],
+            "first_seen": None,
+            "last_seen": None,
+        }
+
+    # Determine overall reputation from severity of matching indicators
+    severity_to_reputation = {
+        "critical": "malicious",
+        "high": "malicious",
+        "medium": "suspicious",
+        "low": "clean",
+        "informational": "clean",
+    }
+
+    best = indicators[0]
+    reputation = severity_to_reputation.get(best.severity or "", "unknown")
+    confidence = best.confidence or 0
+    resolved_type = best.indicator_type or indicator_type
+
+    # Build sources list
+    sources = []
+    for ind in indicators:
+        sources.append({
+            "name": ind.source or "Internal",
+            "verdict": severity_to_reputation.get(ind.severity or "", "unknown"),
+            "last_seen": ind.last_seen.isoformat() if ind.last_seen else datetime.now(timezone.utc).isoformat(),
+        })
+
+    # Aggregate tags
+    all_tags = []
+    for ind in indicators:
+        all_tags.extend(ind.tags or [])
+    unique_tags = list(dict.fromkeys(all_tags))
+
+    # Earliest first_seen and latest last_seen
+    first_seens = [ind.first_seen for ind in indicators if ind.first_seen]
+    last_seens = [ind.last_seen for ind in indicators if ind.last_seen]
+
+    return {
+        "indicator": indicator_value,
+        "type": resolved_type,
+        "reputation": reputation,
+        "confidence": confidence,
+        "sources": sources,
+        "tags": unique_tags,
+        "first_seen": min(first_seens).isoformat() if first_seens else None,
+        "last_seen": max(last_seens).isoformat() if last_seens else None,
+    }
 
 
 # ============================================================================
@@ -220,6 +405,19 @@ async def poll_threat_feed(
     await db.refresh(feed)
 
     return {"status": "poll_scheduled", "feed_id": feed_id}
+
+
+@router.post("/feeds/{feed_id}/sync", response_model=None, operation_id="sync_threat_feed")
+async def sync_threat_feed(
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+    feed_id: str = Path(...),
+) -> dict:
+    """
+    Trigger a sync (alias for poll) of a threat feed.
+    The frontend calls /feeds/{feed_id}/sync.
+    """
+    return await poll_threat_feed(current_user=current_user, db=db, feed_id=feed_id)
 
 
 @router.post("/feeds/register-builtins", response_model=None, operation_id="register_builtin_feeds")
