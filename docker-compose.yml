@@ -160,6 +160,47 @@ services:
       retries: 5
     command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru --requirepass ${REDIS_PASSWORD}
 
+  # Prometheus - Metrics Collection
+  prometheus:
+    image: prom/prometheus:v2.50.1
+    container_name: pysoar-prometheus
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - pysoar-prometheus:/prometheus
+    depends_on:
+      - api
+    networks:
+      - pysoar-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # Grafana - Metrics Visualization
+  grafana:
+    image: grafana/grafana:10.3.1
+    container_name: pysoar-grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=pysoar-grafana
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - pysoar-grafana:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - pysoar-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
 networks:
   pysoar-network:
     driver: bridge
@@ -172,4 +213,8 @@ volumes:
   pysoar-uploads:
     driver: local
   pysoar-logs:
+    driver: local
+  pysoar-prometheus:
+    driver: local
+  pysoar-grafana:
     driver: local

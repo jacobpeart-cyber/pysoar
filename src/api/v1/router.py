@@ -53,6 +53,7 @@ from src.api.v1.endpoints import (
     tickethub,
     backup,
     fedramp,
+    monitoring,
 )
 
 api_router = APIRouter()
@@ -120,3 +121,6 @@ api_router.include_router(backup.router, tags=["backup-restore"])
 
 # --- FedRAMP Compliance ---
 api_router.include_router(fedramp.router, tags=["fedramp"])
+
+# --- Monitoring ---
+api_router.include_router(monitoring.router, tags=["monitoring"])
