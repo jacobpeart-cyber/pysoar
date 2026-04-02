@@ -209,16 +209,47 @@ class STIGScanner:
             Check result with status and evidence
         """
         try:
-            # Simulate check execution
-            # In production, would use actual check tools (SCAP, scripts, etc.)
             status = "not_reviewed"
             evidence = f"Check executed on {host}"
 
             if rule.is_automatable and scan_type in ["scap", "automated"]:
-                # Simulated automated check
-                status = "not_a_finding"  # Placeholder
+                # Query previous scan results for this rule and host
+                prev_stmt = (
+                    select(STIGScanResult)
+                    .where(
+                        STIGScanResult.target_host == host,
+                    )
+                    .order_by(STIGScanResult.started_at.desc())
+                    .limit(5)
+                )
+                prev_results = await self.session.scalars(prev_stmt)
+                prev_scans = list(prev_results)
+
+                if prev_scans:
+                    # Check findings from the most recent completed scan
+                    latest = prev_scans[0]
+                    if latest.findings and isinstance(latest.findings, dict):
+                        prev_finding = latest.findings.get(rule.rule_id, {})
+                        prev_status = prev_finding.get("status")
+                        if prev_status in ("open", "not_a_finding", "not_applicable"):
+                            status = prev_status
+                            evidence = (
+                                f"Based on previous scan {latest.id}: "
+                                f"{prev_finding.get('evidence', 'No details')}"
+                            )
+                        else:
+                            status = "not_reviewed"
+                            evidence = "No prior automated finding; manual review needed"
+                    else:
+                        status = "not_reviewed"
+                        evidence = "Previous scan has no parsed findings for this rule"
+                else:
+                    # No previous scans - first time check
+                    status = "not_reviewed"
+                    evidence = "No prior scan data available; initial assessment needed"
             elif scan_type in ["manual", "hybrid"]:
                 status = "not_reviewed"
+                evidence = f"Manual review required for rule {rule.rule_id} on {host}"
 
             return {
                 "rule_id": rule.rule_id,

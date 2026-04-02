@@ -748,16 +748,45 @@ class ActionExecutor:
         action_name: str,
         input_data: dict[str, Any],
     ) -> dict[str, Any]:
-        """Call actual connector action (placeholder)"""
-        # In production, this would make actual API calls
-        await self._simulate_action()
-        return {"result": "success", "data": input_data}
+        """Call connector action via HTTP using httpx"""
+        import httpx
 
-    async def _simulate_action(self) -> None:
-        """Simulate action execution"""
-        import asyncio
+        # Build request from input data
+        url = input_data.get("url", "")
+        method = input_data.get("method", "POST").upper()
+        headers = input_data.get("headers", {})
+        body = input_data.get("body", {})
+        timeout = input_data.get("timeout", 30)
+        params = input_data.get("params", {})
 
-        await asyncio.sleep(0.1)
+        if not url:
+            raise ValueError("Input data must include a 'url' field")
+
+        # Add installation context header
+        headers.setdefault("X-Installation-Id", installation_id)
+        headers.setdefault("X-Action-Name", action_name)
+
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.request(
+                method=method,
+                url=url,
+                headers=headers,
+                json=body if method in ("POST", "PUT", "PATCH") else None,
+                params=params if method == "GET" else None,
+            )
+
+            # Parse response
+            try:
+                response_data = response.json()
+            except Exception:
+                response_data = {"raw_text": response.text}
+
+            return {
+                "result": "success" if response.is_success else "error",
+                "status_code": response.status_code,
+                "data": response_data,
+                "headers": dict(response.headers),
+            }
 
     def handle_rate_limiting(
         self,
