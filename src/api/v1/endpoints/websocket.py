@@ -63,24 +63,36 @@ async def websocket_endpoint(
         await websocket.close(code=4001, reason="Authentication required")
         return
 
-    await manager.connect(websocket, user_id)
+    try:
+        await manager.connect(websocket, user_id)
+    except Exception as e:
+        logger.error(f"WebSocket connect failed for {user_id}: {e}")
+        return
 
     try:
         while True:
-            # Receive and handle messages from client
-            data = await websocket.receive_text()
+            try:
+                # Receive and handle messages from client
+                data = await websocket.receive_text()
+            except WebSocketDisconnect:
+                break
+            except Exception:
+                break
 
             try:
                 message = json.loads(data)
                 action = message.get("action", "")
 
                 if action == "ping":
-                    await manager.send_personal(user_id, {"type": "pong"})
+                    await websocket.send_json({
+                        "type": "pong",
+                        "timestamp": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
+                    })
 
                 elif action == "subscribe":
                     channel = message.get("channel", "")
                     await manager.subscribe(user_id, channel)
-                    await manager.send_personal(user_id, {
+                    await websocket.send_json({
                         "type": "subscribed",
                         "channel": channel,
                     })
@@ -88,22 +100,28 @@ async def websocket_endpoint(
                 elif action == "unsubscribe":
                     channel = message.get("channel", "")
                     await manager.unsubscribe(user_id, channel)
-                    await manager.send_personal(user_id, {
+                    await websocket.send_json({
                         "type": "unsubscribed",
                         "channel": channel,
                     })
 
                 else:
-                    await manager.send_personal(user_id, {
-                        "type": "error",
-                        "message": f"Unknown action: {action}",
+                    await websocket.send_json({
+                        "type": "ack",
+                        "message": f"Received: {action}",
                     })
 
             except json.JSONDecodeError:
-                await manager.send_personal(user_id, {
-                    "type": "error",
-                    "message": "Invalid JSON",
-                })
+                try:
+                    await websocket.send_json({
+                        "type": "error",
+                        "message": "Invalid JSON",
+                    })
+                except Exception:
+                    break
+            except Exception as e:
+                logger.error(f"WebSocket message handling error: {e}")
+                break
 
-    except WebSocketDisconnect:
+    finally:
         manager.disconnect(websocket, user_id)
