@@ -946,6 +946,17 @@ async def create_remediation_ticket(
     db: DatabaseSession = None,
 ):
     """Create a remediation ticket"""
+    org_id = getattr(current_user, "organization_id", None)
+    if not org_id:
+        # Find first org from organization_members or organizations table
+        from src.models.organization import Organization
+        org_result = await db.execute(select(Organization).limit(1))
+        org = org_result.scalars().first()
+        org_id = org.id if org else None
+
+    if not org_id:
+        raise HTTPException(status_code=400, detail="No organization found. Create an organization first.")
+
     ticket = RemediationTicket(
         id=str(uuid.uuid4()),
         title=ticket_data.title,
@@ -960,7 +971,7 @@ async def create_remediation_ticket(
         due_date=ticket_data.due_date,
         external_ticket_id=ticket_data.external_ticket_id,
         status="open",
-        organization_id=current_user.organization_id,
+        organization_id=org_id,
     )
 
     db.add(ticket)
