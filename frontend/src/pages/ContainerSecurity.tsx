@@ -84,8 +84,8 @@ export default function ContainerSecurity() {
           containerApi.getScans(),
           containerApi.getK8sPolicies(),
         ]);
-        setImages(imagesData.data || []);
-        setScans(scansData.data || []);
+        setImages(Array.isArray(imagesData) ? imagesData : (imagesData?.items || imagesData?.data || []));
+        setScans(Array.isArray(scansData) ? scansData : (scansData?.items || scansData?.data || []));
         setPolicies(policiesData || []);
         setRegistries([]);
       } catch (error) {
@@ -317,7 +317,7 @@ export default function ContainerSecurity() {
                                     try {
                                       await containerApi.scanImage(image.id);
                                       const scansData = await containerApi.getScans();
-                                      setScans(scansData.data || []);
+                                      setScans(Array.isArray(scansData) ? scansData : (scansData?.items || scansData?.data || []));
                                     } catch (err) {
                                       console.error('Re-scan failed:', err);
                                     } finally {

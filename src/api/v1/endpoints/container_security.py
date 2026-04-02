@@ -94,7 +94,7 @@ async def list_images(
     - skip, limit: Pagination
     """
     stmt = select(ContainerImage).where(
-        ContainerImage.organization_id == user.organization_id
+        ContainerImage.organization_id == getattr(current_user, "organization_id", None)
     )
 
     if compliance_status:
@@ -131,7 +131,7 @@ async def create_image(
         base_image=request.base_image,
         labels=request.labels or {},
         compliance_status="not_scanned",
-        organization_id=user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
     )
     db.add(image)
     await db.commit()
@@ -151,7 +151,7 @@ async def get_image(
     stmt = select(ContainerImage).where(
         and_(
             ContainerImage.id == image_id,
-            ContainerImage.organization_id == user.organization_id,
+            ContainerImage.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     result = await db.execute(stmt)
@@ -174,7 +174,7 @@ async def update_image(
     stmt = select(ContainerImage).where(
         and_(
             ContainerImage.id == image_id,
-            ContainerImage.organization_id == user.organization_id,
+            ContainerImage.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     result = await db.execute(stmt)
@@ -210,7 +210,7 @@ async def scan_image(
     stmt = select(ContainerImage).where(
         and_(
             ContainerImage.id == image_id,
-            ContainerImage.organization_id == user.organization_id,
+            ContainerImage.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     result = await db.execute(stmt)
@@ -220,7 +220,7 @@ async def scan_image(
         raise HTTPException(status_code=404, detail="Image not found")
 
     # Queue async scan task
-    scheduled_image_scan.delay(image_id, user.organization_id)
+    scheduled_image_scan.delay(image_id, getattr(current_user, "organization_id", None))
 
     logger.info(f"Queued scan for image {image_id}")
 
@@ -248,7 +248,7 @@ async def get_image_vulnerabilities(
     stmt = select(ContainerImage).where(
         and_(
             ContainerImage.id == image_id,
-            ContainerImage.organization_id == user.organization_id,
+            ContainerImage.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     result = await db.execute(stmt)
@@ -282,7 +282,7 @@ async def verify_image_signature(
     stmt = select(ContainerImage).where(
         and_(
             ContainerImage.id == image_id,
-            ContainerImage.organization_id == user.organization_id,
+            ContainerImage.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     result = await db.execute(stmt)
@@ -314,7 +314,7 @@ async def assess_image_risk(
     stmt = select(ContainerImage).where(
         and_(
             ContainerImage.id == image_id,
-            ContainerImage.organization_id == user.organization_id,
+            ContainerImage.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     result = await db.execute(stmt)
@@ -359,7 +359,7 @@ async def list_clusters(
 ):
     """List Kubernetes clusters."""
     stmt = select(KubernetesCluster).where(
-        KubernetesCluster.organization_id == user.organization_id
+        KubernetesCluster.organization_id == getattr(current_user, "organization_id", None)
     )
 
     if provider:
@@ -386,7 +386,7 @@ async def create_cluster(
         endpoint=request.endpoint,
         pod_security_standards=request.pod_security_standards,
         admission_controllers=request.admission_controllers or {},
-        organization_id=user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
     )
     db.add(cluster)
     await db.commit()
@@ -406,7 +406,7 @@ async def get_cluster(
     stmt = select(KubernetesCluster).where(
         and_(
             KubernetesCluster.id == cluster_id,
-            KubernetesCluster.organization_id == user.organization_id,
+            KubernetesCluster.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     result = await db.execute(stmt)
@@ -429,7 +429,7 @@ async def update_cluster(
     stmt = select(KubernetesCluster).where(
         and_(
             KubernetesCluster.id == cluster_id,
-            KubernetesCluster.organization_id == user.organization_id,
+            KubernetesCluster.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     result = await db.execute(stmt)
@@ -462,7 +462,7 @@ async def audit_cluster(
     stmt = select(KubernetesCluster).where(
         and_(
             KubernetesCluster.id == cluster_id,
-            KubernetesCluster.organization_id == user.organization_id,
+            KubernetesCluster.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     result = await db.execute(stmt)
@@ -472,7 +472,7 @@ async def audit_cluster(
         raise HTTPException(status_code=404, detail="Cluster not found")
 
     # Queue async audit task
-    cluster_security_audit.delay(cluster_id, user.organization_id)
+    cluster_security_audit.delay(cluster_id, getattr(current_user, "organization_id", None))
 
     logger.info(f"Queued audit for cluster {cluster_id}")
 
@@ -496,7 +496,7 @@ async def check_cluster_compliance(
     stmt = select(KubernetesCluster).where(
         and_(
             KubernetesCluster.id == cluster_id,
-            KubernetesCluster.organization_id == user.organization_id,
+            KubernetesCluster.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     result = await db.execute(stmt)
@@ -506,7 +506,7 @@ async def check_cluster_compliance(
         raise HTTPException(status_code=404, detail="Cluster not found")
 
     # Queue compliance check
-    compliance_check.delay(cluster_id, user.organization_id)
+    compliance_check.delay(cluster_id, getattr(current_user, "organization_id", None))
 
     return {
         "status": "queued",
@@ -530,7 +530,7 @@ async def get_cluster_findings(
     stmt = select(KubernetesCluster).where(
         and_(
             KubernetesCluster.id == cluster_id,
-            KubernetesCluster.organization_id == user.organization_id,
+            KubernetesCluster.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     result = await db.execute(stmt)
@@ -571,7 +571,7 @@ async def list_findings(
 ):
     """List security findings across clusters."""
     stmt = select(K8sSecurityFinding).where(
-        K8sSecurityFinding.organization_id == user.organization_id
+        K8sSecurityFinding.organization_id == getattr(current_user, "organization_id", None)
     )
 
     if status:
@@ -602,7 +602,7 @@ async def remediate_finding(
     stmt = select(K8sSecurityFinding).where(
         and_(
             K8sSecurityFinding.id == finding_id,
-            K8sSecurityFinding.organization_id == user.organization_id,
+            K8sSecurityFinding.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     result = await db.execute(stmt)
@@ -643,7 +643,7 @@ async def update_finding(
     stmt = select(K8sSecurityFinding).where(
         and_(
             K8sSecurityFinding.id == finding_id,
-            K8sSecurityFinding.organization_id == user.organization_id,
+            K8sSecurityFinding.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     result = await db.execute(stmt)
@@ -679,7 +679,7 @@ async def list_runtime_alerts(
 ):
     """List runtime security alerts."""
     stmt = select(RuntimeAlert).where(
-        RuntimeAlert.organization_id == user.organization_id
+        RuntimeAlert.organization_id == getattr(current_user, "organization_id", None)
     )
 
     if status:
@@ -706,7 +706,7 @@ async def update_runtime_alert(
     stmt = select(RuntimeAlert).where(
         and_(
             RuntimeAlert.id == alert_id,
-            RuntimeAlert.organization_id == user.organization_id,
+            RuntimeAlert.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     result = await db.execute(stmt)
@@ -737,7 +737,7 @@ async def investigate_alert(
     stmt = select(RuntimeAlert).where(
         and_(
             RuntimeAlert.id == alert_id,
-            RuntimeAlert.organization_id == user.organization_id,
+            RuntimeAlert.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     result = await db.execute(stmt)
@@ -768,7 +768,7 @@ async def quarantine_pod_from_alert(
     stmt = select(RuntimeAlert).where(
         and_(
             RuntimeAlert.id == alert_id,
-            RuntimeAlert.organization_id == user.organization_id,
+            RuntimeAlert.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     result = await db.execute(stmt)
@@ -807,21 +807,21 @@ async def get_dashboard_overview(
     """
     # Count images
     img_stmt = select(func.count(ContainerImage.id)).where(
-        ContainerImage.organization_id == user.organization_id
+        ContainerImage.organization_id == getattr(current_user, "organization_id", None)
     )
     img_result = await db.execute(img_stmt)
     total_images = img_result.scalar() or 0
 
     # Count clusters
     cls_stmt = select(func.count(KubernetesCluster.id)).where(
-        KubernetesCluster.organization_id == user.organization_id
+        KubernetesCluster.organization_id == getattr(current_user, "organization_id", None)
     )
     cls_result = await db.execute(cls_stmt)
     total_clusters = cls_result.scalar() or 0
 
     # Count vulnerabilities by severity
     vuln_stmt = select(ImageVulnerability).where(
-        ImageVulnerability.organization_id == user.organization_id
+        ImageVulnerability.organization_id == getattr(current_user, "organization_id", None)
     )
     vuln_result = await db.execute(vuln_stmt)
     vulns = vuln_result.scalars().all()
@@ -837,7 +837,7 @@ async def get_dashboard_overview(
     # Count critical findings
     finding_stmt = select(func.count(K8sSecurityFinding.id)).where(
         and_(
-            K8sSecurityFinding.organization_id == user.organization_id,
+            K8sSecurityFinding.organization_id == getattr(current_user, "organization_id", None),
             K8sSecurityFinding.severity == "critical",
         )
     )
@@ -847,7 +847,7 @@ async def get_dashboard_overview(
     # Count new alerts
     alert_stmt = select(func.count(RuntimeAlert.id)).where(
         and_(
-            RuntimeAlert.organization_id == user.organization_id,
+            RuntimeAlert.organization_id == getattr(current_user, "organization_id", None),
             RuntimeAlert.status == "new",
         )
     )
@@ -857,7 +857,7 @@ async def get_dashboard_overview(
     # High risk images
     high_risk_stmt = select(func.count(ContainerImage.id)).where(
         and_(
-            ContainerImage.organization_id == user.organization_id,
+            ContainerImage.organization_id == getattr(current_user, "organization_id", None),
             ContainerImage.risk_score >= 80,
         )
     )
@@ -867,7 +867,7 @@ async def get_dashboard_overview(
     # Non-compliant clusters
     non_compliant_stmt = select(func.count(KubernetesCluster.id)).where(
         and_(
-            KubernetesCluster.organization_id == user.organization_id,
+            KubernetesCluster.organization_id == getattr(current_user, "organization_id", None),
             KubernetesCluster.compliance_score < 60,
         )
     )
@@ -895,7 +895,7 @@ async def get_compliance_matrix(
 ):
     """Get compliance matrix across frameworks."""
     stmt = select(KubernetesCluster).where(
-        KubernetesCluster.organization_id == user.organization_id
+        KubernetesCluster.organization_id == getattr(current_user, "organization_id", None)
     )
     result = await db.execute(stmt)
     clusters = result.scalars().all()
