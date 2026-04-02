@@ -541,12 +541,17 @@ export default function ExposureManagement() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
+                  {assetsLoading ? (
+                    <tr><td colSpan={10} className="px-4 py-12 text-center text-gray-500"><Loader2 className="w-6 h-6 animate-spin mx-auto mb-2" />Loading assets...</td></tr>
+                  ) : assets.length === 0 ? (
+                    <tr><td colSpan={10} className="px-4 py-12 text-center text-gray-500">No assets found. Add assets to start monitoring exposure.</td></tr>
+                  ) : null}
                   {assets?.map((asset) => (
                     <tr key={asset.id} className="hover:bg-gray-50 dark:hover:bg-gray-700/50">
                       <td className="px-4 py-3 text-sm text-gray-900 dark:text-white font-medium">{asset.hostname}</td>
                       <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">{asset.ip_address}</td>
-                      <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">{asset.type}</td>
-                      <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">{asset.environment}</td>
+                      <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">{asset.asset_type || asset.type}</td>
+                      <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">{asset.environment || asset.network_zone}</td>
                       <td className="px-4 py-3">
                         <span className={clsx('px-2 py-1 text-xs font-medium rounded-full', getSeverityColor(asset.criticality))}>
                           {asset.criticality}
@@ -563,7 +568,7 @@ export default function ExposureManagement() {
                       </td>
                       <td className="px-4 py-3 text-sm text-gray-900 dark:text-white">{asset.vulnerability_count}</td>
                       <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">
-                        {new Date(asset.last_scan).toLocaleDateString()}
+                        {asset.last_scan_at ? new Date(asset.last_scan_at).toLocaleDateString() : asset.last_scan ? new Date(asset.last_scan).toLocaleDateString() : '-'}
                       </td>
                       <td className="px-4 py-3">
                         <span className={clsx('px-2 py-1 text-xs font-medium rounded-full', getStatusColor(asset.status))}>
@@ -571,7 +576,10 @@ export default function ExposureManagement() {
                         </span>
                       </td>
                       <td className="px-4 py-3">
-                        <button className="text-blue-600 dark:text-blue-400 hover:text-blue-700 text-sm font-medium">
+                        <button
+                          onClick={() => alert(`Asset: ${asset.hostname}\nIP: ${asset.ip_address}\nType: ${asset.asset_type}\nCriticality: ${asset.criticality}\nRisk Score: ${asset.risk_score}\nVulnerabilities: ${asset.vulnerability_count}`)}
+                          className="text-blue-600 dark:text-blue-400 hover:text-blue-700 text-sm font-medium"
+                        >
                           View Details
                         </button>
                       </td>
@@ -651,6 +659,11 @@ export default function ExposureManagement() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
+                  {vulnLoading ? (
+                    <tr><td colSpan={9} className="px-4 py-12 text-center text-gray-500"><Loader2 className="w-6 h-6 animate-spin mx-auto mb-2" />Loading vulnerabilities...</td></tr>
+                  ) : vulnerabilities.length === 0 ? (
+                    <tr><td colSpan={9} className="px-4 py-12 text-center text-gray-500">No vulnerabilities found. Import scan results to populate.</td></tr>
+                  ) : null}
                   {vulnerabilities?.map((vuln) => (
                     <tr key={vuln.id} className="hover:bg-gray-50 dark:hover:bg-gray-700/50">
                       <td className="px-4 py-3 text-sm font-mono text-gray-900 dark:text-white">{vuln.cve_id}</td>
@@ -660,10 +673,10 @@ export default function ExposureManagement() {
                           {vuln.severity}
                         </span>
                       </td>
-                      <td className="px-4 py-3 text-sm font-mono text-gray-900 dark:text-white">{vuln.cvss.toFixed(1)}</td>
-                      <td className="px-4 py-3 text-sm font-mono text-gray-900 dark:text-white">{(vuln.epss * 100).toFixed(1)}%</td>
+                      <td className="px-4 py-3 text-sm font-mono text-gray-900 dark:text-white">{(vuln.cvss_v3_score ?? vuln.cvss ?? 0).toFixed(1)}</td>
+                      <td className="px-4 py-3 text-sm font-mono text-gray-900 dark:text-white">{((vuln.epss_score ?? vuln.epss ?? 0) * 100).toFixed(1)}%</td>
                       <td className="px-4 py-3">
-                        {vuln.has_exploit ? (
+                        {(vuln.exploit_available ?? vuln.has_exploit) ? (
                           <span className="px-2 py-1 text-xs font-medium bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-400 rounded-full">
                             Yes
                           </span>
@@ -673,7 +686,7 @@ export default function ExposureManagement() {
                           </span>
                         )}
                       </td>
-                      <td className="px-4 py-3 text-sm text-gray-900 dark:text-white">{vuln.affected_assets}</td>
+                      <td className="px-4 py-3 text-sm text-gray-900 dark:text-white">{vuln.affected_assets ?? vuln.affected_products?.length ?? 0}</td>
                       <td className="px-4 py-3">
                         {vuln.patch_available ? (
                           <CheckCircle className="w-5 h-5 text-green-500" />
@@ -811,6 +824,11 @@ export default function ExposureManagement() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
+                  {ticketsLoading ? (
+                    <tr><td colSpan={7} className="px-4 py-12 text-center text-gray-500"><Loader2 className="w-6 h-6 animate-spin mx-auto mb-2" />Loading tickets...</td></tr>
+                  ) : tickets.length === 0 ? (
+                    <tr><td colSpan={7} className="px-4 py-12 text-center text-gray-500">No remediation tickets. Create a ticket to track remediation efforts.</td></tr>
+                  ) : null}
                   {tickets?.map((ticket) => (
                     <tr key={ticket.id} className="hover:bg-gray-50 dark:hover:bg-gray-700/50">
                       <td className="px-4 py-3 text-sm text-gray-900 dark:text-white font-medium">{ticket.title}</td>
