@@ -315,7 +315,7 @@ export default function DeceptionTech() {
                 ) : (dashboard?.recent_interactions || []).slice(0, 10).map((interaction) => (
                   <tr key={interaction.id} className="hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors">
                     <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                      {interaction.created_at ? new Date(interaction.created_at).toLocaleString() : '—'}
+                      {interaction.created_at ? new Date(interaction.created_at || "").toLocaleString() : '—'}
                     </td>
                     <td className="px-6 py-4 font-medium text-gray-900 dark:text-white">{interaction.decoy_id}</td>
                     <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400 font-mono">{interaction.source_ip}</td>
@@ -405,7 +405,7 @@ export default function DeceptionTech() {
                 </div>
 
                 <p className="text-xs text-gray-600 dark:text-gray-400">
-                  Last: {decoy.last_interaction_at ? new Date(decoy.last_interaction_at).toLocaleDateString() : 'Never'}
+                  Last: {decoy.last_interaction_at ? new Date(decoy.last_interaction_at || "").toLocaleDateString() : 'Never'}
                 </p>
 
                 <div className="flex gap-2 pt-2 border-t border-gray-200 dark:border-gray-700">
@@ -484,7 +484,7 @@ export default function DeceptionTech() {
                       <p className="font-semibold text-gray-900 dark:text-white">{token.triggered_count ?? 0}</p>
                     </td>
                     <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                      {token.last_triggered ? new Date(token.last_triggered).toLocaleDateString() : '—'}
+                      {token.last_triggered ? new Date(token.last_triggered || "").toLocaleDateString() : '—'}
                     </td>
                     <td className="px-6 py-4">
                       <button
@@ -553,7 +553,7 @@ export default function DeceptionTech() {
                     className="hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors cursor-pointer"
                   >
                     <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                      {interaction.created_at ? new Date(interaction.created_at).toLocaleString() : '—'}
+                      {interaction.created_at ? new Date(interaction.created_at || "").toLocaleString() : '—'}
                     </td>
                     <td className="px-6 py-4 font-medium text-gray-900 dark:text-white">{interaction.decoy_id}</td>
                     <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400 font-mono">{interaction.source_ip}</td>

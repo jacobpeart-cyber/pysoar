@@ -144,7 +144,7 @@ function riskBg(score: number | null | undefined): string {
 
 function formatDate(d: string | null | undefined): string {
   if (!d) return '-';
-  return new Date(d).toLocaleDateString();
+  return new Date(d || "").toLocaleDateString();
 }
 
 function capitalize(s: string | null | undefined): string {

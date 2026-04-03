@@ -88,7 +88,7 @@ class ComplianceEngine:
         )
         satisfied = sum(1 for c in controls if c.last_assessment_result == "satisfied")
 
-        score = self.calculate_compliance_score(framework_id)
+        score = await self.calculate_compliance_score(framework_id)
         assessment_result = "compliant" if score >= 95.0 else "non_compliant"
 
         assessment = ComplianceAssessment(
@@ -156,7 +156,7 @@ class ComplianceEngine:
 
             weighted_score += control_score * weight
 
-        return (weighted_score / total_weight * 100) if total_weight > 0 else 0.0
+        return round(weighted_score / total_weight, 2) if total_weight > 0 else 0.0
 
     async def get_control_gaps(self, framework_id: str) -> List[Dict[str, Any]]:
         """
@@ -330,7 +330,7 @@ class ComplianceEngine:
             )
         )
         source_result = await self.db.execute(source_stmt)
-        source_controls = result.scalars().all()
+        source_controls = source_result.scalars().all()
 
         target_stmt = select(ComplianceControl).where(
             and_(

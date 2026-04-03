@@ -664,7 +664,7 @@ function ControlExpandedDetails({ control }: { control: Control }) {
         <div>
           <h4 className="text-sm font-medium text-gray-700 dark:text-gray-300">Last Assessed</h4>
           <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
-            {control.last_assessed_at ? new Date(control.last_assessed_at).toLocaleDateString() : 'Never'}
+            {control.last_assessed_at ? new Date(control.last_assessed_at || "").toLocaleDateString() : 'Never'}
           </p>
         </div>
         <div>
@@ -679,7 +679,7 @@ function ControlExpandedDetails({ control }: { control: Control }) {
         <div>
           <h4 className="text-sm font-medium text-gray-700 dark:text-gray-300">Related Controls</h4>
           <div className="flex flex-wrap gap-2 mt-2">
-            {control.relatedControls.map((relatedId) => (
+            {(control.relatedControls ?? control.related_controls ?? []).map((relatedId) => (
               <span
                 key={relatedId}
                 className="inline-flex items-center px-2.5 py-1 rounded-full text-xs font-medium bg-white dark:bg-gray-700 border border-gray-200 dark:border-gray-600 text-gray-700 dark:text-gray-300"
@@ -889,11 +889,11 @@ function POAMsTab({
                         : 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400'
                     )}
                   >
-                    {poam.status.replace(/_/g, ' ')}
+                    {(poam.status || '').replace(/_/g, ' ')}
                   </span>
                 </td>
                 <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                  {poam.scheduled_completion_date ? new Date(poam.scheduled_completion_date).toLocaleDateString() : 'N/A'}
+                  {poam.scheduled_completion_date ? new Date(poam.scheduled_completion_date || "").toLocaleDateString() : 'N/A'}
                 </td>
                 <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
                   {poam.assigned_to ?? ''}
@@ -902,7 +902,7 @@ function POAMsTab({
                   {(() => {
                     if (!poam.scheduled_completion_date) return <span className="text-gray-400">N/A</span>;
                     const daysRemaining = Math.ceil(
-                      (new Date(poam.scheduled_completion_date).getTime() - Date.now()) / (1000 * 60 * 60 * 24)
+                      (new Date(poam.scheduled_completion_date || "").getTime() - Date.now()) / (1000 * 60 * 60 * 24)
                     );
                     return (
                       <span
@@ -1094,7 +1094,7 @@ function CISATab({
             <div className="space-y-2 mb-4">
               <div className="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-400">
                 <Calendar className="w-4 h-4" />
-                Deadline: {directive.compliance_deadline ? new Date(directive.compliance_deadline).toLocaleDateString() : 'N/A'}
+                Deadline: {directive.compliance_deadline ? new Date(directive.compliance_deadline || "").toLocaleDateString() : 'N/A'}
               </div>
               <div className="text-sm text-gray-600 dark:text-gray-400">
                 {Array.isArray(directive.actions_taken) ? directive.actions_taken.length : 0} actions taken

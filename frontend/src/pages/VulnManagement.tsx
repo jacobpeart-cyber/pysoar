@@ -316,7 +316,7 @@ export default function VulnManagement() {
                       <div className="grid grid-cols-3 gap-4 text-sm">
                         <div>
                           <p className="text-gray-600 dark:text-gray-400">Last Run</p>
-                          <p className="font-medium">{new Date(profile.lastRun).toLocaleString()}</p>
+                          <p className="font-medium">{new Date(profile.lastRun || "").toLocaleString()}</p>
                         </div>
                         <div>
                           <p className="text-gray-600 dark:text-gray-400">Duration</p>
@@ -324,7 +324,7 @@ export default function VulnManagement() {
                         </div>
                         <div>
                           <p className="text-gray-600 dark:text-gray-400">Next Run</p>
-                          <p className="font-medium">{new Date(profile.nextRun).toLocaleString()}</p>
+                          <p className="font-medium">{new Date(profile.nextRun || "").toLocaleString()}</p>
                         </div>
                       </div>
                       <div className="flex gap-2 mt-4">

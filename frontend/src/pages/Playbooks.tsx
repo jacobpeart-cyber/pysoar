@@ -593,7 +593,7 @@ function PlaybookDetailsModal({ playbook, onClose }: { playbook: Playbook; onClo
                       </span>
                     </div>
                     <div className="text-xs text-gray-500">
-                      {new Date(exec.created_at).toLocaleString()}
+                      {new Date(exec.created_at || "").toLocaleString()}
                     </div>
                   </div>
                 ))}
@@ -605,11 +605,11 @@ function PlaybookDetailsModal({ playbook, onClose }: { playbook: Playbook; onClo
           <div className="grid grid-cols-2 gap-4 text-sm">
             <div>
               <p className="text-gray-500">Created</p>
-              <p className="text-gray-900">{new Date(playbook.created_at).toLocaleString()}</p>
+              <p className="text-gray-900">{new Date(playbook.created_at || "").toLocaleString()}</p>
             </div>
             <div>
               <p className="text-gray-500">Updated</p>
-              <p className="text-gray-900">{new Date(playbook.updated_at).toLocaleString()}</p>
+              <p className="text-gray-900">{new Date(playbook.updated_at || "").toLocaleString()}</p>
             </div>
           </div>
         </div>

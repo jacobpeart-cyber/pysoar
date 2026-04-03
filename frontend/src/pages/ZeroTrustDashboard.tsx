@@ -383,7 +383,7 @@ function OverviewTab({
                   getStatusColor(pillar.status)
                 )}
               >
-                {pillar.status.replace('-', ' ')}
+                {(pillar.status || '').replace('-', ' ')}
               </span>
             </div>
           </div>
@@ -433,7 +433,7 @@ function OverviewTab({
                   {(decision as any).subject_id || "user"} → {(decision as any).resource_id || "resource"}
                 </div>
                 <div className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
-                  {new Date(decision.created_at).toLocaleTimeString()} • Risk: {decision.risk_score}%
+                  {new Date(decision.created_at || "").toLocaleTimeString()} • Risk: {decision.risk_score}%
                 </div>
               </div>
               <span
@@ -621,7 +621,7 @@ function AccessControlTab({
             {recentDecisions.map((decision) => (
               <tr key={decision.id} className="hover:bg-gray-50 dark:hover:bg-gray-700/50">
                 <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                  {new Date(decision.created_at).toLocaleTimeString()}
+                  {new Date(decision.created_at || "").toLocaleTimeString()}
                 </td>
                 <td className="px-6 py-4 text-sm text-gray-900 dark:text-white font-mono">
                   {(decision as any).subject_id || "user"}
@@ -785,7 +785,7 @@ function DeviceTrustTab({
 
             {/* Last Seen */}
             <div className="text-xs text-gray-500 dark:text-gray-400 mt-3 pt-3 border-t border-gray-200 dark:border-gray-700">
-              Last seen: {new Date(device.last_seen).toLocaleTimeString()}
+              Last seen: {new Date(device.last_seen || "").toLocaleTimeString()}
             </div>
 
             {/* Expanded Details */}

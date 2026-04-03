@@ -424,7 +424,7 @@ export default function ContainerSecurity() {
                             )}
                           </td>
                           <td className="px-4 py-3 text-xs text-gray-500">
-                            {img.scanned_at ? new Date(img.scanned_at).toLocaleDateString() : 'Never'}
+                            {img.scanned_at ? new Date(img.scanned_at || "").toLocaleDateString() : 'Never'}
                           </td>
                           <td className="px-4 py-3">
                             <div className="flex gap-1.5">
@@ -513,7 +513,7 @@ export default function ContainerSecurity() {
                           </span>
                         </td>
                         <td className="px-4 py-3 text-xs text-gray-500">
-                          {c.last_audit ? new Date(c.last_audit).toLocaleDateString() : 'Never'}
+                          {c.last_audit ? new Date(c.last_audit || "").toLocaleDateString() : 'Never'}
                         </td>
                         <td className="px-4 py-3">
                           <div className="flex gap-1.5">
@@ -576,7 +576,7 @@ export default function ContainerSecurity() {
                         </td>
                         <td className="px-4 py-3 font-mono text-xs text-gray-500">{f.cis_benchmark_id || '-'}</td>
                         <td className="px-4 py-3"><span className={clsx('px-2 py-0.5 rounded text-xs font-medium', findingStatusColor(f.status))}>{(f.status || '').replace(/_/g, ' ')}</span></td>
-                        <td className="px-4 py-3 text-xs text-gray-500">{f.detected_at ? new Date(f.detected_at).toLocaleDateString() : f.created_at ? new Date(f.created_at).toLocaleDateString() : '-'}</td>
+                        <td className="px-4 py-3 text-xs text-gray-500">{f.detected_at ? new Date(f.detected_at || "").toLocaleDateString() : f.created_at ? new Date(f.created_at || "").toLocaleDateString() : '-'}</td>
                         <td className="px-4 py-3">
                           {f.status === 'open' && (
                             <button
@@ -632,7 +632,7 @@ export default function ContainerSecurity() {
                         <td className="px-4 py-3 text-xs font-mono text-gray-500">{a.process_name || '-'}</td>
                         <td className="px-4 py-3 text-xs text-gray-500">{a.mitre_technique || '-'}</td>
                         <td className="px-4 py-3"><span className={clsx('px-2 py-0.5 rounded text-xs font-medium', alertStatusColor(a.status))}>{(a.status || '').replace(/_/g, ' ')}</span></td>
-                        <td className="px-4 py-3 text-xs text-gray-500">{a.created_at ? new Date(a.created_at).toLocaleString() : '-'}</td>
+                        <td className="px-4 py-3 text-xs text-gray-500">{a.created_at ? new Date(a.created_at || "").toLocaleString() : '-'}</td>
                       </tr>
                     ))}
                   </tbody>
@@ -674,7 +674,7 @@ export default function ContainerSecurity() {
               {selectedImage.digest_sha256 && (
                 <div><span className="text-gray-500">Digest:</span><p className="font-mono text-xs break-all">{selectedImage.digest_sha256}</p></div>
               )}
-              <div><span className="text-gray-500">Last Scanned:</span><p>{selectedImage.scanned_at ? new Date(selectedImage.scanned_at).toLocaleString() : 'Never'}</p></div>
+              <div><span className="text-gray-500">Last Scanned:</span><p>{selectedImage.scanned_at ? new Date(selectedImage.scanned_at || "").toLocaleString() : 'Never'}</p></div>
             </div>
           </div>
         </div>
@@ -716,7 +716,7 @@ export default function ContainerSecurity() {
                   ))}
                 </div>
               </div>
-              <div><span className="text-gray-500">Last Audit:</span><p>{selectedCluster.last_audit ? new Date(selectedCluster.last_audit).toLocaleString() : 'Never'}</p></div>
+              <div><span className="text-gray-500">Last Audit:</span><p>{selectedCluster.last_audit ? new Date(selectedCluster.last_audit || "").toLocaleString() : 'Never'}</p></div>
             </div>
           </div>
         </div>

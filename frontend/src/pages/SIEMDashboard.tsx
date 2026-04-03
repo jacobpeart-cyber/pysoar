@@ -464,7 +464,7 @@ export default function SIEMDashboard() {
                     <div key={idx} className="flex items-start justify-between pb-3 border-b border-gray-100 last:border-0">
                       <div className="flex-1">
                         <p className="text-sm font-medium text-gray-900">{detection.rule_name}</p>
-                        <p className="text-xs text-gray-500 mt-1">{new Date(detection.timestamp).toLocaleTimeString()}</p>
+                        <p className="text-xs text-gray-500 mt-1">{new Date(detection.timestamp || "").toLocaleTimeString()}</p>
                       </div>
                       <span
                         className={clsx(
@@ -721,7 +721,7 @@ export default function SIEMDashboard() {
                     {logs.map((log: any) => (
                       <tr key={log.id} className="hover:bg-gray-50">
                         <td className="px-6 py-4 text-sm text-gray-500">
-                          {new Date(log.timestamp).toLocaleString()}
+                          {new Date(log.timestamp || "").toLocaleString()}
                         </td>
                         <td className="px-6 py-4 text-sm font-medium text-gray-900">{log.source_name}</td>
                         <td className="px-6 py-4">
@@ -798,7 +798,7 @@ export default function SIEMDashboard() {
                   <div className="grid grid-cols-2 gap-4">
                     <div>
                       <label className="block text-sm font-medium text-gray-500 mb-1">Timestamp</label>
-                      <p className="text-gray-900">{new Date(selectedLogDetail.timestamp).toLocaleString()}</p>
+                      <p className="text-gray-900">{new Date(selectedLogDetail.timestamp || "").toLocaleString()}</p>
                     </div>
                     <div>
                       <label className="block text-sm font-medium text-gray-500 mb-1">Source</label>
@@ -1025,7 +1025,7 @@ export default function SIEMDashboard() {
                           </button>
                         </td>
                         <td className="px-6 py-4 text-sm text-gray-600">
-                          {rule.last_matched_at ? new Date(rule.last_matched_at).toLocaleDateString() : '-'}
+                          {rule.last_matched_at ? new Date(rule.last_matched_at || "").toLocaleDateString() : '-'}
                         </td>
                         <td className="px-6 py-4 text-sm font-medium text-gray-900">{rule.match_count || 0}</td>
                         <td className="px-6 py-4 text-right">
@@ -1402,7 +1402,7 @@ export default function SIEMDashboard() {
                     <div className="flex items-center justify-between">
                       <span className="text-sm text-gray-600">Last Event</span>
                       <span className="text-sm text-gray-600">
-                        {source.last_event_at ? new Date(source.last_event_at).toLocaleTimeString() : '-'}
+                        {source.last_event_at ? new Date(source.last_event_at || "").toLocaleTimeString() : '-'}
                       </span>
                     </div>
 
@@ -1562,7 +1562,7 @@ export default function SIEMDashboard() {
                         <div className="grid grid-cols-2 gap-4">
                           <div>
                             <label className="block text-sm font-medium text-gray-500 mb-1">Created</label>
-                            <p className="text-gray-900 text-sm">{selectedSource.created_at ? new Date(selectedSource.created_at).toLocaleString() : '-'}</p>
+                            <p className="text-gray-900 text-sm">{selectedSource.created_at ? new Date(selectedSource.created_at || "").toLocaleString() : '-'}</p>
                           </div>
                           <div>
                             <label className="block text-sm font-medium text-gray-500 mb-1">Error Count</label>
@@ -1645,7 +1645,7 @@ export default function SIEMDashboard() {
                   {correlations.map((correlation: any) => (
                     <tr key={correlation.id} className="hover:bg-gray-50">
                       <td className="px-6 py-4 text-sm text-gray-500">
-                        {new Date(correlation.created_at).toLocaleString()}
+                        {new Date(correlation.created_at || "").toLocaleString()}
                       </td>
                       <td className="px-6 py-4 text-sm font-medium text-gray-900">{correlation.name}</td>
                       <td className="px-6 py-4">
@@ -1738,11 +1738,11 @@ export default function SIEMDashboard() {
                   <div className="grid grid-cols-2 gap-4">
                     <div>
                       <label className="block text-sm font-medium text-gray-500 mb-1">Timespan Start</label>
-                      <p className="text-gray-900 text-sm">{selectedCorrelation.timespan_start ? new Date(selectedCorrelation.timespan_start).toLocaleString() : '-'}</p>
+                      <p className="text-gray-900 text-sm">{selectedCorrelation.timespan_start ? new Date(selectedCorrelation.timespan_start || "").toLocaleString() : '-'}</p>
                     </div>
                     <div>
                       <label className="block text-sm font-medium text-gray-500 mb-1">Timespan End</label>
-                      <p className="text-gray-900 text-sm">{selectedCorrelation.timespan_end ? new Date(selectedCorrelation.timespan_end).toLocaleString() : '-'}</p>
+                      <p className="text-gray-900 text-sm">{selectedCorrelation.timespan_end ? new Date(selectedCorrelation.timespan_end || "").toLocaleString() : '-'}</p>
                     </div>
                   </div>
                   {selectedCorrelation.source_addresses && selectedCorrelation.source_addresses.length > 0 && (
@@ -1759,7 +1759,7 @@ export default function SIEMDashboard() {
                   )}
                   <div className="border-t pt-4">
                     <label className="block text-sm font-medium text-gray-500 mb-1">Created At</label>
-                    <p className="text-gray-600 text-sm">{selectedCorrelation.created_at ? new Date(selectedCorrelation.created_at).toLocaleString() : '-'}</p>
+                    <p className="text-gray-600 text-sm">{selectedCorrelation.created_at ? new Date(selectedCorrelation.created_at || "").toLocaleString() : '-'}</p>
                   </div>
                   <div className="flex justify-end pt-2">
                     <button onClick={() => setSelectedCorrelation(null)} className="px-4 py-2 bg-gray-100 text-gray-700 rounded-lg text-sm font-medium hover:bg-gray-200">
@@ -1886,7 +1886,7 @@ export default function SIEMDashboard() {
                         )}
                       >
                         <td className="px-4 py-2 text-gray-500 whitespace-nowrap">
-                          {new Date(log.timestamp).toLocaleTimeString()}
+                          {new Date(log.timestamp || "").toLocaleTimeString()}
                         </td>
                         <td className="px-4 py-2">
                           <span

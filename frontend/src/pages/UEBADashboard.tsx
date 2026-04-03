@@ -279,7 +279,7 @@ export default function UEBADashboard() {
                     </td>
                     <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">{entity.anomaly_count_30d ?? 0}</td>
                     <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                      {entity.last_activity_at ? new Date(entity.last_activity_at).toLocaleString() : '—'}
+                      {entity.last_activity_at ? new Date(entity.last_activity_at || "").toLocaleString() : '—'}
                     </td>
                   </tr>
                 )) : (
@@ -380,7 +380,7 @@ export default function UEBADashboard() {
                       )}
                     </td>
                     <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                      {entity.last_activity_at ? new Date(entity.last_activity_at).toLocaleDateString() : '—'}
+                      {entity.last_activity_at ? new Date(entity.last_activity_at || "").toLocaleDateString() : '—'}
                     </td>
                   </tr>
                 )) : (
@@ -415,7 +415,7 @@ export default function UEBADashboard() {
               {alerts && alerts.length > 0 ? alerts.slice(0, 20).map((alert) => (
                 <tr key={alert.id} className="hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors">
                   <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                    {alert.created_at ? new Date(alert.created_at).toLocaleString() : '—'}
+                    {alert.created_at ? new Date(alert.created_at || "").toLocaleString() : '—'}
                   </td>
                   <td className="px-6 py-4 font-medium text-gray-900 dark:text-white">{alert.entity_profile_id ?? '—'}</td>
                   <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">{alert.alert_type ?? '—'}</td>
@@ -430,7 +430,7 @@ export default function UEBADashboard() {
                   <td className="px-6 py-4">
                     {alert.status ? (
                       <span className={clsx('px-3 py-1 rounded-full text-xs font-medium', statusBadgeColors[alert.status])}>
-                        {alert.status.charAt(0).toUpperCase() + alert.status.slice(1)}
+                        {(alert.status || '').charAt(0).toUpperCase() + alert.status.slice(1)}
                       </span>
                     ) : '—'}
                   </td>
@@ -560,7 +560,7 @@ export default function UEBADashboard() {
                         <div className="flex items-start justify-between">
                           <div>
                             <p className="font-medium text-gray-900 dark:text-white">{event.description ?? '—'}</p>
-                            <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">{event.timestamp ? new Date(event.timestamp).toLocaleString() : '—'}</p>
+                            <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">{event.timestamp ? new Date(event.timestamp || "").toLocaleString() : '—'}</p>
                           </div>
                           {event.is_anomaly && (
                             <span className="px-2 py-1 rounded-full text-xs font-medium bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400">

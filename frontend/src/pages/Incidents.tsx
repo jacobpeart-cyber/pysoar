@@ -233,7 +233,7 @@ export default function Incidents() {
                     </div>
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                    {format(new Date(incident.created_at), 'MMM d, yyyy HH:mm')}
+                    {format(new Date(incident.created_at || ""), 'MMM d, yyyy HH:mm')}
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
                     <button
@@ -537,13 +537,13 @@ function IncidentDetailsModal({
             <div>
               <label className="block text-sm font-medium text-gray-500">Created</label>
               <p className="text-sm text-gray-900">
-                {format(new Date(incident.created_at), 'MMMM d, yyyy HH:mm')}
+                {format(new Date(incident.created_at || ""), 'MMMM d, yyyy HH:mm')}
               </p>
             </div>
             <div>
               <label className="block text-sm font-medium text-gray-500">Updated</label>
               <p className="text-sm text-gray-900">
-                {format(new Date(incident.updated_at), 'MMMM d, yyyy HH:mm')}
+                {format(new Date(incident.updated_at || ""), 'MMMM d, yyyy HH:mm')}
               </p>
             </div>
           </div>

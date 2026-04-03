@@ -30,6 +30,15 @@ const severityColors: Record<string, string> = {
   info: 'bg-gray-100 text-gray-700 border-gray-200',
 };
 
+// Safely parse a field that might be a JSON string or already an array
+const safeArray = (val: any): any[] => {
+  if (Array.isArray(val)) return val;
+  if (typeof val === 'string') {
+    try { const p = JSON.parse(val); return Array.isArray(p) ? p : []; } catch { return []; }
+  }
+  return [];
+};
+
 const statusColors: Record<string, string> = {
   active: 'text-green-600 bg-green-50 border border-green-200',
   paused: 'text-yellow-600 bg-yellow-50 border border-yellow-200',
@@ -489,7 +498,7 @@ export default function ThreatHunting() {
                       </td>
                       <td className="px-6 py-4 text-sm font-medium text-gray-900">{hunt.findings_count || 0}</td>
                       <td className="px-6 py-4 text-sm text-gray-600">
-                        {hunt.started_at ? new Date(hunt.started_at).toLocaleDateString() : '-'}
+                        {hunt.started_at ? new Date(hunt.started_at || "").toLocaleDateString() : '-'}
                       </td>
                       <td className="px-6 py-4 text-sm text-gray-600">{formatDuration(hunt.duration_seconds)}</td>
                       <td className="px-6 py-4 text-right">
@@ -606,13 +615,13 @@ export default function ThreatHunting() {
                     <div>
                       <label className="block text-sm font-medium text-gray-500 mb-1">Started At</label>
                       <p className="text-gray-900 text-sm">
-                        {selectedHunt.started_at ? new Date(selectedHunt.started_at).toLocaleString() : '-'}
+                        {selectedHunt.started_at ? new Date(selectedHunt.started_at || "").toLocaleString() : '-'}
                       </p>
                     </div>
                     <div>
                       <label className="block text-sm font-medium text-gray-500 mb-1">Completed At</label>
                       <p className="text-gray-900 text-sm">
-                        {selectedHunt.completed_at ? new Date(selectedHunt.completed_at).toLocaleString() : '-'}
+                        {selectedHunt.completed_at ? new Date(selectedHunt.completed_at || "").toLocaleString() : '-'}
                       </p>
                     </div>
                   </div>
@@ -787,26 +796,26 @@ export default function ThreatHunting() {
 
                   <p className="text-sm text-gray-600 mb-4 line-clamp-2">{hypothesis.description}</p>
 
-                  {hypothesis.mitre_techniques && hypothesis.mitre_techniques.length > 0 && (
+                  {(() => { const mt = safeArray(hypothesis.mitre_techniques); return mt.length > 0 ? (
                     <div className="mb-3">
                       <p className="text-xs text-gray-500 font-medium mb-2">MITRE Techniques:</p>
                       <div className="flex flex-wrap gap-1">
-                        {hypothesis.mitre_techniques.slice(0, 3).map((tech: string) => (
-                          <span key={tech} className="px-2 py-1 text-xs bg-gray-100 text-gray-700 rounded">
-                            {tech}
+                        {mt.slice(0, 3).map((tech: string, i: number) => (
+                          <span key={i} className="px-2 py-1 text-xs bg-gray-100 text-gray-700 rounded">
+                            {String(tech)}
                           </span>
                         ))}
-                        {hypothesis.mitre_techniques.length > 3 && (
+                        {mt.length > 3 && (
                           <span className="px-2 py-1 text-xs text-gray-600">
-                            +{hypothesis.mitre_techniques.length - 3}
+                            +{mt.length - 3}
                           </span>
                         )}
                       </div>
                     </div>
-                  )}
+                  ) : null; })()}
 
                   <div className="flex items-center justify-between mb-4 text-xs text-gray-500">
-                    <span>{hypothesis.data_sources?.join(', ') || 'No sources'}</span>
+                    <span>{safeArray(hypothesis.data_sources).join(', ') || 'No sources'}</span>
                     <span
                       className={clsx(
                         'px-2 py-1 rounded-full',
@@ -1129,7 +1138,7 @@ export default function ThreatHunting() {
                   {findings.map((finding: any) => (
                     <tr key={finding.id} className="hover:bg-gray-50">
                       <td className="px-6 py-4 text-sm text-gray-500">
-                        {finding.created_at ? new Date(finding.created_at).toLocaleString() : '-'}
+                        {finding.created_at ? new Date(finding.created_at || "").toLocaleString() : '-'}
                       </td>
                       <td className="px-6 py-4 text-sm font-medium text-gray-900">{finding.title}</td>
                       <td className="px-6 py-4 text-sm text-gray-600 font-mono">
@@ -1361,7 +1370,7 @@ export default function ThreatHunting() {
                       <span>{notebook.is_published ? 'Published' : 'Draft'}</span>
                     </div>
                     <div className="flex items-center justify-between">
-                      <span>Updated: {new Date(notebook.updated_at).toLocaleDateString()}</span>
+                      <span>Updated: {new Date(notebook.updated_at || "").toLocaleDateString()}</span>
                       <span>{notebook.content?.length || 0} cells</span>
                     </div>
                   </div>
@@ -1557,18 +1566,18 @@ export default function ThreatHunting() {
                   </div>
                   <p className="text-sm text-gray-600 mb-4 line-clamp-2">{template.description}</p>
 
-                  {template.mitre_techniques && template.mitre_techniques.length > 0 && (
+                  {(() => { const mt = safeArray(template.mitre_techniques); return mt.length > 0 ? (
                     <div className="mb-3">
                       <p className="text-xs text-gray-500 font-medium mb-2">MITRE Techniques:</p>
                       <div className="flex flex-wrap gap-1">
-                        {template.mitre_techniques.slice(0, 3).map((tech: string) => (
-                          <span key={tech} className="px-2 py-1 text-xs bg-gray-100 text-gray-700 rounded">
-                            {tech}
+                        {mt.slice(0, 3).map((tech: string, i: number) => (
+                          <span key={i} className="px-2 py-1 text-xs bg-gray-100 text-gray-700 rounded">
+                            {String(tech)}
                           </span>
                         ))}
                       </div>
                     </div>
-                  )}
+                  ) : null; })()}
 
                   <div className="space-y-2 text-xs text-gray-500 mb-4">
                     <div>Category: {template.category}</div>

@@ -139,17 +139,17 @@ function IndicatorDetailContent({ indicatorId }: { indicatorId: string }) {
       </div>
       <div>
         <span className="text-gray-500 dark:text-gray-400">First Seen:</span>
-        <span className="ml-2 text-gray-900 dark:text-white">{data.first_seen ? new Date(data.first_seen).toLocaleString() : 'N/A'}</span>
+        <span className="ml-2 text-gray-900 dark:text-white">{data.first_seen ? new Date(data.first_seen || "").toLocaleString() : 'N/A'}</span>
       </div>
       <div>
         <span className="text-gray-500 dark:text-gray-400">Last Seen:</span>
-        <span className="ml-2 text-gray-900 dark:text-white">{data.last_seen ? new Date(data.last_seen).toLocaleString() : 'N/A'}</span>
+        <span className="ml-2 text-gray-900 dark:text-white">{data.last_seen ? new Date(data.last_seen || "").toLocaleString() : 'N/A'}</span>
       </div>
-      {data.tags.length > 0 && (
+      {data?.tags?.length > 0 && (
         <div>
           <span className="text-gray-500 dark:text-gray-400">Tags:</span>
           <div className="flex flex-wrap gap-1 mt-1">
-            {data.tags.map((tag, idx) => (
+            {data?.tags?.map((tag, idx) => (
               <span key={idx} className="px-2 py-0.5 text-xs bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300 rounded">{tag}</span>
             ))}
           </div>
@@ -504,9 +504,9 @@ export default function ThreatIntel() {
                   </div>
                 </div>
 
-                {lookupMutation.data.tags.length > 0 && (
+                {lookupMutation.data?.tags?.length > 0 && (
                   <div className="flex flex-wrap gap-2 mt-3">
-                    {lookupMutation.data.tags.map((tag, idx) => (
+                    {lookupMutation.data?.tags?.map((tag, idx) => (
                       <span
                         key={idx}
                         className="px-2 py-0.5 text-xs bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-300 rounded"
@@ -521,10 +521,10 @@ export default function ThreatIntel() {
               {/* Sources */}
               <div className="p-6">
                 <h4 className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-4">
-                  Intelligence Sources ({lookupMutation.data.sources.length})
+                  Intelligence Sources ({lookupMutation.data?.sources?.length})
                 </h4>
                 <div className="space-y-3">
-                  {lookupMutation.data.sources.map((source, idx) => (
+                  {lookupMutation.data?.sources?.map((source, idx) => (
                     <div
                       key={idx}
                       className="flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-700/50 rounded-lg"
@@ -536,7 +536,7 @@ export default function ThreatIntel() {
                             {source.name}
                           </p>
                           <p className="text-xs text-gray-500 dark:text-gray-400">
-                            Last seen: {new Date(source.last_seen).toLocaleDateString()}
+                            Last seen: {new Date(source.last_seen || "").toLocaleDateString()}
                           </p>
                         </div>
                       </div>
@@ -619,7 +619,7 @@ export default function ThreatIntel() {
                     <p className="text-xs text-gray-500 dark:text-gray-400">Last Updated</p>
                     <p className="text-sm text-gray-900 dark:text-white">
                       {feed.last_poll_at
-                        ? new Date(feed.last_poll_at).toLocaleString()
+                        ? new Date(feed.last_poll_at || "").toLocaleString()
                         : 'Never'}
                     </p>
                   </div>
@@ -769,7 +769,7 @@ export default function ThreatIntel() {
                           {ioc.source || '-'}
                         </td>
                         <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">
-                          {ioc.last_seen ? new Date(ioc.last_seen).toLocaleDateString() : '-'}
+                          {ioc.last_seen ? new Date(ioc.last_seen || "").toLocaleDateString() : '-'}
                         </td>
                         <td className="px-4 py-3">
                           <button

@@ -157,7 +157,7 @@ function formatDuration(startedAt: string | null, completedAt: string | null, du
     return `${m}m`;
   }
   if (startedAt && completedAt) {
-    const diff = Math.floor((new Date(completedAt).getTime() - new Date(startedAt).getTime()) / 1000);
+    const diff = Math.floor((new Date(completedAt || "").getTime() - new Date(startedAt || "").getTime()) / 1000);
     const h = Math.floor(diff / 3600);
     const m = Math.floor((diff % 3600) / 60);
     if (h > 0) return `${h}h ${m}m`;
@@ -398,7 +398,7 @@ export default function AttackSimulation() {
                       <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400 capitalize">{sim.simulation_type}</td>
                       <td className="px-6 py-4">
                         <span className={clsx('px-3 py-1 rounded-full text-xs font-medium', statusColors[sim.status] ?? '')}>
-                          {sim.status ? sim.status.charAt(0).toUpperCase() + sim.status.slice(1) : '--'}
+                          {sim.status ? (sim.status || "").charAt(0).toUpperCase() + sim.status.slice(1) : '--'}
                         </span>
                       </td>
                       <td className="px-6 py-4">
@@ -413,7 +413,7 @@ export default function AttackSimulation() {
                         </div>
                       </td>
                       <td className="px-6 py-4 font-medium text-gray-900 dark:text-white">{sim.score ?? '--'}</td>
-                      <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">{sim.completed_at ? new Date(sim.completed_at).toLocaleDateString() : '--'}</td>
+                      <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">{sim.completed_at ? new Date(sim.completed_at || "").toLocaleDateString() : '--'}</td>
                     </tr>
                   ))
                 ) : (
@@ -467,7 +467,7 @@ export default function AttackSimulation() {
                     <td className="px-6 py-4">
                       <div className="flex items-center gap-2">
                         <span className={clsx('px-3 py-1 rounded-full text-xs font-medium', statusColors[sim.status] ?? '')}>
-                          {sim.status ? sim.status.charAt(0).toUpperCase() + sim.status.slice(1) : '--'}
+                          {sim.status ? (sim.status || "").charAt(0).toUpperCase() + sim.status.slice(1) : '--'}
                         </span>
                         {sim.status === 'running' && sim.progress != null && (
                           <div className="w-24 bg-gray-200 dark:bg-gray-700 rounded-full h-2">
@@ -593,7 +593,7 @@ export default function AttackSimulation() {
 
                 <div>
                   <span className={clsx('px-3 py-1 rounded-full text-xs font-medium', riskLevelColors[technique.risk_level] ?? '')}>
-                    {technique.risk_level ? technique.risk_level.charAt(0).toUpperCase() + technique.risk_level.slice(1) : '--'}
+                    {technique.risk_level ? (technique.risk_level || "").charAt(0).toUpperCase() + technique.risk_level.slice(1) : '--'}
                   </span>
                 </div>
 
@@ -665,14 +665,14 @@ export default function AttackSimulation() {
                   )}
                 </div>
                 <span className={clsx('px-3 py-1 rounded-full text-xs font-medium', sophisticationColors[adversary.sophistication])}>
-                  {adversary.sophistication.charAt(0).toUpperCase() + adversary.sophistication.slice(1)}
+                  {(adversary.sophistication || "").charAt(0).toUpperCase() + adversary.sophistication.slice(1)}
                 </span>
               </div>
 
               <div>
                 <p className="text-xs font-semibold text-gray-900 dark:text-white mb-2">Target Sectors</p>
                 <div className="flex flex-wrap gap-1">
-                  {adversary.target_sectors.map((sector) => (
+                  {(adversary.target_sectors ?? []).map((sector) => (
                     <span key={sector} className="px-2 py-1 rounded text-xs bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300">
                       {sector}
                     </span>
@@ -814,7 +814,7 @@ export default function AttackSimulation() {
                               : 'bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400'
                           )}
                         >
-                          {gap.detection_status.charAt(0).toUpperCase() + gap.detection_status.slice(1)}
+                          {(gap.detection_status || "").charAt(0).toUpperCase() + gap.detection_status.slice(1)}
                         </span>
                       </td>
                       <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">{gap.recommendation}</td>

@@ -268,8 +268,8 @@ class ExposureVulnerability(BaseModel):
     )
 
     __table_args__ = (
-        Index("ix_vulnerabilities_cve_id", "cve_id"),
-        Index("ix_vulnerabilities_organization_id", "organization_id"),
+        Index("ix_exposure_vulns_cve_id", "cve_id"),
+        Index("ix_exposure_vulns_organization_id", "organization_id"),
     )
 
 

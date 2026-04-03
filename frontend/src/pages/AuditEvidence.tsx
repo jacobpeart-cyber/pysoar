@@ -580,7 +580,7 @@ function AuditTrailTab({
                 }
               >
                 <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                  {new Date(event.time).toLocaleTimeString()}
+                  {new Date(event.time || event.timestamp || "").toLocaleTimeString()}
                 </td>
                 <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
                   {event.type}
@@ -764,7 +764,7 @@ function EvidenceTab({
                     {item.source}
                   </td>
                   <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                    {new Date(item.collected).toLocaleDateString()}
+                    {new Date(item.collected || item.created_at || "").toLocaleDateString()}
                   </td>
                   <td className="px-6 py-4 text-sm">
                     <span
@@ -875,7 +875,7 @@ function PackagesTab({
                     : 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400'
                 )}
               >
-                {pkg.status.replace('-', ' ')}
+                {(pkg.status || '').replace('-', ' ')}
               </span>
             </div>
 
@@ -889,7 +889,7 @@ function PackagesTab({
               <div className="flex items-center justify-between text-sm text-gray-600 dark:text-gray-400">
                 <span>Due Date</span>
                 <span className="font-medium text-gray-900 dark:text-white">
-                  {new Date(pkg.dueDate).toLocaleDateString()}
+                  {new Date(pkg.dueDate || pkg.due_date || "").toLocaleDateString()}
                 </span>
               </div>
               <div className="flex items-center justify-between text-sm text-gray-600 dark:text-gray-400">
@@ -962,7 +962,7 @@ function ConMonTab({
               </div>
               <div>
                 Last Run: <span className="font-medium text-gray-900 dark:text-white">
-                  {new Date(status.lastRun).toLocaleString()}
+                  {new Date(status.lastRun || status.last_run || "").toLocaleString()}
                 </span>
               </div>
             </div>

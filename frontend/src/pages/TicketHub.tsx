@@ -184,7 +184,7 @@ function sourceIcon(type: string, className = 'w-4 h-4') {
 function formatDate(dateStr: string | null | undefined): string {
   if (!dateStr) return '--';
   try {
-    return new Date(dateStr).toLocaleDateString('en-US', {
+    return new Date(dateStr || "").toLocaleDateString('en-US', {
       month: 'short',
       day: 'numeric',
       year: 'numeric',
@@ -197,7 +197,7 @@ function formatDate(dateStr: string | null | undefined): string {
 function formatDateTime(dateStr: string | null | undefined): string {
   if (!dateStr) return '--';
   try {
-    return new Date(dateStr).toLocaleString('en-US', {
+    return new Date(dateStr || "").toLocaleString('en-US', {
       month: 'short',
       day: 'numeric',
       hour: '2-digit',
