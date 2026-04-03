@@ -63,29 +63,29 @@ export default function Analytics() {
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
         <KPICard
           title="Total Alerts"
-          value={metrics?.overview.total_alerts || 0}
-          change={metrics?.overview.alerts_change || 0}
+          value={metrics?.overview?.total_alerts || 0}
+          change={metrics?.overview?.alerts_change || 0}
           icon={AlertTriangle}
           color="orange"
         />
         <KPICard
           title="Active Incidents"
-          value={metrics?.overview.total_incidents || 0}
-          change={metrics?.overview.incidents_change || 0}
+          value={metrics?.overview?.total_incidents || 0}
+          change={metrics?.overview?.incidents_change || 0}
           icon={Shield}
           color="red"
         />
         <KPICard
           title="Avg. MTTR"
-          value={`${(metrics?.overview.avg_mttr_hours || 0).toFixed(1)}h`}
-          change={metrics?.overview.mttr_change || 0}
+          value={`${(metrics?.overview?.avg_mttr_hours || 0).toFixed(1)}h`}
+          change={metrics?.overview?.mttr_change || 0}
           icon={Clock}
           color="blue"
           invertChange
         />
         <KPICard
           title="Active IOCs"
-          value={metrics?.overview.active_iocs || 0}
+          value={metrics?.overview?.active_iocs || 0}
           icon={Target}
           color="purple"
         />
@@ -109,7 +109,7 @@ export default function Analytics() {
           </h2>
           <div className="space-y-4">
             {Object.entries(metrics?.severity_distribution || {}).map(([severity, count]) => (
-              <SeverityBar key={severity} severity={severity} count={count as number} total={metrics?.overview.total_alerts || 1} />
+              <SeverityBar key={severity} severity={severity} count={count as number} total={metrics?.overview?.total_alerts || 1} />
             ))}
           </div>
         </div>
