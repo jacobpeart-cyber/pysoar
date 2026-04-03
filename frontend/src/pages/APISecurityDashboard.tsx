@@ -489,7 +489,7 @@ export default function APISecurityDashboard() {
                 <div>
                   <p className="text-gray-400 text-sm mb-1">Pass Rate</p>
                   <p className="text-3xl font-bold text-green-400">
-                    {((owaspCompliance.reduce((sum, c) => sum + c.pass, 0) / (owaspCompliance.reduce((sum, c) => sum + c.pass + c.fail, 0))) * 100).toFixed(1)}%
+                    {((owaspCompliance.reduce((sum, c) => sum + c.pass, 0) / (owaspCompliance.reduce((sum, c) => sum + c.pass + c.fail, 0) || 1)) * 100).toFixed(1)}%
                   </p>
                 </div>
                 <div>

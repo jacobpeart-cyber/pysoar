@@ -734,7 +734,7 @@ export default function ExposureManagement() {
               <p className="text-sm text-gray-500 dark:text-gray-400">Avg SLA Compliance</p>
               <p className="text-2xl font-semibold text-gray-900 dark:text-white mt-1">
                 {tickets && tickets.length > 0
-                  ? `${Math.round(tickets.filter(t => t.sla_status !== 'overdue').length / tickets.length * 100)}%`
+                  ? `${Math.round(tickets.filter(t => t.sla_status !== 'overdue').length / (tickets.length || 1) * 100)}%`
                   : '0%'}
               </p>
             </div>
@@ -953,7 +953,7 @@ export default function ExposureManagement() {
           <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
             <h4 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">Compliance Trend</h4>
             <ResponsiveContainer width="100%" height={300}>
-              <AreaChart data={trendData.map(d => ({ ...d, compliance: compliance && compliance.length > 0 ? Math.round(compliance.reduce((sum, f) => sum + f.pass_percentage, 0) / compliance.length) : 0 }))}>
+              <AreaChart data={trendData.map(d => ({ ...d, compliance: compliance && compliance.length > 0 ? Math.round(compliance.reduce((sum, f) => sum + f.pass_percentage, 0) / (compliance.length || 1)) : 0 }))}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
                 <XAxis dataKey="date" tick={{ fontSize: 12 }} />
                 <YAxis tick={{ fontSize: 12 }} domain={[0, 100]} />

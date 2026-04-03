@@ -1367,7 +1367,7 @@ export default function TicketHub() {
                           </div>
                         </td>
                         <td className="p-3">
-                          <Badge text={rule.trigger_type.replace(/_/g, ' ')} />
+                          <Badge text={(rule.trigger_type || '').replace(/_/g, ' ')} />
                         </td>
                         <td className="p-3">
                           <button

@@ -88,7 +88,7 @@ export default function RiskQuantification() {
 
   const totalScenarios = scenarios.length;
   const avgRiskScore = scenarios.length > 0
-    ? Math.round(scenarios.reduce((sum, s) => sum + (s.riskScore || s.risk_score || 0), 0) / scenarios.length)
+    ? Math.round(scenarios.reduce((sum, s) => sum + (s.riskScore || s.risk_score || 0), 0) / (scenarios.length || 1))
     : 0;
   const highRiskItems = scenarios.filter(s => (s.riskScore || s.risk_score || 0) >= 60).length;
   const totalControls = scenarios.reduce((sum, s) => sum + (s.controls?.length || s.controlCount || 0), 0);
@@ -386,7 +386,7 @@ export default function RiskQuantification() {
                         <span>Avg per Scenario</span>
                         <span className="font-semibold">
                           {scenarios.length > 0
-                            ? formatCurrency(scenarios.reduce((sum, s) => sum + (s.ale || s.annualized_loss || 0), 0) / scenarios.length)
+                            ? formatCurrency(scenarios.reduce((sum, s) => sum + (s.ale || s.annualized_loss || 0), 0) / (scenarios.length || 1))
                             : '—'}
                         </span>
                       </div>

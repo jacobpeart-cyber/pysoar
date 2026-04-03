@@ -59,7 +59,7 @@ export default function WarRoom() {
     const myActionItems = actionItems.length;
     const overdueActions = actionItems.filter((a: ActionItem) => a.status === 'Overdue').length;
     const avgMTTR = postMortems.length > 0
-      ? `${Math.round(postMortems.reduce((sum: number, pm: PostMortem) => sum + (parseInt(pm.mttr) || 0), 0) / postMortems.length)}m`
+      ? `${Math.round(postMortems.reduce((sum: number, pm: PostMortem) => sum + (parseInt(pm.mttr) || 0), 0) / (postMortems.length || 1))}m`
       : '0m';
     return { activeRooms, myActionItems, overdueActions, avgMTTR };
   }, [warRooms, actionItems, postMortems]);
@@ -72,8 +72,8 @@ export default function WarRoom() {
       mttr: parseInt(pm.mttr) || 0,
     }));
     if (entries.length > 1) {
-      const avgMttd = Math.round(entries.reduce((s: number, e: { mttd: number }) => s + e.mttd, 0) / entries.length);
-      const avgMttr = Math.round(entries.reduce((s: number, e: { mttr: number }) => s + e.mttr, 0) / entries.length);
+      const avgMttd = Math.round(entries.reduce((s: number, e: { mttd: number }) => s + e.mttd, 0) / (entries.length || 1));
+      const avgMttr = Math.round(entries.reduce((s: number, e: { mttr: number }) => s + e.mttr, 0) / (entries.length || 1));
       entries.push({ incident: 'Avg', mttd: avgMttd, mttr: avgMttr });
     }
     return entries;

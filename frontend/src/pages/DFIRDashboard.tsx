@@ -211,7 +211,7 @@ export default function DFIRDashboard() {
     const totalMs = closedCases.reduce((sum: number, c: any) => {
       return sum + (new Date(c.updated_at || "").getTime() - new Date(c.created_at || "").getTime());
     }, 0);
-    const avgDays = totalMs / closedCases.length / (1000 * 60 * 60 * 24);
+    const avgDays = totalMs / (closedCases.length || 1) / (1000 * 60 * 60 * 24);
     return `${avgDays.toFixed(1)} days`;
   };
   const avgResolutionTime = computeAvgResolution();
