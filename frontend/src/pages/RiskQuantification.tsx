@@ -657,7 +657,7 @@ export default function RiskQuantification() {
               e.preventDefault();
               const fd = new FormData(e.currentTarget);
               try {
-                await api.post('/riskquant/scenarios', {
+                await api.post('/risk-quantification/scenarios', {
                   name: fd.get('name'),
                   description: fd.get('description'),
                   category: fd.get('category'),
