@@ -983,7 +983,7 @@ export default function ExposureManagement() {
                 setShowCreateTicketModal(false);
                 queryClient.invalidateQueries({ queryKey: ['exposure'] });
               } catch (err) {
-                alert('Failed to create ticket');
+                console.error('Failed to create ticket');
               }
             }} className="p-6 space-y-4">
               <div>
@@ -1042,7 +1042,7 @@ export default function ExposureManagement() {
                 setShowImportModal(false);
                 queryClient.invalidateQueries({ queryKey: ['exposure'] });
               } catch (err) {
-                alert('Failed to import scan results');
+                console.error('Failed to import scan results');
               }
             }} className="p-6 space-y-4">
               <div>

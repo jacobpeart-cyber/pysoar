@@ -469,34 +469,32 @@ export default function SupplyChainDashboard() {
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
           <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-96 max-h-screen overflow-y-auto">
             <h2 className="text-xl font-bold mb-4">Add Component</h2>
-            <div className="space-y-4">
+            <form className="space-y-4" onSubmit={async (e) => {
+              e.preventDefault();
+              const fd = new FormData(e.currentTarget);
+              try {
+                await api.post('/supplychain/components', { name: fd.get('name'), version: fd.get('version'), license: fd.get('license') });
+                setShowNewComponentModal(false);
+                loadData();
+              } catch (err) { console.error('Failed to add component:', err); }
+            }}>
               <div>
                 <label className="block text-sm font-medium mb-1">Component Name</label>
-                <input type="text" placeholder="e.g., log4j-core" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+                <input name="name" required type="text" placeholder="e.g., log4j-core" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
               </div>
               <div>
                 <label className="block text-sm font-medium mb-1">Version</label>
-                <input type="text" placeholder="e.g., 2.18.0" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+                <input name="version" type="text" placeholder="e.g., 2.18.0" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
               </div>
               <div>
                 <label className="block text-sm font-medium mb-1">License</label>
-                <input type="text" placeholder="e.g., Apache-2.0" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+                <input name="license" type="text" placeholder="e.g., Apache-2.0" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
               </div>
               <div className="flex gap-2 mt-6">
-                <button
-                  onClick={() => setShowNewComponentModal(false)}
-                  className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
-                >
-                  Cancel
-                </button>
-                <button
-                  onClick={() => setShowNewComponentModal(false)}
-                  className="flex-1 px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg transition"
-                >
-                  Add
-                </button>
+                <button type="button" onClick={() => setShowNewComponentModal(false)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
+                <button type="submit" className="flex-1 px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg transition">Add</button>
               </div>
-            </div>
+            </form>
           </div>
         </div>
       )}

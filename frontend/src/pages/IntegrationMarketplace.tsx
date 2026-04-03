@@ -57,6 +57,7 @@ export default function IntegrationMarketplace() {
   const [searchQuery, setSearchQuery] = useState('');
   const [categoryFilter, setCategoryFilter] = useState('all');
   const [showNewWebhookModal, setShowNewWebhookModal] = useState(false);
+  const [selectedConnector, setSelectedConnector] = useState<any>(null);
 
   React.useEffect(() => {
     const loadData = async () => {
@@ -227,12 +228,12 @@ export default function IntegrationMarketplace() {
                             <div className={`w-2 h-2 rounded-full ${connector.health === 'healthy' ? 'bg-green-600' : 'bg-yellow-600'}`} />
                             <span className="capitalize">{connector.health}</span>
                           </div>
-                          <button className="w-full px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                          <button onClick={() => setSelectedConnector(connector)} className="w-full px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
                             Manage
                           </button>
                         </div>
                       ) : (
-                        <button className="w-full px-3 py-2 text-sm bg-cyan-600 hover:bg-cyan-700 text-white rounded transition flex items-center justify-center gap-2">
+                        <button onClick={async () => { try { await api.post(`/integrations/connectors/${connector.id}/install`, { config: {} }); loadData(); } catch(e) { console.error(e); } }} className="w-full px-3 py-2 text-sm bg-cyan-600 hover:bg-cyan-700 text-white rounded transition flex items-center justify-center gap-2">
                           <Download className="w-4 h-4" />
                           Install
                         </button>
@@ -277,13 +278,13 @@ export default function IntegrationMarketplace() {
                         </div>
                       </div>
                       <div className="flex gap-2">
-                        <button className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                        <button onClick={() => setSelectedConnector(integration)} className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
                           Configure
                         </button>
-                        <button className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                        <button onClick={async () => { try { await api.post(`/integrations/connectors/${integration.id}/test`); } catch(e) { console.error(e); } }} className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
                           Test
                         </button>
-                        <button className="px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                        <button onClick={() => setSelectedConnector(integration)} className="px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
                           <Settings className="w-4 h-4" />
                         </button>
                       </div>
@@ -391,18 +392,26 @@ export default function IntegrationMarketplace() {
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
           <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-96 max-h-screen overflow-y-auto">
             <h2 className="text-xl font-bold mb-4">Create Webhook</h2>
-            <div className="space-y-4">
+            <form className="space-y-4" onSubmit={async (e) => {
+              e.preventDefault();
+              const fd = new FormData(e.currentTarget);
+              try {
+                await api.post('/integrations/webhooks', { name: fd.get('name'), url: fd.get('url'), event_type: fd.get('event') });
+                setShowNewWebhookModal(false);
+                loadData();
+              } catch (err) { console.error('Failed to create webhook:', err); }
+            }}>
               <div>
                 <label className="block text-sm font-medium mb-1">Webhook Name</label>
-                <input type="text" placeholder="e.g., Slack Alert Webhook" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+                <input name="name" required type="text" placeholder="e.g., Slack Alert Webhook" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
               </div>
               <div>
                 <label className="block text-sm font-medium mb-1">Webhook URL</label>
-                <input type="url" placeholder="https://..." className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+                <input name="url" required type="url" placeholder="https://..." className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
               </div>
               <div>
                 <label className="block text-sm font-medium mb-1">Event Type</label>
-                <select className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
+                <select name="event" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
                   <option>alert.critical</option>
                   <option>alert.high</option>
                   <option>incident.created</option>
@@ -410,20 +419,10 @@ export default function IntegrationMarketplace() {
                 </select>
               </div>
               <div className="flex gap-2 mt-6">
-                <button
-                  onClick={() => setShowNewWebhookModal(false)}
-                  className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
-                >
-                  Cancel
-                </button>
-                <button
-                  onClick={() => setShowNewWebhookModal(false)}
-                  className="flex-1 px-4 py-2 bg-cyan-600 hover:bg-cyan-700 text-white rounded-lg transition"
-                >
-                  Create
-                </button>
+                <button type="button" onClick={() => setShowNewWebhookModal(false)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
+                <button type="submit" className="flex-1 px-4 py-2 bg-cyan-600 hover:bg-cyan-700 text-white rounded-lg transition">Create</button>
               </div>
-            </div>
+            </form>
           </div>
         </div>
       )}

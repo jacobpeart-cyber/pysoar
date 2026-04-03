@@ -68,7 +68,7 @@ export default function Profile() {
   const handlePasswordSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (passwordData.new_password !== passwordData.confirm_password) {
-      alert('Passwords do not match');
+      return;
       return;
     }
     updatePasswordMutation.mutate({
@@ -348,7 +348,7 @@ export default function Profile() {
                   onClick={async () => {
                     try {
                       await api.post('/auth/mfa/enable');
-                      alert('Two-factor authentication setup initiated. Check your email for the QR code.');
+                      // MFA setup initiated
                     } catch (err) {
                       console.error('MFA enable failed:', err);
                     }

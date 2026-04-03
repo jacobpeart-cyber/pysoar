@@ -639,7 +639,7 @@ function ExecutePlaybookModal({
         try {
           parsedInput = JSON.parse(inputData)
         } catch {
-          alert('Invalid JSON input')
+          console.error('Invalid JSON input')
           setIsSubmitting(false)
           return
         }
@@ -648,7 +648,7 @@ function ExecutePlaybookModal({
       setResult(execution)
     } catch (error) {
       console.error('Failed to execute playbook:', error)
-      alert('Failed to execute playbook')
+      console.error('Failed to execute playbook')
     } finally {
       setIsSubmitting(false)
     }

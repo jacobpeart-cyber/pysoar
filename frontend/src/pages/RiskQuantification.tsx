@@ -653,18 +653,32 @@ export default function RiskQuantification() {
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
           <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-96 max-h-screen overflow-y-auto">
             <h2 className="text-xl font-bold mb-4">Create FAIR Risk Scenario</h2>
-            <div className="space-y-4">
+            <form className="space-y-4" onSubmit={async (e) => {
+              e.preventDefault();
+              const fd = new FormData(e.currentTarget);
+              try {
+                await api.post('/riskquant/scenarios', {
+                  name: fd.get('name'),
+                  description: fd.get('description'),
+                  category: fd.get('category'),
+                  loss_event_frequency: parseFloat(fd.get('lef') as string) || 0,
+                  loss_magnitude: parseFloat(fd.get('magnitude') as string) || 0,
+                });
+                setShowNewScenarioModal(false);
+                queryClient.invalidateQueries({ queryKey: ['riskquant'] });
+              } catch (err) { console.error('Failed to create scenario:', err); }
+            }}>
               <div>
                 <label className="block text-sm font-medium mb-1">Scenario Name</label>
-                <input type="text" placeholder="e.g., Ransomware Attack on ERP" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+                <input name="name" type="text" required placeholder="e.g., Ransomware Attack on ERP" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
               </div>
               <div>
                 <label className="block text-sm font-medium mb-1">Description</label>
-                <textarea placeholder="Describe the risk scenario..." rows={3} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+                <textarea name="description" placeholder="Describe the risk scenario..." rows={3} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
               </div>
               <div>
                 <label className="block text-sm font-medium mb-1">Category</label>
-                <select className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
+                <select name="category" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
                   <option value="cyber">Cyber Attack</option>
                   <option value="insider">Insider Threat</option>
                   <option value="compliance">Compliance Failure</option>
@@ -675,28 +689,29 @@ export default function RiskQuantification() {
               <div className="grid grid-cols-2 gap-3">
                 <div>
                   <label className="block text-sm font-medium mb-1">Loss Event Frequency</label>
-                  <input type="number" placeholder="0.0 - 1.0" step="0.01" min="0" max="1" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+                  <input name="lef" type="number" placeholder="0.0 - 1.0" step="0.01" min="0" max="1" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
                 </div>
                 <div>
                   <label className="block text-sm font-medium mb-1">Loss Magnitude ($)</label>
-                  <input type="number" placeholder="e.g., 500000" min="0" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+                  <input name="magnitude" type="number" placeholder="e.g., 500000" min="0" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
                 </div>
               </div>
               <div className="flex gap-2 mt-6">
                 <button
+                  type="button"
                   onClick={() => setShowNewScenarioModal(false)}
                   className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
                 >
                   Cancel
                 </button>
                 <button
-                  onClick={() => setShowNewScenarioModal(false)}
+                  type="submit"
                   className="flex-1 px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg transition"
                 >
                   Create Scenario
                 </button>
               </div>
-            </div>
+            </form>
           </div>
         </div>
       )}
