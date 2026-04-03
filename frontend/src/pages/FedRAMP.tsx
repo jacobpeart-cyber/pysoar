@@ -1077,22 +1077,32 @@ const FEDRAMP_DOCUMENTS: { type: string; name: string; description: string; endp
 ];
 
 function DocumentsTab() {
+  const [generatedDocs, setGeneratedDocs] = useState<Record<string, any>>({});
+
   const generateDoc = useMutation({
-    mutationFn: async (endpoint: string) => {
-      try {
-        const res = await api.get(endpoint);
-        return res.data;
-      } catch { return null; }
+    mutationFn: async ({ endpoint, docType }: { endpoint: string; docType: string }) => {
+      const res = await api.get(endpoint);
+      return { data: res.data, docType };
+    },
+    onSuccess: ({ data, docType }) => {
+      setGeneratedDocs(prev => ({ ...prev, [docType]: data }));
+      // Auto-download
+      const json = JSON.stringify(data, null, 2);
+      const blob = new Blob([json], { type: 'application/json' });
+      downloadBlob(blob, `FedRAMP_${docType}.json`);
     },
   });
 
   const downloadDoc = useMutation({
-    mutationFn: async (endpoint: string) => {
+    mutationFn: async ({ endpoint, docType }: { endpoint: string; docType: string }) => {
+      // If already generated, use cached version
+      if (generatedDocs[docType]) {
+        return { data: generatedDocs[docType], docType };
+      }
       const res = await api.get(endpoint);
-      return { data: res.data, endpoint };
+      return { data: res.data, docType };
     },
-    onSuccess: ({ data, endpoint }) => {
-      const docType = endpoint.split('/').pop() || 'document';
+    onSuccess: ({ data, docType }) => {
       const json = JSON.stringify(data, null, 2);
       const blob = new Blob([json], { type: 'application/json' });
       downloadBlob(blob, `FedRAMP_${docType}.json`);
@@ -1115,8 +1125,8 @@ function DocumentsTab() {
 
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
         {FEDRAMP_DOCUMENTS.map((doc) => {
-          const isGenerating = generateDoc.isPending && generateDoc.variables === doc.endpoint;
-          const isDownloading = downloadDoc.isPending && downloadDoc.variables === doc.endpoint;
+          const isGenerating = generateDoc.isPending && (generateDoc.variables as any)?.docType === doc.type;
+          const isDownloading = downloadDoc.isPending && (downloadDoc.variables as any)?.docType === doc.type;
 
           return (
             <div
@@ -1130,7 +1140,7 @@ function DocumentsTab() {
                   <p className="text-xs text-gray-500 dark:text-gray-400 mt-1 leading-relaxed">{doc.description}</p>
                   <div className="flex items-center gap-2 mt-4">
                     <button
-                      onClick={() => generateDoc.mutate(doc.endpoint)}
+                      onClick={() => generateDoc.mutate({ endpoint: doc.endpoint, docType: doc.type })}
                       disabled={isGenerating}
                       className={clsx(
                         'flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors',
@@ -1141,7 +1151,7 @@ function DocumentsTab() {
                       Generate
                     </button>
                     <button
-                      onClick={() => downloadDoc.mutate(doc.endpoint)}
+                      onClick={() => downloadDoc.mutate({ endpoint: doc.endpoint, docType: doc.type })}
                       disabled={isDownloading}
                       className={clsx(
                         'flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-colors',
