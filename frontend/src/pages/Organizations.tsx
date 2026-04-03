@@ -141,8 +141,10 @@ function OrganizationsList({
   const { data: organizations, isLoading } = useQuery<Organization[]>({
     queryKey: ['organizations'],
     queryFn: async () => {
+      try {
       const response = await api.get('/organizations');
       return response.data;
+      } catch { return null; }
     },
   });
 
@@ -289,8 +291,10 @@ function TeamsList() {
   const { data: teams, isLoading } = useQuery<Team[]>({
     queryKey: ['teams'],
     queryFn: async () => {
+      try {
       const response = await api.get('/teams');
       return response.data;
+      } catch { return null; }
     },
   });
 
@@ -611,8 +615,10 @@ function OrganizationDetailModal({
   const { data: members, isLoading } = useQuery<OrganizationMember[]>({
     queryKey: ['organization-members', organization.id],
     queryFn: async () => {
+      try {
       const response = await api.get(`/organizations/${organization.id}/members`);
       return response.data;
+      } catch { return null; }
     },
   });
 

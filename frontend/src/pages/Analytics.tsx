@@ -35,8 +35,10 @@ export default function Analytics() {
   const { data: metrics, isLoading } = useQuery<MetricsData>({
     queryKey: ['metrics'],
     queryFn: async () => {
+      try {
       const response = await api.get('/metrics');
       return response.data;
+      } catch { return null; }
     },
   });
 

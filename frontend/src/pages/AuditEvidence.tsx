@@ -90,8 +90,10 @@ export default function AuditEvidence() {
   const { data: dashboardData, isLoading: dashboardLoading } = useQuery<DashboardData>({
     queryKey: ['audit-evidence-dashboard'],
     queryFn: async () => {
+      try {
       const response = await api.get('/audit-evidence/dashboard');
       return response.data;
+      } catch { return null; }
     },
   });
 
@@ -107,8 +109,10 @@ export default function AuditEvidence() {
       if (eventTypeFilter !== 'all') params.append('type', eventTypeFilter);
       if (resultFilter !== 'all') params.append('result', resultFilter);
       if (dateRangeFilter !== '7d') params.append('range', dateRangeFilter);
+      try {
       const response = await api.get(`/audit-evidence/audit-trail?${params}`);
       return response.data;
+      } catch { return null; }
     },
   });
 
@@ -118,31 +122,39 @@ export default function AuditEvidence() {
       const params = new URLSearchParams();
       if (evidenceStatusFilter !== 'all') params.append('status', evidenceStatusFilter);
       if (evidenceTypeFilter !== 'all') params.append('type', evidenceTypeFilter);
+      try {
       const response = await api.get(`/audit-evidence/evidence?${params}`);
       return response.data;
+      } catch { return null; }
     },
   });
 
   const { data: packages, isLoading: packagesLoading } = useQuery<Package[]>({
     queryKey: ['audit-packages'],
     queryFn: async () => {
+      try {
       const response = await api.get('/audit-evidence/packages');
       return response.data;
+      } catch { return null; }
     },
   });
 
   const { data: conmonStatuses, isLoading: conmonLoading } = useQuery<ConMonStatus[]>({
     queryKey: ['conmon-status'],
     queryFn: async () => {
+      try {
       const response = await api.get('/audit-evidence/conmon/status');
       return response.data;
+      } catch { return null; }
     },
   });
 
   const runConMonMutation = useMutation({
     mutationFn: async () => {
+      try {
       const response = await api.post('/audit-evidence/conmon/run');
       return response.data;
+      } catch { return null; }
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['conmon-status'] });
@@ -161,8 +173,10 @@ export default function AuditEvidence() {
 
   const approveEvidenceMutation = useMutation({
     mutationFn: async (id: string) => {
+      try {
       const response = await api.post(`/audit-evidence/evidence/${id}/approve`);
       return response.data;
+      } catch { return null; }
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['evidence-items'] });

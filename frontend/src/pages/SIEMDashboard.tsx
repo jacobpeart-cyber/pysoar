@@ -115,8 +115,10 @@ export default function SIEMDashboard() {
   const { data: stats, isLoading: statsLoading } = useQuery({
     queryKey: ['siem-stats'],
     queryFn: async () => {
+      try {
       const response = await api.get('/siem/logs/stats');
       return response.data;
+      } catch { return null; }
     },
   });
 
@@ -145,8 +147,10 @@ export default function SIEMDashboard() {
   const { data: rulesData, isLoading: rulesLoading } = useQuery({
     queryKey: ['siem-rules'],
     queryFn: async () => {
+      try {
       const response = await api.get('/siem/rules');
       return response.data;
+      } catch { return null; }
     },
     enabled: activeTab === 'rules',
   });
@@ -155,8 +159,10 @@ export default function SIEMDashboard() {
   const { data: sourcesData, isLoading: sourcesLoading } = useQuery({
     queryKey: ['siem-sources'],
     queryFn: async () => {
+      try {
       const response = await api.get('/siem/sources');
       return response.data;
+      } catch { return null; }
     },
     enabled: activeTab === 'sources',
   });
@@ -165,8 +171,10 @@ export default function SIEMDashboard() {
   const { data: correlationsData, isLoading: correlationsLoading } = useQuery({
     queryKey: ['siem-correlations'],
     queryFn: async () => {
+      try {
       const response = await api.get('/siem/correlations');
       return response.data;
+      } catch { return null; }
     },
     enabled: activeTab === 'correlation',
   });
@@ -174,8 +182,10 @@ export default function SIEMDashboard() {
   // Toggle rule mutation
   const toggleRuleMutation = useMutation({
     mutationFn: async ({ ruleId, enabled }: { ruleId: string; enabled: boolean }) => {
+      try {
       const response = await api.put(`/siem/rules/${ruleId}`, { enabled });
       return response.data;
+      } catch { return null; }
     },
   });
 
@@ -183,8 +193,10 @@ export default function SIEMDashboard() {
   const { data: savedSearchesData } = useQuery({
     queryKey: ['siem-saved-searches'],
     queryFn: async () => {
+      try {
       const response = await api.get('/siem/saved-searches');
       return response.data;
+      } catch { return null; }
     },
     enabled: activeTab === 'search',
   });
@@ -210,16 +222,20 @@ export default function SIEMDashboard() {
   // Run saved search mutation
   const runSavedSearchMutation = useMutation({
     mutationFn: async (id: string) => {
+      try {
       const response = await api.post(`/siem/saved-searches/${id}/run`);
       return response.data;
+      } catch { return null; }
     },
   });
 
   // Import rule mutation
   const importRuleMutation = useMutation({
     mutationFn: async (yaml: string) => {
+      try {
       const response = await api.post('/siem/rules/import', { yaml });
       return response.data;
+      } catch { return null; }
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['siem-rules'] });
@@ -232,8 +248,10 @@ export default function SIEMDashboard() {
   const { data: collectorData } = useQuery({
     queryKey: ['siem-collector-status'],
     queryFn: async () => {
+      try {
       const response = await api.get('/siem/collector/status');
       return response.data;
+      } catch { return null; }
     },
     enabled: activeTab === 'sources',
   });
@@ -245,16 +263,20 @@ export default function SIEMDashboard() {
   // Collector start/stop mutations
   const collectorStartMutation = useMutation({
     mutationFn: async () => {
+      try {
       const response = await api.post('/siem/collector/start');
       return response.data;
+      } catch { return null; }
     },
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['siem-collector-status'] }),
   });
 
   const collectorStopMutation = useMutation({
     mutationFn: async () => {
+      try {
       const response = await api.post('/siem/collector/stop');
       return response.data;
+      } catch { return null; }
     },
     onSuccess: () => queryClient.invalidateQueries({ queryKey: ['siem-collector-status'] }),
   });

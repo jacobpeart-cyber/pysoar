@@ -124,8 +124,10 @@ export default function IncidentDetail() {
   // TODO: Verify POST /incidents/{id}/notes endpoint exists on backend
   const addNoteMutation = useMutation({
     mutationFn: async (content: string) => {
+      try {
       const response = await api.post(`/incidents/${id}/notes`, { content, note_type: 'general' });
       return response.data;
+      } catch { return null; }
     },
     onSuccess: () => {
       setNewNote('');
@@ -136,8 +138,10 @@ export default function IncidentDetail() {
   // TODO: Verify POST /incidents/{id}/tasks endpoint exists on backend
   const addTaskMutation = useMutation({
     mutationFn: async (title: string) => {
+      try {
       const response = await api.post(`/incidents/${id}/tasks`, { title, status: 'pending' });
       return response.data;
+      } catch { return null; }
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['incident', id] });
@@ -147,8 +151,10 @@ export default function IncidentDetail() {
   // TODO: Verify PATCH /incidents/{id}/tasks/{taskId} endpoint exists on backend
   const updateTaskMutation = useMutation({
     mutationFn: async ({ taskId, status }: { taskId: string; status: string }) => {
+      try {
       const response = await api.patch(`/incidents/${id}/tasks/${taskId}`, { status });
       return response.data;
+      } catch { return null; }
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['incident', id] });

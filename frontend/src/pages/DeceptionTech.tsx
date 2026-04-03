@@ -170,8 +170,10 @@ export default function DeceptionTech() {
   const { data: dashboard, isLoading: dashboardLoading } = useQuery({
     queryKey: ['deceptionDashboard'],
     queryFn: async () => {
+      try {
       const response = await api.get<DeceptionDashboard>('/deception/dashboard');
       return response.data;
+      } catch { return null; }
     },
   });
 
@@ -183,8 +185,10 @@ export default function DeceptionTech() {
       if (decoyTypeFilter !== 'all') params.decoy_type = decoyTypeFilter;
       if (decoyStatusFilter !== 'all') params.status = decoyStatusFilter;
 
+      try {
       const response = await api.get<Decoy[]>('/deception/decoys', { params });
       return response.data;
+      } catch { return null; }
     },
   });
 
@@ -192,8 +196,10 @@ export default function DeceptionTech() {
   const { data: tokens, isLoading: tokensLoading } = useQuery({
     queryKey: ['honeyTokens'],
     queryFn: async () => {
+      try {
       const response = await api.get<HoneyToken[]>('/deception/tokens');
       return response.data;
+      } catch { return null; }
     },
   });
 
@@ -204,8 +210,10 @@ export default function DeceptionTech() {
       const params: Record<string, any> = {};
       if (threatLevelFilter !== 'all') params.threat_level = threatLevelFilter;
 
+      try {
       const response = await api.get<Interaction[]>('/deception/interactions', { params });
       return response.data;
+      } catch { return null; }
     },
   });
 
@@ -213,8 +221,10 @@ export default function DeceptionTech() {
   const { data: campaigns, isLoading: campaignsLoading } = useQuery({
     queryKey: ['campaigns'],
     queryFn: async () => {
+      try {
       const response = await api.get<Campaign[]>('/deception/campaigns');
       return response.data;
+      } catch { return null; }
     },
   });
 

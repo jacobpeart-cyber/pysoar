@@ -95,8 +95,10 @@ function IndicatorDetailContent({ indicatorId }: { indicatorId: string }) {
   }>({
     queryKey: ['threat-intel', 'indicator-detail', indicatorId],
     queryFn: async () => {
+      try {
       const response = await api.get(`/threat-intel/indicators/${indicatorId}`);
       return response.data;
+      } catch { return null; }
     },
   });
 
@@ -171,16 +173,20 @@ export default function ThreatIntel() {
   const { data: stats } = useQuery<ThreatStats>({
     queryKey: ['threat-intel', 'stats'],
     queryFn: async () => {
+      try {
       const response = await api.get('/threat-intel/stats');
       return response.data;
+      } catch { return null; }
     },
   });
 
   const { data: indicatorsData } = useQuery<{ items: Array<{ ioc_type: string }> }>({
     queryKey: ['threat-intel', 'indicators'],
     queryFn: async () => {
+      try {
       const response = await api.get('/threat-intel/indicators', { params: { size: 1000 } });
       return response.data;
+      } catch { return null; }
     },
   });
 
@@ -203,8 +209,10 @@ export default function ThreatIntel() {
   const { data: feeds, refetch: refetchFeeds } = useQuery<ThreatFeed[]>({
     queryKey: ['threat-intel', 'feeds'],
     queryFn: async () => {
+      try {
       const response = await api.get('/threat-intel/feeds');
       return response.data;
+      } catch { return null; }
     },
   });
 
@@ -233,23 +241,29 @@ export default function ThreatIntel() {
   }>({
     queryKey: ['threat-intel', 'ioc-database', iocQueryParams],
     queryFn: async () => {
+      try {
       const response = await api.get('/threat-intel/indicators', { params: iocQueryParams });
       return response.data;
+      } catch { return null; }
     },
     enabled: activeTab === 'iocs',
   });
 
   const lookupMutation = useMutation<IOCLookupResult, Error, { indicator: string; type: string }>({
     mutationFn: async ({ indicator, type }) => {
+      try {
       const response = await api.post('/threat-intel/lookup', { indicator, type });
       return response.data;
+      } catch { return null; }
     },
   });
 
   const syncFeedMutation = useMutation({
     mutationFn: async (feedId: string) => {
+      try {
       const response = await api.post(`/threat-intel/feeds/${feedId}/sync`);
       return response.data;
+      } catch { return null; }
     },
     onSuccess: () => {
       refetchFeeds();

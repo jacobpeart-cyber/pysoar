@@ -195,8 +195,10 @@ export default function AttackSimulation() {
   const { data: dashboard, isLoading: dashboardLoading, error: dashboardError } = useQuery({
     queryKey: ['simulationDashboard'],
     queryFn: async () => {
+      try {
       const response = await api.get<SimulationDashboard>('/simulation/dashboard');
       return response.data;
+      } catch { return null; }
     },
   });
 
@@ -242,8 +244,10 @@ export default function AttackSimulation() {
   const { data: posture, isLoading: postureLoading } = useQuery({
     queryKey: ['postureAnalysis'],
     queryFn: async () => {
+      try {
       const response = await api.get<PostureResponse>('/simulation/posture');
       return response.data;
+      } catch { return null; }
     },
   });
 
