@@ -73,9 +73,8 @@ def ot_asset_discovery(self, organization_id: str, network_ranges: List[str]):
 
             return {"discovered_count": len(discovered)}
 
-        # In production, run this in async context
-        logger.info(f"Asset discovery task for {organization_id} queued")
-        return {"status": "queued", "organization_id": organization_id}
+        import asyncio
+        return asyncio.run(_discover())
 
     except Exception as exc:
         logger.error(f"Asset discovery failed: {str(exc)}")
@@ -108,7 +107,7 @@ def protocol_monitoring(self, organization_id: str):
             return {"violations": len(violations)}
 
         logger.info(f"Protocol monitoring task for {organization_id} queued")
-        return {"status": "queued"}
+        return asyncio.run(_monitor())
 
     except Exception as exc:
         logger.error(f"Protocol monitoring failed: {str(exc)}")
@@ -190,7 +189,7 @@ def zone_compliance_check(self, organization_id: str):
             return report
 
         logger.info(f"Zone compliance check task for {organization_id} queued")
-        return {"status": "queued"}
+        return asyncio.run(_check())
 
     except Exception as exc:
         logger.error(f"Zone compliance check failed: {str(exc)}")

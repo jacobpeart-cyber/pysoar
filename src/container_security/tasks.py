@@ -7,6 +7,7 @@ compliance checking, and vulnerability reporting.
 
 from datetime import datetime, timedelta
 from typing import Dict, Any, List
+import asyncio
 from celery import shared_task
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
@@ -148,8 +149,7 @@ def scheduled_image_scan(self, image_id: str, org_id: str):
                     "risk_score": image.risk_score,
                 }
 
-        # Run async function
-        return {"status": "queued"}
+        return asyncio.run(_scan())
 
     except Exception as exc:
         logger.error(f"Image scan failed: {str(exc)}")
@@ -271,8 +271,7 @@ def cluster_security_audit(self, cluster_id: str, org_id: str):
                     "cis_compliance": cis_audit.get("compliance_percentage", 0),
                 }
 
-        # Run async function
-        return {"status": "queued"}
+        return asyncio.run(_audit())
 
     except Exception as exc:
         logger.error(f"Cluster audit failed: {str(exc)}")
@@ -385,8 +384,7 @@ def runtime_monitoring(self, cluster_id: str, org_id: str):
                     "alerts_created": alerts_created,
                 }
 
-        # Run async function
-        return {"status": "queued"}
+        return asyncio.run(_monitor())
 
     except Exception as exc:
         logger.error(f"Runtime monitoring failed: {str(exc)}")
@@ -453,8 +451,7 @@ def compliance_check(self, cluster_id: str, org_id: str):
                     },
                 }
 
-        # Run async function
-        return {"status": "queued"}
+        return asyncio.run(_check())
 
     except Exception as exc:
         logger.error(f"Compliance check failed: {str(exc)}")
@@ -515,8 +512,7 @@ def stale_image_report(self, org_id: str, days_threshold: int = 90):
                     "generated_at": datetime.utcnow(),
                 }
 
-        # Run async function
-        return {"status": "queued"}
+        return asyncio.run(_report())
 
     except Exception as exc:
         logger.error(f"Stale image report failed: {str(exc)}")

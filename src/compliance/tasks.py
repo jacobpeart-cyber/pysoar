@@ -5,6 +5,7 @@ Background tasks for compliance assessment, monitoring, and reporting.
 Supports continuous monitoring, POA&M tracking, and automated evidence collection.
 """
 
+import asyncio
 from datetime import datetime, timedelta
 from typing import Dict, Any, List
 from celery import shared_task
@@ -67,8 +68,7 @@ def run_compliance_assessment(self, framework_id: str, org_id: str):
                 logger.info(f"Assessment complete: {result['compliance_score']}%")
                 return result
 
-        # In production, use asyncio.run() in async context
-        return {"status": "completed", "framework_id": framework_id}
+        return asyncio.run(_assess())
 
     except Exception as exc:
         logger.error(f"Assessment failed: {str(exc)}")
@@ -93,7 +93,7 @@ def run_continuous_monitoring(self, org_id: str):
                 logger.info(f"ConMon complete: {len(result['results'])} frameworks assessed")
                 return result
 
-        return {"status": "completed", "org_id": org_id}
+        return asyncio.run(_conmon())
 
     except Exception as exc:
         logger.error(f"ConMon failed: {str(exc)}")
@@ -150,7 +150,7 @@ def check_poam_deadlines(self, org_id: str):
                     "total_items": len(overdue) + len(upcoming),
                 }
 
-        return {"status": "completed"}
+        return asyncio.run(_check())
 
     except Exception as exc:
         logger.error(f"POA&M deadline check failed: {str(exc)}")
@@ -266,7 +266,8 @@ def update_compliance_scores(self, org_id: str):
                 logger.info(f"Updated {updated_count} framework scores")
                 return updated_count
 
-        return {"status": "completed", "frameworks_updated": 0}
+        result = asyncio.run(_update())
+        return {"status": "completed", "frameworks_updated": result}
 
     except Exception as exc:
         logger.error(f"Score update failed: {str(exc)}")
@@ -314,7 +315,7 @@ def check_cisa_directives(self, org_id: str):
                     "approaching_deadline": len(approaching_deadline),
                 }
 
-        return {"status": "completed"}
+        return asyncio.run(_check())
 
     except Exception as exc:
         logger.error(f"CISA directive check failed: {str(exc)}")
@@ -372,7 +373,7 @@ def generate_compliance_reports(self, org_id: str, report_type: str = "weekly"):
                 logger.info(f"Report generated with {len(frameworks)} frameworks")
                 return report_data
 
-        return {"status": "completed"}
+        return asyncio.run(_generate())
 
     except Exception as exc:
         logger.error(f"Report generation failed: {str(exc)}")
@@ -419,7 +420,7 @@ def cross_reference_controls(self, org_id: str):
                 logger.info(f"Created {mapping_count} cross-framework mappings")
                 return mapping_count
 
-        return {"status": "completed"}
+        return asyncio.run(_crossref())
 
     except Exception as exc:
         logger.error(f"Cross-reference failed: {str(exc)}")
@@ -475,7 +476,7 @@ def validate_cui_markings(self, org_id: str):
                     "deactivated": expired_count,
                 }
 
-        return {"status": "completed"}
+        return asyncio.run(_validate())
 
     except Exception as exc:
         logger.error(f"CUI validation failed: {str(exc)}")
