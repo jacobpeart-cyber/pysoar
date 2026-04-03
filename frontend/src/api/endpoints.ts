@@ -832,7 +832,7 @@ export const otsecurityApi = {
     size?: number;
     status?: string;
   }): Promise<PaginatedResponse<OTAsset>> => {
-    const response = await api.get('/otsecurity/assets', { params });
+    const response = await api.get('/ot_security/assets', { params });
     return response.data;
   },
 
@@ -840,17 +840,17 @@ export const otsecurityApi = {
     page?: number;
     size?: number;
   }): Promise<PaginatedResponse<Alert>> => {
-    const response = await api.get('/otsecurity/alerts', { params });
+    const response = await api.get('/ot_security/alerts', { params });
     return response.data;
   },
 
   getZones: async (): Promise<OTZone[]> => {
-    const response = await api.get('/otsecurity/zones');
+    const response = await api.get('/ot_security/zones');
     return response.data;
   },
 
   getPurdueMap: async (): Promise<any> => {
-    const response = await api.get('/otsecurity/purdue-map');
+    const response = await api.get('/ot_security/purdue-map');
     return response.data;
   },
 };
@@ -979,12 +979,12 @@ export const threatmodelApi = {
     page?: number;
     size?: number;
   }): Promise<PaginatedResponse<ThreatModel>> => {
-    const response = await api.get('/threatmodel/models', { params });
+    const response = await api.get('/threat-modeling/models', { params });
     return response.data;
   },
 
   runSTRIDE: async (data: { application_id: string }): Promise<{ model_id: string }> => {
-    const response = await api.post('/threatmodel/stride', data);
+    const response = await api.post('/threat-modeling/stride', data);
     return response.data;
   },
 
@@ -999,17 +999,17 @@ export const threatmodelApi = {
   },
 
   getSTRIDEAnalysis: async (): Promise<any[]> => {
-    const response = await api.get('/threatmodel/stride');
+    const response = await api.get('/threat-modeling/stride');
     return response.data;
   },
 
   getThreats: async (): Promise<any[]> => {
-    const response = await api.get('/threatmodel/threats');
+    const response = await api.get('/threat-modeling/threats');
     return response.data;
   },
 
   createModel: async (data: any): Promise<any> => {
-    const response = await api.post('/threatmodel/models', data);
+    const response = await api.post('/threat-modeling/models', data);
     return response.data;
   },
 };
@@ -1061,7 +1061,7 @@ export const datalakeApi = {
     page?: number;
     size?: number;
   }): Promise<PaginatedResponse<DataSource>> => {
-    const response = await api.get('/datalake/sources', { params });
+    const response = await api.get('/data-lake/sources', { params });
     return response.data;
   },
 
@@ -1069,22 +1069,22 @@ export const datalakeApi = {
     page?: number;
     size?: number;
   }): Promise<PaginatedResponse<DataLakePipeline>> => {
-    const response = await api.get('/datalake/pipelines', { params });
+    const response = await api.get('/data-lake/pipelines', { params });
     return response.data;
   },
 
   runQuery: async (query: string): Promise<any> => {
-    const response = await api.post('/datalake/query', { query });
+    const response = await api.post('/data-lake/query', { query });
     return response.data;
   },
 
   getCatalog: async (): Promise<any[]> => {
-    const response = await api.get('/datalake/catalog');
+    const response = await api.get('/data-lake/catalog');
     return response.data;
   },
 
   createDataSource: async (data: { name: string; connection_string: string }): Promise<any> => {
-    const response = await api.post('/datalake/sources', data);
+    const response = await api.post('/data-lake/sources', data);
     return response.data;
   },
 };
@@ -1140,7 +1140,7 @@ export const phishingApi = {
     size?: number;
     status?: string;
   }): Promise<PaginatedResponse<PhishingCampaign>> => {
-    const response = await api.get('/phishing/campaigns', { params });
+    const response = await api.get('/phishing_sim/campaigns', { params });
     return response.data;
   },
 
@@ -1149,7 +1149,7 @@ export const phishingApi = {
     description: string;
     targets: string[];
   }): Promise<PhishingCampaign> => {
-    const response = await api.post('/phishing/campaigns', data);
+    const response = await api.post('/phishing_sim/campaigns', data);
     return response.data;
   },
 
@@ -1162,17 +1162,17 @@ export const phishingApi = {
   },
 
   getAwarenessScores: async (): Promise<{ user_email: string; awareness_score: number }[]> => {
-    const response = await api.get('/phishing/awareness-scores');
+    const response = await api.get('/phishing_sim/awareness-scores');
     return response.data;
   },
 
   getTemplates: async (): Promise<any[]> => {
-    const response = await api.get('/phishing/templates');
+    const response = await api.get('/phishing_sim/templates');
     return response.data;
   },
 
   getTargetGroups: async (): Promise<any[]> => {
-    const response = await api.get('/phishing/target-groups');
+    const response = await api.get('/phishing_sim/target-groups');
     return response.data;
   },
 

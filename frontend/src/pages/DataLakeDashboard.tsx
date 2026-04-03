@@ -383,7 +383,7 @@ export default function DataLakeDashboard() {
                     setQueryRunning(true);
                     setQueryResult(null);
                     try {
-                      const res = await api.post('/datalake/query', { query: queryInput });
+                      const res = await api.post('/data-lake/query', { query: queryInput });
                       setQueryResult(JSON.stringify(res.data, null, 2));
                     } catch (err: any) {
                       setQueryResult('Error: ' + (err?.response?.data?.detail || err.message || 'Query failed'));
@@ -532,7 +532,7 @@ export default function DataLakeDashboard() {
                 e.preventDefault();
                 const fd = new FormData(e.currentTarget);
                 try {
-                  await api.post('/datalake/sources', { name: fd.get('name'), connection_string: fd.get('conn') });
+                  await api.post('/data-lake/sources', { name: fd.get('name'), connection_string: fd.get('conn') });
                   setShowModal(false);
                 } catch (err) { console.error('Failed to add source:', err); }
               }}>
