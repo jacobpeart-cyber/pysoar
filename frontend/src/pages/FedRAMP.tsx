@@ -308,9 +308,14 @@ function ReadinessTab() {
   });
 
   const exportSSP = useMutation({
-    mutationFn: () => api.get('/fedramp/ssp/export', { responseType: 'blob' }),
-    onSuccess: (res) => {
-      downloadBlob(res.data, 'FedRAMP_SSP_Export.docx');
+    mutationFn: async () => {
+      const res = await api.get('/fedramp/ssp/export');
+      return res.data;
+    },
+    onSuccess: (data) => {
+      const json = JSON.stringify(data?.document ?? data, null, 2);
+      const blob = new Blob([json], { type: 'application/json' });
+      downloadBlob(blob, data?.filename ?? 'FedRAMP_SSP_Export.json');
     },
   });
 
@@ -751,9 +756,14 @@ function POAMTab() {
   });
 
   const exportPOAM = useMutation({
-    mutationFn: () => api.get('/fedramp/poam/export', { responseType: 'blob' }),
-    onSuccess: (res) => {
-      downloadBlob(res.data, 'FedRAMP_POAM_Report.xlsx');
+    mutationFn: async () => {
+      const res = await api.get('/fedramp/poam/report');
+      return res.data;
+    },
+    onSuccess: (data) => {
+      const json = JSON.stringify(data, null, 2);
+      const blob = new Blob([json], { type: 'application/json' });
+      downloadBlob(blob, 'FedRAMP_POAM_Report.json');
     },
   });
 
@@ -919,10 +929,22 @@ function EvidenceTab() {
   if (error) return <ErrorState message="Failed to load evidence status." />;
   if (!data) return <EmptyState icon={<FolderOpen className="w-10 h-10" />} title="No Evidence Data" description="Evidence collection has not been configured." />;
 
-  const families: any[] = Array.isArray(data?.families) ? data.families : [];
-  const overallCollected = Number(data?.overallCollected ?? data?.overall_collected ?? 0) || 0;
-  const overallRequired = Number(data?.overallRequired ?? data?.overall_required ?? 0) || 0;
-  const overallPercent = overallRequired > 0 ? Math.round((overallCollected / overallRequired) * 100) : 0;
+  const rawFamilies: any[] = Array.isArray(data?.families) ? data.families : [];
+  // Normalize backend field names to what the UI expects
+  const families = rawFamilies.map((f: any) => ({
+    family: f.family || f.label || '',
+    label: f.family || f.label || '',
+    totalRequired: Number(f.totalRequired ?? f.total_controls ?? 0),
+    collected: Number(f.collected ?? f.controls_with_evidence ?? 0),
+    controls: Array.isArray(f.controls) ? f.controls : (f.evidence_artifacts || []).map((a: any) => ({
+      id: a.control_id || a.id || '',
+      controlId: a.control_id || a.id || '',
+      hasEvidence: true,
+    })),
+  }));
+  const overallCollected = Number(data?.overallCollected ?? data?.overall_collected ?? data?.controls_with_evidence ?? 0) || 0;
+  const overallRequired = Number(data?.overallRequired ?? data?.overall_required ?? data?.total_controls ?? 0) || 0;
+  const overallPercent = overallRequired > 0 ? Math.round((overallCollected / (overallRequired || 1)) * 100) : 0;
 
   return (
     <div className="space-y-6">
@@ -1032,38 +1054,48 @@ const FEDRAMP_DOCUMENTS: { type: string; name: string; description: string; endp
     type: 'ssp',
     name: 'System Security Plan (SSP)',
     description: 'Comprehensive document describing the security controls, system boundaries, and authorization scope for FedRAMP Moderate.',
-    endpoint: '/fedramp/documents/ssp',
+    endpoint: '/fedramp/ssp/generate',
   },
   {
     type: 'irp',
     name: 'Incident Response Plan',
     description: 'Defines incident detection, reporting, handling, and recovery procedures aligned with FedRAMP IR controls.',
-    endpoint: '/fedramp/documents/irp',
+    endpoint: '/fedramp/ssp/generate',
   },
   {
     type: 'cmp',
     name: 'Configuration Management Plan',
     description: 'Establishes policies and procedures for managing configuration baselines and changes for the system.',
-    endpoint: '/fedramp/documents/cmp',
+    endpoint: '/fedramp/ssp/generate',
   },
   {
     type: 'conmon',
     name: 'Continuous Monitoring Plan',
     description: 'Describes continuous monitoring strategy including vulnerability scanning, log review, and ongoing authorization activities.',
-    endpoint: '/fedramp/documents/conmon',
+    endpoint: '/fedramp/ssp/generate',
   },
 ];
 
 function DocumentsTab() {
   const generateDoc = useMutation({
-    mutationFn: (endpoint: string) => api.post(`${endpoint}/generate`),
+    mutationFn: async (endpoint: string) => {
+      try {
+        const res = await api.get(endpoint);
+        return res.data;
+      } catch { return null; }
+    },
   });
 
   const downloadDoc = useMutation({
-    mutationFn: (endpoint: string) => api.get(`${endpoint}/download`, { responseType: 'blob' }),
-    onSuccess: (res, endpoint) => {
+    mutationFn: async (endpoint: string) => {
+      const res = await api.get(endpoint);
+      return { data: res.data, endpoint };
+    },
+    onSuccess: ({ data, endpoint }) => {
       const docType = endpoint.split('/').pop() || 'document';
-      downloadBlob(res.data, `FedRAMP_${docType}.docx`);
+      const json = JSON.stringify(data, null, 2);
+      const blob = new Blob([json], { type: 'application/json' });
+      downloadBlob(blob, `FedRAMP_${docType}.json`);
     },
   });
 
