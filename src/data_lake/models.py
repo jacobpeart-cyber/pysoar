@@ -4,7 +4,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional
 
 from sqlalchemy import Boolean, Float, ForeignKey, Integer, JSON, String, Text
-from sqlalchemy.dialects.postgresql import JSON, JSONB
+from sqlalchemy.types import JSON as JSONB  # Use generic JSON for SQLite compat
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.models.base import BaseModel
