@@ -298,7 +298,13 @@ function ScoreGauge({ score, size = 180 }: { score: number; size?: number }) {
 function ReadinessTab() {
   const { data: rawData, isLoading, error } = useQuery<any>({
     queryKey: ['fedramp', 'readiness'],
-    queryFn: () => api.get('/fedramp/readiness').then((r) => r.data),
+    queryFn: async () => {
+      try {
+        const r = await api.get('/fedramp/readiness');
+        return r.data;
+      } catch { return null; }
+    },
+    retry: 1,
   });
 
   const exportSSP = useMutation({
@@ -329,7 +335,14 @@ function ReadinessTab() {
           total: Number(val?.total ?? 0) || 0,
         }));
 
-  const gapSummary = data?.status_breakdown ?? data?.gap_analysis ?? data?.gapSummary ?? {};
+  const gapSummary = data?.status_breakdown ?? data?.gapSummary ?? {};
+  // Ensure gapSummary is always a plain object with expected keys
+  const gap = {
+    implemented: Number(gapSummary?.implemented ?? 0) || 0,
+    partially_implemented: Number(gapSummary?.partially_implemented ?? gapSummary?.partial ?? 0) || 0,
+    planned: Number(gapSummary?.planned ?? gapSummary?.not_assessed ?? 0) || 0,
+    not_implemented: Number(gapSummary?.not_implemented ?? gapSummary?.alternative ?? 0) || 0,
+  };
 
   // Backend returns [{priority: "Critical", action: "..."}] — normalize to display format
   const rawRecs: any[] = Array.isArray(data?.recommendations) ? data.recommendations : [];
@@ -367,10 +380,10 @@ function ReadinessTab() {
           <h3 className="text-sm font-semibold text-gray-700 dark:text-gray-300 mb-4">Gap Summary</h3>
           <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-6">
             {[
-              { label: 'Implemented', count: gapSummary?.implemented ?? 0, color: 'text-green-600 dark:text-green-400', bg: 'bg-green-50 dark:bg-green-900/20' },
-              { label: 'Partial', count: gapSummary?.partially_implemented ?? gapSummary?.partial ?? 0, color: 'text-yellow-600 dark:text-yellow-400', bg: 'bg-yellow-50 dark:bg-yellow-900/20' },
-              { label: 'Planned', count: gapSummary?.planned ?? gapSummary?.not_assessed ?? 0, color: 'text-blue-600 dark:text-blue-400', bg: 'bg-blue-50 dark:bg-blue-900/20' },
-              { label: 'Not Implemented', count: gapSummary?.not_implemented ?? gapSummary?.alternative ?? 0, color: 'text-red-600 dark:text-red-400', bg: 'bg-red-50 dark:bg-red-900/20' },
+              { label: 'Implemented', count: gap.implemented, color: 'text-green-600 dark:text-green-400', bg: 'bg-green-50 dark:bg-green-900/20' },
+              { label: 'Partial', count: gap.partially_implemented, color: 'text-yellow-600 dark:text-yellow-400', bg: 'bg-yellow-50 dark:bg-yellow-900/20' },
+              { label: 'Planned', count: gap.planned, color: 'text-blue-600 dark:text-blue-400', bg: 'bg-blue-50 dark:bg-blue-900/20' },
+              { label: 'Not Implemented', count: gap.not_implemented, color: 'text-red-600 dark:text-red-400', bg: 'bg-red-50 dark:bg-red-900/20' },
             ].map((item) => (
               <div key={item.label} className={clsx('rounded-lg p-4 text-center', item.bg)}>
                 <p className={clsx('text-2xl font-bold', item.color)}>{item.count}</p>
@@ -480,7 +493,7 @@ function ControlsTab() {
 
   const { data: controlsRaw, isLoading, error } = useQuery<any>({
     queryKey: ['fedramp', 'controls'],
-    queryFn: () => api.get('/fedramp/controls').then((r) => r.data),
+    queryFn: async () => { try { return (await api.get('/fedramp/controls')).data; } catch { return null; } },
   });
   const controls: FedRAMPControl[] = Array.isArray(controlsRaw) ? controlsRaw : (controlsRaw?.controls || []);
 
@@ -734,7 +747,7 @@ function ControlRow({
 function POAMTab() {
   const { data, isLoading, error } = useQuery<POAMReport>({
     queryKey: ['fedramp', 'poam', 'report'],
-    queryFn: () => api.get('/fedramp/poam/report').then((r) => r.data),
+    queryFn: async () => { try { return (await api.get('/fedramp/poam/report')).data; } catch { return null; } },
   });
 
   const exportPOAM = useMutation({
@@ -892,7 +905,7 @@ function EvidenceTab() {
   const queryClient = useQueryClient();
   const { data, isLoading, error } = useQuery<EvidenceStatus>({
     queryKey: ['fedramp', 'evidence', 'status'],
-    queryFn: () => api.get('/fedramp/evidence/status').then((r) => r.data),
+    queryFn: async () => { try { return (await api.get('/fedramp/evidence/status')).data; } catch { return null; } },
   });
 
   const collectEvidence = useMutation({
@@ -1124,7 +1137,7 @@ export default function FedRAMP() {
 
   const { data: readinessData } = useQuery<any>({
     queryKey: ['fedramp', 'readiness'],
-    queryFn: () => api.get('/fedramp/readiness').then((r) => r.data),
+    queryFn: async () => { try { return (await api.get('/fedramp/readiness')).data; } catch { return null; } },
     staleTime: 60_000,
   });
 
