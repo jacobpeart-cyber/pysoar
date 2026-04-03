@@ -7,6 +7,7 @@ PIA reviews, and cross-border audits.
 
 from datetime import datetime, timedelta
 from typing import Dict, Any
+import asyncio
 from celery import shared_task
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
@@ -76,9 +77,7 @@ def dsr_deadline_monitor(self, org_id: str):
                 await db.commit()
                 return {"alerts_generated": len(alerts)}
 
-        # In production use asyncio.run() in async context
-        logger.info(f"DSR deadline monitoring complete for org {org_id}")
-        return {"status": "completed", "org_id": org_id}
+        return asyncio.run(_monitor())
 
     except Exception as exc:
         logger.error(f"DSR deadline monitoring failed: {str(exc)}")
@@ -118,8 +117,7 @@ def consent_expiry_check(self, org_id: str):
                 await db.commit()
                 return {"withdrawn_consents": len(withdrawn_consents)}
 
-        logger.info(f"Consent expiry check complete for org {org_id}")
-        return {"status": "completed", "org_id": org_id}
+        return asyncio.run(_check())
 
     except Exception as exc:
         logger.error(f"Consent expiry check failed: {str(exc)}")
@@ -149,8 +147,7 @@ def retention_enforcement(self, org_id: str):
                 await db.commit()
                 return {"retention_violations": len(violations)}
 
-        logger.info(f"Retention enforcement complete for org {org_id}")
-        return {"status": "completed", "org_id": org_id}
+        return asyncio.run(_enforce())
 
     except Exception as exc:
         logger.error(f"Retention enforcement failed: {str(exc)}")
@@ -190,8 +187,7 @@ def pia_review_reminder(self, org_id: str):
                 await db.commit()
                 return {"pias_reviewed": len(pending_pias)}
 
-        logger.info(f"PIA review reminders complete for org {org_id}")
-        return {"status": "completed", "org_id": org_id}
+        return asyncio.run(_remind())
 
     except Exception as exc:
         logger.error(f"PIA review reminder failed: {str(exc)}")
@@ -223,8 +219,7 @@ def cross_border_audit(self, org_id: str):
                 await db.commit()
                 return {"transfers_audited": len(transfers)}
 
-        logger.info(f"Cross-border audit complete for org {org_id}")
-        return {"status": "completed", "org_id": org_id}
+        return asyncio.run(_audit())
 
     except Exception as exc:
         logger.error(f"Cross-border audit failed: {str(exc)}")
@@ -263,8 +258,7 @@ def privacy_incident_escalation(self, incident_id: str, org_id: str):
                 await db.commit()
                 return deadlines
 
-        logger.info(f"Privacy incident escalation complete for {incident_id}")
-        return {"status": "completed", "incident_id": incident_id}
+        return asyncio.run(_escalate())
 
     except Exception as exc:
         logger.error(f"Privacy incident escalation failed: {str(exc)}")
@@ -315,8 +309,7 @@ def breach_notification_reminder(self, org_id: str):
                 await db.commit()
                 return {"critical_notifications": critical_alerts}
 
-        logger.info(f"Breach notification reminders complete for org {org_id}")
-        return {"status": "completed", "org_id": org_id}
+        return asyncio.run(_remind())
 
     except Exception as exc:
         logger.error(f"Breach notification reminder failed: {str(exc)}")
