@@ -527,7 +527,7 @@ export default function APISecurityDashboard() {
                 e.preventDefault();
                 const fd = new FormData(e.currentTarget);
                 try {
-                  await api.post('/apisecurity/endpoints', { name: fd.get('name'), api_type: fd.get('type') });
+                  await api.post('/api-security/endpoints', { name: fd.get('name'), api_type: fd.get('type') });
                   setShowModal(false);
                 } catch (err) { console.error('Failed to register API:', err); }
               }}>
