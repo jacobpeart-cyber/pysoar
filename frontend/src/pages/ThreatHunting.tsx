@@ -106,72 +106,90 @@ export default function ThreatHunting() {
   const { data: stats, isLoading: statsLoading } = useQuery({
     queryKey: ['hunting-stats'],
     queryFn: async () => {
-      const response = await api.get('/hunting/stats');
-      return response.data;
+      try {
+        const response = await api.get('/hunting/stats');
+        return response.data;
+      } catch { return null; }
     },
+    retry: 1,
   });
 
   // Fetch hunt sessions
   const { data: huntsData, isLoading: huntsLoading } = useQuery({
     queryKey: ['hunting-sessions', huntFilter],
     queryFn: async () => {
-      const response = await api.get('/hunting/sessions', {
-        params: huntFilter ? { status: huntFilter } : {},
-      });
-      return response.data;
+      try {
+        const response = await api.get('/hunting/sessions', {
+          params: huntFilter ? { status: huntFilter } : {},
+        });
+        return response.data;
+      } catch { return { items: [] }; }
     },
     enabled: activeTab === 'hunts',
+    retry: 1,
   });
 
   // Fetch hypotheses
   const { data: hypothesesData, isLoading: hypothesesLoading } = useQuery({
     queryKey: ['hunting-hypotheses', mitreFilterTab, priorityFilterTab, hypothesisStatusFilter],
     queryFn: async () => {
-      const response = await api.get('/hunting/hypotheses', {
-        params: {
-          ...(mitreFilterTab && { search: mitreFilterTab }),
-          ...(priorityFilterTab && { priority: priorityFilterTab }),
-          ...(hypothesisStatusFilter && { status: hypothesisStatusFilter }),
-        },
-      });
-      return response.data;
+      try {
+        const response = await api.get('/hunting/hypotheses', {
+          params: {
+            ...(mitreFilterTab && { search: mitreFilterTab }),
+            ...(priorityFilterTab && { priority: priorityFilterTab }),
+            ...(hypothesisStatusFilter && { status: hypothesisStatusFilter }),
+          },
+        });
+        return response.data;
+      } catch { return { items: [] }; }
     },
     enabled: activeTab === 'hypotheses' || showNewHuntModal,
+    retry: 1,
   });
 
   // Fetch findings
   const { data: findingsData, isLoading: findingsLoading } = useQuery({
     queryKey: ['hunting-findings', findingSeverityFilter, findingStatusFilter],
     queryFn: async () => {
-      const response = await api.get('/hunting/findings', {
-        params: {
-          ...(findingSeverityFilter && { severity: findingSeverityFilter }),
-          ...(findingStatusFilter && { classification: findingStatusFilter }),
-        },
-      });
-      return response.data;
+      try {
+        const response = await api.get('/hunting/findings', {
+          params: {
+            ...(findingSeverityFilter && { severity: findingSeverityFilter }),
+            ...(findingStatusFilter && { classification: findingStatusFilter }),
+          },
+        });
+        return response.data;
+      } catch { return { items: [] }; }
     },
     enabled: activeTab === 'findings',
+    retry: 1,
   });
 
   // Fetch notebooks
   const { data: notebooksData, isLoading: notebooksLoading } = useQuery({
     queryKey: ['hunting-notebooks'],
     queryFn: async () => {
-      const response = await api.get('/hunting/notebooks');
-      return response.data;
+      try {
+        const response = await api.get('/hunting/notebooks');
+        return response.data;
+      } catch { return []; }
     },
     enabled: activeTab === 'notebooks',
+    retry: 1,
   });
 
   // Fetch templates
   const { data: templatesData, isLoading: templatesLoading } = useQuery({
     queryKey: ['hunting-templates'],
     queryFn: async () => {
-      const response = await api.get('/hunting/templates');
-      return response.data;
+      try {
+        const response = await api.get('/hunting/templates');
+        return response.data;
+      } catch { return []; }
     },
     enabled: activeTab === 'templates',
+    retry: 1,
   });
 
   // Pause/Resume hunt mutation
