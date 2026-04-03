@@ -1018,34 +1018,38 @@ export const apisecurityApi = {
   getAPIs: async (params?: {
     page?: number;
     size?: number;
-  }): Promise<PaginatedResponse<APIEndpoint>> => {
-    const response = await api.get('/apisecurity/endpoints', { params });
-    return response.data;
+  }): Promise<any[]> => {
+    const response = await api.get('/api-security/endpoints', { params });
+    const data = response.data;
+    return Array.isArray(data) ? data : (data?.items ?? []);
   },
 
   getVulnerabilities: async (params?: {
     page?: number;
     size?: number;
-  }): Promise<PaginatedResponse<Vulnerability>> => {
-    const response = await api.get('/apisecurity/vulnerabilities', { params });
-    return response.data;
+  }): Promise<any[]> => {
+    const response = await api.get('/api-security/vulnerabilities', { params });
+    const data = response.data;
+    return Array.isArray(data) ? data : (data?.items ?? []);
   },
 
   getAnomalies: async (params?: {
     page?: number;
     size?: number;
-  }): Promise<PaginatedResponse<any>> => {
-    const response = await api.get('/apisecurity/anomalies', { params });
-    return response.data;
+  }): Promise<any[]> => {
+    const response = await api.get('/api-security/anomalies', { params });
+    const data = response.data;
+    return Array.isArray(data) ? data : (data?.items ?? []);
   },
 
   getPolicies: async (): Promise<any[]> => {
-    const response = await api.get('/apisecurity/policies');
-    return response.data;
+    const response = await api.get('/api-security/policies');
+    const data = response.data;
+    return Array.isArray(data) ? data : (data?.items ?? []);
   },
 
   registerAPI: async (data: { name: string; method: string }): Promise<any> => {
-    const response = await api.post('/apisecurity/endpoints', data);
+    const response = await api.post('/api-security/endpoints', data);
     return response.data;
   },
 };
