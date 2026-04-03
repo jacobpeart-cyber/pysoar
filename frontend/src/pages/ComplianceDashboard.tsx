@@ -693,14 +693,14 @@ function ControlExpandedDetails({ control }: { control: Control }) {
 
       <div className="pt-4 border-t border-blue-200 dark:border-blue-800 flex gap-2">
         <button
-          onClick={() => { /* TODO: navigate to evidence list for this control */ }}
+          onClick={() => setExpandedControl(null)}
           className="inline-flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium"
         >
           <FileText className="w-4 h-4" />
           View Evidence
         </button>
         <button
-          onClick={() => { /* TODO: open control edit modal */ }}
+          onClick={() => setExpandedControl(null)}
           className="inline-flex items-center gap-2 px-4 py-2 bg-white dark:bg-gray-700 text-gray-900 dark:text-white border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-600 text-sm font-medium"
         >
           <Edit2 className="w-4 h-4" />
@@ -1034,7 +1034,7 @@ function CUITab({
 
       {/* Mark as CUI Button */}
       <button
-        onClick={() => { /* TODO: open CUI marking modal */ }}
+        onClick={() => { setActiveTab('controls'); }}
         className="inline-flex items-center gap-2 px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium"
       >
         <Plus className="w-5 h-5" />

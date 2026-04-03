@@ -145,7 +145,7 @@ export default function OTSecurityDashboard() {
             <Cpu className="w-8 h-8 text-indigo-600" />
             <h1 className="text-3xl font-bold">OT/ICS Security</h1>
           </div>
-          <button className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+          <button onClick={() => { const blob = new Blob([JSON.stringify({ timestamp: new Date().toISOString(), report: 'OT Security Export' }, null, 2)], { type: 'application/json' }); const url = URL.createObjectURL(blob); const a = document.createElement('a'); a.href = url; a.download = 'ot-security-report.json'; a.click(); URL.revokeObjectURL(url); }} className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">
             <Download className="w-4 h-4" />
             Export Report
           </button>

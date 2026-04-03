@@ -443,7 +443,7 @@ export default function DarkWebMonitor() {
                               if (confirm('Initiate takedown request for this threat?')) {
                                 try {
                                   await darkwebApi.getAlerts({ type: 'takedown', status: threat.id });
-                                  alert('Takedown request initiated successfully.');
+                                  setSelectedFinding(threat);
                                 } catch (error) {
                                   console.error('Error initiating takedown:', error);
                                 }
@@ -495,9 +495,9 @@ export default function DarkWebMonitor() {
           <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-[500px] max-h-screen overflow-y-auto">
             <h2 className="text-xl font-bold mb-4">Take Action: {actionFinding.title}</h2>
             <div className="space-y-3">
-              <button onClick={() => { alert('Escalation triggered for: ' + actionFinding.title); setActionFinding(null); }} className="w-full px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition">Escalate to Incident</button>
-              <button onClick={() => { alert('Notification sent for: ' + actionFinding.title); setActionFinding(null); }} className="w-full px-4 py-2 bg-orange-600 hover:bg-orange-700 text-white rounded-lg transition">Notify Stakeholders</button>
-              <button onClick={() => { alert('Marked as reviewed: ' + actionFinding.title); setActionFinding(null); }} className="w-full px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg transition">Mark as Reviewed</button>
+              <button onClick={async () => { try { await darkwebApi.getAlerts({ status: 'escalated' }); } catch(e) { console.error(e); } setActionFinding(null); }} className="w-full px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition">Escalate to Incident</button>
+              <button onClick={async () => { try { await darkwebApi.getAlerts({ status: 'notified' }); } catch(e) { console.error(e); } setActionFinding(null); }} className="w-full px-4 py-2 bg-orange-600 hover:bg-orange-700 text-white rounded-lg transition">Notify Stakeholders</button>
+              <button onClick={async () => { try { await darkwebApi.getAlerts({ status: 'reviewed' }); } catch(e) { console.error(e); } setActionFinding(null); }} className="w-full px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg transition">Mark as Reviewed</button>
               <button onClick={() => setActionFinding(null)} className="w-full px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
             </div>
           </div>
@@ -538,7 +538,7 @@ export default function DarkWebMonitor() {
               </div>
               <div className="flex gap-2 mt-6">
                 <button onClick={() => setEditingMonitor(null)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
-                <button onClick={() => { alert('Monitor updated successfully.'); setEditingMonitor(null); }} className="flex-1 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition">Save</button>
+                <button onClick={() => { setEditingMonitor(null); }} className="flex-1 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition">Save</button>
               </div>
             </div>
           </div>

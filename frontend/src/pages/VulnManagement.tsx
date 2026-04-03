@@ -189,24 +189,27 @@ export default function VulnManagement() {
                   <div className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4">
                     <h3 className="font-semibold mb-3">CVSS Score Distribution</h3>
                     <div className="space-y-2 text-sm">
-                      <div className="flex justify-between"><span>9.0 - 10.0</span><span className="font-semibold text-red-600">3</span></div>
-                      <div className="flex justify-between"><span>7.0 - 8.9</span><span className="font-semibold text-orange-600">2</span></div>
-                      <div className="flex justify-between"><span>5.0 - 6.9</span><span className="font-semibold text-yellow-600">1</span></div>
+                      <div className="flex justify-between"><span>9.0 - 10.0</span><span className="font-semibold text-red-600">{vulnerabilities.filter(v => (v.cvss ?? 0) >= 9).length}</span></div>
+                      <div className="flex justify-between"><span>7.0 - 8.9</span><span className="font-semibold text-orange-600">{vulnerabilities.filter(v => (v.cvss ?? 0) >= 7 && (v.cvss ?? 0) < 9).length}</span></div>
+                      <div className="flex justify-between"><span>4.0 - 6.9</span><span className="font-semibold text-yellow-600">{vulnerabilities.filter(v => (v.cvss ?? 0) >= 4 && (v.cvss ?? 0) < 7).length}</span></div>
+                      <div className="flex justify-between"><span>0.0 - 3.9</span><span className="font-semibold text-green-600">{vulnerabilities.filter(v => (v.cvss ?? 0) < 4).length}</span></div>
                     </div>
                   </div>
                   <div className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4">
-                    <h3 className="font-semibold mb-3">Exploitability Index</h3>
+                    <h3 className="font-semibold mb-3">Severity Breakdown</h3>
                     <div className="space-y-2 text-sm">
-                      <div className="flex justify-between"><span>Very High</span><span className="font-semibold">2</span></div>
-                      <div className="flex justify-between"><span>High</span><span className="font-semibold">3</span></div>
-                      <div className="flex justify-between"><span>Medium</span><span className="font-semibold">1</span></div>
+                      <div className="flex justify-between"><span>Critical</span><span className="font-semibold text-red-600">{vulnerabilities.filter(v => v.severity === 'critical').length}</span></div>
+                      <div className="flex justify-between"><span>High</span><span className="font-semibold text-orange-600">{vulnerabilities.filter(v => v.severity === 'high').length}</span></div>
+                      <div className="flex justify-between"><span>Medium</span><span className="font-semibold text-yellow-600">{vulnerabilities.filter(v => v.severity === 'medium').length}</span></div>
+                      <div className="flex justify-between"><span>Low</span><span className="font-semibold text-green-600">{vulnerabilities.filter(v => v.severity === 'low').length}</span></div>
                     </div>
                   </div>
                   <div className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4">
                     <h3 className="font-semibold mb-3">Patch Status</h3>
                     <div className="space-y-2 text-sm">
-                      <div className="flex justify-between"><span>Patch Available</span><span className="font-semibold text-green-600">4</span></div>
-                      <div className="flex justify-between"><span>No Patch</span><span className="font-semibold text-red-600">2</span></div>
+                      <div className="flex justify-between"><span>Patch Available</span><span className="font-semibold text-green-600">{vulnerabilities.filter(v => v.patchAvailable || v.patch_available).length}</span></div>
+                      <div className="flex justify-between"><span>No Patch</span><span className="font-semibold text-red-600">{vulnerabilities.filter(v => !v.patchAvailable && !v.patch_available).length}</span></div>
+                      <div className="flex justify-between"><span>KEV Listed</span><span className="font-semibold text-red-600">{vulnerabilities.filter(v => v.kev).length}</span></div>
                     </div>
                   </div>
                 </div>
@@ -253,7 +256,7 @@ export default function VulnManagement() {
                           <td className="px-6 py-4 text-sm">{vuln.title}</td>
                           <td className="px-6 py-4">
                             <span className={`px-3 py-1 rounded-full text-xs font-medium ${getSeverityColor(vuln.severity)}`}>
-                              {vuln.severity.toUpperCase()}
+                              {(vuln.severity || 'unknown').toUpperCase()}
                             </span>
                           </td>
                           <td className="px-6 py-4 text-sm font-semibold">{vuln.cvss?.toFixed(1) ?? 'N/A'}</td>
@@ -329,7 +332,7 @@ export default function VulnManagement() {
                           onClick={async () => {
                             try {
                               await vulnmgmtApi.runScan(profile.id);
-                              alert('Scan started successfully for: ' + profile.name);
+                              queryClient.invalidateQueries({ queryKey: ['vulnmgmt'] });
                             } catch (error) {
                               console.error('Error running scan:', error);
                             }
@@ -552,7 +555,7 @@ export default function VulnManagement() {
               </div>
               <div className="flex gap-2 mt-6">
                 <button onClick={() => setEditingVulnerability(null)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
-                <button onClick={() => { alert('Vulnerability updated.'); setEditingVulnerability(null); }} className="flex-1 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition">Save</button>
+                <button onClick={() => { setEditingVulnerability(null); }} className="flex-1 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition">Save</button>
               </div>
             </div>
           </div>
@@ -575,7 +578,7 @@ export default function VulnManagement() {
               </div>
               <div className="flex gap-2 mt-6">
                 <button onClick={() => setEditingException(null)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
-                <button onClick={() => { alert('Exception updated.'); setEditingException(null); }} className="flex-1 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition">Save</button>
+                <button onClick={() => { setEditingException(null); }} className="flex-1 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition">Save</button>
               </div>
             </div>
           </div>
@@ -598,7 +601,7 @@ export default function VulnManagement() {
               </div>
               <div className="flex gap-2 mt-6">
                 <button onClick={() => setEditingScanProfile(null)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
-                <button onClick={() => { alert('Scan profile updated.'); setEditingScanProfile(null); }} className="flex-1 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition">Save</button>
+                <button onClick={() => { setEditingScanProfile(null); }} className="flex-1 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition">Save</button>
               </div>
             </div>
           </div>
@@ -612,8 +615,8 @@ export default function VulnManagement() {
             <h2 className="text-xl font-bold mb-4">Remediate: {remediatingVuln.cveId}</h2>
             <div className="space-y-3">
               <p className="text-sm text-gray-600 dark:text-gray-400">{remediatingVuln.title}</p>
-              <button onClick={async () => { try { await vulnmgmtApi.runScan(remediatingVuln.id); alert('Patch operation initiated for ' + remediatingVuln.cveId); setRemediatingVuln(null); } catch (e) { console.error(e); } }} className="w-full px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition">Apply Patch</button>
-              <button onClick={() => { alert('Compensating control applied for ' + remediatingVuln.cveId); setRemediatingVuln(null); }} className="w-full px-4 py-2 bg-orange-600 hover:bg-orange-700 text-white rounded-lg transition">Apply Compensating Control</button>
+              <button onClick={async () => { try { await vulnmgmtApi.runScan(remediatingVuln.id); setRemediatingVuln(null); queryClient.invalidateQueries({ queryKey: ['vulnmgmt'] }); } catch (e) { console.error(e); } }} className="w-full px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition">Apply Patch</button>
+              <button onClick={() => { setRemediatingVuln(null); }} className="w-full px-4 py-2 bg-orange-600 hover:bg-orange-700 text-white rounded-lg transition">Apply Compensating Control</button>
               <button onClick={() => setRemediatingVuln(null)} className="w-full px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
             </div>
           </div>

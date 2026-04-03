@@ -167,11 +167,10 @@ function formatDuration(startedAt: string | null, completedAt: string | null, du
 }
 
 function showNotification(message: string, type: 'success' | 'error' = 'success') {
-  // Use a simple alert-based notification; could be replaced with toast library
   if (type === 'error') {
-    alert('Error: ' + message);
+    console.error(message);
   } else {
-    alert(message);
+    console.log(message);
   }
 }
 

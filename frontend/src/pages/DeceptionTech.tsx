@@ -421,10 +421,10 @@ export default function DeceptionTech() {
                       if (confirm('Are you sure you want to disable this decoy?')) {
                         try {
                           await api.post(`/deception/decoys/${decoy.id}/disable`);
-                          alert('Decoy disabled: ' + decoy.name);
+                          // success
                           queryClient.invalidateQueries({ queryKey: ['decoys'] });
                         } catch (error: any) {
-                          alert('Failed to disable decoy: ' + (error?.response?.data?.detail || error.message));
+                          console.error('Failed to disable decoy:', error);
                         }
                       }
                     }}
@@ -491,9 +491,9 @@ export default function DeceptionTech() {
                         onClick={async () => {
                           try {
                             await api.post(`/deception/tokens/${token.id}/check`);
-                            alert('Token check initiated for: ' + token.name);
+                            // success
                           } catch (error: any) {
-                            alert('Failed to check token: ' + (error?.response?.data?.detail || error.message));
+                            console.error('Failed to check token:', error);
                           }
                         }}
                         className="text-xs px-2 py-1 rounded bg-blue-50 dark:bg-blue-900/20 text-blue-600 dark:text-blue-400 hover:bg-blue-100 dark:hover:bg-blue-900/40 transition-colors font-medium"
@@ -697,7 +697,7 @@ export default function DeceptionTech() {
                     setModalError(null);
                     try {
                       await api.post('/deception/decoys', { name: deployName, decoy_type: deployType, category: deployCategory, fidelity_level: deployFidelity, organization_id: 'default' });
-                      alert('Decoy deployed successfully.');
+                      setShowDeployModal(false);
                       setShowDeployModal(false);
                       setDeployName(''); setDeployType('honeypot'); setDeployCategory('network'); setDeployFidelity('medium');
                       queryClient.invalidateQueries({ queryKey: ['decoys'] });
@@ -745,7 +745,7 @@ export default function DeceptionTech() {
                     setModalError(null);
                     try {
                       await api.post('/deception/tokens', { token_type: tokenType, organization_id: 'default' });
-                      alert('Token generated successfully.');
+                      setShowTokenModal(false);
                       setShowGenerateTokenModal(false);
                       setTokenName(''); setTokenType('aws_key');
                       queryClient.invalidateQueries({ queryKey: ['honeyTokens'] });
@@ -796,7 +796,7 @@ export default function DeceptionTech() {
                     setModalError(null);
                     try {
                       await api.post('/deception/campaigns', { name: campaignName, objective: campaignObjective, description: campaignDescription, organization_id: 'default', created_by: 'current_user' });
-                      alert('Campaign created successfully.');
+                      setShowCampaignModal(false);
                       setShowCreateCampaignModal(false);
                       setCampaignName(''); setCampaignObjective('general_detection'); setCampaignDescription('');
                       queryClient.invalidateQueries({ queryKey: ['campaigns'] });
@@ -865,7 +865,7 @@ export default function DeceptionTech() {
                         fidelity_level: configFidelity || configDecoy.fidelity_level,
                         organization_id: 'default',
                       });
-                      alert('Decoy configuration saved.');
+                      setConfigDecoy(null);
                       setConfigDecoy(null);
                       setConfigName(''); setConfigFidelity('medium');
                       queryClient.invalidateQueries({ queryKey: ['decoys'] });

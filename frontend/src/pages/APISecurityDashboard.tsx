@@ -523,41 +523,32 @@ export default function APISecurityDashboard() {
                 </button>
               </div>
 
-              <div className="space-y-4">
+              <form className="space-y-4" onSubmit={async (e) => {
+                e.preventDefault();
+                const fd = new FormData(e.currentTarget);
+                try {
+                  await api.post('/apisecurity/endpoints', { name: fd.get('name'), api_type: fd.get('type') });
+                  setShowModal(false);
+                } catch (err) { console.error('Failed to register API:', err); }
+              }}>
                 <div>
                   <label className="block text-sm font-medium text-gray-300 mb-2">API Name</label>
-                  <input
-                    type="text"
-                    className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white placeholder-gray-500 dark:bg-gray-700 dark:border-gray-600"
-                    placeholder="e.g., Payment Service"
-                  />
+                  <input name="name" required type="text" className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white placeholder-gray-500" placeholder="e.g., Payment Service" />
                 </div>
-
                 <div>
                   <label className="block text-sm font-medium text-gray-300 mb-2">API Type</label>
-                  <select className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white dark:bg-gray-700 dark:border-gray-600">
+                  <select name="type" className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white">
                     <option>REST</option>
                     <option>GraphQL</option>
                     <option>gRPC</option>
                     <option>SOAP</option>
                   </select>
                 </div>
-
                 <div className="flex gap-4 mt-6">
-                  <button
-                    onClick={() => setShowModal(false)}
-                    className="flex-1 bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded transition-colors"
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    onClick={() => setShowModal(false)}
-                    className="flex-1 bg-cyan-600 hover:bg-cyan-700 text-white px-4 py-2 rounded transition-colors"
-                  >
-                    Register
-                  </button>
+                  <button type="button" onClick={() => setShowModal(false)} className="flex-1 bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded transition-colors">Cancel</button>
+                  <button type="submit" className="flex-1 bg-cyan-600 hover:bg-cyan-700 text-white px-4 py-2 rounded transition-colors">Register</button>
                 </div>
-              </div>
+              </form>
             </div>
           </div>
         )}

@@ -531,59 +531,38 @@ export default function PhishingSimulation() {
                 </button>
               </div>
 
-              <div className="space-y-4">
+              <form className="space-y-4" onSubmit={async (e) => {
+                e.preventDefault();
+                const fd = new FormData(e.currentTarget);
+                try {
+                  await phishingApi.createCampaign({ name: fd.get('name') as string, description: fd.get('template') as string, targets: [(fd.get('group') as string) || 'all'] });
+                  setShowModal(false);
+                  loadData();
+                } catch (err) { console.error('Create campaign failed:', err); }
+              }}>
                 <div>
                   <label className="block text-sm font-medium text-gray-300 mb-2">Campaign Name</label>
-                  <input
-                    type="text"
-                    className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white placeholder-gray-500 dark:bg-gray-700 dark:border-gray-600"
-                    placeholder="e.g., Invoice Scam Q2"
-                  />
+                  <input name="name" required type="text" className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white placeholder-gray-500" placeholder="e.g., Invoice Scam Q2" />
                 </div>
-
                 <div>
                   <label className="block text-sm font-medium text-gray-300 mb-2">Template</label>
-                  <select className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white dark:bg-gray-700 dark:border-gray-600">
-                    <option>Select a template...</option>
-                    {templates.map((t) => (
-                      <option key={t.id}>{t.name}</option>
-                    ))}
+                  <select name="template" className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white">
+                    <option value="">Select a template...</option>
+                    {templates.map((t: any) => (<option key={t.id} value={t.name}>{t.name}</option>))}
                   </select>
                 </div>
-
                 <div>
                   <label className="block text-sm font-medium text-gray-300 mb-2">Target Group</label>
-                  <select className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white dark:bg-gray-700 dark:border-gray-600">
-                    <option>Select a group...</option>
-                    {targetGroups.map((g) => (
-                      <option key={g.id}>{g.name}</option>
-                    ))}
+                  <select name="group" className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white">
+                    <option value="">Select a group...</option>
+                    {targetGroups.map((g: any) => (<option key={g.id} value={g.name}>{g.name}</option>))}
                   </select>
                 </div>
-
                 <div className="flex gap-4 mt-6">
-                  <button
-                    onClick={() => setShowModal(false)}
-                    className="flex-1 bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded transition-colors"
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    onClick={async () => {
-                      try {
-                        await phishingApi.createCampaign({});
-                      } catch (err) {
-                        console.error('Create campaign failed:', err);
-                      } finally {
-                        setShowModal(false);
-                      }
-                    }}
-                    className="flex-1 bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded transition-colors"
-                  >
-                    Create Campaign
-                  </button>
+                  <button type="button" onClick={() => setShowModal(false)} className="flex-1 bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded transition-colors">Cancel</button>
+                  <button type="submit" className="flex-1 bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded transition-colors">Create Campaign</button>
                 </div>
-              </div>
+              </form>
             </div>
           </div>
         )}

@@ -26,6 +26,8 @@ export default function DataLakeDashboard() {
   const [showModal, setShowModal] = useState(false);
   const [queryLanguage, setQueryLanguage] = useState<'sql' | 'kql' | 'spl'>('sql');
   const [queryInput, setQueryInput] = useState('');
+  const [queryResult, setQueryResult] = useState<string | null>(null);
+  const [queryRunning, setQueryRunning] = useState(false);
 
   const { data: sources = [] } = useQuery({ queryKey: ['dataSources'], queryFn: datalakeApi.getDataSources });
   const { data: pipelines = [] } = useQuery({ queryKey: ['pipelines'], queryFn: datalakeApi.getPipelines });
@@ -375,8 +377,23 @@ export default function DataLakeDashboard() {
                 >
                   Clear
                 </button>
-                <button className="bg-emerald-600 hover:bg-emerald-700 text-white px-6 py-2 rounded transition-colors font-medium">
-                  Execute Query
+                <button
+                  disabled={!queryInput.trim() || queryRunning}
+                  onClick={async () => {
+                    setQueryRunning(true);
+                    setQueryResult(null);
+                    try {
+                      const res = await api.post('/datalake/query', { query: queryInput });
+                      setQueryResult(JSON.stringify(res.data, null, 2));
+                    } catch (err: any) {
+                      setQueryResult('Error: ' + (err?.response?.data?.detail || err.message || 'Query failed'));
+                    } finally {
+                      setQueryRunning(false);
+                    }
+                  }}
+                  className="bg-emerald-600 hover:bg-emerald-700 text-white px-6 py-2 rounded transition-colors font-medium disabled:opacity-50"
+                >
+                  {queryRunning ? 'Running...' : 'Execute Query'}
                 </button>
               </div>
             </div>
@@ -384,12 +401,7 @@ export default function DataLakeDashboard() {
             <div className="bg-gray-800 border border-gray-700 rounded-lg p-6 dark:bg-gray-800 dark:border-gray-700">
               <h4 className="font-semibold text-white mb-4">Query Results</h4>
               <div className="bg-gray-700/50 rounded p-4 text-gray-300 font-mono text-sm max-h-60 overflow-y-auto">
-                <pre>
-{`Executing query...
-Results will appear here
-Estimated execution time: 1.2s
-Rows returned: 1,250,400`}
-                </pre>
+                <pre>{queryResult ?? 'Execute a query to see results here.'}</pre>
               </div>
             </div>
           </div>
@@ -516,40 +528,27 @@ Rows returned: 1,250,400`}
                 </button>
               </div>
 
-              <div className="space-y-4">
+              <form className="space-y-4" onSubmit={async (e) => {
+                e.preventDefault();
+                const fd = new FormData(e.currentTarget);
+                try {
+                  await api.post('/datalake/sources', { name: fd.get('name'), connection_string: fd.get('conn') });
+                  setShowModal(false);
+                } catch (err) { console.error('Failed to add source:', err); }
+              }}>
                 <div>
                   <label className="block text-sm font-medium text-gray-300 mb-2">Source Name</label>
-                  <input
-                    type="text"
-                    className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white placeholder-gray-500 dark:bg-gray-700 dark:border-gray-600"
-                    placeholder="e.g., Customer Events"
-                  />
+                  <input name="name" required type="text" className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white placeholder-gray-500" placeholder="e.g., Customer Events" />
                 </div>
-
                 <div>
                   <label className="block text-sm font-medium text-gray-300 mb-2">Connection String</label>
-                  <input
-                    type="text"
-                    className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white placeholder-gray-500 dark:bg-gray-700 dark:border-gray-600"
-                    placeholder="Connection details"
-                  />
+                  <input name="conn" type="text" className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white placeholder-gray-500" placeholder="Connection details" />
                 </div>
-
                 <div className="flex gap-4 mt-6">
-                  <button
-                    onClick={() => setShowModal(false)}
-                    className="flex-1 bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded transition-colors"
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    onClick={() => setShowModal(false)}
-                    className="flex-1 bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded transition-colors"
-                  >
-                    Add Source
-                  </button>
+                  <button type="button" onClick={() => setShowModal(false)} className="flex-1 bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded transition-colors">Cancel</button>
+                  <button type="submit" className="flex-1 bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded transition-colors">Add Source</button>
                 </div>
-              </div>
+              </form>
             </div>
           </div>
         )}
