@@ -7,6 +7,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from src.api.deps import AdminUser, CurrentUser, DatabaseSession
 from src.core.logging import get_logger
@@ -67,8 +68,12 @@ async def list_playbooks(
     is_template: Optional[bool] = None,
 ):
     """List playbooks with filtering and pagination"""
-    query = select(VisualPlaybook).where(
-        VisualPlaybook.organization_id == current_user.organization_id
+    org_id = getattr(current_user, "organization_id", None)
+    query = select(VisualPlaybook).options(
+        selectinload(VisualPlaybook.nodes),
+        selectinload(VisualPlaybook.edges),
+    ).where(
+        VisualPlaybook.organization_id == org_id
     )
 
     if search:
@@ -86,7 +91,7 @@ async def list_playbooks(
     # Get total count
     count_result = await db.execute(
         select(func.count(VisualPlaybook.id)).where(
-            VisualPlaybook.organization_id == current_user.organization_id
+            VisualPlaybook.organization_id == org_id
         )
     )
     total = count_result.scalar() or 0
@@ -696,7 +701,10 @@ async def _get_playbook_or_404(
 ) -> VisualPlaybook:
     """Get playbook or raise 404"""
     result = await db.execute(
-        select(VisualPlaybook).where(
+        select(VisualPlaybook).options(
+            selectinload(VisualPlaybook.nodes),
+            selectinload(VisualPlaybook.edges),
+        ).where(
             VisualPlaybook.id == playbook_id,
             VisualPlaybook.organization_id == organization_id,
         )
