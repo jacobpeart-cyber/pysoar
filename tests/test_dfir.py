@@ -131,10 +131,10 @@ class TestEvidenceManager:
 
     def test_add_evidence_item(self, evidence_manager):
         """Test adding evidence to case"""
-        result = evidence_manager.add_evidence(
+        result = evidence_manager.collect_evidence(
             case_id="case_123",
             evidence_type="file",
-            source_location="/mnt/evidence/log.txt",
+            storage_location="/mnt/evidence/log.txt",
             description="System log file",
             chain_of_custody_owner="investigator_1",
         )
@@ -144,10 +144,10 @@ class TestEvidenceManager:
 
     def test_add_network_evidence(self, evidence_manager):
         """Test adding network evidence"""
-        result = evidence_manager.add_evidence(
+        result = evidence_manager.collect_evidence(
             case_id="case_123",
             evidence_type="network",
-            source_location="192.168.1.100",
+            storage_location="192.168.1.100",
             description="Compromised workstation",
         )
 
@@ -155,7 +155,7 @@ class TestEvidenceManager:
 
     def test_compute_evidence_hash(self, evidence_manager):
         """Test computing evidence hash for integrity"""
-        result = evidence_manager.compute_hash(
+        result = evidence_manager.verify_integrity(
             evidence_id="evidence_123",
             algorithm="sha256",
         )
@@ -213,7 +213,7 @@ class TestTimelineReconstructor:
 
     def test_identify_timeline_gaps(self, timeline_reconstructor):
         """Test identifying gaps in event timeline"""
-        result = timeline_reconstructor.identify_gaps(
+        result = timeline_reconstructor.detect_gaps(
             case_id="case_123",
             start_time=datetime.utcnow(),
             end_time=datetime.utcnow() + timedelta(hours=1),
@@ -232,7 +232,7 @@ class TestArtifactAnalyzer:
 
     def test_analyze_file_artifact(self, artifact_analyzer):
         """Test analyzing file artifact"""
-        result = artifact_analyzer.analyze_file(
+        result = artifact_analyzer.analyze_disk_artifacts(
             case_id="case_123",
             file_path="/path/to/evidence.bin",
             analysis_type="binary",
@@ -242,7 +242,7 @@ class TestArtifactAnalyzer:
 
     def test_extract_metadata(self, artifact_analyzer):
         """Test extracting file metadata"""
-        result = artifact_analyzer.extract_metadata(
+        result = artifact_analyzer.extract_iocs(
             evidence_id="evidence_123",
         )
 

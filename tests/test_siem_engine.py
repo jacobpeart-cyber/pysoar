@@ -3,6 +3,7 @@
 Real tests importing and testing actual SIEM rule evaluation classes.
 """
 
+import re
 import pytest
 from datetime import datetime, timedelta
 from typing import Dict, Any

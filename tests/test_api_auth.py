@@ -10,8 +10,8 @@ import jwt
 
 from src.core.security import (
     create_access_token,
-    verify_access_token,
-    hash_password,
+    verify_token as verify_access_token,
+    get_password_hash as hash_password,
     verify_password,
 )
 
