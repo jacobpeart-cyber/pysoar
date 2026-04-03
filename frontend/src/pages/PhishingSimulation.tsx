@@ -34,9 +34,9 @@ export default function PhishingSimulation() {
     const totalClicked = campaigns.reduce((sum: number, c: Campaign) => sum + c.clicked, 0);
     const totalReported = campaigns.reduce((sum: number, c: Campaign) => sum + c.reported, 0);
     const totalSent = campaigns.reduce((sum: number, c: Campaign) => sum + c.sent, 0);
-    const avgClickRate = ((totalClicked / totalSent) * 100).toFixed(1);
-    const avgReportRate = ((totalReported / totalSent) * 100).toFixed(1);
-    const avgAwareness = (awarenessScores.reduce((sum: number, s: AwarenessScore) => sum + s.score, 0) / awarenessScores.length).toFixed(1);
+    const avgClickRate = ((totalClicked / (totalSent || 1)) * 100).toFixed(1);
+    const avgReportRate = ((totalReported / (totalSent || 1)) * 100).toFixed(1);
+    const avgAwareness = (awarenessScores.reduce((sum: number, s: AwarenessScore) => sum + s.score, 0) / (awarenessScores.length || 1)).toFixed(1);
     return { activeCampaigns, avgClickRate, avgReportRate, avgAwareness };
   }, [campaigns, awarenessScores]);
 
@@ -67,7 +67,7 @@ export default function PhishingSimulation() {
     // Use departments as x-axis points with their average scores
     return depts.map((dept) => ({
       month: dept,
-      score: Math.round(deptScores[dept].reduce((a, b) => a + b, 0) / deptScores[dept].length),
+      score: Math.round(deptScores[dept].reduce((a, b) => a + b, 0) / (deptScores[dept].length || 1)),
     }));
   }, [awarenessScores]);
 

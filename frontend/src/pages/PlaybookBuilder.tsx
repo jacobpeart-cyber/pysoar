@@ -498,7 +498,7 @@ export default function PlaybookBuilder() {
                               <CategoryIcon className="w-6 h-6 text-indigo-600 dark:text-indigo-400" />
                             </div>
                             <span className="text-xs font-medium text-gray-500 dark:text-gray-400 bg-gray-100 dark:bg-gray-700 px-2 py-1 rounded">
-                              {template.category.replace('-', ' ')}
+                              {(template.category || '').replace('-', ' ')}
                             </span>
                           </div>
                           <h3 className="font-semibold text-lg mb-2 group-hover:text-indigo-600 dark:group-hover:text-indigo-400 transition">

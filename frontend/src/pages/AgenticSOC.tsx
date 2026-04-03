@@ -76,7 +76,7 @@ const AgenticSOC: React.FC = () => {
         const activeCount = agentList.filter((a: any) => a.status === 'active').length;
         const openInv = invList.filter((i: any) => i.status !== 'completed' && i.status !== 'closed').length;
         const avgConf = invList.length > 0
-          ? Math.round(invList.reduce((sum: number, i: any) => sum + (i.confidence_score || 0), 0) / invList.length * 10) / 10
+          ? Math.round(invList.reduce((sum: number, i: any) => sum + (i.confidence_score || 0), 0) / (invList.length || 1) * 10) / 10
           : 0;
 
         setAgentMetrics({

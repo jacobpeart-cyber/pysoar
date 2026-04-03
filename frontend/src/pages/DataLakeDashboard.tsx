@@ -489,14 +489,14 @@ export default function DataLakeDashboard() {
                         </div>
                         <div className="flex justify-between text-xs text-gray-500 mb-2">
                           <span>Capacity Used</span>
-                          <span>{Math.round((tier.value / totalValue) * 100)}%</span>
+                          <span>{Math.round((tier.value / (totalValue || 1)) * 100)}%</span>
                         </div>
                         <div className="w-full h-2 bg-gray-700 rounded-full dark:bg-gray-700">
                           <div
                             className="h-full rounded-full"
                             style={{
                               backgroundColor: STORAGE_COLORS[idx],
-                              width: `${Math.round((tier.value / totalValue) * 100)}%`,
+                              width: `${Math.round((tier.value / (totalValue || 1)) * 100)}%`,
                             }}
                           />
                         </div>

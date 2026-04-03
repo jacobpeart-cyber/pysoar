@@ -86,7 +86,7 @@ export default function SupplyChainDashboard() {
 
   const totalComponents = components.length;
   const criticalRisks = risks.filter(r => r.severity === 'critical').length;
-  const vendorScoreAvg = (vendors.reduce((sum, v) => sum + v.assessmentScore, 0) / vendors.length).toFixed(1);
+  const vendorScoreAvg = (vendors.reduce((sum, v) => sum + v.assessmentScore, 0) / (vendors.length || 1)).toFixed(1);
   const sbomCompliance = sboms.filter(s => s.status === 'compliant').length * 25;
 
   const tabs = [

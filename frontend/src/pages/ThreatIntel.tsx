@@ -482,8 +482,8 @@ export default function ThreatIntel() {
                           getReputationColor(lookupMutation.data.reputation)
                         )}
                       >
-                        {lookupMutation.data.reputation.charAt(0).toUpperCase() +
-                          lookupMutation.data.reputation.slice(1)}
+                        {(lookupMutation.data?.reputation || 'unknown').charAt(0).toUpperCase() +
+                          (lookupMutation.data?.reputation || 'unknown').slice(1)}
                       </span>
                     </div>
                     <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">

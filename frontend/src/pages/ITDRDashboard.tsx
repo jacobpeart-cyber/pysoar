@@ -154,7 +154,7 @@ export default function ITDRDashboard() {
 
   // Compute MFA coverage from identities data
   const mfaCoverage = identities.length > 0
-    ? Math.round((identities.filter((i: any) => i.mfa_enabled).length / identities.length) * 100)
+    ? Math.round((identities.filter((i: any) => i.mfa_enabled).length / (identities.length || 1)) * 100)
     : 0;
 
   const tabs = [
