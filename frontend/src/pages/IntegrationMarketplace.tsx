@@ -262,7 +262,7 @@ export default function IntegrationMarketplace() {
                       <div className="grid grid-cols-4 gap-4 text-sm mb-4">
                         <div>
                           <p className="text-gray-600 dark:text-gray-400">Last Sync</p>
-                          <p className="font-medium">{new Date(integration.lastSync).toLocaleDateString()}</p>
+                          <p className="font-medium">{new Date(integration.lastSync || "").toLocaleDateString()}</p>
                         </div>
                         <div>
                           <p className="text-gray-600 dark:text-gray-400">Frequency</p>
@@ -313,7 +313,7 @@ export default function IntegrationMarketplace() {
                       {executions.map((exec) => (
                         <tr key={exec.id} className="border-b border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700 transition">
                           <td className="px-6 py-4 text-sm font-medium">{exec.connector}</td>
-                          <td className="px-6 py-4 text-sm">{new Date(exec.executionTime).toLocaleString()}</td>
+                          <td className="px-6 py-4 text-sm">{new Date(exec.executionTime || "").toLocaleString()}</td>
                           <td className="px-6 py-4">
                             <span className={`px-3 py-1 rounded-full text-xs font-medium ${getStatusColor(exec.status)}`}>
                               {exec.status}
@@ -356,7 +356,7 @@ export default function IntegrationMarketplace() {
                         </div>
                         <div>
                           <p className="text-gray-600 dark:text-gray-400">Last Triggered</p>
-                          <p className="font-medium">{webhook.lastTriggered ? new Date(webhook.lastTriggered).toLocaleDateString() : 'Never'}</p>
+                          <p className="font-medium">{webhook.lastTriggered ? new Date(webhook.lastTriggered || "").toLocaleDateString() : 'Never'}</p>
                         </div>
                         <div>
                           <p className="text-gray-600 dark:text-gray-400">Success Count</p>

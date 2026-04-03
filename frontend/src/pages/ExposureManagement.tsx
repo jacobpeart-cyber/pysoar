@@ -569,7 +569,7 @@ export default function ExposureManagement() {
                       </td>
                       <td className="px-4 py-3 text-sm text-gray-900 dark:text-white">{asset.vulnerability_count}</td>
                       <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">
-                        {asset.last_scan_at ? new Date(asset.last_scan_at).toLocaleDateString() : asset.last_scan ? new Date(asset.last_scan).toLocaleDateString() : '-'}
+                        {asset.last_scan_at ? new Date(asset.last_scan_at || "").toLocaleDateString() : asset.last_scan ? new Date(asset.last_scan || "").toLocaleDateString() : '-'}
                       </td>
                       <td className="px-4 py-3">
                         <span className={clsx('px-2 py-1 text-xs font-medium rounded-full', getStatusColor(asset.status))}>
@@ -846,7 +846,7 @@ export default function ExposureManagement() {
                       <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">{ticket.assigned_to || '-'}</td>
                       <td className="px-4 py-3 text-sm text-gray-900 dark:text-white">{ticket.affected_assets?.length ?? ticket.affected_assets ?? 0}</td>
                       <td className="px-4 py-3 text-sm text-gray-500 dark:text-gray-400">
-                        {ticket.due_date ? new Date(ticket.due_date).toLocaleDateString() : '-'}
+                        {ticket.due_date ? new Date(ticket.due_date || "").toLocaleDateString() : '-'}
                       </td>
                       <td className="px-4 py-3">
                         <span className={clsx('px-2 py-1 text-xs font-medium rounded-full', getStatusColor(ticket.sla_status || 'on_track'))}>
@@ -898,7 +898,7 @@ export default function ExposureManagement() {
                     <span className="font-semibold text-red-600 dark:text-red-400">{surface.critical_exposures}</span>
                   </div>
                   <div className="text-xs text-gray-500 dark:text-gray-400 pt-2 border-t border-gray-200 dark:border-gray-700">
-                    Last assessed: {new Date(surface.last_assessed).toLocaleDateString()}
+                    Last assessed: {new Date(surface.last_assessed || "").toLocaleDateString()}
                   </div>
                 </div>
                 <button

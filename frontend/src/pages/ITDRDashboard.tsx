@@ -420,7 +420,7 @@ export default function ITDRDashboard() {
                           <tr key={credential.id} className="border-b border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700 transition">
                             <td className="px-6 py-4 text-sm font-medium">{credential.exposure_source ?? 'N/A'}</td>
                             <td className="px-6 py-4 text-sm">{credential.credential_type ?? 'N/A'}</td>
-                            <td className="px-6 py-4 text-sm">{credential.created_at ? new Date(credential.created_at).toLocaleDateString() : 'N/A'}</td>
+                            <td className="px-6 py-4 text-sm">{credential.created_at ? new Date(credential.created_at || "").toLocaleDateString() : 'N/A'}</td>
                             <td className="px-6 py-4 text-sm">{credential.identity_id ?? 'N/A'}</td>
                             <td className="px-6 py-4 text-sm">{credential.remediation_action ?? 'None'}</td>
                             <td className="px-6 py-4">
@@ -492,7 +492,7 @@ export default function ITDRDashboard() {
                               </div>
                             </div>
                             <p className="text-xs text-gray-500 dark:text-gray-400 mt-2">
-                              {anomaly.created_at ? new Date(anomaly.created_at).toLocaleString() : 'N/A'}
+                              {anomaly.created_at ? new Date(anomaly.created_at || "").toLocaleString() : 'N/A'}
                             </p>
                           </div>
                           <button
@@ -546,7 +546,7 @@ export default function ITDRDashboard() {
                           <tr key={access.id} className="border-b border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700 transition">
                             <td className="px-6 py-4 text-sm font-medium">{access.identity_id ?? 'N/A'}</td>
                             <td className="px-6 py-4 text-sm">{access.event_type ?? 'N/A'}</td>
-                            <td className="px-6 py-4 text-sm">{access.created_at ? new Date(access.created_at).toLocaleDateString() : 'N/A'}</td>
+                            <td className="px-6 py-4 text-sm">{access.created_at ? new Date(access.created_at || "").toLocaleDateString() : 'N/A'}</td>
                             <td className="px-6 py-4">
                               <span className={`px-3 py-1 rounded-full text-xs font-medium ${access.was_revoked ? 'bg-red-100 dark:bg-red-900 text-red-800 dark:text-red-100' : 'bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-100'}`}>
                                 {access.was_revoked ? 'Revoked' : 'Active'}

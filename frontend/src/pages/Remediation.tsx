@@ -305,7 +305,7 @@ export default function Remediation() {
     if (executions.length === 0) return [];
     const grouped: Record<string, { successful: number; failed: number }> = {};
     executions.forEach((exec) => {
-      const day = new Date(exec.created_at).toLocaleDateString('en-US', { weekday: 'short' });
+      const day = new Date(exec.created_at || "").toLocaleDateString('en-US', { weekday: 'short' });
       if (!grouped[day]) grouped[day] = { successful: 0, failed: 0 };
       if (exec.overall_result === 'success' || exec.status === 'completed') grouped[day].successful += 1;
       else if (exec.overall_result === 'failure' || exec.status === 'failed') grouped[day].failed += 1;
@@ -812,7 +812,7 @@ export default function Remediation() {
                       }
                     >
                       <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-white">
-                        {new Date(execution.created_at).toLocaleString()}
+                        {new Date(execution.created_at || "").toLocaleString()}
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap">
                         <div className="flex items-center gap-2">
@@ -846,7 +846,7 @@ export default function Remediation() {
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
                         {execution.started_at && execution.completed_at
-                          ? `${((new Date(execution.completed_at).getTime() - new Date(execution.started_at).getTime()) / 1000).toFixed(1)}s`
+                          ? `${((new Date(execution.completed_at || "").getTime() - new Date(execution.started_at || "").getTime()) / 1000).toFixed(1)}s`
                           : execution.started_at ? 'Running' : '-'}
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
@@ -1109,7 +1109,7 @@ export default function Remediation() {
                       {action.target_entity}
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
-                      {action.created_at ? new Date(action.created_at).toLocaleString() : '-'}
+                      {action.created_at ? new Date(action.created_at || "").toLocaleString() : '-'}
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap">
                       <span
@@ -1208,7 +1208,7 @@ export default function Remediation() {
 
               <div className="mb-4 pb-4 border-b border-gray-200 dark:border-gray-700">
                 <p className="text-xs text-gray-600 dark:text-gray-400">
-                  Last health check: {integration.last_health_check ? new Date(integration.last_health_check).toLocaleString() : 'Never'}
+                  Last health check: {integration.last_health_check ? new Date(integration.last_health_check || "").toLocaleString() : 'Never'}
                 </p>
               </div>
 

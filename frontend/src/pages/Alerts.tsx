@@ -187,12 +187,12 @@ export default function Alerts() {
                         statusColors[alert.status] || statusColors.new
                       )}
                     >
-                      {alert.status.replace('_', ' ')}
+                      {(alert.status || "").replace('_', ' ')}
                     </span>
                   </td>
                   <td className="px-6 py-4 text-sm text-gray-500">{alert.source}</td>
                   <td className="px-6 py-4 text-sm text-gray-500">
-                    {new Date(alert.created_at).toLocaleString()}
+                    {new Date(alert.created_at || "").toLocaleString()}
                   </td>
                   <td className="px-6 py-4 text-right">
                     <div className="flex items-center justify-end space-x-2">
@@ -406,7 +406,7 @@ function AlertDetailsModal({ alert, onClose }: { alert: any; onClose: () => void
                   statusColors[alert.status]
                 )}
               >
-                {alert.status.replace('_', ' ')}
+                {(alert.status || "").replace('_', ' ')}
               </span>
             </div>
           </div>
@@ -434,11 +434,11 @@ function AlertDetailsModal({ alert, onClose }: { alert: any; onClose: () => void
           <div className="grid grid-cols-2 gap-4">
             <div>
               <label className="block text-sm font-medium text-gray-500 mb-1">Created</label>
-              <p className="text-gray-900">{new Date(alert.created_at).toLocaleString()}</p>
+              <p className="text-gray-900">{new Date(alert.created_at || "").toLocaleString()}</p>
             </div>
             <div>
               <label className="block text-sm font-medium text-gray-500 mb-1">Updated</label>
-              <p className="text-gray-900">{new Date(alert.updated_at).toLocaleString()}</p>
+              <p className="text-gray-900">{new Date(alert.updated_at || "").toLocaleString()}</p>
             </div>
           </div>
 

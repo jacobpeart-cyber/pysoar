@@ -93,7 +93,7 @@ export default function AuditLogs() {
   });
 
   const formatDate = (dateString: string) => {
-    return new Date(dateString).toLocaleString();
+    return new Date(dateString || "").toLocaleString();
   };
 
   const getActionColor = (action: string) => {

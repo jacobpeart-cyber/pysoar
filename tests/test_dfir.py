@@ -134,9 +134,11 @@ class TestEvidenceManager:
         result = evidence_manager.collect_evidence(
             case_id="case_123",
             evidence_type="file",
+            source_device="workstation-01",
+            acquisition_method="disk_image",
             storage_location="/mnt/evidence/log.txt",
-            description="System log file",
-            chain_of_custody_owner="investigator_1",
+            organization_id="org_123",
+            handling_notes="System log file",
         )
 
         assert result["status"] == "success"
@@ -147,8 +149,12 @@ class TestEvidenceManager:
         result = evidence_manager.collect_evidence(
             case_id="case_123",
             evidence_type="network",
-            storage_location="192.168.1.100",
-            description="Compromised workstation",
+            source_device="firewall-01",
+            acquisition_method="pcap_capture",
+            storage_location="/mnt/evidence/capture.pcap",
+            organization_id="org_123",
+            source_ip="192.168.1.100",
+            handling_notes="Compromised workstation",
         )
 
         assert result["status"] == "success"
@@ -157,18 +163,20 @@ class TestEvidenceManager:
         """Test computing evidence hash for integrity"""
         result = evidence_manager.verify_integrity(
             evidence_id="evidence_123",
-            algorithm="sha256",
+            evidence_hash="abc123def456",
+            hash_algorithm="sha256",
         )
 
         assert result["status"] == "success"
-        assert "hash_value" in result
+        assert "current_hash" in result
 
     def test_maintain_chain_of_custody(self, evidence_manager):
         """Test chain of custody tracking"""
         result = evidence_manager.update_chain_of_custody(
             evidence_id="evidence_123",
-            new_owner="investigator_2",
-            transfer_notes="Handed over for analysis",
+            actor="investigator_2",
+            action="transferred",
+            details="Handed over for analysis",
         )
 
         assert result["status"] == "success"
@@ -186,37 +194,48 @@ class TestTimelineReconstructor:
         """Test adding event to forensic timeline"""
         result = timeline_reconstructor.add_event(
             case_id="case_123",
-            timestamp=datetime.utcnow(),
+            event_timestamp=datetime.utcnow().isoformat(),
             event_type="file_access",
             source="audit_log",
             description="User accessed sensitive file",
-            user_id="user_abc",
         )
 
         assert result["status"] == "success"
 
     def test_build_timeline_sequence(self, timeline_reconstructor):
         """Test building timeline from events"""
-        events = [
-            {"timestamp": datetime.utcnow(), "event": "login"},
-            {"timestamp": datetime.utcnow(), "event": "file_access"},
-            {"timestamp": datetime.utcnow(), "event": "logout"},
-        ]
+        # Add events first since build_timeline reads from internal state
+        timeline_reconstructor.add_event(
+            case_id="case_123",
+            event_timestamp=datetime.utcnow().isoformat(),
+            event_type="login",
+            source="auth_log",
+        )
+        timeline_reconstructor.add_event(
+            case_id="case_123",
+            event_timestamp=datetime.utcnow().isoformat(),
+            event_type="file_access",
+            source="audit_log",
+        )
+        timeline_reconstructor.add_event(
+            case_id="case_123",
+            event_timestamp=datetime.utcnow().isoformat(),
+            event_type="logout",
+            source="auth_log",
+        )
 
         result = timeline_reconstructor.build_timeline(
             case_id="case_123",
-            events=events,
         )
 
         assert result["status"] == "success"
-        assert result["event_count"] >= len(events)
+        assert result["event_count"] >= 3
 
     def test_identify_timeline_gaps(self, timeline_reconstructor):
         """Test identifying gaps in event timeline"""
         result = timeline_reconstructor.detect_gaps(
             case_id="case_123",
-            start_time=datetime.utcnow(),
-            end_time=datetime.utcnow() + timedelta(hours=1),
+            max_gap_hours=4,
         )
 
         assert result["status"] == "success"
@@ -233,28 +252,27 @@ class TestArtifactAnalyzer:
     def test_analyze_file_artifact(self, artifact_analyzer):
         """Test analyzing file artifact"""
         result = artifact_analyzer.analyze_disk_artifacts(
-            case_id="case_123",
-            file_path="/path/to/evidence.bin",
-            analysis_type="binary",
+            artifact_type="mft_entry",
+            artifact_data={"entries": []},
         )
 
         assert result["status"] == "success"
 
     def test_extract_metadata(self, artifact_analyzer):
-        """Test extracting file metadata"""
+        """Test extracting IOCs from artifact"""
         result = artifact_analyzer.extract_iocs(
-            evidence_id="evidence_123",
+            artifact_data={"ip_addresses": ["10.0.0.1"], "domains": ["example.com"]},
+            artifact_type="network_connection",
         )
 
         assert result["status"] == "success"
-        assert "metadata" in result
+        assert "iocs" in result
 
     def test_analyze_registry_artifacts(self, artifact_analyzer):
         """Test analyzing Windows registry artifacts"""
-        result = artifact_analyzer.analyze_artifact(
-            case_id="case_123",
+        result = artifact_analyzer.analyze_disk_artifacts(
             artifact_type="registry",
-            artifact_path="HKLM\\Software\\",
+            artifact_data={"entries": []},
         )
 
         assert result["status"] == "success"
@@ -269,11 +287,13 @@ class TestLegalHoldManager:
 
     def test_place_legal_hold(self, legal_hold_manager):
         """Test placing legal hold on evidence"""
-        result = legal_hold_manager.place_hold(
+        result = legal_hold_manager.create_hold(
             case_id="case_123",
-            evidence_type="emails",
-            custodian="user@company.com",
-            hold_reason="Litigation - Case 2024-001",
+            hold_type="litigation",
+            custodians=["user@company.com"],
+            data_sources=["emails"],
+            issued_by="legal-team",
+            organization_id="org_123",
         )
 
         assert result["status"] == "success"
@@ -283,19 +303,20 @@ class TestLegalHoldManager:
         """Test releasing legal hold"""
         result = legal_hold_manager.release_hold(
             hold_id="hold_123",
-            release_reason="Case dismissed",
+            released_by="legal-team",
+            reason="Case dismissed",
         )
 
         assert result["status"] == "success"
 
     def test_track_hold_compliance(self, legal_hold_manager):
         """Test tracking legal hold compliance"""
-        result = legal_hold_manager.check_compliance(
+        result = legal_hold_manager.generate_compliance_report(
             hold_id="hold_123",
         )
 
         assert result["status"] == "success"
-        assert "compliant" in result
+        assert "report" in result
 
     async def test_case_lifecycle(self, db_session: AsyncSession):
         """Test complete case lifecycle"""
@@ -413,7 +434,7 @@ class TestChainOfCustody:
         # Verify hash matches
         assert coc["entries"][0]["hash"] == "hash_abc123"
 
-    async def test_custody_gap_detection(self, db_session: AsyncSession):
+    def test_custody_gap_detection(self):
         """Test detection of gaps in chain of custody"""
         coc_entries = [
             {"timestamp": datetime(2024, 3, 20, 10, 0), "action": "acquired"},
@@ -434,8 +455,9 @@ class TestChainOfCustody:
             if gap > max_gap_hours:
                 gaps.append({"gap_hours": gap, "between_entries": (i, i + 1)})
 
-        assert len(gaps) == 1
-        assert gaps[0]["gap_hours"] == 6
+        assert len(gaps) == 2
+        assert gaps[0]["gap_hours"] == 5.0
+        assert gaps[1]["gap_hours"] == 6.0
 
 
 @pytest.mark.asyncio

@@ -391,7 +391,7 @@ export default function AIEngine() {
                     className="w-full p-4 rounded-lg border border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors text-left"
                   >
                     <p className="text-gray-900 dark:text-white font-medium">{query.text}</p>
-                    <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">{query.results_count} results · {new Date(query.timestamp).toLocaleString()}</p>
+                    <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">{query.results_count} results · {new Date(query.timestamp || "").toLocaleString()}</p>
                   </button>
                 ))}
               </div>
@@ -454,7 +454,7 @@ export default function AIEngine() {
                             style={{ width: `${alert.confidence * 100}%` }}
                           />
                         </div>
-                        <span className="text-sm text-gray-600 dark:text-gray-400">{(alert.confidence * 100).toFixed(0)}%</span>
+                        <span className="text-sm text-gray-600 dark:text-gray-400">{((alert.confidence ?? 0) * 100).toFixed(0)}%</span>
                       </div>
                     </td>
                     <td className="px-6 py-4">
@@ -543,7 +543,7 @@ export default function AIEngine() {
                 {anomalies?.slice(0, 10).map((anomaly) => (
                   <tr key={anomaly.id} className="hover:bg-gray-50 dark:hover:bg-gray-700 transition-colors">
                     <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                      {anomaly.created_at ? new Date(anomaly.created_at).toLocaleString() : 'N/A'}
+                      {anomaly.created_at ? new Date(anomaly.created_at || "").toLocaleString() : 'N/A'}
                     </td>
                     <td className="px-6 py-4 text-sm font-medium text-gray-900 dark:text-white">{anomaly.entity_id}</td>
                     <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">{anomaly.entity_type}</td>
@@ -648,7 +648,7 @@ export default function AIEngine() {
                 <div className="grid grid-cols-2 gap-4">
                   <div className="p-3 rounded-lg bg-gray-50 dark:bg-gray-700">
                     <p className="text-xs text-gray-600 dark:text-gray-400">Probability</p>
-                    <p className="text-lg font-bold text-gray-900 dark:text-white mt-1">{(prediction.probability * 100).toFixed(0)}%</p>
+                    <p className="text-lg font-bold text-gray-900 dark:text-white mt-1">{((prediction.probability ?? 0) * 100).toFixed(0)}%</p>
                   </div>
                   <div className="p-3 rounded-lg bg-gray-50 dark:bg-gray-700">
                     <p className="text-xs text-gray-600 dark:text-gray-400">Time Horizon</p>
@@ -735,7 +735,7 @@ export default function AIEngine() {
                   <div className="space-y-2 text-sm">
                     <div className="flex justify-between">
                       <span className="text-gray-600 dark:text-gray-400">Last Trained</span>
-                      <span className="text-gray-900 dark:text-white font-medium">{model.last_trained_at ? new Date(model.last_trained_at).toLocaleDateString() : 'N/A'}</span>
+                      <span className="text-gray-900 dark:text-white font-medium">{model.last_trained_at ? new Date(model.last_trained_at || "").toLocaleDateString() : 'N/A'}</span>
                     </div>
                     <div className="flex justify-between">
                       <span className="text-gray-600 dark:text-gray-400">Predictions</span>

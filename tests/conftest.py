@@ -46,8 +46,11 @@ def event_loop() -> Generator:
 @pytest_asyncio.fixture(scope="function")
 async def db_session() -> AsyncGenerator[AsyncSession, None]:
     """Create a fresh database session for each test"""
+    # Drop first to clear stale indexes from prior failed tests
     async with test_engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all, checkfirst=True)
+        await conn.run_sync(Base.metadata.drop_all)
+    async with test_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
 
     async with TestSessionLocal() as session:
         yield session

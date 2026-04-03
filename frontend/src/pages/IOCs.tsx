@@ -214,7 +214,7 @@ export default function IOCs() {
                     {ioc.source || '-'}
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                    {format(new Date(ioc.first_seen), 'MMM d, yyyy HH:mm')}
+                    {format(new Date(ioc.first_seen || ""), 'MMM d, yyyy HH:mm')}
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
                     <button
@@ -514,14 +514,14 @@ function IOCDetailsModal({
             <div>
               <label className="block text-sm font-medium text-gray-500">First Seen</label>
               <p className="text-sm text-gray-900">
-                {format(new Date(ioc.first_seen), 'MMMM d, yyyy HH:mm')}
+                {format(new Date(ioc.first_seen || ""), 'MMMM d, yyyy HH:mm')}
               </p>
             </div>
             {ioc.last_seen && (
               <div>
                 <label className="block text-sm font-medium text-gray-500">Last Seen</label>
                 <p className="text-sm text-gray-900">
-                  {format(new Date(ioc.last_seen), 'MMMM d, yyyy HH:mm')}
+                  {format(new Date(ioc.last_seen || ""), 'MMMM d, yyyy HH:mm')}
                 </p>
               </div>
             )}

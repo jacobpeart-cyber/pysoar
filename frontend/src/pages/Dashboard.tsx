@@ -398,7 +398,7 @@ export default function Dashboard() {
                     <div className="flex-1 min-w-0">
                       <p className="text-sm font-medium text-gray-900 truncate">{alert.title}</p>
                       <p className="text-sm text-gray-500 mt-1">
-                        {alert.source} &middot; {new Date(alert.created_at).toLocaleString()}
+                        {alert.source} &middot; {new Date(alert.created_at || "").toLocaleString()}
                       </p>
                     </div>
                     <span
@@ -442,7 +442,7 @@ export default function Dashboard() {
                     <div className="flex-1 min-w-0">
                       <p className="text-sm font-medium text-gray-900 truncate">{incident.title}</p>
                       <p className="text-sm text-gray-500 mt-1">
-                        {incident.incident_type || 'Unknown'} &middot; {new Date(incident.created_at).toLocaleString()}
+                        {incident.incident_type || 'Unknown'} &middot; {new Date(incident.created_at || "").toLocaleString()}
                       </p>
                     </div>
                     <span

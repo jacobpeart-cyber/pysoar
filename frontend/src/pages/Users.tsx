@@ -182,7 +182,7 @@ export default function Users() {
                   <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
                     <div className="flex items-center gap-1">
                       <Calendar className="w-4 h-4" />
-                      {format(new Date(user.created_at), 'MMM d, yyyy')}
+                      {format(new Date(user.created_at || ""), 'MMM d, yyyy')}
                     </div>
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
@@ -467,7 +467,7 @@ function UserDetailsModal({
             <div>
               <label className="block text-sm font-medium text-gray-500">Created</label>
               <p className="text-sm text-gray-900">
-                {format(new Date(user.created_at), 'MMMM d, yyyy')}
+                {format(new Date(user.created_at || ""), 'MMMM d, yyyy')}
               </p>
             </div>
             <div>

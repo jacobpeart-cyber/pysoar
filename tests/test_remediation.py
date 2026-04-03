@@ -100,10 +100,10 @@ class TestRemediationEngine:
             "timestamp": datetime.utcnow().isoformat(),
         }
 
-        # Mock the database query
-        remediation_engine.db.execute = AsyncMock()
-        remediation_engine.db.execute.return_value.scalars = AsyncMock()
-        remediation_engine.db.execute.return_value.scalars.return_value = []
+        # Mock the database query - execute returns awaitable, scalars() returns sync
+        mock_result = MagicMock()
+        mock_result.scalars.return_value.all.return_value = []
+        remediation_engine.db.execute = AsyncMock(return_value=mock_result)
 
         policies = await remediation_engine.evaluate_trigger(
             "alert_severity",
@@ -121,9 +121,9 @@ class TestRemediationEngine:
             "severity": "high",
         }
 
-        remediation_engine.db.execute = AsyncMock()
-        remediation_engine.db.execute.return_value.scalars = AsyncMock()
-        remediation_engine.db.execute.return_value.scalars.return_value = []
+        mock_result = MagicMock()
+        mock_result.scalars.return_value.all.return_value = []
+        remediation_engine.db.execute = AsyncMock(return_value=mock_result)
 
         policies = await remediation_engine.evaluate_trigger(
             "compliance_failure",
@@ -151,7 +151,7 @@ class TestActionExecutors:
             "duration": 3600,
         }
         executor.db.execute = AsyncMock()
-        result = await executor.execute(action_data)
+        result = await executor.execute("192.168.1.100", action_data, {})
         assert result is not None
 
     def test_host_isolation_executor_initialization(self, mock_db):

@@ -426,7 +426,7 @@ function DashboardTab({
                     </span>
                   </td>
                   <td className="px-4 py-3 text-gray-600 dark:text-gray-400">
-                    {new Date(scan.date).toLocaleDateString()}
+                    {new Date(scan.date || "").toLocaleDateString()}
                   </td>
                 </tr>
               ))}
@@ -518,7 +518,7 @@ function BenchmarksTab({
               </div>
 
               <div className="text-xs text-gray-500 dark:text-gray-400">
-                Last scanned: {new Date(benchmark.lastScanDate).toLocaleDateString()}
+                Last scanned: {new Date(benchmark.lastScanDate || "").toLocaleDateString()}
               </div>
             </div>
 
@@ -639,7 +639,7 @@ function ScanResultsTab({
                   {scan.findings.open}/{scan.findings.naf}/{scan.findings.na}/{scan.findings.nr}
                 </td>
                 <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                  {new Date(scan.date).toLocaleDateString()}
+                  {new Date(scan.date || "").toLocaleDateString()}
                 </td>
                 <td className="px-6 py-4 text-center">
                   <button
@@ -747,7 +747,7 @@ function RemediationTab({
               <div><span className="text-gray-500">Host:</span> <span className="font-mono text-gray-900 dark:text-white">{selectedRemediation.host}</span></div>
               <div><span className="text-gray-500">Status:</span> {selectedRemediation.status}</div>
               <div><span className="text-gray-500">Assigned To:</span> {selectedRemediation.assignedTo}</div>
-              <div><span className="text-gray-500">Due Date:</span> {new Date(selectedRemediation.dueDate).toLocaleDateString()}</div>
+              <div><span className="text-gray-500">Due Date:</span> {new Date(selectedRemediation.dueDate || "").toLocaleDateString()}</div>
             </div>
             <button onClick={() => setSelectedRemediation(null)} className="mt-6 w-full px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700">Close</button>
           </div>
@@ -848,7 +848,7 @@ function RemediationTab({
                   {remediation.assignedTo}
                 </td>
                 <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                  {new Date(remediation.dueDate).toLocaleDateString()}
+                  {new Date(remediation.dueDate || "").toLocaleDateString()}
                 </td>
                 <td className="px-6 py-4 text-center">
                   <button

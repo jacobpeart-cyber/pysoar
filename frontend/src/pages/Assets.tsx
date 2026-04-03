@@ -241,7 +241,7 @@ export default function Assets() {
                     </td>
                     <td className="px-6 py-4">
                       <span className="text-sm text-gray-600 capitalize">
-                        {asset.asset_type.replace('_', ' ')}
+                        {(asset.asset_type || "").replace('_', ' ')}
                       </span>
                     </td>
                     <td className="px-6 py-4">
@@ -633,7 +633,7 @@ function AssetDetailsModal({ asset, onClose }: { asset: Asset; onClose: () => vo
               </div>
               <div>
                 <p className="text-xs text-gray-500">Asset Type</p>
-                <p className="text-sm text-gray-900 capitalize">{asset.asset_type.replace('_', ' ')}</p>
+                <p className="text-sm text-gray-900 capitalize">{(asset.asset_type || "").replace('_', ' ')}</p>
               </div>
             </div>
           </div>
@@ -684,7 +684,7 @@ function AssetDetailsModal({ asset, onClose }: { asset: Asset; onClose: () => vo
                 {asset.last_scan && (
                   <div>
                     <p className="text-xs text-blue-600">Last Scan</p>
-                    <p className="text-sm text-blue-900">{new Date(asset.last_scan).toLocaleString()}</p>
+                    <p className="text-sm text-blue-900">{new Date(asset.last_scan || "").toLocaleString()}</p>
                   </div>
                 )}
               </div>
@@ -726,16 +726,16 @@ function AssetDetailsModal({ asset, onClose }: { asset: Asset; onClose: () => vo
           <div className="grid grid-cols-2 gap-4 text-sm border-t border-gray-200 pt-4">
             <div>
               <p className="text-gray-500">Created</p>
-              <p className="text-gray-900">{new Date(asset.created_at).toLocaleString()}</p>
+              <p className="text-gray-900">{new Date(asset.created_at || "").toLocaleString()}</p>
             </div>
             <div>
               <p className="text-gray-500">Last Updated</p>
-              <p className="text-gray-900">{new Date(asset.updated_at).toLocaleString()}</p>
+              <p className="text-gray-900">{new Date(asset.updated_at || "").toLocaleString()}</p>
             </div>
             {asset.last_seen && (
               <div>
                 <p className="text-gray-500">Last Seen</p>
-                <p className="text-gray-900">{new Date(asset.last_seen).toLocaleString()}</p>
+                <p className="text-gray-900">{new Date(asset.last_seen || "").toLocaleString()}</p>
               </div>
             )}
           </div>

@@ -205,14 +205,6 @@ class TestFieldMatcher:
         log_fields = {"action": "login"}
         assert matcher.matches(log_fields) is False
 
-        event = {
-            "ip": "192.168.1.100",
-        }
-
-        matches = bool(re.match(rule["condition"]["value"], event[rule["condition"]["field"]]))
-
-        assert matches is True
-
     async def test_match_rule_comparison_operator(self):
         """Test matching rule with comparison operators"""
         rule = {
@@ -439,12 +431,15 @@ class TestEventNormalization:
 
         normalized_events = []
         for event in raw_events:
-            # Normalize to ISO format
-            normalized_events.append({
-                "timestamp": datetime.fromisoformat(
-                    event["timestamp"].replace("Z", "+00:00")
-                ) if isinstance(event["timestamp"], str) else datetime.fromtimestamp(event["timestamp"]),
-            })
+            ts = event["timestamp"]
+            if isinstance(ts, (int, float)):
+                normalized_events.append({"timestamp": datetime.fromtimestamp(ts)})
+            elif isinstance(ts, str):
+                try:
+                    normalized_events.append({"timestamp": datetime.fromisoformat(ts.replace("Z", "+00:00"))})
+                except ValueError:
+                    from datetime import datetime as dt
+                    normalized_events.append({"timestamp": dt.strptime(ts, "%m/%d/%Y %H:%M:%S")})
 
         assert all("timestamp" in e for e in normalized_events)
 

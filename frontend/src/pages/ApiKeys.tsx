@@ -204,7 +204,7 @@ export default function ApiKeys() {
                   </td>
                   <td className="px-6 py-4 text-sm text-gray-500 dark:text-gray-400">
                     {key.last_used_at
-                      ? new Date(key.last_used_at).toLocaleDateString()
+                      ? new Date(key.last_used_at || "").toLocaleDateString()
                       : 'Never'}
                   </td>
                   <td className="px-6 py-4">

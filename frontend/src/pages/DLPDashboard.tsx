@@ -96,7 +96,7 @@ export default function DLPDashboard() {
   const openIncidents = incidents.filter(i => i.status === 'open' || i.status === 'investigating').length;
   const dataClassifications = classifications.length;
   const violationsThisWeek = incidents.filter(i => {
-    const incDate = new Date(i.createdAt || i.created_at || '');
+    const incDate = new Date(i?.createdAt || i?.created_at || "");
     const weekAgo = new Date();
     weekAgo.setDate(weekAgo.getDate() - 7);
     return incDate >= weekAgo;
@@ -305,7 +305,7 @@ export default function DLPDashboard() {
                             <td className="px-6 py-4 text-sm font-semibold">{policy.trigger_count || policy.match_count || 0}</td>
                             <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
                               {policy.last_triggered
-                                ? new Date(policy.last_triggered).toLocaleDateString()
+                                ? new Date(policy.last_triggered || "").toLocaleDateString()
                                 : 'Never'}
                             </td>
                             <td className="px-6 py-4 text-sm flex gap-2">

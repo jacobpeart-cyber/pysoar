@@ -295,7 +295,6 @@ class CredentialLeak(BaseModel):
     )
 
     __table_args__ = (
-        Index("ix_darkweb_credential_leaks_email", email),
         Index("ix_darkweb_credential_leaks_organization_remediated", organization_id, is_remediated),
     )
 
@@ -355,7 +354,6 @@ class BrandThreat(BaseModel):
     )
 
     __table_args__ = (
-        Index("ix_darkweb_brand_threats_malicious_domain", malicious_domain),
         Index("ix_darkweb_brand_threats_organization_status", organization_id, takedown_status),
     )
 

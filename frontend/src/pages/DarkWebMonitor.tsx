@@ -89,7 +89,7 @@ export default function DarkWebMonitor() {
   }, []);
 
   const activeMonitors = monitors.filter(m => m.status === 'active').length;
-  const newFindings = findings.filter(f => new Date(f.discoveryDate) > new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)).length;
+  const newFindings = findings.filter(f => new Date(f.discoveryDate || "") > new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)).length;
   const exposedCredentials = credentials.length;
   const brandThreats = threats.filter(t => t.status === 'active').length;
 
@@ -224,7 +224,7 @@ export default function DarkWebMonitor() {
                         </div>
                         <div>
                           <p className="text-gray-600 dark:text-gray-400">Last Scan</p>
-                          <p className="font-medium">{new Date(monitor.lastScan).toLocaleDateString()}</p>
+                          <p className="font-medium">{new Date(monitor.lastScan || "").toLocaleDateString()}</p>
                         </div>
                       </div>
                       <div className="flex gap-2">

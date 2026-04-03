@@ -340,7 +340,7 @@ export default function OTSecurityDashboard() {
                               </span>
                             </td>
                             <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                              {asset.lastSeen ? new Date(asset.lastSeen).toLocaleString() : '\u2014'}
+                              {asset.lastSeen ? new Date(asset.lastSeen || "").toLocaleString() : '\u2014'}
                             </td>
                             <td className="px-6 py-4 text-sm">
                               <button className="text-blue-600 dark:text-blue-400 hover:underline">
@@ -449,7 +449,7 @@ export default function OTSecurityDashboard() {
                               </span>
                             </td>
                             <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                              {alert.timestamp ? new Date(alert.timestamp).toLocaleString() : '\u2014'}
+                              {alert.timestamp ? new Date(alert.timestamp || "").toLocaleString() : '\u2014'}
                             </td>
                             <td className="px-6 py-4 text-sm flex gap-2">
                               <button className="text-blue-600 dark:text-blue-400 hover:underline">

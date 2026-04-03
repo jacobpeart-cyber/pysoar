@@ -90,7 +90,7 @@ const AgenticSOC: React.FC = () => {
         const timelineMap: Record<string, number> = {};
         invList.forEach((inv: any) => {
           if (inv.created_at) {
-            const hour = new Date(inv.created_at).getHours();
+            const hour = new Date(inv.created_at || "").getHours();
             const bucket = `${String(Math.floor(hour / 4) * 4).padStart(2, '0')}:00`;
             timelineMap[bucket] = (timelineMap[bucket] || 0) + 1;
           }
@@ -392,7 +392,7 @@ const AgenticSOC: React.FC = () => {
                           {inv.title || 'Untitled Investigation'}
                         </h3>
                         <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
-                          Started {inv.created_at ? new Date(inv.created_at).toLocaleString() : 'Unknown'}
+                          Started {inv.created_at ? new Date(inv.created_at || "").toLocaleString() : 'Unknown'}
                         </p>
                       </div>
                       <div className="text-right">

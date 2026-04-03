@@ -386,13 +386,13 @@ export default function PlaybookBuilder() {
                                   getStatusColor(playbook.status)
                                 )}
                               >
-                                {playbook.status.charAt(0).toUpperCase() + playbook.status.slice(1)}
+                                {(playbook.status || '').charAt(0).toUpperCase() + playbook.status.slice(1)}
                               </span>
                             </td>
                             <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
                               <span className="inline-flex items-center gap-1">
                                 <Clock className="w-3.5 h-3.5" />
-                                {new Date(playbook.updated_at).toLocaleDateString()}
+                                {new Date(playbook.updated_at || "").toLocaleDateString()}
                               </span>
                             </td>
                             <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
@@ -694,7 +694,7 @@ export default function PlaybookBuilder() {
                                   <CheckCircle className="w-3 h-3" />
                                 )}
                                 {execution.status === 'failed' && <XCircle className="w-3 h-3" />}
-                                {execution.status.charAt(0).toUpperCase() + execution.status.slice(1)}
+                                {(execution.status || '').charAt(0).toUpperCase() + execution.status.slice(1)}
                               </span>
                             </td>
                             <td className="px-6 py-4">
@@ -725,7 +725,7 @@ export default function PlaybookBuilder() {
                             <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
                               <span className="inline-flex items-center gap-1">
                                 <Clock className="w-3.5 h-3.5" />
-                                {new Date(execution.startedAt).toLocaleString()}
+                                {new Date(execution.startedAt || "").toLocaleString()}
                               </span>
                             </td>
                             <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">

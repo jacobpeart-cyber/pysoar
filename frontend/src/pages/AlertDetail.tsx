@@ -109,7 +109,7 @@ export default function AlertDetail() {
   }
 
   const formatDate = (dateString: string) => {
-    return new Date(dateString).toLocaleString();
+    return new Date(dateString || "").toLocaleString();
   };
 
   return (

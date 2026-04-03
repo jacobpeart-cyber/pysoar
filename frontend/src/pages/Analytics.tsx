@@ -329,7 +329,7 @@ function AlertTrendsChart({ data }: { data: Array<{ date: string; count: number 
               />
             </div>
             <div className="text-xs text-gray-500 dark:text-gray-400 mt-2">
-              {new Date(point.date).toLocaleDateString('en-US', { weekday: 'short' })}
+              {new Date(point.date || "").toLocaleDateString('en-US', { weekday: 'short' })}
             </div>
           </div>
         );

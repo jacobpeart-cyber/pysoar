@@ -58,7 +58,7 @@ const safeUpper = (val: any): string => (val ? String(val).toUpperCase() : '');
 const safeLocale = (val: any, fallback = 'N/A'): string => {
   if (val == null) return fallback;
   try {
-    return new Date(val).toLocaleString();
+    return new Date(val || "").toLocaleString();
   } catch {
     return String(val);
   }
@@ -209,7 +209,7 @@ export default function DFIRDashboard() {
     const closedCases = cases.filter((c: any) => c?.status === 'closed' && c?.created_at && c?.updated_at);
     if (closedCases.length === 0) return 'N/A';
     const totalMs = closedCases.reduce((sum: number, c: any) => {
-      return sum + (new Date(c.updated_at).getTime() - new Date(c.created_at).getTime());
+      return sum + (new Date(c.updated_at || "").getTime() - new Date(c.created_at || "").getTime());
     }, 0);
     const avgDays = totalMs / closedCases.length / (1000 * 60 * 60 * 24);
     return `${avgDays.toFixed(1)} days`;
