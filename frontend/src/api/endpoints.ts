@@ -804,22 +804,23 @@ export const dlpApi = {
 // Risk Quantification
 export const riskquantApi = {
   getScenarios: async (): Promise<RiskScenario[]> => {
-    const response = await api.get('/riskquant/scenarios');
-    return response.data;
+    const response = await api.get('/risk-quantification/scenarios');
+    const data = response.data;
+    return Array.isArray(data) ? data : (data?.items ?? []);
   },
 
   runAnalysis: async (scenarioIds: string[]): Promise<{ analysis_id: string }> => {
-    const response = await api.post('/riskquant/analyze', { scenario_ids: scenarioIds });
+    const response = await api.post('/risk-quantification/analyze', { scenario_ids: scenarioIds });
     return response.data;
   },
 
   getLossExceedance: async (): Promise<any> => {
-    const response = await api.get('/riskquant/loss-exceedance');
+    const response = await api.get('/risk-quantification/loss-exceedance');
     return response.data;
   },
 
   createScenario: async (data: { name: string; description: string; loss_magnitude: number }): Promise<any> => {
-    const response = await api.post('/riskquant/scenarios', data);
+    const response = await api.post('/risk-quantification/scenarios', data);
     return response.data;
   },
 };
