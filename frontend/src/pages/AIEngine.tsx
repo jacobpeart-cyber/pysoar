@@ -134,8 +134,10 @@ export default function AIEngine() {
   const { data: dashboard } = useQuery({
     queryKey: ['aiDashboard'],
     queryFn: async () => {
+      try {
       const response = await api.get<AIDashboard>('/ai/dashboard');
       return response.data;
+      } catch { return null; }
     },
   });
 
@@ -143,8 +145,10 @@ export default function AIEngine() {
   const { data: triagedAlerts } = useQuery({
     queryKey: ['triagedAlerts'],
     queryFn: async () => {
+      try {
       const response = await api.get<TriagedAlert[]>('/ai/alerts/triaged');
       return response.data;
+      } catch { return null; }
     },
   });
 
@@ -177,16 +181,20 @@ export default function AIEngine() {
   const { data: models } = useQuery({
     queryKey: ['mlModels'],
     queryFn: async () => {
+      try {
       const response = await api.get<MLModel[]>('/ai/models');
       return response.data;
+      } catch { return null; }
     },
   });
 
   // Submit query mutation
   const queryMutation = useMutation({
     mutationFn: async (query: string) => {
+      try {
       const response = await api.post<Query>('/ai/query', { natural_language: query });
       return response.data;
+      } catch { return null; }
     },
     onSuccess: (data) => {
       setSelectedQuery(data);

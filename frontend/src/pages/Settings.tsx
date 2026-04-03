@@ -68,22 +68,28 @@ export default function Settings() {
   const { data: settings, isLoading } = useQuery<SettingsData>({
     queryKey: ['settings'],
     queryFn: async () => {
+      try {
       const response = await api.get('/settings');
       return response.data;
+      } catch { return null; }
     },
   });
 
   const testEmailMutation = useMutation({
     mutationFn: async () => {
+      try {
       const response = await api.post('/settings/test-email');
       return response.data;
+      } catch { return null; }
     },
   });
 
   const testIntegrationMutation = useMutation({
     mutationFn: async (integration: string) => {
+      try {
       const response = await api.post(`/settings/test-integration/${integration}`);
       return response.data;
+      } catch { return null; }
     },
   });
 
@@ -160,8 +166,10 @@ function GeneralSettings({ settings }: { settings: SettingsData['general'] }) {
   const [formData, setFormData] = useState(settings);
   const saveMutation = useMutation({
     mutationFn: async (data: typeof formData) => {
+      try {
       const response = await api.patch('/settings/general', data);
       return response.data;
+      } catch { return null; }
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['settings'] });
@@ -243,8 +251,10 @@ function NotificationSettings({ settings }: { settings: SettingsData['notificati
   const [formData, setFormData] = useState(settings);
   const saveMutation = useMutation({
     mutationFn: async (data: typeof formData) => {
+      try {
       const response = await api.patch('/settings/notifications', data);
       return response.data;
+      } catch { return null; }
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['settings'] });
@@ -561,8 +571,10 @@ function IntegrationSettings({
 
   const saveMutation = useMutation({
     mutationFn: async ({ integrationId, config }: { integrationId: string; config: Record<string, string> }) => {
+      try {
       const response = await api.post(`/settings/integrations/${integrationId}`, config);
       return response.data;
+      } catch { return null; }
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['settings'] });
@@ -962,8 +974,10 @@ function SecuritySettings({
   const queryClient = useQueryClient();
   const saveMutation = useMutation({
     mutationFn: async () => {
+      try {
       const response = await api.patch('/settings/security', { alert_correlation: settings, general });
       return response.data;
+      } catch { return null; }
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['settings'] });

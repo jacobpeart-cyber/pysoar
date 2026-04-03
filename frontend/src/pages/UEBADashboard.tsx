@@ -109,8 +109,10 @@ export default function UEBADashboard() {
   const { data: dashboard } = useQuery({
     queryKey: ['uebaDashboard'],
     queryFn: async () => {
+      try {
       const response = await api.get<UEBADashboard>('/ueba/dashboard');
       return response.data;
+      } catch { return null; }
     },
   });
 
@@ -123,8 +125,10 @@ export default function UEBADashboard() {
       if (riskLevelFilter !== 'all') params.risk_level = riskLevelFilter;
       if (searchQuery) params.search = searchQuery;
 
+      try {
       const response = await api.get<Entity[]>('/ueba/entities', { params });
       return response.data;
+      } catch { return null; }
     },
   });
 
@@ -132,8 +136,10 @@ export default function UEBADashboard() {
   const { data: alerts } = useQuery({
     queryKey: ['ueba-alerts'],
     queryFn: async () => {
+      try {
       const response = await api.get<RiskAlert[]>('/ueba/alerts');
       return response.data;
+      } catch { return null; }
     },
   });
 
@@ -141,8 +147,10 @@ export default function UEBADashboard() {
   const { data: peerGroups } = useQuery({
     queryKey: ['ueba-peer-groups'],
     queryFn: async () => {
+      try {
       const response = await api.get<PeerGroup[]>('/ueba/peer-groups');
       return response.data;
+      } catch { return null; }
     },
   });
 

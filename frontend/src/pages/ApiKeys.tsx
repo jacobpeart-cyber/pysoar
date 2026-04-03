@@ -54,8 +54,10 @@ export default function ApiKeys() {
   const { data: keys, isLoading } = useQuery<APIKey[]>({
     queryKey: ['api-keys'],
     queryFn: async () => {
+      try {
       const response = await api.get('/api-keys');
       return response.data;
+      } catch { return null; }
     },
   });
 
@@ -70,8 +72,10 @@ export default function ApiKeys() {
 
   const regenerateMutation = useMutation({
     mutationFn: async (id: string) => {
+      try {
       const response = await api.post(`/api-keys/${id}/regenerate`);
       return response.data;
+      } catch { return null; }
     },
     onSuccess: (data) => {
       setNewApiKey(data.api_key);

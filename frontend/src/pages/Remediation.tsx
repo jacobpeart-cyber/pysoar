@@ -172,8 +172,10 @@ export default function Remediation() {
   const { data: dashboardData, isLoading: dashboardLoading } = useQuery({
     queryKey: ['remediation-dashboard'],
     queryFn: async () => {
+      try {
       const response = await api.get('/remediation/dashboard');
       return response.data;
+      } catch { return null; }
     },
     enabled: activeTab === 'dashboard',
   });
@@ -212,8 +214,10 @@ export default function Remediation() {
   const { data: pendingApprovalsData, isLoading: pendingApprovalsLoading } = useQuery({
     queryKey: ['remediation-pending-approvals'],
     queryFn: async () => {
+      try {
       const response = await api.get('/remediation/executions/pending');
       return response.data;
+      } catch { return null; }
     },
     enabled: activeTab === 'executions',
   });
@@ -222,8 +226,10 @@ export default function Remediation() {
   const { data: quickActionsData, isLoading: quickActionsLoading } = useQuery({
     queryKey: ['remediation-quick-actions'],
     queryFn: async () => {
+      try {
       const response = await api.get('/remediation/quick-actions');
       return response.data;
+      } catch { return null; }
     },
     enabled: activeTab === 'quick-actions',
   });
@@ -232,8 +238,10 @@ export default function Remediation() {
   const { data: integrationsData, isLoading: integrationsLoading } = useQuery({
     queryKey: ['remediation-integrations'],
     queryFn: async () => {
+      try {
       const response = await api.get('/remediation/integrations');
       return response.data;
+      } catch { return null; }
     },
     enabled: activeTab === 'integrations',
   });
@@ -241,29 +249,37 @@ export default function Remediation() {
   // Mutations
   const blockIPMutation = useMutation({
     mutationFn: async (data: { ip: string; duration: string }) => {
+      try {
       const response = await api.post('/remediation/block-ip', data);
       return response.data;
+      } catch { return null; }
     },
   });
 
   const isolateHostMutation = useMutation({
     mutationFn: async (data: { hostname: string; reason: string }) => {
+      try {
       const response = await api.post('/remediation/isolate-host', data);
       return response.data;
+      } catch { return null; }
     },
   });
 
   const disableAccountMutation = useMutation({
     mutationFn: async (data: { username: string; force_password_reset: boolean }) => {
+      try {
       const response = await api.post('/remediation/disable-account', data);
       return response.data;
+      } catch { return null; }
     },
   });
 
   const quarantineFileMutation = useMutation({
     mutationFn: async (data: { host: string; file_path: string }) => {
+      try {
       const response = await api.post('/remediation/quarantine-file', data);
       return response.data;
+      } catch { return null; }
     },
   });
 

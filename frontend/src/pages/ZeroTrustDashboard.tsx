@@ -109,24 +109,30 @@ export default function ZeroTrustDashboard() {
   const { data: dashboardData, isLoading: dashboardLoading } = useQuery<DashboardData>({
     queryKey: ['zerotrust-dashboard'],
     queryFn: async () => {
+      try {
       const response = await api.get('/zerotrust/dashboard');
       return response.data;
+      } catch { return null; }
     },
   });
 
   const { data: deviceStats, isLoading: statsLoading } = useQuery<DeviceStats>({
     queryKey: ['zerotrust-device-stats'],
     queryFn: async () => {
+      try {
       const response = await api.get('/zerotrust/device-stats');
       return response.data;
+      } catch { return null; }
     },
   });
 
   const { data: devicesRaw, isLoading: devicesLoading } = useQuery<any>({
     queryKey: ['zerotrust-devices'],
     queryFn: async () => {
+      try {
       const response = await api.get('/zerotrust/devices');
       return response.data;
+      } catch { return null; }
     },
   });
   const devices: Device[] = Array.isArray(devicesRaw) ? devicesRaw : (devicesRaw?.devices || devicesRaw?.items || []);
@@ -134,8 +140,10 @@ export default function ZeroTrustDashboard() {
   const { data: segmentsRaw, isLoading: segmentsLoading } = useQuery<any>({
     queryKey: ['zerotrust-segments'],
     queryFn: async () => {
+      try {
       const response = await api.get('/zerotrust/segments');
       return response.data;
+      } catch { return null; }
     },
   });
   const segments: Segment[] = Array.isArray(segmentsRaw) ? segmentsRaw : (segmentsRaw?.segments || segmentsRaw?.items || []);
@@ -143,16 +151,20 @@ export default function ZeroTrustDashboard() {
   const { data: policiesRaw, isLoading: policiesLoading } = useQuery<any>({
     queryKey: ['zerotrust-policies'],
     queryFn: async () => {
+      try {
       const response = await api.get('/zerotrust/policies');
       return response.data;
+      } catch { return null; }
     },
   });
   const policies: Policy[] = Array.isArray(policiesRaw) ? policiesRaw : (policiesRaw?.policies || policiesRaw?.items || []);
 
   const assessDevicesMutation = useMutation({
     mutationFn: async () => {
+      try {
       const response = await api.post('/zerotrust/assess-devices');
       return response.data;
+      } catch { return null; }
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['zerotrust-devices'] });
@@ -165,8 +177,10 @@ export default function ZeroTrustDashboard() {
       resource: string;
       context?: string;
     }) => {
+      try {
       const response = await api.post('/zerotrust/evaluate-access', data);
       return response.data;
+      } catch { return null; }
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['zerotrust-dashboard'] });

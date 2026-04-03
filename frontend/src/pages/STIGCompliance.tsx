@@ -88,8 +88,10 @@ export default function STIGCompliance() {
   const { data: dashboardData, isLoading: dashboardLoading } = useQuery<DashboardData>({
     queryKey: ['stig-dashboard'],
     queryFn: async () => {
+      try {
       const response = await api.get('/stig/dashboard');
       return response.data;
+      } catch { return null; }
     },
   });
 
@@ -98,16 +100,20 @@ export default function STIGCompliance() {
     queryFn: async () => {
       const params = new URLSearchParams();
       if (platformFilter !== 'all') params.append('platform', platformFilter);
+      try {
       const response = await api.get(`/stig/benchmarks?${params}`);
       return response.data;
+      } catch { return null; }
     },
   });
 
   const { data: scans, isLoading: scansLoading } = useQuery<Scan[]>({
     queryKey: ['stig-scans'],
     queryFn: async () => {
+      try {
       const response = await api.get('/stig/scans');
       return response.data;
+      } catch { return null; }
     },
   });
 
@@ -117,8 +123,10 @@ export default function STIGCompliance() {
     queryKey: ['stig-scan-results', expandedScan],
     queryFn: async () => {
       if (!expandedScan) return [];
+      try {
       const response = await api.get(`/stig/scans/${expandedScan}`);
       return response.data.results;
+      } catch { return null; }
     },
     enabled: !!expandedScan,
   });
@@ -128,15 +136,19 @@ export default function STIGCompliance() {
     queryFn: async () => {
       const params = new URLSearchParams();
       if (severityFilter !== 'all') params.append('severity', severityFilter);
+      try {
       const response = await api.get(`/stig/remediations?${params}`);
       return response.data;
+      } catch { return null; }
     },
   });
 
   const runScanMutation = useMutation({
     mutationFn: async (benchmarkId: string) => {
+      try {
       const response = await api.post(`/stig/benchmarks/${benchmarkId}/scan`);
       return response.data;
+      } catch { return null; }
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['stig-scans'] });
@@ -146,8 +158,10 @@ export default function STIGCompliance() {
 
   const autoRemediateMutation = useMutation({
     mutationFn: async () => {
+      try {
       const response = await api.post('/stig/auto-remediate-cat-i');
       return response.data;
+      } catch { return null; }
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['stig-remediations'] });

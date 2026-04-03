@@ -71,24 +71,30 @@ export default function AuditLogs() {
       if (filters.resource_type) params.append('resource_type', filters.resource_type);
       if (filters.success !== undefined) params.append('success', filters.success.toString());
 
+      try {
       const response = await api.get(`/audit?${params.toString()}`);
       return response.data;
+      } catch { return null; }
     },
   });
 
   const { data: actionsData } = useQuery<{ actions: string[] }>({
     queryKey: ['audit-actions'],
     queryFn: async () => {
+      try {
       const response = await api.get('/audit/actions');
       return response.data;
+      } catch { return null; }
     },
   });
 
   const { data: resourceTypesData } = useQuery<{ resource_types: string[] }>({
     queryKey: ['audit-resource-types'],
     queryFn: async () => {
+      try {
       const response = await api.get('/audit/resource-types');
       return response.data;
+      } catch { return null; }
     },
   });
 

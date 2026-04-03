@@ -92,8 +92,10 @@ export default function ComplianceDashboard() {
   const { data: dashboardData, isLoading: dashboardLoading } = useQuery<DashboardData>({
     queryKey: ['compliance-dashboard'],
     queryFn: async () => {
+      try {
       const response = await api.get('/compliance/dashboard');
       return response.data;
+      } catch { return null; }
     },
   });
 
@@ -104,8 +106,10 @@ export default function ComplianceDashboard() {
       if (frameworkFilter !== 'all') params.append('framework_id', frameworkFilter);
       if (familyFilter !== 'all') params.append('family', familyFilter);
       if (statusFilter !== 'all') params.append('status', statusFilter);
+      try {
       const response = await api.get(`/compliance/controls?${params}`);
       return response.data;
+      } catch { return null; }
     },
   });
 
@@ -115,31 +119,39 @@ export default function ComplianceDashboard() {
       const params = new URLSearchParams();
       if (poamStatusFilter !== 'all') params.append('status', poamStatusFilter);
       if (riskLevelFilter !== 'all') params.append('risk_level', riskLevelFilter);
+      try {
       const response = await api.get(`/compliance/poams?${params}`);
       return response.data;
+      } catch { return null; }
     },
   });
 
   const { data: cuiAssets, isLoading: cuiLoading } = useQuery<CUIAsset[]>({
     queryKey: ['compliance-cui'],
     queryFn: async () => {
+      try {
       const response = await api.get('/compliance/cui');
       return response.data;
+      } catch { return null; }
     },
   });
 
   const { data: cisaDirectives, isLoading: cisaLoading } = useQuery<CISADirective[]>({
     queryKey: ['compliance-cisa'],
     queryFn: async () => {
+      try {
       const response = await api.get('/compliance/cisa/directives');
       return response.data;
+      } catch { return null; }
     },
   });
 
   const createPOAMMutation = useMutation({
     mutationFn: async (data: Partial<POAM>) => {
+      try {
       const response = await api.post('/compliance/poams', data);
       return response.data;
+      } catch { return null; }
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['compliance-poams'] });

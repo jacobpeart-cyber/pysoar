@@ -157,8 +157,10 @@ export default function ExposureManagement() {
   const { data: stats, isLoading: statsLoading } = useQuery<DashboardStats>({
     queryKey: ['exposure', 'dashboard'],
     queryFn: async () => {
+      try {
       const response = await api.get('/exposure/dashboard');
       return response.data;
+      } catch { return null; }
     },
   });
 
@@ -210,8 +212,10 @@ export default function ExposureManagement() {
   const { data: surfaceData } = useQuery<any>({
     queryKey: ['exposure', 'attack-surface'],
     queryFn: async () => {
+      try {
       const response = await api.get('/exposure/attack-surface');
       return response.data;
+      } catch { return null; }
     },
   });
   const attackSurfaces: AttackSurface[] = Array.isArray(surfaceData) ? surfaceData : (surfaceData?.items || []);

@@ -38,8 +38,10 @@ export default function Profile() {
 
   const updateProfileMutation = useMutation({
     mutationFn: async (data: typeof profileData) => {
+      try {
       const response = await api.patch(`/users/${user?.id}`, data);
       return response.data;
+      } catch { return null; }
     },
     onSuccess: () => {
       setShowSuccess(true);
@@ -50,8 +52,10 @@ export default function Profile() {
 
   const updatePasswordMutation = useMutation({
     mutationFn: async (data: { current_password: string; new_password: string }) => {
+      try {
       const response = await api.post('/auth/change-password', data);
       return response.data;
+      } catch { return null; }
     },
     onSuccess: () => {
       setShowSuccess(true);
