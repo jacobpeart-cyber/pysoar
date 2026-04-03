@@ -36,8 +36,29 @@ export default function Analytics() {
     queryKey: ['metrics'],
     queryFn: async () => {
       try {
-      const response = await api.get('/metrics');
-      return response.data;
+        const [alertsRes, incidentsRes] = await Promise.allSettled([
+          api.get('/alerts/stats'),
+          api.get('/incidents/stats'),
+        ]);
+        const alertStats = alertsRes.status === 'fulfilled' ? alertsRes.value.data : {};
+        const incidentStats = incidentsRes.status === 'fulfilled' ? incidentsRes.value.data : {};
+        return {
+          overview: {
+            total_alerts: alertStats.total ?? 0,
+            alerts_change: 0,
+            total_incidents: incidentStats.total ?? 0,
+            incidents_change: 0,
+            avg_mttr_hours: incidentStats.avg_resolution_hours ?? 0,
+            mttr_change: 0,
+            active_iocs: 0,
+          },
+          alert_trends: alertStats.trends ?? [],
+          severity_distribution: alertStats.by_severity ?? {},
+          status_distribution: alertStats.by_status ?? {},
+          top_sources: Array.isArray(alertStats.by_source) ? alertStats.by_source.map((s: any) => ({ source: s.source ?? s.name ?? '', count: s.count ?? 0 })) : [],
+          top_attackers: [],
+          incident_types: incidentStats.by_type ?? {},
+        };
       } catch { return null; }
     },
   });
