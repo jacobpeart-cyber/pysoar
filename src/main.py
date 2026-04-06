@@ -178,12 +178,24 @@ async def pysoar_exception_handler(request: Request, exc: PySOARException):
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     """Handle request validation errors"""
+    # Sanitize errors — convert any non-serializable objects to strings
+    import json as _json
+    safe_errors = []
+    for err in exc.errors():
+        safe_err = {}
+        for k, v in err.items():
+            try:
+                _json.dumps(v)
+                safe_err[k] = v
+            except (TypeError, ValueError):
+                safe_err[k] = str(v)
+        safe_errors.append(safe_err)
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={
             "error": "ValidationError",
             "message": "Request validation failed",
-            "details": {"errors": exc.errors()},
+            "details": {"errors": safe_errors},
         },
     )
 
