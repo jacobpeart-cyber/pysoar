@@ -11,29 +11,40 @@ from typing import Any
 from pydantic import BaseModel, model_validator
 
 
+def _parse_value(value: Any) -> Any:
+    """Parse a JSON string value to its Python equivalent."""
+    if isinstance(value, str) and value and value[0] in ('[', '{'):
+        try:
+            return json.loads(value)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return value
+
+
 class DBModel(BaseModel):
     """Base model for DB response schemas that auto-parses JSON string fields.
 
-    Use this instead of BaseModel for any Response schema with from_attributes = True.
-    It automatically converts JSON strings to their Python equivalents (list, dict).
+    Handles both dict input and ORM objects (from_attributes).
+    Automatically converts JSON strings to lists/dicts.
     """
 
     @model_validator(mode="before")
     @classmethod
     def parse_json_strings(cls, data: Any) -> Any:
         if isinstance(data, dict):
-            parsed = {}
-            for key, value in data.items():
-                if isinstance(value, str) and value and value[0] in ('[', '{'):
-                    try:
-                        parsed[key] = json.loads(value)
-                    except (json.JSONDecodeError, ValueError):
-                        parsed[key] = value
-                else:
-                    parsed[key] = value
-            return parsed
-        # For ORM objects, let Pydantic handle attribute access —
-        # the field validators will catch JSON strings on individual fields
+            return {k: _parse_value(v) for k, v in data.items()}
+
+        # For ORM objects: convert to dict first, then parse
+        if hasattr(data, "__dict__"):
+            result = {}
+            for key in cls.model_fields:
+                try:
+                    val = getattr(data, key, None)
+                    result[key] = _parse_value(val)
+                except Exception:
+                    result[key] = None
+            return result
+
         return data
 
     class Config:
