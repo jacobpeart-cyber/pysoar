@@ -4,6 +4,7 @@ import json
 from datetime import datetime
 from typing import Any, Optional
 
+from src.schemas.base import DBModel
 from pydantic import BaseModel, Field
 
 
@@ -68,7 +69,7 @@ class ExposureAssetUpdate(BaseModel):
     metadata: Optional[dict] = None
 
 
-class ExposureAssetResponse(ExposureAssetBase):
+class ExposureAssetResponse(DBModel):
     """Schema for exposure asset response"""
 
     id: str
@@ -149,7 +150,7 @@ class VulnerabilityUpdate(BaseModel):
     tags: Optional[list[str]] = None
 
 
-class VulnerabilityResponse(VulnerabilityBase):
+class VulnerabilityResponse(DBModel):
     """Schema for vulnerability response"""
 
     id: str
@@ -205,7 +206,7 @@ class AssetVulnerabilityUpdate(BaseModel):
     detected_by: Optional[str] = Field(None, max_length=100)
 
 
-class AssetVulnerabilityResponse(AssetVulnerabilityBase):
+class AssetVulnerabilityResponse(DBModel):
     """Schema for asset-vulnerability response"""
 
     id: str
@@ -250,7 +251,7 @@ class ExposureScanCreate(ExposureScanBase):
     pass
 
 
-class ExposureScanResponse(ExposureScanBase):
+class ExposureScanResponse(DBModel):
     """Schema for exposure scan response"""
 
     id: str
@@ -320,7 +321,7 @@ class RemediationTicketUpdate(BaseModel):
     external_ticket_id: Optional[str] = Field(None, max_length=255)
 
 
-class RemediationTicketResponse(RemediationTicketBase):
+class RemediationTicketResponse(DBModel):
     """Schema for remediation ticket response"""
 
     id: str
@@ -370,7 +371,7 @@ class AttackSurfaceUpdate(BaseModel):
     description: Optional[str] = None
 
 
-class AttackSurfaceResponse(AttackSurfaceBase):
+class AttackSurfaceResponse(DBModel):
     """Schema for attack surface response"""
 
     id: str

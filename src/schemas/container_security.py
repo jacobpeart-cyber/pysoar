@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 from enum import Enum
 
+from src.schemas.base import DBModel
 from pydantic import BaseModel, Field
 
 __all__ = [
@@ -121,7 +122,7 @@ class Severity(str, Enum):
 
 
 # Container Image Schemas
-class ImageVulnerabilityResponse(BaseModel):
+class ImageVulnerabilityResponse(DBModel):
     """Image vulnerability details"""
 
     id: str
@@ -156,7 +157,7 @@ class ImageVulnerabilityCreateRequest(BaseModel):
     remediation: Optional[str] = None
 
 
-class ContainerImageResponse(BaseModel):
+class ContainerImageResponse(DBModel):
     """Container image with metadata"""
 
     id: str
@@ -211,7 +212,7 @@ class ContainerImageUpdateRequest(BaseModel):
 
 
 # Kubernetes Cluster Schemas
-class KubernetesClusterResponse(BaseModel):
+class KubernetesClusterResponse(DBModel):
     """Kubernetes cluster details"""
 
     id: str
@@ -265,7 +266,7 @@ class KubernetesClusterUpdateRequest(BaseModel):
 
 
 # Security Finding Schemas
-class K8sSecurityFindingResponse(BaseModel):
+class K8sSecurityFindingResponse(DBModel):
     """Kubernetes security finding"""
 
     id: str
@@ -309,7 +310,7 @@ class K8sSecurityFindingUpdateRequest(BaseModel):
 
 
 # Runtime Alert Schemas
-class RuntimeAlertResponse(BaseModel):
+class RuntimeAlertResponse(DBModel):
     """Runtime security alert"""
 
     id: str

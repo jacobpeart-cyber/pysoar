@@ -6,10 +6,11 @@ Defines input validation and output serialization for simulation operations.
 
 from datetime import datetime
 from typing import Optional, List, Dict, Any
+from src.schemas.base import DBModel
 from pydantic import BaseModel, Field, validator
 
 
-class AttackTechniqueSchema(BaseModel):
+class AttackTechniqueSchema(DBModel):
     """Schema for AttackTechnique model."""
 
     id: str
@@ -34,7 +35,7 @@ class AttackTechniqueSchema(BaseModel):
         from_attributes = True
 
 
-class SimulationTestSchema(BaseModel):
+class SimulationTestSchema(DBModel):
     """Schema for SimulationTest results."""
 
     id: str
@@ -64,7 +65,7 @@ class SimulationTestSchema(BaseModel):
         from_attributes = True
 
 
-class AttackSimulationSchema(BaseModel):
+class AttackSimulationSchema(DBModel):
     """Schema for AttackSimulation model."""
 
     id: str
@@ -97,7 +98,7 @@ class AttackSimulationSchema(BaseModel):
         from_attributes = True
 
 
-class AdversaryProfileSchema(BaseModel):
+class AdversaryProfileSchema(DBModel):
     """Schema for AdversaryProfile model."""
 
     id: str
@@ -119,7 +120,7 @@ class AdversaryProfileSchema(BaseModel):
         from_attributes = True
 
 
-class SecurityPostureScoreSchema(BaseModel):
+class SecurityPostureScoreSchema(DBModel):
     """Schema for SecurityPostureScore model."""
 
     id: str

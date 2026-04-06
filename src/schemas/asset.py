@@ -3,6 +3,7 @@
 from datetime import datetime
 from typing import Any, Optional
 
+from src.schemas.base import DBModel
 from pydantic import BaseModel, Field
 
 
@@ -62,7 +63,7 @@ class AssetUpdate(BaseModel):
     agent_installed: Optional[bool] = None
 
 
-class AssetResponse(BaseModel):
+class AssetResponse(DBModel):
     """Schema for asset response"""
     id: str
     name: str

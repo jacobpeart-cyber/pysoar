@@ -3,6 +3,7 @@
 from datetime import datetime
 from typing import Any, Optional
 
+from src.schemas.base import DBModel
 from pydantic import BaseModel, Field
 
 
@@ -48,7 +49,7 @@ class IncidentUpdate(BaseModel):
     tags: Optional[list[str]] = None
 
 
-class IncidentResponse(IncidentBase):
+class IncidentResponse(DBModel):
     """Schema for incident response"""
 
     id: str

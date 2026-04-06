@@ -8,6 +8,7 @@ queries, anomaly detection, threat predictions, and incident analysis.
 from datetime import datetime
 from typing import Any
 
+from src.schemas.base import DBModel
 from pydantic import BaseModel, Field
 
 
@@ -25,7 +26,7 @@ class NLQueryRequest(BaseModel):
     )
 
 
-class NLQueryResponse(BaseModel):
+class NLQueryResponse(DBModel):
     """Natural language query response with results and summary."""
 
     id: str = Field(..., description="Query ID")
@@ -41,7 +42,7 @@ class NLQueryResponse(BaseModel):
         from_attributes = True
 
 
-class QueryHistoryResponse(BaseModel):
+class QueryHistoryResponse(DBModel):
     """Query history entry."""
 
     id: str
@@ -66,7 +67,7 @@ class AlertTriageRequest(BaseModel):
     )
 
 
-class AlertTriageResponse(BaseModel):
+class AlertTriageResponse(DBModel):
     """Alert triage analysis response."""
 
     alert_id: str
@@ -136,7 +137,7 @@ class ImpactAssessment(BaseModel):
     severity: str = Field(..., description="Overall impact severity")
 
 
-class IncidentAnalysisResponse(BaseModel):
+class IncidentAnalysisResponse(DBModel):
     """Full incident analysis response."""
 
     incident_id: str
@@ -189,7 +190,7 @@ class ResponseRecommendation(BaseModel):
 
 # Anomaly Detection
 
-class AnomalyDetectionResponse(BaseModel):
+class AnomalyDetectionResponse(DBModel):
     """Detected anomaly with explanation."""
 
     id: str
@@ -267,7 +268,7 @@ class ThreatPredictionRequest(BaseModel):
     )
 
 
-class ThreatPredictionResponse(BaseModel):
+class ThreatPredictionResponse(DBModel):
     """Threat prediction result."""
 
     id: str
@@ -340,7 +341,7 @@ class ModelTrainingRequest(BaseModel):
     )
 
 
-class MLModelResponse(BaseModel):
+class MLModelResponse(DBModel):
     """ML model details."""
 
     id: str

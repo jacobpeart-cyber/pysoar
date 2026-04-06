@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
+from src.schemas.base import DBModel
 from pydantic import BaseModel, Field
 
 
@@ -67,7 +68,7 @@ class PhishingTemplateUpdateRequest(BaseModel):
     is_seasonal: bool | None = None
 
 
-class PhishingTemplateResponse(PhishingTemplateBase):
+class PhishingTemplateResponse(DBModel):
     """Response schema for phishing template."""
 
     id: UUID
@@ -118,7 +119,7 @@ class TargetGroupUpdateRequest(BaseModel):
     members: list[TargetMember] | None = None
 
 
-class TargetGroupResponse(TargetGroupBase):
+class TargetGroupResponse(DBModel):
     """Response schema for target group."""
 
     id: UUID
@@ -180,7 +181,7 @@ class PhishingCampaignUpdateRequest(BaseModel):
     difficulty_level: str | None = None
 
 
-class PhishingCampaignResponse(PhishingCampaignBase):
+class PhishingCampaignResponse(DBModel):
     """Response schema for phishing campaign."""
 
     id: UUID
@@ -259,7 +260,7 @@ class CampaignEventCreateRequest(CampaignEventBase):
     time_to_action_seconds: int | None = None
 
 
-class CampaignEventResponse(CampaignEventBase):
+class CampaignEventResponse(DBModel):
     """Response schema for campaign event."""
 
     id: UUID
@@ -305,7 +306,7 @@ class SecurityAwarenessScoreBase(BaseModel):
     department: str | None = None
 
 
-class SecurityAwarenessScoreResponse(SecurityAwarenessScoreBase):
+class SecurityAwarenessScoreResponse(DBModel):
     """Response schema for security awareness score."""
 
     id: UUID

@@ -3,6 +3,7 @@
 from datetime import datetime
 from typing import Optional
 
+from src.schemas.base import DBModel
 from pydantic import BaseModel, EmailStr, Field
 
 
@@ -35,7 +36,7 @@ class UserUpdate(BaseModel):
     password: Optional[str] = Field(None, min_length=8)
 
 
-class UserResponse(UserBase):
+class UserResponse(DBModel):
     """Schema for user response"""
 
     id: str

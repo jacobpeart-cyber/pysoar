@@ -8,6 +8,7 @@ access anomalies, and privileged access events.
 from datetime import datetime
 from typing import Any, Optional
 
+from src.schemas.base import DBModel
 from pydantic import BaseModel, Field
 
 
@@ -51,7 +52,7 @@ class IdentityProfileUpdate(BaseModel):
     mfa_methods: Optional[list[str]] = None
 
 
-class IdentityProfileResponse(IdentityProfileBase):
+class IdentityProfileResponse(DBModel):
     """Schema for identity profile response"""
 
     id: str
@@ -104,7 +105,7 @@ class IdentityThreatUpdate(BaseModel):
     response_actions: Optional[list[dict[str, Any]]] = None
 
 
-class IdentityThreatResponse(IdentityThreatBase):
+class IdentityThreatResponse(DBModel):
     """Schema for identity threat response"""
 
     id: str
@@ -169,7 +170,7 @@ class CredentialExposureUpdate(BaseModel):
     remediation_date: Optional[str] = None
 
 
-class CredentialExposureResponse(CredentialExposureBase):
+class CredentialExposureResponse(DBModel):
     """Schema for credential exposure response"""
 
     id: str
@@ -231,7 +232,7 @@ class AccessAnomalyUpdate(BaseModel):
     reviewer_notes: Optional[str] = None
 
 
-class AccessAnomalyResponse(AccessAnomalyBase):
+class AccessAnomalyResponse(DBModel):
     """Schema for access anomaly response"""
 
     id: str
@@ -296,7 +297,7 @@ class PrivilegedAccessEventUpdate(BaseModel):
     revocation_reason: Optional[str] = None
 
 
-class PrivilegedAccessEventResponse(PrivilegedAccessEventBase):
+class PrivilegedAccessEventResponse(DBModel):
     """Schema for privileged access event response"""
 
     id: str

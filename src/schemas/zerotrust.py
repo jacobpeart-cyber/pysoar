@@ -3,6 +3,7 @@
 from datetime import datetime
 from typing import Any, Optional
 
+from src.schemas.base import DBModel
 from pydantic import BaseModel, Field
 
 
@@ -51,7 +52,7 @@ class ZeroTrustPolicyUpdate(BaseModel):
     priority: Optional[int] = None
 
 
-class ZeroTrustPolicyResponse(ZeroTrustPolicyBase):
+class ZeroTrustPolicyResponse(DBModel):
     """Schema for policy response"""
 
     id: str
@@ -100,7 +101,7 @@ class DeviceComplianceUpdate(BaseModel):
     rooted: Optional[bool] = None
 
 
-class DeviceTrustProfileResponse(DeviceTrustProfileBase):
+class DeviceTrustProfileResponse(DBModel):
     """Schema for device trust profile response"""
 
     id: str
@@ -132,7 +133,7 @@ class AccessRequestSchema(BaseModel):
     )
 
 
-class AccessDecisionResponse(BaseModel):
+class AccessDecisionResponse(DBModel):
     """Schema for access decision response"""
 
     id: str
@@ -183,7 +184,7 @@ class MicroSegmentUpdate(BaseModel):
     is_active: Optional[bool] = None
 
 
-class MicroSegmentResponse(MicroSegmentBase):
+class MicroSegmentResponse(DBModel):
     """Schema for micro-segment response"""
 
     id: str
@@ -236,7 +237,7 @@ class IdentityVerificationCreate(IdentityVerificationBase):
     pass
 
 
-class IdentityVerificationResponse(IdentityVerificationBase):
+class IdentityVerificationResponse(DBModel):
     """Schema for identity verification response"""
 
     id: str

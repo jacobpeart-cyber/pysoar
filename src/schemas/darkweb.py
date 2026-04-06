@@ -7,6 +7,7 @@ Includes monitor configurations, findings, credentials, and brand threats.
 from datetime import datetime
 from typing import Any, Optional
 
+from src.schemas.base import DBModel
 from pydantic import BaseModel, Field
 
 
@@ -45,7 +46,7 @@ class DarkWebMonitorUpdate(BaseModel):
     alert_severity: Optional[str] = None
 
 
-class DarkWebMonitorResponse(DarkWebMonitorBase):
+class DarkWebMonitorResponse(DBModel):
     """Schema for monitor response"""
 
     id: str
@@ -99,7 +100,7 @@ class DarkWebFindingUpdate(BaseModel):
     confidence_score: Optional[int] = Field(None, ge=0, le=100)
 
 
-class DarkWebFindingResponse(DarkWebFindingBase):
+class DarkWebFindingResponse(DBModel):
     """Schema for finding response"""
 
     id: str
@@ -160,7 +161,7 @@ class CredentialLeakUpdate(BaseModel):
     remediation_action: Optional[str] = None
 
 
-class CredentialLeakResponse(CredentialLeakBase):
+class CredentialLeakResponse(DBModel):
     """Schema for credential leak response"""
 
     id: str
@@ -211,7 +212,7 @@ class BrandThreatUpdate(BaseModel):
     takedown_provider: Optional[str] = None
 
 
-class BrandThreatResponse(BrandThreatBase):
+class BrandThreatResponse(DBModel):
     """Schema for brand threat response"""
 
     id: str

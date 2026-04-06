@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 from enum import Enum
 
+from src.schemas.base import DBModel
 from pydantic import BaseModel, Field
 
 __all__ = [
@@ -188,7 +189,7 @@ class IncidentStatus(str, Enum):
 
 
 # OT Asset Schemas
-class OTAssetResponse(BaseModel):
+class OTAssetResponse(DBModel):
     """OT Asset Response"""
 
     id: str
@@ -258,7 +259,7 @@ class OTAssetListResponse(BaseModel):
 
 
 # OT Alert Schemas
-class OTAlertResponse(BaseModel):
+class OTAlertResponse(DBModel):
     """OT Alert Response"""
 
     id: str
@@ -315,7 +316,7 @@ class OTAlertListResponse(BaseModel):
 
 
 # OT Zone Schemas
-class OTZoneResponse(BaseModel):
+class OTZoneResponse(DBModel):
     """OT Zone Response"""
 
     id: str
@@ -369,7 +370,7 @@ class OTZoneListResponse(BaseModel):
 
 
 # OT Incident Schemas
-class OTIncidentResponse(BaseModel):
+class OTIncidentResponse(DBModel):
     """OT Incident Response"""
 
     id: str
@@ -427,7 +428,7 @@ class OTIncidentListResponse(BaseModel):
 
 
 # OT Policy Schemas
-class OTPolicyRuleResponse(BaseModel):
+class OTPolicyRuleResponse(DBModel):
     """OT Policy Rule Response"""
 
     id: str
