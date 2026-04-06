@@ -7,8 +7,10 @@ from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect
 from jose import JWTError, jwt
 
 from src.core.config import settings
+from src.core.logging import get_logger
 from src.services.websocket_manager import manager
 
+logger = get_logger(__name__)
 router = APIRouter(tags=["WebSocket"])
 
 
