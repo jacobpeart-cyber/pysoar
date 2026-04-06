@@ -22,6 +22,7 @@ import {
   Globe,
   Mail,
   Terminal,
+  X,
 } from 'lucide-react';
 import clsx from 'clsx';
 import { api } from '../api/client';
@@ -68,8 +69,13 @@ interface Playbook {
   id: string;
   name: string;
   description: string;
-  nodes?: unknown[];
+  nodes?: any[];
+  edges?: any[];
   status: string;
+  category?: string;
+  trigger_type?: string;
+  trigger_config?: any;
+  version?: number;
   updated_at: string;
   created_by: string;
   execution_count: number;
@@ -791,6 +797,117 @@ export default function PlaybookBuilder() {
           </>
         )}
       </div>
+
+      {/* Edit Playbook Modal */}
+      {selectedPlaybook && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50" onClick={() => setSelectedPlaybook(null)}>
+          <div className="bg-white dark:bg-gray-800 rounded-lg shadow-xl w-full max-w-2xl mx-4 max-h-[85vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200 dark:border-gray-700">
+              <h2 className="text-lg font-semibold text-gray-900 dark:text-white">Edit Playbook</h2>
+              <button onClick={() => setSelectedPlaybook(null)} className="text-gray-400 hover:text-gray-600"><X className="w-5 h-5" /></button>
+            </div>
+            <form className="p-6 space-y-4" onSubmit={async (e) => {
+              e.preventDefault();
+              const fd = new FormData(e.currentTarget);
+              try {
+                await api.put(`/playbook-builder/${selectedPlaybook.id}`, {
+                  name: fd.get('name'),
+                  description: fd.get('description'),
+                  category: fd.get('category'),
+                  trigger_type: fd.get('trigger_type'),
+                  status: fd.get('status'),
+                });
+                setPlaybooks((prev) => prev.map((p) => p.id === selectedPlaybook.id ? {
+                  ...p,
+                  name: fd.get('name') as string,
+                  description: fd.get('description') as string,
+                  category: fd.get('category') as string,
+                  trigger_type: fd.get('trigger_type') as string,
+                  status: fd.get('status') as string,
+                } : p));
+                setSelectedPlaybook(null);
+                setNotification({ type: 'success', text: 'Playbook updated' });
+              } catch (err) {
+                setNotification({ type: 'error', text: 'Failed to update playbook' });
+              }
+            }}>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Name</label>
+                <input name="name" type="text" defaultValue={selectedPlaybook.name} required
+                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Description</label>
+                <textarea name="description" rows={3} defaultValue={selectedPlaybook.description || ''}
+                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Category</label>
+                  <select name="category" defaultValue={selectedPlaybook.category || 'incident-response'}
+                    className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
+                    <option value="incident-response">Incident Response</option>
+                    <option value="threat-hunting">Threat Hunting</option>
+                    <option value="compliance">Compliance</option>
+                    <option value="enrichment">Enrichment</option>
+                    <option value="remediation">Remediation</option>
+                    <option value="notification">Notification</option>
+                    <option value="custom">Custom</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Trigger Type</label>
+                  <select name="trigger_type" defaultValue={selectedPlaybook.trigger_type || 'manual'}
+                    className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
+                    <option value="manual">Manual</option>
+                    <option value="alert">Alert-based</option>
+                    <option value="scheduled">Scheduled</option>
+                    <option value="webhook">Webhook</option>
+                    <option value="event">Event-driven</option>
+                  </select>
+                </div>
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Status</label>
+                <select name="status" defaultValue={selectedPlaybook.status || 'draft'}
+                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
+                  <option value="draft">Draft</option>
+                  <option value="active">Active</option>
+                  <option value="paused">Paused</option>
+                  <option value="archived">Archived</option>
+                </select>
+              </div>
+
+              {/* Nodes summary */}
+              {selectedPlaybook.nodes && selectedPlaybook.nodes.length > 0 && (
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Workflow Nodes ({selectedPlaybook.nodes.length})</label>
+                  <div className="space-y-1 max-h-40 overflow-y-auto">
+                    {selectedPlaybook.nodes.map((node: any, i: number) => (
+                      <div key={node.id || i} className="flex items-center gap-2 p-2 bg-gray-50 dark:bg-gray-700 rounded text-sm">
+                        <span className="w-6 h-6 flex items-center justify-center bg-indigo-100 dark:bg-indigo-900 text-indigo-600 dark:text-indigo-400 rounded text-xs font-bold">{i + 1}</span>
+                        <span className="font-medium text-gray-800 dark:text-gray-200">{node.label || node.name || node.node_type}</span>
+                        <span className="text-xs text-gray-500">{node.node_type}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <div className="flex gap-3 pt-4 border-t border-gray-200 dark:border-gray-700">
+                <button type="button" onClick={() => setSelectedPlaybook(null)}
+                  className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700 transition">
+                  Cancel
+                </button>
+                <button type="submit"
+                  className="flex-1 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition">
+                  Save Changes
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
