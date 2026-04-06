@@ -68,15 +68,58 @@ api.interceptors.request.use((config) => {
   return config;
 });
 
-// Response interceptor to handle auth errors
+// Response interceptor — auto-refresh token on 401, then retry
+let isRefreshing = false;
+let refreshQueue: Array<(token: string) => void> = [];
+
 api.interceptors.response.use(
   (response) => response,
   async (error) => {
-    if (error.response?.status === 401) {
-      localStorage.removeItem('access_token');
-      localStorage.removeItem('refresh_token');
-      window.location.href = '/login';
+    const originalRequest = error.config;
+
+    if (error.response?.status === 401 && !originalRequest._retry) {
+      const refreshToken = localStorage.getItem('refresh_token');
+      if (!refreshToken) {
+        localStorage.removeItem('access_token');
+        window.location.href = '/login';
+        return Promise.reject(error);
+      }
+
+      if (isRefreshing) {
+        // Queue this request until refresh completes
+        return new Promise((resolve) => {
+          refreshQueue.push((newToken: string) => {
+            originalRequest.headers.Authorization = `Bearer ${newToken}`;
+            resolve(api(originalRequest));
+          });
+        });
+      }
+
+      originalRequest._retry = true;
+      isRefreshing = true;
+
+      try {
+        const res = await axios.post(`${API_BASE_URL}/auth/refresh`, { refresh_token: refreshToken });
+        const newToken = res.data.access_token;
+        localStorage.setItem('access_token', newToken);
+        if (res.data.refresh_token) localStorage.setItem('refresh_token', res.data.refresh_token);
+
+        // Retry queued requests
+        refreshQueue.forEach((cb) => cb(newToken));
+        refreshQueue = [];
+
+        originalRequest.headers.Authorization = `Bearer ${newToken}`;
+        return api(originalRequest);
+      } catch {
+        localStorage.removeItem('access_token');
+        localStorage.removeItem('refresh_token');
+        window.location.href = '/login';
+        return Promise.reject(error);
+      } finally {
+        isRefreshing = false;
+      }
     }
+
     return Promise.reject(error);
   }
 );
