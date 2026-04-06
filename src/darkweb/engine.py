@@ -1,19 +1,30 @@
 """Dark Web Monitoring Engine
 
-Core scanning, analysis, and correlation engine for dark web monitoring.
-Handles credential analysis, brand protection, and threat intelligence correlation.
+Integrates free threat intel feeds:
+- Have I Been Pwned (HIBP) — credential breach lookup
+- AlienVault OTX — threat intel pulses and IOCs
+- Abuse.ch URLhaus — malicious URLs
+- Abuse.ch ThreatFox — malware IOCs
 """
 
 import hashlib
 import json
+import os
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from difflib import SequenceMatcher
 
+import httpx
+
 from src.core.logging import get_logger
 
 logger = get_logger(__name__)
+
+HIBP_API = "https://haveibeenpwned.com/api/v3"
+OTX_API = "https://otx.alienvault.com/api/v1"
+ABUSECH_URLHAUS = "https://urlhaus-api.abuse.ch/v1"
+ABUSECH_THREATFOX = "https://threatfox-api.abuse.ch/api/v1"
 
 
 class DarkWebScanner:
@@ -66,93 +77,119 @@ class DarkWebScanner:
         return await self.aggregate_findings(results)
 
     async def search_paste_sites(self) -> list[dict[str, Any]]:
-        """Simulate searching paste sites for leaked content"""
+        """Search Abuse.ch URLhaus for malicious URLs (real API, free, no key)."""
         findings = []
-        for site in self.paste_sites:
-            # Simulate API calls to paste sites
-            simulated_pastes = [
-                {
-                    "site": site,
-                    "url": f"https://{site}/paste123456",
-                    "title": "admin credentials dump",
-                    "content_hash": hashlib.sha256(
-                        f"creds_from_{site}".encode()
-                    ).hexdigest(),
-                    "posted_date": (
-                        datetime.now(timezone.utc) - timedelta(hours=12)
-                    ).isoformat(),
-                    "credentials": [
-                        {
-                            "email": "admin@company.com",
-                            "password": "hashed_password_1",
-                        },
-                    ],
-                }
-            ]
-            findings.extend(simulated_pastes)
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(ABUSECH_URLHAUS + "/urls/recent/", data={"limit": "25"})
+                if resp.status_code == 200:
+                    data = resp.json()
+                    for url_entry in (data.get("urls") or [])[:25]:
+                        findings.append({
+                            "site": "urlhaus.abuse.ch",
+                            "url": url_entry.get("url", ""),
+                            "title": url_entry.get("threat", "malicious_url"),
+                            "content_hash": hashlib.sha256(url_entry.get("url", "").encode()).hexdigest(),
+                            "posted_date": url_entry.get("date_added", ""),
+                            "tags": url_entry.get("tags") or [],
+                            "threat_type": url_entry.get("threat", ""),
+                            "status": url_entry.get("url_status", ""),
+                        })
+                    logger.info(f"URLhaus: found {len(findings)} malicious URLs")
+        except Exception as e:
+            logger.warning(f"URLhaus search failed: {e}")
         return findings
 
     async def search_breach_databases(self) -> list[dict[str, Any]]:
-        """Simulate searching breach databases for organization data"""
+        """Search HIBP for recent breaches (free, no key needed for breach list)."""
         findings = []
-        for db in self.breach_databases:
-            # Simulate HIBP-style API queries
-            simulated_breaches = [
-                {
-                    "database": db,
-                    "breach_name": f"breach_{db}_2024",
-                    "affected_count": 10000 + (hash(db) % 100000),
-                    "breach_date": "2024-01-15",
-                    "compromised_data": [
-                        "emails",
-                        "passwords",
-                        "usernames",
-                    ],
-                    "affected_emails": [
-                        f"user_{i}@company.com" for i in range(5)
-                    ],
-                },
-            ]
-            findings.extend(simulated_breaches)
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(
+                    f"{HIBP_API}/breaches",
+                    headers={"User-Agent": "PySOAR-DarkWebMonitor"},
+                )
+                if resp.status_code == 200:
+                    breaches = resp.json()
+                    # Get recent breaches (last 90 days)
+                    cutoff = (datetime.now(timezone.utc) - timedelta(days=90)).strftime("%Y-%m-%d")
+                    for breach in breaches:
+                        if breach.get("AddedDate", "") >= cutoff:
+                            findings.append({
+                                "database": "haveibeenpwned",
+                                "breach_name": breach.get("Name", ""),
+                                "affected_count": breach.get("PwnCount", 0),
+                                "breach_date": breach.get("BreachDate", ""),
+                                "compromised_data": breach.get("DataClasses", []),
+                                "domain": breach.get("Domain", ""),
+                                "description": breach.get("Description", "")[:200],
+                                "is_verified": breach.get("IsVerified", False),
+                            })
+                    logger.info(f"HIBP: found {len(findings)} recent breaches")
+        except Exception as e:
+            logger.warning(f"HIBP breach search failed: {e}")
         return findings
 
     async def search_forums(self) -> list[dict[str, Any]]:
-        """Simulate dark web forum crawling"""
+        """Search Abuse.ch ThreatFox for recent IOCs (real API, free, no key)."""
         findings = []
-        for forum in self.forums:
-            simulated_posts = [
-                {
-                    "forum": forum,
-                    "post_id": f"post_{hash(forum)}",
-                    "author": f"user_{hash(forum) % 1000}",
-                    "title": f"Selling {forum} database access",
-                    "content_snippet": "Database contains user credentials and PII",
-                    "timestamp": (
-                        datetime.now(timezone.utc) - timedelta(days=1)
-                    ).isoformat(),
-                    "pricing": "$5000-$10000",
-                    "seller_reputation": "trusted",
-                },
-            ]
-            findings.extend(simulated_posts)
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.post(
+                    ABUSECH_THREATFOX,
+                    json={"query": "get_iocs", "days": 7},
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    for ioc in (data.get("data") or [])[:25]:
+                        findings.append({
+                            "forum": "threatfox.abuse.ch",
+                            "post_id": str(ioc.get("id", "")),
+                            "author": ioc.get("reporter", "anonymous"),
+                            "title": f"{ioc.get('threat_type', 'malware')}: {ioc.get('malware', 'unknown')}",
+                            "content_snippet": f"IOC: {ioc.get('ioc', '')} ({ioc.get('ioc_type', '')})",
+                            "timestamp": ioc.get("first_seen_utc", ""),
+                            "ioc_value": ioc.get("ioc", ""),
+                            "ioc_type": ioc.get("ioc_type", ""),
+                            "malware": ioc.get("malware", ""),
+                            "confidence": ioc.get("confidence_level", 0),
+                        })
+                    logger.info(f"ThreatFox: found {len(findings)} IOCs")
+        except Exception as e:
+            logger.warning(f"ThreatFox search failed: {e}")
         return findings
 
     async def search_telegram_channels(self) -> list[dict[str, Any]]:
-        """Simulate Telegram channel monitoring"""
-        findings = [
-            {
-                "platform": "telegram",
-                "channel": "@leaks_channel_1",
-                "message_id": "msg_123456",
-                "sender": "anonymous_leaker",
-                "message": "Leaked company database available",
-                "timestamp": (
-                    datetime.now(timezone.utc) - timedelta(hours=2)
-                ).isoformat(),
-                "has_attachment": True,
-                "attachment_type": "file",
-            },
-        ]
+        """Search AlienVault OTX for recent threat pulses (free, no key needed for public)."""
+        findings = []
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                resp = await client.get(
+                    f"{OTX_API}/pulses/subscribed",
+                    params={"limit": 20, "modified_since": (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%S")},
+                    headers={"X-OTX-API-KEY": os.environ.get("OTX_API_KEY", "")},
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    for pulse in (data.get("results") or [])[:20]:
+                        findings.append({
+                            "platform": "alienvault_otx",
+                            "channel": pulse.get("author_name", "OTX"),
+                            "message_id": pulse.get("id", ""),
+                            "sender": pulse.get("author_name", ""),
+                            "message": pulse.get("name", ""),
+                            "description": pulse.get("description", "")[:300],
+                            "timestamp": pulse.get("modified", ""),
+                            "tags": pulse.get("tags", []),
+                            "adversary": pulse.get("adversary", ""),
+                            "indicator_count": len(pulse.get("indicators", [])),
+                            "tlp": pulse.get("tlp", "white"),
+                        })
+                    logger.info(f"OTX: found {len(findings)} threat pulses")
+                elif resp.status_code == 403:
+                    logger.info("OTX: no API key configured, skipping")
+        except Exception as e:
+            logger.warning(f"OTX search failed: {e}")
         return findings
 
     async def aggregate_findings(self, results: dict[str, Any]) -> dict[str, Any]:
@@ -528,24 +565,32 @@ class BrandProtection:
     def monitor_certificate_transparency_logs(
         self, monitored_domains: list[str]
     ) -> list[dict[str, Any]]:
-        """Monitor certificate transparency logs for suspicious certificates"""
+        """Query crt.sh for certificate transparency logs (free, no key)."""
         detected_certs = []
 
         for domain in monitored_domains:
-            # Simulate CT log queries
-            simulated_certs = [
-                {
-                    "domain": domain,
-                    "issued_to": f"suspicious-{domain}",
-                    "issuer": "Let's Encrypt",
-                    "issued_date": datetime.now(timezone.utc).isoformat(),
-                    "valid_until": (
-                        datetime.now(timezone.utc) + timedelta(days=90)
-                    ).isoformat(),
-                    "risk": "high",
-                },
-            ]
-            detected_certs.extend(simulated_certs)
+            try:
+                resp = httpx.get(
+                    f"https://crt.sh/?q=%.{domain}&output=json",
+                    timeout=15.0,
+                )
+                if resp.status_code == 200:
+                    certs = resp.json()
+                    for cert in certs[:10]:
+                        name_value = cert.get("name_value", "")
+                        is_suspicious = domain not in name_value or name_value.count(".") > domain.count(".") + 1
+                        detected_certs.append({
+                            "domain": domain,
+                            "issued_to": name_value,
+                            "issuer": cert.get("issuer_name", ""),
+                            "issued_date": cert.get("not_before", ""),
+                            "valid_until": cert.get("not_after", ""),
+                            "serial_number": cert.get("serial_number", ""),
+                            "risk": "high" if is_suspicious else "low",
+                        })
+                    logger.info(f"crt.sh: found {len(certs)} certs for {domain}")
+            except Exception as e:
+                logger.warning(f"crt.sh query failed for {domain}: {e}")
 
         return detected_certs
 
