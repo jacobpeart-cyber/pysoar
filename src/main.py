@@ -205,6 +205,39 @@ async def general_exception_handler(request: Request, exc: Exception):
 app.include_router(api_router, prefix=settings.api_v1_prefix)
 
 
+# Direct WebSocket mount — bypasses BaseHTTPMiddleware which breaks WS
+from fastapi import WebSocket, Query as WSQuery
+from src.services.websocket_manager import manager as ws_manager
+from src.api.v1.endpoints.websocket import get_user_from_token
+
+@app.websocket("/api/v1/ws")
+async def ws_direct(websocket: WebSocket, token: str = WSQuery(default="")):
+    """WebSocket endpoint mounted directly on app to bypass middleware."""
+    user_id = await get_user_from_token(token) if token else None
+    if not user_id:
+        await websocket.accept()
+        await websocket.close(code=4001, reason="Authentication required")
+        return
+    try:
+        await ws_manager.connect(websocket, user_id)
+        while True:
+            try:
+                data = await websocket.receive_json()
+                action = data.get("action", "")
+                if action == "ping":
+                    await websocket.send_json({"type": "pong"})
+                elif action == "subscribe":
+                    await ws_manager.subscribe(user_id, data.get("channel", ""))
+                elif action == "unsubscribe":
+                    await ws_manager.unsubscribe(user_id, data.get("channel", ""))
+            except Exception:
+                break
+    except Exception:
+        pass
+    finally:
+        ws_manager.disconnect(user_id)
+
+
 # Root endpoint
 @app.get("/")
 async def root():
