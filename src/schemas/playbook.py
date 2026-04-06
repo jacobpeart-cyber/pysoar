@@ -9,12 +9,12 @@ from pydantic import BaseModel, Field
 class PlaybookStep(BaseModel):
     """Schema for a single playbook step"""
 
-    id: str
-    name: str
-    action: str  # e.g., "enrich_ip", "send_notification", "block_ip"
+    id: Optional[str] = None
+    name: str = ""
+    action: str = "manual"
     parameters: dict[str, Any] = {}
-    on_success: Optional[str] = None  # Next step ID on success
-    on_failure: Optional[str] = None  # Next step ID on failure
+    on_success: Optional[str] = None
+    on_failure: Optional[str] = None
     timeout_seconds: int = 300
     continue_on_error: bool = False
 
