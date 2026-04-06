@@ -392,6 +392,22 @@ class PrivacyIncidentBase(BaseModel):
     data_types_affected: Optional[List[str]] = None
     subjects_affected_count: Optional[int] = None
 
+    @field_validator("data_types_affected", mode="before")
+    @classmethod
+    def parse_json_list(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, list):
+            return v
+        if isinstance(v, str):
+            try:
+                import json as _json
+                parsed = _json.loads(v)
+                return parsed if isinstance(parsed, list) else [str(parsed)]
+            except (ValueError, TypeError):
+                return [v]
+        return v
+
 
 class PrivacyIncidentCreate(PrivacyIncidentBase):
     """Create Privacy Incident"""
