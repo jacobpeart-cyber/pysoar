@@ -730,10 +730,12 @@ async def report_privacy_incident(
             subjects_count=incident.subjects_affected_count or 0,
         )
 
-        # Trigger escalation task
-        from src.privacy.tasks import privacy_incident_escalation
-
-        privacy_incident_escalation.delay(privacy_incident.id, getattr(current_user, "organization_id", None))
+        # Trigger escalation task (non-blocking — if Celery/Redis unavailable, save still works)
+        try:
+            from src.privacy.tasks import privacy_incident_escalation
+            privacy_incident_escalation.delay(privacy_incident.id, getattr(current_user, "organization_id", None))
+        except Exception:
+            logger.warning("Could not dispatch escalation task — Celery/Redis may be unavailable")
 
         await db.commit()
         return privacy_incident
