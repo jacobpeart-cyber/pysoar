@@ -186,7 +186,7 @@ async def create_identity(
 ):
     """Create new identity profile"""
     identity = IdentityProfile(
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
         **data.dict()
     )
     db.add(identity)
@@ -354,7 +354,7 @@ async def create_threat(
 ):
     """Create new identity threat"""
     threat = IdentityThreat(
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
         **data.dict()
     )
     db.add(threat)
@@ -429,13 +429,13 @@ async def run_threat_scan(
     organization_id: Optional[str] = None,
 ):
     """Run comprehensive threat detection scan"""
-    logger.info(f"Initiating threat scan for org={organization_id or current_user.organization_id}")
+    logger.info(f"Initiating threat scan for org={organization_id or getattr(current_user, "organization_id", None)}")
 
     return {
         "status": "initiated",
         "scan_id": f"scan_{datetime.now(timezone.utc).timestamp()}",
         "message": "Threat detection scan initiated in background",
-        "organization_id": organization_id or current_user.organization_id,
+        "organization_id": organization_id or getattr(current_user, "organization_id", None),
     }
 
 
@@ -743,7 +743,7 @@ async def request_elevation(
     identity = await get_identity_or_404(db, data.identity_id)
 
     event = PrivilegedAccessEvent(
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
         identity_id=data.identity_id,
         event_type="elevation_request",
         target_resource=data.target_resource,

@@ -221,7 +221,7 @@ async def create_hypothesis(
     hypothesis = HuntHypothesis(
         title=hypothesis_data.title,
         description=hypothesis_data.description,
-        priority=hypothesis_data.priority,
+        priority=str(hypothesis_data.priority),
         hunt_type=hypothesis_data.hunt_type,
         mitre_tactics=json.dumps(hypothesis_data.mitre_tactics) if hypothesis_data.mitre_tactics else None,
         mitre_techniques=json.dumps(hypothesis_data.mitre_techniques) if hypothesis_data.mitre_techniques else None,

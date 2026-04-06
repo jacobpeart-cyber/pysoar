@@ -139,7 +139,7 @@ async def create_policy(
 ):
     """Create a new DLP policy"""
     policy = DLPPolicy(
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
         name=policy_data.name,
         description=policy_data.description,
         policy_type=policy_data.policy_type,
@@ -174,7 +174,7 @@ async def list_policies(
     search: Optional[str] = None,
 ):
     """List DLP policies"""
-    query = select(DLPPolicy).where(DLPPolicy.organization_id == current_user.organization_id)
+    query = select(DLPPolicy).where(DLPPolicy.organization_id == getattr(current_user, "organization_id", None))
 
     if enabled is not None:
         query = query.where(DLPPolicy.enabled == enabled)
@@ -317,7 +317,7 @@ async def create_violation(
 ):
     """Create a DLP violation record"""
     violation = DLPViolation(
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
         policy_id=violation_data.policy_id,
         violation_type=violation_data.violation_type,
         severity=violation_data.severity,
@@ -355,7 +355,7 @@ async def list_violations(
     search: Optional[str] = None,
 ):
     """List DLP violations"""
-    query = select(DLPViolation).where(DLPViolation.organization_id == current_user.organization_id)
+    query = select(DLPViolation).where(DLPViolation.organization_id == getattr(current_user, "organization_id", None))
 
     if status_filter:
         query = query.where(DLPViolation.status == status_filter)
@@ -471,7 +471,7 @@ async def create_classification(
 ):
     """Create a data classification level"""
     classification = DataClassification(
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
         name=classification_data.name,
         classification_level=classification_data.classification_level,
         description=classification_data.description,
@@ -506,7 +506,7 @@ async def list_classifications(
 ):
     """List data classifications"""
     query = select(DataClassification).where(
-        DataClassification.organization_id == current_user.organization_id
+        DataClassification.organization_id == getattr(current_user, "organization_id", None)
     )
 
     if level:
@@ -627,8 +627,8 @@ async def trigger_discovery_scan(
 ):
     """Trigger a sensitive data discovery scan"""
     scan = SensitiveDataDiscovery(
-        organization_id=current_user.organization_id,
-        scan_id=f"scan_{current_user.organization_id}_{int(__import__('time').time())}",
+        organization_id=getattr(current_user, "organization_id", None),
+        scan_id=f"scan_{getattr(current_user, "organization_id", None)}_{int(__import__('time').time())}",
         scan_type=scan_request.scan_type,
         target=scan_request.target,
         status="pending",
@@ -652,7 +652,7 @@ async def list_discovery_scans(
 ):
     """List sensitive data discovery scans"""
     query = select(SensitiveDataDiscovery).where(
-        SensitiveDataDiscovery.organization_id == current_user.organization_id
+        SensitiveDataDiscovery.organization_id == getattr(current_user, "organization_id", None)
     )
 
     if scan_type:
@@ -700,7 +700,7 @@ async def get_data_map(
     db: DatabaseSession = None,
 ):
     """Get data map showing where sensitive data lives"""
-    data_map = scanner.generate_data_map(current_user.organization_id)
+    data_map = scanner.generate_data_map(getattr(current_user, "organization_id", None))
     return DataMapResponse(**data_map)
 
 
@@ -726,7 +726,7 @@ async def create_incident(
 ):
     """Create a DLP incident"""
     incident = DLPIncident(
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
         violation_ids=json.dumps(incident_data.violation_ids)
         if incident_data.violation_ids
         else None,
@@ -758,7 +758,7 @@ async def list_incidents(
     severity: Optional[str] = None,
 ):
     """List DLP incidents"""
-    query = select(DLPIncident).where(DLPIncident.organization_id == current_user.organization_id)
+    query = select(DLPIncident).where(DLPIncident.organization_id == getattr(current_user, "organization_id", None))
 
     if status_filter:
         query = query.where(DLPIncident.status == status_filter)
@@ -894,14 +894,14 @@ async def get_dlp_dashboard(
     """Get DLP dashboard summary"""
     # Count violations
     violations_query = select(func.count()).select_from(DLPViolation).where(
-        DLPViolation.organization_id == current_user.organization_id
+        DLPViolation.organization_id == getattr(current_user, "organization_id", None)
     )
     total_violations_result = await db.execute(violations_query)
     total_violations = total_violations_result.scalar() or 0
 
     # Count critical violations
     critical_query = select(func.count()).select_from(DLPViolation).where(
-        (DLPViolation.organization_id == current_user.organization_id)
+        (DLPViolation.organization_id == getattr(current_user, "organization_id", None))
         & (DLPViolation.severity == "critical")
     )
     critical_result = await db.execute(critical_query)
@@ -912,7 +912,7 @@ async def get_dlp_dashboard(
         DLPViolation,
         DLPPolicy.id == DLPViolation.policy_id,
     ).where(
-        DLPPolicy.organization_id == current_user.organization_id
+        DLPPolicy.organization_id == getattr(current_user, "organization_id", None)
     ).group_by(
         DLPPolicy.name
     ).order_by(
@@ -926,7 +926,7 @@ async def get_dlp_dashboard(
     ]
 
     return DLPDashboardResponse(
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
         total_violations=total_violations,
         violations_this_month=0,
         critical_violations=critical_violations,

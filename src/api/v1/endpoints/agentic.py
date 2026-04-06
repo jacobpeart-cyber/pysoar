@@ -73,7 +73,7 @@ async def list_agents(
 ):
     """List SOC agents with filtering and pagination"""
     query = select(SOCAgent).where(
-        SOCAgent.organization_id == current_user.organization_id
+        SOCAgent.organization_id == getattr(current_user, "organization_id", None)
     )
 
     if agent_type:
@@ -113,7 +113,7 @@ async def get_agent(
     """Get specific agent details"""
     agent = await db.get(SOCAgent, agent_id)
 
-    if not agent or agent.organization_id != current_user.organization_id:
+    if not agent or agent.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Agent not found",
@@ -130,7 +130,7 @@ async def create_agent(
 ):
     """Create new SOC agent"""
     agent = SOCAgent(
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
         name=agent_data.name,
         agent_type=agent_data.agent_type,
         capabilities=json.dumps(agent_data.capabilities or []),
@@ -157,7 +157,7 @@ async def update_agent(
     """Update agent configuration"""
     agent = await db.get(SOCAgent, agent_id)
 
-    if not agent or agent.organization_id != current_user.organization_id:
+    if not agent or agent.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Agent not found",
@@ -190,7 +190,7 @@ async def start_agent(
     """Start agent operation"""
     agent = await db.get(SOCAgent, agent_id)
 
-    if not agent or agent.organization_id != current_user.organization_id:
+    if not agent or agent.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Agent not found",
@@ -211,7 +211,7 @@ async def stop_agent(
     """Stop agent operation"""
     agent = await db.get(SOCAgent, agent_id)
 
-    if not agent or agent.organization_id != current_user.organization_id:
+    if not agent or agent.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Agent not found",
@@ -232,7 +232,7 @@ async def get_agent_performance(
     """Get agent performance metrics"""
     agent = await db.get(SOCAgent, agent_id)
 
-    if not agent or agent.organization_id != current_user.organization_id:
+    if not agent or agent.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Agent not found",
@@ -266,7 +266,7 @@ async def list_investigations(
 ):
     """List investigations with filtering and pagination"""
     query = select(Investigation).where(
-        Investigation.organization_id == current_user.organization_id
+        Investigation.organization_id == getattr(current_user, "organization_id", None)
     )
 
     if agent_id:
@@ -309,7 +309,7 @@ async def get_investigation(
     """Get investigation details"""
     investigation = await db.get(Investigation, investigation_id)
 
-    if not investigation or investigation.organization_id != current_user.organization_id:
+    if not investigation or investigation.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Investigation not found",
@@ -354,14 +354,14 @@ async def start_investigation(
     """Start manual investigation"""
     # Verify agent exists
     agent = await db.get(SOCAgent, inv_data.agent_id)
-    if not agent or agent.organization_id != current_user.organization_id:
+    if not agent or agent.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Agent not found",
         )
 
     investigation = Investigation(
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
         agent_id=inv_data.agent_id,
         trigger_type=inv_data.trigger_type,
         trigger_source_id=inv_data.trigger_source_id,
@@ -378,7 +378,7 @@ async def start_investigation(
     # Start async investigation
     run_investigation.delay(
         agent_id=inv_data.agent_id,
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
         trigger_type=inv_data.trigger_type,
         trigger_source_id=inv_data.trigger_source_id,
         title=inv_data.title,
@@ -399,7 +399,7 @@ async def update_investigation(
     """Update investigation"""
     investigation = await db.get(Investigation, investigation_id)
 
-    if not investigation or investigation.organization_id != current_user.organization_id:
+    if not investigation or investigation.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Investigation not found",
@@ -433,7 +433,7 @@ async def get_reasoning_chain(
     """Get detailed reasoning chain for investigation"""
     investigation = await db.get(Investigation, investigation_id)
 
-    if not investigation or investigation.organization_id != current_user.organization_id:
+    if not investigation or investigation.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Investigation not found",
@@ -466,7 +466,7 @@ async def get_investigation_timeline(
     """Get timeline view of investigation"""
     investigation = await db.get(Investigation, investigation_id)
 
-    if not investigation or investigation.organization_id != current_user.organization_id:
+    if not investigation or investigation.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Investigation not found",
@@ -494,7 +494,7 @@ async def submit_investigation_feedback(
     """Submit feedback on investigation quality"""
     investigation = await db.get(Investigation, investigation_id)
 
-    if not investigation or investigation.organization_id != current_user.organization_id:
+    if not investigation or investigation.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Investigation not found",
@@ -583,7 +583,7 @@ async def approve_action(
     """Approve action execution"""
     action = await db.get(AgentAction, action_id)
 
-    if not action or action.organization_id != current_user.organization_id:
+    if not action or action.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Action not found",
@@ -613,7 +613,7 @@ async def rollback_action(
     """Rollback executed action"""
     action = await db.get(AgentAction, action_id)
 
-    if not action or action.organization_id != current_user.organization_id:
+    if not action or action.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Action not found",
@@ -694,7 +694,7 @@ async def explain_investigation(
     """Get natural language explanation of investigation"""
     investigation = await db.get(Investigation, investigation_id)
 
-    if not investigation or investigation.organization_id != current_user.organization_id:
+    if not investigation or investigation.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Investigation not found",
@@ -727,21 +727,21 @@ async def get_dashboard_metrics(
     """Get SOC dashboard metrics"""
     # Count agents
     agent_query = select(func.count()).select_from(SOCAgent).where(
-        SOCAgent.organization_id == current_user.organization_id
+        SOCAgent.organization_id == getattr(current_user, "organization_id", None)
     )
     agent_result = await db.execute(agent_query)
     total_agents = agent_result.scalar() or 0
 
     # Count investigations
     inv_query = select(func.count()).select_from(Investigation).where(
-        Investigation.organization_id == current_user.organization_id
+        Investigation.organization_id == getattr(current_user, "organization_id", None)
     )
     inv_result = await db.execute(inv_query)
     total_investigations = inv_result.scalar() or 0
 
     # Count by status
     in_progress_query = select(func.count()).select_from(Investigation).where(
-        Investigation.organization_id == current_user.organization_id,
+        Investigation.organization_id == getattr(current_user, "organization_id", None),
         Investigation.status == InvestigationStatus.REASONING.value,
     )
     in_progress_result = await db.execute(in_progress_query)
@@ -749,7 +749,7 @@ async def get_dashboard_metrics(
 
     # Count pending approvals
     approval_query = select(func.count()).select_from(AgentAction).where(
-        AgentAction.organization_id == current_user.organization_id,
+        AgentAction.organization_id == getattr(current_user, "organization_id", None),
         AgentAction.execution_status == ActionExecutionStatus.PENDING_APPROVAL.value,
     )
     approval_result = await db.execute(approval_query)
@@ -828,7 +828,7 @@ async def start_threat_hunt(
 
     if not agent_id:
         query = select(SOCAgent).where(
-            SOCAgent.organization_id == current_user.organization_id
+            SOCAgent.organization_id == getattr(current_user, "organization_id", None)
         )
         result = await db.execute(query)
         agent = result.scalars().first()
@@ -871,7 +871,7 @@ async def list_agent_memory(
     """List agent memory entries"""
     agent = await db.get(SOCAgent, agent_id)
 
-    if not agent or agent.organization_id != current_user.organization_id:
+    if not agent or agent.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Agent not found",
@@ -913,7 +913,7 @@ async def get_memory_stats(
     """Get agent memory statistics"""
     agent = await db.get(SOCAgent, agent_id)
 
-    if not agent or agent.organization_id != current_user.organization_id:
+    if not agent or agent.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Agent not found",
@@ -951,7 +951,7 @@ async def clear_agent_memory(
     """Clear agent memory (optional filter by type)"""
     agent = await db.get(SOCAgent, agent_id)
 
-    if not agent or agent.organization_id != current_user.organization_id:
+    if not agent or agent.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Agent not found",

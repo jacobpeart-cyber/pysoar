@@ -147,7 +147,7 @@ async def list_risk_scenarios(
 ):
     """List risk scenarios with filtering and pagination"""
     query = select(RiskScenario).where(
-        RiskScenario.organization_id == current_user.organization_id
+        RiskScenario.organization_id == getattr(current_user, "organization_id", None)
     )
 
     if search:
@@ -198,7 +198,7 @@ async def create_risk_scenario(
 ):
     """Create a new risk scenario"""
     scenario = RiskScenario(
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
         name=scenario_data.name,
         description=scenario_data.description,
         asset_id=scenario_data.asset_id,
@@ -274,7 +274,7 @@ async def list_fair_analyses(
 ):
     """List FAIR analyses"""
     query = select(FAIRAnalysis).where(
-        FAIRAnalysis.organization_id == current_user.organization_id
+        FAIRAnalysis.organization_id == getattr(current_user, "organization_id", None)
     )
 
     if scenario_id:
@@ -317,7 +317,7 @@ async def create_fair_analysis(
     scenario = await get_risk_scenario_or_404(db, analysis_data.scenario_id)
 
     analysis = FAIRAnalysis(
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
         scenario_id=analysis_data.scenario_id,
         tef_min=analysis_data.tef_min,
         tef_mode=analysis_data.tef_mode,
@@ -349,7 +349,7 @@ async def create_fair_analysis(
     await db.refresh(analysis)
 
     # Queue simulation task
-    run_fair_simulation.delay(analysis.id, current_user.organization_id)
+    run_fair_simulation.delay(analysis.id, getattr(current_user, "organization_id", None))
 
     return FAIRAnalysisResponse.model_validate(analysis)
 
@@ -460,7 +460,7 @@ async def list_risk_registers(
 ):
     """List risk registers"""
     query = select(RiskRegister).where(
-        RiskRegister.organization_id == current_user.organization_id
+        RiskRegister.organization_id == getattr(current_user, "organization_id", None)
     )
 
     if category:
@@ -503,7 +503,7 @@ async def create_risk_register(
 ):
     """Create a new risk register entry"""
     register = RiskRegister(
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
         name=register_data.name,
         description=register_data.description,
         risk_category=register_data.risk_category,
@@ -590,7 +590,7 @@ async def list_risk_controls(
 ):
     """List risk controls"""
     query = select(RiskControl).where(
-        RiskControl.organization_id == current_user.organization_id
+        RiskControl.organization_id == getattr(current_user, "organization_id", None)
     )
 
     if control_type:
@@ -633,7 +633,7 @@ async def create_risk_control(
 ):
     """Create a new risk control"""
     control = RiskControl(
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
         risk_register_id=control_data.risk_register_id,
         control_name=control_data.control_name,
         control_type=control_data.control_type,
@@ -746,7 +746,7 @@ async def list_bias(
 ):
     """List Business Impact Assessments"""
     query = select(BusinessImpactAssessment).where(
-        BusinessImpactAssessment.organization_id == current_user.organization_id
+        BusinessImpactAssessment.organization_id == getattr(current_user, "organization_id", None)
     )
 
     if criticality:
@@ -786,7 +786,7 @@ async def create_bia(
 ):
     """Create a new Business Impact Assessment"""
     bia = BusinessImpactAssessment(
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
         asset_name=bia_data.asset_name,
         asset_type=bia_data.asset_type,
         business_unit=bia_data.business_unit,
@@ -866,7 +866,7 @@ async def get_risk_dashboard(
     """Get organizational risk dashboard"""
     # Query all risks for organization
     query = select(RiskRegister).where(
-        RiskRegister.organization_id == current_user.organization_id
+        RiskRegister.organization_id == getattr(current_user, "organization_id", None)
     )
     result = await db.execute(query)
     registers = list(result.scalars().all())
@@ -931,7 +931,7 @@ async def get_risk_heatmap(
 
     # Query all risks
     query = select(RiskRegister).where(
-        RiskRegister.organization_id == current_user.organization_id
+        RiskRegister.organization_id == getattr(current_user, "organization_id", None)
     )
     result = await db.execute(query)
     registers = list(result.scalars().all())

@@ -98,7 +98,7 @@ async def create_template(
         is_seasonal=request.is_seasonal,
         usage_count=0,
         average_click_rate=0.0,
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
     )
 
     db.add(template)
@@ -126,7 +126,7 @@ async def list_templates(
 ):
     """List all phishing templates with optional filtering."""
     query = select(PhishingTemplate).where(
-        PhishingTemplate.organization_id == current_user.organization_id
+        PhishingTemplate.organization_id == getattr(current_user, "organization_id", None)
     )
 
     if category:
@@ -156,7 +156,7 @@ async def get_template(
     result = await db.execute(
         select(PhishingTemplate).where(
             PhishingTemplate.id == str(template_id),
-            PhishingTemplate.organization_id == current_user.organization_id,
+            PhishingTemplate.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     template = result.scalar_one_or_none()
@@ -184,7 +184,7 @@ async def update_template(
     result = await db.execute(
         select(PhishingTemplate).where(
             PhishingTemplate.id == str(template_id),
-            PhishingTemplate.organization_id == current_user.organization_id,
+            PhishingTemplate.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     template = result.scalar_one_or_none()
@@ -220,7 +220,7 @@ async def render_template(
     result = await db.execute(
         select(PhishingTemplate).where(
             PhishingTemplate.id == str(template_id),
-            PhishingTemplate.organization_id == current_user.organization_id,
+            PhishingTemplate.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     template = result.scalar_one_or_none()
@@ -264,7 +264,7 @@ async def validate_template(
     result = await db.execute(
         select(PhishingTemplate).where(
             PhishingTemplate.id == str(template_id),
-            PhishingTemplate.organization_id == current_user.organization_id,
+            PhishingTemplate.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     template = result.scalar_one_or_none()
@@ -314,7 +314,7 @@ async def get_template_effectiveness(
     result = await db.execute(
         select(PhishingTemplate).where(
             PhishingTemplate.id == str(template_id),
-            PhishingTemplate.organization_id == current_user.organization_id,
+            PhishingTemplate.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     template = result.scalar_one_or_none()
@@ -374,7 +374,7 @@ async def create_target_group(
         avg_click_rate=0.0,
         campaigns_participated=0,
         last_campaign_date=None,
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
     )
 
     db.add(group)
@@ -383,7 +383,7 @@ async def create_target_group(
     logger.info(
         f"Created target group: {request.name}",
         extra={
-            "organization_id": current_user.organization_id,
+            "organization_id": getattr(current_user, "organization_id", None),
             "member_count": len(request.members),
         },
     )
@@ -401,7 +401,7 @@ async def list_target_groups(
 ):
     """List all target groups."""
     query = select(TargetGroup).where(
-        TargetGroup.organization_id == current_user.organization_id
+        TargetGroup.organization_id == getattr(current_user, "organization_id", None)
     )
 
     if department:
@@ -424,7 +424,7 @@ async def get_target_group(
     result = await db.execute(
         select(TargetGroup).where(
             TargetGroup.id == str(group_id),
-            TargetGroup.organization_id == current_user.organization_id,
+            TargetGroup.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     group = result.scalar_one_or_none()
@@ -449,7 +449,7 @@ async def update_target_group(
     result = await db.execute(
         select(TargetGroup).where(
             TargetGroup.id == str(group_id),
-            TargetGroup.organization_id == current_user.organization_id,
+            TargetGroup.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     group = result.scalar_one_or_none()
@@ -491,7 +491,7 @@ async def delete_target_group(
     result = await db.execute(
         select(TargetGroup).where(
             TargetGroup.id == str(group_id),
-            TargetGroup.organization_id == current_user.organization_id,
+            TargetGroup.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     group = result.scalar_one_or_none()
@@ -547,7 +547,7 @@ async def create_campaign(
         attachments_opened=0,
         reported_count=0,
         created_by=current_user.id,
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
     )
 
     db.add(campaign)
@@ -575,7 +575,7 @@ async def list_campaigns(
 ):
     """List all campaigns with optional filtering."""
     query = select(PhishingCampaign).where(
-        PhishingCampaign.organization_id == current_user.organization_id
+        PhishingCampaign.organization_id == getattr(current_user, "organization_id", None)
     )
 
     if status_filter:
@@ -608,7 +608,7 @@ async def get_campaign(
     result = await db.execute(
         select(PhishingCampaign).where(
             PhishingCampaign.id == str(campaign_id),
-            PhishingCampaign.organization_id == current_user.organization_id,
+            PhishingCampaign.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     campaign = result.scalar_one_or_none()
@@ -688,7 +688,7 @@ async def update_campaign(
     result = await db.execute(
         select(PhishingCampaign).where(
             PhishingCampaign.id == str(campaign_id),
-            PhishingCampaign.organization_id == current_user.organization_id,
+            PhishingCampaign.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     campaign = result.scalar_one_or_none()
@@ -736,7 +736,7 @@ async def launch_campaign(
     result = await db.execute(
         select(PhishingCampaign).where(
             PhishingCampaign.id == str(campaign_id),
-            PhishingCampaign.organization_id == current_user.organization_id,
+            PhishingCampaign.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     campaign = result.scalar_one_or_none()
@@ -783,7 +783,7 @@ async def pause_campaign(
     result = await db.execute(
         select(PhishingCampaign).where(
             PhishingCampaign.id == str(campaign_id),
-            PhishingCampaign.organization_id == current_user.organization_id,
+            PhishingCampaign.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     campaign = result.scalar_one_or_none()
@@ -818,7 +818,7 @@ async def resume_campaign(
     result = await db.execute(
         select(PhishingCampaign).where(
             PhishingCampaign.id == str(campaign_id),
-            PhishingCampaign.organization_id == current_user.organization_id,
+            PhishingCampaign.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     campaign = result.scalar_one_or_none()
@@ -853,7 +853,7 @@ async def end_campaign(
     result = await db.execute(
         select(PhishingCampaign).where(
             PhishingCampaign.id == str(campaign_id),
-            PhishingCampaign.organization_id == current_user.organization_id,
+            PhishingCampaign.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     campaign = result.scalar_one_or_none()
@@ -892,7 +892,7 @@ async def clone_campaign(
     result = await db.execute(
         select(PhishingCampaign).where(
             PhishingCampaign.id == str(campaign_id),
-            PhishingCampaign.organization_id == current_user.organization_id,
+            PhishingCampaign.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     campaign = result.scalar_one_or_none()
@@ -923,7 +923,7 @@ async def clone_campaign(
         attachments_opened=0,
         reported_count=0,
         created_by=current_user.id,
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
     )
 
     db.add(cloned)
@@ -948,7 +948,7 @@ async def schedule_campaign(
     result = await db.execute(
         select(PhishingCampaign).where(
             PhishingCampaign.id == str(campaign_id),
-            PhishingCampaign.organization_id == current_user.organization_id,
+            PhishingCampaign.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     campaign = result.scalar_one_or_none()
@@ -994,7 +994,7 @@ async def get_campaign_results(
     result = await db.execute(
         select(PhishingCampaign).where(
             PhishingCampaign.id == str(campaign_id),
-            PhishingCampaign.organization_id == current_user.organization_id,
+            PhishingCampaign.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     campaign = result.scalar_one_or_none()
@@ -1046,7 +1046,7 @@ async def record_event(
     campaign_result = await db.execute(
         select(PhishingCampaign).where(
             PhishingCampaign.id == str(campaign_id),
-            PhishingCampaign.organization_id == current_user.organization_id,
+            PhishingCampaign.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     campaign = campaign_result.scalar_one_or_none()
@@ -1069,7 +1069,7 @@ async def record_event(
         geo_location=request.geo_location,
         device_type=request.device_type,
         time_to_action_seconds=request.time_to_action_seconds,
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
     )
 
     db.add(event)
@@ -1118,7 +1118,7 @@ async def list_campaign_events(
     """List events for a campaign."""
     query = select(CampaignEvent).where(
         CampaignEvent.campaign_id == str(campaign_id),
-        CampaignEvent.organization_id == current_user.organization_id,
+        CampaignEvent.organization_id == getattr(current_user, "organization_id", None),
     )
 
     if event_type:
@@ -1148,7 +1148,7 @@ async def get_event_timeline(
     """Get event timeline for campaign or specific target."""
     query = select(CampaignEvent).where(
         CampaignEvent.campaign_id == str(campaign_id),
-        CampaignEvent.organization_id == current_user.organization_id,
+        CampaignEvent.organization_id == getattr(current_user, "organization_id", None),
     )
 
     if target_email:
@@ -1194,7 +1194,7 @@ async def get_user_awareness_score(
     result = await db.execute(
         select(SecurityAwarenessScore).where(
             SecurityAwarenessScore.user_email == user_email,
-            SecurityAwarenessScore.organization_id == current_user.organization_id,
+            SecurityAwarenessScore.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     score = result.scalar_one_or_none()
@@ -1266,7 +1266,7 @@ async def calculate_user_score(
     result = await db.execute(
         select(SecurityAwarenessScore).where(
             SecurityAwarenessScore.user_email == user_email,
-            SecurityAwarenessScore.organization_id == current_user.organization_id,
+            SecurityAwarenessScore.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     score_record = result.scalar_one_or_none()
@@ -1303,7 +1303,7 @@ async def calculate_user_score(
             risk_category=risk_category,
             training_assignments=[],
             certifications=[],
-            organization_id=current_user.organization_id,
+            organization_id=getattr(current_user, "organization_id", None),
         )
         db.add(score_record)
 
@@ -1330,7 +1330,7 @@ async def get_department_scores(
     result = await db.execute(
         select(SecurityAwarenessScore).where(
             SecurityAwarenessScore.department == department,
-            SecurityAwarenessScore.organization_id == current_user.organization_id,
+            SecurityAwarenessScore.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     scores = result.scalars().all()
@@ -1380,7 +1380,7 @@ async def get_high_risk_users(
         select(SecurityAwarenessScore)
         .where(
             SecurityAwarenessScore.overall_score < threshold,
-            SecurityAwarenessScore.organization_id == current_user.organization_id,
+            SecurityAwarenessScore.organization_id == getattr(current_user, "organization_id", None),
         )
         .order_by(SecurityAwarenessScore.overall_score)
     )
@@ -1468,7 +1468,7 @@ async def assign_training(
     result = await db.execute(
         select(SecurityAwarenessScore).where(
             SecurityAwarenessScore.user_email == user_email,
-            SecurityAwarenessScore.organization_id == current_user.organization_id,
+            SecurityAwarenessScore.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     score_record = result.scalar_one_or_none()
@@ -1490,7 +1490,7 @@ async def assign_training(
             risk_category="moderate_risk",
             training_assignments=[],
             certifications=[],
-            organization_id=current_user.organization_id,
+            organization_id=getattr(current_user, "organization_id", None),
         )
         db.add(score_record)
 
@@ -1543,7 +1543,7 @@ async def track_training_completion(
     result = await db.execute(
         select(SecurityAwarenessScore).where(
             SecurityAwarenessScore.user_email == user_email,
-            SecurityAwarenessScore.organization_id == current_user.organization_id,
+            SecurityAwarenessScore.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     score_record = result.scalar_one_or_none()
@@ -1624,7 +1624,7 @@ async def generate_certificate(
     result = await db.execute(
         select(SecurityAwarenessScore).where(
             SecurityAwarenessScore.user_email == user_email,
-            SecurityAwarenessScore.organization_id == current_user.organization_id,
+            SecurityAwarenessScore.organization_id == getattr(current_user, "organization_id", None),
         )
     )
     score_record = result.scalar_one_or_none()
@@ -1680,7 +1680,7 @@ async def get_dashboard(
     current_user: CurrentUser,
 ):
     """Get comprehensive phishing simulation dashboard."""
-    org_id = current_user.organization_id
+    org_id = getattr(current_user, "organization_id", None)
 
     # Fetch all campaigns for this org
     campaign_result = await db.execute(
@@ -1845,7 +1845,7 @@ async def get_risk_report(
     current_user: CurrentUser,
 ):
     """Generate comprehensive risk assessment report."""
-    org_id = current_user.organization_id
+    org_id = getattr(current_user, "organization_id", None)
 
     result = await db.execute(
         select(SecurityAwarenessScore).where(

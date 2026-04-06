@@ -254,7 +254,7 @@ async def create_threat_feed(
     feed = ThreatFeed(
         id=str(uuid.uuid4()),
         **feed_data.model_dump(),
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
     )
     db.add(feed)
     await db.flush()
@@ -275,7 +275,7 @@ async def list_threat_feeds(
     """
     List threat feeds with filtering and pagination.
     """
-    query = select(ThreatFeed).where(ThreatFeed.organization_id == current_user.organization_id)
+    query = select(ThreatFeed).where(ThreatFeed.organization_id == getattr(current_user, "organization_id", None))
 
     if is_enabled is not None:
         query = query.where(ThreatFeed.is_enabled == is_enabled)
@@ -311,7 +311,7 @@ async def get_threat_feed(
     """
     result = await db.execute(
         select(ThreatFeed).where(
-            and_(ThreatFeed.id == feed_id, ThreatFeed.organization_id == current_user.organization_id)
+            and_(ThreatFeed.id == feed_id, ThreatFeed.organization_id == getattr(current_user, "organization_id", None))
         )
     )
     feed = result.scalars().first()
@@ -336,7 +336,7 @@ async def update_threat_feed(
 
     result = await db.execute(
         select(ThreatFeed).where(
-            and_(ThreatFeed.id == feed_id, ThreatFeed.organization_id == current_user.organization_id)
+            and_(ThreatFeed.id == feed_id, ThreatFeed.organization_id == getattr(current_user, "organization_id", None))
         )
     )
     feed = result.scalars().first()
@@ -366,7 +366,7 @@ async def delete_threat_feed(
 
     result = await db.execute(
         select(ThreatFeed).where(
-            and_(ThreatFeed.id == feed_id, ThreatFeed.organization_id == current_user.organization_id)
+            and_(ThreatFeed.id == feed_id, ThreatFeed.organization_id == getattr(current_user, "organization_id", None))
         )
     )
     feed = result.scalars().first()
@@ -392,7 +392,7 @@ async def poll_threat_feed(
 
     result = await db.execute(
         select(ThreatFeed).where(
-            and_(ThreatFeed.id == feed_id, ThreatFeed.organization_id == current_user.organization_id)
+            and_(ThreatFeed.id == feed_id, ThreatFeed.organization_id == getattr(current_user, "organization_id", None))
         )
     )
     feed = result.scalars().first()
@@ -468,7 +468,7 @@ async def register_builtin_feeds(
             select(ThreatFeed).where(
                 and_(
                     ThreatFeed.name == feed_def["name"],
-                    ThreatFeed.organization_id == current_user.organization_id,
+                    ThreatFeed.organization_id == getattr(current_user, "organization_id", None),
                 )
             )
         )
@@ -477,7 +477,7 @@ async def register_builtin_feeds(
 
         feed = ThreatFeed(
             id=str(uuid.uuid4()),
-            organization_id=current_user.organization_id,
+            organization_id=getattr(current_user, "organization_id", None),
             **feed_def,
         )
         db.add(feed)
@@ -498,7 +498,7 @@ async def get_feed_stats(
     """
     result = await db.execute(
         select(ThreatFeed).where(
-            and_(ThreatFeed.id == feed_id, ThreatFeed.organization_id == current_user.organization_id)
+            and_(ThreatFeed.id == feed_id, ThreatFeed.organization_id == getattr(current_user, "organization_id", None))
         )
     )
     feed = result.scalars().first()
@@ -547,7 +547,7 @@ async def create_indicator(
         **indicator_data.model_dump(),
         first_seen=datetime.now(timezone.utc),
         last_seen=datetime.now(timezone.utc),
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
     )
     db.add(indicator)
     await db.flush()
@@ -576,7 +576,7 @@ async def bulk_import_indicators(
                 feed_id=import_data.feed_id,
                 first_seen=now,
                 last_seen=now,
-                organization_id=current_user.organization_id,
+                organization_id=getattr(current_user, "organization_id", None),
             )
             # Override source with the bulk import source if not set on individual indicator
             if not indicator.source:
@@ -618,7 +618,7 @@ async def list_indicators(
     """
     List threat indicators with advanced filtering and pagination.
     """
-    query = select(ThreatIndicator).where(ThreatIndicator.organization_id == current_user.organization_id)
+    query = select(ThreatIndicator).where(ThreatIndicator.organization_id == getattr(current_user, "organization_id", None))
 
     if indicator_type:
         query = query.where(ThreatIndicator.indicator_type == indicator_type)
@@ -673,7 +673,7 @@ async def get_indicator(
     """
     result = await db.execute(
         select(ThreatIndicator).where(
-            and_(ThreatIndicator.id == indicator_id, ThreatIndicator.organization_id == current_user.organization_id)
+            and_(ThreatIndicator.id == indicator_id, ThreatIndicator.organization_id == getattr(current_user, "organization_id", None))
         )
     )
     indicator = result.scalars().first()
@@ -694,7 +694,7 @@ async def update_indicator(
     """
     result = await db.execute(
         select(ThreatIndicator).where(
-            and_(ThreatIndicator.id == indicator_id, ThreatIndicator.organization_id == current_user.organization_id)
+            and_(ThreatIndicator.id == indicator_id, ThreatIndicator.organization_id == getattr(current_user, "organization_id", None))
         )
     )
     indicator = result.scalars().first()
@@ -720,7 +720,7 @@ async def delete_indicator(
     """
     result = await db.execute(
         select(ThreatIndicator).where(
-            and_(ThreatIndicator.id == indicator_id, ThreatIndicator.organization_id == current_user.organization_id)
+            and_(ThreatIndicator.id == indicator_id, ThreatIndicator.organization_id == getattr(current_user, "organization_id", None))
         )
     )
     indicator = result.scalars().first()
@@ -742,7 +742,7 @@ async def enrich_indicator(
     """
     result = await db.execute(
         select(ThreatIndicator).where(
-            and_(ThreatIndicator.id == indicator_id, ThreatIndicator.organization_id == current_user.organization_id)
+            and_(ThreatIndicator.id == indicator_id, ThreatIndicator.organization_id == getattr(current_user, "organization_id", None))
         )
     )
     indicator = result.scalars().first()
@@ -775,7 +775,7 @@ async def whitelist_indicator(
     """
     result = await db.execute(
         select(ThreatIndicator).where(
-            and_(ThreatIndicator.id == indicator_id, ThreatIndicator.organization_id == current_user.organization_id)
+            and_(ThreatIndicator.id == indicator_id, ThreatIndicator.organization_id == getattr(current_user, "organization_id", None))
         )
     )
     indicator = result.scalars().first()
@@ -802,7 +802,7 @@ async def get_indicator_timeline(
     # Verify indicator exists and belongs to user's org
     result = await db.execute(
         select(ThreatIndicator).where(
-            and_(ThreatIndicator.id == indicator_id, ThreatIndicator.organization_id == current_user.organization_id)
+            and_(ThreatIndicator.id == indicator_id, ThreatIndicator.organization_id == getattr(current_user, "organization_id", None))
         )
     )
     indicator = result.scalars().first()
@@ -853,7 +853,7 @@ async def advanced_search_indicators(
     """
     Perform advanced search on threat indicators.
     """
-    query = select(ThreatIndicator).where(ThreatIndicator.organization_id == current_user.organization_id)
+    query = select(ThreatIndicator).where(ThreatIndicator.organization_id == getattr(current_user, "organization_id", None))
 
     if search_request.query:
         query = query.where(
@@ -907,7 +907,7 @@ async def record_sighting(
         select(ThreatIndicator).where(
             and_(
                 ThreatIndicator.id == sighting_data.indicator_id,
-                ThreatIndicator.organization_id == current_user.organization_id,
+                ThreatIndicator.organization_id == getattr(current_user, "organization_id", None),
             )
         )
     )
@@ -918,7 +918,7 @@ async def record_sighting(
     sighting = IndicatorSighting(
         id=str(uuid.uuid4()),
         **sighting_data.model_dump(),
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
     )
     db.add(sighting)
 
@@ -946,7 +946,7 @@ async def get_indicator_sightings(
     # Verify the indicator exists and belongs to user's org
     ind_result = await db.execute(
         select(ThreatIndicator).where(
-            and_(ThreatIndicator.id == indicator_id, ThreatIndicator.organization_id == current_user.organization_id)
+            and_(ThreatIndicator.id == indicator_id, ThreatIndicator.organization_id == getattr(current_user, "organization_id", None))
         )
     )
     if not ind_result.scalars().first():
@@ -981,7 +981,7 @@ async def create_actor(
     actor = ThreatActor(
         id=str(uuid.uuid4()),
         **actor_data.model_dump(),
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
     )
     db.add(actor)
     await db.flush()
@@ -1003,7 +1003,7 @@ async def list_actors(
     """
     List threat actors with filtering and pagination.
     """
-    query = select(ThreatActor).where(ThreatActor.organization_id == current_user.organization_id)
+    query = select(ThreatActor).where(ThreatActor.organization_id == getattr(current_user, "organization_id", None))
 
     if search:
         query = query.where(
@@ -1039,7 +1039,7 @@ async def get_actor(
     """
     result = await db.execute(
         select(ThreatActor).where(
-            and_(ThreatActor.id == actor_id, ThreatActor.organization_id == current_user.organization_id)
+            and_(ThreatActor.id == actor_id, ThreatActor.organization_id == getattr(current_user, "organization_id", None))
         )
     )
     actor = result.scalars().first()
@@ -1060,7 +1060,7 @@ async def update_actor(
     """
     result = await db.execute(
         select(ThreatActor).where(
-            and_(ThreatActor.id == actor_id, ThreatActor.organization_id == current_user.organization_id)
+            and_(ThreatActor.id == actor_id, ThreatActor.organization_id == getattr(current_user, "organization_id", None))
         )
     )
     actor = result.scalars().first()
@@ -1086,7 +1086,7 @@ async def delete_actor(
     """
     result = await db.execute(
         select(ThreatActor).where(
-            and_(ThreatActor.id == actor_id, ThreatActor.organization_id == current_user.organization_id)
+            and_(ThreatActor.id == actor_id, ThreatActor.organization_id == getattr(current_user, "organization_id", None))
         )
     )
     actor = result.scalars().first()
@@ -1114,7 +1114,7 @@ async def create_campaign(
     campaign = ThreatCampaign(
         id=str(uuid.uuid4()),
         **campaign_data.model_dump(),
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
     )
     db.add(campaign)
     await db.flush()
@@ -1135,7 +1135,7 @@ async def list_campaigns(
     """
     List threat campaigns with filtering and pagination.
     """
-    query = select(ThreatCampaign).where(ThreatCampaign.organization_id == current_user.organization_id)
+    query = select(ThreatCampaign).where(ThreatCampaign.organization_id == getattr(current_user, "organization_id", None))
 
     if status:
         query = query.where(ThreatCampaign.status == status)
@@ -1169,7 +1169,7 @@ async def get_campaign(
     """
     result = await db.execute(
         select(ThreatCampaign).where(
-            and_(ThreatCampaign.id == campaign_id, ThreatCampaign.organization_id == current_user.organization_id)
+            and_(ThreatCampaign.id == campaign_id, ThreatCampaign.organization_id == getattr(current_user, "organization_id", None))
         )
     )
     campaign = result.scalars().first()
@@ -1190,7 +1190,7 @@ async def update_campaign(
     """
     result = await db.execute(
         select(ThreatCampaign).where(
-            and_(ThreatCampaign.id == campaign_id, ThreatCampaign.organization_id == current_user.organization_id)
+            and_(ThreatCampaign.id == campaign_id, ThreatCampaign.organization_id == getattr(current_user, "organization_id", None))
         )
     )
     campaign = result.scalars().first()
@@ -1216,7 +1216,7 @@ async def delete_campaign(
     """
     result = await db.execute(
         select(ThreatCampaign).where(
-            and_(ThreatCampaign.id == campaign_id, ThreatCampaign.organization_id == current_user.organization_id)
+            and_(ThreatCampaign.id == campaign_id, ThreatCampaign.organization_id == getattr(current_user, "organization_id", None))
         )
     )
     campaign = result.scalars().first()
@@ -1246,7 +1246,7 @@ async def create_report(
         **report_data.model_dump(),
         author_id=current_user.id,
         status="draft",
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
     )
     db.add(report)
     await db.flush()
@@ -1268,7 +1268,7 @@ async def list_reports(
     """
     List intel reports with filtering and pagination.
     """
-    query = select(IntelReport).where(IntelReport.organization_id == current_user.organization_id)
+    query = select(IntelReport).where(IntelReport.organization_id == getattr(current_user, "organization_id", None))
 
     if report_type:
         query = query.where(IntelReport.report_type == report_type)
@@ -1304,7 +1304,7 @@ async def get_report(
     """
     result = await db.execute(
         select(IntelReport).where(
-            and_(IntelReport.id == report_id, IntelReport.organization_id == current_user.organization_id)
+            and_(IntelReport.id == report_id, IntelReport.organization_id == getattr(current_user, "organization_id", None))
         )
     )
     report = result.scalars().first()
@@ -1325,7 +1325,7 @@ async def update_report(
     """
     result = await db.execute(
         select(IntelReport).where(
-            and_(IntelReport.id == report_id, IntelReport.organization_id == current_user.organization_id)
+            and_(IntelReport.id == report_id, IntelReport.organization_id == getattr(current_user, "organization_id", None))
         )
     )
     report = result.scalars().first()
@@ -1351,7 +1351,7 @@ async def publish_report(
     """
     result = await db.execute(
         select(IntelReport).where(
-            and_(IntelReport.id == report_id, IntelReport.organization_id == current_user.organization_id)
+            and_(IntelReport.id == report_id, IntelReport.organization_id == getattr(current_user, "organization_id", None))
         )
     )
     report = result.scalars().first()
@@ -1377,7 +1377,7 @@ async def delete_report(
     """
     result = await db.execute(
         select(IntelReport).where(
-            and_(IntelReport.id == report_id, IntelReport.organization_id == current_user.organization_id)
+            and_(IntelReport.id == report_id, IntelReport.organization_id == getattr(current_user, "organization_id", None))
         )
     )
     report = result.scalars().first()
@@ -1401,7 +1401,7 @@ async def get_dashboard_stats(
     """
     Get threat intelligence dashboard statistics.
     """
-    org_id = current_user.organization_id
+    org_id = getattr(current_user, "organization_id", None)
 
     # Total indicators
     total_indicators = (
@@ -1516,7 +1516,7 @@ async def export_indicators(
             detail="Invalid export format. Must be json, csv, or stix",
         )
 
-    query = select(ThreatIndicator).where(ThreatIndicator.organization_id == current_user.organization_id)
+    query = select(ThreatIndicator).where(ThreatIndicator.organization_id == getattr(current_user, "organization_id", None))
 
     if indicator_types:
         query = query.where(ThreatIndicator.indicator_type.in_(indicator_types))
