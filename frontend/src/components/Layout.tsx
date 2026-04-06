@@ -56,7 +56,7 @@ import {
   Mail,
   Ticket,
 } from 'lucide-react';
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import clsx from 'clsx';
 import { useWebSocket } from '../hooks/useWebSocket';
 import NotificationToast from './NotificationToast';
@@ -120,6 +120,22 @@ export default function Layout() {
   const navigate = useNavigate();
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const { isConnected } = useWebSocket();
+  const [apiLive, setApiLive] = useState(true);
+
+  // Poll API health every 30 seconds
+  useEffect(() => {
+    const check = async () => {
+      try {
+        const res = await fetch('/api/v1/health/live');
+        setApiLive(res.ok);
+      } catch {
+        setApiLive(false);
+      }
+    };
+    check();
+    const interval = setInterval(check, 30000);
+    return () => clearInterval(interval);
+  }, []);
 
   const handleLogout = () => {
     logout();
@@ -267,11 +283,16 @@ export default function Layout() {
             <div className="flex-1" />
             <div className="flex items-center space-x-4">
               <div
-                className="flex items-center gap-1 px-2 py-1 rounded-full text-xs bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300"
-                title="Platform is live"
+                className={clsx(
+                  'flex items-center gap-1 px-2 py-1 rounded-full text-xs',
+                  apiLive
+                    ? 'bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300'
+                    : 'bg-red-100 text-red-500 dark:bg-red-900 dark:text-red-400'
+                )}
+                title={apiLive ? 'Platform is live' : 'API unreachable'}
               >
-                <Wifi className="w-3 h-3" />
-                <span>Live</span>
+                {apiLive ? <Wifi className="w-3 h-3" /> : <WifiOff className="w-3 h-3" />}
+                <span>{apiLive ? 'Live' : 'Offline'}</span>
               </div>
               <span className="text-sm text-gray-500 dark:text-gray-400">
                 {new Date().toLocaleDateString('en-US', {
