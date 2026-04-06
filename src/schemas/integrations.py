@@ -3,6 +3,7 @@
 from datetime import datetime
 from typing import Any, Optional
 
+from src.schemas.base import DBModel
 from pydantic import BaseModel, Field
 
 
@@ -21,7 +22,7 @@ class ConnectorBase(BaseModel):
     supported_triggers: list[str] = []
 
 
-class ConnectorResponse(ConnectorBase):
+class ConnectorResponse(DBModel):
     """Connector response schema"""
 
     id: str
@@ -92,7 +93,7 @@ class InstalledIntegrationUpdate(BaseModel):
     credentials: Optional[dict[str, Any]] = None
 
 
-class InstalledIntegrationResponse(InstalledIntegrationBase):
+class InstalledIntegrationResponse(DBModel):
     """Response for installed integration"""
 
     id: str
@@ -168,7 +169,7 @@ class ActionOutputField(BaseModel):
     description: Optional[str] = None
 
 
-class IntegrationActionResponse(BaseModel):
+class IntegrationActionResponse(DBModel):
     """Response for integration action"""
 
     id: str
@@ -215,7 +216,7 @@ class ExecutionLogEntry(BaseModel):
     message: str
 
 
-class IntegrationExecutionResponse(BaseModel):
+class IntegrationExecutionResponse(DBModel):
     """Response for action execution"""
 
     id: str
@@ -266,7 +267,7 @@ class WebhookRegisterRequest(BaseModel):
     transform_template: Optional[str] = None
 
 
-class WebhookResponse(BaseModel):
+class WebhookResponse(DBModel):
     """Webhook endpoint response"""
 
     id: str

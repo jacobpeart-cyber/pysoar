@@ -3,6 +3,7 @@
 from datetime import datetime
 from typing import Any, Optional
 
+from src.schemas.base import DBModel
 from pydantic import BaseModel, Field
 
 
@@ -48,7 +49,7 @@ class IOCUpdate(BaseModel):
     expires_at: Optional[str] = None
 
 
-class IOCResponse(IOCBase):
+class IOCResponse(DBModel):
     """Schema for IOC response"""
 
     id: str

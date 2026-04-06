@@ -3,6 +3,7 @@
 from datetime import datetime
 from typing import Any, Optional
 
+from src.schemas.base import DBModel
 from pydantic import BaseModel, Field
 
 
@@ -56,7 +57,7 @@ class PlaybookUpdate(BaseModel):
     max_retries: Optional[int] = None
 
 
-class PlaybookResponse(PlaybookBase):
+class PlaybookResponse(DBModel):
     """Schema for playbook response"""
 
     id: str
@@ -94,7 +95,7 @@ class PlaybookExecuteRequest(BaseModel):
     input_data: Optional[dict[str, Any]] = None
 
 
-class PlaybookExecutionResponse(BaseModel):
+class PlaybookExecutionResponse(DBModel):
     """Schema for playbook execution response"""
 
     id: str

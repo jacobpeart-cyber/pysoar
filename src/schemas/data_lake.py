@@ -3,6 +3,7 @@
 from datetime import datetime
 from typing import Any, Optional
 
+from src.schemas.base import DBModel
 from pydantic import BaseModel, Field
 
 
@@ -43,7 +44,7 @@ class DataSourceUpdate(BaseModel):
     is_enabled: Optional[bool] = None
 
 
-class DataSourceResponse(DataSourceBase):
+class DataSourceResponse(DBModel):
     """Schema for data source response"""
 
     id: str
@@ -100,7 +101,7 @@ class DataPartitionUpdate(BaseModel):
     index_columns: Optional[list[str]] = None
 
 
-class DataPartitionResponse(DataPartitionBase):
+class DataPartitionResponse(DBModel):
     """Schema for data partition response"""
 
     id: str
@@ -168,7 +169,7 @@ class DataPipelineUpdate(BaseModel):
     status: Optional[str] = None
 
 
-class DataPipelineResponse(DataPipelineBase):
+class DataPipelineResponse(DBModel):
     """Schema for data pipeline response"""
 
     id: str
@@ -239,7 +240,7 @@ class UnifiedDataModelUpdate(BaseModel):
     is_active: Optional[bool] = None
 
 
-class UnifiedDataModelResponse(UnifiedDataModelBase):
+class UnifiedDataModelResponse(DBModel):
     """Schema for unified data model response"""
 
     id: str
@@ -282,7 +283,7 @@ class QueryJobCreate(QueryJobBase):
     pass
 
 
-class QueryJobResponse(QueryJobBase):
+class QueryJobResponse(DBModel):
     """Schema for query job response"""
 
     id: str

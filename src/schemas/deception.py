@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID
 
+from src.schemas.base import DBModel
 from pydantic import BaseModel, Field
 
 
@@ -52,7 +53,7 @@ class DecoyDeployRequest(DecoyBase):
     organization_id: str
 
 
-class DecoyResponse(DecoyBase):
+class DecoyResponse(DBModel):
     """Response schema for decoy."""
 
     id: UUID
@@ -106,7 +107,7 @@ class DecoyInteractionBase(BaseModel):
     mitre_techniques: list[str] = Field(default_factory=list)
 
 
-class DecoyInteractionResponse(DecoyInteractionBase):
+class DecoyInteractionResponse(DBModel):
     """Response schema for decoy interaction."""
 
     id: UUID
@@ -171,7 +172,7 @@ class HoneyTokenGenerateRequest(BaseModel):
     deployed_by: str | None = None
 
 
-class HoneyTokenGenerateResponse(HoneyTokenBase):
+class HoneyTokenGenerateResponse(DBModel):
     """Response schema for generated honey token."""
 
     id: UUID
@@ -226,7 +227,7 @@ class DeceptionCampaignCreateRequest(DeceptionCampaignBase):
     created_by: str
 
 
-class DeceptionCampaignResponse(DeceptionCampaignBase):
+class DeceptionCampaignResponse(DBModel):
     """Response schema for campaign."""
 
     id: UUID

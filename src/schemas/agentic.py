@@ -3,6 +3,7 @@
 from datetime import datetime
 from typing import Any, Optional
 
+from src.schemas.base import DBModel
 from pydantic import BaseModel, Field
 
 
@@ -39,7 +40,7 @@ class SOCAgentUpdate(BaseModel):
     autonomy_level: Optional[str] = None
 
 
-class SOCAgentResponse(SOCAgentBase):
+class SOCAgentResponse(DBModel):
     """Schema for SOC Agent response"""
 
     id: str
@@ -84,7 +85,7 @@ class SOCAgentPerformance(BaseModel):
 # ============================================================================
 
 
-class ReasoningStepResponse(BaseModel):
+class ReasoningStepResponse(DBModel):
     """Single reasoning step"""
 
     id: str
@@ -131,7 +132,7 @@ class InvestigationUpdate(BaseModel):
     feedback_rating: Optional[int] = Field(None, ge=1, le=5)
 
 
-class InvestigationResponse(InvestigationBase):
+class InvestigationResponse(DBModel):
     """Schema for investigation response"""
 
     id: str
@@ -207,7 +208,7 @@ class AgentActionApproval(BaseModel):
     approval_notes: Optional[str] = None
 
 
-class AgentActionResponse(AgentActionBase):
+class AgentActionResponse(DBModel):
     """Schema for action response"""
 
     id: str
@@ -255,7 +256,7 @@ class ActionHistory(BaseModel):
 # ============================================================================
 
 
-class AgentMemoryResponse(BaseModel):
+class AgentMemoryResponse(DBModel):
     """Agent memory entry"""
 
     id: str

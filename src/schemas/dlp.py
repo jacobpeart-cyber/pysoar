@@ -7,6 +7,7 @@ Pydantic schemas for request/response validation across DLP endpoints.
 from datetime import datetime
 from typing import Any, Optional
 
+from src.schemas.base import DBModel
 from pydantic import BaseModel, Field
 
 
@@ -48,7 +49,7 @@ class DLPPolicyUpdate(BaseModel):
     exceptions: Optional[list[dict[str, Any]]] = None
 
 
-class DLPPolicyResponse(DLPPolicyBase):
+class DLPPolicyResponse(DBModel):
     """Schema for DLP policy response"""
 
     id: str
@@ -128,7 +129,7 @@ class DLPViolationUpdate(BaseModel):
     action_taken: Optional[str] = Field(None, max_length=50)
 
 
-class DLPViolationResponse(DLPViolationBase):
+class DLPViolationResponse(DBModel):
     """Schema for violation response"""
 
     id: str
@@ -211,7 +212,7 @@ class DataClassificationUpdate(BaseModel):
     color_code: Optional[str] = Field(None, pattern=r"^#[0-9A-Fa-f]{6}$")
 
 
-class DataClassificationResponse(DataClassificationBase):
+class DataClassificationResponse(DBModel):
     """Schema for classification response"""
 
     id: str
@@ -280,7 +281,7 @@ class DiscoveryScanTriggerRequest(BaseModel):
     schedule: Optional[str] = None
 
 
-class SensitiveDataDiscoveryResponse(SensitiveDataDiscoveryBase):
+class SensitiveDataDiscoveryResponse(DBModel):
     """Schema for discovery scan response"""
 
     id: str
@@ -361,7 +362,7 @@ class DLPIncidentUpdate(BaseModel):
     remediation_steps: Optional[list[str]] = None
 
 
-class DLPIncidentResponse(DLPIncidentBase):
+class DLPIncidentResponse(DBModel):
     """Schema for incident response"""
 
     id: str

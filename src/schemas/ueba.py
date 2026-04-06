@@ -5,6 +5,7 @@ Request/response schemas for UEBA API endpoints.
 
 from datetime import datetime
 from typing import Optional
+from src.schemas.base import DBModel
 from pydantic import BaseModel, Field
 
 
@@ -49,7 +50,7 @@ class EntityProfileUpdate(BaseModel):
     metadata: Optional[dict] = None
 
 
-class EntityProfileResponse(EntityProfileBase):
+class EntityProfileResponse(DBModel):
     """Response schema for entity profile with full details."""
 
     id: str
@@ -71,7 +72,7 @@ class EntityProfileResponse(EntityProfileBase):
 # Behavior Baseline Schemas
 # ============================================================================
 
-class BehaviorBaselineResponse(BaseModel):
+class BehaviorBaselineResponse(DBModel):
     """Response schema for behavior baseline."""
 
     id: str
@@ -113,7 +114,7 @@ class BehaviorEventCreate(BehaviorEventBase):
     pass
 
 
-class BehaviorEventResponse(BehaviorEventBase):
+class BehaviorEventResponse(DBModel):
     """Response schema for behavior event."""
 
     id: str
@@ -164,7 +165,7 @@ class UEBARiskAlertUpdate(BaseModel):
     escalated_to_incident: Optional[str] = None
 
 
-class UEBARiskAlertResponse(UEBARiskAlertBase):
+class UEBARiskAlertResponse(DBModel):
     """Response schema for UEBA risk alert."""
 
     id: str
@@ -200,7 +201,7 @@ class PeerGroupCreate(PeerGroupBase):
     pass
 
 
-class PeerGroupResponse(PeerGroupBase):
+class PeerGroupResponse(DBModel):
     """Response schema for peer group."""
 
     id: str

@@ -3,6 +3,7 @@
 from datetime import datetime
 from typing import Any, Optional
 
+from src.schemas.base import DBModel
 from pydantic import BaseModel, Field
 
 
@@ -49,7 +50,7 @@ class AlertUpdate(BaseModel):
     tags: Optional[list[str]] = None
 
 
-class AlertResponse(AlertBase):
+class AlertResponse(DBModel):
     """Schema for alert response"""
 
     id: str

@@ -3,6 +3,7 @@
 from datetime import datetime
 from typing import Any, Optional, Dict, List
 
+from src.schemas.base import DBModel
 from pydantic import BaseModel, Field
 
 
@@ -57,7 +58,7 @@ class APIEndpointInventoryUpdate(BaseModel):
     owner_team: Optional[str] = Field(None, max_length=255)
 
 
-class APIEndpointInventoryResponse(APIEndpointInventoryBase):
+class APIEndpointInventoryResponse(DBModel):
     """Schema for API endpoint response"""
 
     id: str
@@ -104,7 +105,7 @@ class APIVulnerabilityUpdate(BaseModel):
     evidence: Optional[Dict[str, Any]] = None
 
 
-class APIVulnerabilityResponse(APIVulnerabilityBase):
+class APIVulnerabilityResponse(DBModel):
     """Schema for vulnerability response"""
 
     id: str
@@ -148,7 +149,7 @@ class APISecurityPolicyUpdate(BaseModel):
     applies_to: Optional[Dict[str, Any]] = None
 
 
-class APISecurityPolicyResponse(APISecurityPolicyBase):
+class APISecurityPolicyResponse(DBModel):
     """Schema for policy response"""
 
     id: str
@@ -192,7 +193,7 @@ class APIAnomalyDetectionUpdate(BaseModel):
     severity: Optional[str] = Field(None, pattern="^(critical|high|medium|low|info)$")
 
 
-class APIAnomalyDetectionResponse(APIAnomalyDetectionBase):
+class APIAnomalyDetectionResponse(DBModel):
     """Schema for anomaly detection response"""
 
     id: str
@@ -232,7 +233,7 @@ class APIComplianceCheckUpdate(BaseModel):
     remediation_steps: Optional[str] = None
 
 
-class APIComplianceCheckResponse(APIComplianceCheckBase):
+class APIComplianceCheckResponse(DBModel):
     """Schema for compliance check response"""
 
     id: str

@@ -6,6 +6,7 @@ Schemas for risk scenarios, FAIR analyses, risk registers, controls, and BIAs.
 from datetime import datetime
 from typing import Any, Optional
 
+from src.schemas.base import DBModel
 from pydantic import BaseModel, Field
 
 
@@ -48,7 +49,7 @@ class RiskScenarioUpdate(BaseModel):
     confidence_level: Optional[float] = Field(None, ge=0, le=1)
 
 
-class RiskScenarioResponse(RiskScenarioBase):
+class RiskScenarioResponse(DBModel):
     """Schema for risk scenario response"""
 
     id: str
@@ -125,7 +126,7 @@ class FAIRAnalysisUpdate(BaseModel):
     simulation_iterations: Optional[int] = Field(None, ge=100, le=100000)
 
 
-class FAIRAnalysisResponse(FAIRAnalysisBase):
+class FAIRAnalysisResponse(DBModel):
     """Schema for FAIR analysis response"""
 
     id: str
@@ -206,7 +207,7 @@ class RiskRegisterUpdate(BaseModel):
     ale_annual_usd: Optional[float] = Field(None, ge=0)
 
 
-class RiskRegisterResponse(RiskRegisterBase):
+class RiskRegisterResponse(DBModel):
     """Schema for risk register response"""
 
     id: str
@@ -262,7 +263,7 @@ class RiskControlUpdate(BaseModel):
     test_result: Optional[str] = Field(None, max_length=50)
 
 
-class RiskControlResponse(RiskControlBase):
+class RiskControlResponse(DBModel):
     """Schema for risk control response"""
 
     id: str
@@ -328,7 +329,7 @@ class BusinessImpactAssessmentUpdate(BaseModel):
     single_point_of_failure: Optional[bool] = None
 
 
-class BusinessImpactAssessmentResponse(BusinessImpactAssessmentBase):
+class BusinessImpactAssessmentResponse(DBModel):
     """Schema for BIA response"""
 
     id: str

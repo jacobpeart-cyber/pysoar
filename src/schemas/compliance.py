@@ -8,6 +8,7 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 from enum import Enum
 
+from src.schemas.base import DBModel
 from pydantic import BaseModel, Field
 
 __all__ = [
@@ -92,7 +93,7 @@ class ReviewStatus(str, Enum):
 
 
 # Base Response Models
-class ComplianceFrameworkResponse(BaseModel):
+class ComplianceFrameworkResponse(DBModel):
     """Compliance Framework Response"""
 
     id: str
@@ -117,7 +118,7 @@ class ComplianceFrameworkResponse(BaseModel):
         from_attributes = True
 
 
-class ComplianceControlResponse(BaseModel):
+class ComplianceControlResponse(DBModel):
     """Compliance Control Response"""
 
     id: str
@@ -151,7 +152,7 @@ class ComplianceControlResponse(BaseModel):
         from_attributes = True
 
 
-class POAMResponse(BaseModel):
+class POAMResponse(DBModel):
     """Plan of Action & Milestones Response"""
 
     id: str
@@ -181,7 +182,7 @@ class POAMResponse(BaseModel):
         from_attributes = True
 
 
-class ComplianceEvidenceResponse(BaseModel):
+class ComplianceEvidenceResponse(DBModel):
     """Compliance Evidence Response"""
 
     id: str
@@ -209,7 +210,7 @@ class ComplianceEvidenceResponse(BaseModel):
         from_attributes = True
 
 
-class ComplianceAssessmentResponse(BaseModel):
+class ComplianceAssessmentResponse(DBModel):
     """Compliance Assessment Response"""
 
     id: str
@@ -232,7 +233,7 @@ class ComplianceAssessmentResponse(BaseModel):
         from_attributes = True
 
 
-class CUIMarkingResponse(BaseModel):
+class CUIMarkingResponse(DBModel):
     """CUI Marking Response"""
 
     id: str
@@ -253,7 +254,7 @@ class CUIMarkingResponse(BaseModel):
         from_attributes = True
 
 
-class CISADirectiveResponse(BaseModel):
+class CISADirectiveResponse(DBModel):
     """CISA Directive Response"""
 
     id: str

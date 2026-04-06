@@ -3,6 +3,7 @@
 from datetime import datetime
 from typing import Any, Optional
 
+from src.schemas.base import DBModel
 from pydantic import BaseModel, Field
 
 
@@ -48,7 +49,7 @@ class ThreatFeedUpdate(BaseModel):
     auth_config: Optional[dict[str, Any]] = None
 
 
-class ThreatFeedResponse(ThreatFeedBase):
+class ThreatFeedResponse(DBModel):
     """Schema for threat feed response"""
 
     id: str
@@ -122,7 +123,7 @@ class ThreatIndicatorUpdate(BaseModel):
     is_whitelisted: Optional[bool] = None
 
 
-class ThreatIndicatorResponse(ThreatIndicatorBase):
+class ThreatIndicatorResponse(DBModel):
     """Schema for threat indicator response"""
 
     id: str
@@ -211,7 +212,7 @@ class ThreatActorUpdate(BaseModel):
     tags: Optional[list[str]] = None
 
 
-class ThreatActorResponse(ThreatActorBase):
+class ThreatActorResponse(DBModel):
     """Schema for threat actor response"""
 
     id: str
@@ -276,7 +277,7 @@ class ThreatCampaignUpdate(BaseModel):
     actor_id: Optional[str] = None
 
 
-class ThreatCampaignResponse(ThreatCampaignBase):
+class ThreatCampaignResponse(DBModel):
     """Schema for threat campaign response"""
 
     id: str
@@ -350,7 +351,7 @@ class IntelReportUpdate(BaseModel):
     status: Optional[str] = None
 
 
-class IntelReportResponse(IntelReportBase):
+class IntelReportResponse(DBModel):
     """Schema for intel report response"""
 
     id: str
@@ -388,7 +389,7 @@ class IndicatorSightingCreate(BaseModel):
     context: dict[str, Any] = Field(default_factory=dict)
 
 
-class IndicatorSightingResponse(BaseModel):
+class IndicatorSightingResponse(DBModel):
     """Schema for indicator sighting response"""
 
     id: str

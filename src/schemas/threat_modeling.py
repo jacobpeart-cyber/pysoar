@@ -3,6 +3,7 @@
 from datetime import datetime
 from typing import Any, Optional
 
+from src.schemas.base import DBModel
 from pydantic import BaseModel, Field
 
 
@@ -59,7 +60,7 @@ class ThreatModelUpdate(BaseModel):
     reviewed_by: Optional[str] = None
 
 
-class ThreatModelResponse(ThreatModelBase):
+class ThreatModelResponse(DBModel):
     """Schema for threat model response"""
     id: str
     organization_id: str
@@ -116,7 +117,7 @@ class ComponentUpdate(BaseModel):
     connections: Optional[list[str]] = None
 
 
-class ComponentResponse(ComponentBase):
+class ComponentResponse(DBModel):
     """Schema for component response"""
     id: str
     model_id: str
@@ -163,7 +164,7 @@ class ThreatUpdate(BaseModel):
     cwe_ids: Optional[list[str]] = None
 
 
-class ThreatResponse(ThreatBase):
+class ThreatResponse(DBModel):
     """Schema for threat response"""
     id: str
     model_id: str
@@ -221,7 +222,7 @@ class MitigationUpdate(BaseModel):
     verification_method: Optional[str] = None
 
 
-class MitigationResponse(MitigationBase):
+class MitigationResponse(DBModel):
     """Schema for mitigation response"""
     id: str
     threat_id: str
@@ -265,7 +266,7 @@ class AttackTreeUpdate(BaseModel):
     tree_structure: Optional[dict[str, Any]] = None
 
 
-class AttackTreeResponse(AttackTreeBase):
+class AttackTreeResponse(DBModel):
     """Schema for attack tree response"""
     id: str
     model_id: str

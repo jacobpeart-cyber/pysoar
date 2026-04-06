@@ -7,6 +7,7 @@ SBOM, component, risk, and vendor management endpoints.
 from datetime import datetime
 from typing import Any, Optional
 
+from src.schemas.base import DBModel
 from pydantic import BaseModel, Field
 
 
@@ -44,7 +45,7 @@ class SoftwareComponentUpdate(BaseModel):
     license_spdx_id: Optional[str] = None
 
 
-class SoftwareComponentResponse(SoftwareComponentBase):
+class SoftwareComponentResponse(DBModel):
     """Schema for component response"""
 
     id: str
@@ -85,7 +86,7 @@ class SBOMUpdate(BaseModel):
     compliance_status: Optional[str] = None
 
 
-class SBOMResponse(SBOMBase):
+class SBOMResponse(DBModel):
     """Schema for SBOM response"""
 
     id: str
@@ -118,7 +119,7 @@ class SBOMComponentCreate(SBOMComponentBase):
     component_id: str
 
 
-class SBOMComponentResponse(SBOMComponentBase):
+class SBOMComponentResponse(DBModel):
     """Schema for SBOM component response"""
 
     id: str
@@ -158,7 +159,7 @@ class SupplyChainRiskUpdate(BaseModel):
     remediation_date: Optional[datetime] = None
 
 
-class SupplyChainRiskResponse(SupplyChainRiskBase):
+class SupplyChainRiskResponse(DBModel):
     """Schema for supply chain risk response"""
 
     id: str
@@ -201,7 +202,7 @@ class VendorAssessmentUpdate(BaseModel):
     notes: Optional[str] = None
 
 
-class VendorAssessmentResponse(VendorAssessmentBase):
+class VendorAssessmentResponse(DBModel):
     """Schema for vendor assessment response"""
 
     id: str

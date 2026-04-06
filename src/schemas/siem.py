@@ -3,6 +3,7 @@
 from datetime import datetime
 from typing import Any, Optional
 
+from src.schemas.base import DBModel
 from pydantic import BaseModel, Field
 
 
@@ -33,7 +34,7 @@ class LogBatchIngestRequest(BaseModel):
     organization_id: Optional[str] = None
 
 
-class LogEntryResponse(BaseModel):
+class LogEntryResponse(DBModel):
     """Schema for log entry response"""
 
     id: str
@@ -165,7 +166,7 @@ class DetectionRuleUpdate(BaseModel):
     enabled: Optional[bool] = None
 
 
-class DetectionRuleResponse(DetectionRuleBase):
+class DetectionRuleResponse(DBModel):
     """Schema for detection rule response"""
 
     id: str
@@ -198,7 +199,7 @@ class DetectionRuleListResponse(BaseModel):
     pages: int
 
 
-class CorrelationEventResponse(BaseModel):
+class CorrelationEventResponse(DBModel):
     """Schema for correlation event response"""
 
     id: str
@@ -254,7 +255,7 @@ class DataSourceCreate(BaseModel):
     enabled: bool = True
 
 
-class DataSourceResponse(BaseModel):
+class DataSourceResponse(DBModel):
     """Schema for data source response"""
 
     id: str

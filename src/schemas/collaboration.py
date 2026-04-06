@@ -3,6 +3,7 @@
 from datetime import datetime
 from typing import Any, Optional
 
+from src.schemas.base import DBModel
 from pydantic import BaseModel, Field
 
 
@@ -42,7 +43,7 @@ class WarRoomUpdate(BaseModel):
     tags: Optional[list[str]] = None
 
 
-class WarRoomResponse(WarRoomBase):
+class WarRoomResponse(DBModel):
     """Schema for war room response"""
 
     id: str
@@ -112,7 +113,7 @@ class WarRoomMessageUpdate(BaseModel):
     content: str = Field(..., min_length=1)
 
 
-class WarRoomMessageResponse(WarRoomMessageBase):
+class WarRoomMessageResponse(DBModel):
     """Schema for message response"""
 
     id: str
@@ -169,7 +170,7 @@ class SharedArtifactCreate(SharedArtifactBase):
     access_restricted_to: Optional[list[str]] = None
 
 
-class SharedArtifactResponse(SharedArtifactBase):
+class SharedArtifactResponse(DBModel):
     """Schema for artifact response"""
 
     id: str
@@ -236,7 +237,7 @@ class ActionItemUpdate(BaseModel):
     notes: Optional[str] = None
 
 
-class ActionItemResponse(ActionItemBase):
+class ActionItemResponse(DBModel):
     """Schema for action item response"""
 
     id: str
@@ -295,7 +296,7 @@ class IncidentTimelineCreate(IncidentTimelineBase):
     evidence_ids: Optional[list[str]] = None
 
 
-class IncidentTimelineResponse(IncidentTimelineBase):
+class IncidentTimelineResponse(DBModel):
     """Schema for timeline event response"""
 
     id: str

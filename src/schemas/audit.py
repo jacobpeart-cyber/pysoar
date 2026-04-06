@@ -2,6 +2,7 @@
 
 from datetime import datetime
 from typing import Optional, List
+from src.schemas.base import DBModel
 from pydantic import BaseModel
 
 
@@ -24,7 +25,7 @@ class AuditLogCreate(AuditLogBase):
     new_value: Optional[str] = None
 
 
-class AuditLogResponse(AuditLogBase):
+class AuditLogResponse(DBModel):
     """Schema for audit log responses"""
     id: str
     user_id: Optional[str] = None

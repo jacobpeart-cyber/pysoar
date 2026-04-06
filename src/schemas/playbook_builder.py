@@ -3,6 +3,7 @@
 from datetime import datetime
 from typing import Any, Optional
 
+from src.schemas.base import DBModel
 from pydantic import BaseModel, Field
 
 
@@ -41,7 +42,7 @@ class PlaybookNodeUpdate(BaseModel):
     on_error: Optional[str] = None
 
 
-class PlaybookNodeResponse(PlaybookNodeConfigBase):
+class PlaybookNodeResponse(DBModel):
     """Schema for node response"""
 
     id: str
@@ -85,7 +86,7 @@ class PlaybookEdgeUpdate(BaseModel):
     priority: Optional[int] = None
 
 
-class PlaybookEdgeResponse(PlaybookEdgeBase):
+class PlaybookEdgeResponse(DBModel):
     """Schema for edge response"""
 
     id: str
@@ -141,7 +142,7 @@ class PlaybookValidateResponse(BaseModel):
     warnings: list[str] = []
 
 
-class PlaybookResponse(PlaybookBase):
+class PlaybookResponse(DBModel):
     """Schema for playbook response"""
 
     id: str
@@ -211,7 +212,7 @@ class PlaybookExecutionTrigger(BaseModel):
     variables: Optional[dict[str, Any]] = None
 
 
-class PlaybookExecutionResponse(BaseModel):
+class PlaybookExecutionResponse(DBModel):
     """Schema for execution response"""
 
     id: str
@@ -234,7 +235,7 @@ class PlaybookExecutionResponse(BaseModel):
         from_attributes = True
 
 
-class PlaybookNodeExecutionResponse(BaseModel):
+class PlaybookNodeExecutionResponse(DBModel):
     """Schema for node execution response"""
 
     id: str
@@ -287,7 +288,7 @@ class PlaybookTemplateBase(BaseModel):
     category: str
 
 
-class PlaybookTemplateResponse(PlaybookTemplateBase):
+class PlaybookTemplateResponse(DBModel):
     """Schema for template response"""
 
     id: str

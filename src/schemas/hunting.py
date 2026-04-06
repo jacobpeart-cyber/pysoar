@@ -4,6 +4,7 @@ import json as json_mod
 from datetime import datetime
 from typing import Any, Optional
 
+from src.schemas.base import DBModel
 from pydantic import BaseModel, Field, field_validator
 
 
@@ -76,7 +77,7 @@ class HuntHypothesisUpdate(BaseModel):
     tags: Optional[list[str]] = None
 
 
-class HuntHypothesisResponse(HuntHypothesisBase):
+class HuntHypothesisResponse(DBModel):
     """Schema for hunt hypothesis response"""
 
     id: str
@@ -111,7 +112,7 @@ class HuntSessionCreate(BaseModel):
     )
 
 
-class HuntSessionResponse(BaseModel):
+class HuntSessionResponse(DBModel):
     """Schema for hunt session response"""
 
     id: str
@@ -170,7 +171,7 @@ class HuntFindingUpdate(BaseModel):
     case_id: Optional[str] = None
 
 
-class HuntFindingResponse(HuntFindingCreate):
+class HuntFindingResponse(DBModel):
     """Schema for hunt finding response"""
 
     id: str
@@ -193,7 +194,7 @@ class HuntFindingListResponse(BaseModel):
     pages: int
 
 
-class HuntTemplateResponse(BaseModel):
+class HuntTemplateResponse(DBModel):
     """Schema for hunt template response"""
 
     id: str
@@ -240,7 +241,7 @@ class HuntNotebookUpdate(BaseModel):
     content: Optional[list[HuntNotebookCell]] = None
 
 
-class HuntNotebookResponse(BaseModel):
+class HuntNotebookResponse(DBModel):
     """Schema for hunt notebook response"""
 
     id: str
