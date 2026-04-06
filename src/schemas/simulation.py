@@ -149,8 +149,8 @@ class SimulationCreateRequest(BaseModel):
         ...,
         description="atomic_test, attack_chain, adversary_emulation, purple_team, continuous_validation"
     )
-    techniques: List[str] = Field(..., min_items=1)
-    scope: Dict[str, Any] = Field(..., description="Target scope: hosts, networks, users")
+    techniques: List[str] = Field(default_factory=list)
+    scope: Dict[str, Any] = Field(default_factory=dict, description="Target scope: hosts, networks, users")
     target_environment: str = Field(
         ...,
         description="production, staging, lab, isolated"
