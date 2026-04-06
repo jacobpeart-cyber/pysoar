@@ -1,8 +1,4 @@
-"""Base schema with automatic JSON string parsing for DB compatibility.
-
-SQLAlchemy JSON columns sometimes store '[]' and '{}' as literal strings
-instead of Python lists/dicts. This base model handles parsing them.
-"""
+"""Base schema with automatic JSON string parsing for DB compatibility."""
 
 import json
 from typing import Any
@@ -11,35 +7,36 @@ from pydantic import BaseModel, model_validator
 
 
 class DBModel(BaseModel):
-    """Base model that auto-parses JSON string fields from both dicts and ORM objects."""
+    """Base model that auto-parses JSON string fields from ORM objects."""
 
     @model_validator(mode="before")
     @classmethod
     def parse_json_strings(cls, data: Any) -> Any:
-        # Convert ORM object to dict so we can parse JSON strings
+        # Convert ORM object to dict
         if not isinstance(data, dict) and hasattr(data, "__dict__"):
             raw = {}
             for key in cls.model_fields:
                 try:
-                    raw[key] = getattr(data, key)
+                    val = getattr(data, key, None)
+                    # Ensure we never store exception objects as values
+                    if isinstance(val, Exception):
+                        continue
+                    if val is not None:
+                        raw[key] = val
                 except Exception:
-                    pass  # Skip fields that trigger lazy loading errors
+                    continue
             data = raw
 
         if isinstance(data, dict):
-            parsed = {}
-            for key, value in data.items():
-                if value is None:
-                    # Skip None — let Pydantic field defaults apply
-                    continue
+            for key, value in list(data.items()):
                 if isinstance(value, str) and len(value) >= 2 and value[0] in ('[', '{'):
                     try:
-                        parsed[key] = json.loads(value)
+                        data[key] = json.loads(value)
                     except (json.JSONDecodeError, ValueError, TypeError):
-                        parsed[key] = value
-                else:
-                    parsed[key] = value
-            return parsed
+                        pass
+                # Safety: never allow exception objects in values
+                if isinstance(data[key], Exception):
+                    del data[key]
 
         return data
 
