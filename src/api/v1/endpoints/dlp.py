@@ -628,7 +628,7 @@ async def trigger_discovery_scan(
     """Trigger a sensitive data discovery scan"""
     scan = SensitiveDataDiscovery(
         organization_id=getattr(current_user, "organization_id", None),
-        scan_id=f"scan_{getattr(current_user, "organization_id", None)}_{int(__import__('time').time())}",
+        scan_id=f"scan_{getattr(current_user, 'organization_id', None)}_{int(__import__('time').time())}",
         scan_type=scan_request.scan_type,
         target=scan_request.target,
         status="pending",
