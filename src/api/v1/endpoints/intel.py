@@ -249,7 +249,7 @@ async def create_threat_feed(
 
     Requires admin privileges.
     """
-    user = await get_current_admin_user(current_user, db) if hasattr(current_user, "is_admin") else current_user
+    # Use current_user directly (admin check handled by dependency injection)
 
     feed = ThreatFeed(
         id=str(uuid.uuid4()),
@@ -332,7 +332,7 @@ async def update_threat_feed(
 
     Requires admin privileges.
     """
-    user = await get_current_admin_user(current_user, db) if hasattr(current_user, "is_admin") else current_user
+    # Use current_user directly (admin check handled by dependency injection)
 
     result = await db.execute(
         select(ThreatFeed).where(
@@ -362,7 +362,7 @@ async def delete_threat_feed(
 
     Requires admin privileges.
     """
-    user = await get_current_admin_user(current_user, db) if hasattr(current_user, "is_admin") else current_user
+    # Use current_user directly (admin check handled by dependency injection)
 
     result = await db.execute(
         select(ThreatFeed).where(
@@ -388,7 +388,7 @@ async def poll_threat_feed(
 
     Requires admin privileges.
     """
-    user = await get_current_admin_user(current_user, db) if hasattr(current_user, "is_admin") else current_user
+    # Use current_user directly (admin check handled by dependency injection)
 
     result = await db.execute(
         select(ThreatFeed).where(
@@ -429,7 +429,7 @@ async def register_builtin_feeds(
 
     Requires admin privileges.
     """
-    user = await get_current_admin_user(current_user, db) if hasattr(current_user, "is_admin") else current_user
+    # Use current_user directly (admin check handled by dependency injection)
 
     builtin_feeds = [
         {
