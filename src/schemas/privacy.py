@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 from enum import Enum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 __all__ = [
     "DSRType",
@@ -334,6 +334,22 @@ class DataProcessingRecordBase(BaseModel):
     recipients: Optional[List[str]] = None
     retention_period_days: Optional[int] = None
     dpo_contact: Optional[str] = Field(None, max_length=255)
+
+    @field_validator("data_categories", "data_subjects", "recipients", mode="before")
+    @classmethod
+    def parse_json_lists(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, list):
+            return v
+        if isinstance(v, str):
+            try:
+                import json as _json
+                parsed = _json.loads(v)
+                return parsed if isinstance(parsed, list) else [str(parsed)]
+            except (ValueError, TypeError):
+                return [v]
+        return v
 
 
 class DataProcessingRecordCreate(DataProcessingRecordBase):
