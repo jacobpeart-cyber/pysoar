@@ -1,8 +1,7 @@
 """Base schema with automatic JSON string parsing for DB compatibility.
 
-SQLAlchemy JSON columns store Python objects as JSON strings in some backends.
-When Pydantic reads these via from_attributes, it gets strings like '["a","b"]'
-instead of actual lists. This base model auto-parses them.
+SQLAlchemy JSON columns sometimes return Python objects as JSON strings.
+This base model handles parsing them back to native Python types.
 """
 
 import json
@@ -11,44 +10,30 @@ from typing import Any
 from pydantic import BaseModel, model_validator
 
 
-def _parse_value(value: Any) -> Any:
-    """Parse a JSON string value to its Python equivalent."""
-    if isinstance(value, str) and value and value[0] in ('[', '{'):
-        try:
-            return json.loads(value)
-        except (json.JSONDecodeError, ValueError):
-            pass
-    return value
-
-
 class DBModel(BaseModel):
-    """Base model for DB response schemas that auto-parses JSON string fields.
+    """Base model that auto-parses JSON string fields when input is a dict.
 
-    Handles both dict input and ORM objects (from_attributes).
-    Automatically converts JSON strings to lists/dicts.
-    Skips None values so Pydantic defaults are preserved.
+    For ORM objects (from_attributes), Pydantic handles attribute access
+    natively. The JSON parsing only applies to dict input.
     """
 
     @model_validator(mode="before")
     @classmethod
     def parse_json_strings(cls, data: Any) -> Any:
-        if isinstance(data, dict):
-            return {k: _parse_value(v) for k, v in data.items()}
+        # Only parse dict input — let Pydantic handle ORM objects via from_attributes
+        if not isinstance(data, dict):
+            return data
 
-        # For ORM objects: extract field values, skip None so defaults work
-        if hasattr(data, "__dict__"):
-            result = {}
-            for key in cls.model_fields:
+        parsed = {}
+        for key, value in data.items():
+            if isinstance(value, str) and len(value) > 1 and value[0] in ('[', '{'):
                 try:
-                    val = getattr(data, key, None)
-                    if val is not None:
-                        result[key] = _parse_value(val)
-                    # If val is None, don't include — let Pydantic use the field default
-                except Exception:
-                    pass
-            return result
-
-        return data
+                    parsed[key] = json.loads(value)
+                except (json.JSONDecodeError, ValueError, TypeError):
+                    parsed[key] = value
+            else:
+                parsed[key] = value
+        return parsed
 
     class Config:
         from_attributes = True
