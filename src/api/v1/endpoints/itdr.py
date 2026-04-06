@@ -429,7 +429,8 @@ async def run_threat_scan(
     organization_id: Optional[str] = None,
 ):
     """Run comprehensive threat detection scan"""
-    logger.info(f"Initiating threat scan for org={organization_id or getattr(current_user, "organization_id", None)}")
+    org_id = organization_id or getattr(current_user, 'organization_id', None)
+    logger.info(f"Initiating threat scan for org={org_id}")
 
     return {
         "status": "initiated",
