@@ -46,7 +46,7 @@ class DarkWebMonitorUpdate(BaseModel):
     alert_severity: Optional[str] = None
 
 
-class DarkWebMonitorResponse(DBModel):
+class DarkWebMonitorResponse(DarkWebMonitorBase, DBModel):
     """Schema for monitor response"""
 
     id: str
@@ -100,7 +100,7 @@ class DarkWebFindingUpdate(BaseModel):
     confidence_score: Optional[int] = Field(None, ge=0, le=100)
 
 
-class DarkWebFindingResponse(DBModel):
+class DarkWebFindingResponse(DarkWebFindingBase, DBModel):
     """Schema for finding response"""
 
     id: str
@@ -161,7 +161,7 @@ class CredentialLeakUpdate(BaseModel):
     remediation_action: Optional[str] = None
 
 
-class CredentialLeakResponse(DBModel):
+class CredentialLeakResponse(CredentialLeakBase, DBModel):
     """Schema for credential leak response"""
 
     id: str
@@ -212,7 +212,7 @@ class BrandThreatUpdate(BaseModel):
     takedown_provider: Optional[str] = None
 
 
-class BrandThreatResponse(DBModel):
+class BrandThreatResponse(BrandThreatBase, DBModel):
     """Schema for brand threat response"""
 
     id: str

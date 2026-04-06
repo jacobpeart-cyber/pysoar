@@ -49,7 +49,7 @@ class IOCUpdate(BaseModel):
     expires_at: Optional[str] = None
 
 
-class IOCResponse(DBModel):
+class IOCResponse(IOCBase, DBModel):
     """Schema for IOC response"""
 
     id: str

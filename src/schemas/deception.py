@@ -53,7 +53,7 @@ class DecoyDeployRequest(DecoyBase):
     organization_id: str
 
 
-class DecoyResponse(DBModel):
+class DecoyResponse(DecoyBase, DBModel):
     """Response schema for decoy."""
 
     id: UUID
@@ -107,7 +107,7 @@ class DecoyInteractionBase(BaseModel):
     mitre_techniques: list[str] = Field(default_factory=list)
 
 
-class DecoyInteractionResponse(DBModel):
+class DecoyInteractionResponse(DecoyInteractionBase, DBModel):
     """Response schema for decoy interaction."""
 
     id: UUID
@@ -227,7 +227,7 @@ class DeceptionCampaignCreateRequest(DeceptionCampaignBase):
     created_by: str
 
 
-class DeceptionCampaignResponse(DBModel):
+class DeceptionCampaignResponse(DeceptionCampaignBase, DBModel):
     """Response schema for campaign."""
 
     id: UUID

@@ -49,7 +49,7 @@ class DLPPolicyUpdate(BaseModel):
     exceptions: Optional[list[dict[str, Any]]] = None
 
 
-class DLPPolicyResponse(DBModel):
+class DLPPolicyResponse(DLPPolicyBase, DBModel):
     """Schema for DLP policy response"""
 
     id: str
@@ -129,7 +129,7 @@ class DLPViolationUpdate(BaseModel):
     action_taken: Optional[str] = Field(None, max_length=50)
 
 
-class DLPViolationResponse(DBModel):
+class DLPViolationResponse(DLPViolationBase, DBModel):
     """Schema for violation response"""
 
     id: str
@@ -212,7 +212,7 @@ class DataClassificationUpdate(BaseModel):
     color_code: Optional[str] = Field(None, pattern=r"^#[0-9A-Fa-f]{6}$")
 
 
-class DataClassificationResponse(DBModel):
+class DataClassificationResponse(DataClassificationBase, DBModel):
     """Schema for classification response"""
 
     id: str
@@ -281,7 +281,7 @@ class DiscoveryScanTriggerRequest(BaseModel):
     schedule: Optional[str] = None
 
 
-class SensitiveDataDiscoveryResponse(DBModel):
+class SensitiveDataDiscoveryResponse(SensitiveDataDiscoveryBase, DBModel):
     """Schema for discovery scan response"""
 
     id: str
@@ -362,7 +362,7 @@ class DLPIncidentUpdate(BaseModel):
     remediation_steps: Optional[list[str]] = None
 
 
-class DLPIncidentResponse(DBModel):
+class DLPIncidentResponse(DLPIncidentBase, DBModel):
     """Schema for incident response"""
 
     id: str

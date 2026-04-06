@@ -49,7 +49,7 @@ class ThreatFeedUpdate(BaseModel):
     auth_config: Optional[dict[str, Any]] = None
 
 
-class ThreatFeedResponse(DBModel):
+class ThreatFeedResponse(ThreatFeedBase, DBModel):
     """Schema for threat feed response"""
 
     id: str
@@ -123,7 +123,7 @@ class ThreatIndicatorUpdate(BaseModel):
     is_whitelisted: Optional[bool] = None
 
 
-class ThreatIndicatorResponse(DBModel):
+class ThreatIndicatorResponse(ThreatIndicatorBase, DBModel):
     """Schema for threat indicator response"""
 
     id: str
@@ -212,7 +212,7 @@ class ThreatActorUpdate(BaseModel):
     tags: Optional[list[str]] = None
 
 
-class ThreatActorResponse(DBModel):
+class ThreatActorResponse(ThreatActorBase, DBModel):
     """Schema for threat actor response"""
 
     id: str
@@ -277,7 +277,7 @@ class ThreatCampaignUpdate(BaseModel):
     actor_id: Optional[str] = None
 
 
-class ThreatCampaignResponse(DBModel):
+class ThreatCampaignResponse(ThreatCampaignBase, DBModel):
     """Schema for threat campaign response"""
 
     id: str
@@ -351,7 +351,7 @@ class IntelReportUpdate(BaseModel):
     status: Optional[str] = None
 
 
-class IntelReportResponse(DBModel):
+class IntelReportResponse(IntelReportBase, DBModel):
     """Schema for intel report response"""
 
     id: str

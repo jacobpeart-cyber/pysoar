@@ -40,7 +40,7 @@ class SOCAgentUpdate(BaseModel):
     autonomy_level: Optional[str] = None
 
 
-class SOCAgentResponse(DBModel):
+class SOCAgentResponse(SOCAgentBase, DBModel):
     """Schema for SOC Agent response"""
 
     id: str
@@ -132,7 +132,7 @@ class InvestigationUpdate(BaseModel):
     feedback_rating: Optional[int] = Field(None, ge=1, le=5)
 
 
-class InvestigationResponse(DBModel):
+class InvestigationResponse(InvestigationBase, DBModel):
     """Schema for investigation response"""
 
     id: str
@@ -208,7 +208,7 @@ class AgentActionApproval(BaseModel):
     approval_notes: Optional[str] = None
 
 
-class AgentActionResponse(DBModel):
+class AgentActionResponse(AgentActionBase, DBModel):
     """Schema for action response"""
 
     id: str

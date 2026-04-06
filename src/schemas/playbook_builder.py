@@ -86,7 +86,7 @@ class PlaybookEdgeUpdate(BaseModel):
     priority: Optional[int] = None
 
 
-class PlaybookEdgeResponse(DBModel):
+class PlaybookEdgeResponse(PlaybookEdgeBase, DBModel):
     """Schema for edge response"""
 
     id: str
@@ -142,7 +142,7 @@ class PlaybookValidateResponse(BaseModel):
     warnings: list[str] = []
 
 
-class PlaybookResponse(DBModel):
+class PlaybookResponse(PlaybookBase, DBModel):
     """Schema for playbook response"""
 
     id: str
@@ -288,7 +288,7 @@ class PlaybookTemplateBase(BaseModel):
     category: str
 
 
-class PlaybookTemplateResponse(DBModel):
+class PlaybookTemplateResponse(PlaybookTemplateBase, DBModel):
     """Schema for template response"""
 
     id: str

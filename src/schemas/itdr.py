@@ -52,7 +52,7 @@ class IdentityProfileUpdate(BaseModel):
     mfa_methods: Optional[list[str]] = None
 
 
-class IdentityProfileResponse(DBModel):
+class IdentityProfileResponse(IdentityProfileBase, DBModel):
     """Schema for identity profile response"""
 
     id: str
@@ -105,7 +105,7 @@ class IdentityThreatUpdate(BaseModel):
     response_actions: Optional[list[dict[str, Any]]] = None
 
 
-class IdentityThreatResponse(DBModel):
+class IdentityThreatResponse(IdentityThreatBase, DBModel):
     """Schema for identity threat response"""
 
     id: str
@@ -170,7 +170,7 @@ class CredentialExposureUpdate(BaseModel):
     remediation_date: Optional[str] = None
 
 
-class CredentialExposureResponse(DBModel):
+class CredentialExposureResponse(CredentialExposureBase, DBModel):
     """Schema for credential exposure response"""
 
     id: str
@@ -232,7 +232,7 @@ class AccessAnomalyUpdate(BaseModel):
     reviewer_notes: Optional[str] = None
 
 
-class AccessAnomalyResponse(DBModel):
+class AccessAnomalyResponse(AccessAnomalyBase, DBModel):
     """Schema for access anomaly response"""
 
     id: str
@@ -297,7 +297,7 @@ class PrivilegedAccessEventUpdate(BaseModel):
     revocation_reason: Optional[str] = None
 
 
-class PrivilegedAccessEventResponse(DBModel):
+class PrivilegedAccessEventResponse(PrivilegedAccessEventBase, DBModel):
     """Schema for privileged access event response"""
 
     id: str

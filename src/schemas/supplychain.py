@@ -45,7 +45,7 @@ class SoftwareComponentUpdate(BaseModel):
     license_spdx_id: Optional[str] = None
 
 
-class SoftwareComponentResponse(DBModel):
+class SoftwareComponentResponse(SoftwareComponentBase, DBModel):
     """Schema for component response"""
 
     id: str
@@ -86,7 +86,7 @@ class SBOMUpdate(BaseModel):
     compliance_status: Optional[str] = None
 
 
-class SBOMResponse(DBModel):
+class SBOMResponse(SBOMBase, DBModel):
     """Schema for SBOM response"""
 
     id: str
@@ -119,7 +119,7 @@ class SBOMComponentCreate(SBOMComponentBase):
     component_id: str
 
 
-class SBOMComponentResponse(DBModel):
+class SBOMComponentResponse(SBOMComponentBase, DBModel):
     """Schema for SBOM component response"""
 
     id: str
@@ -159,7 +159,7 @@ class SupplyChainRiskUpdate(BaseModel):
     remediation_date: Optional[datetime] = None
 
 
-class SupplyChainRiskResponse(DBModel):
+class SupplyChainRiskResponse(SupplyChainRiskBase, DBModel):
     """Schema for supply chain risk response"""
 
     id: str
@@ -202,7 +202,7 @@ class VendorAssessmentUpdate(BaseModel):
     notes: Optional[str] = None
 
 
-class VendorAssessmentResponse(DBModel):
+class VendorAssessmentResponse(VendorAssessmentBase, DBModel):
     """Schema for vendor assessment response"""
 
     id: str

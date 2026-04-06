@@ -22,7 +22,7 @@ class ConnectorBase(BaseModel):
     supported_triggers: list[str] = []
 
 
-class ConnectorResponse(DBModel):
+class ConnectorResponse(ConnectorBase, DBModel):
     """Connector response schema"""
 
     id: str
@@ -93,7 +93,7 @@ class InstalledIntegrationUpdate(BaseModel):
     credentials: Optional[dict[str, Any]] = None
 
 
-class InstalledIntegrationResponse(DBModel):
+class InstalledIntegrationResponse(InstalledIntegrationBase, DBModel):
     """Response for installed integration"""
 
     id: str

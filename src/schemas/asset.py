@@ -63,7 +63,7 @@ class AssetUpdate(BaseModel):
     agent_installed: Optional[bool] = None
 
 
-class AssetResponse(DBModel):
+class AssetResponse(AssetBase, DBModel):
     """Schema for asset response"""
     id: str
     name: str

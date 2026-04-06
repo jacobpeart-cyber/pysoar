@@ -49,7 +49,7 @@ class IncidentUpdate(BaseModel):
     tags: Optional[list[str]] = None
 
 
-class IncidentResponse(DBModel):
+class IncidentResponse(IncidentBase, DBModel):
     """Schema for incident response"""
 
     id: str
