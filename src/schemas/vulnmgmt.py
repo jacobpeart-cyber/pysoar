@@ -52,7 +52,7 @@ class VulnerabilityUpdate(BaseModel):
     kev_listed: Optional[bool] = None
 
 
-class VulnerabilityResponse(DBModel):
+class VulnerabilityResponse(VulnerabilityBase, DBModel):
     """Schema for vulnerability response"""
 
     id: str
@@ -105,7 +105,7 @@ class VulnerabilityInstanceUpdate(BaseModel):
     business_criticality: Optional[int] = None
 
 
-class VulnerabilityInstanceResponse(DBModel):
+class VulnerabilityInstanceResponse(VulnerabilityInstanceBase, DBModel):
     """Schema for vulnerability instance response"""
 
     id: str
@@ -149,7 +149,7 @@ class ScanProfileUpdate(BaseModel):
     enabled: Optional[bool] = None
 
 
-class ScanProfileResponse(DBModel):
+class ScanProfileResponse(ScanProfileBase, DBModel):
     """Schema for scan profile response"""
 
     id: str
@@ -196,7 +196,7 @@ class PatchOperationUpdate(BaseModel):
     deployment_notes: Optional[str] = None
 
 
-class PatchOperationResponse(DBModel):
+class PatchOperationResponse(PatchOperationBase, DBModel):
     """Schema for patch operation response"""
 
     id: str
@@ -240,7 +240,7 @@ class VulnerabilityExceptionUpdate(BaseModel):
     compensating_control_description: Optional[str] = None
 
 
-class VulnerabilityExceptionResponse(DBModel):
+class VulnerabilityExceptionResponse(VulnerabilityExceptionBase, DBModel):
     """Schema for vulnerability exception response"""
 
     id: str

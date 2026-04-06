@@ -50,7 +50,7 @@ class EntityProfileUpdate(BaseModel):
     metadata: Optional[dict] = None
 
 
-class EntityProfileResponse(DBModel):
+class EntityProfileResponse(EntityProfileBase, DBModel):
     """Response schema for entity profile with full details."""
 
     id: str
@@ -114,7 +114,7 @@ class BehaviorEventCreate(BehaviorEventBase):
     pass
 
 
-class BehaviorEventResponse(DBModel):
+class BehaviorEventResponse(BehaviorEventBase, DBModel):
     """Response schema for behavior event."""
 
     id: str
@@ -165,7 +165,7 @@ class UEBARiskAlertUpdate(BaseModel):
     escalated_to_incident: Optional[str] = None
 
 
-class UEBARiskAlertResponse(DBModel):
+class UEBARiskAlertResponse(UEBARiskAlertBase, DBModel):
     """Response schema for UEBA risk alert."""
 
     id: str
@@ -201,7 +201,7 @@ class PeerGroupCreate(PeerGroupBase):
     pass
 
 
-class PeerGroupResponse(DBModel):
+class PeerGroupResponse(PeerGroupBase, DBModel):
     """Response schema for peer group."""
 
     id: str

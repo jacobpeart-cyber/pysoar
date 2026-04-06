@@ -44,7 +44,7 @@ class DataSourceUpdate(BaseModel):
     is_enabled: Optional[bool] = None
 
 
-class DataSourceResponse(DBModel):
+class DataSourceResponse(DataSourceBase, DBModel):
     """Schema for data source response"""
 
     id: str
@@ -101,7 +101,7 @@ class DataPartitionUpdate(BaseModel):
     index_columns: Optional[list[str]] = None
 
 
-class DataPartitionResponse(DBModel):
+class DataPartitionResponse(DataPartitionBase, DBModel):
     """Schema for data partition response"""
 
     id: str
@@ -169,7 +169,7 @@ class DataPipelineUpdate(BaseModel):
     status: Optional[str] = None
 
 
-class DataPipelineResponse(DBModel):
+class DataPipelineResponse(DataPipelineBase, DBModel):
     """Schema for data pipeline response"""
 
     id: str
@@ -240,7 +240,7 @@ class UnifiedDataModelUpdate(BaseModel):
     is_active: Optional[bool] = None
 
 
-class UnifiedDataModelResponse(DBModel):
+class UnifiedDataModelResponse(UnifiedDataModelBase, DBModel):
     """Schema for unified data model response"""
 
     id: str
@@ -283,7 +283,7 @@ class QueryJobCreate(QueryJobBase):
     pass
 
 
-class QueryJobResponse(DBModel):
+class QueryJobResponse(QueryJobBase, DBModel):
     """Schema for query job response"""
 
     id: str

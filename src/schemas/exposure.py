@@ -69,7 +69,7 @@ class ExposureAssetUpdate(BaseModel):
     metadata: Optional[dict] = None
 
 
-class ExposureAssetResponse(DBModel):
+class ExposureAssetResponse(ExposureAssetBase, DBModel):
     """Schema for exposure asset response"""
 
     id: str
@@ -150,7 +150,7 @@ class VulnerabilityUpdate(BaseModel):
     tags: Optional[list[str]] = None
 
 
-class VulnerabilityResponse(DBModel):
+class VulnerabilityResponse(VulnerabilityBase, DBModel):
     """Schema for vulnerability response"""
 
     id: str
@@ -206,7 +206,7 @@ class AssetVulnerabilityUpdate(BaseModel):
     detected_by: Optional[str] = Field(None, max_length=100)
 
 
-class AssetVulnerabilityResponse(DBModel):
+class AssetVulnerabilityResponse(AssetVulnerabilityBase, DBModel):
     """Schema for asset-vulnerability response"""
 
     id: str
@@ -251,7 +251,7 @@ class ExposureScanCreate(ExposureScanBase):
     pass
 
 
-class ExposureScanResponse(DBModel):
+class ExposureScanResponse(ExposureScanBase, DBModel):
     """Schema for exposure scan response"""
 
     id: str
@@ -321,7 +321,7 @@ class RemediationTicketUpdate(BaseModel):
     external_ticket_id: Optional[str] = Field(None, max_length=255)
 
 
-class RemediationTicketResponse(DBModel):
+class RemediationTicketResponse(RemediationTicketBase, DBModel):
     """Schema for remediation ticket response"""
 
     id: str
@@ -371,7 +371,7 @@ class AttackSurfaceUpdate(BaseModel):
     description: Optional[str] = None
 
 
-class AttackSurfaceResponse(DBModel):
+class AttackSurfaceResponse(AttackSurfaceBase, DBModel):
     """Schema for attack surface response"""
 
     id: str

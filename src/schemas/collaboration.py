@@ -43,7 +43,7 @@ class WarRoomUpdate(BaseModel):
     tags: Optional[list[str]] = None
 
 
-class WarRoomResponse(DBModel):
+class WarRoomResponse(WarRoomBase, DBModel):
     """Schema for war room response"""
 
     id: str
@@ -113,7 +113,7 @@ class WarRoomMessageUpdate(BaseModel):
     content: str = Field(..., min_length=1)
 
 
-class WarRoomMessageResponse(DBModel):
+class WarRoomMessageResponse(WarRoomMessageBase, DBModel):
     """Schema for message response"""
 
     id: str
@@ -170,7 +170,7 @@ class SharedArtifactCreate(SharedArtifactBase):
     access_restricted_to: Optional[list[str]] = None
 
 
-class SharedArtifactResponse(DBModel):
+class SharedArtifactResponse(SharedArtifactBase, DBModel):
     """Schema for artifact response"""
 
     id: str
@@ -237,7 +237,7 @@ class ActionItemUpdate(BaseModel):
     notes: Optional[str] = None
 
 
-class ActionItemResponse(DBModel):
+class ActionItemResponse(ActionItemBase, DBModel):
     """Schema for action item response"""
 
     id: str
@@ -296,7 +296,7 @@ class IncidentTimelineCreate(IncidentTimelineBase):
     evidence_ids: Optional[list[str]] = None
 
 
-class IncidentTimelineResponse(DBModel):
+class IncidentTimelineResponse(IncidentTimelineBase, DBModel):
     """Schema for timeline event response"""
 
     id: str

@@ -68,7 +68,7 @@ class PhishingTemplateUpdateRequest(BaseModel):
     is_seasonal: bool | None = None
 
 
-class PhishingTemplateResponse(DBModel):
+class PhishingTemplateResponse(PhishingTemplateBase, DBModel):
     """Response schema for phishing template."""
 
     id: UUID
@@ -119,7 +119,7 @@ class TargetGroupUpdateRequest(BaseModel):
     members: list[TargetMember] | None = None
 
 
-class TargetGroupResponse(DBModel):
+class TargetGroupResponse(TargetGroupBase, DBModel):
     """Response schema for target group."""
 
     id: UUID
@@ -181,7 +181,7 @@ class PhishingCampaignUpdateRequest(BaseModel):
     difficulty_level: str | None = None
 
 
-class PhishingCampaignResponse(DBModel):
+class PhishingCampaignResponse(PhishingCampaignBase, DBModel):
     """Response schema for phishing campaign."""
 
     id: UUID
@@ -260,7 +260,7 @@ class CampaignEventCreateRequest(CampaignEventBase):
     time_to_action_seconds: int | None = None
 
 
-class CampaignEventResponse(DBModel):
+class CampaignEventResponse(CampaignEventBase, DBModel):
     """Response schema for campaign event."""
 
     id: UUID
@@ -306,7 +306,7 @@ class SecurityAwarenessScoreBase(BaseModel):
     department: str | None = None
 
 
-class SecurityAwarenessScoreResponse(DBModel):
+class SecurityAwarenessScoreResponse(SecurityAwarenessScoreBase, DBModel):
     """Response schema for security awareness score."""
 
     id: UUID

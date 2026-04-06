@@ -60,7 +60,7 @@ class ThreatModelUpdate(BaseModel):
     reviewed_by: Optional[str] = None
 
 
-class ThreatModelResponse(DBModel):
+class ThreatModelResponse(ThreatModelBase, DBModel):
     """Schema for threat model response"""
     id: str
     organization_id: str
@@ -117,7 +117,7 @@ class ComponentUpdate(BaseModel):
     connections: Optional[list[str]] = None
 
 
-class ComponentResponse(DBModel):
+class ComponentResponse(ComponentBase, DBModel):
     """Schema for component response"""
     id: str
     model_id: str
@@ -164,7 +164,7 @@ class ThreatUpdate(BaseModel):
     cwe_ids: Optional[list[str]] = None
 
 
-class ThreatResponse(DBModel):
+class ThreatResponse(ThreatBase, DBModel):
     """Schema for threat response"""
     id: str
     model_id: str
@@ -222,7 +222,7 @@ class MitigationUpdate(BaseModel):
     verification_method: Optional[str] = None
 
 
-class MitigationResponse(DBModel):
+class MitigationResponse(MitigationBase, DBModel):
     """Schema for mitigation response"""
     id: str
     threat_id: str
@@ -266,7 +266,7 @@ class AttackTreeUpdate(BaseModel):
     tree_structure: Optional[dict[str, Any]] = None
 
 
-class AttackTreeResponse(DBModel):
+class AttackTreeResponse(AttackTreeBase, DBModel):
     """Schema for attack tree response"""
     id: str
     model_id: str

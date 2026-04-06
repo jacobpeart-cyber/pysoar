@@ -49,7 +49,7 @@ class RiskScenarioUpdate(BaseModel):
     confidence_level: Optional[float] = Field(None, ge=0, le=1)
 
 
-class RiskScenarioResponse(DBModel):
+class RiskScenarioResponse(RiskScenarioBase, DBModel):
     """Schema for risk scenario response"""
 
     id: str
@@ -126,7 +126,7 @@ class FAIRAnalysisUpdate(BaseModel):
     simulation_iterations: Optional[int] = Field(None, ge=100, le=100000)
 
 
-class FAIRAnalysisResponse(DBModel):
+class FAIRAnalysisResponse(FAIRAnalysisBase, DBModel):
     """Schema for FAIR analysis response"""
 
     id: str
@@ -207,7 +207,7 @@ class RiskRegisterUpdate(BaseModel):
     ale_annual_usd: Optional[float] = Field(None, ge=0)
 
 
-class RiskRegisterResponse(DBModel):
+class RiskRegisterResponse(RiskRegisterBase, DBModel):
     """Schema for risk register response"""
 
     id: str
@@ -263,7 +263,7 @@ class RiskControlUpdate(BaseModel):
     test_result: Optional[str] = Field(None, max_length=50)
 
 
-class RiskControlResponse(DBModel):
+class RiskControlResponse(RiskControlBase, DBModel):
     """Schema for risk control response"""
 
     id: str
@@ -329,7 +329,7 @@ class BusinessImpactAssessmentUpdate(BaseModel):
     single_point_of_failure: Optional[bool] = None
 
 
-class BusinessImpactAssessmentResponse(DBModel):
+class BusinessImpactAssessmentResponse(BusinessImpactAssessmentBase, DBModel):
     """Schema for BIA response"""
 
     id: str

@@ -34,7 +34,7 @@ class LogBatchIngestRequest(BaseModel):
     organization_id: Optional[str] = None
 
 
-class LogEntryResponse(DBModel):
+class LogEntryResponse(LogEntryBase, DBModel):
     """Schema for log entry response"""
 
     id: str
@@ -166,7 +166,7 @@ class DetectionRuleUpdate(BaseModel):
     enabled: Optional[bool] = None
 
 
-class DetectionRuleResponse(DBModel):
+class DetectionRuleResponse(DetectionRuleBase, DBModel):
     """Schema for detection rule response"""
 
     id: str

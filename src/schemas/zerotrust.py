@@ -52,17 +52,14 @@ class ZeroTrustPolicyUpdate(BaseModel):
     priority: Optional[int] = None
 
 
-class ZeroTrustPolicyResponse(DBModel):
+class ZeroTrustPolicyResponse(ZeroTrustPolicyBase, DBModel):
     """Schema for policy response"""
 
     id: str
-    hit_count: int
+    hit_count: int = 0
     last_triggered_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
-
-    class Config:
-        from_attributes = True
 
 
 class DeviceTrustProfileBase(BaseModel):
@@ -101,7 +98,7 @@ class DeviceComplianceUpdate(BaseModel):
     rooted: Optional[bool] = None
 
 
-class DeviceTrustProfileResponse(DBModel):
+class DeviceTrustProfileResponse(DeviceTrustProfileBase, DBModel):
     """Schema for device trust profile response"""
 
     id: str
@@ -184,7 +181,7 @@ class MicroSegmentUpdate(BaseModel):
     is_active: Optional[bool] = None
 
 
-class MicroSegmentResponse(DBModel):
+class MicroSegmentResponse(MicroSegmentBase, DBModel):
     """Schema for micro-segment response"""
 
     id: str
@@ -237,7 +234,7 @@ class IdentityVerificationCreate(IdentityVerificationBase):
     pass
 
 
-class IdentityVerificationResponse(DBModel):
+class IdentityVerificationResponse(IdentityVerificationBase, DBModel):
     """Schema for identity verification response"""
 
     id: str

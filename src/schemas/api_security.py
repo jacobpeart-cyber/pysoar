@@ -58,7 +58,7 @@ class APIEndpointInventoryUpdate(BaseModel):
     owner_team: Optional[str] = Field(None, max_length=255)
 
 
-class APIEndpointInventoryResponse(DBModel):
+class APIEndpointInventoryResponse(APIEndpointInventoryBase, DBModel):
     """Schema for API endpoint response"""
 
     id: str
@@ -105,7 +105,7 @@ class APIVulnerabilityUpdate(BaseModel):
     evidence: Optional[Dict[str, Any]] = None
 
 
-class APIVulnerabilityResponse(DBModel):
+class APIVulnerabilityResponse(APIVulnerabilityBase, DBModel):
     """Schema for vulnerability response"""
 
     id: str
@@ -149,7 +149,7 @@ class APISecurityPolicyUpdate(BaseModel):
     applies_to: Optional[Dict[str, Any]] = None
 
 
-class APISecurityPolicyResponse(DBModel):
+class APISecurityPolicyResponse(APISecurityPolicyBase, DBModel):
     """Schema for policy response"""
 
     id: str
@@ -193,7 +193,7 @@ class APIAnomalyDetectionUpdate(BaseModel):
     severity: Optional[str] = Field(None, pattern="^(critical|high|medium|low|info)$")
 
 
-class APIAnomalyDetectionResponse(DBModel):
+class APIAnomalyDetectionResponse(APIAnomalyDetectionBase, DBModel):
     """Schema for anomaly detection response"""
 
     id: str
@@ -233,7 +233,7 @@ class APIComplianceCheckUpdate(BaseModel):
     remediation_steps: Optional[str] = None
 
 
-class APIComplianceCheckResponse(DBModel):
+class APIComplianceCheckResponse(APIComplianceCheckBase, DBModel):
     """Schema for compliance check response"""
 
     id: str

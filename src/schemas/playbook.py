@@ -57,7 +57,7 @@ class PlaybookUpdate(BaseModel):
     max_retries: Optional[int] = None
 
 
-class PlaybookResponse(DBModel):
+class PlaybookResponse(PlaybookBase, DBModel):
     """Schema for playbook response"""
 
     id: str

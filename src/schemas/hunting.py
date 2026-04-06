@@ -77,7 +77,7 @@ class HuntHypothesisUpdate(BaseModel):
     tags: Optional[list[str]] = None
 
 
-class HuntHypothesisResponse(DBModel):
+class HuntHypothesisResponse(HuntHypothesisBase, DBModel):
     """Schema for hunt hypothesis response"""
 
     id: str

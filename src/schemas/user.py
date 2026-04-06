@@ -36,7 +36,7 @@ class UserUpdate(BaseModel):
     password: Optional[str] = Field(None, min_length=8)
 
 
-class UserResponse(DBModel):
+class UserResponse(UserBase, DBModel):
     """Schema for user response"""
 
     id: str

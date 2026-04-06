@@ -50,7 +50,7 @@ class AlertUpdate(BaseModel):
     tags: Optional[list[str]] = None
 
 
-class AlertResponse(DBModel):
+class AlertResponse(AlertBase, DBModel):
     """Schema for alert response"""
 
     id: str

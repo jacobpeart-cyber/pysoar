@@ -44,7 +44,7 @@ class ForensicCaseUpdate(BaseModel):
     court_admissible: Optional[bool] = None
 
 
-class ForensicCaseResponse(DBModel):
+class ForensicCaseResponse(ForensicCaseBase, DBModel):
     """Schema for forensic case response"""
 
     id: str
@@ -121,7 +121,7 @@ class ForensicEvidenceUpdate(BaseModel):
     handling_notes: Optional[str] = None
 
 
-class ForensicEvidenceResponse(DBModel):
+class ForensicEvidenceResponse(ForensicEvidenceBase, DBModel):
     """Schema for forensic evidence response"""
 
     id: str
@@ -212,7 +212,7 @@ class ForensicTimelineUpdate(BaseModel):
     artifact_data: Optional[dict[str, Any]] = None
 
 
-class ForensicTimelineResponse(DBModel):
+class ForensicTimelineResponse(ForensicTimelineBase, DBModel):
     """Schema for forensic timeline response"""
 
     id: str
@@ -282,7 +282,7 @@ class ForensicArtifactUpdate(BaseModel):
     risk_score: Optional[float] = Field(None, ge=0.0, le=10.0)
 
 
-class ForensicArtifactResponse(DBModel):
+class ForensicArtifactResponse(ForensicArtifactBase, DBModel):
     """Schema for forensic artifact response"""
 
     id: str
@@ -363,7 +363,7 @@ class LegalHoldUpdate(BaseModel):
     expiry_date: Optional[str] = None
 
 
-class LegalHoldResponse(DBModel):
+class LegalHoldResponse(LegalHoldBase, DBModel):
     """Schema for legal hold response"""
 
     id: str

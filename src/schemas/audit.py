@@ -25,7 +25,7 @@ class AuditLogCreate(AuditLogBase):
     new_value: Optional[str] = None
 
 
-class AuditLogResponse(DBModel):
+class AuditLogResponse(AuditLogBase, DBModel):
     """Schema for audit log responses"""
     id: str
     user_id: Optional[str] = None

@@ -204,7 +204,7 @@ class DataSubjectRequestUpdate(BaseModel):
     denial_reason: Optional[str] = None
 
 
-class DataSubjectRequestResponse(DBModel):
+class DataSubjectRequestResponse(DataSubjectRequestBase, DBModel):
     """Data Subject Request response"""
 
     id: str
@@ -260,7 +260,7 @@ class PrivacyImpactAssessmentUpdate(BaseModel):
     supervisory_authority_consulted: Optional[bool] = None
 
 
-class PrivacyImpactAssessmentResponse(DBModel):
+class PrivacyImpactAssessmentResponse(PrivacyImpactAssessmentBase, DBModel):
     """Privacy Impact Assessment response"""
 
     id: str
@@ -304,7 +304,7 @@ class ConsentRecordUpdate(BaseModel):
     withdrawal_date: Optional[str] = None
 
 
-class ConsentRecordResponse(DBModel):
+class ConsentRecordResponse(ConsentRecordBase, DBModel):
     """Consent Record response"""
 
     id: str
@@ -366,7 +366,7 @@ class DataProcessingRecordUpdate(BaseModel):
     retention_period_days: Optional[int] = None
 
 
-class DataProcessingRecordResponse(DBModel):
+class DataProcessingRecordResponse(DataProcessingRecordBase, DBModel):
     """Data Processing Record response"""
 
     id: str
@@ -427,7 +427,7 @@ class PrivacyIncidentUpdate(BaseModel):
     subjects_notified: Optional[bool] = None
 
 
-class PrivacyIncidentResponse(DBModel):
+class PrivacyIncidentResponse(PrivacyIncidentBase, DBModel):
     """Privacy Incident response"""
 
     id: str
