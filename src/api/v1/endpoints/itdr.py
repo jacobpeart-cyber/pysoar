@@ -163,7 +163,7 @@ async def list_identities(
         page=page,
         size=size,
         pages=math.ceil(total / size),
-        items=[IdentityProfileResponse.from_orm(i) for i in identities],
+        items=[IdentityProfileResponse.model_validate(i) for i in identities],
     )
 
 
@@ -175,7 +175,7 @@ async def get_identity(
 ):
     """Get identity profile details"""
     identity = await get_identity_or_404(db, identity_id)
-    return IdentityProfileResponse.from_orm(identity)
+    return IdentityProfileResponse.model_validate(identity)
 
 
 @router.post("/identities", response_model=IdentityProfileResponse, status_code=status.HTTP_201_CREATED)
@@ -193,7 +193,7 @@ async def create_identity(
     await db.commit()
     await db.refresh(identity)
     logger.info(f"Identity created: {identity.username}")
-    return IdentityProfileResponse.from_orm(identity)
+    return IdentityProfileResponse.model_validate(identity)
 
 
 @router.put("/identities/{identity_id}", response_model=IdentityProfileResponse)
@@ -211,7 +211,7 @@ async def update_identity(
     await db.commit()
     await db.refresh(identity)
     logger.info(f"Identity updated: {identity.username}")
-    return IdentityProfileResponse.from_orm(identity)
+    return IdentityProfileResponse.model_validate(identity)
 
 
 @router.get("/identities/{identity_id}/risk-score")
@@ -331,7 +331,7 @@ async def list_threats(
         page=page,
         size=size,
         pages=math.ceil(total / size),
-        items=[IdentityThreatResponse.from_orm(t) for t in threats],
+        items=[IdentityThreatResponse.model_validate(t) for t in threats],
     )
 
 
@@ -343,7 +343,7 @@ async def get_threat(
 ):
     """Get identity threat details"""
     threat = await get_threat_or_404(db, threat_id)
-    return IdentityThreatResponse.from_orm(threat)
+    return IdentityThreatResponse.model_validate(threat)
 
 
 @router.post("/threats", response_model=IdentityThreatResponse, status_code=status.HTTP_201_CREATED)
@@ -361,7 +361,7 @@ async def create_threat(
     await db.commit()
     await db.refresh(threat)
     logger.warning(f"Identity threat created: {threat.threat_type} ({threat.severity})")
-    return IdentityThreatResponse.from_orm(threat)
+    return IdentityThreatResponse.model_validate(threat)
 
 
 @router.put("/threats/{threat_id}", response_model=IdentityThreatResponse)
@@ -379,7 +379,7 @@ async def update_threat(
     await db.commit()
     await db.refresh(threat)
     logger.info(f"Identity threat updated: {threat.threat_type} -> {threat.status}")
-    return IdentityThreatResponse.from_orm(threat)
+    return IdentityThreatResponse.model_validate(threat)
 
 
 @router.post("/threats/{threat_id}/investigate")
@@ -501,7 +501,7 @@ async def list_exposures(
         page=page,
         size=size,
         pages=math.ceil(total / size),
-        items=[CredentialExposureResponse.from_orm(e) for e in exposures],
+        items=[CredentialExposureResponse.model_validate(e) for e in exposures],
     )
 
 
@@ -521,7 +521,7 @@ async def get_exposure(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Credential exposure not found",
         )
-    return CredentialExposureResponse.from_orm(exposure)
+    return CredentialExposureResponse.model_validate(exposure)
 
 
 @router.post("/credential-exposures/check")
@@ -618,7 +618,7 @@ async def list_anomalies(
         page=page,
         size=size,
         pages=math.ceil(total / size),
-        items=[AccessAnomalyResponse.from_orm(a) for a in anomalies],
+        items=[AccessAnomalyResponse.model_validate(a) for a in anomalies],
     )
 
 
@@ -638,7 +638,7 @@ async def get_anomaly(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Access anomaly not found",
         )
-    return AccessAnomalyResponse.from_orm(anomaly)
+    return AccessAnomalyResponse.model_validate(anomaly)
 
 
 @router.post("/anomalies/{anomaly_id}/review")
@@ -730,7 +730,7 @@ async def list_privileged_events(
         page=page,
         size=size,
         pages=math.ceil(total / size),
-        items=[PrivilegedAccessEventResponse.from_orm(e) for e in events],
+        items=[PrivilegedAccessEventResponse.model_validate(e) for e in events],
     )
 
 

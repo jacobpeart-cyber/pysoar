@@ -161,10 +161,10 @@ async def deploy_decoy(
         return DecoyResponse.model_validate(decoy)
 
     except Exception as e:
-        logger.error(f"Failed to deploy decoy: {e}")
+        logger.error(f"Failed to deploy decoy: {e}", exc_info=True)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Operation failed. Please try again or contact support.",
+            detail=f"Operation failed: {str(e)[:200]}",
         )
 
 

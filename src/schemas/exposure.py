@@ -79,7 +79,7 @@ class ExposureAssetResponse(DBModel):
     risk_score: float = 0.0
     vulnerability_count: int = 0
     open_ports: list[int] = Field(default_factory=list)
-    compliance_status: Optional[str]
+    compliance_status: Optional[Any] = None
     created_at: datetime
     updated_at: datetime
 

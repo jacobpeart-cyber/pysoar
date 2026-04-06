@@ -89,7 +89,7 @@ async def create_simulation(
             tags=request.tags,
         )
 
-        return AttackSimulationSchema.from_orm(simulation)
+        return AttackSimulationSchema.model_validate(simulation)
 
     except Exception as e:
         logger.error(f"Error creating simulation: {str(e)}")
@@ -150,7 +150,7 @@ async def list_simulations(
             total=total,
             page=skip // limit,
             page_size=limit,
-            simulations=[AttackSimulationSchema.from_orm(s) for s in simulations],
+            simulations=[AttackSimulationSchema.model_validate(s) for s in simulations],
         )
 
     except Exception as e:
@@ -200,9 +200,9 @@ async def get_simulation_detail(
         posture_score = result.scalar_one_or_none()
 
         return SimulationDetailResponse(
-            simulation=AttackSimulationSchema.from_orm(simulation),
-            tests=[SimulationTestSchema.from_orm(t) for t in tests],
-            posture_score=SecurityPostureScoreSchema.from_orm(posture_score) if posture_score else None,
+            simulation=AttackSimulationSchema.model_validate(simulation),
+            tests=[SimulationTestSchema.model_validate(t) for t in tests],
+            posture_score=SecurityPostureScoreSchema.model_validate(posture_score) if posture_score else None,
             execution_summary={
                 "total_tests": simulation.total_tests,
                 "passed_tests": simulation.passed_tests,
@@ -413,7 +413,7 @@ async def list_techniques(
 
         return TechniqueListResponse(
             total=len(techniques),
-            techniques=[AttackTechniqueSchema.from_orm(t) for t in techniques],
+            techniques=[AttackTechniqueSchema.model_validate(t) for t in techniques],
             facets={
                 "by_tactic": tactics,
                 "by_risk_level": {},
@@ -493,7 +493,7 @@ async def get_technique(
         if not technique:
             raise HTTPException(status_code=404, detail="Technique not found")
 
-        return AttackTechniqueSchema.from_orm(technique)
+        return AttackTechniqueSchema.model_validate(technique)
 
     except HTTPException:
         raise
@@ -591,7 +591,7 @@ async def list_adversaries(
 
         return AdversaryListResponse(
             total=len(adversaries),
-            adversaries=[AdversaryProfileSchema.from_orm(a) for a in adversaries],
+            adversaries=[AdversaryProfileSchema.model_validate(a) for a in adversaries],
         )
 
     except Exception as e:
@@ -626,7 +626,7 @@ async def get_adversary(
         if not adversary:
             raise HTTPException(status_code=404, detail="Adversary not found")
 
-        return AdversaryProfileSchema.from_orm(adversary)
+        return AdversaryProfileSchema.model_validate(adversary)
 
     except HTTPException:
         raise
@@ -661,7 +661,7 @@ async def create_emulation_plan(
         )
 
         return SimulationDetailResponse(
-            simulation=AttackSimulationSchema.from_orm(simulation),
+            simulation=AttackSimulationSchema.model_validate(simulation),
             tests=[],
             execution_summary={"status": "created"},
         )
