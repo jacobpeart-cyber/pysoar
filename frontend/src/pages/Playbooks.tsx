@@ -305,15 +305,20 @@ function CreatePlaybookModal({ onClose, onCreated }: { onClose: () => void; onCr
     steps: [{ id: 'step_1', name: 'Step 1', action: 'send_notification', parameters: {} }],
   })
   const [isSubmitting, setIsSubmitting] = useState(false)
+  const [error, setError] = useState('')
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
+    if (!formData.name.trim()) { setError('Name is required'); return; }
     setIsSubmitting(true)
+    setError('')
     try {
       await playbooksApi.create(formData)
       onCreated()
-    } catch (error) {
-      console.error('Failed to create playbook:', error)
+    } catch (err: any) {
+      const msg = err?.response?.data?.detail || err?.response?.data?.message || err?.message || 'Failed to create playbook'
+      setError(typeof msg === 'string' ? msg : JSON.stringify(msg))
+      console.error('Failed to create playbook:', err)
     } finally {
       setIsSubmitting(false)
     }
@@ -459,6 +464,9 @@ function CreatePlaybookModal({ onClose, onCreated }: { onClose: () => void; onCr
             </div>
           </div>
 
+          {error && (
+            <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-700">{error}</div>
+          )}
           <div className="flex justify-end space-x-3 pt-4">
             <button
               type="button"
