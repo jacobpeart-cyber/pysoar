@@ -264,7 +264,7 @@ async def create_policy(
     await db.commit()
     await db.refresh(db_policy)
 
-    return ZeroTrustPolicyResponse.from_orm(db_policy)
+    return ZeroTrustPolicyResponse.model_validate(db_policy)
 
 
 @router.get("/policies", response_model=None)
@@ -303,7 +303,7 @@ async def list_policies(
         "total": total,
         "skip": skip,
         "limit": limit,
-        "policies": [ZeroTrustPolicyResponse.from_orm(p) for p in policies],
+        "policies": [ZeroTrustPolicyResponse.model_validate(p) for p in policies],
     }
 
 
@@ -330,7 +330,7 @@ async def get_policy(
             status_code=status.HTTP_404_NOT_FOUND, detail="Policy not found"
         )
 
-    return ZeroTrustPolicyResponse.from_orm(policy)
+    return ZeroTrustPolicyResponse.model_validate(policy)
 
 
 @router.put("/policies/{policy_id}", response_model=ZeroTrustPolicyResponse)
@@ -370,7 +370,7 @@ async def update_policy(
     await db.commit()
     await db.refresh(policy)
 
-    return ZeroTrustPolicyResponse.from_orm(policy)
+    return ZeroTrustPolicyResponse.model_validate(policy)
 
 
 @router.delete("/policies/{policy_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -642,7 +642,7 @@ async def get_device(
             status_code=status.HTTP_404_NOT_FOUND, detail="Device not found"
         )
 
-    return DeviceTrustProfileResponse.from_orm(device)
+    return DeviceTrustProfileResponse.model_validate(device)
 
 
 @router.post("/devices/{device_id}/assess", response_model=DeviceTrustProfileResponse)
@@ -657,7 +657,7 @@ async def assess_device(
 
     device = await assessor.assess_device(device_id)
 
-    return DeviceTrustProfileResponse.from_orm(device)
+    return DeviceTrustProfileResponse.model_validate(device)
 
 
 @router.put("/devices/{device_id}/compliance", response_model=DeviceTrustProfileResponse)
@@ -674,7 +674,7 @@ async def update_device_compliance(
     compliance_data = compliance.dict(exclude_unset=True, exclude_none=True)
     device = await assessor.update_device_compliance(device_id, compliance_data)
 
-    return DeviceTrustProfileResponse.from_orm(device)
+    return DeviceTrustProfileResponse.model_validate(device)
 
 
 # ============================================================================
@@ -698,7 +698,7 @@ async def create_segment(
         config=segment.dict(),
     )
 
-    return MicroSegmentResponse.from_orm(seg)
+    return MicroSegmentResponse.model_validate(seg)
 
 
 @router.get("/segments", response_model=None)
@@ -733,7 +733,7 @@ async def list_segments(
         "total": total,
         "skip": skip,
         "limit": limit,
-        "segments": [MicroSegmentResponse.from_orm(s) for s in segments],
+        "segments": [MicroSegmentResponse.model_validate(s) for s in segments],
     }
 
 
@@ -760,7 +760,7 @@ async def get_segment(
             status_code=status.HTTP_404_NOT_FOUND, detail="Segment not found"
         )
 
-    return MicroSegmentResponse.from_orm(segment)
+    return MicroSegmentResponse.model_validate(segment)
 
 
 @router.put("/segments/{segment_id}", response_model=MicroSegmentResponse)
@@ -800,7 +800,7 @@ async def update_segment(
     await db.commit()
     await db.refresh(segment)
 
-    return MicroSegmentResponse.from_orm(segment)
+    return MicroSegmentResponse.model_validate(segment)
 
 
 @router.delete("/segments/{segment_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -903,7 +903,7 @@ async def initiate_verification(
         },
     )
 
-    return IdentityVerificationResponse.from_orm(v)
+    return IdentityVerificationResponse.model_validate(v)
 
 
 @router.post("/step-up/{session_id}", response_model=None)
@@ -958,7 +958,7 @@ async def list_verifications(
         "total": total,
         "skip": skip,
         "limit": limit,
-        "verifications": [IdentityVerificationResponse.from_orm(v) for v in verifications],
+        "verifications": [IdentityVerificationResponse.model_validate(v) for v in verifications],
     }
 
 

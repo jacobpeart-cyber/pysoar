@@ -151,7 +151,7 @@ async def list_monitors(
     pages = math.ceil(total / size) if total > 0 else 1
 
     return DarkWebMonitorListResponse(
-        items=[DarkWebMonitorResponse.from_orm(m) for m in monitors],
+        items=[DarkWebMonitorResponse.model_validate(m) for m in monitors],
         total=total,
         page=page,
         size=size,
@@ -188,7 +188,7 @@ async def create_monitor(
 
     logger.info(f"Created dark web monitor: {db_monitor.id}")
 
-    return DarkWebMonitorResponse.from_orm(db_monitor)
+    return DarkWebMonitorResponse.model_validate(db_monitor)
 
 
 @router.get("/monitors/{monitor_id}", response_model=DarkWebMonitorResponse)
@@ -203,7 +203,7 @@ async def get_monitor(
     if monitor.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
 
-    return DarkWebMonitorResponse.from_orm(monitor)
+    return DarkWebMonitorResponse.model_validate(monitor)
 
 
 @router.patch("/monitors/{monitor_id}", response_model=DarkWebMonitorResponse)
@@ -242,7 +242,7 @@ async def update_monitor(
 
     logger.info(f"Updated dark web monitor: {monitor_id}")
 
-    return DarkWebMonitorResponse.from_orm(monitor)
+    return DarkWebMonitorResponse.model_validate(monitor)
 
 
 @router.delete("/monitors/{monitor_id}", status_code=204)
@@ -358,7 +358,7 @@ async def list_findings(
     pages = math.ceil(total / size) if total > 0 else 1
 
     return DarkWebFindingListResponse(
-        items=[DarkWebFindingResponse.from_orm(f) for f in findings],
+        items=[DarkWebFindingResponse.model_validate(f) for f in findings],
         total=total,
         page=page,
         size=size,
@@ -378,7 +378,7 @@ async def get_finding(
     if finding.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
 
-    return DarkWebFindingDetailResponse.from_orm(finding)
+    return DarkWebFindingDetailResponse.model_validate(finding)
 
 
 @router.patch("/findings/{finding_id}", response_model=DarkWebFindingResponse)
@@ -406,7 +406,7 @@ async def update_finding(
     await db.commit()
     await db.refresh(finding)
 
-    return DarkWebFindingResponse.from_orm(finding)
+    return DarkWebFindingResponse.model_validate(finding)
 
 
 @router.post("/findings/bulk-action")
@@ -513,7 +513,7 @@ async def list_credentials(
     pages = math.ceil(total / size) if total > 0 else 1
 
     return CredentialLeakListResponse(
-        items=[CredentialLeakResponse.from_orm(c) for c in credentials],
+        items=[CredentialLeakResponse.model_validate(c) for c in credentials],
         total=total,
         page=page,
         size=size,
@@ -545,7 +545,7 @@ async def update_credential(
     await db.commit()
     await db.refresh(credential)
 
-    return CredentialLeakResponse.from_orm(credential)
+    return CredentialLeakResponse.model_validate(credential)
 
 
 @router.post("/credentials/bulk-remediate", response_model=CredentialRemediationReport)
@@ -647,7 +647,7 @@ async def list_brand_threats(
     pages = math.ceil(total / size) if total > 0 else 1
 
     return BrandThreatListResponse(
-        items=[BrandThreatResponse.from_orm(t) for t in threats],
+        items=[BrandThreatResponse.model_validate(t) for t in threats],
         total=total,
         page=page,
         size=size,
@@ -682,7 +682,7 @@ async def update_brand_threat(
     await db.commit()
     await db.refresh(threat)
 
-    return BrandThreatResponse.from_orm(threat)
+    return BrandThreatResponse.model_validate(threat)
 
 
 @router.post("/brand-threats/{threat_id}/initiate-takedown")

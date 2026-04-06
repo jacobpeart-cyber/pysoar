@@ -136,7 +136,7 @@ async def list_vulnerabilities(
     items = result.scalars().all()
 
     return VulnerabilityListResponse(
-        items=[VulnerabilityResponse.from_orm(item) for item in items],
+        items=[VulnerabilityResponse.model_validate(item) for item in items],
         total=total,
         page=page,
         size=size,
@@ -158,7 +158,7 @@ async def create_vulnerability(
     await db.commit()
     await db.refresh(vuln)
 
-    return VulnerabilityResponse.from_orm(vuln)
+    return VulnerabilityResponse.model_validate(vuln)
 
 
 @router.get("/vulnerabilities/{vuln_id}", response_model=VulnerabilityResponse)
@@ -169,7 +169,7 @@ async def get_vulnerability(
 ):
     """Get vulnerability by ID"""
     vuln = await get_or_404(db, Vulnerability, vuln_id, getattr(current_user, "organization_id", None))
-    return VulnerabilityResponse.from_orm(vuln)
+    return VulnerabilityResponse.model_validate(vuln)
 
 
 @router.put("/vulnerabilities/{vuln_id}", response_model=VulnerabilityResponse)
@@ -188,7 +188,7 @@ async def update_vulnerability(
 
     await db.commit()
     await db.refresh(vuln)
-    return VulnerabilityResponse.from_orm(vuln)
+    return VulnerabilityResponse.model_validate(vuln)
 
 
 @router.post("/vulnerabilities/import-scan", response_model=None)
@@ -315,7 +315,7 @@ async def list_instances(
     items = result.scalars().all()
 
     return VulnerabilityInstanceListResponse(
-        items=[VulnerabilityInstanceResponse.from_orm(item) for item in items],
+        items=[VulnerabilityInstanceResponse.model_validate(item) for item in items],
         total=total,
         page=page,
         size=size,
@@ -337,7 +337,7 @@ async def create_instance(
     await db.commit()
     await db.refresh(instance)
 
-    return VulnerabilityInstanceResponse.from_orm(instance)
+    return VulnerabilityInstanceResponse.model_validate(instance)
 
 
 @router.get("/instances/{instance_id}", response_model=VulnerabilityInstanceResponse)
@@ -350,7 +350,7 @@ async def get_instance(
     instance = await get_or_404(
         db, VulnerabilityInstance, instance_id, getattr(current_user, "organization_id", None)
     )
-    return VulnerabilityInstanceResponse.from_orm(instance)
+    return VulnerabilityInstanceResponse.model_validate(instance)
 
 
 @router.put("/instances/{instance_id}", response_model=VulnerabilityInstanceResponse)
@@ -371,7 +371,7 @@ async def update_instance(
 
     await db.commit()
     await db.refresh(instance)
-    return VulnerabilityInstanceResponse.from_orm(instance)
+    return VulnerabilityInstanceResponse.model_validate(instance)
 
 
 @router.post("/instances/bulk-action")
@@ -439,7 +439,7 @@ async def list_scan_profiles(
     items = result.scalars().all()
 
     return ScanProfileListResponse(
-        items=[ScanProfileResponse.from_orm(item) for item in items],
+        items=[ScanProfileResponse.model_validate(item) for item in items],
         total=total,
         page=page,
         size=size,
@@ -461,7 +461,7 @@ async def create_scan_profile(
     await db.commit()
     await db.refresh(profile)
 
-    return ScanProfileResponse.from_orm(profile)
+    return ScanProfileResponse.model_validate(profile)
 
 
 @router.put("/scan-profiles/{profile_id}", response_model=ScanProfileResponse)
@@ -482,7 +482,7 @@ async def update_scan_profile(
 
     await db.commit()
     await db.refresh(profile)
-    return ScanProfileResponse.from_orm(profile)
+    return ScanProfileResponse.model_validate(profile)
 
 
 # Patch Operation Endpoints
@@ -512,7 +512,7 @@ async def list_patch_operations(
     items = result.scalars().all()
 
     return PatchOperationListResponse(
-        items=[PatchOperationResponse.from_orm(item) for item in items],
+        items=[PatchOperationResponse.model_validate(item) for item in items],
         total=total,
         page=page,
         size=size,
@@ -574,7 +574,7 @@ async def schedule_patch(
         )
 
     await db.refresh(patch)
-    return PatchOperationResponse.from_orm(patch)
+    return PatchOperationResponse.model_validate(patch)
 
 
 @router.post("/patch-operations/{patch_id}/verify")
@@ -644,7 +644,7 @@ async def create_exception(
     await db.commit()
     await db.refresh(exception)
 
-    return VulnerabilityExceptionResponse.from_orm(exception)
+    return VulnerabilityExceptionResponse.model_validate(exception)
 
 
 @router.put("/exceptions/{exception_id}", response_model=VulnerabilityExceptionResponse)
@@ -665,7 +665,7 @@ async def update_exception(
 
     await db.commit()
     await db.refresh(exception)
-    return VulnerabilityExceptionResponse.from_orm(exception)
+    return VulnerabilityExceptionResponse.model_validate(exception)
 
 
 # Dashboard and Reporting Endpoints
@@ -713,7 +713,7 @@ async def get_dashboard(
         },
         trends_30_days=trends,
         aging=aging,
-        top_vulnerabilities=[VulnerabilityInstanceResponse.from_orm(v) for v in top_vulns],
+        top_vulnerabilities=[VulnerabilityInstanceResponse.model_validate(v) for v in top_vulns],
         kev_compliance=KEVComplianceReport(
             report_date=datetime.now(timezone.utc).isoformat(),
             total_kev_tracked=0,
