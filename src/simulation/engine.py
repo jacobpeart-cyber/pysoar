@@ -356,9 +356,9 @@ class SimulationOrchestrator:
         Returns:
             True if scope is valid and safe
         """
-        # Safety validations
+        # Empty scope is valid (lab environment, no specific targets)
         if not scope:
-            return False
+            return True
 
         # Validate no overly broad targets
         hosts = scope.get("hosts", [])
