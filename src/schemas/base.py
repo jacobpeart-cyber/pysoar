@@ -26,6 +26,7 @@ class DBModel(BaseModel):
 
     Handles both dict input and ORM objects (from_attributes).
     Automatically converts JSON strings to lists/dicts.
+    Skips None values so Pydantic defaults are preserved.
     """
 
     @model_validator(mode="before")
@@ -34,15 +35,17 @@ class DBModel(BaseModel):
         if isinstance(data, dict):
             return {k: _parse_value(v) for k, v in data.items()}
 
-        # For ORM objects: convert to dict first, then parse
+        # For ORM objects: extract field values, skip None so defaults work
         if hasattr(data, "__dict__"):
             result = {}
             for key in cls.model_fields:
                 try:
                     val = getattr(data, key, None)
-                    result[key] = _parse_value(val)
+                    if val is not None:
+                        result[key] = _parse_value(val)
+                    # If val is None, don't include — let Pydantic use the field default
                 except Exception:
-                    result[key] = None
+                    pass
             return result
 
         return data

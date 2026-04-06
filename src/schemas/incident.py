@@ -70,7 +70,7 @@ class IncidentResponse(IncidentBase, DBModel):
     tags: Optional[list[str]] = None
     mitre_tactics: Optional[list[str]] = None
     mitre_techniques: Optional[list[str]] = None
-    alert_count: int = 0
+    alert_count: Optional[int] = 0
     external_id: Optional[str] = None
     ticket_url: Optional[str] = None
     created_at: datetime

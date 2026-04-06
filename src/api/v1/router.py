@@ -48,7 +48,6 @@ from src.api.v1.endpoints import (
     ueba,
     users,
     vulnmgmt,
-    websocket,
     zerotrust,
     tickethub,
     backup,
@@ -68,7 +67,7 @@ api_router.include_router(incidents.router)
 api_router.include_router(playbooks.router)
 api_router.include_router(iocs.router)
 api_router.include_router(assets.router)
-api_router.include_router(websocket.router)
+# WebSocket mounted directly on app in main.py to bypass BaseHTTPMiddleware
 api_router.include_router(settings.router)
 api_router.include_router(audit.router)
 api_router.include_router(metrics.router, prefix="/metrics", tags=["metrics"])
