@@ -210,7 +210,7 @@ async def install_connector(
     result = await db.execute(
         select(InstalledIntegration).where(
             and_(
-                InstalledIntegration.organization_id == current_user.organization_id,
+                InstalledIntegration.organization_id == getattr(current_user, "organization_id", None),
                 InstalledIntegration.connector_id == request.connector_id,
             ),
         ),
@@ -223,7 +223,7 @@ async def install_connector(
 
     # Create installation record
     installation = InstalledIntegration(
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
         connector_id=request.connector_id,
         display_name=request.display_name,
         config_encrypted=json.dumps(request.config),
@@ -266,7 +266,7 @@ async def list_installed_integrations(
     )
 
     # Filter by organization
-    query = query.where(InstalledIntegration.organization_id == current_user.organization_id)
+    query = query.where(InstalledIntegration.organization_id == getattr(current_user, "organization_id", None))
 
     # Apply status filter
     if status:
@@ -332,7 +332,7 @@ async def get_installed_integration(
     integration = await get_installed_integration_or_404(db, integration_id)
 
     # Check authorization
-    if integration.organization_id != current_user.organization_id:
+    if integration.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied",
@@ -366,7 +366,7 @@ async def update_installed_integration(
     integration = await get_installed_integration_or_404(db, integration_id)
 
     # Check authorization
-    if integration.organization_id != current_user.organization_id:
+    if integration.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied",
@@ -410,7 +410,7 @@ async def test_integration(
     integration = await get_installed_integration_or_404(db, integration_id)
 
     # Check authorization
-    if integration.organization_id != current_user.organization_id:
+    if integration.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied",
@@ -437,7 +437,7 @@ async def enable_integration(
     integration = await get_installed_integration_or_404(db, integration_id)
 
     # Check authorization
-    if integration.organization_id != current_user.organization_id:
+    if integration.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied",
@@ -468,7 +468,7 @@ async def disable_integration(
     integration = await get_installed_integration_or_404(db, integration_id)
 
     # Check authorization
-    if integration.organization_id != current_user.organization_id:
+    if integration.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied",
@@ -499,7 +499,7 @@ async def uninstall_integration(
     integration = await get_installed_integration_or_404(db, integration_id)
 
     # Check authorization
-    if integration.organization_id != current_user.organization_id:
+    if integration.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied",
@@ -522,7 +522,7 @@ async def list_integration_actions(
     integration = await get_installed_integration_or_404(db, integration_id)
 
     # Check authorization
-    if integration.organization_id != current_user.organization_id:
+    if integration.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied",
@@ -593,7 +593,7 @@ async def execute_action(
     integration = await get_installed_integration_or_404(db, integration_id)
 
     # Check authorization
-    if integration.organization_id != current_user.organization_id:
+    if integration.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied",
@@ -612,7 +612,7 @@ async def execute_action(
 
     # Create execution record
     execution = IntegrationExecution(
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
         installed_id=integration_id,
         action_id=action_id,
         triggered_by="manual",
@@ -662,7 +662,7 @@ async def get_execution_history(
     integration = await get_installed_integration_or_404(db, integration_id)
 
     # Check authorization
-    if integration.organization_id != current_user.organization_id:
+    if integration.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied",
@@ -737,7 +737,7 @@ async def register_webhook(
     integration = await get_installed_integration_or_404(db, integration_id)
 
     # Check authorization
-    if integration.organization_id != current_user.organization_id:
+    if integration.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied",
@@ -745,7 +745,7 @@ async def register_webhook(
 
     # Create webhook
     webhook = WebhookEndpoint(
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
         installed_id=integration_id,
         endpoint_path=request.endpoint_path,
         http_method=request.http_method,
@@ -787,7 +787,7 @@ async def list_webhooks(
     integration = await get_installed_integration_or_404(db, integration_id)
 
     # Check authorization
-    if integration.organization_id != current_user.organization_id:
+    if integration.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied",
@@ -852,7 +852,7 @@ async def delete_webhook(
     integration = await get_installed_integration_or_404(db, integration_id)
 
     # Check authorization
-    if integration.organization_id != current_user.organization_id:
+    if integration.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Access denied",
@@ -881,7 +881,7 @@ async def get_health_dashboard(
 ):
     """Get integration health overview dashboard"""
     query = select(InstalledIntegration).where(
-        InstalledIntegration.organization_id == current_user.organization_id,
+        InstalledIntegration.organization_id == getattr(current_user, "organization_id", None),
     )
 
     result = await db.execute(query)
@@ -935,7 +935,7 @@ async def get_dashboard_summary(
 ):
     """Get complete dashboard summary"""
     query = select(InstalledIntegration).where(
-        InstalledIntegration.organization_id == current_user.organization_id,
+        InstalledIntegration.organization_id == getattr(current_user, "organization_id", None),
     )
 
     result = await db.execute(query)

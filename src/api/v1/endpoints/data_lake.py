@@ -69,7 +69,7 @@ async def create_data_source(
     """Create new data source"""
     try:
         source = DataSource(
-            organization_id=current_user.organization_id,
+            organization_id=getattr(current_user, "organization_id", None),
             name=source_in.name,
             description=source_in.description,
             source_type=source_in.source_type,
@@ -102,7 +102,7 @@ async def list_data_sources(
 ):
     """List data sources with filtering and pagination"""
     query = select(DataSource).where(
-        DataSource.organization_id == current_user.organization_id
+        DataSource.organization_id == getattr(current_user, "organization_id", None)
     )
 
     if search:
@@ -147,7 +147,7 @@ async def get_data_source(
     result = await db.execute(
         select(DataSource).where(
             (DataSource.id == source_id)
-            & (DataSource.organization_id == current_user.organization_id)
+            & (DataSource.organization_id == getattr(current_user, "organization_id", None))
         )
     )
     source = result.scalar_one_or_none()
@@ -167,7 +167,7 @@ async def update_data_source(
     result = await db.execute(
         select(DataSource).where(
             (DataSource.id == source_id)
-            & (DataSource.organization_id == current_user.organization_id)
+            & (DataSource.organization_id == getattr(current_user, "organization_id", None))
         )
     )
     source = result.scalar_one_or_none()
@@ -196,7 +196,7 @@ async def start_data_source_ingestion(
     result = await db.execute(
         select(DataSource).where(
             (DataSource.id == source_id)
-            & (DataSource.organization_id == current_user.organization_id)
+            & (DataSource.organization_id == getattr(current_user, "organization_id", None))
         )
     )
     source = result.scalar_one_or_none()
@@ -227,7 +227,7 @@ async def stop_data_source_ingestion(
     result = await db.execute(
         select(DataSource).where(
             (DataSource.id == source_id)
-            & (DataSource.organization_id == current_user.organization_id)
+            & (DataSource.organization_id == getattr(current_user, "organization_id", None))
         )
     )
     source = result.scalar_one_or_none()
@@ -259,7 +259,7 @@ async def create_partition(
     """Create new data partition"""
     try:
         partition = DataPartition(
-            organization_id=current_user.organization_id,
+            organization_id=getattr(current_user, "organization_id", None),
             source_id=partition_in.source_id,
             partition_key=partition_in.partition_key,
             time_range_start=partition_in.time_range_start,
@@ -289,7 +289,7 @@ async def list_partitions(
 ):
     """List data partitions with filtering"""
     query = select(DataPartition).where(
-        DataPartition.organization_id == current_user.organization_id
+        DataPartition.organization_id == getattr(current_user, "organization_id", None)
     )
 
     if source_id:
@@ -331,7 +331,7 @@ async def update_partition(
     result = await db.execute(
         select(DataPartition).where(
             (DataPartition.id == partition_id)
-            & (DataPartition.organization_id == current_user.organization_id)
+            & (DataPartition.organization_id == getattr(current_user, "organization_id", None))
         )
     )
     partition = result.scalar_one_or_none()
@@ -362,7 +362,7 @@ async def create_pipeline(
     """Create new data pipeline"""
     try:
         pipeline = DataPipeline(
-            organization_id=current_user.organization_id,
+            organization_id=getattr(current_user, "organization_id", None),
             name=pipeline_in.name,
             description=pipeline_in.description,
             pipeline_type=pipeline_in.pipeline_type,
@@ -391,7 +391,7 @@ async def list_pipelines(
 ):
     """List data pipelines with filtering"""
     query = select(DataPipeline).where(
-        DataPipeline.organization_id == current_user.organization_id
+        DataPipeline.organization_id == getattr(current_user, "organization_id", None)
     )
 
     if pipeline_type:
@@ -433,7 +433,7 @@ async def update_pipeline(
     result = await db.execute(
         select(DataPipeline).where(
             (DataPipeline.id == pipeline_id)
-            & (DataPipeline.organization_id == current_user.organization_id)
+            & (DataPipeline.organization_id == getattr(current_user, "organization_id", None))
         )
     )
     pipeline = result.scalar_one_or_none()
@@ -466,7 +466,7 @@ async def create_unified_model(
     """Create unified data model"""
     try:
         model = UnifiedDataModel(
-            organization_id=current_user.organization_id,
+            organization_id=getattr(current_user, "organization_id", None),
             name=model_in.name,
             description=model_in.description,
             entity_type=model_in.entity_type,
@@ -495,7 +495,7 @@ async def list_unified_models(
 ):
     """List unified data models"""
     query = select(UnifiedDataModel).where(
-        UnifiedDataModel.organization_id == current_user.organization_id
+        UnifiedDataModel.organization_id == getattr(current_user, "organization_id", None)
     )
 
     if entity_type:
@@ -538,7 +538,7 @@ async def update_unified_model(
     result = await db.execute(
         select(UnifiedDataModel).where(
             (UnifiedDataModel.id == model_id)
-            & (UnifiedDataModel.organization_id == current_user.organization_id)
+            & (UnifiedDataModel.organization_id == getattr(current_user, "organization_id", None))
         )
     )
     model = result.scalar_one_or_none()
@@ -571,7 +571,7 @@ async def submit_query(
     """Submit a query job"""
     try:
         job = QueryJob(
-            organization_id=current_user.organization_id,
+            organization_id=getattr(current_user, "organization_id", None),
             query_text=query_in.query_text,
             query_language=query_in.query_language,
             data_sources_queried=query_in.data_sources_queried,
@@ -620,7 +620,7 @@ async def list_queries(
 ):
     """List query jobs"""
     query = select(QueryJob).where(
-        QueryJob.organization_id == current_user.organization_id
+        QueryJob.organization_id == getattr(current_user, "organization_id", None)
     )
 
     if status:
@@ -658,7 +658,7 @@ async def get_query(
     result = await db.execute(
         select(QueryJob).where(
             (QueryJob.id == query_id)
-            & (QueryJob.organization_id == current_user.organization_id)
+            & (QueryJob.organization_id == getattr(current_user, "organization_id", None))
         )
     )
     job = result.scalar_one_or_none()

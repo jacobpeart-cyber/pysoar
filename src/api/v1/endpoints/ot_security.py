@@ -142,7 +142,7 @@ async def list_assets(
     search: Optional[str] = None,
 ):
     """List OT assets with filtering and pagination"""
-    query = select(OTAsset).where(OTAsset.organization_id == current_user.organization_id)
+    query = select(OTAsset).where(OTAsset.organization_id == getattr(current_user, "organization_id", None))
 
     if asset_type:
         query = query.where(OTAsset.asset_type == asset_type)
@@ -192,7 +192,7 @@ async def create_asset(
 ):
     """Create a new OT asset"""
     asset = OTAsset(
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
         name=asset_data.name,
         asset_type=asset_data.asset_type,
         vendor=asset_data.vendor,
@@ -285,7 +285,7 @@ async def get_asset_risk_assessment(
 ):
     """Get risk assessment for OT asset"""
     asset = await get_asset_or_404(db, asset_id)
-    assessor = OTVulnerabilityAssessor(current_user.organization_id)
+    assessor = OTVulnerabilityAssessor(getattr(current_user, "organization_id", None))
 
     vulns = await assessor.check_known_vulnerabilities(asset.to_dict())
     risk_score = await assessor.calculate_ot_risk_score(asset.to_dict(), vulns)
@@ -304,7 +304,7 @@ async def get_asset_risk_assessment(
 async def check_asset_firmware(asset_id: str, current_user: CurrentUser = None, db: DatabaseSession = None):
     """Check firmware version and vulnerabilities"""
     asset = await get_asset_or_404(db, asset_id)
-    assessor = OTVulnerabilityAssessor(current_user.organization_id)
+    assessor = OTVulnerabilityAssessor(getattr(current_user, "organization_id", None))
 
     vulns = await assessor.scan_firmware_versions([asset.to_dict()])
 
@@ -331,7 +331,7 @@ async def list_alerts(
     asset_id: Optional[str] = None,
 ):
     """List OT alerts with filtering and pagination"""
-    query = select(OTAlert).where(OTAlert.organization_id == current_user.organization_id)
+    query = select(OTAlert).where(OTAlert.organization_id == getattr(current_user, "organization_id", None))
 
     if alert_type:
         query = query.where(OTAlert.alert_type == alert_type)
@@ -373,7 +373,7 @@ async def create_alert(
 ):
     """Create a new OT alert"""
     alert = OTAlert(
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
         asset_id=alert_data.asset_id,
         alert_type=alert_data.alert_type,
         severity=alert_data.severity,
@@ -489,7 +489,7 @@ async def list_zones(
     purdue_level: Optional[str] = None,
 ):
     """List OT security zones"""
-    query = select(OTZone).where(OTZone.organization_id == current_user.organization_id)
+    query = select(OTZone).where(OTZone.organization_id == getattr(current_user, "organization_id", None))
 
     if purdue_level:
         query = query.where(OTZone.purdue_level == purdue_level)
@@ -522,7 +522,7 @@ async def create_zone(
 ):
     """Create a new OT security zone"""
     zone = OTZone(
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
         name=zone_data.name,
         description=zone_data.description,
         purdue_level=zone_data.purdue_level,
@@ -577,7 +577,7 @@ async def delete_zone(zone_id: str, current_user: CurrentUser = None, db: Databa
 async def check_zone_compliance(zone_id: str, current_user: CurrentUser = None, db: DatabaseSession = None):
     """Check zone compliance with Purdue model"""
     zone = await get_zone_or_404(db, zone_id)
-    enforcer = PurdueModelEnforcer(current_user.organization_id)
+    enforcer = PurdueModelEnforcer(getattr(current_user, "organization_id", None))
 
     report = await enforcer.generate_zone_compliance_report([zone.to_dict()])
 
@@ -630,7 +630,7 @@ async def list_incidents(
     incident_type: Optional[str] = None,
 ):
     """List OT incidents"""
-    query = select(OTIncident).where(OTIncident.organization_id == current_user.organization_id)
+    query = select(OTIncident).where(OTIncident.organization_id == getattr(current_user, "organization_id", None))
 
     if status:
         query = query.where(OTIncident.status == status)
@@ -669,7 +669,7 @@ async def create_incident(
 ):
     """Create a new OT incident"""
     incident = OTIncident(
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
         title=incident_data.title,
         description=incident_data.description,
         incident_type=incident_data.incident_type,
@@ -736,7 +736,7 @@ async def initiate_safe_shutdown(
     """Initiate safe shutdown procedure for incident"""
     incident = await get_incident_or_404(db, incident_id)
 
-    safety_mgr = SafetyManager(current_user.organization_id)
+    safety_mgr = SafetyManager(getattr(current_user, "organization_id", None))
     shutdown_plan = await safety_mgr.initiate_safe_shutdown(
         incident_id, incident.affected_zones
     )
@@ -754,7 +754,7 @@ async def get_post_incident_report(
     """Generate post-incident report"""
     incident = await get_incident_or_404(db, incident_id)
 
-    safety_mgr = SafetyManager(current_user.organization_id)
+    safety_mgr = SafetyManager(getattr(current_user, "organization_id", None))
     report = await safety_mgr.generate_safety_incident_report(incident.to_dict())
 
     return report
@@ -773,7 +773,7 @@ async def list_policies(
     enabled_only: bool = False,
 ):
     """List OT policy rules"""
-    query = select(OTPolicyRule).where(OTPolicyRule.organization_id == current_user.organization_id)
+    query = select(OTPolicyRule).where(OTPolicyRule.organization_id == getattr(current_user, "organization_id", None))
 
     if rule_type:
         query = query.where(OTPolicyRule.rule_type == rule_type)
@@ -809,7 +809,7 @@ async def create_policy(
 ):
     """Create a new OT policy rule"""
     policy = OTPolicyRule(
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
         name=policy_data.name,
         description=policy_data.description,
         rule_type=policy_data.rule_type,
@@ -906,7 +906,7 @@ async def get_policy_violation_history(
 @router.get("/dashboard", response_model=OTDashboardResponse)
 async def get_ot_dashboard(current_user: CurrentUser = None, db: DatabaseSession = None):
     """Get OT security dashboard"""
-    org_id = current_user.organization_id
+    org_id = getattr(current_user, "organization_id", None)
 
     # Get asset counts
     asset_result = await db.execute(
@@ -967,7 +967,7 @@ async def get_ot_dashboard(current_user: CurrentUser = None, db: DatabaseSession
 @router.get("/compliance/report", response_model=ComplianceReportResponse)
 async def get_compliance_report(current_user: CurrentUser = None, db: DatabaseSession = None):
     """Get comprehensive ICS compliance report"""
-    org_id = current_user.organization_id
+    org_id = getattr(current_user, "organization_id", None)
 
     # Fetch assets and zones
     assets_result = await db.execute(
@@ -1000,7 +1000,7 @@ async def get_compliance_report(current_user: CurrentUser = None, db: DatabaseSe
 @router.get("/risk_assessment", response_model=OTRiskAssessmentResponse)
 async def get_risk_assessment(current_user: CurrentUser = None, db: DatabaseSession = None):
     """Get OT risk assessment report"""
-    org_id = current_user.organization_id
+    org_id = getattr(current_user, "organization_id", None)
 
     # Fetch assets
     assets_result = await db.execute(

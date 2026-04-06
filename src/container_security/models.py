@@ -34,7 +34,7 @@ class ContainerImage(BaseModel):
     registry: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     repository: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     tag: Mapped[str] = mapped_column(String(255), nullable=False)
-    digest_sha256: Mapped[str] = mapped_column(String(71), unique=True, nullable=False)
+    digest_sha256: Mapped[str] = mapped_column(String(255), nullable=False)
     image_size_mb: Mapped[float] = mapped_column(Float, nullable=True)
 
     # Operating system info

@@ -98,7 +98,7 @@ async def list_vulnerabilities(
     sort_order: str = "desc",
 ):
     """List vulnerabilities with filtering and pagination"""
-    org_id = current_user.organization_id
+    org_id = getattr(current_user, "organization_id", None)
 
     query = select(Vulnerability).where(Vulnerability.organization_id == org_id)
 
@@ -151,7 +151,7 @@ async def create_vulnerability(
     db: DatabaseSession = None,
 ):
     """Create a vulnerability record"""
-    vuln_data.organization_id = current_user.organization_id
+    vuln_data.organization_id = getattr(current_user, "organization_id", None)
 
     vuln = Vulnerability(**vuln_data.dict())
     db.add(vuln)
@@ -168,7 +168,7 @@ async def get_vulnerability(
     vuln_id: str = Path(...),
 ):
     """Get vulnerability by ID"""
-    vuln = await get_or_404(db, Vulnerability, vuln_id, current_user.organization_id)
+    vuln = await get_or_404(db, Vulnerability, vuln_id, getattr(current_user, "organization_id", None))
     return VulnerabilityResponse.from_orm(vuln)
 
 
@@ -180,7 +180,7 @@ async def update_vulnerability(
     vuln_id: str = Path(...),
 ):
     """Update a vulnerability"""
-    vuln = await get_or_404(db, Vulnerability, vuln_id, current_user.organization_id)
+    vuln = await get_or_404(db, Vulnerability, vuln_id, getattr(current_user, "organization_id", None))
 
     update_data = vuln_data.dict(exclude_unset=True)
     for key, value in update_data.items():
@@ -198,7 +198,7 @@ async def import_scan_results(
     db: DatabaseSession = None,
 ):
     """Import vulnerability scan results"""
-    org_id = current_user.organization_id
+    org_id = getattr(current_user, "organization_id", None)
 
     try:
         scanner = VulnerabilityScanner(org_id)
@@ -234,7 +234,7 @@ async def sync_kev(
     db: DatabaseSession = None,
 ):
     """Sync CISA Known Exploited Vulnerabilities"""
-    org_id = current_user.organization_id
+    org_id = getattr(current_user, "organization_id", None)
 
     try:
         monitor = KEVMonitor(org_id)
@@ -273,7 +273,7 @@ async def list_instances(
     sort_order: str = "desc",
 ):
     """List vulnerability instances with filtering"""
-    org_id = current_user.organization_id
+    org_id = getattr(current_user, "organization_id", None)
 
     query = select(VulnerabilityInstance).where(
         VulnerabilityInstance.organization_id == org_id
@@ -330,7 +330,7 @@ async def create_instance(
     db: DatabaseSession = None,
 ):
     """Create vulnerability instance"""
-    instance_data.organization_id = current_user.organization_id
+    instance_data.organization_id = getattr(current_user, "organization_id", None)
 
     instance = VulnerabilityInstance(**instance_data.dict())
     db.add(instance)
@@ -348,7 +348,7 @@ async def get_instance(
 ):
     """Get vulnerability instance by ID"""
     instance = await get_or_404(
-        db, VulnerabilityInstance, instance_id, current_user.organization_id
+        db, VulnerabilityInstance, instance_id, getattr(current_user, "organization_id", None)
     )
     return VulnerabilityInstanceResponse.from_orm(instance)
 
@@ -362,7 +362,7 @@ async def update_instance(
 ):
     """Update vulnerability instance"""
     instance = await get_or_404(
-        db, VulnerabilityInstance, instance_id, current_user.organization_id
+        db, VulnerabilityInstance, instance_id, getattr(current_user, "organization_id", None)
     )
 
     update_data = instance_data.dict(exclude_unset=True)
@@ -381,7 +381,7 @@ async def bulk_action_instances(
     db: DatabaseSession = None,
 ):
     """Perform bulk action on vulnerability instances"""
-    org_id = current_user.organization_id
+    org_id = getattr(current_user, "organization_id", None)
 
     result = await db.execute(
         select(VulnerabilityInstance).where(
@@ -422,7 +422,7 @@ async def list_scan_profiles(
     enabled_only: bool = False,
 ):
     """List scan profiles"""
-    org_id = current_user.organization_id
+    org_id = getattr(current_user, "organization_id", None)
 
     query = select(ScanProfile).where(ScanProfile.organization_id == org_id)
 
@@ -454,7 +454,7 @@ async def create_scan_profile(
     db: DatabaseSession = None,
 ):
     """Create scan profile"""
-    profile_data.organization_id = current_user.organization_id
+    profile_data.organization_id = getattr(current_user, "organization_id", None)
 
     profile = ScanProfile(**profile_data.dict())
     db.add(profile)
@@ -473,7 +473,7 @@ async def update_scan_profile(
 ):
     """Update scan profile"""
     profile = await get_or_404(
-        db, ScanProfile, profile_id, current_user.organization_id
+        db, ScanProfile, profile_id, getattr(current_user, "organization_id", None)
     )
 
     update_data = profile_data.dict(exclude_unset=True)
@@ -495,7 +495,7 @@ async def list_patch_operations(
     status: Optional[str] = None,
 ):
     """List patch operations"""
-    org_id = current_user.organization_id
+    org_id = getattr(current_user, "organization_id", None)
 
     query = select(PatchOperation).where(PatchOperation.organization_id == org_id)
 
@@ -527,7 +527,7 @@ async def create_patch_plan(
     db: DatabaseSession = None,
 ):
     """Create patch deployment plan"""
-    org_id = current_user.organization_id
+    org_id = getattr(current_user, "organization_id", None)
 
     # Get instances
     result = await db.execute(
@@ -560,7 +560,7 @@ async def schedule_patch(
     patch_id: str = Path(...),
 ):
     """Schedule patch deployment"""
-    org_id = current_user.organization_id
+    org_id = getattr(current_user, "organization_id", None)
 
     patch = await get_or_404(db, PatchOperation, patch_id, org_id)
 
@@ -585,7 +585,7 @@ async def verify_patch(
     patch_id: str = Path(...),
 ):
     """Verify patch deployment"""
-    org_id = current_user.organization_id
+    org_id = getattr(current_user, "organization_id", None)
 
     orchestrator = PatchOrchestrator(org_id)
     success = await orchestrator.verify_patch(
@@ -610,7 +610,7 @@ async def rollback_patch(
     patch_id: str = Path(...),
 ):
     """Rollback patch deployment"""
-    org_id = current_user.organization_id
+    org_id = getattr(current_user, "organization_id", None)
 
     orchestrator = PatchOrchestrator(org_id)
     success = await orchestrator.rollback_patch(db, patch_id, rollback_request.reason)
@@ -637,7 +637,7 @@ async def create_exception(
     db: DatabaseSession = None,
 ):
     """Create vulnerability exception"""
-    exception_data.organization_id = current_user.organization_id
+    exception_data.organization_id = getattr(current_user, "organization_id", None)
 
     exception = VulnerabilityException(**exception_data.dict())
     db.add(exception)
@@ -656,7 +656,7 @@ async def update_exception(
 ):
     """Update vulnerability exception"""
     exception = await get_or_404(
-        db, VulnerabilityException, exception_id, current_user.organization_id
+        db, VulnerabilityException, exception_id, getattr(current_user, "organization_id", None)
     )
 
     update_data = exception_data.dict(exclude_unset=True)
@@ -675,7 +675,7 @@ async def get_dashboard(
     db: DatabaseSession = None,
 ):
     """Get vulnerability management dashboard metrics"""
-    org_id = current_user.organization_id
+    org_id = getattr(current_user, "organization_id", None)
 
     prioritizer = RiskPrioritizer(org_id)
     orchestrator = PatchOrchestrator(org_id)
@@ -731,7 +731,7 @@ async def get_executive_report(
     db: DatabaseSession = None,
 ):
     """Get executive summary report"""
-    org_id = current_user.organization_id
+    org_id = getattr(current_user, "organization_id", None)
 
     lifecycle = VulnerabilityLifecycle(org_id)
     report = await lifecycle.generate_executive_report(db)
@@ -745,7 +745,7 @@ async def get_kev_compliance_report(
     db: DatabaseSession = None,
 ):
     """Get BOD 22-01 KEV compliance report"""
-    org_id = current_user.organization_id
+    org_id = getattr(current_user, "organization_id", None)
 
     kev_monitor = KEVMonitor(org_id)
     report = await kev_monitor.generate_bod_22_01_report(db)

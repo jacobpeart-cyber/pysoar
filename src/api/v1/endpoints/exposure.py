@@ -223,7 +223,7 @@ async def create_asset(
         tags=asset_data.tags,
         network_zone=asset_data.network_zone,
         extra_metadata=asset_data.metadata if hasattr(asset_data, "metadata") else {},
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
     )
 
     db.add(asset)
@@ -311,7 +311,7 @@ async def get_asset(
     db: DatabaseSession = None,
 ):
     """Get a specific exposure asset with details and vulnerabilities"""
-    asset = await get_asset_or_404(db, asset_id, current_user.organization_id)
+    asset = await get_asset_or_404(db, asset_id, getattr(current_user, "organization_id", None))
     return asset
 
 
@@ -323,7 +323,7 @@ async def update_asset(
     db: DatabaseSession = None,
 ):
     """Update an exposure asset"""
-    asset = await get_asset_or_404(db, asset_id, current_user.organization_id)
+    asset = await get_asset_or_404(db, asset_id, getattr(current_user, "organization_id", None))
 
     update_data = asset_data.model_dump(exclude_unset=True, exclude_none=True)
     # Map 'metadata' field to 'extra_metadata' column if present
@@ -346,7 +346,7 @@ async def deactivate_asset(
     db: DatabaseSession = None,
 ):
     """Deactivate an exposure asset"""
-    asset = await get_asset_or_404(db, asset_id, current_user.organization_id)
+    asset = await get_asset_or_404(db, asset_id, getattr(current_user, "organization_id", None))
     asset.is_active = False
     await db.flush()
 
@@ -366,7 +366,7 @@ async def trigger_asset_discovery(
         target_assets=[],
         scanner="builtin",
         initiated_by=current_user.id,
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
     )
     db.add(scan)
     await db.flush()
@@ -401,7 +401,7 @@ async def import_assets(
                 asset_type=getattr(item, "asset_type", "server"),
                 environment=getattr(item, "environment", "production"),
                 criticality=getattr(item, "criticality", "medium"),
-                organization_id=current_user.organization_id,
+                organization_id=getattr(current_user, "organization_id", None),
             )
             db.add(asset)
             imported += 1
@@ -493,7 +493,7 @@ async def create_vulnerability(
         references=vuln_data.references,
         mitre_techniques=vuln_data.mitre_techniques,
         tags=vuln_data.tags,
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
     )
 
     db.add(vuln)
@@ -571,7 +571,7 @@ async def get_vulnerability(
     db: DatabaseSession = None,
 ):
     """Get a specific vulnerability with affected assets"""
-    vuln = await get_vulnerability_or_404(db, vuln_id, current_user.organization_id)
+    vuln = await get_vulnerability_or_404(db, vuln_id, getattr(current_user, "organization_id", None))
     return vuln
 
 
@@ -583,7 +583,7 @@ async def update_vulnerability(
     db: DatabaseSession = None,
 ):
     """Update vulnerability information"""
-    vuln = await get_vulnerability_or_404(db, vuln_id, current_user.organization_id)
+    vuln = await get_vulnerability_or_404(db, vuln_id, getattr(current_user, "organization_id", None))
 
     update_data = vuln_data.model_dump(exclude_unset=True, exclude_none=True)
     for key, value in update_data.items():
@@ -602,7 +602,7 @@ async def delete_vulnerability(
     db: DatabaseSession = None,
 ):
     """Delete a vulnerability record"""
-    vuln = await get_vulnerability_or_404(db, vuln_id, current_user.organization_id)
+    vuln = await get_vulnerability_or_404(db, vuln_id, getattr(current_user, "organization_id", None))
     await db.delete(vuln)
     await db.flush()
 
@@ -616,7 +616,7 @@ async def get_cisa_kev_list(
     result = await db.execute(
         select(Vulnerability).where(
             and_(
-                Vulnerability.organization_id == current_user.organization_id,
+                Vulnerability.organization_id == getattr(current_user, "organization_id", None),
                 Vulnerability.is_exploited_in_wild == True,
             )
         )
@@ -640,7 +640,7 @@ async def advanced_vulnerability_search(
 ):
     """Advanced vulnerability search with complex filtering"""
     query = select(Vulnerability).where(
-        Vulnerability.organization_id == current_user.organization_id
+        Vulnerability.organization_id == getattr(current_user, "organization_id", None)
     )
 
     if hasattr(search_request, "query") and search_request.query:
@@ -702,7 +702,7 @@ async def create_asset_vulnerability(
         remediation_notes=mapping_data.remediation_notes,
         compensating_controls=mapping_data.compensating_controls if hasattr(mapping_data, "compensating_controls") else [],
         detected_by=mapping_data.detected_by,
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
     )
 
     db.add(mapping)
@@ -720,7 +720,7 @@ async def update_asset_vulnerability(
     db: DatabaseSession = None,
 ):
     """Update asset-vulnerability status (open, remediated, accepted, false-positive)"""
-    mapping = await get_asset_vulnerability_or_404(db, mapping_id, current_user.organization_id)
+    mapping = await get_asset_vulnerability_or_404(db, mapping_id, getattr(current_user, "organization_id", None))
 
     update_data = mapping_data.model_dump(exclude_unset=True, exclude_none=True)
     for key, value in update_data.items():
@@ -740,7 +740,7 @@ async def mark_as_remediated(
     remediation_notes: Optional[str] = Query(None),
 ):
     """Mark asset-vulnerability as remediated"""
-    mapping = await get_asset_vulnerability_or_404(db, mapping_id, current_user.organization_id)
+    mapping = await get_asset_vulnerability_or_404(db, mapping_id, getattr(current_user, "organization_id", None))
 
     mapping.status = "remediated"
     mapping.remediated_at = datetime.now(timezone.utc)
@@ -765,7 +765,7 @@ async def get_prioritized_remediation_list(
     """Get prioritized list of asset-vulnerabilities for remediation"""
     query = select(AssetVulnerability).where(
         and_(
-            AssetVulnerability.organization_id == current_user.organization_id,
+            AssetVulnerability.organization_id == getattr(current_user, "organization_id", None),
             AssetVulnerability.status == "open",
         )
     )
@@ -813,7 +813,7 @@ async def launch_scan(
         scan_profile=scan_data.scan_profile,
         status="pending",
         initiated_by=current_user.id,
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
     )
 
     db.add(scan)
@@ -876,7 +876,7 @@ async def get_scan(
     db: DatabaseSession = None,
 ):
     """Get scan results and details"""
-    scan = await get_scan_or_404(db, scan_id, current_user.organization_id)
+    scan = await get_scan_or_404(db, scan_id, getattr(current_user, "organization_id", None))
     return scan
 
 
@@ -887,7 +887,7 @@ async def cancel_scan(
     db: DatabaseSession = None,
 ):
     """Cancel a running scan"""
-    scan = await get_scan_or_404(db, scan_id, current_user.organization_id)
+    scan = await get_scan_or_404(db, scan_id, getattr(current_user, "organization_id", None))
 
     if scan.status not in ("pending", "running"):
         raise HTTPException(
@@ -919,7 +919,7 @@ async def import_scan_results(
         scanner=import_data.scanner_name,
         target_assets=[],
         initiated_by=current_user.id,
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
     )
     db.add(scan)
     await db.flush()
@@ -1043,7 +1043,7 @@ async def get_remediation_ticket(
     db: DatabaseSession = None,
 ):
     """Get a specific remediation ticket"""
-    ticket = await get_ticket_or_404(db, ticket_id, current_user.organization_id)
+    ticket = await get_ticket_or_404(db, ticket_id, getattr(current_user, "organization_id", None))
     return ticket
 
 
@@ -1055,7 +1055,7 @@ async def update_remediation_ticket(
     db: DatabaseSession = None,
 ):
     """Update a remediation ticket"""
-    ticket = await get_ticket_or_404(db, ticket_id, current_user.organization_id)
+    ticket = await get_ticket_or_404(db, ticket_id, getattr(current_user, "organization_id", None))
 
     update_data = ticket_data.model_dump(exclude_unset=True, exclude_none=True)
     for key, value in update_data.items():
@@ -1075,7 +1075,7 @@ async def verify_remediation(
     db: DatabaseSession = None,
 ):
     """Verify remediation completion"""
-    ticket = await get_ticket_or_404(db, ticket_id, current_user.organization_id)
+    ticket = await get_ticket_or_404(db, ticket_id, getattr(current_user, "organization_id", None))
 
     now = datetime.now(timezone.utc)
     ticket.verification_status = "verified"
@@ -1106,7 +1106,7 @@ async def get_overdue_tickets(
     """Get overdue remediation tickets"""
     query = select(RemediationTicket).where(
         and_(
-            RemediationTicket.organization_id == current_user.organization_id,
+            RemediationTicket.organization_id == getattr(current_user, "organization_id", None),
             RemediationTicket.due_date < datetime.now(timezone.utc),
             RemediationTicket.status.notin_(["closed", "verification"]),
         )
@@ -1150,7 +1150,7 @@ async def define_attack_surface(
         name=surface_data.name,
         surface_type=surface_data.surface_type,
         description=surface_data.description,
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
     )
 
     db.add(surface)
@@ -1205,7 +1205,7 @@ async def get_attack_surface(
     db: DatabaseSession = None,
 ):
     """Get attack surface details and composition"""
-    surface = await get_attack_surface_or_404(db, surface_id, current_user.organization_id)
+    surface = await get_attack_surface_or_404(db, surface_id, getattr(current_user, "organization_id", None))
     return surface
 
 
@@ -1217,7 +1217,7 @@ async def update_attack_surface(
     db: DatabaseSession = None,
 ):
     """Update attack surface"""
-    surface = await get_attack_surface_or_404(db, surface_id, current_user.organization_id)
+    surface = await get_attack_surface_or_404(db, surface_id, getattr(current_user, "organization_id", None))
 
     update_data = surface_data.model_dump(exclude_unset=True, exclude_none=True)
     for key, value in update_data.items():
@@ -1236,12 +1236,12 @@ async def trigger_assessment(
     surface_id: str = Query(...),
 ):
     """Trigger assessment of an attack surface"""
-    surface = await get_attack_surface_or_404(db, surface_id, current_user.organization_id)
+    surface = await get_attack_surface_or_404(db, surface_id, getattr(current_user, "organization_id", None))
 
     # Count exposures for this surface
     asset_count_result = await db.execute(
         select(func.count(ExposureAsset.id)).where(
-            ExposureAsset.organization_id == current_user.organization_id
+            ExposureAsset.organization_id == getattr(current_user, "organization_id", None)
         )
     )
     total_exposures = asset_count_result.scalar() or 0
@@ -1249,7 +1249,7 @@ async def trigger_assessment(
     critical_count_result = await db.execute(
         select(func.count(AssetVulnerability.id)).where(
             and_(
-                AssetVulnerability.organization_id == current_user.organization_id,
+                AssetVulnerability.organization_id == getattr(current_user, "organization_id", None),
                 AssetVulnerability.status == "open",
             )
         )
@@ -1371,7 +1371,7 @@ async def get_risk_matrix(
     db: DatabaseSession = None,
 ):
     """Get risk matrix (criticality vs severity)"""
-    org_id = current_user.organization_id
+    org_id = getattr(current_user, "organization_id", None)
 
     total_result = await db.execute(
         select(func.count(AssetVulnerability.id)).where(
@@ -1433,7 +1433,7 @@ async def generate_exposure_report(
     include_recommendations: bool = Query(True),
 ):
     """Generate exposure management report"""
-    org_id = current_user.organization_id
+    org_id = getattr(current_user, "organization_id", None)
 
     # Gather statistics
     total_assets_result = await db.execute(

@@ -117,7 +117,7 @@ async def list_monitors(
 ):
     """List dark web monitors with filtering and pagination"""
     query = select(DarkWebMonitor).where(
-        DarkWebMonitor.organization_id == current_user.organization_id
+        DarkWebMonitor.organization_id == getattr(current_user, "organization_id", None)
     )
 
     if enabled is not None:
@@ -167,7 +167,7 @@ async def create_monitor(
 ):
     """Create a new dark web monitor"""
     db_monitor = DarkWebMonitor(
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
         name=monitor.name,
         description=monitor.description,
         monitor_type=monitor.monitor_type,
@@ -200,7 +200,7 @@ async def get_monitor(
     """Get monitor by ID"""
     monitor = await get_monitor_or_404(db, monitor_id)
 
-    if monitor.organization_id != current_user.organization_id:
+    if monitor.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
 
     return DarkWebMonitorResponse.from_orm(monitor)
@@ -216,7 +216,7 @@ async def update_monitor(
     """Update monitor configuration"""
     monitor = await get_monitor_or_404(db, monitor_id)
 
-    if monitor.organization_id != current_user.organization_id:
+    if monitor.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
 
     # Update fields
@@ -254,7 +254,7 @@ async def delete_monitor(
     """Delete monitor"""
     monitor = await get_monitor_or_404(db, monitor_id)
 
-    if monitor.organization_id != current_user.organization_id:
+    if monitor.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
 
     await db.delete(monitor)
@@ -277,7 +277,7 @@ async def trigger_monitor_scan(
     """Trigger immediate scan for monitor"""
     monitor = await get_monitor_or_404(db, monitor_id)
 
-    if monitor.organization_id != current_user.organization_id:
+    if monitor.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
 
     # Queue background task
@@ -318,7 +318,7 @@ async def list_findings(
 ):
     """List dark web findings with filtering"""
     query = select(DarkWebFinding).where(
-        DarkWebFinding.organization_id == current_user.organization_id
+        DarkWebFinding.organization_id == getattr(current_user, "organization_id", None)
     )
 
     if monitor_id:
@@ -375,7 +375,7 @@ async def get_finding(
     """Get finding details with related data"""
     finding = await get_finding_or_404(db, finding_id)
 
-    if finding.organization_id != current_user.organization_id:
+    if finding.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
 
     return DarkWebFindingDetailResponse.from_orm(finding)
@@ -391,7 +391,7 @@ async def update_finding(
     """Update finding status and notes"""
     finding = await get_finding_or_404(db, finding_id)
 
-    if finding.organization_id != current_user.organization_id:
+    if finding.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
 
     if update.status is not None:
@@ -417,7 +417,7 @@ async def bulk_finding_action(action: BulkFindingAction, current_user: CurrentUs
         select(DarkWebFinding).where(
             and_(
                 DarkWebFinding.id.in_(action.finding_ids),
-                DarkWebFinding.organization_id == current_user.organization_id,
+                DarkWebFinding.organization_id == getattr(current_user, "organization_id", None),
             )
         )
     )
@@ -464,7 +464,7 @@ async def list_credentials(
 ):
     """List credential leaks"""
     query = select(CredentialLeak).where(
-        CredentialLeak.organization_id == current_user.organization_id
+        CredentialLeak.organization_id == getattr(current_user, "organization_id", None)
     )
 
     if remediated is not None:
@@ -494,7 +494,7 @@ async def list_credentials(
             select(CredentialLeak)
             .where(
                 and_(
-                    CredentialLeak.organization_id == current_user.organization_id,
+                    CredentialLeak.organization_id == getattr(current_user, "organization_id", None),
                     CredentialLeak.is_remediated == False,
                 )
             )
@@ -532,7 +532,7 @@ async def update_credential(
     """Update credential leak remediation status"""
     credential = await get_credential_or_404(db, credential_id)
 
-    if credential.organization_id != current_user.organization_id:
+    if credential.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
 
     if update.is_valid is not None:
@@ -560,7 +560,7 @@ async def bulk_remediate_credentials(
         select(CredentialLeak).where(
             and_(
                 CredentialLeak.id.in_(action.credential_ids),
-                CredentialLeak.organization_id == current_user.organization_id,
+                CredentialLeak.organization_id == getattr(current_user, "organization_id", None),
             )
         )
     )
@@ -619,7 +619,7 @@ async def list_brand_threats(
 ):
     """List brand threats"""
     query = select(BrandThreat).where(
-        BrandThreat.organization_id == current_user.organization_id
+        BrandThreat.organization_id == getattr(current_user, "organization_id", None)
     )
 
     if status:
@@ -671,7 +671,7 @@ async def update_brand_threat(
     if not threat:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
-    if threat.organization_id != current_user.organization_id:
+    if threat.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
 
     if update.takedown_status is not None:
@@ -701,7 +701,7 @@ async def initiate_takedown(
     if not threat:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
-    if threat.organization_id != current_user.organization_id:
+    if threat.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
 
     # Queue background task
@@ -728,7 +728,7 @@ async def get_dashboard(
     db: DatabaseSession = None,
 ):
     """Get dark web monitoring dashboard"""
-    org_id = current_user.organization_id
+    org_id = getattr(current_user, "organization_id", None)
 
     # Exposure summary
     findings_result = await db.execute(

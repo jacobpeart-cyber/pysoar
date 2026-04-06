@@ -220,7 +220,7 @@ async def create_case(
         lead_investigator_id=case_data.lead_investigator_id,
         assigned_team=json.dumps(case_data.assigned_team) if case_data.assigned_team else None,
         created_by=case_data.created_by,
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
         status=CaseStatus.OPEN.value,
     )
 
@@ -364,7 +364,7 @@ async def collect_evidence(
         storage_location=evidence_data.storage_location,
         file_size_bytes=evidence_data.file_size_bytes,
         handling_notes=evidence_data.handling_notes,
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
         chain_of_custody_log={
             "entries": [
                 {
@@ -526,7 +526,7 @@ async def add_timeline_event(
         mitre_technique_id=event_data.mitre_technique_id,
         severity_score=event_data.severity_score,
         is_pivotal=event_data.is_pivotal,
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
     )
 
     db.add(event)
@@ -635,7 +635,7 @@ async def create_artifact(
         ioc_extracted=artifact_data.ioc_extracted or {},
         mitre_mapping=artifact_data.mitre_mapping,
         risk_score=artifact_data.risk_score,
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
     )
 
     db.add(artifact)
@@ -790,7 +790,7 @@ async def create_legal_hold(
         issued_date=hold_data.issued_date or datetime.now(timezone.utc).isoformat(),
         expiry_date=hold_data.expiry_date,
         status="active",
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
     )
 
     db.add(hold)

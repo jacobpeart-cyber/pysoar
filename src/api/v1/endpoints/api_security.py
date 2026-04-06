@@ -153,7 +153,7 @@ async def create_endpoint(
     """Create a new API endpoint"""
     endpoint = APIEndpointInventory(
         **endpoint_data.model_dump(),
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
     )
     db.add(endpoint)
     await db.commit()
@@ -289,7 +289,7 @@ async def create_vulnerability(
     """Create a new vulnerability"""
     vuln = APIVulnerability(
         **vuln_data.model_dump(),
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
     )
     db.add(vuln)
     await db.commit()
@@ -429,7 +429,7 @@ async def create_policy(
     """Create a new security policy"""
     policy = APISecurityPolicy(
         **policy_data.model_dump(),
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
     )
     db.add(policy)
     await db.commit()
@@ -565,7 +565,7 @@ async def create_anomaly(
     """Create a new anomaly detection record"""
     anomaly = APIAnomalyDetection(
         **anomaly_data.model_dump(),
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
     )
     db.add(anomaly)
     await db.commit()
@@ -686,7 +686,7 @@ async def create_compliance_check(
     """Create a new compliance check"""
     check = APIComplianceCheck(
         **check_data.model_dump(),
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
     )
     db.add(check)
     await db.commit()
@@ -877,7 +877,7 @@ async def trigger_api_discovery(
     """Trigger API discovery scan from traffic"""
     background_tasks.add_task(
         api_discovery_scan,
-        current_user.organization_id,
+        getattr(current_user, "organization_id", None),
         traffic_logs or [],
     )
     return APIDiscoveryResultsResponse(
@@ -895,7 +895,7 @@ async def trigger_security_scan(endpoint_id: str, current_user: CurrentUser = No
     background_tasks.add_task(
         security_assessment,
         endpoint_id,
-        current_user.organization_id,
+        getattr(current_user, "organization_id", None),
     )
     return APIScanResultResponse(
         endpoint_id=endpoint_id,
@@ -915,7 +915,7 @@ async def trigger_compliance_check(endpoint_id: str, current_user: CurrentUser =
     background_tasks.add_task(
         compliance_check,
         endpoint_id,
-        current_user.organization_id,
+        getattr(current_user, "organization_id", None),
     )
     return {"status": "compliance_check_queued", "endpoint_id": endpoint_id}
 
@@ -930,7 +930,7 @@ async def trigger_shadow_api_detection(
     """Trigger shadow API detection"""
     background_tasks.add_task(
         shadow_api_detection,
-        current_user.organization_id,
+        getattr(current_user, "organization_id", None),
         traffic_logs or [],
     )
     return {"status": "shadow_api_detection_queued"}

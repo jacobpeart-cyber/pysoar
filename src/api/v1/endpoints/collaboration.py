@@ -127,7 +127,7 @@ async def create_war_room(
     """Create a new war room"""
     manager = WarRoomManager(db)
     room = await manager.create_room(
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
         name=room_data.name,
         room_type=room_data.room_type,
         severity_level=room_data.severity_level,
@@ -155,7 +155,7 @@ async def list_war_rooms(
     search: Optional[str] = None,
 ):
     """List war rooms with filtering"""
-    query = select(WarRoom).where(WarRoom.organization_id == current_user.organization_id)
+    query = select(WarRoom).where(WarRoom.organization_id == getattr(current_user, "organization_id", None))
 
     if status:
         query = query.where(WarRoom.status == status)
@@ -326,7 +326,7 @@ async def send_message(
 
     message = await engine.send_message(
         room_id=room_id,
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
         sender_id=current_user.id,
         sender_name=current_user.username,
         content=msg_data.content,
@@ -453,7 +453,7 @@ async def upload_artifact(
 
     artifact = await manager.upload_artifact(
         room_id=room_id,
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
         uploaded_by=current_user.id,
         file_name=artifact_data.file_name,
         file_hash=artifact_data.file_hash,
@@ -561,7 +561,7 @@ async def create_action_item(
 
     action = await tracker.create_action_item(
         room_id=room_id,
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
         title=action_data.title,
         description=action_data.description,
         assigned_by=current_user.id,
@@ -677,7 +677,7 @@ async def add_timeline_event(
 
     event = await manager.add_event(
         room_id=room_id,
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
         event_type=event_data.event_type,
         description=event_data.description,
         created_by=current_user.id,
@@ -810,7 +810,7 @@ async def get_collaboration_dashboard(
     manager = WarRoomManager(db)
 
     # Get active rooms
-    active_rooms = await manager.get_active_rooms(current_user.organization_id)
+    active_rooms = await manager.get_active_rooms(getattr(current_user, "organization_id", None))
 
     # Build dashboard
     pending_actions_result = await db.execute(

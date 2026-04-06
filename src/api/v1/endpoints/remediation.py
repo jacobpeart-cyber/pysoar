@@ -98,7 +98,7 @@ async def create_policy(
         rollback_actions=request.rollback_actions,
         tags=request.tags,
         created_by=request.created_by,
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
     )
     db.add(policy)
     await db.commit()
@@ -169,7 +169,7 @@ async def get_policy(
 ):
     """Get a specific policy with execution history."""
     policy = await db.get(RemediationPolicy, policy_id)
-    if not policy or policy.organization_id != current_user.organization_id:
+    if not policy or policy.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     return policy
 
@@ -183,7 +183,7 @@ async def update_policy(
 ):
     """Update a policy."""
     policy = await db.get(RemediationPolicy, policy_id)
-    if not policy or policy.organization_id != current_user.organization_id:
+    if not policy or policy.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
     update_data = request.model_dump(exclude_unset=True)
@@ -204,7 +204,7 @@ async def delete_policy(
 ):
     """Disable a policy (soft delete)."""
     policy = await db.get(RemediationPolicy, policy_id)
-    if not policy or policy.organization_id != current_user.organization_id:
+    if not policy or policy.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
     policy.is_enabled = False
@@ -221,14 +221,14 @@ async def test_policy(
 ):
     """Test a policy against sample data."""
     policy = await db.get(RemediationPolicy, policy_id)
-    if not policy or policy.organization_id != current_user.organization_id:
+    if not policy or policy.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
     engine = RemediationEngine(db)
     matched = await engine.evaluate_trigger(
         policy.trigger_type,
         trigger_data,
-        current_user.organization_id,
+        getattr(current_user, "organization_id", None),
     )
 
     return {
@@ -252,7 +252,7 @@ async def list_actions(
 ):
     """List available remediation actions."""
     query = select(RemediationAction).where(
-        RemediationAction.organization_id == current_user.organization_id
+        RemediationAction.organization_id == getattr(current_user, "organization_id", None)
     )
 
     if action_type:
@@ -286,7 +286,7 @@ async def create_action(
         risk_level=request.risk_level,
         requires_confirmation=request.requires_confirmation,
         tags=request.tags,
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
     )
     db.add(action)
     await db.commit()
@@ -302,7 +302,7 @@ async def get_action(
 ):
     """Get a specific action."""
     action = await db.get(RemediationAction, action_id)
-    if not action or action.organization_id != current_user.organization_id:
+    if not action or action.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     return action
 
@@ -316,7 +316,7 @@ async def test_action(
 ):
     """Test an action."""
     action = await db.get(RemediationAction, action_id)
-    if not action or action.organization_id != current_user.organization_id:
+    if not action or action.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
     return {
@@ -405,7 +405,7 @@ async def get_execution(
 ):
     """Get execution detail with action results."""
     execution = await db.get(RemediationExecution, execution_id)
-    if not execution or execution.organization_id != current_user.organization_id:
+    if not execution or execution.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     return execution
 
@@ -418,7 +418,7 @@ async def get_execution_progress(
 ):
     """Get real-time execution progress."""
     execution = await db.get(RemediationExecution, execution_id)
-    if not execution or execution.organization_id != current_user.organization_id:
+    if not execution or execution.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
     percent = 0.0
@@ -450,7 +450,7 @@ async def approve_execution(
 ):
     """Approve a pending remediation execution."""
     execution = await db.get(RemediationExecution, execution_id)
-    if not execution or execution.organization_id != current_user.organization_id:
+    if not execution or execution.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
     if execution.approval_status != "pending":
@@ -478,7 +478,7 @@ async def reject_execution(
 ):
     """Reject a pending remediation execution."""
     execution = await db.get(RemediationExecution, execution_id)
-    if not execution or execution.organization_id != current_user.organization_id:
+    if not execution or execution.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
     engine = RemediationEngine(db)
@@ -498,7 +498,7 @@ async def rollback_execution(
 ):
     """Rollback a completed execution."""
     execution = await db.get(RemediationExecution, execution_id)
-    if not execution or execution.organization_id != current_user.organization_id:
+    if not execution or execution.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
     engine = RemediationEngine(db)
@@ -519,7 +519,7 @@ async def cancel_execution(
 ):
     """Cancel a running execution."""
     execution = await db.get(RemediationExecution, execution_id)
-    if not execution or execution.organization_id != current_user.organization_id:
+    if not execution or execution.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
     execution.status = "cancelled"
@@ -551,7 +551,7 @@ async def execute_manual_remediation(
         },
         trigger_source="manual",
         initiated_by=current_user.id,
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
     )
 
     return {
@@ -639,7 +639,7 @@ async def list_playbooks(
 ):
     """List remediation playbooks."""
     query = select(RemediationPlaybook).where(
-        RemediationPlaybook.organization_id == current_user.organization_id
+        RemediationPlaybook.organization_id == getattr(current_user, "organization_id", None)
     )
 
     if playbook_type:
@@ -670,7 +670,7 @@ async def create_playbook(
         is_enabled=request.is_enabled,
         tags=request.tags,
         created_by=request.created_by,
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
     )
     db.add(playbook)
     await db.commit()
@@ -686,7 +686,7 @@ async def get_playbook(
 ):
     """Get a specific playbook."""
     playbook = await db.get(RemediationPlaybook, playbook_id)
-    if not playbook or playbook.organization_id != current_user.organization_id:
+    if not playbook or playbook.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     return playbook
 
@@ -700,7 +700,7 @@ async def update_playbook(
 ):
     """Update a playbook."""
     playbook = await db.get(RemediationPlaybook, playbook_id)
-    if not playbook or playbook.organization_id != current_user.organization_id:
+    if not playbook or playbook.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
     playbook.name = request.name
@@ -723,7 +723,7 @@ async def execute_playbook(
 ):
     """Execute a playbook."""
     playbook = await db.get(RemediationPlaybook, playbook_id)
-    if not playbook or playbook.organization_id != current_user.organization_id:
+    if not playbook or playbook.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
     return {
@@ -773,7 +773,7 @@ async def create_integration(
         capabilities=request.capabilities,
         rate_limit=request.rate_limit,
         tags=request.tags,
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
     )
     db.add(integration)
     await db.commit()
@@ -790,7 +790,7 @@ async def update_integration(
 ):
     """Update an integration."""
     integration = await db.get(RemediationIntegration, integration_id)
-    if not integration or integration.organization_id != current_user.organization_id:
+    if not integration or integration.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
     for key, value in request.model_dump(exclude_unset=True).items():
@@ -810,7 +810,7 @@ async def test_integration(
 ):
     """Test integration connectivity."""
     integration = await db.get(RemediationIntegration, integration_id)
-    if not integration or integration.organization_id != current_user.organization_id:
+    if not integration or integration.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
     return IntegrationTestResult(
@@ -829,7 +829,7 @@ async def get_integration_health(
 ):
     """Check integration health status."""
     integration = await db.get(RemediationIntegration, integration_id)
-    if not integration or integration.organization_id != current_user.organization_id:
+    if not integration or integration.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
     return {
@@ -920,7 +920,7 @@ async def get_effectiveness_metrics(
 ):
     """Get remediation effectiveness metrics."""
     return EffectivenessMetrics(
-        organization_id=current_user.organization_id,
+        organization_id=getattr(current_user, "organization_id", None),
         period=f"last_{days}_days",
         executions_verified=0,
         effective_count=0,
