@@ -122,6 +122,9 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
 
     async def dispatch(self, request: Request, call_next: Callable) -> Response:
         """Log request details"""
+        # Skip WebSocket — BaseHTTPMiddleware breaks WS connections
+        if request.url.path.endswith("/ws"):
+            return await call_next(request)
         start_time = time.time()
         request_id = getattr(request.state, "request_id", "unknown")
 
