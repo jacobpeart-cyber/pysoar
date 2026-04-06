@@ -125,6 +125,9 @@ _global_limiter = InMemoryRateLimiter()
 class RateLimitMiddleware(BaseHTTPMiddleware):
     """Global API rate limiting - 100 requests per minute per IP."""
     async def dispatch(self, request, call_next):
+        # Skip WebSocket connections — BaseHTTPMiddleware breaks them
+        if request.url.path.endswith("/ws"):
+            return await call_next(request)
         if request.url.path.startswith("/api/"):
             client_ip = request.client.host if request.client else "unknown"
             key = f"global:{client_ip}"
