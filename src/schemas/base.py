@@ -1,7 +1,7 @@
 """Base schema with automatic JSON string parsing for DB compatibility.
 
-SQLAlchemy JSON columns sometimes return Python objects as JSON strings.
-This base model handles parsing them back to native Python types.
+SQLAlchemy JSON columns sometimes store '[]' and '{}' as literal strings
+instead of Python lists/dicts. This base model handles parsing them.
 """
 
 import json
@@ -11,29 +11,37 @@ from pydantic import BaseModel, model_validator
 
 
 class DBModel(BaseModel):
-    """Base model that auto-parses JSON string fields when input is a dict.
-
-    For ORM objects (from_attributes), Pydantic handles attribute access
-    natively. The JSON parsing only applies to dict input.
-    """
+    """Base model that auto-parses JSON string fields from both dicts and ORM objects."""
 
     @model_validator(mode="before")
     @classmethod
     def parse_json_strings(cls, data: Any) -> Any:
-        # Only parse dict input — let Pydantic handle ORM objects via from_attributes
-        if not isinstance(data, dict):
-            return data
-
-        parsed = {}
-        for key, value in data.items():
-            if isinstance(value, str) and len(value) > 1 and value[0] in ('[', '{'):
+        # Convert ORM object to dict so we can parse JSON strings
+        if not isinstance(data, dict) and hasattr(data, "__dict__"):
+            raw = {}
+            for key in cls.model_fields:
                 try:
-                    parsed[key] = json.loads(value)
-                except (json.JSONDecodeError, ValueError, TypeError):
+                    raw[key] = getattr(data, key)
+                except Exception:
+                    pass  # Skip fields that trigger lazy loading errors
+            data = raw
+
+        if isinstance(data, dict):
+            parsed = {}
+            for key, value in data.items():
+                if value is None:
+                    # Skip None — let Pydantic field defaults apply
+                    continue
+                if isinstance(value, str) and len(value) >= 2 and value[0] in ('[', '{'):
+                    try:
+                        parsed[key] = json.loads(value)
+                    except (json.JSONDecodeError, ValueError, TypeError):
+                        parsed[key] = value
+                else:
                     parsed[key] = value
-            else:
-                parsed[key] = value
-        return parsed
+            return parsed
+
+        return data
 
     class Config:
         from_attributes = True
