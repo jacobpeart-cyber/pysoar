@@ -7,6 +7,7 @@ natural language query processing for security operations.
 
 import json
 import logging
+import os
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -442,20 +443,20 @@ class AIAnalyzer:
     automated response recommendations using large language models.
     """
 
-    def __init__(self, provider: str = "openai"):
-        """
-        Initialize AI analyzer with specified LLM provider.
+    # Gemini API configuration
+    GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyDmwl7YE-xvboorsujYxgevE2lFq3UAp9I")
+    GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
 
-        Args:
-            provider: LLM provider (openai, claude, local-llm, ensemble)
+    def __init__(self, provider: str = "gemini"):
+        """
+        Initialize AI analyzer with Gemini LLM.
         """
         self.logger = get_logger(__name__)
         self.provider = provider
         self.model_map = {
+            "gemini": "gemini-2.0-flash",
             "openai": "gpt-4",
             "claude": "claude-3-opus",
-            "local-llm": "local-model",
-            "ensemble": "gpt-4,claude-3-opus",
         }
 
     def triage_alert(self, alert_data: dict) -> dict:
@@ -668,7 +669,7 @@ class AIAnalyzer:
 
     def _call_llm(self, system_prompt: str, user_prompt: str, structured_output: bool = False) -> str | dict:
         """
-        Call configured LLM with prompts.
+        Call Gemini 2.0 Flash API.
 
         Args:
             system_prompt: System-level instructions
@@ -678,26 +679,76 @@ class AIAnalyzer:
         Returns:
             LLM response (string or parsed JSON)
         """
-        self.logger.info(f"Calling LLM ({self.provider}) with structured_output={structured_output}")
+        import httpx
 
-        # In production, would call actual LLM API (OpenAI, Claude, etc.)
-        # This is a simulation response
+        self.logger.info(f"Calling Gemini API (structured={structured_output})")
+
+        full_prompt = f"{system_prompt}\n\n{user_prompt}"
         if structured_output:
-            return {
-                "priority": "p2",
-                "reasoning": "Simulated AI analysis",
-                "confidence": 0.75,
-                "false_positive_probability": 0.2,
-                "recommended_actions": ["Isolate affected system", "Preserve logs"],
-                "executive_summary": "Simulated incident summary",
-                "technical_details": "Detailed technical analysis would appear here",
-                "impact_assessment": {"affected_systems": ["srv-01"], "data_exposed": "employee_ids"},
-                "recommendations": ["Implement endpoint detection", "Update firewall rules"],
-                "threat_level": "high",
-                "analysis": "Threat analysis details",
-            }
-        else:
-            return "Simulated LLM response"
+            full_prompt += "\n\nRespond ONLY with valid JSON. No markdown, no code fences."
+
+        try:
+            response = httpx.post(
+                f"{self.GEMINI_URL}?key={self.GEMINI_API_KEY}",
+                json={
+                    "contents": [{"parts": [{"text": full_prompt}]}],
+                    "generationConfig": {
+                        "temperature": 0.3,
+                        "maxOutputTokens": 2048,
+                    },
+                },
+                timeout=30.0,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            # Extract text from Gemini response
+            text = data["candidates"][0]["content"]["parts"][0]["text"]
+            self.logger.info(f"Gemini response received ({len(text)} chars)")
+
+            if structured_output:
+                # Clean markdown fences if present
+                clean = text.strip()
+                if clean.startswith("```"):
+                    clean = clean.split("\n", 1)[1] if "\n" in clean else clean[3:]
+                    clean = clean.rsplit("```", 1)[0]
+                try:
+                    return json.loads(clean.strip())
+                except json.JSONDecodeError:
+                    self.logger.warning(f"Failed to parse Gemini JSON, returning raw text")
+                    return {
+                        "analysis": clean.strip(),
+                        "priority": "p3",
+                        "reasoning": clean.strip()[:200],
+                        "confidence": 0.7,
+                        "false_positive_probability": 0.3,
+                        "recommended_actions": ["Review manually"],
+                        "executive_summary": clean.strip()[:300],
+                        "technical_details": clean.strip(),
+                        "recommendations": ["Review the analysis above"],
+                        "threat_level": "medium",
+                    }
+            else:
+                return text.strip()
+
+        except Exception as e:
+            self.logger.error(f"Gemini API call failed: {e}")
+            # Graceful fallback — never crash the endpoint
+            if structured_output:
+                return {
+                    "priority": "p3",
+                    "reasoning": f"AI analysis unavailable: {str(e)[:100]}",
+                    "confidence": 0.0,
+                    "false_positive_probability": 0.5,
+                    "recommended_actions": ["Manual review required"],
+                    "executive_summary": "AI analysis could not be completed",
+                    "technical_details": f"Error: {str(e)[:200]}",
+                    "recommendations": ["Retry analysis", "Review manually"],
+                    "threat_level": "unknown",
+                    "analysis": "AI unavailable",
+                }
+            else:
+                return f"AI analysis unavailable: {str(e)[:100]}"
 
     def _build_security_context(self, data: dict) -> str:
         """
@@ -885,27 +936,34 @@ class NaturalLanguageQueryEngine:
         return results
 
     def _summarize_results(self, query: str, results: list[dict]) -> str:
-        """
-        Summarize query results in natural language.
-
-        Args:
-            query: Original query
-            results: Query results
-
-        Returns:
-            Natural language summary
-        """
+        """Summarize query results using Gemini AI."""
         if not results:
             return "No results found for your query."
 
-        summary = f"Found {len(results)} matching items. "
+        # Use Gemini for intelligent summarization
+        try:
+            import httpx
+            prompt = f"""You are a SOC analyst assistant. The user asked: "{query}"
 
-        if len(results) <= 3:
-            summary += "Here are all results:"
-        else:
-            summary += f"Showing top 3 of {len(results)} results:"
+Here are the results ({len(results)} items, showing first 5):
+{json.dumps(results[:5], indent=2, default=str)[:2000]}
 
-        return summary
+Provide a brief, actionable summary in 2-3 sentences. Focus on what matters for security operations."""
+
+            response = httpx.post(
+                f"{AIAnalyzer.GEMINI_URL}?key={AIAnalyzer.GEMINI_API_KEY}",
+                json={
+                    "contents": [{"parts": [{"text": prompt}]}],
+                    "generationConfig": {"temperature": 0.3, "maxOutputTokens": 300},
+                },
+                timeout=15.0,
+            )
+            response.raise_for_status()
+            text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
+            return text.strip()
+        except Exception as e:
+            self.logger.warning(f"Gemini summarization failed: {e}")
+            return f"Found {len(results)} matching items for your query."
 
 
 class ThreatPredictor:
