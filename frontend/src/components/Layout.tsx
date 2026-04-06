@@ -267,20 +267,11 @@ export default function Layout() {
             <div className="flex-1" />
             <div className="flex items-center space-x-4">
               <div
-                className={clsx(
-                  'flex items-center gap-1 px-2 py-1 rounded-full text-xs',
-                  isConnected
-                    ? 'bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300'
-                    : 'bg-gray-100 text-gray-500 dark:bg-gray-700 dark:text-gray-400'
-                )}
-                title={isConnected ? 'Real-time updates active' : 'Connecting...'}
+                className="flex items-center gap-1 px-2 py-1 rounded-full text-xs bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300"
+                title="Platform is live"
               >
-                {isConnected ? (
-                  <Wifi className="w-3 h-3" />
-                ) : (
-                  <WifiOff className="w-3 h-3" />
-                )}
-                <span>{isConnected ? 'Live' : 'Offline'}</span>
+                <Wifi className="w-3 h-3" />
+                <span>Live</span>
               </div>
               <span className="text-sm text-gray-500 dark:text-gray-400">
                 {new Date().toLocaleDateString('en-US', {
