@@ -57,23 +57,13 @@ router = APIRouter(prefix="/simulation", tags=["simulation"])
 
 # ==================== SIMULATIONS ====================
 
-@router.post("/simulations", response_model=AttackSimulationSchema)
+@router.post("/simulations")
 async def create_simulation(
     request: SimulationCreateRequest,
     current_user: CurrentUser = None,
     session: DatabaseSession = None,
-) -> AttackSimulationSchema:
-    """
-    Create a new attack simulation.
-
-    Args:
-        request: Simulation creation parameters
-        session: Database session
-        current_user: Current user ID
-
-    Returns:
-        Created simulation object
-    """
+):
+    """Create a new attack simulation."""
     try:
         org_id = getattr(current_user, "organization_id", None)
         orchestrator = SimulationOrchestrator(session)
@@ -89,11 +79,23 @@ async def create_simulation(
             tags=request.tags,
         )
 
-        return AttackSimulationSchema.model_validate(simulation)
+        # Return as dict to avoid response_model serialization issues
+        return {
+            "id": simulation.id,
+            "name": simulation.name,
+            "description": simulation.description,
+            "simulation_type": simulation.simulation_type,
+            "status": simulation.status,
+            "target_environment": simulation.target_environment,
+            "created_by": simulation.created_by,
+            "organization_id": simulation.organization_id,
+            "created_at": str(simulation.created_at),
+            "updated_at": str(simulation.updated_at),
+        }
 
     except Exception as e:
-        logger.error(f"Error creating simulation: {str(e)}")
-        raise HTTPException(status_code=400, detail="Operation failed. Please try again or contact support.")
+        logger.error(f"Error creating simulation: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=400, detail=f"Failed to create simulation: {str(e)[:200]}")
 
 
 @router.get("/simulations", response_model=SimulationListResponse)
