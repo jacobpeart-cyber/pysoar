@@ -141,7 +141,7 @@ async def deploy_decoy(
         data = request.model_dump()
         user_id = str(getattr(current_user, 'id', '')) if current_user else ''
         data["deployed_by"] = data.get("deployed_by") or user_id
-        data["deployed_at"] = datetime.now(timezone.utc)
+        data["deployed_at"] = datetime.utcnow()
         data["status"] = "active"
 
         decoy = Decoy(**data)

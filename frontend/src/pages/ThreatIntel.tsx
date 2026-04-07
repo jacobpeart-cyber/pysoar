@@ -210,9 +210,10 @@ export default function ThreatIntel() {
     queryKey: ['threat-intel', 'feeds'],
     queryFn: async () => {
       try {
-      const response = await api.get('/threat-intel/feeds');
-      return response.data;
-      } catch { return null; }
+        const response = await api.get('/threat-intel/feeds');
+        const d = response.data;
+        return Array.isArray(d) ? d : (d?.items ?? []);
+      } catch { return []; }
     },
   });
 

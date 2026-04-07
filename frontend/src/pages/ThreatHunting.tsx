@@ -1484,14 +1484,17 @@ export default function ThreatHunting() {
                     />
                   </div>
                   <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">Session ID</label>
-                    <input
-                      type="text"
+                    <label className="block text-sm font-medium text-gray-700 mb-1">Hunt Session</label>
+                    <select
                       value={newNotebookSessionId}
                       onChange={(e) => setNewNotebookSessionId(e.target.value)}
-                      placeholder="Session ID to link"
                       className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-blue-500 focus:border-blue-500"
-                    />
+                    >
+                      <option value="">-- Select a session --</option>
+                      {hunts.map((h: any) => (
+                        <option key={h.id} value={h.id}>{h.id?.slice(0, 8)} — {h.status}</option>
+                      ))}
+                    </select>
                   </div>
                   <div className="flex justify-end gap-2">
                     <button

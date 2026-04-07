@@ -214,7 +214,7 @@ export default function IOCs() {
                     {ioc.source || '-'}
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                    {format(new Date(ioc.first_seen || ""), 'MMM d, yyyy HH:mm')}
+                    {ioc.first_seen ? format(new Date(ioc.first_seen), 'MMM d, yyyy HH:mm') : '-'}
                   </td>
                   <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
                     <button
@@ -514,24 +514,24 @@ function IOCDetailsModal({
             <div>
               <label className="block text-sm font-medium text-gray-500">First Seen</label>
               <p className="text-sm text-gray-900">
-                {format(new Date(ioc.first_seen || ""), 'MMMM d, yyyy HH:mm')}
+                {ioc.first_seen ? format(new Date(ioc.first_seen), 'MMMM d, yyyy HH:mm') : '-'}
               </p>
             </div>
             {ioc.last_seen && (
               <div>
                 <label className="block text-sm font-medium text-gray-500">Last Seen</label>
                 <p className="text-sm text-gray-900">
-                  {format(new Date(ioc.last_seen || ""), 'MMMM d, yyyy HH:mm')}
+                  {ioc.last_seen ? format(new Date(ioc.last_seen), 'MMMM d, yyyy HH:mm') : '-'}
                 </p>
               </div>
             )}
           </div>
 
-          {ioc.tags && ioc.tags.length > 0 && (
+          {ioc.tags && Array.isArray(ioc.tags) && ioc.tags.length > 0 && (
             <div>
               <label className="block text-sm font-medium text-gray-500 mb-2">Tags</label>
               <div className="flex flex-wrap gap-2">
-                {ioc.tags.map((tag, index) => (
+                {ioc.tags.map((tag: any, index: number) => (
                   <span
                     key={index}
                     className="inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-800"
