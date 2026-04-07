@@ -264,7 +264,11 @@ export default function ThreatModeling() {
 
   const addThreatMutation = useMutation({
     mutationFn: async (data: typeof threatForm) => {
-      const res = await api.post(`/threat-modeling/${selectedModelId}/threats`, data);
+      const res = await api.post(`/threat-modeling/${selectedModelId}/threats`, {
+        ...data,
+        model_id: selectedModelId,
+        threat_description: data.description || data.title,
+      });
       return res.data;
     },
     onSuccess: () => {
