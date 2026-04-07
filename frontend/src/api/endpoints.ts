@@ -695,14 +695,16 @@ export const darkwebApi = {
 
 // Integrations
 export const integrationsApi = {
-  getConnectors: async (): Promise<Connector[]> => {
+  getConnectors: async (): Promise<any[]> => {
     const response = await api.get('/integrations/connectors');
-    return response.data;
+    const d = response.data;
+    return Array.isArray(d) ? d : (d?.items ?? []);
   },
 
-  getInstalled: async (): Promise<Connector[]> => {
+  getInstalled: async (): Promise<any[]> => {
     const response = await api.get('/integrations/installed');
-    return response.data;
+    const d = response.data;
+    return Array.isArray(d) ? d : (d?.items ?? []);
   },
 
   installConnector: async (connectorId: string, config: Record<string, any>): Promise<Connector> => {

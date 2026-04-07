@@ -17,6 +17,7 @@ import {
   Clock,
 } from 'lucide-react';
 import clsx from 'clsx';
+import { api } from '../lib/api';
 import { integrationsApi } from '../api/endpoints';
 
 const getHealthColor = (health: string | null) => {
@@ -59,24 +60,25 @@ export default function IntegrationMarketplace() {
   const [showNewWebhookModal, setShowNewWebhookModal] = useState(false);
   const [selectedConnector, setSelectedConnector] = useState<any>(null);
 
+  const loadData = async () => {
+    setLoading(true);
+    try {
+      const [connectorsData, installedData] = await Promise.all([
+        integrationsApi.getConnectors(),
+        integrationsApi.getInstalled(),
+      ]);
+      setConnectors(connectorsData);
+      setInstalled(installedData);
+      setExecutions([]);
+      setWebhooks([]);
+    } catch (error) {
+      console.error('Error loading integration data:', error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   React.useEffect(() => {
-    const loadData = async () => {
-      setLoading(true);
-      try {
-        const [connectorsData, installedData] = await Promise.all([
-          integrationsApi.getConnectors(),
-          integrationsApi.getInstalled(),
-        ]);
-        setConnectors(connectorsData);
-        setInstalled(installedData);
-        setExecutions([]);
-        setWebhooks([]);
-      } catch (error) {
-        console.error('Error loading integration data:', error);
-      } finally {
-        setLoading(false);
-      }
-    };
     loadData();
   }, []);
 
@@ -87,7 +89,7 @@ export default function IntegrationMarketplace() {
 
   const categories = ['all', ...new Set(connectors.map(c => c.category))];
   const filteredConnectors = connectors.filter(c => {
-    const matchesSearch = c.name.toLowerCase().includes(searchQuery.toLowerCase());
+    const matchesSearch = (c.name || c.display_name || '').toLowerCase().includes(searchQuery.toLowerCase());
     const matchesCategory = categoryFilter === 'all' || c.category === categoryFilter;
     return matchesSearch && matchesCategory;
   });
