@@ -64,9 +64,9 @@ class APIEndpointInventoryResponse(APIEndpointInventoryBase, DBModel):
     id: str
     request_count_24h: int
     error_rate: float
-    last_seen: datetime
-    created_at: datetime
-    updated_at: datetime
+    last_seen: Optional[datetime] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -109,8 +109,8 @@ class APIVulnerabilityResponse(APIVulnerabilityBase, DBModel):
     """Schema for vulnerability response"""
 
     id: str
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -154,8 +154,8 @@ class APISecurityPolicyResponse(APISecurityPolicyBase, DBModel):
 
     id: str
     violations_count: int
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -197,8 +197,8 @@ class APIAnomalyDetectionResponse(APIAnomalyDetectionBase, DBModel):
     """Schema for anomaly detection response"""
 
     id: str
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -237,9 +237,9 @@ class APIComplianceCheckResponse(APIComplianceCheckBase, DBModel):
     """Schema for compliance check response"""
 
     id: str
-    last_checked: datetime
-    created_at: datetime
-    updated_at: datetime
+    last_checked: Optional[datetime] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -347,7 +347,7 @@ class APIScanResultResponse(BaseModel):
     high_count: int
     medium_count: int
     low_count: int
-    scan_timestamp: datetime
+    scan_timestamp: Optional[datetime] = None
     remediation_guidance: Optional[str] = None
 
 
@@ -360,7 +360,7 @@ class APIComplianceReportResponse(BaseModel):
     checks_failed: int
     pass_rate: float
     by_check_type: Dict[str, Dict[str, int]]
-    report_date: datetime
+    report_date: Optional[datetime] = None
 
 
 # ============================================================================

@@ -111,8 +111,8 @@ class ComplianceFrameworkResponse(DBModel):
     certification_level: Optional[str] = None
     is_enabled: bool
     metadata: Dict[str, Any] = {}
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -145,8 +145,8 @@ class ComplianceControlResponse(DBModel):
     remediation_guidance: Optional[str] = None
     poam_id: Optional[str] = None
     tags: List[str] = []
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -165,7 +165,7 @@ class POAMResponse(DBModel):
     residual_risk_rating: Optional[float] = None
     status: POAMStatus
     milestone_changes: List[Dict[str, Any]] = []
-    scheduled_completion_date: datetime
+    scheduled_completion_date: Optional[datetime] = None
     actual_completion_date: Optional[datetime] = None
     milestones: List[Dict[str, Any]] = []
     resources_required: Optional[str] = None
@@ -175,8 +175,8 @@ class POAMResponse(DBModel):
     assigned_to: Optional[str] = None
     approved_by: Optional[str] = None
     comments: List[Dict[str, Any]] = []
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -194,7 +194,7 @@ class ComplianceEvidenceResponse(DBModel):
     file_hash: Optional[str] = None
     content: Optional[str] = None
     source_system: Optional[str] = None
-    collected_at: datetime
+    collected_at: Optional[datetime] = None
     collected_by: str
     is_automated: bool
     is_valid: bool
@@ -203,8 +203,8 @@ class ComplianceEvidenceResponse(DBModel):
     reviewed_by: Optional[str] = None
     reviewed_at: Optional[datetime] = None
     tags: List[str] = []
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -217,7 +217,7 @@ class ComplianceAssessmentResponse(DBModel):
     framework_id: str
     assessment_type: str
     assessor: str
-    assessment_date: datetime
+    assessment_date: Optional[datetime] = None
     status: str
     scope: Optional[str] = None
     findings_count: int
@@ -226,8 +226,8 @@ class ComplianceAssessmentResponse(DBModel):
     overall_result: Optional[str] = None
     report_path: Optional[str] = None
     next_steps: List[Dict[str, Any]] = []
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -247,8 +247,8 @@ class CUIMarkingResponse(DBModel):
     declassification_date: Optional[datetime] = None
     access_list: List[str] = []
     is_active: bool
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -262,15 +262,15 @@ class CISADirectiveResponse(DBModel):
     title: str
     description: Optional[str] = None
     directive_type: str
-    effective_date: datetime
-    compliance_deadline: datetime
+    effective_date: Optional[datetime] = None
+    compliance_deadline: Optional[datetime] = None
     status: str
     requirements: List[Dict[str, Any]] = []
     compliance_status: str
     actions_taken: List[Dict[str, Any]] = []
     evidence_ids: List[str] = []
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -335,7 +335,7 @@ class FrameworkAssessmentResponse(BaseModel):
     satisfied: int
     compliance_score: float
     status: str
-    assessment_date: datetime
+    assessment_date: Optional[datetime] = None
 
 
 class SSPGenerationResponse(BaseModel):
@@ -343,7 +343,7 @@ class SSPGenerationResponse(BaseModel):
 
     framework: str
     baseline: str
-    generated_at: datetime
+    generated_at: Optional[datetime] = None
     control_families: Dict[str, Any]
 
 
@@ -351,7 +351,7 @@ class ConMonReportResponse(BaseModel):
     """Continuous Monitoring Report Response"""
 
     conmon_type: str
-    conmon_date: datetime
+    conmon_date: Optional[datetime] = None
     frameworks_assessed: int
     results: List[Dict[str, Any]]
 
@@ -400,7 +400,7 @@ class CISADirectiveStatusResponse(BaseModel):
     directive_id: str
     title: str
     directive_type: str
-    compliance_deadline: datetime
+    compliance_deadline: Optional[datetime] = None
     compliance_status: str
     actions_taken: int
     evidence_count: int

@@ -58,8 +58,8 @@ class ZeroTrustPolicyResponse(ZeroTrustPolicyBase, DBModel):
     id: str
     hit_count: int = 0
     last_triggered_at: Optional[datetime] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
 
 class DeviceTrustProfileBase(BaseModel):
@@ -108,8 +108,8 @@ class DeviceTrustProfileResponse(DeviceTrustProfileBase, DBModel):
     last_assessment_at: Optional[datetime] = None
     risk_factors: list[str] = Field(default_factory=list)
     enrolled_at: Optional[datetime] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -141,7 +141,7 @@ class AccessDecisionResponse(DBModel):
     required_actions: list[str] = Field(default_factory=list)
     mfa_required: bool = False
     challenge_id: Optional[str] = None
-    created_at: datetime
+    created_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -188,8 +188,8 @@ class MicroSegmentResponse(MicroSegmentBase, DBModel):
     violation_count: int
     last_violation_at: Optional[datetime] = None
     traffic_stats: dict[str, Any] = Field(default_factory=dict)
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -242,7 +242,7 @@ class IdentityVerificationResponse(IdentityVerificationBase, DBModel):
     risk_score_before: float
     risk_score_after: float
     session_id: Optional[str] = None
-    created_at: datetime
+    created_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -257,7 +257,7 @@ class ZeroTrustMaturityResponse(BaseModel):
     )
     pillars: dict[str, dict[str, Any]]
     recommendations: list[dict[str, Any]] = Field(default_factory=list)
-    assessed_at: datetime
+    assessed_at: Optional[datetime] = None
 
 
 class PillarAssessmentResponse(BaseModel):

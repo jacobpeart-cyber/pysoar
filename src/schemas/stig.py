@@ -66,8 +66,8 @@ class STIGBenchmarkResponse(STIGBenchmarkBase):
     id: str
     last_scan_at: Optional[datetime] = None
     organization_id: str
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -94,8 +94,8 @@ class STIGRuleResponse(STIGRuleBase):
     id: str
     benchmark_id_ref: str
     organization_id: str
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -123,11 +123,11 @@ class STIGScanResultResponse(STIGScanResultBase):
     id: str
     benchmark_id_ref: str
     organization_id: str
-    started_at: datetime
+    started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     findings: Optional[dict[str, Any]] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -148,8 +148,8 @@ class SCAPProfileResponse(SCAPProfileBase):
     """SCAP Profile response schema"""
     id: str
     organization_id: str
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -237,7 +237,7 @@ class RemediationScriptResponse(BaseModel):
     platform: str
     script: str
     total_findings: int
-    generated_at: datetime
+    generated_at: Optional[datetime] = None
     script_format: str = "text"
 
 
@@ -262,7 +262,7 @@ class SCAPScanResponse(BaseModel):
     checks_failed: int
     checks_notapplicable: int
     status: str
-    timestamp: datetime
+    timestamp: Optional[datetime] = None
 
 
 class ARFReportResponse(BaseModel):
@@ -272,7 +272,7 @@ class ARFReportResponse(BaseModel):
     asset: dict[str, Any]
     assessment: dict[str, Any]
     findings: dict[str, Any]
-    timestamp: datetime
+    timestamp: Optional[datetime] = None
 
 
 class STIGDashboardStats(BaseModel):

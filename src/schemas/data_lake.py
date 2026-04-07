@@ -55,8 +55,8 @@ class DataSourceResponse(DataSourceBase, DBModel):
     last_event_received: Optional[str] = None
     last_error: Optional[str] = None
     is_enabled: bool
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -113,8 +113,8 @@ class DataPartitionResponse(DataPartitionBase, DBModel):
     index_columns: Optional[list[str]] = None
     query_count_30d: int
     last_accessed: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -181,8 +181,8 @@ class DataPipelineResponse(DataPipelineBase, DBModel):
     records_processed_total: int
     error_count: int
     last_error: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -247,8 +247,8 @@ class UnifiedDataModelResponse(UnifiedDataModelBase, DBModel):
     schema_version: str
     sample_data: Optional[dict[str, Any]] = None
     is_active: bool
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -296,8 +296,8 @@ class QueryJobResponse(QueryJobBase, DBModel):
     submitted_by: str
     cached: bool
     error_message: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True

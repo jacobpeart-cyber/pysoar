@@ -84,8 +84,8 @@ class HuntHypothesisResponse(HuntHypothesisBase, DBModel):
     status: str  # DRAFT, ACTIVE, COMPLETED, ARCHIVED
     created_by: str
     assigned_to: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
     sessions_count: int = 0
 
     class Config:
@@ -127,7 +127,7 @@ class HuntSessionResponse(DBModel):
     queries_executed: Optional[int] = 0
     error_message: Optional[str] = None
     created_by: str
-    created_at: datetime
+    created_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -178,7 +178,7 @@ class HuntFindingResponse(DBModel):
     classification: Optional[str] = None
     escalated_to_case: bool = False
     case_id: Optional[str] = None
-    created_at: datetime
+    created_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -251,8 +251,8 @@ class HuntNotebookResponse(DBModel):
     version: int = 1
     is_published: bool = False
     published_at: Optional[datetime] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True

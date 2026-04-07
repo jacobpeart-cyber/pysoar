@@ -56,8 +56,8 @@ class DLPPolicyResponse(DLPPolicyBase, DBModel):
     organization_id: str
     last_triggered: Optional[datetime] = None
     trigger_count: int = 0
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -88,7 +88,7 @@ class DLPPolicyTestResponse(BaseModel):
     violations_detected: int
     matched_patterns: list[str]
     sample_result: dict[str, Any]
-    timestamp: datetime
+    timestamp: Optional[datetime] = None
 
 
 # Violation Schemas
@@ -134,8 +134,8 @@ class DLPViolationResponse(DLPViolationBase, DBModel):
 
     id: str
     organization_id: str
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -217,8 +217,8 @@ class DataClassificationResponse(DataClassificationBase, DBModel):
 
     id: str
     organization_id: str
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -250,7 +250,7 @@ class DocumentClassificationResponse(BaseModel):
     indicators: list[str]
     content_based: dict[str, Any]
     metadata_based: dict[str, Any]
-    timestamp: datetime
+    timestamp: Optional[datetime] = None
 
 
 class DataHandlingRequirementsResponse(BaseModel):
@@ -294,8 +294,8 @@ class SensitiveDataDiscoveryResponse(SensitiveDataDiscoveryBase, DBModel):
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     next_scheduled_scan: Optional[datetime] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -315,7 +315,7 @@ class DataMapResponse(BaseModel):
     """Schema for data map results"""
 
     organization_id: str
-    generated_at: datetime
+    generated_at: Optional[datetime] = None
     data_locations: dict[str, Any]
     high_risk_locations: list[dict[str, Any]]
     total_sensitive_data_locations: int
@@ -374,8 +374,8 @@ class DLPIncidentResponse(DLPIncidentBase, DBModel):
     incident_commander: Optional[str] = None
     remediation_steps: Optional[list[str]] = None
     regulatory_implications: Optional[dict[str, Any]] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -404,12 +404,12 @@ class BreachAssessmentResponse(BaseModel):
     """Schema for breach assessment results"""
 
     incident_id: str
-    assessment_date: datetime
+    assessment_date: Optional[datetime] = None
     severity: str
     affected_subjects: int
     data_types: list[str]
     regulatory_obligations: dict[str, bool]
-    notification_deadline: datetime
+    notification_deadline: Optional[datetime] = None
     notification_required: bool
 
 
@@ -421,7 +421,7 @@ class NotificationTrackingResponse(BaseModel):
     total_required: int
     completion_percentage: float
     status: str
-    last_updated: datetime
+    last_updated: Optional[datetime] = None
 
 
 # Dashboard Schemas

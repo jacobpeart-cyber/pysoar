@@ -28,8 +28,8 @@ class AttackTechniqueSchema(DBModel):
     is_enabled: bool = True
     atomic_test_ref: Optional[str] = None
     tags: List[str] = Field(default_factory=list)
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -58,8 +58,8 @@ class SimulationTestSchema(DBModel):
     detection_source: Optional[str] = None
     detection_details: Optional[Dict[str, Any]] = None
     notes: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -91,8 +91,8 @@ class AttackSimulationSchema(DBModel):
     approved_by: Optional[str] = None
     tags: List[str] = Field(default_factory=list)
     organization_id: str
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -113,8 +113,8 @@ class AdversaryProfileSchema(DBModel):
     tools_used: List[str] = Field(default_factory=list)
     is_builtin: bool = False
     organization_id: str
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -131,10 +131,10 @@ class SecurityPostureScoreSchema(DBModel):
     breakdown: Dict[str, Any] = Field(default_factory=dict)
     comparison_to_previous: Optional[float] = None
     recommendations: List[str] = Field(default_factory=list)
-    assessed_at: datetime
+    assessed_at: Optional[datetime] = None
     organization_id: str
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -209,7 +209,7 @@ class PostureScoreResponse(BaseModel):
     breakdown: Dict[str, Any] = Field(default_factory=dict)
     comparison_to_previous: Optional[float] = None
     recommendations: List[str] = Field(default_factory=list)
-    assessed_at: datetime
+    assessed_at: Optional[datetime] = None
 
 
 class GapAnalysisItem(BaseModel):

@@ -33,7 +33,7 @@ class AuditLogResponse(AuditLogBase, DBModel):
     user_name: Optional[str] = None
     old_value: Optional[str] = None
     new_value: Optional[str] = None
-    created_at: datetime
+    created_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True

@@ -64,8 +64,8 @@ class IdentityProfileResponse(IdentityProfileBase, DBModel):
     last_authentication: Optional[str] = None
     last_password_change: Optional[str] = None
     authentication_methods: Optional[list[str]] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -114,8 +114,8 @@ class IdentityThreatResponse(IdentityThreatBase, DBModel):
     status: str
     evidence: Optional[dict[str, Any]] = None
     response_actions: Optional[list[dict[str, Any]]] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -177,8 +177,8 @@ class CredentialExposureResponse(CredentialExposureBase, DBModel):
     organization_id: str
     identity_id: str
     remediation_date: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -240,8 +240,8 @@ class AccessAnomalyResponse(AccessAnomalyBase, DBModel):
     identity_id: str
     baseline_data: Optional[dict[str, Any]] = None
     observed_data: Optional[dict[str, Any]] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -306,8 +306,8 @@ class PrivilegedAccessEventResponse(PrivilegedAccessEventBase, DBModel):
     approved_by: Optional[str] = None
     approval_timestamp: Optional[str] = None
     expiry_timestamp: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True

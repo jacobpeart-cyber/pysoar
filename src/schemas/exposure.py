@@ -80,8 +80,8 @@ class ExposureAssetResponse(ExposureAssetBase, DBModel):
     vulnerability_count: int = 0
     open_ports: list[int] = Field(default_factory=list)
     compliance_status: Optional[Any] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -154,8 +154,8 @@ class VulnerabilityResponse(VulnerabilityBase, DBModel):
     """Schema for vulnerability response"""
 
     id: str
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -210,11 +210,11 @@ class AssetVulnerabilityResponse(AssetVulnerabilityBase, DBModel):
     """Schema for asset-vulnerability response"""
 
     id: str
-    first_detected: datetime
-    last_detected: datetime
+    first_detected: Optional[datetime] = None
+    last_detected: Optional[datetime] = None
     detection_count: int = 0
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -261,8 +261,8 @@ class ExposureScanResponse(ExposureScanBase, DBModel):
     stats: dict = Field(default_factory=dict, description="Scan statistics")
     findings_count: int = 0
     errors: list[str] = Field(default_factory=list)
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -326,8 +326,8 @@ class RemediationTicketResponse(RemediationTicketBase, DBModel):
 
     id: str
     status: str = Field(default="open", max_length=50, description="open, in-progress, completed, cancelled, overdue")
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
 
     class Config:
@@ -379,8 +379,8 @@ class AttackSurfaceResponse(AttackSurfaceBase, DBModel):
     vulnerabilities_count: int = 0
     risk_score: float = 0.0
     last_assessment_at: Optional[datetime] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True

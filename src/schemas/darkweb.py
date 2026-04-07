@@ -53,8 +53,8 @@ class DarkWebMonitorResponse(DarkWebMonitorBase, DBModel):
     organization_id: str
     last_check: Optional[str] = None
     findings_count: int = 0
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -111,8 +111,8 @@ class DarkWebFindingResponse(DarkWebFindingBase, DBModel):
     raw_data_hash: Optional[str] = None
     discovered_date: Optional[str] = None
     analyst_notes: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -169,8 +169,8 @@ class CredentialLeakResponse(CredentialLeakBase, DBModel):
     organization_id: str
     is_remediated: bool = False
     remediation_action: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -220,8 +220,8 @@ class BrandThreatResponse(BrandThreatBase, DBModel):
     organization_id: str
     takedown_status: str = "identified"
     takedown_provider: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True

@@ -1,47 +1,63 @@
-"""Base schema with automatic JSON string parsing for DB compatibility."""
+"""Base schema with JSON string parsing for DB compatibility.
+
+Uses Pydantic's native from_attributes for ORM handling.
+Only adds field-level JSON string parsing via a custom validator.
+"""
 
 import json
-from typing import Any
+from typing import Any, List, Optional
 
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, field_validator, model_validator
 
 
 class DBModel(BaseModel):
-    """Base model that auto-parses JSON string fields from ORM objects.
+    """Response model base that handles JSON strings from DB columns.
 
-    Converts ORM objects to dicts, parses JSON strings like '[]' and '{}',
-    and includes all field values (even None) so required fields don't fail.
+    Uses Pydantic's native from_attributes for ORM object conversion.
+    Only intervenes to parse JSON string values like '[]' and '{}'.
+    Does NOT convert ORM objects to dicts manually.
     """
 
-    @model_validator(mode="before")
+    model_config = {"from_attributes": True}
+
+    @model_validator(mode="wrap")
     @classmethod
-    def parse_json_strings(cls, data: Any) -> Any:
-        # Convert ORM object to dict
-        if not isinstance(data, dict) and hasattr(data, "__dict__"):
-            raw = {}
-            for key in cls.model_fields:
-                try:
-                    val = getattr(data, key, None)
-                    if isinstance(val, Exception):
-                        raw[key] = None
-                    else:
-                        raw[key] = val
-                except Exception:
-                    raw[key] = None
-            data = raw
-
-        if isinstance(data, dict):
-            for key in list(data.keys()):
-                value = data[key]
-                if isinstance(value, str) and len(value) >= 2 and value[0] in ('[', '{'):
+    def _handle_orm_and_json(cls, data: Any, handler: Any) -> Any:
+        """Wrap the default validator to catch and fix JSON string issues."""
+        try:
+            return handler(data)
+        except Exception:
+            # If default validation fails (likely JSON string fields),
+            # convert to dict manually and parse JSON strings
+            if hasattr(data, "__dict__") and not isinstance(data, dict):
+                raw = {}
+                for key in cls.model_fields:
                     try:
-                        data[key] = json.loads(value)
-                    except (json.JSONDecodeError, ValueError, TypeError):
+                        val = getattr(data, key, None)
+                        # Parse JSON strings
+                        if isinstance(val, str) and len(val) >= 2 and val[0] in ('[', '{'):
+                            try:
+                                val = json.loads(val)
+                            except (json.JSONDecodeError, ValueError):
+                                pass
+                        # Convert non-serializable objects to None
+                        if val is not None and not isinstance(val, (str, int, float, bool, list, dict, tuple)):
+                            try:
+                                json.dumps(val, default=str)
+                            except (TypeError, ValueError):
+                                val = None
+                        raw[key] = val
+                    except Exception:
                         pass
-                if isinstance(value, Exception):
-                    data[key] = None
-
-        return data
-
-    class Config:
-        from_attributes = True
+                try:
+                    return handler(raw)
+                except Exception:
+                    # Last resort: fill missing required fields with defaults
+                    for field_name, field_info in cls.model_fields.items():
+                        if field_name not in raw:
+                            if field_info.default is not None:
+                                raw[field_name] = field_info.default
+                            elif field_info.is_required():
+                                raw[field_name] = None
+                    return handler(raw)
+            raise

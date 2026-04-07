@@ -78,8 +78,8 @@ class AuditTrailResponse(AuditTrailBase):
     """Audit trail response schema"""
     id: str
     organization_id: str
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -104,8 +104,8 @@ class EvidencePackageResponse(EvidencePackageBase):
     submitted_at: Optional[datetime] = None
     package_hash: Optional[str] = None
     organization_id: str
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -126,8 +126,8 @@ class AutomatedEvidenceRuleResponse(AutomatedEvidenceRuleBase):
     id: str
     last_collected_at: Optional[datetime] = None
     organization_id: str
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -215,7 +215,7 @@ class AuditReportResponse(BaseModel):
     date_range: dict[str, str]
     statistics: dict[str, Any]
     total_entries: int
-    generated_at: datetime
+    generated_at: Optional[datetime] = None
 
 
 class SuspiciousActivityResponse(BaseModel):
@@ -232,7 +232,7 @@ class ConMonReportResponse(BaseModel):
     period: dict[str, str]
     overall_status: str
     checks: dict[str, Any]
-    generated_at: datetime
+    generated_at: Optional[datetime] = None
 
 
 class AuditReadinessResponse(BaseModel):
@@ -257,7 +257,7 @@ class EvidenceCoverageResponse(BaseModel):
 class EvidenceFreshnessResponse(BaseModel):
     """Evidence freshness assessment"""
     framework_id: str
-    assessment_date: datetime
+    assessment_date: Optional[datetime] = None
     fresh_evidence_count: int
     stale_evidence_count: int
     freshness_percentage: float
@@ -270,7 +270,7 @@ class AssessorPackageResponse(BaseModel):
     framework_id: str
     coverage: EvidenceCoverageResponse
     freshness: EvidenceFreshnessResponse
-    generated_at: datetime
+    generated_at: Optional[datetime] = None
     ready_for_assessment: bool
 
 

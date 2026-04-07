@@ -54,8 +54,8 @@ class WarRoomResponse(WarRoomBase, DBModel):
     participants: list[str] = Field(default_factory=list)
     created_by: str
     pinned_items: list[str] = Field(default_factory=list)
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -125,8 +125,8 @@ class WarRoomMessageResponse(WarRoomMessageBase, DBModel):
     edited_at: Optional[datetime] = None
     parent_message_id: Optional[str] = None
     reactions: dict[str, list[str]] = Field(default_factory=dict)
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -181,8 +181,8 @@ class SharedArtifactResponse(SharedArtifactBase, DBModel):
     download_count: int
     analysis_status: str
     access_restricted_to: list[str] = Field(default_factory=list)
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -249,8 +249,8 @@ class ActionItemResponse(ActionItemBase, DBModel):
     linked_incident_id: Optional[str] = None
     notes: Optional[str] = None
     completed_at: Optional[datetime] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -303,8 +303,8 @@ class IncidentTimelineResponse(IncidentTimelineBase, DBModel):
     room_id: str
     created_by: str
     evidence_ids: list[str] = Field(default_factory=list)
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True

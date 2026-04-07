@@ -58,8 +58,8 @@ class LogEntryResponse(LogEntryBase, DBModel):
     normalized_fields: Optional[dict[str, Any]] = None
     rule_matches: Optional[list[str]] = None
     tags: Optional[list[str]] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -182,8 +182,8 @@ class DetectionRuleResponse(DetectionRuleBase, DBModel):
     false_positive_notes: Optional[str] = None
     references: Optional[list[str]] = None
     rule_yaml: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -219,7 +219,7 @@ class CorrelationEventResponse(DBModel):
     mitre_techniques: Optional[list[str]] = None
     alert_generated: bool
     status: str
-    created_at: datetime
+    created_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -267,7 +267,7 @@ class DataSourceResponse(DBModel):
     events_today: int
     error_count: int
     last_error: Optional[str] = None
-    created_at: datetime
+    created_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True

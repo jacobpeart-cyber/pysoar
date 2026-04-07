@@ -51,8 +51,8 @@ class SOCAgentResponse(SOCAgentBase, DBModel):
     avg_resolution_time_minutes: float
     accuracy_score: float
     false_positive_rate: float
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -98,7 +98,7 @@ class ReasoningStepResponse(DBModel):
     confidence_delta: float
     duration_ms: int
     tokens_used: int
-    created_at: datetime
+    created_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -151,8 +151,8 @@ class InvestigationResponse(InvestigationBase, DBModel):
     resolution_type: Optional[str] = None
     human_feedback: Optional[str] = None
     feedback_rating: Optional[int] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -219,8 +219,8 @@ class AgentActionResponse(AgentActionBase, DBModel):
     result: Optional[dict[str, Any]] = None
     rollback_available: bool
     rollback_executed: bool
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -266,8 +266,8 @@ class AgentMemoryResponse(DBModel):
     confidence: float
     access_count: int
     last_accessed: Optional[datetime] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True

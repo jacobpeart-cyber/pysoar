@@ -55,8 +55,8 @@ class SoftwareComponentResponse(SoftwareComponentBase, DBModel):
     known_vulnerabilities_count: int = 0
     risk_score: float = 0.0
     last_scanned: Optional[datetime] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -99,8 +99,8 @@ class SBOMResponse(SBOMBase, DBModel):
     vulnerability_risk_score: float = 0.0
     compliance_status: Optional[str] = None
     last_generated: Optional[datetime] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -125,8 +125,8 @@ class SBOMComponentResponse(SBOMComponentBase, DBModel):
     id: str
     sbom_id: str
     component_id: str
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -164,10 +164,10 @@ class SupplyChainRiskResponse(SupplyChainRiskBase, DBModel):
 
     id: str
     organization_id: str
-    detected_date: datetime
+    detected_date: Optional[datetime] = None
     remediation_date: Optional[datetime] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -207,12 +207,12 @@ class VendorAssessmentResponse(VendorAssessmentBase, DBModel):
 
     id: str
     organization_id: str
-    assessment_date: datetime
+    assessment_date: Optional[datetime] = None
     last_incident_date: Optional[datetime] = None
     incident_count: int = 0
     contract_expiry: Optional[datetime] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
