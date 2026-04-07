@@ -131,7 +131,7 @@ async def list_connectors(
                 supported_triggers=connector_meta.get("supported_triggers", []),
                 icon_url=None,
                 documentation_url=None,
-                config_schema=json.loads(connector_meta.get("config_schema", "{}")),
+                config_schema=connector_meta.get("config_schema", {}) if isinstance(connector_meta.get("config_schema"), dict) else json.loads(connector_meta.get("config_schema", "{}")) if isinstance(connector_meta.get("config_schema"), str) else {},
                 is_builtin=connector_meta.get("is_builtin", False),
                 is_community=connector_meta.get("is_community", False),
                 rating=connector_meta.get("rating"),
