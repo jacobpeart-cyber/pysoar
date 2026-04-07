@@ -50,14 +50,14 @@ class DecoyDeployRequest(DecoyBase):
     """Request schema for deploying a decoy."""
 
     deployed_by: str | None = None
-    organization_id: str
+    organization_id: str = ""
 
 
 class DecoyResponse(DecoyBase, DBModel):
     """Response schema for decoy."""
 
     id: UUID
-    interaction_count: int
+    interaction_count: int = 0
     last_interaction_at: datetime | None
     deployed_at: datetime | None
     deployed_by: str | None
@@ -83,12 +83,12 @@ class DecoyDetailResponse(DecoyResponse):
 class DecoyInteractionBase(BaseModel):
     """Base schema for decoy interactions."""
 
-    decoy_id: str
+    decoy_id: str = ""
     interaction_type: str = Field(
         ...,
         description="scan, connection, authentication, command, file_access, credential_use, dns_query, data_transfer",
     )
-    source_ip: str
+    source_ip: str = ""
     source_port: int | None = None
     source_hostname: str | None = None
     source_user: str | None = None
@@ -111,7 +111,7 @@ class DecoyInteractionResponse(DecoyInteractionBase, DBModel):
     """Response schema for decoy interaction."""
 
     id: UUID
-    alert_generated: bool
+    alert_generated: bool = False
     alert_id: str | None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -124,14 +124,14 @@ class InteractionAnalysisResponse(BaseModel):
     """Response for interaction analysis."""
 
     interaction_id: UUID
-    interaction_type: str
-    threat_level: str
-    is_automated: bool
+    interaction_type: str = ""
+    threat_level: str = ""
+    is_automated: bool = False
     tools_detected: list[str]
     techniques: list[str]
-    skill_level: str
+    skill_level: str = ""
     objectives: list[str]
-    confidence: float
+    confidence: float = 0.0
 
 
 # Honey Token Schemas
@@ -145,7 +145,7 @@ class HoneyTokenBase(BaseModel):
         ...,
         description="aws_key, api_key, database_cred, jwt_token, ssh_key, certificate, dns_canary, url_canary, email_canary, document_beacon",
     )
-    token_value: str
+    token_value: str = ""
     deployment_location: str | None = None
     deployment_context: str | None = None
     status: str = Field(
@@ -168,7 +168,7 @@ class HoneyTokenGenerateRequest(BaseModel):
     domain: str | None = None
     doc_type: str | None = None
     doc_title: str | None = None
-    organization_id: str
+    organization_id: str = ""
     deployed_by: str | None = None
 
 
@@ -176,8 +176,8 @@ class HoneyTokenGenerateResponse(DBModel):
     """Response schema for generated honey token."""
 
     id: UUID
-    token_hash: str
-    triggered_count: int
+    token_hash: str = ""
+    triggered_count: int = 0
     last_triggered_at: datetime | None
     last_triggered_by: str | None
     created_at: Optional[datetime] = None
@@ -197,9 +197,9 @@ class HoneyTokenCheckResponse(BaseModel):
     """Response for token usage check."""
 
     token_id: UUID
-    token_hash: str
-    has_been_used: bool
-    triggered_count: int
+    token_hash: str = ""
+    has_been_used: bool = False
+    triggered_count: int = 0
     last_triggered_at: datetime | None
     last_triggered_by: str | None
 
@@ -223,22 +223,22 @@ class DeceptionCampaignCreateRequest(DeceptionCampaignBase):
     """Request schema for creating campaign."""
 
     decoy_configs: list[dict[str, Any]] = Field(default_factory=list)
-    organization_id: str
-    created_by: str
+    organization_id: str = ""
+    created_by: str = ""
 
 
 class DeceptionCampaignResponse(DeceptionCampaignBase, DBModel):
     """Response schema for campaign."""
 
     id: UUID
-    status: str
+    status: str = ""
     decoy_ids: list[str]
-    total_interactions: int
-    unique_attackers: int
+    total_interactions: int = 0
+    unique_attackers: int = 0
     started_at: datetime | None
     completed_at: datetime | None
     effectiveness_score: float | None
-    created_by: str
+    created_by: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -263,17 +263,17 @@ class CampaignEffectivenessResponse(BaseModel):
     """Response for campaign effectiveness assessment."""
 
     campaign_id: UUID
-    name: str
-    objective: str
-    status: str
-    effectiveness_score: float
-    coverage_percentage: float
-    total_interactions: int
-    unique_attackers: int
-    attacks_detected: int
-    false_positives: int
-    detection_rate: float
-    mean_time_to_detection: float
+    name: str = ""
+    objective: str = ""
+    status: str = ""
+    effectiveness_score: float = 0.0
+    coverage_percentage: float = 0.0
+    total_interactions: int = 0
+    unique_attackers: int = 0
+    attacks_detected: int = 0
+    false_positives: int = 0
+    detection_rate: float = 0.0
+    mean_time_to_detection: float = 0.0
     recommendations: list[str]
 
 
@@ -283,21 +283,21 @@ class CampaignEffectivenessResponse(BaseModel):
 class DeceptionDashboardStats(BaseModel):
     """Dashboard statistics for deception module."""
 
-    total_decoys: int
-    active_decoys: int
-    disabled_decoys: int
-    total_honeytokens: int
-    active_tokens: int
-    triggered_tokens: int
-    active_campaigns: int
-    completed_campaigns: int
-    interactions_today: int
-    interactions_this_week: int
-    unique_attackers_today: int
-    unique_attackers_this_week: int
-    high_severity_interactions: int
-    critical_interactions: int
-    average_interaction_response_time_seconds: float
+    total_decoys: int = 0
+    active_decoys: int = 0
+    disabled_decoys: int = 0
+    total_honeytokens: int = 0
+    active_tokens: int = 0
+    triggered_tokens: int = 0
+    active_campaigns: int = 0
+    completed_campaigns: int = 0
+    interactions_today: int = 0
+    interactions_this_week: int = 0
+    unique_attackers_today: int = 0
+    unique_attackers_this_week: int = 0
+    high_severity_interactions: int = 0
+    critical_interactions: int = 0
+    average_interaction_response_time_seconds: float = 0.0
 
 
 class DeceptionDashboardResponse(BaseModel):
@@ -316,9 +316,9 @@ class DeceptionDashboardResponse(BaseModel):
 class CoverageZoneInfo(BaseModel):
     """Information about deception coverage in a zone."""
 
-    zone_name: str
-    covered: bool
-    decoy_count: int
+    zone_name: str = ""
+    covered: bool = False
+    decoy_count: int = 0
     decoy_types: list[str] = Field(default_factory=list)
     last_interaction: datetime | None = None
 
@@ -327,9 +327,9 @@ class CoverageMapResponse(BaseModel):
     """Network coverage map for deception infrastructure."""
 
     zones: dict[str, CoverageZoneInfo]
-    total_zones: int
-    covered_zones: int
-    total_coverage_percentage: float
+    total_zones: int = 0
+    covered_zones: int = 0
+    total_coverage_percentage: float = 0.0
     gaps: list[str] = Field(default_factory=list)
     recommendations: list[str] = Field(default_factory=list)
 
@@ -340,12 +340,12 @@ class CoverageMapResponse(BaseModel):
 class DeploymentRecommendation(BaseModel):
     """Recommendation for decoy deployment."""
 
-    zone: str
-    decoy_type: str
+    zone: str = ""
+    decoy_type: str = ""
     service: str | None = None
     location: str | None = None
     filename: str | None = None
-    purpose: str
+    purpose: str = ""
     priority: str = Field(default="medium", description="high, medium, low")
     estimated_value: str = Field(
         default="high", description="Potential detection value"
@@ -369,11 +369,11 @@ class InteractionTimelineEntry(BaseModel):
     timestamp: datetime
     interaction_id: UUID
     decoy_id: UUID
-    decoy_name: str
-    source_ip: str
-    interaction_type: str
-    threat_level: str
-    description: str
+    decoy_name: str = ""
+    source_ip: str = ""
+    interaction_type: str = ""
+    threat_level: str = ""
+    description: str = ""
 
 
 class InteractionTimelineResponse(BaseModel):
@@ -381,8 +381,8 @@ class InteractionTimelineResponse(BaseModel):
 
     decoy_id: UUID
     entries: list[InteractionTimelineEntry]
-    total_count: int
-    time_span_hours: int
+    total_count: int = 0
+    time_span_hours: int = 0
 
 
 # Investigation Schemas

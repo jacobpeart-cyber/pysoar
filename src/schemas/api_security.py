@@ -61,9 +61,9 @@ class APIEndpointInventoryUpdate(BaseModel):
 class APIEndpointInventoryResponse(APIEndpointInventoryBase, DBModel):
     """Schema for API endpoint response"""
 
-    id: str
-    request_count_24h: int
-    error_rate: float
+    id: str = ""
+    request_count_24h: int = 0
+    error_rate: float = 0.0
     last_seen: Optional[datetime] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -80,8 +80,8 @@ class APIEndpointInventoryResponse(APIEndpointInventoryBase, DBModel):
 class APIVulnerabilityBase(BaseModel):
     """Base API vulnerability schema"""
 
-    endpoint_id: str
-    vulnerability_type: str
+    endpoint_id: str = ""
+    vulnerability_type: str = ""
     severity: str = Field(..., pattern="^(critical|high|medium|low)$")
     description: str = Field(..., min_length=1)
     evidence: Optional[Dict[str, Any]] = None
@@ -108,7 +108,7 @@ class APIVulnerabilityUpdate(BaseModel):
 class APIVulnerabilityResponse(APIVulnerabilityBase, DBModel):
     """Schema for vulnerability response"""
 
-    id: str
+    id: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -126,7 +126,7 @@ class APISecurityPolicyBase(BaseModel):
 
     name: str = Field(..., min_length=1, max_length=255)
     description: Optional[str] = None
-    policy_type: str
+    policy_type: str = ""
     rules: Optional[Dict[str, Any]] = None
     enforcement_level: str = Field(default="enforce", pattern="^(enforce|monitor|disabled)$")
     applies_to: Optional[Dict[str, Any]] = None
@@ -152,8 +152,8 @@ class APISecurityPolicyUpdate(BaseModel):
 class APISecurityPolicyResponse(APISecurityPolicyBase, DBModel):
     """Schema for policy response"""
 
-    id: str
-    violations_count: int
+    id: str = ""
+    violations_count: int = 0
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -169,11 +169,11 @@ class APISecurityPolicyResponse(APISecurityPolicyBase, DBModel):
 class APIAnomalyDetectionBase(BaseModel):
     """Base API anomaly detection schema"""
 
-    endpoint_id: str
-    anomaly_type: str
-    baseline_value: float
-    observed_value: float
-    deviation_percentage: float
+    endpoint_id: str = ""
+    anomaly_type: str = ""
+    baseline_value: float = 0.0
+    observed_value: float = 0.0
+    deviation_percentage: float = 0.0
     severity: str = Field(..., pattern="^(critical|high|medium|low|info)$")
     source_ips: Optional[List[str]] = None
     sample_requests: Optional[List[Dict[str, Any]]] = None
@@ -196,7 +196,7 @@ class APIAnomalyDetectionUpdate(BaseModel):
 class APIAnomalyDetectionResponse(APIAnomalyDetectionBase, DBModel):
     """Schema for anomaly detection response"""
 
-    id: str
+    id: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -212,9 +212,9 @@ class APIAnomalyDetectionResponse(APIAnomalyDetectionBase, DBModel):
 class APIComplianceCheckBase(BaseModel):
     """Base API compliance check schema"""
 
-    endpoint_id: str
-    check_type: str
-    passed: bool
+    endpoint_id: str = ""
+    check_type: str = ""
+    passed: bool = False
     details: Optional[Dict[str, Any]] = None
     remediation_steps: Optional[str] = None
 
@@ -236,7 +236,7 @@ class APIComplianceCheckUpdate(BaseModel):
 class APIComplianceCheckResponse(APIComplianceCheckBase, DBModel):
     """Schema for compliance check response"""
 
-    id: str
+    id: str = ""
     last_checked: Optional[datetime] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -254,50 +254,50 @@ class APIEndpointInventoryListResponse(BaseModel):
     """Schema for paginated API endpoint list"""
 
     items: List[APIEndpointInventoryResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class APIVulnerabilityListResponse(BaseModel):
     """Schema for paginated vulnerability list"""
 
     items: List[APIVulnerabilityResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class APISecurityPolicyListResponse(BaseModel):
     """Schema for paginated policy list"""
 
     items: List[APISecurityPolicyResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class APIAnomalyDetectionListResponse(BaseModel):
     """Schema for paginated anomaly detection list"""
 
     items: List[APIAnomalyDetectionResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class APIComplianceCheckListResponse(BaseModel):
     """Schema for paginated compliance check list"""
 
     items: List[APIComplianceCheckResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 # ============================================================================
@@ -308,14 +308,14 @@ class APIComplianceCheckListResponse(BaseModel):
 class APISummaryStats(BaseModel):
     """Summary statistics for API security"""
 
-    total_endpoints: int
-    documented_endpoints: int
-    shadow_apis: int
-    zombie_apis: int
-    critical_vulnerabilities: int
-    high_vulnerabilities: int
-    policy_violations: int
-    compliance_pass_rate: float
+    total_endpoints: int = 0
+    documented_endpoints: int = 0
+    shadow_apis: int = 0
+    zombie_apis: int = 0
+    critical_vulnerabilities: int = 0
+    high_vulnerabilities: int = 0
+    policy_violations: int = 0
+    compliance_pass_rate: float = 0.0
 
 
 class APISecurityDashboardResponse(BaseModel):
@@ -331,22 +331,22 @@ class APISecurityDashboardResponse(BaseModel):
 class APIDiscoveryResultsResponse(BaseModel):
     """API discovery results"""
 
-    new_endpoints_count: int
-    shadow_apis_count: int
-    zombie_apis_count: int
-    total_discovered: int
+    new_endpoints_count: int = 0
+    shadow_apis_count: int = 0
+    zombie_apis_count: int = 0
+    total_discovered: int = 0
     discovery_summary: Optional[Dict[str, Any]] = None
 
 
 class APIScanResultResponse(BaseModel):
     """API security scan results"""
 
-    endpoint_id: str
-    vulnerabilities_found: int
-    critical_count: int
-    high_count: int
-    medium_count: int
-    low_count: int
+    endpoint_id: str = ""
+    vulnerabilities_found: int = 0
+    critical_count: int = 0
+    high_count: int = 0
+    medium_count: int = 0
+    low_count: int = 0
     scan_timestamp: Optional[datetime] = None
     remediation_guidance: Optional[str] = None
 
@@ -354,11 +354,11 @@ class APIScanResultResponse(BaseModel):
 class APIComplianceReportResponse(BaseModel):
     """API compliance report"""
 
-    total_endpoints: int
-    endpoints_checked: int
-    checks_passed: int
-    checks_failed: int
-    pass_rate: float
+    total_endpoints: int = 0
+    endpoints_checked: int = 0
+    checks_passed: int = 0
+    checks_failed: int = 0
+    pass_rate: float = 0.0
     by_check_type: Dict[str, Dict[str, int]]
     report_date: Optional[datetime] = None
 

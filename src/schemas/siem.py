@@ -37,13 +37,13 @@ class LogBatchIngestRequest(BaseModel):
 class LogEntryResponse(LogEntryBase, DBModel):
     """Schema for log entry response"""
 
-    id: str
-    timestamp: str
-    received_at: str
-    source_type: str
-    source_name: str
-    log_type: str
-    severity: str
+    id: str = ""
+    timestamp: str = ""
+    received_at: str = ""
+    source_type: str = ""
+    source_name: str = ""
+    log_type: str = ""
+    severity: str = ""
     message: Optional[str] = None
     source_address: Optional[str] = None
     destination_address: Optional[str] = None
@@ -69,10 +69,10 @@ class LogListResponse(BaseModel):
     """Schema for paginated log list"""
 
     items: list[LogEntryResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class LogSearchRequest(BaseModel):
@@ -100,19 +100,19 @@ class LogSearchResponse(BaseModel):
     """Schema for log search results"""
 
     items: list[LogEntryResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
-    query_time_ms: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
+    query_time_ms: int = 0
     aggregations: Optional[dict[str, Any]] = None
 
 
 class AggregationRequest(BaseModel):
     """Schema for aggregation queries"""
 
-    field: str
-    agg_type: str
+    field: str = ""
+    agg_type: str = ""
     time_start: Optional[datetime] = None
     time_end: Optional[datetime] = None
     interval: Optional[str] = None
@@ -169,10 +169,10 @@ class DetectionRuleUpdate(BaseModel):
 class DetectionRuleResponse(DetectionRuleBase, DBModel):
     """Schema for detection rule response"""
 
-    id: str
-    status: str
-    enabled: bool
-    match_count: int
+    id: str = ""
+    status: str = ""
+    enabled: bool = False
+    match_count: int = 0
     last_matched_at: Optional[str] = None
     detection_logic: Optional[dict[str, Any]] = None
     condition: Optional[str] = None
@@ -193,32 +193,32 @@ class DetectionRuleListResponse(BaseModel):
     """Schema for paginated detection rule list"""
 
     items: list[DetectionRuleResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class CorrelationEventResponse(DBModel):
     """Schema for correlation event response"""
 
-    id: str
-    correlation_id: str
-    name: str
+    id: str = ""
+    correlation_id: str = ""
+    name: str = ""
     description: Optional[str] = None
-    severity: str
+    severity: str = ""
     rule_id: Optional[str] = None
     log_entry_ids: Optional[list[str]] = None
     source_addresses: Optional[list[str]] = None
     usernames: Optional[list[str]] = None
     hostnames: Optional[list[str]] = None
-    timespan_start: str
-    timespan_end: str
-    event_count: int
+    timespan_start: str = ""
+    timespan_end: str = ""
+    event_count: int = 0
     mitre_tactics: Optional[list[str]] = None
     mitre_techniques: Optional[list[str]] = None
-    alert_generated: bool
-    status: str
+    alert_generated: bool = False
+    status: str = ""
     created_at: Optional[datetime] = None
 
     class Config:
@@ -228,19 +228,19 @@ class CorrelationEventResponse(DBModel):
 class SIEMStatsResponse(BaseModel):
     """Schema for SIEM statistics"""
 
-    total_logs: int
-    logs_today: int
+    total_logs: int = 0
+    logs_today: int = 0
     events_per_second: float = 0.0
-    active_rules: int
+    active_rules: int = 0
     alerts_triggered_24h: int = 0
     active_data_sources: int = 0
     logs_by_type: list[dict[str, Any]]
     logs_by_severity: list[dict[str, Any]]
     logs_by_source: list[dict[str, Any]]
     recent_detections: list[dict[str, Any]] = []
-    rule_matches_today: int
-    active_correlations: int
-    ingestion_rate_per_hour: float
+    rule_matches_today: int = 0
+    active_correlations: int = 0
+    ingestion_rate_per_hour: float = 0.0
     storage_stats: Optional[dict[str, Any]] = None
 
 
@@ -249,7 +249,7 @@ class DataSourceCreate(BaseModel):
 
     name: str = Field(..., min_length=1, max_length=255)
     description: Optional[str] = None
-    source_type: str
+    source_type: str = ""
     connection_config: dict[str, Any] = {}
     parser_config: Optional[dict[str, Any]] = None
     enabled: bool = True
@@ -258,14 +258,14 @@ class DataSourceCreate(BaseModel):
 class DataSourceResponse(DBModel):
     """Schema for data source response"""
 
-    id: str
-    name: str
+    id: str = ""
+    name: str = ""
     description: Optional[str] = None
-    source_type: str
-    enabled: bool
+    source_type: str = ""
+    enabled: bool = False
     last_event_at: Optional[str] = None
-    events_today: int
-    error_count: int
+    events_today: int = 0
+    error_count: int = 0
     last_error: Optional[str] = None
     created_at: Optional[datetime] = None
 

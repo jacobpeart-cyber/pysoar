@@ -192,9 +192,9 @@ class IncidentStatus(str, Enum):
 class OTAssetResponse(DBModel):
     """OT Asset Response"""
 
-    id: str
-    organization_id: str
-    name: str
+    id: str = ""
+    organization_id: str = ""
+    name: str = ""
     asset_type: AssetType
     vendor: Optional[str] = None
     model: Optional[str] = None
@@ -208,10 +208,10 @@ class OTAssetResponse(DBModel):
     cell_area: Optional[str] = None
     criticality: Criticality
     last_seen: Optional[datetime] = None
-    is_online: bool
-    firmware_current: bool
-    known_vulnerabilities_count: int
-    risk_score: float
+    is_online: bool = False
+    firmware_current: bool = False
+    known_vulnerabilities_count: int = 0
+    risk_score: float = 0.0
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -222,7 +222,7 @@ class OTAssetResponse(DBModel):
 class OTAssetCreate(BaseModel):
     """Create OT Asset"""
 
-    name: str
+    name: str = ""
     asset_type: AssetType
     vendor: Optional[str] = None
     model: Optional[str] = None
@@ -252,26 +252,26 @@ class OTAssetListResponse(BaseModel):
     """Paginated OT Asset List"""
 
     items: List[OTAssetResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 # OT Alert Schemas
 class OTAlertResponse(DBModel):
     """OT Alert Response"""
 
-    id: str
-    organization_id: str
-    asset_id: str
+    id: str = ""
+    organization_id: str = ""
+    asset_id: str = ""
     alert_type: AlertType
     severity: AlertSeverity
     source_ip: Optional[str] = None
     destination_ip: Optional[str] = None
     protocol_used: Optional[str] = None
     command_function_code: Optional[str] = None
-    description: str
+    description: str = ""
     raw_data: Dict[str, Any] = {}
     mitre_ics_technique: Optional[str] = None
     status: AlertStatus
@@ -286,10 +286,10 @@ class OTAlertResponse(DBModel):
 class OTAlertCreate(BaseModel):
     """Create OT Alert"""
 
-    asset_id: str
+    asset_id: str = ""
     alert_type: AlertType
     severity: AlertSeverity
-    description: str
+    description: str = ""
     source_ip: Optional[str] = None
     destination_ip: Optional[str] = None
     protocol_used: Optional[str] = None
@@ -309,29 +309,29 @@ class OTAlertListResponse(BaseModel):
     """Paginated OT Alert List"""
 
     items: List[OTAlertResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 # OT Zone Schemas
 class OTZoneResponse(DBModel):
     """OT Zone Response"""
 
-    id: str
-    organization_id: str
-    name: str
+    id: str = ""
+    organization_id: str = ""
+    name: str = ""
     description: Optional[str] = None
     purdue_level: PurdueLevel
-    network_cidr: str
+    network_cidr: str = ""
     allowed_protocols: List[str] = []
     allowed_communications: List[Dict[str, Any]] = []
-    assets_count: int
-    compliance_status: str
+    assets_count: int = 0
+    compliance_status: str = ""
     last_audit: Optional[datetime] = None
     firewall_rules: Dict[str, Any] = {}
-    segmentation_verified: bool
+    segmentation_verified: bool = False
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -342,10 +342,10 @@ class OTZoneResponse(DBModel):
 class OTZoneCreate(BaseModel):
     """Create OT Zone"""
 
-    name: str
+    name: str = ""
     description: Optional[str] = None
     purdue_level: PurdueLevel
-    network_cidr: str
+    network_cidr: str = ""
     allowed_protocols: Optional[List[str]] = None
     allowed_communications: Optional[List[Dict[str, Any]]] = None
 
@@ -363,20 +363,20 @@ class OTZoneListResponse(BaseModel):
     """Paginated OT Zone List"""
 
     items: List[OTZoneResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 # OT Incident Schemas
 class OTIncidentResponse(DBModel):
     """OT Incident Response"""
 
-    id: str
-    organization_id: str
-    title: str
-    description: str
+    id: str = ""
+    organization_id: str = ""
+    title: str = ""
+    description: str = ""
     affected_assets: List[str] = []
     affected_zones: List[str] = []
     incident_type: IncidentType
@@ -385,7 +385,7 @@ class OTIncidentResponse(DBModel):
     operational_impact: OperationalImpact
     status: IncidentStatus
     containment_strategy: Optional[ContainmentStrategy] = None
-    safe_shutdown_initiated: bool
+    safe_shutdown_initiated: bool = False
     detected_at: Optional[datetime] = None
     contained_at: Optional[datetime] = None
     resolved_at: Optional[datetime] = None
@@ -399,8 +399,8 @@ class OTIncidentResponse(DBModel):
 class OTIncidentCreate(BaseModel):
     """Create OT Incident"""
 
-    title: str
-    description: str
+    title: str = ""
+    description: str = ""
     incident_type: IncidentType
     severity: AlertSeverity
     affected_assets: Optional[List[str]] = None
@@ -421,26 +421,26 @@ class OTIncidentListResponse(BaseModel):
     """Paginated OT Incident List"""
 
     items: List[OTIncidentResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 # OT Policy Schemas
 class OTPolicyRuleResponse(DBModel):
     """OT Policy Rule Response"""
 
-    id: str
-    organization_id: str
-    name: str
+    id: str = ""
+    organization_id: str = ""
+    name: str = ""
     description: Optional[str] = None
     rule_type: RuleType
     purdue_levels_applied: List[str] = []
     conditions: Dict[str, Any] = {}
     enforcement_action: EnforcementAction
-    enabled: bool
-    violations_count: int
+    enabled: bool = False
+    violations_count: int = 0
     last_violation: Optional[datetime] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -452,7 +452,7 @@ class OTPolicyRuleResponse(DBModel):
 class OTPolicyRuleCreate(BaseModel):
     """Create OT Policy Rule"""
 
-    name: str
+    name: str = ""
     description: Optional[str] = None
     rule_type: RuleType
     purdue_levels_applied: Optional[List[str]] = None
@@ -474,32 +474,32 @@ class OTPolicyListResponse(BaseModel):
     """Paginated OT Policy List"""
 
     items: List[OTPolicyRuleResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 # Dashboard Schemas
 class AssetInventoryStats(BaseModel):
     """Asset Inventory Statistics"""
 
-    total_assets: int
+    total_assets: int = 0
     by_type: Dict[str, int] = {}
     by_purdue_level: Dict[str, int] = {}
     by_criticality: Dict[str, int] = {}
-    online_count: int
-    offline_count: int
+    online_count: int = 0
+    offline_count: int = 0
 
 
 class AlertStats(BaseModel):
     """Alert Statistics"""
 
-    total_alerts: int
+    total_alerts: int = 0
     by_severity: Dict[str, int] = {}
     by_status: Dict[str, int] = {}
-    new_alerts_24h: int
-    resolved_24h: int
+    new_alerts_24h: int = 0
+    resolved_24h: int = 0
 
 
 class ComplianceScores(BaseModel):
@@ -532,7 +532,7 @@ class ComplianceReportResponse(BaseModel):
     nerc_cip: Dict[str, Any] = {}
     iec_62443: Dict[str, Any] = {}
     nist_sp_800_82: Dict[str, Any] = {}
-    overall_compliant: bool
+    overall_compliant: bool = False
     remediation_actions: List[str] = []
 
 
@@ -540,9 +540,9 @@ class ComplianceReportResponse(BaseModel):
 class AssetRisk(BaseModel):
     """Asset Risk Assessment"""
 
-    asset_id: str
-    name: str
-    risk_score: float
+    asset_id: str = ""
+    name: str = ""
+    risk_score: float = 0.0
     risk_level: str  # critical, high, medium, low
     vulnerabilities: List[str] = []
     exposure_factors: List[str] = []
@@ -552,10 +552,10 @@ class OTRiskAssessmentResponse(BaseModel):
     """OT Risk Assessment Report Response"""
 
     timestamp: Optional[datetime] = None
-    total_assets: int
-    critical_risk_assets: int
-    high_risk_assets: int
-    medium_risk_assets: int
+    total_assets: int = 0
+    critical_risk_assets: int = 0
+    high_risk_assets: int = 0
+    medium_risk_assets: int = 0
     asset_risks: List[AssetRisk] = []
     network_risks: List[Dict[str, Any]] = []
     compliance_risks: List[Dict[str, Any]] = []

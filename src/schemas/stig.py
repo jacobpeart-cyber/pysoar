@@ -47,7 +47,7 @@ class BenchmarkStatusEnum(str, Enum):
 
 class STIGBenchmarkBase(BaseModel):
     """Base STIG Benchmark schema"""
-    benchmark_id: str
+    benchmark_id: str = ""
     title: Optional[str] = None
     version: Optional[str] = None
     release: Optional[str] = None
@@ -63,9 +63,9 @@ class STIGBenchmarkBase(BaseModel):
 
 class STIGBenchmarkResponse(STIGBenchmarkBase):
     """STIG Benchmark response schema"""
-    id: str
+    id: str = ""
     last_scan_at: Optional[datetime] = None
-    organization_id: str
+    organization_id: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -74,11 +74,11 @@ class STIGBenchmarkResponse(STIGBenchmarkBase):
 
 class STIGRuleBase(BaseModel):
     """Base STIG Rule schema"""
-    rule_id: str
+    rule_id: str = ""
     stig_id: Optional[str] = None
     group_id: Optional[str] = None
     severity: SeverityEnum
-    title: str
+    title: str = ""
     description: Optional[str] = None
     check_text: Optional[str] = None
     fix_text: Optional[str] = None
@@ -91,9 +91,9 @@ class STIGRuleBase(BaseModel):
 
 class STIGRuleResponse(STIGRuleBase):
     """STIG Rule response schema"""
-    id: str
-    benchmark_id_ref: str
-    organization_id: str
+    id: str = ""
+    benchmark_id_ref: str = ""
+    organization_id: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -102,7 +102,7 @@ class STIGRuleResponse(STIGRuleBase):
 
 class STIGScanResultBase(BaseModel):
     """Base STIG Scan Result schema"""
-    target_host: str
+    target_host: str = ""
     target_ip: Optional[str] = None
     scan_type: ScanTypeEnum
     scanner: Optional[str] = None
@@ -120,9 +120,9 @@ class STIGScanResultBase(BaseModel):
 
 class STIGScanResultResponse(STIGScanResultBase):
     """STIG Scan Result response schema"""
-    id: str
-    benchmark_id_ref: str
-    organization_id: str
+    id: str = ""
+    benchmark_id_ref: str = ""
+    organization_id: str = ""
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     findings: Optional[dict[str, Any]] = None
@@ -134,8 +134,8 @@ class STIGScanResultResponse(STIGScanResultBase):
 
 class SCAPProfileBase(BaseModel):
     """Base SCAP Profile schema"""
-    name: str
-    profile_type: str
+    name: str = ""
+    profile_type: str = ""
     description: Optional[str] = None
     content_path: Optional[str] = None
     content_hash: Optional[str] = None
@@ -146,8 +146,8 @@ class SCAPProfileBase(BaseModel):
 
 class SCAPProfileResponse(SCAPProfileBase):
     """SCAP Profile response schema"""
-    id: str
-    organization_id: str
+    id: str = ""
+    organization_id: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -216,59 +216,59 @@ class ARFReportRequest(BaseModel):
 
 class ScanComparisonResponse(BaseModel):
     """Scan comparison result"""
-    scan_1: str
-    scan_2: str
-    host: str
-    benchmark: str
-    compliance_delta: float
-    open_delta: int
-    cat1_delta: int
-    cat2_delta: int
-    cat3_delta: int
-    improvements: int
-    regressions: int
+    scan_1: str = ""
+    scan_2: str = ""
+    host: str = ""
+    benchmark: str = ""
+    compliance_delta: float = 0.0
+    open_delta: int = 0
+    cat1_delta: int = 0
+    cat2_delta: int = 0
+    cat3_delta: int = 0
+    improvements: int = 0
+    regressions: int = 0
     improved_rules: list[str]
     regressed_rules: list[str]
-    trend: str
+    trend: str = ""
 
 
 class RemediationScriptResponse(BaseModel):
     """Remediation script response"""
-    platform: str
-    script: str
-    total_findings: int
+    platform: str = ""
+    script: str = ""
+    total_findings: int = 0
     generated_at: Optional[datetime] = None
     script_format: str = "text"
 
 
 class RemediationResponse(BaseModel):
     """Auto-remediation response"""
-    scan_id: str
-    host: str
-    total_findings: int
-    remediated: int
-    failed: int
-    status: str
+    scan_id: str = ""
+    host: str = ""
+    total_findings: int = 0
+    remediated: int = 0
+    failed: int = 0
+    status: str = ""
     actions: list[dict[str, Any]]
 
 
 class SCAPScanResponse(BaseModel):
     """SCAP scan result"""
-    profile_id: str
-    profile_name: str
-    target: str
-    checks_evaluated: int
-    checks_passed: int
-    checks_failed: int
-    checks_notapplicable: int
-    status: str
+    profile_id: str = ""
+    profile_name: str = ""
+    target: str = ""
+    checks_evaluated: int = 0
+    checks_passed: int = 0
+    checks_failed: int = 0
+    checks_notapplicable: int = 0
+    status: str = ""
     timestamp: Optional[datetime] = None
 
 
 class ARFReportResponse(BaseModel):
     """Assessment Results Format report"""
-    scan_id: str
-    arf_version: str
+    scan_id: str = ""
+    arf_version: str = ""
     asset: dict[str, Any]
     assessment: dict[str, Any]
     findings: dict[str, Any]
@@ -277,7 +277,7 @@ class ARFReportResponse(BaseModel):
 
 class STIGDashboardStats(BaseModel):
     """STIG compliance dashboard statistics"""
-    organization_id: str
+    organization_id: str = ""
     total_benchmarks: int = 0
     total_scans: int = 0
     average_compliance: float = 0.0
@@ -293,23 +293,23 @@ class STIGDashboardStats(BaseModel):
 
 class RuleSearchResponse(BaseModel):
     """Rule search result"""
-    rule_id: str
-    title: str
-    severity: str
-    benchmark: str
+    rule_id: str = ""
+    title: str = ""
+    severity: str = ""
+    benchmark: str = ""
     description: Optional[str] = None
 
 
 class BenchmarkListResponse(BaseModel):
     """Benchmark list item"""
-    id: str
-    benchmark_id: str
-    title: str
-    platform: str
-    version: str
-    total_rules: int
-    category_1_count: int
-    category_2_count: int
-    category_3_count: int
-    status: str
+    id: str = ""
+    benchmark_id: str = ""
+    title: str = ""
+    platform: str = ""
+    version: str = ""
+    total_rules: int = 0
+    category_1_count: int = 0
+    category_2_count: int = 0
+    category_3_count: int = 0
+    status: str = ""
     last_scan_at: Optional[datetime] = None

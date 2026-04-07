@@ -72,8 +72,8 @@ class PhishingTemplateResponse(PhishingTemplateBase, DBModel):
     """Response schema for phishing template."""
 
     id: UUID
-    usage_count: int
-    average_click_rate: float
+    usage_count: int = 0
+    average_click_rate: float = 0.0
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -89,8 +89,8 @@ class PhishingTemplateResponse(PhishingTemplateBase, DBModel):
 class TargetMember(BaseModel):
     """Schema for target group member."""
 
-    name: str
-    email: str
+    name: str = ""
+    email: str = ""
     role: str | None = None
     department: str | None = None
 
@@ -123,10 +123,10 @@ class TargetGroupResponse(TargetGroupBase, DBModel):
     """Response schema for target group."""
 
     id: UUID
-    member_count: int
-    risk_level: str
-    avg_click_rate: float
-    campaigns_participated: int
+    member_count: int = 0
+    risk_level: str = ""
+    avg_click_rate: float = 0.0
+    campaigns_participated: int = 0
     last_campaign_date: datetime | None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -185,17 +185,17 @@ class PhishingCampaignResponse(PhishingCampaignBase, DBModel):
     """Response schema for phishing campaign."""
 
     id: UUID
-    status: str
+    status: str = ""
     start_date: datetime | None
     end_date: datetime | None
-    total_targets: int
-    emails_sent: int
-    emails_opened: int
-    links_clicked: int
-    credentials_submitted: int
-    attachments_opened: int
-    reported_count: int
-    created_by: str
+    total_targets: int = 0
+    emails_sent: int = 0
+    emails_opened: int = 0
+    links_clicked: int = 0
+    credentials_submitted: int = 0
+    attachments_opened: int = 0
+    reported_count: int = 0
+    created_by: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -206,14 +206,14 @@ class PhishingCampaignResponse(PhishingCampaignBase, DBModel):
 class CampaignMetrics(BaseModel):
     """Campaign performance metrics."""
 
-    open_rate: float
-    click_rate: float
-    submission_rate: float
-    report_rate: float
-    attachment_open_rate: float
-    vulnerability_index: float
-    security_score: float
-    duration_hours: float
+    open_rate: float = 0.0
+    click_rate: float = 0.0
+    submission_rate: float = 0.0
+    report_rate: float = 0.0
+    attachment_open_rate: float = 0.0
+    vulnerability_index: float = 0.0
+    security_score: float = 0.0
+    duration_hours: float = 0.0
 
 
 class CampaignDetailResponse(PhishingCampaignResponse):
@@ -242,7 +242,7 @@ class CampaignScheduleRequest(BaseModel):
 class CampaignEventBase(BaseModel):
     """Base schema for campaign events."""
 
-    target_email: str
+    target_email: str = ""
     target_name: str | None = None
     event_type: str = Field(
         ...,
@@ -264,7 +264,7 @@ class CampaignEventResponse(CampaignEventBase, DBModel):
     """Response schema for campaign event."""
 
     id: UUID
-    campaign_id: str
+    campaign_id: str = ""
     event_timestamp: Optional[datetime] = None
     ip_address: str | None
     user_agent: str | None
@@ -285,7 +285,7 @@ class CampaignEventResponse(CampaignEventBase, DBModel):
 class TrainingAssignment(BaseModel):
     """Training assignment status."""
 
-    module: str
+    module: str = ""
     status: str  # assigned, in_progress, completed
     completion_date: datetime | None = None
 
@@ -293,7 +293,7 @@ class TrainingAssignment(BaseModel):
 class Certification(BaseModel):
     """User certification."""
 
-    name: str
+    name: str = ""
     completed_at: datetime
     valid_until: datetime
 
@@ -301,8 +301,8 @@ class Certification(BaseModel):
 class SecurityAwarenessScoreBase(BaseModel):
     """Base schema for awareness scores."""
 
-    user_email: str
-    user_name: str
+    user_email: str = ""
+    user_name: str = ""
     department: str | None = None
 
 
@@ -310,15 +310,15 @@ class SecurityAwarenessScoreResponse(SecurityAwarenessScoreBase, DBModel):
     """Response schema for security awareness score."""
 
     id: UUID
-    overall_score: int
-    phishing_score: int
-    training_completion_rate: float
-    campaigns_participated: int
-    times_clicked: int
-    times_reported: int
-    times_submitted_credentials: int
+    overall_score: int = 0
+    phishing_score: int = 0
+    training_completion_rate: float = 0.0
+    campaigns_participated: int = 0
+    times_clicked: int = 0
+    times_reported: int = 0
+    times_submitted_credentials: int = 0
     last_failed_campaign: datetime | None
-    risk_category: str
+    risk_category: str = ""
     training_assignments: list[TrainingAssignment]
     certifications: list[Certification]
     created_at: Optional[datetime] = None
@@ -346,10 +346,10 @@ class UserScoreCalculationRequest(BaseModel):
 class TrainingModuleResponse(BaseModel):
     """Training module information."""
 
-    id: str
-    title: str
-    description: str
-    duration_minutes: int
+    id: str = ""
+    title: str = ""
+    description: str = ""
+    duration_minutes: int = 0
     modules: list[str]
 
 
@@ -363,20 +363,20 @@ class TrainingAssignmentRequest(BaseModel):
 class TrainingCompletionRequest(BaseModel):
     """Request to track training completion."""
 
-    module_name: str
-    completion_time_minutes: int
+    module_name: str = ""
+    completion_time_minutes: int = 0
 
 
 class TrainingCertificateResponse(BaseModel):
     """Training certificate."""
 
     id: UUID
-    user_email: str
-    user_name: str
-    module: str
+    user_email: str = ""
+    user_name: str = ""
+    module: str = ""
     issued_at: Optional[datetime] = None
     valid_until: Optional[datetime] = None
-    certificate_number: str
+    certificate_number: str = ""
 
 
 # ============================================================================
@@ -387,21 +387,21 @@ class TrainingCertificateResponse(BaseModel):
 class DepartmentStats(BaseModel):
     """Department statistics."""
 
-    department: str
-    user_count: int
-    avg_score: float
-    avg_phishing_score: float
-    min_score: float
-    max_score: float
+    department: str = ""
+    user_count: int = 0
+    avg_score: float = 0.0
+    avg_phishing_score: float = 0.0
+    min_score: float = 0.0
+    max_score: float = 0.0
     risk_distribution: dict[str, int]
 
 
 class RiskReport(BaseModel):
     """Risk assessment report."""
 
-    total_users: int
-    total_departments: int
-    avg_score: float
+    total_users: int = 0
+    total_departments: int = 0
+    avg_score: float = 0.0
     risk_distribution: dict[str, int]
     high_risk_users: list[SecurityAwarenessScoreResponse]
     critical_risk_users: list[SecurityAwarenessScoreResponse]
@@ -411,8 +411,8 @@ class RiskReport(BaseModel):
 class IndustryBenchmark(BaseModel):
     """Industry benchmark comparison."""
 
-    organization_click_rate: float
-    industry_average: float
+    organization_click_rate: float = 0.0
+    industry_average: float = 0.0
     vs_industry: str  # below_average, above_average
     percentile: str  # top_25, top_50, bottom_50, bottom_25
 
@@ -420,27 +420,27 @@ class IndustryBenchmark(BaseModel):
 class CampaignComparisonResponse(BaseModel):
     """Campaign comparison data."""
 
-    campaign_id: str
-    campaign_name: str
-    status: str
-    click_rate: float
-    submission_rate: float
-    report_rate: float
-    difficulty_level: str
-    target_count: int
+    campaign_id: str = ""
+    campaign_name: str = ""
+    status: str = ""
+    click_rate: float = 0.0
+    submission_rate: float = 0.0
+    report_rate: float = 0.0
+    difficulty_level: str = ""
+    target_count: int = 0
 
 
 class DashboardResponse(BaseModel):
     """Phishing simulation dashboard data."""
 
-    total_campaigns: int
-    active_campaigns: int
-    completed_campaigns: int
-    avg_click_rate: float
-    avg_submission_rate: float
-    total_users_at_risk: int
-    high_risk_count: int
-    critical_risk_count: int
+    total_campaigns: int = 0
+    active_campaigns: int = 0
+    completed_campaigns: int = 0
+    avg_click_rate: float = 0.0
+    avg_submission_rate: float = 0.0
+    total_users_at_risk: int = 0
+    high_risk_count: int = 0
+    critical_risk_count: int = 0
     recent_campaigns: list[CampaignComparisonResponse]
     department_stats: list[DepartmentStats]
     risk_distribution: dict[str, int]
@@ -455,29 +455,29 @@ class DashboardResponse(BaseModel):
 class RenderedTemplate(BaseModel):
     """Rendered template with personalization."""
 
-    subject_line: str
-    html_body: str
-    sender_name: str
-    sender_email: str
+    subject_line: str = ""
+    html_body: str = ""
+    sender_name: str = ""
+    sender_email: str = ""
 
 
 class TemplateValidationResult(BaseModel):
     """Template validation results."""
 
-    template_id: str
-    is_valid: bool
+    template_id: str = ""
+    is_valid: bool = False
     issues: list[str]
     placeholders_found: list[str]
-    links_found: int
+    links_found: int = 0
 
 
 class TemplateEffectivenessResponse(BaseModel):
     """Template effectiveness metrics."""
 
-    template_id: str
-    name: str
-    usage_count: int
-    average_click_rate: float
-    category: str
-    difficulty: str
-    effectiveness_rating: str
+    template_id: str = ""
+    name: str = ""
+    usage_count: int = 0
+    average_click_rate: float = 0.0
+    category: str = ""
+    difficulty: str = ""
+    effectiveness_rating: str = ""

@@ -10,18 +10,18 @@ T = TypeVar("T")
 class HealthResponse(BaseModel):
     """Health check response"""
 
-    status: str
-    version: str
-    environment: str
-    database: str
-    redis: str
+    status: str = ""
+    version: str = ""
+    environment: str = ""
+    database: str = ""
+    redis: str = ""
 
 
 class ErrorResponse(BaseModel):
     """Standard error response"""
 
-    error: str
-    message: str
+    error: str = ""
+    message: str = ""
     details: Optional[dict[str, Any]] = None
     request_id: Optional[str] = None
 
@@ -30,17 +30,17 @@ class SuccessResponse(BaseModel):
     """Standard success response"""
 
     success: bool = True
-    message: str
+    message: str = ""
 
 
 class PaginatedResponse(BaseModel, Generic[T]):
     """Generic paginated response"""
 
     items: list[T]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class FilterParams(BaseModel):
@@ -58,8 +58,8 @@ class FilterParams(BaseModel):
 class BulkActionResponse(BaseModel):
     """Response for bulk actions"""
 
-    success_count: int
-    failure_count: int
+    success_count: int = 0
+    failure_count: int = 0
     failures: list[dict[str, str]] = []
 
 

@@ -39,8 +39,8 @@ class UserUpdate(BaseModel):
 class UserResponse(UserBase, DBModel):
     """Schema for user response"""
 
-    id: str
-    is_superuser: bool
+    id: str = ""
+    is_superuser: bool = False
     avatar_url: Optional[str] = None
     last_login: Optional[str] = None
     created_at: Optional[datetime] = None
@@ -54,7 +54,7 @@ class UserListResponse(BaseModel):
     """Schema for paginated user list"""
 
     items: list[UserResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0

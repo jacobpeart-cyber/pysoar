@@ -8,8 +8,8 @@ from pydantic import BaseModel
 
 class AuditLogBase(BaseModel):
     """Base audit log schema"""
-    action: str
-    resource_type: str
+    action: str = ""
+    resource_type: str = ""
     resource_id: Optional[str] = None
     description: Optional[str] = None
     ip_address: Optional[str] = None
@@ -27,7 +27,7 @@ class AuditLogCreate(AuditLogBase):
 
 class AuditLogResponse(AuditLogBase, DBModel):
     """Schema for audit log responses"""
-    id: str
+    id: str = ""
     user_id: Optional[str] = None
     user_email: Optional[str] = None
     user_name: Optional[str] = None
@@ -42,7 +42,7 @@ class AuditLogResponse(AuditLogBase, DBModel):
 class AuditLogListResponse(BaseModel):
     """Paginated list of audit logs"""
     items: List[AuditLogResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0

@@ -65,15 +65,15 @@ class AssetUpdate(BaseModel):
 
 class AssetResponse(AssetBase, DBModel):
     """Schema for asset response"""
-    id: str
-    name: str
+    id: str = ""
+    name: str = ""
     hostname: Optional[str]
-    asset_type: str
-    status: str
+    asset_type: str = ""
+    status: str = ""
     ip_address: Optional[str]
     mac_address: Optional[str]
     fqdn: Optional[str]
-    criticality: str
+    criticality: str = ""
     business_unit: Optional[str]
     department: Optional[str]
     owner: Optional[str]
@@ -87,8 +87,8 @@ class AssetResponse(AssetBase, DBModel):
     last_scan: Optional[str]
     description: Optional[str]
     tags: Optional[list[str]]
-    is_monitored: bool
-    agent_installed: bool
+    is_monitored: bool = False
+    agent_installed: bool = False
     last_seen: Optional[str]
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -100,7 +100,7 @@ class AssetResponse(AssetBase, DBModel):
 class AssetListResponse(BaseModel):
     """Schema for paginated asset list"""
     items: list[AssetResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0

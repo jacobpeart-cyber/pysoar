@@ -23,7 +23,7 @@ class RiskScenarioBase(BaseModel):
     threat_type: str = Field(..., max_length=255)
     vulnerability_exploited: str = Field(..., max_length=255)
     loss_type: str = Field(default="productivity", max_length=50)
-    analyst_id: str
+    analyst_id: str = ""
     confidence_level: float = Field(default=0.5, ge=0, le=1)
 
 
@@ -52,8 +52,8 @@ class RiskScenarioUpdate(BaseModel):
 class RiskScenarioResponse(RiskScenarioBase, DBModel):
     """Schema for risk scenario response"""
 
-    id: str
-    status: str
+    id: str = ""
+    status: str = ""
     review_date: Optional[datetime]
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -66,17 +66,17 @@ class RiskScenarioListResponse(BaseModel):
     """Schema for paginated risk scenario list"""
 
     items: list[RiskScenarioResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 # FAIR Analysis Schemas
 class FAIRAnalysisBase(BaseModel):
     """Base FAIR analysis schema"""
 
-    scenario_id: str
+    scenario_id: str = ""
     tef_min: float = Field(..., ge=0)
     tef_mode: float = Field(..., ge=0)
     tef_max: float = Field(..., ge=0)
@@ -129,8 +129,8 @@ class FAIRAnalysisUpdate(BaseModel):
 class FAIRAnalysisResponse(FAIRAnalysisBase, DBModel):
     """Schema for FAIR analysis response"""
 
-    id: str
-    organization_id: str
+    id: str = ""
+    organization_id: str = ""
     ale_mean: Optional[float]
     ale_p10: Optional[float]
     ale_p50: Optional[float]
@@ -149,20 +149,20 @@ class FAIRAnalysisListResponse(BaseModel):
     """Schema for paginated FAIR analysis list"""
 
     items: list[FAIRAnalysisResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class FAIRResultsResponse(BaseModel):
     """Schema for FAIR simulation results"""
 
-    ale_mean: float
-    ale_p10: float
-    ale_p50: float
-    ale_p90: float
-    ale_p99: float
+    ale_mean: float = 0.0
+    ale_p10: float = 0.0
+    ale_p50: float = 0.0
+    ale_p90: float = 0.0
+    ale_p99: float = 0.0
     loss_exceedance_curve: dict
     ale_statistics: dict
     risk_distribution: dict
@@ -180,7 +180,7 @@ class RiskRegisterBase(BaseModel):
     risk_treatment: str = Field(..., max_length=50)
     treatment_plan: Optional[str] = None
     control_effectiveness: float = Field(default=0.0, ge=0, le=1)
-    owner_id: str
+    owner_id: str = ""
     review_frequency_days: int = Field(default=90, ge=1, le=365)
     ale_annual_usd: float = Field(..., ge=0)
     risk_appetite_threshold_usd: float = Field(..., ge=0)
@@ -210,12 +210,12 @@ class RiskRegisterUpdate(BaseModel):
 class RiskRegisterResponse(RiskRegisterBase, DBModel):
     """Schema for risk register response"""
 
-    id: str
-    organization_id: str
-    status: str
+    id: str = ""
+    organization_id: str = ""
+    status: str = ""
     last_review: Optional[datetime]
     next_review: Optional[datetime]
-    is_within_appetite: bool
+    is_within_appetite: bool = False
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -227,17 +227,17 @@ class RiskRegisterListResponse(BaseModel):
     """Schema for paginated risk register list"""
 
     items: list[RiskRegisterResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 # Risk Control Schemas
 class RiskControlBase(BaseModel):
     """Base risk control schema"""
 
-    risk_register_id: str
+    risk_register_id: str = ""
     control_name: str = Field(..., min_length=1, max_length=255)
     control_type: str = Field(default="preventive", max_length=50)
     implementation_status: str = Field(default="planned", max_length=50)
@@ -266,8 +266,8 @@ class RiskControlUpdate(BaseModel):
 class RiskControlResponse(RiskControlBase, DBModel):
     """Schema for risk control response"""
 
-    id: str
-    organization_id: str
+    id: str = ""
+    organization_id: str = ""
     roi_percentage: Optional[float]
     last_tested: Optional[datetime]
     test_result: Optional[str]
@@ -282,10 +282,10 @@ class RiskControlListResponse(BaseModel):
     """Schema for paginated risk control list"""
 
     items: list[RiskControlResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 # Business Impact Assessment Schemas
@@ -332,8 +332,8 @@ class BusinessImpactAssessmentUpdate(BaseModel):
 class BusinessImpactAssessmentResponse(BusinessImpactAssessmentBase, DBModel):
     """Schema for BIA response"""
 
-    id: str
-    organization_id: str
+    id: str = ""
+    organization_id: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -345,24 +345,24 @@ class BusinessImpactAssessmentListResponse(BaseModel):
     """Schema for paginated BIA list"""
 
     items: list[BusinessImpactAssessmentResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 # Dashboard and Analytics Schemas
 class RiskDashboardResponse(BaseModel):
     """Risk quantification dashboard response"""
 
-    total_ale_annual_usd: float
-    number_of_risks: int
-    average_ale_per_risk: float
-    risks_within_appetite: int
-    risks_exceeding_appetite: int
+    total_ale_annual_usd: float = 0.0
+    number_of_risks: int = 0
+    average_ale_per_risk: float = 0.0
+    risks_within_appetite: int = 0
+    risks_exceeding_appetite: int = 0
     top_risks_by_ale: list[dict]
     ale_by_category: dict
-    control_effectiveness_avg: float
+    control_effectiveness_avg: float = 0.0
 
 
 class RiskHeatmapResponse(BaseModel):
@@ -376,33 +376,33 @@ class RiskHeatmapResponse(BaseModel):
 class ComparisonResponse(BaseModel):
     """Risk scenario comparison response"""
 
-    scenario_1_name: str
-    scenario_2_name: str
-    ale_difference: float
-    ale_percent_difference: float
+    scenario_1_name: str = ""
+    scenario_2_name: str = ""
+    ale_difference: float = 0.0
+    ale_percent_difference: float = 0.0
     key_driver_differences: list[dict]
 
 
 class ControlROIResponse(BaseModel):
     """Control ROI analysis response"""
 
-    control_name: str
-    annual_benefit_usd: float
-    annual_cost_usd: float
-    net_annual_benefit_usd: float
-    roi_5_year_percent: float
-    payback_period_months: float
-    effective: bool
+    control_name: str = ""
+    annual_benefit_usd: float = 0.0
+    annual_cost_usd: float = 0.0
+    net_annual_benefit_usd: float = 0.0
+    roi_5_year_percent: float = 0.0
+    payback_period_months: float = 0.0
+    effective: bool = False
 
 
 class ControlRecommendationResponse(BaseModel):
     """Control recommendation response"""
 
-    rank: int
-    control_name: str
-    control_type: str
-    annual_cost: float
-    expected_effectiveness: float
-    estimated_ale_reduction: float
-    roi_percent: float
-    implementation_priority: str
+    rank: int = 0
+    control_name: str = ""
+    control_type: str = ""
+    annual_cost: float = 0.0
+    expected_effectiveness: float = 0.0
+    estimated_ale_reduction: float = 0.0
+    roi_percent: float = 0.0
+    implementation_priority: str = ""

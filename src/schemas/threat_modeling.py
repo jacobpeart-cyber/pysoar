@@ -62,12 +62,12 @@ class ThreatModelUpdate(BaseModel):
 
 class ThreatModelResponse(ThreatModelBase, DBModel):
     """Schema for threat model response"""
-    id: str
-    organization_id: str
-    status: str
-    risk_score: int
-    threats_count: int
-    mitigations_count: int
+    id: str = ""
+    organization_id: str = ""
+    status: str = ""
+    risk_score: int = 0
+    threats_count: int = 0
+    mitigations_count: int = 0
     created_by: Optional[str] = None
     reviewed_by: Optional[str] = None
     review_date: Optional[str] = None
@@ -82,16 +82,16 @@ class ThreatModelResponse(ThreatModelBase, DBModel):
 class ThreatModelListResponse(BaseModel):
     """Schema for paginated threat model list"""
     items: list[ThreatModelResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 # Component schemas
 class ComponentBase(BaseModel):
     """Base component schema"""
-    component_type: str
+    component_type: str = ""
     name: str = Field(..., min_length=1, max_length=500)
     description: Optional[str] = None
     technology_stack: Optional[str] = None
@@ -103,7 +103,7 @@ class ComponentBase(BaseModel):
 
 class ComponentCreate(ComponentBase):
     """Schema for creating component"""
-    model_id: str
+    model_id: str = ""
 
 
 class ComponentUpdate(BaseModel):
@@ -119,9 +119,9 @@ class ComponentUpdate(BaseModel):
 
 class ComponentResponse(ComponentBase, DBModel):
     """Schema for component response"""
-    id: str
-    model_id: str
-    organization_id: str
+    id: str = ""
+    model_id: str = ""
+    organization_id: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -146,7 +146,7 @@ class ThreatBase(BaseModel):
 
 class ThreatCreate(ThreatBase):
     """Schema for creating threat"""
-    model_id: str
+    model_id: str = ""
     component_id: Optional[str] = None
     mitre_technique_ids: Optional[list[str]] = None
     cwe_ids: Optional[list[str]] = None
@@ -166,11 +166,11 @@ class ThreatUpdate(BaseModel):
 
 class ThreatResponse(ThreatBase, DBModel):
     """Schema for threat response"""
-    id: str
-    model_id: str
+    id: str = ""
+    model_id: str = ""
     component_id: Optional[str] = None
-    organization_id: str
-    risk_score: int
+    organization_id: str = ""
+    risk_score: int = 0
     mitre_technique_ids: Optional[list[str]] = None
     cwe_ids: Optional[list[str]] = None
     created_at: Optional[datetime] = None
@@ -183,16 +183,16 @@ class ThreatResponse(ThreatBase, DBModel):
 class ThreatListResponse(BaseModel):
     """Schema for paginated threat list"""
     items: list[ThreatResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 # Mitigation schemas
 class MitigationBase(BaseModel):
     """Base mitigation schema"""
-    mitigation_type: str
+    mitigation_type: str = ""
     title: str = Field(..., min_length=1, max_length=500)
     description: Optional[str] = None
     implementation_status: str = "planned"
@@ -205,7 +205,7 @@ class MitigationBase(BaseModel):
 
 class MitigationCreate(MitigationBase):
     """Schema for creating mitigation"""
-    threat_id: str
+    threat_id: str = ""
     assigned_to: Optional[str] = None
 
 
@@ -224,9 +224,9 @@ class MitigationUpdate(BaseModel):
 
 class MitigationResponse(MitigationBase, DBModel):
     """Schema for mitigation response"""
-    id: str
-    threat_id: str
-    organization_id: str
+    id: str = ""
+    threat_id: str = ""
+    organization_id: str = ""
     assigned_to: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -238,10 +238,10 @@ class MitigationResponse(MitigationBase, DBModel):
 class MitigationListResponse(BaseModel):
     """Schema for paginated mitigation list"""
     items: list[MitigationResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 # Attack tree schemas
@@ -255,7 +255,7 @@ class AttackTreeBase(BaseModel):
 
 class AttackTreeCreate(AttackTreeBase):
     """Schema for creating attack tree"""
-    model_id: str
+    model_id: str = ""
 
 
 class AttackTreeUpdate(BaseModel):
@@ -268,14 +268,14 @@ class AttackTreeUpdate(BaseModel):
 
 class AttackTreeResponse(AttackTreeBase, DBModel):
     """Schema for attack tree response"""
-    id: str
-    model_id: str
-    organization_id: str
-    total_attack_paths: int
+    id: str = ""
+    model_id: str = ""
+    organization_id: str = ""
+    total_attack_paths: int = 0
     minimum_cost_path_usd: Optional[int] = None
     minimum_skill_path: Optional[str] = None
     highest_probability_path: Optional[str] = None
-    generated_from_stride: bool
+    generated_from_stride: bool = False
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -286,46 +286,46 @@ class AttackTreeResponse(AttackTreeBase, DBModel):
 class AttackTreeListResponse(BaseModel):
     """Schema for paginated attack tree list"""
     items: list[AttackTreeResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 # Analysis schemas
 class STRIDEAnalysisRequest(BaseModel):
     """Request for STRIDE analysis"""
-    model_id: str
+    model_id: str = ""
     component_ids: Optional[list[str]] = None
     auto_generate: bool = True
 
 
 class STRIDEAnalysisResponse(BaseModel):
     """Response from STRIDE analysis"""
-    status: str
-    model_id: str
-    threats_generated: int
-    timestamp: str
+    status: str = ""
+    model_id: str = ""
+    threats_generated: int = 0
+    timestamp: str = ""
 
 
 class PASTAAnalysisRequest(BaseModel):
     """Request for PASTA analysis"""
-    model_id: str
+    model_id: str = ""
     include_attack_trees: bool = True
 
 
 class PASTAAnalysisResponse(BaseModel):
     """Response from PASTA analysis"""
-    status: str
-    model_id: str
-    stages_completed: int
-    timestamp: str
+    status: str = ""
+    model_id: str = ""
+    stages_completed: int = 0
+    timestamp: str = ""
 
 
 # Validation schemas
 class ValidationRequest(BaseModel):
     """Request for model validation"""
-    model_id: str
+    model_id: str = ""
     check_completeness: bool = True
     check_coverage: bool = True
     check_staleness: bool = True
@@ -333,25 +333,25 @@ class ValidationRequest(BaseModel):
 
 class ValidationResponse(BaseModel):
     """Validation report response"""
-    model_id: str
-    model_name: str
-    overall_valid: bool
+    model_id: str = ""
+    model_name: str = ""
+    overall_valid: bool = False
     completeness: dict[str, Any]
     coverage: dict[str, Any]
-    is_stale: bool
+    is_stale: bool = False
     recommendations: list[str]
-    timestamp: str
+    timestamp: str = ""
 
 
 # Dashboard schemas
 class ThreatModelDashboard(BaseModel):
     """Dashboard data for threat models"""
-    total_models: int
-    total_threats: int
-    high_risk_threats: int
-    mitigations_planned: int
-    mitigations_implemented: int
-    average_risk_score: float
+    total_models: int = 0
+    total_threats: int = 0
+    high_risk_threats: int = 0
+    mitigations_planned: int = 0
+    mitigations_implemented: int = 0
+    average_risk_score: float = 0.0
     models_by_status: dict[str, int]
     threats_by_stride: dict[str, int]
 
@@ -366,15 +366,15 @@ class RiskMatrix(BaseModel):
 # Recommendation schemas
 class MitigationRecommendation(BaseModel):
     """Recommended mitigation"""
-    type: str
-    title: str
-    description: str
+    type: str = ""
+    title: str = ""
+    description: str = ""
     controls: dict[str, list[str]]
-    cost_estimate: int
+    cost_estimate: int = 0
     priority_score: Optional[float] = None
 
 
 class RecommendationResponse(BaseModel):
     """Response with mitigation recommendations"""
-    threat_id: str
+    threat_id: str = ""
     recommendations: list[MitigationRecommendation]

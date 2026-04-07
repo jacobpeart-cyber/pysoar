@@ -125,15 +125,15 @@ class Severity(str, Enum):
 class ImageVulnerabilityResponse(DBModel):
     """Image vulnerability details"""
 
-    id: str
-    image_id: str
-    cve_id: str
-    package_name: str
-    package_version: str
+    id: str = ""
+    image_id: str = ""
+    cve_id: str = ""
+    package_name: str = ""
+    package_version: str = ""
     fixed_version: Optional[str]
     severity: VulnerabilitySeverity
     cvss_score: Optional[float]
-    exploit_available: bool
+    exploit_available: bool = False
     description: Optional[str]
     layer_introduced: Optional[str]
     remediation: Optional[str]
@@ -147,9 +147,9 @@ class ImageVulnerabilityResponse(DBModel):
 class ImageVulnerabilityCreateRequest(BaseModel):
     """Create vulnerability"""
 
-    cve_id: str
-    package_name: str
-    package_version: str
+    cve_id: str = ""
+    package_name: str = ""
+    package_version: str = ""
     severity: VulnerabilitySeverity
     cvss_score: Optional[float] = None
     exploit_available: bool = False
@@ -160,26 +160,26 @@ class ImageVulnerabilityCreateRequest(BaseModel):
 class ContainerImageResponse(DBModel):
     """Container image with metadata"""
 
-    id: str
-    registry: str
-    repository: str
-    tag: str
-    digest_sha256: str
+    id: str = ""
+    registry: str = ""
+    repository: str = ""
+    tag: str = ""
+    digest_sha256: str = ""
     image_size_mb: Optional[float]
     os: Optional[str]
     architecture: Optional[str]
     created_at_source: Optional[datetime]
     scanned_at: Optional[datetime] = None
-    vulnerability_count_critical: int
-    vulnerability_count_high: int
-    vulnerability_count_medium: int
-    vulnerability_count_low: int
-    is_signed: bool
-    signature_verified: bool
+    vulnerability_count_critical: int = 0
+    vulnerability_count_high: int = 0
+    vulnerability_count_medium: int = 0
+    vulnerability_count_low: int = 0
+    is_signed: bool = False
+    signature_verified: bool = False
     base_image: Optional[str]
-    sbom_generated: bool
+    sbom_generated: bool = False
     compliance_status: ComplianceStatus
-    risk_score: int
+    risk_score: int = 0
     labels: Dict[str, Any]
     last_deployed: Optional[datetime]
     created_at: Optional[datetime] = None
@@ -215,24 +215,24 @@ class ContainerImageUpdateRequest(BaseModel):
 class KubernetesClusterResponse(DBModel):
     """Kubernetes cluster details"""
 
-    id: str
-    name: str
-    version: str
-    provider: str
-    endpoint: str
-    node_count: int
-    namespace_count: int
-    pod_count: int
-    rbac_enabled: bool
-    network_policy_enabled: bool
+    id: str = ""
+    name: str = ""
+    version: str = ""
+    provider: str = ""
+    endpoint: str = ""
+    node_count: int = 0
+    namespace_count: int = 0
+    pod_count: int = 0
+    rbac_enabled: bool = False
+    network_policy_enabled: bool = False
     pod_security_standards: PodSecurityStandards
-    audit_logging_enabled: bool
-    encryption_at_rest: bool
-    secrets_encrypted: bool
+    audit_logging_enabled: bool = False
+    encryption_at_rest: bool = False
+    secrets_encrypted: bool = False
     admission_controllers: Dict[str, Any]
     last_audit: Optional[datetime]
-    compliance_score: int
-    risk_score: int
+    compliance_score: int = 0
+    risk_score: int = 0
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -245,7 +245,7 @@ class KubernetesClusterCreateRequest(BaseModel):
 
     name: str = Field(..., min_length=1)
     version: str = Field(..., min_length=1)
-    provider: str
+    provider: str = ""
     endpoint: str = Field(..., min_length=1)
     pod_security_standards: PodSecurityStandards = PodSecurityStandards.BASELINE
     admission_controllers: Optional[Dict[str, Any]] = {}
@@ -269,14 +269,14 @@ class KubernetesClusterUpdateRequest(BaseModel):
 class K8sSecurityFindingResponse(DBModel):
     """Kubernetes security finding"""
 
-    id: str
-    cluster_id: str
+    id: str = ""
+    cluster_id: str = ""
     finding_type: FindingType
-    namespace: str
-    resource_type: str
-    resource_name: str
+    namespace: str = ""
+    resource_type: str = ""
+    resource_name: str = ""
     severity: Severity
-    description: str
+    description: str = ""
     remediation: Optional[str]
     cis_benchmark_id: Optional[str]
     status: FindingStatus
@@ -291,13 +291,13 @@ class K8sSecurityFindingResponse(DBModel):
 class K8sSecurityFindingCreateRequest(BaseModel):
     """Create security finding"""
 
-    cluster_id: str
+    cluster_id: str = ""
     finding_type: FindingType
     namespace: str = Field(..., min_length=1)
-    resource_type: str
-    resource_name: str
+    resource_type: str = ""
+    resource_name: str = ""
     severity: Severity
-    description: str
+    description: str = ""
     remediation: Optional[str] = None
     cis_benchmark_id: Optional[str] = None
 
@@ -313,16 +313,16 @@ class K8sSecurityFindingUpdateRequest(BaseModel):
 class RuntimeAlertResponse(DBModel):
     """Runtime security alert"""
 
-    id: str
-    cluster_id: str
+    id: str = ""
+    cluster_id: str = ""
     alert_type: AlertType
-    namespace: str
-    pod_name: str
+    namespace: str = ""
+    pod_name: str = ""
     container_name: Optional[str]
     process_name: Optional[str]
     process_args: Optional[str]
     severity: Severity
-    description: str
+    description: str = ""
     source_ip: Optional[str]
     destination_ip: Optional[str]
     destination_port: Optional[int]
@@ -338,13 +338,13 @@ class RuntimeAlertResponse(DBModel):
 class RuntimeAlertCreateRequest(BaseModel):
     """Create runtime alert"""
 
-    cluster_id: str
+    cluster_id: str = ""
     alert_type: AlertType
-    namespace: str
-    pod_name: str
+    namespace: str = ""
+    pod_name: str = ""
     container_name: Optional[str] = None
     severity: Severity
-    description: str
+    description: str = ""
 
 
 class RuntimeAlertUpdateRequest(BaseModel):
@@ -358,98 +358,98 @@ class RuntimeAlertUpdateRequest(BaseModel):
 class ImageScanRequest(BaseModel):
     """Request image scan"""
 
-    image_id: str
+    image_id: str = ""
 
 
 class ImageScanResponse(BaseModel):
     """Image scan response"""
 
-    status: str
-    image_id: str
-    vulnerabilities: int
-    risk_score: int
+    status: str = ""
+    image_id: str = ""
+    vulnerabilities: int = 0
+    risk_score: int = 0
     compliance_status: ComplianceStatus
 
 
 class ClusterAuditRequest(BaseModel):
     """Request cluster audit"""
 
-    cluster_id: str
+    cluster_id: str = ""
     audit_type: Optional[str] = "full"
 
 
 class ClusterAuditResponse(BaseModel):
     """Cluster audit response"""
 
-    status: str
-    cluster_id: str
-    findings: int
-    risk_score: int
-    compliance_score: int
-    cis_compliance: float
+    status: str = ""
+    cluster_id: str = ""
+    findings: int = 0
+    risk_score: int = 0
+    compliance_score: int = 0
+    cis_compliance: float = 0.0
 
 
 class SecurityFindingRemediationRequest(BaseModel):
     """Request remediation"""
 
-    finding_id: str
+    finding_id: str = ""
     remediation_type: Optional[str] = "auto_generated"
 
 
 class SecurityFindingRemediationResponse(BaseModel):
     """Remediation response"""
 
-    status: str
-    finding_id: str
-    manifest: str
-    description: str
+    status: str = ""
+    finding_id: str = ""
+    manifest: str = ""
+    description: str = ""
 
 
 class RuntimeAlertInvestigationRequest(BaseModel):
     """Investigate runtime alert"""
 
-    alert_id: str
+    alert_id: str = ""
     notes: Optional[str] = None
 
 
 class PodQuarantineRequest(BaseModel):
     """Quarantine pod"""
 
-    cluster_id: str
-    namespace: str
-    pod_name: str
-    reason: str
+    cluster_id: str = ""
+    namespace: str = ""
+    pod_name: str = ""
+    reason: str = ""
 
 
 # Dashboard Schemas
 class VulnerabilityCountResponse(BaseModel):
     """Vulnerability count summary"""
 
-    critical: int
-    high: int
-    medium: int
-    low: int
-    negligible: int
+    critical: int = 0
+    high: int = 0
+    medium: int = 0
+    low: int = 0
+    negligible: int = 0
 
 
 class ClusterComplianceResponse(BaseModel):
     """Cluster compliance status"""
 
-    cluster_name: str
-    risk_score: int
-    compliance_score: int
-    findings_count: int
-    status: str
+    cluster_name: str = ""
+    risk_score: int = 0
+    compliance_score: int = 0
+    findings_count: int = 0
+    status: str = ""
 
 
 class DashboardOverviewResponse(BaseModel):
     """Dashboard overview"""
 
-    total_images: int
-    total_clusters: int
+    total_images: int = 0
+    total_clusters: int = 0
     total_vulnerabilities: VulnerabilityCountResponse
-    critical_findings: int
-    runtime_alerts_new: int
+    critical_findings: int = 0
+    runtime_alerts_new: int = 0
     high_risk_images: int = Field(default=0)
     non_compliant_clusters: int = Field(default=0)
     top_vulnerabilities: List[Dict[str, Any]] = Field(default_factory=list)
@@ -460,11 +460,11 @@ class DashboardOverviewResponse(BaseModel):
 class ComplianceMatrixResponse(BaseModel):
     """Compliance matrix across frameworks"""
 
-    cluster_name: str
-    nsa_cisa_score: int
-    dod_stig_score: int
-    soc2_score: int
-    overall_compliance: int
+    cluster_name: str = ""
+    nsa_cisa_score: int = 0
+    dod_stig_score: int = 0
+    soc2_score: int = 0
+    overall_compliance: int = 0
     timestamp: Optional[datetime] = None
 
 

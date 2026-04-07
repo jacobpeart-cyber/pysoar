@@ -18,7 +18,7 @@ class ForensicCaseBase(BaseModel):
     case_number: str = Field(..., min_length=1, max_length=100)
     title: str = Field(..., min_length=1, max_length=500)
     description: Optional[str] = None
-    case_type: str
+    case_type: str = ""
     severity: str = "medium"
 
 
@@ -47,8 +47,8 @@ class ForensicCaseUpdate(BaseModel):
 class ForensicCaseResponse(ForensicCaseBase, DBModel):
     """Schema for forensic case response"""
 
-    id: str
-    status: str
+    id: str = ""
+    status: str = ""
     lead_investigator_id: Optional[str] = None
     assigned_team: Optional[list[str]] = None
     legal_hold_active: bool = False
@@ -67,10 +67,10 @@ class ForensicCaseListResponse(BaseModel):
     """Schema for paginated forensic case list"""
 
     items: list[ForensicCaseResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 # ============================================================================
@@ -81,9 +81,9 @@ class ForensicCaseListResponse(BaseModel):
 class ChainOfCustodyEntry(BaseModel):
     """Chain of custody log entry"""
 
-    timestamp: str
-    actor: str
-    action: str
+    timestamp: str = ""
+    actor: str = ""
+    action: str = ""
     hash: Optional[str] = None
     details: Optional[str] = None
 
@@ -91,17 +91,17 @@ class ChainOfCustodyEntry(BaseModel):
 class ForensicEvidenceBase(BaseModel):
     """Base forensic evidence schema"""
 
-    evidence_type: str
+    evidence_type: str = ""
     source_device: str = Field(..., min_length=1)
     source_ip: Optional[str] = None
-    acquisition_method: str
-    storage_location: str
+    acquisition_method: str = ""
+    storage_location: str = ""
 
 
 class ForensicEvidenceCreate(ForensicEvidenceBase):
     """Schema for collecting forensic evidence"""
 
-    case_id: str
+    case_id: str = ""
     original_hash_md5: Optional[str] = None
     original_hash_sha256: Optional[str] = None
     file_size_bytes: Optional[int] = None
@@ -124,8 +124,8 @@ class ForensicEvidenceUpdate(BaseModel):
 class ForensicEvidenceResponse(ForensicEvidenceBase, DBModel):
     """Schema for forensic evidence response"""
 
-    id: str
-    case_id: str
+    id: str = ""
+    case_id: str = ""
     original_hash_md5: Optional[str] = None
     original_hash_sha256: Optional[str] = None
     chain_of_custody_log: list[ChainOfCustodyEntry] = Field(default_factory=list)
@@ -145,16 +145,16 @@ class ForensicEvidenceListResponse(BaseModel):
     """Schema for paginated evidence list"""
 
     items: list[ForensicEvidenceResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class EvidenceVerifyRequest(BaseModel):
     """Request to verify evidence integrity"""
 
-    evidence_hash: str
+    evidence_hash: str = ""
     hash_algorithm: str = "sha256"
     original_hash: Optional[str] = None
 
@@ -162,8 +162,8 @@ class EvidenceVerifyRequest(BaseModel):
 class ChainOfCustodyUpdateRequest(BaseModel):
     """Request to update chain of custody"""
 
-    actor: str
-    action: str
+    actor: str = ""
+    action: str = ""
     evidence_hash: Optional[str] = None
     details: Optional[str] = None
 
@@ -194,8 +194,8 @@ class ForensicTimelineBase(BaseModel):
 class ForensicTimelineCreate(ForensicTimelineBase):
     """Schema for creating timeline events"""
 
-    case_id: str
-    event_timestamp: str
+    case_id: str = ""
+    event_timestamp: str = ""
     source_evidence_id: Optional[str] = None
     artifact_data: Optional[dict[str, Any]] = Field(default_factory=dict)
 
@@ -215,9 +215,9 @@ class ForensicTimelineUpdate(BaseModel):
 class ForensicTimelineResponse(ForensicTimelineBase, DBModel):
     """Schema for forensic timeline response"""
 
-    id: str
-    case_id: str
-    event_timestamp: str
+    id: str = ""
+    case_id: str = ""
+    event_timestamp: str = ""
     source_evidence_id: Optional[str] = None
     artifact_data: dict[str, Any] = Field(default_factory=dict)
     created_at: Optional[datetime] = None
@@ -231,10 +231,10 @@ class ForensicTimelineListResponse(BaseModel):
     """Schema for paginated timeline list"""
 
     items: list[ForensicTimelineResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 # ============================================================================
@@ -266,8 +266,8 @@ class ForensicArtifactBase(BaseModel):
 class ForensicArtifactCreate(ForensicArtifactBase):
     """Schema for creating forensic artifacts"""
 
-    case_id: str
-    evidence_id: str
+    case_id: str = ""
+    evidence_id: str = ""
     ioc_extracted: Optional[dict[str, Any]] = Field(default_factory=dict)
 
 
@@ -285,9 +285,9 @@ class ForensicArtifactUpdate(BaseModel):
 class ForensicArtifactResponse(ForensicArtifactBase, DBModel):
     """Schema for forensic artifact response"""
 
-    id: str
-    case_id: str
-    evidence_id: str
+    id: str = ""
+    case_id: str = ""
+    evidence_id: str = ""
     ioc_extracted: dict[str, Any] = Field(default_factory=dict)
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -300,24 +300,24 @@ class ForensicArtifactListResponse(BaseModel):
     """Schema for paginated artifact list"""
 
     items: list[ForensicArtifactResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class ArtifactAnalysisRequest(BaseModel):
     """Request to analyze artifact"""
 
-    artifact_type: str
+    artifact_type: str = ""
     artifact_data: dict[str, Any]
 
 
 class ArtifactAnalysisResponse(BaseModel):
     """Response from artifact analysis"""
 
-    status: str
-    artifact_type: str
+    status: str = ""
+    artifact_type: str = ""
     analysis: dict[str, Any]
     iocs_extracted: int = 0
     mitre_mapping: dict[str, Any] = Field(default_factory=dict)
@@ -326,9 +326,9 @@ class ArtifactAnalysisResponse(BaseModel):
 class IOCExtractionResponse(BaseModel):
     """Response from IOC extraction"""
 
-    status: str
+    status: str = ""
     iocs: IOCData
-    total_extracted: int
+    total_extracted: int = 0
 
 
 # ============================================================================
@@ -339,10 +339,10 @@ class IOCExtractionResponse(BaseModel):
 class LegalHoldBase(BaseModel):
     """Base legal hold schema"""
 
-    hold_type: str
+    hold_type: str = ""
     custodians: list[str]
     data_sources: list[str]
-    issued_by: str
+    issued_by: str = ""
     issued_date: Optional[str] = None
     expiry_date: Optional[str] = None
 
@@ -350,7 +350,7 @@ class LegalHoldBase(BaseModel):
 class LegalHoldCreate(LegalHoldBase):
     """Schema for creating legal holds"""
 
-    case_id: str
+    case_id: str = ""
 
 
 class LegalHoldUpdate(BaseModel):
@@ -366,8 +366,8 @@ class LegalHoldUpdate(BaseModel):
 class LegalHoldResponse(LegalHoldBase, DBModel):
     """Schema for legal hold response"""
 
-    id: str
-    case_id: str
+    id: str = ""
+    case_id: str = ""
     acknowledgments: dict[str, Any] = Field(default_factory=dict)
     status: str = "active"
     created_at: Optional[datetime] = None
@@ -381,30 +381,30 @@ class LegalHoldListResponse(BaseModel):
     """Schema for paginated legal hold list"""
 
     items: list[LegalHoldResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class LegalHoldExtendRequest(BaseModel):
     """Request to extend legal hold"""
 
-    new_expiry_date: str
-    reason: str
+    new_expiry_date: str = ""
+    reason: str = ""
 
 
 class LegalHoldReleaseRequest(BaseModel):
     """Request to release legal hold"""
 
-    reason: str
+    reason: str = ""
 
 
 class CustodianAcknowledgment(BaseModel):
     """Custodian acknowledgment tracking"""
 
-    custodian: str
-    acknowledged: bool
+    custodian: str = ""
+    acknowledged: bool = False
     timestamp: Optional[str] = None
 
 
@@ -416,16 +416,16 @@ class CustodianAcknowledgment(BaseModel):
 class TimelineVisualizationData(BaseModel):
     """Data for timeline visualization"""
 
-    timestamp: str
-    event_type: str
-    severity: float
-    is_pivotal: bool
+    timestamp: str = ""
+    event_type: str = ""
+    severity: float = 0.0
+    is_pivotal: bool = False
 
 
 class CaseReportResponse(BaseModel):
     """Case report response"""
 
-    case_id: str
+    case_id: str = ""
     generated_at: Optional[datetime] = None
     sections: list[str]
     evidence_count: int = 0
@@ -438,16 +438,16 @@ class CaseReportResponse(BaseModel):
 class TimelineExportResponse(BaseModel):
     """Timeline export response"""
 
-    case_id: str
+    case_id: str = ""
     generated_at: Optional[datetime] = None
-    event_count: int
+    event_count: int = 0
     events: list[ForensicTimelineResponse] = Field(default_factory=list)
 
 
 class ChainOfCustodyReportResponse(BaseModel):
     """Chain of custody report"""
 
-    evidence_id: str
+    evidence_id: str = ""
     generated_at: Optional[datetime] = None
     log_entries: list[ChainOfCustodyEntry] = Field(default_factory=list)
     is_court_admissible: bool = True
@@ -461,12 +461,12 @@ class ChainOfCustodyReportResponse(BaseModel):
 class CaseMetrics(BaseModel):
     """Case metrics and statistics"""
 
-    case_id: str
-    evidence_count: int
-    artifact_count: int
-    timeline_events: int
-    legal_holds_active: int
-    investigation_duration_days: int
+    case_id: str = ""
+    evidence_count: int = 0
+    artifact_count: int = 0
+    timeline_events: int = 0
+    legal_holds_active: int = 0
+    investigation_duration_days: int = 0
     high_risk_artifacts: int = 0
     pivotal_events: int = 0
 
@@ -474,12 +474,12 @@ class CaseMetrics(BaseModel):
 class DFIRDashboardResponse(BaseModel):
     """DFIR dashboard overview"""
 
-    total_cases: int
-    active_cases: int
-    cases_in_analysis: int
-    total_evidence_items: int
-    total_artifacts: int
-    legal_holds_active: int
+    total_cases: int = 0
+    active_cases: int = 0
+    cases_in_analysis: int = 0
+    total_evidence_items: int = 0
+    total_artifacts: int = 0
+    legal_holds_active: int = 0
     critical_cases: int = 0
     high_cases: int = 0
     cases_with_legal_holds: int = 0

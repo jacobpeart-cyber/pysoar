@@ -72,8 +72,8 @@ class ExposureAssetUpdate(BaseModel):
 class ExposureAssetResponse(ExposureAssetBase, DBModel):
     """Schema for exposure asset response"""
 
-    id: str
-    is_active: bool
+    id: str = ""
+    is_active: bool = False
     last_seen: Optional[datetime]
     last_scan_at: Optional[datetime]
     risk_score: float = 0.0
@@ -91,10 +91,10 @@ class ExposureAssetListResponse(BaseModel):
     """Schema for paginated exposure asset list"""
 
     items: list[ExposureAssetResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 # ============================================================================
@@ -153,7 +153,7 @@ class VulnerabilityUpdate(BaseModel):
 class VulnerabilityResponse(VulnerabilityBase, DBModel):
     """Schema for vulnerability response"""
 
-    id: str
+    id: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -165,10 +165,10 @@ class VulnerabilityListResponse(BaseModel):
     """Schema for paginated vulnerability list"""
 
     items: list[VulnerabilityResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 # ============================================================================
@@ -209,7 +209,7 @@ class AssetVulnerabilityUpdate(BaseModel):
 class AssetVulnerabilityResponse(AssetVulnerabilityBase, DBModel):
     """Schema for asset-vulnerability response"""
 
-    id: str
+    id: str = ""
     first_detected: Optional[datetime] = None
     last_detected: Optional[datetime] = None
     detection_count: int = 0
@@ -224,10 +224,10 @@ class AssetVulnerabilityListResponse(BaseModel):
     """Schema for paginated asset-vulnerability list"""
 
     items: list[AssetVulnerabilityResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 # ============================================================================
@@ -254,7 +254,7 @@ class ExposureScanCreate(ExposureScanBase):
 class ExposureScanResponse(ExposureScanBase, DBModel):
     """Schema for exposure scan response"""
 
-    id: str
+    id: str = ""
     status: str = Field(default="pending", max_length=50, description="pending, running, completed, failed, cancelled")
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
@@ -272,10 +272,10 @@ class ExposureScanListResponse(BaseModel):
     """Schema for paginated scan list"""
 
     items: list[ExposureScanResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 # ============================================================================
@@ -324,7 +324,7 @@ class RemediationTicketUpdate(BaseModel):
 class RemediationTicketResponse(RemediationTicketBase, DBModel):
     """Schema for remediation ticket response"""
 
-    id: str
+    id: str = ""
     status: str = Field(default="open", max_length=50, description="open, in-progress, completed, cancelled, overdue")
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -338,10 +338,10 @@ class RemediationTicketListResponse(BaseModel):
     """Schema for paginated remediation ticket list"""
 
     items: list[RemediationTicketResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 # ============================================================================
@@ -374,7 +374,7 @@ class AttackSurfaceUpdate(BaseModel):
 class AttackSurfaceResponse(AttackSurfaceBase, DBModel):
     """Schema for attack surface response"""
 
-    id: str
+    id: str = ""
     assets_count: int = 0
     vulnerabilities_count: int = 0
     risk_score: float = 0.0
@@ -390,10 +390,10 @@ class AttackSurfaceListResponse(BaseModel):
     """Schema for paginated attack surface list"""
 
     items: list[AttackSurfaceResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 # ============================================================================
@@ -460,9 +460,9 @@ class ExposureSearchRequest(BaseModel):
 class ExposureReport(BaseModel):
     """Schema for exposure report"""
 
-    title: str
+    title: str = ""
     report_date: datetime
-    summary: str
+    summary: str = ""
     statistics: ExposureDashboardStats
     top_findings: list[dict] = Field(default_factory=list)
     recommendations: list[str] = Field(default_factory=list)
@@ -506,22 +506,22 @@ class AssetDiscoveryRequest(BaseModel):
 class DiscoveryResult(BaseModel):
     """Schema for discovery result"""
 
-    scan_id: str
+    scan_id: str = ""
     discovered_assets: int = 0
     new_assets: int = 0
     updated_assets: int = 0
-    status: str
+    status: str = ""
 
 
 class AssessmentResult(BaseModel):
     """Schema for attack surface assessment result"""
 
-    assessment_id: str
-    surface_id: str
+    assessment_id: str = ""
+    surface_id: str = ""
     total_exposures: int = 0
     critical_exposures: int = 0
     risk_score: float = 0.0
-    status: str
+    status: str = ""
     findings: list[dict] = Field(default_factory=list)
 
 
@@ -533,7 +533,7 @@ class AssessmentResult(BaseModel):
 class RemediationVerificationRequest(BaseModel):
     """Schema for remediation verification"""
 
-    ticket_id: str
+    ticket_id: str = ""
     verification_notes: Optional[str] = None
     evidence: Optional[list[dict]] = Field(None, description="Verification evidence")
 
@@ -541,10 +541,10 @@ class RemediationVerificationRequest(BaseModel):
 class RemediationVerificationResult(BaseModel):
     """Schema for remediation verification result"""
 
-    ticket_id: str
-    verified: bool
+    ticket_id: str = ""
+    verified: bool = False
     verification_date: datetime
-    verified_by: str
+    verified_by: str = ""
     notes: Optional[str] = None
 
 
@@ -565,9 +565,9 @@ class ExternalScannerImportRequest(BaseModel):
 class ScannerImportResult(BaseModel):
     """Schema for scanner import result"""
 
-    import_id: str
-    scanner_name: str
+    import_id: str = ""
+    scanner_name: str = ""
     vulnerabilities_imported: int = 0
     assets_updated: int = 0
-    status: str
+    status: str = ""
     errors: list[str] = Field(default_factory=list)

@@ -207,7 +207,7 @@ class DataSubjectRequestUpdate(BaseModel):
 class DataSubjectRequestResponse(DataSubjectRequestBase, DBModel):
     """Data Subject Request response"""
 
-    id: str
+    id: str = ""
     status: DSRStatus
     deadline: Optional[str]
     data_systems_searched: Optional[List[str]] = None
@@ -222,9 +222,9 @@ class DataSubjectRequestResponse(DataSubjectRequestBase, DBModel):
 class DataSubjectRequestListResponse(BaseModel):
     """Paginated DSR list response"""
 
-    total: int
-    page: int
-    size: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
     items: List[DataSubjectRequestResponse]
 
 
@@ -263,10 +263,10 @@ class PrivacyImpactAssessmentUpdate(BaseModel):
 class PrivacyImpactAssessmentResponse(PrivacyImpactAssessmentBase, DBModel):
     """Privacy Impact Assessment response"""
 
-    id: str
+    id: str = ""
     status: PIAStatus
     risk_level: RiskLevel
-    dpo_review: bool
+    dpo_review: bool = False
     dpo_approval_date: Optional[str]
     mitigations: Optional[List[str]] = None
     created_at: Optional[datetime] = None
@@ -307,11 +307,11 @@ class ConsentRecordUpdate(BaseModel):
 class ConsentRecordResponse(ConsentRecordBase, DBModel):
     """Consent Record response"""
 
-    id: str
-    consent_given: bool
+    id: str = ""
+    consent_given: bool = False
     consent_date: Optional[str]
     withdrawal_date: Optional[str]
-    version: int
+    version: int = 0
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -369,7 +369,7 @@ class DataProcessingRecordUpdate(BaseModel):
 class DataProcessingRecordResponse(DataProcessingRecordBase, DBModel):
     """Data Processing Record response"""
 
-    id: str
+    id: str = ""
     last_reviewed: Optional[str]
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -430,12 +430,12 @@ class PrivacyIncidentUpdate(BaseModel):
 class PrivacyIncidentResponse(PrivacyIncidentBase, DBModel):
     """Privacy Incident response"""
 
-    id: str
+    id: str = ""
     status: IncidentStatus
-    notification_required: bool
+    notification_required: bool = False
     notification_deadline: Optional[str]
-    supervisory_authority_notified: bool
-    subjects_notified: bool
+    supervisory_authority_notified: bool = False
+    subjects_notified: bool = False
     root_cause: Optional[str]
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -452,9 +452,9 @@ class PrivacyIncidentResponse(PrivacyIncidentBase, DBModel):
 class DSRDeadlineAlert(BaseModel):
     """DSR deadline compliance alert"""
 
-    dsr_id: str
+    dsr_id: str = ""
     status: str  # BREACHED, CRITICAL, APPROACHING
-    subject: str
+    subject: str = ""
     days_remaining: Optional[int] = None
     days_overdue: Optional[int] = None
 
@@ -462,26 +462,26 @@ class DSRDeadlineAlert(BaseModel):
 class RetentionViolation(BaseModel):
     """Data retention compliance violation"""
 
-    record_id: str
-    name: str
+    record_id: str = ""
+    name: str = ""
     status: str  # RETENTION_EXCEEDED
-    days_overdue: int
+    days_overdue: int = 0
 
 
 class PrivacyDashboardStats(BaseModel):
     """Privacy module dashboard statistics"""
 
-    total_dsrs: int
-    pending_dsrs: int
-    dsr_compliance_rate: float
-    active_pias: int
-    pias_requiring_review: int
-    total_consents: int
-    withdrawn_consents: int
-    processing_records: int
-    pending_incidents: int
-    incidents_this_month: int
-    avg_incident_resolution_days: float
+    total_dsrs: int = 0
+    pending_dsrs: int = 0
+    dsr_compliance_rate: float = 0.0
+    active_pias: int = 0
+    pias_requiring_review: int = 0
+    total_consents: int = 0
+    withdrawn_consents: int = 0
+    processing_records: int = 0
+    pending_incidents: int = 0
+    incidents_this_month: int = 0
+    avg_incident_resolution_days: float = 0.0
 
 
 class PaginationParams(BaseModel):

@@ -60,15 +60,15 @@ class PlaybookUpdate(BaseModel):
 class PlaybookResponse(PlaybookBase, DBModel):
     """Schema for playbook response"""
 
-    id: str
-    status: str
+    id: str = ""
+    status: str = ""
     steps: list[PlaybookStep]
     trigger_conditions: Optional[dict[str, Any]] = None
     variables: Optional[dict[str, Any]] = None
-    version: int
-    is_enabled: bool
-    timeout_seconds: int
-    max_retries: int
+    version: int = 0
+    is_enabled: bool = False
+    timeout_seconds: int = 0
+    max_retries: int = 0
     created_by: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -81,10 +81,10 @@ class PlaybookListResponse(BaseModel):
     """Schema for paginated playbook list"""
 
     items: list[PlaybookResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class PlaybookExecuteRequest(BaseModel):
@@ -98,12 +98,12 @@ class PlaybookExecuteRequest(BaseModel):
 class PlaybookExecutionResponse(DBModel):
     """Schema for playbook execution response"""
 
-    id: str
-    playbook_id: str
+    id: str = ""
+    playbook_id: str = ""
     incident_id: Optional[str] = None
-    status: str
-    current_step: int
-    total_steps: int
+    status: str = ""
+    current_step: int = 0
+    total_steps: int = 0
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
     input_data: Optional[dict[str, Any]] = None
@@ -124,7 +124,7 @@ class PlaybookExecutionListResponse(BaseModel):
     """Schema for paginated execution list"""
 
     items: list[PlaybookExecutionResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0

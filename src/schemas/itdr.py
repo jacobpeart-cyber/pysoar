@@ -55,8 +55,8 @@ class IdentityProfileUpdate(BaseModel):
 class IdentityProfileResponse(IdentityProfileBase, DBModel):
     """Schema for identity profile response"""
 
-    id: str
-    organization_id: str
+    id: str = ""
+    organization_id: str = ""
     risk_score: float = Field(0.0, ge=0.0, le=100.0)
     role_assignments: Optional[list[str]] = None
     group_memberships: Optional[list[str]] = None
@@ -79,7 +79,7 @@ class IdentityProfileResponse(IdentityProfileBase, DBModel):
 class IdentityThreatBase(BaseModel):
     """Base identity threat schema"""
 
-    threat_type: str
+    threat_type: str = ""
     severity: str = Field(..., pattern="^(critical|high|medium|low)$")
     confidence_score: float = Field(0.0, ge=0.0, le=100.0)
     source_ip: Optional[str] = None
@@ -91,7 +91,7 @@ class IdentityThreatBase(BaseModel):
 class IdentityThreatCreate(IdentityThreatBase):
     """Schema for creating identity threat"""
 
-    identity_id: str
+    identity_id: str = ""
     evidence: Optional[dict[str, Any]] = None
     response_actions: Optional[list[dict[str, Any]]] = None
 
@@ -108,10 +108,10 @@ class IdentityThreatUpdate(BaseModel):
 class IdentityThreatResponse(IdentityThreatBase, DBModel):
     """Schema for identity threat response"""
 
-    id: str
-    organization_id: str
-    identity_id: str
-    status: str
+    id: str = ""
+    organization_id: str = ""
+    identity_id: str = ""
+    status: str = ""
     evidence: Optional[dict[str, Any]] = None
     response_actions: Optional[list[dict[str, Any]]] = None
     created_at: Optional[datetime] = None
@@ -124,8 +124,8 @@ class IdentityThreatResponse(IdentityThreatBase, DBModel):
 class ThreatInvestigationRequest(BaseModel):
     """Schema for threat investigation action"""
 
-    threat_id: str
-    investigation_notes: str
+    threat_id: str = ""
+    investigation_notes: str = ""
     new_status: str = "investigating"
     evidence_summary: Optional[dict[str, Any]] = None
 
@@ -133,10 +133,10 @@ class ThreatInvestigationRequest(BaseModel):
 class ThreatResponseAction(BaseModel):
     """Schema for threat response action"""
 
-    threat_id: str
-    action_type: str
+    threat_id: str = ""
+    action_type: str = ""
     action_details: dict[str, Any]
-    executed_by: str
+    executed_by: str = ""
 
 
 # ============================================================================
@@ -147,8 +147,8 @@ class ThreatResponseAction(BaseModel):
 class CredentialExposureBase(BaseModel):
     """Base credential exposure schema"""
 
-    exposure_source: str
-    credential_type: str
+    exposure_source: str = ""
+    credential_type: str = ""
     exposure_date: Optional[str] = None
     discovery_date: Optional[str] = None
     breach_name: Optional[str] = None
@@ -159,7 +159,7 @@ class CredentialExposureBase(BaseModel):
 class CredentialExposureCreate(CredentialExposureBase):
     """Schema for creating credential exposure"""
 
-    identity_id: str
+    identity_id: str = ""
 
 
 class CredentialExposureUpdate(BaseModel):
@@ -173,9 +173,9 @@ class CredentialExposureUpdate(BaseModel):
 class CredentialExposureResponse(CredentialExposureBase, DBModel):
     """Schema for credential exposure response"""
 
-    id: str
-    organization_id: str
-    identity_id: str
+    id: str = ""
+    organization_id: str = ""
+    identity_id: str = ""
     remediation_date: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -190,17 +190,17 @@ class CredentialRemediationRequest(BaseModel):
     exposure_ids: list[str]
     remediation_type: str = Field(..., pattern="^(password_reset|token_revoke|key_rotation)$")
     require_approval: bool = True
-    justification: str
+    justification: str = ""
 
 
 class PasswordStrengthAssessment(BaseModel):
     """Schema for password strength assessment"""
 
-    password: str
+    password: str = ""
     score: int = Field(0, ge=0, le=100)
-    strength: str
+    strength: str = ""
     issues: list[str]
-    compliant: bool
+    compliant: bool = False
 
 
 # ============================================================================
@@ -211,7 +211,7 @@ class PasswordStrengthAssessment(BaseModel):
 class AccessAnomalyBase(BaseModel):
     """Base access anomaly schema"""
 
-    anomaly_type: str
+    anomaly_type: str = ""
     deviation_score: float = Field(0.0, ge=0.0, le=1.0)
     is_reviewed: bool = False
     reviewer_notes: Optional[str] = None
@@ -220,7 +220,7 @@ class AccessAnomalyBase(BaseModel):
 class AccessAnomalyCreate(AccessAnomalyBase):
     """Schema for creating access anomaly"""
 
-    identity_id: str
+    identity_id: str = ""
     baseline_data: Optional[dict[str, Any]] = None
     observed_data: Optional[dict[str, Any]] = None
 
@@ -235,9 +235,9 @@ class AccessAnomalyUpdate(BaseModel):
 class AccessAnomalyResponse(AccessAnomalyBase, DBModel):
     """Schema for access anomaly response"""
 
-    id: str
-    organization_id: str
-    identity_id: str
+    id: str = ""
+    organization_id: str = ""
+    identity_id: str = ""
     baseline_data: Optional[dict[str, Any]] = None
     observed_data: Optional[dict[str, Any]] = None
     created_at: Optional[datetime] = None
@@ -250,20 +250,20 @@ class AccessAnomalyResponse(AccessAnomalyBase, DBModel):
 class AnomalyReviewRequest(BaseModel):
     """Schema for anomaly review action"""
 
-    anomaly_id: str
-    is_legitimate: bool
-    reviewer_notes: str
+    anomaly_id: str = ""
+    is_legitimate: bool = False
+    reviewer_notes: str = ""
 
 
 class IdentityBaseline(BaseModel):
     """Schema for identity baseline"""
 
-    identity_id: str
+    identity_id: str = ""
     normal_hours: list[int]
     normal_locations: list[str]
     normal_resources: list[str]
     normal_devices: list[str]
-    analysis_window_days: int
+    analysis_window_days: int = 0
 
 
 # ============================================================================
@@ -274,7 +274,7 @@ class IdentityBaseline(BaseModel):
 class PrivilegedAccessEventBase(BaseModel):
     """Base privileged access event schema"""
 
-    event_type: str
+    event_type: str = ""
     target_resource: Optional[str] = None
     justification: Optional[str] = None
     was_revoked: bool = False
@@ -284,7 +284,7 @@ class PrivilegedAccessEventBase(BaseModel):
 class PrivilegedAccessEventCreate(PrivilegedAccessEventBase):
     """Schema for creating privileged access event"""
 
-    identity_id: str
+    identity_id: str = ""
     approved_by: Optional[str] = None
     expiry_timestamp: Optional[str] = None
 
@@ -300,9 +300,9 @@ class PrivilegedAccessEventUpdate(BaseModel):
 class PrivilegedAccessEventResponse(PrivilegedAccessEventBase, DBModel):
     """Schema for privileged access event response"""
 
-    id: str
-    organization_id: str
-    identity_id: str
+    id: str = ""
+    organization_id: str = ""
+    identity_id: str = ""
     approved_by: Optional[str] = None
     approval_timestamp: Optional[str] = None
     expiry_timestamp: Optional[str] = None
@@ -316,10 +316,10 @@ class PrivilegedAccessEventResponse(PrivilegedAccessEventBase, DBModel):
 class ElevationRequest(BaseModel):
     """Schema for privilege elevation request"""
 
-    identity_id: str
-    target_resource: str
-    justification: str
-    required_privilege_level: str
+    identity_id: str = ""
+    target_resource: str = ""
+    justification: str = ""
+    required_privilege_level: str = ""
     duration_minutes: int = Field(default=60, ge=15, le=480)
     require_mfa: bool = True
 
@@ -327,8 +327,8 @@ class ElevationRequest(BaseModel):
 class ElevationApprovalRequest(BaseModel):
     """Schema for elevation approval"""
 
-    request_id: str
-    approved: bool
+    request_id: str = ""
+    approved: bool = False
     approver_notes: Optional[str] = None
     approval_duration_minutes: Optional[int] = Field(None, ge=15, le=480)
 
@@ -336,7 +336,7 @@ class ElevationApprovalRequest(BaseModel):
 class PrivilegedAccessAuditRequest(BaseModel):
     """Schema for privileged access audit request"""
 
-    organization_id: str
+    organization_id: str = ""
     audit_scope: str = Field(default="all", pattern="^(all|elevation_requests|jit_access)$")
     include_service_accounts: bool = False
     start_date: Optional[str] = None
@@ -351,29 +351,29 @@ class PrivilegedAccessAuditRequest(BaseModel):
 class IdentityRiskProfile(BaseModel):
     """Schema for identity risk profile"""
 
-    identity_id: str
-    username: str
+    identity_id: str = ""
+    username: str = ""
     current_risk_score: float = Field(0.0, ge=0.0, le=100.0)
-    threat_count: int
-    critical_threats: int
-    anomalies_count: int
-    credential_exposures: int
-    privilege_level: str
+    threat_count: int = 0
+    critical_threats: int = 0
+    anomalies_count: int = 0
+    credential_exposures: int = 0
+    privilege_level: str = ""
     last_update: datetime
 
 
 class ITDRDashboardMetrics(BaseModel):
     """Schema for ITDR dashboard metrics"""
 
-    total_identities: int
-    identities_at_risk: int
-    critical_threats_active: int
-    high_threats_active: int
-    credential_exposures_active: int
-    anomalies_pending_review: int
-    service_accounts_over_privileged: int
-    dormant_accounts: int
-    jit_access_active: int
+    total_identities: int = 0
+    identities_at_risk: int = 0
+    critical_threats_active: int = 0
+    high_threats_active: int = 0
+    credential_exposures_active: int = 0
+    anomalies_pending_review: int = 0
+    service_accounts_over_privileged: int = 0
+    dormant_accounts: int = 0
+    jit_access_active: int = 0
     last_scan_timestamp: datetime
     overall_risk_score: float = Field(0.0, ge=0.0, le=100.0)
 
@@ -381,7 +381,7 @@ class ITDRDashboardMetrics(BaseModel):
 class ITDRRiskOverview(BaseModel):
     """Schema for ITDR risk overview"""
 
-    summary: str
+    summary: str = ""
     critical_findings: list[str]
     risk_trends: dict[str, Any]
     recommendations: list[str]
@@ -391,43 +391,43 @@ class ITDRRiskOverview(BaseModel):
 class ThreatDetectionReport(BaseModel):
     """Schema for threat detection report"""
 
-    report_type: str
+    report_type: str = ""
     scan_timestamp: datetime
-    total_threats: int
+    total_threats: int = 0
     threat_breakdown: dict[str, int]
     top_threat_types: list[dict[str, Any]]
-    affected_identities: int
+    affected_identities: int = 0
     critical_threats: list[IdentityThreatResponse]
 
 
 class CredentialRiskReport(BaseModel):
     """Schema for credential risk report"""
 
-    report_type: str
+    report_type: str = ""
     timestamp: datetime
-    total_issues: int
-    critical_issues: int
-    risk_score: float
-    exposure_count: int
-    weak_password_count: int
-    shared_credential_count: int
-    stale_credential_count: int
+    total_issues: int = 0
+    critical_issues: int = 0
+    risk_score: float = 0.0
+    exposure_count: int = 0
+    weak_password_count: int = 0
+    shared_credential_count: int = 0
+    stale_credential_count: int = 0
     recommendations: list[str]
 
 
 class PAMComplianceReport(BaseModel):
     """Schema for PAM compliance report"""
 
-    report_type: str
+    report_type: str = ""
     timestamp: datetime
-    jit_grants_total: int
-    jit_grants_active: int
-    elevation_requests_total: int
-    elevation_requests_approved: int
-    approval_rate_percent: float
-    audit_violations: int
+    jit_grants_total: int = 0
+    jit_grants_active: int = 0
+    elevation_requests_total: int = 0
+    elevation_requests_approved: int = 0
+    approval_rate_percent: float = 0.0
+    audit_violations: int = 0
     compliance_score: float = Field(0.0, ge=0.0, le=100.0)
-    over_privileged_identities: int
+    over_privileged_identities: int = 0
 
 
 # ============================================================================
@@ -438,48 +438,48 @@ class PAMComplianceReport(BaseModel):
 class IdentityProfileListResponse(BaseModel):
     """Schema for paginated identity profile list"""
 
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
     items: list[IdentityProfileResponse]
 
 
 class IdentityThreatListResponse(BaseModel):
     """Schema for paginated identity threat list"""
 
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
     items: list[IdentityThreatResponse]
 
 
 class CredentialExposureListResponse(BaseModel):
     """Schema for paginated credential exposure list"""
 
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
     items: list[CredentialExposureResponse]
 
 
 class AccessAnomalyListResponse(BaseModel):
     """Schema for paginated access anomaly list"""
 
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
     items: list[AccessAnomalyResponse]
 
 
 class PrivilegedAccessEventListResponse(BaseModel):
     """Schema for paginated privileged access event list"""
 
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
     items: list[PrivilegedAccessEventResponse]

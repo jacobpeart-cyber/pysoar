@@ -41,7 +41,7 @@ class RemediationPolicyBase(BaseModel):
 
 class RemediationPolicyCreate(RemediationPolicyBase):
     """Create request."""
-    created_by: str
+    created_by: str = ""
 
 
 class RemediationPolicyUpdate(BaseModel):
@@ -60,14 +60,14 @@ class RemediationPolicyUpdate(BaseModel):
 
 class RemediationPolicyResponse(RemediationPolicyBase):
     """Response with metadata."""
-    id: str
+    id: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
-    execution_count: int
+    execution_count: int = 0
     last_executed_at: Optional[datetime] = None
     success_rate: Optional[float] = None
-    created_by: str
-    organization_id: str
+    created_by: str = ""
+    organization_id: str = ""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -102,10 +102,10 @@ class RemediationActionCreate(RemediationActionBase):
 
 class RemediationActionResponse(RemediationActionBase):
     """Response with metadata."""
-    id: str
+    id: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
-    organization_id: str
+    organization_id: str = ""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -117,19 +117,19 @@ class RemediationActionResponse(RemediationActionBase):
 class RemediationExecutionBase(BaseModel):
     """Base execution fields."""
     policy_id: Optional[str] = None
-    trigger_source: str
+    trigger_source: str = ""
     trigger_id: Optional[str] = None
     trigger_details: dict = Field(default_factory=dict)
-    target_entity: str
-    target_type: str
+    target_entity: str = ""
+    target_type: str = ""
     actions_planned: list[dict] = Field(default_factory=list)
 
 
 class ExecutionActionResult(BaseModel):
     """Single action execution result."""
-    action_type: str
+    action_type: str = ""
     target: Optional[str] = None
-    success: bool
+    success: bool = False
     details: dict = Field(default_factory=dict)
     error: Optional[str] = None
     timestamp: datetime
@@ -137,24 +137,24 @@ class ExecutionActionResult(BaseModel):
 
 class ExecutionProgressResponse(BaseModel):
     """Real-time execution progress."""
-    execution_id: str
-    status: str
+    execution_id: str = ""
+    status: str = ""
     approval_status: Optional[str] = None
-    current_action_index: int
-    total_actions: int
-    target_entity: str
+    current_action_index: int = 0
+    total_actions: int = 0
+    target_entity: str = ""
     actions_completed: list[ExecutionActionResult] = Field(default_factory=list)
     overall_result: Optional[str] = None
     error_message: Optional[str] = None
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
-    percent_complete: float
+    percent_complete: float = 0.0
 
 
 class RemediationExecutionResponse(RemediationExecutionBase):
     """Response with full details."""
-    id: str
-    status: str
+    id: str = ""
+    status: str = ""
     approval_status: Optional[str] = None
     approved_by: Optional[str] = None
     approved_at: Optional[datetime] = None
@@ -170,7 +170,7 @@ class RemediationExecutionResponse(RemediationExecutionBase):
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
     created_by: Optional[str] = None
-    organization_id: str
+    organization_id: str = ""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -181,58 +181,58 @@ class RemediationExecutionResponse(RemediationExecutionBase):
 
 class ApprovalRequest(BaseModel):
     """Approve a pending execution."""
-    execution_id: str
-    approver_id: str
+    execution_id: str = ""
+    approver_id: str = ""
 
 
 class ApprovalResponse(BaseModel):
     """Approval response."""
-    execution_id: str
-    approval_status: str
+    execution_id: str = ""
+    approval_status: str = ""
     approved_at: Optional[datetime] = None
 
 
 class RejectionRequest(BaseModel):
     """Reject a pending execution."""
-    execution_id: str
-    approver_id: str
+    execution_id: str = ""
+    approver_id: str = ""
     reason: Optional[str] = None
 
 
 class ManualRemediationRequest(BaseModel):
     """Manually trigger a remediation."""
-    action_type: str
-    target_entity: str
-    target_type: str
+    action_type: str = ""
+    target_entity: str = ""
+    target_type: str = ""
     parameters: dict = Field(default_factory=dict)
     priority: int = Field(default=50, ge=1, le=100)
     requires_approval: bool = False
-    initiated_by: str
+    initiated_by: str = ""
 
 
 class QuickBlockIPRequest(BaseModel):
     """Quick: block an IP."""
-    ip: str
+    ip: str = ""
     duration_hours: int = Field(default=24, ge=1, le=365*24)
     reason: Optional[str] = None
 
 
 class QuickIsolateHostRequest(BaseModel):
     """Quick: isolate a host."""
-    hostname: str
+    hostname: str = ""
     reason: Optional[str] = None
 
 
 class QuickDisableAccountRequest(BaseModel):
     """Quick: disable an account."""
-    username: str
+    username: str = ""
     reason: Optional[str] = None
 
 
 class QuickQuarantineFileRequest(BaseModel):
     """Quick: quarantine a file."""
-    file_path: str
-    hostname: str
+    file_path: str = ""
+    hostname: str = ""
     reason: Optional[str] = None
 
 
@@ -242,7 +242,7 @@ class QuickQuarantineFileRequest(BaseModel):
 
 class PlaybookStep(BaseModel):
     """Single playbook step."""
-    action_id: str
+    action_id: str = ""
     conditions: dict = Field(default_factory=dict)
     on_success: Optional[str] = None
     on_failure: Optional[str] = None
@@ -266,19 +266,19 @@ class RemediationPlaybookBase(BaseModel):
 
 class RemediationPlaybookCreate(RemediationPlaybookBase):
     """Create request."""
-    created_by: str
+    created_by: str = ""
 
 
 class RemediationPlaybookResponse(RemediationPlaybookBase):
     """Response with metadata."""
-    id: str
+    id: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
-    success_count: int
-    failure_count: int
+    success_count: int = 0
+    failure_count: int = 0
     avg_execution_minutes: Optional[float] = None
-    created_by: str
-    organization_id: str
+    created_by: str = ""
+    organization_id: str = ""
 
     model_config = ConfigDict(from_attributes=True)
 
@@ -290,7 +290,7 @@ class RemediationPlaybookResponse(RemediationPlaybookBase):
 class RemediationIntegrationBase(BaseModel):
     """Base integration fields."""
     name: str = Field(..., min_length=1, max_length=255)
-    integration_type: str
+    integration_type: str = ""
     vendor: Optional[str] = None
     endpoint_url: Optional[str] = None
     auth_type: str = Field(default="api_key")
@@ -307,22 +307,22 @@ class RemediationIntegrationCreate(RemediationIntegrationBase):
 
 class RemediationIntegrationResponse(RemediationIntegrationBase):
     """Response with metadata."""
-    id: str
+    id: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
-    is_connected: bool
+    is_connected: bool = False
     last_health_check: Optional[datetime] = None
-    health_status: str
-    organization_id: str
+    health_status: str = ""
+    organization_id: str = ""
 
     model_config = ConfigDict(from_attributes=True)
 
 
 class IntegrationTestResult(BaseModel):
     """Result of integration test."""
-    integration_id: str
-    success: bool
-    message: str
+    integration_id: str = ""
+    success: bool = False
+    message: str = ""
     details: dict = Field(default_factory=dict)
     tested_at: datetime
 
@@ -333,33 +333,33 @@ class IntegrationTestResult(BaseModel):
 
 class ActionTypeStats(BaseModel):
     """Statistics for action types."""
-    action_type: str
-    count: int
-    success_count: int
-    failure_count: int
+    action_type: str = ""
+    count: int = 0
+    success_count: int = 0
+    failure_count: int = 0
 
 
 class PolicyStats(BaseModel):
     """Statistics for policies."""
-    policy_id: str
-    name: str
-    execution_count: int
-    success_count: int
-    failure_count: int
+    policy_id: str = ""
+    name: str = ""
+    execution_count: int = 0
+    success_count: int = 0
+    failure_count: int = 0
 
 
 class RemediationDashboardStats(BaseModel):
     """Dashboard summary statistics."""
     period_start: datetime
     period_end: datetime
-    organization_id: str
-    total_executions: int
-    successful_executions: int
-    failed_executions: int
-    overall_success_rate: float
-    avg_execution_minutes: float
-    pending_approvals: int
-    in_progress: int
+    organization_id: str = ""
+    total_executions: int = 0
+    successful_executions: int = 0
+    failed_executions: int = 0
+    overall_success_rate: float = 0.0
+    avg_execution_minutes: float = 0.0
+    pending_approvals: int = 0
+    in_progress: int = 0
     actions_by_type: list[ActionTypeStats]
     top_policies: list[PolicyStats]
     top_targets: list[dict]
@@ -368,31 +368,31 @@ class RemediationDashboardStats(BaseModel):
 
 class TimelineEvent(BaseModel):
     """Single timeline event."""
-    execution_id: str
+    execution_id: str = ""
     policy_name: Optional[str] = None
-    target: str
-    action_count: int
-    status: str
+    target: str = ""
+    action_count: int = 0
+    status: str = ""
     overall_result: Optional[str] = None
     completed_at: datetime
 
 
 class RemediationTimelineResponse(BaseModel):
     """Recent remediation timeline."""
-    organization_id: str
-    period: str
+    organization_id: str = ""
+    period: str = ""
     events: list[TimelineEvent]
-    total_count: int
+    total_count: int = 0
 
 
 class EffectivenessMetrics(BaseModel):
     """Remediation effectiveness metrics."""
-    organization_id: str
-    period: str
-    executions_verified: int
-    effective_count: int
-    ineffective_count: int
-    effectiveness_rate: float
+    organization_id: str = ""
+    period: str = ""
+    executions_verified: int = 0
+    effective_count: int = 0
+    ineffective_count: int = 0
+    effectiveness_rate: float = 0.0
     avg_time_to_effectiveness: Optional[float] = None
-    rollbacks_recommended: int
-    rollbacks_executed: int
+    rollbacks_recommended: int = 0
+    rollbacks_executed: int = 0

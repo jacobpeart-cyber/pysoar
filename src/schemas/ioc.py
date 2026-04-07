@@ -11,7 +11,7 @@ class IOCBase(BaseModel):
     """Base IOC schema"""
 
     value: str = Field(..., min_length=1, max_length=2048)
-    ioc_type: str
+    ioc_type: str = ""
     threat_level: str = "unknown"
     confidence: int = Field(default=50, ge=0, le=100)
     description: Optional[str] = None
@@ -52,8 +52,8 @@ class IOCUpdate(BaseModel):
 class IOCResponse(IOCBase, DBModel):
     """Schema for IOC response"""
 
-    id: str
-    status: str
+    id: str = ""
+    status: str = ""
     source: Optional[str] = None
     source_url: Optional[str] = None
     source_reference: Optional[str] = None
@@ -67,10 +67,10 @@ class IOCResponse(IOCBase, DBModel):
     first_seen: Optional[str] = None
     last_seen: Optional[str] = None
     expires_at: Optional[str] = None
-    sighting_count: int
+    sighting_count: int = 0
     last_sighting: Optional[str] = None
-    is_whitelisted: bool
-    is_internal: bool
+    is_whitelisted: bool = False
+    is_internal: bool = False
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -82,10 +82,10 @@ class IOCListResponse(BaseModel):
     """Schema for paginated IOC list"""
 
     items: list[IOCResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class IOCBulkCreate(BaseModel):
@@ -97,12 +97,12 @@ class IOCBulkCreate(BaseModel):
 class IOCSearchRequest(BaseModel):
     """Schema for IOC search"""
 
-    value: str
+    value: str = ""
     ioc_type: Optional[str] = None
 
 
 class IOCEnrichRequest(BaseModel):
     """Schema for IOC enrichment request"""
 
-    ioc_id: str
+    ioc_id: str = ""
     providers: Optional[list[str]] = None  # Specific providers to use

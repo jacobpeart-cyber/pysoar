@@ -52,8 +52,8 @@ class DLPPolicyUpdate(BaseModel):
 class DLPPolicyResponse(DLPPolicyBase, DBModel):
     """Schema for DLP policy response"""
 
-    id: str
-    organization_id: str
+    id: str = ""
+    organization_id: str = ""
     last_triggered: Optional[datetime] = None
     trigger_count: int = 0
     created_at: Optional[datetime] = None
@@ -67,10 +67,10 @@ class DLPPolicyListResponse(BaseModel):
     """Schema for paginated policy list"""
 
     items: list[DLPPolicyResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class DLPPolicyTestRequest(BaseModel):
@@ -83,9 +83,9 @@ class DLPPolicyTestRequest(BaseModel):
 class DLPPolicyTestResponse(BaseModel):
     """Schema for policy test results"""
 
-    policy_id: str
-    test_passed: bool
-    violations_detected: int
+    policy_id: str = ""
+    test_passed: bool = False
+    violations_detected: int = 0
     matched_patterns: list[str]
     sample_result: dict[str, Any]
     timestamp: Optional[datetime] = None
@@ -96,7 +96,7 @@ class DLPPolicyTestResponse(BaseModel):
 class DLPViolationBase(BaseModel):
     """Base DLP violation schema"""
 
-    policy_id: str
+    policy_id: str = ""
     violation_type: str = Field(default="unauthorized_transfer", max_length=50)
     severity: str = Field(default="medium", max_length=20)
     source_user: Optional[str] = Field(None, max_length=255)
@@ -132,8 +132,8 @@ class DLPViolationUpdate(BaseModel):
 class DLPViolationResponse(DLPViolationBase, DBModel):
     """Schema for violation response"""
 
-    id: str
-    organization_id: str
+    id: str = ""
+    organization_id: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -145,10 +145,10 @@ class DLPViolationListResponse(BaseModel):
     """Schema for paginated violation list"""
 
     items: list[DLPViolationResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class DLPViolationResolveRequest(BaseModel):
@@ -170,9 +170,9 @@ class DLPViolationBulkActionRequest(BaseModel):
 class DLPViolationBulkActionResponse(BaseModel):
     """Schema for bulk action results"""
 
-    successful: int
-    failed: int
-    total: int
+    successful: int = 0
+    failed: int = 0
+    total: int = 0
     failed_ids: list[str] = []
 
 
@@ -215,8 +215,8 @@ class DataClassificationUpdate(BaseModel):
 class DataClassificationResponse(DataClassificationBase, DBModel):
     """Schema for classification response"""
 
-    id: str
-    organization_id: str
+    id: str = ""
+    organization_id: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -228,10 +228,10 @@ class DataClassificationListResponse(BaseModel):
     """Schema for paginated classification list"""
 
     items: list[DataClassificationResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class DocumentClassificationRequest(BaseModel):
@@ -245,7 +245,7 @@ class DocumentClassificationRequest(BaseModel):
 class DocumentClassificationResponse(BaseModel):
     """Schema for document classification result"""
 
-    classification_level: str
+    classification_level: str = ""
     confidence: float = Field(ge=0.0, le=1.0)
     indicators: list[str]
     content_based: dict[str, Any]
@@ -256,11 +256,11 @@ class DocumentClassificationResponse(BaseModel):
 class DataHandlingRequirementsResponse(BaseModel):
     """Schema for data handling requirements"""
 
-    classification_level: str
-    encryption: bool
-    access_control: str
-    retention_days: int
-    sharing_restrictions: str
+    classification_level: str = ""
+    encryption: bool = False
+    access_control: str = ""
+    retention_days: int = 0
+    sharing_restrictions: str = ""
 
 
 # Data Discovery Schemas
@@ -284,9 +284,9 @@ class DiscoveryScanTriggerRequest(BaseModel):
 class SensitiveDataDiscoveryResponse(SensitiveDataDiscoveryBase, DBModel):
     """Schema for discovery scan response"""
 
-    id: str
-    organization_id: str
-    scan_id: str
+    id: str = ""
+    organization_id: str = ""
+    scan_id: str = ""
     total_files_scanned: int = 0
     sensitive_files_found: int = 0
     classification_breakdown: Optional[dict[str, int]] = None
@@ -305,30 +305,30 @@ class DiscoveryScanListResponse(BaseModel):
     """Schema for paginated scan list"""
 
     items: list[SensitiveDataDiscoveryResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class DataMapResponse(BaseModel):
     """Schema for data map results"""
 
-    organization_id: str
+    organization_id: str = ""
     generated_at: Optional[datetime] = None
     data_locations: dict[str, Any]
     high_risk_locations: list[dict[str, Any]]
-    total_sensitive_data_locations: int
+    total_sensitive_data_locations: int = 0
 
 
 class DataLineageResponse(BaseModel):
     """Schema for data lineage tracking"""
 
-    data_id: str
-    origin: str
-    current_location: str
+    data_id: str = ""
+    origin: str = ""
+    current_location: str = ""
     flows: list[dict[str, Any]]
-    access_count: int
+    access_count: int = 0
 
 
 # Incident Schemas
@@ -365,8 +365,8 @@ class DLPIncidentUpdate(BaseModel):
 class DLPIncidentResponse(DLPIncidentBase, DBModel):
     """Schema for incident response"""
 
-    id: str
-    organization_id: str
+    id: str = ""
+    organization_id: str = ""
     violation_ids: Optional[list[str]] = None
     breach_notification_required: bool = False
     notification_deadline: Optional[datetime] = None
@@ -385,42 +385,42 @@ class DLPIncidentListResponse(BaseModel):
     """Schema for paginated incident list"""
 
     items: list[DLPIncidentResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class BreachAssessmentRequest(BaseModel):
     """Schema for breach assessment"""
 
-    incident_id: str
-    affected_count: int
+    incident_id: str = ""
+    affected_count: int = 0
     data_types: list[str]
-    description: str
+    description: str = ""
 
 
 class BreachAssessmentResponse(BaseModel):
     """Schema for breach assessment results"""
 
-    incident_id: str
+    incident_id: str = ""
     assessment_date: Optional[datetime] = None
-    severity: str
-    affected_subjects: int
+    severity: str = ""
+    affected_subjects: int = 0
     data_types: list[str]
     regulatory_obligations: dict[str, bool]
     notification_deadline: Optional[datetime] = None
-    notification_required: bool
+    notification_required: bool = False
 
 
 class NotificationTrackingResponse(BaseModel):
     """Schema for notification tracking"""
 
-    incident_id: str
-    notified_count: int
-    total_required: int
-    completion_percentage: float
-    status: str
+    incident_id: str = ""
+    notified_count: int = 0
+    total_required: int = 0
+    completion_percentage: float = 0.0
+    status: str = ""
     last_updated: Optional[datetime] = None
 
 
@@ -429,34 +429,34 @@ class NotificationTrackingResponse(BaseModel):
 class DLPDashboardResponse(BaseModel):
     """Schema for DLP dashboard summary"""
 
-    organization_id: str
-    total_violations: int
-    violations_this_month: int
-    critical_violations: int
+    organization_id: str = ""
+    total_violations: int = 0
+    violations_this_month: int = 0
+    critical_violations: int = 0
     top_violations: list[dict[str, Any]]
     top_policies_triggered: list[dict[str, Any]]
     data_risk_map: dict[str, Any]
     compliance_status: dict[str, Any]
-    remediation_rate: float
-    average_response_time_hours: float
+    remediation_rate: float = 0.0
+    average_response_time_hours: float = 0.0
 
 
 class ViolationTrendResponse(BaseModel):
     """Schema for violation trends"""
 
-    period: str
-    total_violations: int
+    period: str = ""
+    total_violations: int = 0
     by_type: dict[str, int]
     by_severity: dict[str, int]
     by_status: dict[str, int]
-    trend_direction: str
+    trend_direction: str = ""
 
 
 class ComplianceStatusResponse(BaseModel):
     """Schema for compliance status"""
 
     regulations: dict[str, Any]
-    open_incidents: int
-    overdue_notifications: int
-    compliance_score: float
+    open_incidents: int = 0
+    overdue_notifications: int = 0
+    compliance_score: float = 0.0
     recommendations: list[str]
