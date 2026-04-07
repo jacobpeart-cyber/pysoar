@@ -53,8 +53,8 @@ class AlertUpdate(BaseModel):
 class AlertResponse(AlertBase, DBModel):
     """Schema for alert response"""
 
-    id: str
-    status: str
+    id: str = ""
+    status: str = ""
     source_id: Optional[str] = None
     source_url: Optional[str] = None
     source_ip: Optional[str] = None
@@ -80,10 +80,10 @@ class AlertListResponse(BaseModel):
     """Schema for paginated alert list"""
 
     items: list[AlertResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class AlertBulkAction(BaseModel):
@@ -97,9 +97,9 @@ class AlertBulkAction(BaseModel):
 class AlertStats(BaseModel):
     """Schema for alert statistics"""
 
-    total: int
+    total: int = 0
     by_severity: dict[str, int]
     by_status: dict[str, int]
     by_source: dict[str, int]
-    new_today: int
-    new_this_week: int
+    new_today: int = 0
+    new_this_week: int = 0

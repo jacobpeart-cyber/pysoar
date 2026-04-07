@@ -80,9 +80,9 @@ class HuntHypothesisUpdate(BaseModel):
 class HuntHypothesisResponse(HuntHypothesisBase, DBModel):
     """Schema for hunt hypothesis response"""
 
-    id: str
+    id: str = ""
     status: str  # DRAFT, ACTIVE, COMPLETED, ARCHIVED
-    created_by: str
+    created_by: str = ""
     assigned_to: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -96,16 +96,16 @@ class HuntHypothesisListResponse(BaseModel):
     """Schema for paginated hunt hypothesis list"""
 
     items: list[HuntHypothesisResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class HuntSessionCreate(BaseModel):
     """Schema for creating a hunt session"""
 
-    hypothesis_id: str
+    hypothesis_id: str = ""
     parameters: dict[str, Any] = Field(
         default_factory=dict,
         description="Hunt parameters (time_start, time_end, target_hosts, scope, etc.)",
@@ -115,8 +115,8 @@ class HuntSessionCreate(BaseModel):
 class HuntSessionResponse(DBModel):
     """Schema for hunt session response"""
 
-    id: str
-    hypothesis_id: str
+    id: str = ""
+    hypothesis_id: str = ""
     status: str  # PENDING, RUNNING, PAUSED, COMPLETED, FAILED, CANCELLED
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
@@ -126,7 +126,7 @@ class HuntSessionResponse(DBModel):
     findings_count: int = 0
     queries_executed: Optional[int] = 0
     error_message: Optional[str] = None
-    created_by: str
+    created_by: str = ""
     created_at: Optional[datetime] = None
 
     class Config:
@@ -137,18 +137,18 @@ class HuntSessionListResponse(BaseModel):
     """Schema for paginated hunt session list"""
 
     items: list[HuntSessionResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class HuntFindingCreate(BaseModel):
     """Schema for creating a hunt finding"""
 
-    session_id: str
+    session_id: str = ""
     title: str = Field(..., min_length=1, max_length=500)
-    description: str
+    description: str = ""
     severity: str  # critical, high, medium, low, info
     evidence: Optional[list[Any]] = None
     affected_assets: Optional[list[str]] = None
@@ -174,7 +174,7 @@ class HuntFindingUpdate(BaseModel):
 class HuntFindingResponse(DBModel):
     """Schema for hunt finding response"""
 
-    id: str
+    id: str = ""
     classification: Optional[str] = None
     escalated_to_case: bool = False
     case_id: Optional[str] = None
@@ -188,26 +188,26 @@ class HuntFindingListResponse(BaseModel):
     """Schema for paginated hunt finding list"""
 
     items: list[HuntFindingResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class HuntTemplateResponse(DBModel):
     """Schema for hunt template response"""
 
-    id: str
-    name: str
-    description: str
+    id: str = ""
+    name: str = ""
+    description: str = ""
     category: str  # investigation_report, ioc_sweep, behavioral_hunt, etc.
-    hunt_type: str
-    hypothesis_template: str
+    hunt_type: str = ""
+    hypothesis_template: str = ""
     default_queries: Optional[list[dict[str, str]]] = None
     mitre_tactics: Optional[list[str]] = None
     mitre_techniques: Optional[list[str]] = None
     difficulty: str  # beginner, intermediate, advanced
-    estimated_duration_minutes: int
+    estimated_duration_minutes: int = 0
     tags: Optional[list[str]] = None
     is_builtin: bool = True
     enabled: bool = True
@@ -220,7 +220,7 @@ class HuntNotebookCell(BaseModel):
     """Schema for a notebook cell"""
 
     cell_type: str  # markdown, query, result, visualization, code
-    content: str
+    content: str = ""
     output: Optional[str] = None
     executed_at: Optional[datetime] = None
     execution_time_ms: Optional[float] = None
@@ -230,7 +230,7 @@ class HuntNotebookCell(BaseModel):
 class HuntNotebookCreate(BaseModel):
     """Schema for creating a hunt notebook"""
 
-    session_id: str
+    session_id: str = ""
     title: str = Field(..., min_length=1, max_length=500)
 
 
@@ -244,9 +244,9 @@ class HuntNotebookUpdate(BaseModel):
 class HuntNotebookResponse(DBModel):
     """Schema for hunt notebook response"""
 
-    id: str
-    session_id: str
-    title: str
+    id: str = ""
+    session_id: str = ""
+    title: str = ""
     content: list[HuntNotebookCell]
     version: int = 1
     is_published: bool = False
@@ -262,10 +262,10 @@ class HuntNotebookListResponse(BaseModel):
     """Schema for paginated hunt notebook list"""
 
     items: list[HuntNotebookResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class HuntNotebookCellExecute(BaseModel):
@@ -278,11 +278,11 @@ class HuntNotebookCellExecute(BaseModel):
 class HuntStatsResponse(BaseModel):
     """Schema for hunt statistics"""
 
-    total_hypotheses: int
-    active_hunts: int
-    completed_hunts: int
-    total_findings: int
+    total_hypotheses: int = 0
+    active_hunts: int = 0
+    completed_hunts: int = 0
+    total_findings: int = 0
     findings_by_classification: dict[str, int]
     findings_by_severity: dict[str, int]
-    avg_hunt_duration_minutes: float
+    avg_hunt_duration_minutes: float = 0.0
     top_mitre_techniques: list[str]

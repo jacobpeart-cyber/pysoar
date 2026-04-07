@@ -35,7 +35,7 @@ class VulnerabilityBase(BaseModel):
 class VulnerabilityCreate(VulnerabilityBase):
     """Schema for creating a vulnerability"""
 
-    organization_id: str
+    organization_id: str = ""
     mitre_technique_ids: Optional[list[str]] = None
 
 
@@ -55,8 +55,8 @@ class VulnerabilityUpdate(BaseModel):
 class VulnerabilityResponse(VulnerabilityBase, DBModel):
     """Schema for vulnerability response"""
 
-    id: str
-    organization_id: str
+    id: str = ""
+    organization_id: str = ""
     mitre_technique_ids: Optional[list[str]] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -69,7 +69,7 @@ class VulnerabilityResponse(VulnerabilityBase, DBModel):
 class VulnerabilityInstanceBase(BaseModel):
     """Base vulnerability instance schema"""
 
-    vulnerability_id: str
+    vulnerability_id: str = ""
     asset_id: Optional[str] = None
     asset_name: Optional[str] = None
     asset_ip: Optional[str] = None
@@ -90,7 +90,7 @@ class VulnerabilityInstanceBase(BaseModel):
 class VulnerabilityInstanceCreate(VulnerabilityInstanceBase):
     """Schema for creating a vulnerability instance"""
 
-    organization_id: str
+    organization_id: str = ""
 
 
 class VulnerabilityInstanceUpdate(BaseModel):
@@ -108,8 +108,8 @@ class VulnerabilityInstanceUpdate(BaseModel):
 class VulnerabilityInstanceResponse(VulnerabilityInstanceBase, DBModel):
     """Schema for vulnerability instance response"""
 
-    id: str
-    organization_id: str
+    id: str = ""
+    organization_id: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -123,7 +123,7 @@ class ScanProfileBase(BaseModel):
 
     name: str = Field(..., min_length=1, max_length=255)
     description: Optional[str] = None
-    scanner_type: str
+    scanner_type: str = ""
     target_ranges: Optional[list[str]] = None
     scan_policy: Optional[str] = None
     credentials_encrypted: bool = True
@@ -134,7 +134,7 @@ class ScanProfileBase(BaseModel):
 class ScanProfileCreate(ScanProfileBase):
     """Schema for creating a scan profile"""
 
-    organization_id: str
+    organization_id: str = ""
 
 
 class ScanProfileUpdate(BaseModel):
@@ -152,8 +152,8 @@ class ScanProfileUpdate(BaseModel):
 class ScanProfileResponse(ScanProfileBase, DBModel):
     """Schema for scan profile response"""
 
-    id: str
-    organization_id: str
+    id: str = ""
+    organization_id: str = ""
     last_scan_date: Optional[str] = None
     next_scan_date: Optional[str] = None
     created_at: Optional[datetime] = None
@@ -167,7 +167,7 @@ class ScanProfileResponse(ScanProfileBase, DBModel):
 class PatchOperationBase(BaseModel):
     """Base patch operation schema"""
 
-    vulnerability_instance_id: str
+    vulnerability_instance_id: str = ""
     patch_type: str = "os_patch"
     patch_id: Optional[str] = None
     patch_name: Optional[str] = None
@@ -183,7 +183,7 @@ class PatchOperationBase(BaseModel):
 class PatchOperationCreate(PatchOperationBase):
     """Schema for creating a patch operation"""
 
-    organization_id: str
+    organization_id: str = ""
 
 
 class PatchOperationUpdate(BaseModel):
@@ -199,8 +199,8 @@ class PatchOperationUpdate(BaseModel):
 class PatchOperationResponse(PatchOperationBase, DBModel):
     """Schema for patch operation response"""
 
-    id: str
-    organization_id: str
+    id: str = ""
+    organization_id: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -212,8 +212,8 @@ class PatchOperationResponse(PatchOperationBase, DBModel):
 class VulnerabilityExceptionBase(BaseModel):
     """Base vulnerability exception schema"""
 
-    vulnerability_instance_id: str
-    exception_type: str
+    vulnerability_instance_id: str = ""
+    exception_type: str = ""
     justification: str = Field(..., min_length=10)
     approved_by: Optional[str] = None
     approval_date: Optional[str] = None
@@ -226,7 +226,7 @@ class VulnerabilityExceptionBase(BaseModel):
 class VulnerabilityExceptionCreate(VulnerabilityExceptionBase):
     """Schema for creating a vulnerability exception"""
 
-    organization_id: str
+    organization_id: str = ""
 
 
 class VulnerabilityExceptionUpdate(BaseModel):
@@ -243,8 +243,8 @@ class VulnerabilityExceptionUpdate(BaseModel):
 class VulnerabilityExceptionResponse(VulnerabilityExceptionBase, DBModel):
     """Schema for vulnerability exception response"""
 
-    id: str
-    organization_id: str
+    id: str = ""
+    organization_id: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -257,40 +257,40 @@ class VulnerabilityListResponse(BaseModel):
     """Paginated vulnerability list response"""
 
     items: list[VulnerabilityResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class VulnerabilityInstanceListResponse(BaseModel):
     """Paginated vulnerability instance list response"""
 
     items: list[VulnerabilityInstanceResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class ScanProfileListResponse(BaseModel):
     """Paginated scan profile list response"""
 
     items: list[ScanProfileResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class PatchOperationListResponse(BaseModel):
     """Paginated patch operation list response"""
 
     items: list[PatchOperationResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 # Dashboard and Reporting Schemas
@@ -303,28 +303,28 @@ class RiskMatrix(BaseModel):
 class SLAComplianceMetrics(BaseModel):
     """SLA compliance metrics"""
 
-    total: int
-    within_sla: int
-    approaching: int
-    breached: int
-    compliance_percentage: float
+    total: int = 0
+    within_sla: int = 0
+    approaching: int = 0
+    breached: int = 0
+    compliance_percentage: float = 0.0
 
 
 class PatchComplianceMetrics(BaseModel):
     """Patch deployment compliance metrics"""
 
-    total_vulnerabilities: int
-    patched: int
-    compliance_percentage: float
+    total_vulnerabilities: int = 0
+    patched: int = 0
+    compliance_percentage: float = 0.0
 
 
 class VulnerabilityTrends(BaseModel):
     """Vulnerability trend data"""
 
-    period_days: int
-    new_discovered: int
-    closed: int
-    net_change: int
+    period_days: int = 0
+    new_discovered: int = 0
+    closed: int = 0
+    net_change: int = 0
 
 
 class VulnerabilityAging(BaseModel):
@@ -339,11 +339,11 @@ class VulnerabilityAging(BaseModel):
 class ExecutiveReport(BaseModel):
     """Executive summary report"""
 
-    total_vulnerabilities: int
-    open_vulnerabilities: int
-    critical_count: int
-    high_count: int
-    mttr_days: float
+    total_vulnerabilities: int = 0
+    open_vulnerabilities: int = 0
+    critical_count: int = 0
+    high_count: int = 0
+    mttr_days: float = 0.0
     sla_compliance: SLAComplianceMetrics
     aging: dict[str, int]
 
@@ -351,14 +351,14 @@ class ExecutiveReport(BaseModel):
 class KEVComplianceReport(BaseModel):
     """CISA BOD 22-01 compliance report"""
 
-    report_date: str
+    report_date: str = ""
     mandate: str = "BOD 22-01"
     deadline_days: int = 15
-    total_kev_tracked: int
-    kev_patched: int
-    kev_compliant: int
-    kev_non_compliant: int
-    compliance_percentage: float
+    total_kev_tracked: int = 0
+    kev_patched: int = 0
+    kev_compliant: int = 0
+    kev_non_compliant: int = 0
+    compliance_percentage: float = 0.0
 
 
 class DashboardMetrics(BaseModel):
@@ -384,9 +384,9 @@ class BulkAction(BaseModel):
 class ScanImportRequest(BaseModel):
     """Scan import request"""
 
-    scan_profile_id: str
+    scan_profile_id: str = ""
     scan_format: str  # nessus, qualys, openvas, tenable, trivy, grype
-    scan_data: str
+    scan_data: str = ""
     notes: Optional[str] = None
 
 
@@ -402,8 +402,8 @@ class PatchPlanRequest(BaseModel):
 class PatchDeploymentRequest(BaseModel):
     """Patch deployment request"""
 
-    patch_operation_id: str
-    deployment_date: str
+    patch_operation_id: str = ""
+    deployment_date: str = ""
     change_ticket_id: Optional[str] = None
     notes: Optional[str] = None
 
@@ -411,7 +411,7 @@ class PatchDeploymentRequest(BaseModel):
 class PatchVerificationRequest(BaseModel):
     """Patch verification request"""
 
-    patch_operation_id: str
+    patch_operation_id: str = ""
     verification_results: dict[str, Any]
     verification_date: Optional[str] = None
 
@@ -419,6 +419,6 @@ class PatchVerificationRequest(BaseModel):
 class PatchRollbackRequest(BaseModel):
     """Patch rollback request"""
 
-    patch_operation_id: str
+    patch_operation_id: str = ""
     reason: str = Field(..., min_length=10)
     approved_by: Optional[str] = None

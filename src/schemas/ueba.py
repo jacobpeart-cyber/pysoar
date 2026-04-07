@@ -53,12 +53,12 @@ class EntityProfileUpdate(BaseModel):
 class EntityProfileResponse(EntityProfileBase, DBModel):
     """Response schema for entity profile with full details."""
 
-    id: str
-    risk_score: float
-    risk_level: str
+    id: str = ""
+    risk_score: float = 0.0
+    risk_level: str = ""
     baseline_data: dict
     current_behavior: dict
-    anomaly_count_30d: int
+    anomaly_count_30d: int = 0
     last_activity_at: Optional[datetime] = None
     last_anomaly_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
@@ -75,16 +75,16 @@ class EntityProfileResponse(EntityProfileBase, DBModel):
 class BehaviorBaselineResponse(DBModel):
     """Response schema for behavior baseline."""
 
-    id: str
-    entity_profile_id: str
-    behavior_type: str
-    baseline_period_days: int
+    id: str = ""
+    entity_profile_id: str = ""
+    behavior_type: str = ""
+    baseline_period_days: int = 0
     statistical_model: dict
     typical_values: list
     time_patterns: dict
     peer_comparison: dict
-    confidence: float
-    sample_count: int
+    confidence: float = 0.0
+    sample_count: int = 0
     last_updated_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
 
@@ -99,7 +99,7 @@ class BehaviorBaselineResponse(DBModel):
 class BehaviorEventBase(BaseModel):
     """Base schema for behavior event."""
 
-    entity_id: str
+    entity_id: str = ""
     event_type: str = Field(..., description="Type: authentication, resource_access, network_connection, etc.")
     event_data: dict
     source_ip: Optional[str] = None
@@ -117,10 +117,10 @@ class BehaviorEventCreate(BehaviorEventBase):
 class BehaviorEventResponse(BehaviorEventBase, DBModel):
     """Response schema for behavior event."""
 
-    id: str
-    entity_profile_id: str
-    risk_contribution: float
-    is_anomalous: bool
+    id: str = ""
+    entity_profile_id: str = ""
+    risk_contribution: float = 0.0
+    is_anomalous: bool = False
     anomaly_reasons: list
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -142,10 +142,10 @@ class BehaviorEventBatch(BaseModel):
 class UEBARiskAlertBase(BaseModel):
     """Base schema for UEBA risk alert."""
 
-    entity_id: str
-    alert_type: str
+    entity_id: str = ""
+    alert_type: str = ""
     severity: str = Field(..., description="Severity: critical, high, medium, low")
-    description: str
+    description: str = ""
     evidence: list = Field(default_factory=list)
     mitre_techniques: list = Field(default_factory=list)
 
@@ -153,7 +153,7 @@ class UEBARiskAlertBase(BaseModel):
 class UEBARiskAlertCreate(UEBARiskAlertBase):
     """Schema for creating UEBA alert."""
 
-    risk_score_delta: float
+    risk_score_delta: float = 0.0
     contributing_events: list = Field(default_factory=list)
 
 
@@ -168,11 +168,11 @@ class UEBARiskAlertUpdate(BaseModel):
 class UEBARiskAlertResponse(UEBARiskAlertBase, DBModel):
     """Response schema for UEBA risk alert."""
 
-    id: str
-    entity_profile_id: str
-    risk_score_delta: float
+    id: str = ""
+    entity_profile_id: str = ""
+    risk_score_delta: float = 0.0
     contributing_events: list
-    status: str
+    status: str = ""
     analyst_notes: Optional[str] = None
     escalated_to_incident: Optional[str] = None
     created_at: Optional[datetime] = None
@@ -189,7 +189,7 @@ class UEBARiskAlertResponse(UEBARiskAlertBase, DBModel):
 class PeerGroupBase(BaseModel):
     """Base schema for peer group."""
 
-    name: str
+    name: str = ""
     description: Optional[str] = None
     group_type: str = Field(..., description="Type: department, role, custom, auto_clustered")
     risk_threshold: float = 70.0
@@ -204,8 +204,8 @@ class PeerGroupCreate(PeerGroupBase):
 class PeerGroupResponse(PeerGroupBase, DBModel):
     """Response schema for peer group."""
 
-    id: str
-    member_count: int
+    id: str = ""
+    member_count: int = 0
     baseline_data: dict
     members: list
     created_at: Optional[datetime] = None
@@ -222,24 +222,24 @@ class PeerGroupResponse(PeerGroupBase, DBModel):
 class RiskFactorResponse(BaseModel):
     """Schema for risk factor breakdown."""
 
-    factor: str
-    count: int
-    contribution: float
+    factor: str = ""
+    count: int = 0
+    contribution: float = 0.0
 
 
 class RiskTrendPoint(BaseModel):
     """Schema for single point in risk trend."""
 
-    date: str
-    risk_score: float
+    date: str = ""
+    risk_score: float = 0.0
 
 
 class EntityRiskResponse(BaseModel):
     """Response schema for entity risk detail."""
 
-    entity_id: str
-    risk_score: float
-    risk_level: str
+    entity_id: str = ""
+    risk_score: float = 0.0
+    risk_level: str = ""
     risk_factors: list[RiskFactorResponse]
     risk_trend: list[RiskTrendPoint]
     updated_at: Optional[datetime] = None
@@ -252,21 +252,21 @@ class EntityRiskResponse(BaseModel):
 class BehaviorTimelineEvent(BaseModel):
     """Schema for event in behavior timeline."""
 
-    id: str
-    event_type: str
+    id: str = ""
+    event_type: str = ""
     timestamp: datetime
-    description: str
-    is_anomalous: bool
+    description: str = ""
+    is_anomalous: bool = False
     anomaly_reasons: list
-    risk_contribution: float
+    risk_contribution: float = 0.0
 
 
 class BehaviorTimelineResponse(BaseModel):
     """Response schema for behavior timeline."""
 
-    entity_id: str
-    event_count: int
-    anomaly_count: int
+    entity_id: str = ""
+    event_count: int = 0
+    anomaly_count: int = 0
     events: list[BehaviorTimelineEvent]
 
 
@@ -277,19 +277,19 @@ class BehaviorTimelineResponse(BaseModel):
 class PercentileComparison(BaseModel):
     """Schema for percentile comparison metric."""
 
-    metric: str
-    entity_value: float
-    peer_average: float
-    percentile: float
+    metric: str = ""
+    entity_value: float = 0.0
+    peer_average: float = 0.0
+    percentile: float = 0.0
 
 
 class PeerComparisonResponse(BaseModel):
     """Response schema for peer comparison."""
 
-    entity_id: str
-    peer_group_id: str
-    peer_group_name: str
-    member_count: int
+    entity_id: str = ""
+    peer_group_id: str = ""
+    peer_group_name: str = ""
+    member_count: int = 0
     comparisons: list[PercentileComparison]
     deviations: list[dict]
 
@@ -301,27 +301,27 @@ class PeerComparisonResponse(BaseModel):
 class RiskDistribution(BaseModel):
     """Schema for risk level distribution."""
 
-    level: str
-    count: int
-    percentage: float
+    level: str = ""
+    count: int = 0
+    percentage: float = 0.0
 
 
 class AlertDistribution(BaseModel):
     """Schema for alert type distribution."""
 
-    alert_type: str
-    count: int
-    percentage: float
+    alert_type: str = ""
+    count: int = 0
+    percentage: float = 0.0
 
 
 class HighRiskEntity(BaseModel):
     """Schema for high risk entity in dashboard."""
 
-    id: str
-    entity_id: str
-    entity_type: str
-    risk_score: float
-    risk_level: str
+    id: str = ""
+    entity_id: str = ""
+    entity_type: str = ""
+    risk_score: float = 0.0
+    risk_level: str = ""
     latest_alert: Optional[str] = None
     last_anomaly_at: Optional[datetime] = None
 
@@ -329,15 +329,15 @@ class HighRiskEntity(BaseModel):
 class UEBADashboardStats(BaseModel):
     """Response schema for UEBA dashboard."""
 
-    total_entities: int
-    watched_entities: int
+    total_entities: int = 0
+    watched_entities: int = 0
     high_risk_entities: list[HighRiskEntity]
     risk_distribution: list[RiskDistribution]
     alert_distribution: list[AlertDistribution]
-    alerts_last_7d: int
-    alerts_last_30d: int
-    anomalies_last_7d: int
-    anomalies_last_30d: int
+    alerts_last_7d: int = 0
+    alerts_last_30d: int = 0
+    anomalies_last_7d: int = 0
+    anomalies_last_30d: int = 0
     updated_at: datetime
 
 
@@ -348,17 +348,17 @@ class UEBADashboardStats(BaseModel):
 class RiskHeatmapCell(BaseModel):
     """Schema for single heatmap cell."""
 
-    entity_type: str
-    risk_level: str
-    count: int
-    percentage: float
+    entity_type: str = ""
+    risk_level: str = ""
+    count: int = 0
+    percentage: float = 0.0
 
 
 class RiskHeatmapResponse(BaseModel):
     """Response schema for risk heatmap."""
 
     heatmap_data: list[RiskHeatmapCell]
-    total_entities: int
+    total_entities: int = 0
     generated_at: Optional[datetime] = None
 
 
@@ -369,12 +369,12 @@ class RiskHeatmapResponse(BaseModel):
 class BatchIngestionResponse(BaseModel):
     """Response schema for batch event ingestion."""
 
-    total_events: int
-    processed_events: int
-    failed_events: int
-    anomalies_detected: int
-    alerts_created: int
-    processing_time_ms: float
+    total_events: int = 0
+    processed_events: int = 0
+    failed_events: int = 0
+    anomalies_detected: int = 0
+    alerts_created: int = 0
+    processing_time_ms: float = 0.0
 
 
 # ============================================================================

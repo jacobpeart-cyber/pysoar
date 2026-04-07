@@ -96,20 +96,20 @@ class ReviewStatus(str, Enum):
 class ComplianceFrameworkResponse(DBModel):
     """Compliance Framework Response"""
 
-    id: str
-    name: str
-    short_name: str
-    version: str
+    id: str = ""
+    name: str = ""
+    short_name: str = ""
+    version: str = ""
     description: Optional[str] = None
-    authority: str
-    total_controls: int
-    implemented_controls: int
-    compliance_score: float
+    authority: str = ""
+    total_controls: int = 0
+    implemented_controls: int = 0
+    compliance_score: float = 0.0
     status: FrameworkStatus
     last_assessment_at: Optional[datetime] = None
     next_assessment_due: Optional[datetime] = None
     certification_level: Optional[str] = None
-    is_enabled: bool
+    is_enabled: bool = False
     metadata: Dict[str, Any] = {}
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -121,27 +121,27 @@ class ComplianceFrameworkResponse(DBModel):
 class ComplianceControlResponse(DBModel):
     """Compliance Control Response"""
 
-    id: str
-    framework_id: str
-    control_id: str
-    control_family: str
-    title: str
+    id: str = ""
+    framework_id: str = ""
+    control_id: str = ""
+    control_family: str = ""
+    title: str = ""
     description: Optional[str] = None
-    priority: str
+    priority: str = ""
     baseline: Optional[str] = None
     status: ControlStatus
-    implementation_status: float
+    implementation_status: float = 0.0
     implementation_details: Optional[str] = None
     responsible_party: Optional[str] = None
-    assessment_method: str
-    assessment_frequency: str
+    assessment_method: str = ""
+    assessment_frequency: str = ""
     last_assessed_at: Optional[datetime] = None
     last_assessment_result: Optional[AssessmentResult] = None
     evidence_ids: List[str] = []
     related_controls: Dict[str, Any] = {}
     mitre_techniques: List[str] = []
     automated_check_id: Optional[str] = None
-    risk_if_not_implemented: str
+    risk_if_not_implemented: str = ""
     remediation_guidance: Optional[str] = None
     poam_id: Optional[str] = None
     tags: List[str] = []
@@ -155,11 +155,11 @@ class ComplianceControlResponse(DBModel):
 class POAMResponse(DBModel):
     """Plan of Action & Milestones Response"""
 
-    id: str
-    control_id_ref: str
-    weakness_name: str
+    id: str = ""
+    control_id_ref: str = ""
+    weakness_name: str = ""
     weakness_description: Optional[str] = None
-    weakness_source: str
+    weakness_source: str = ""
     risk_level: RiskLevel
     original_risk_rating: Optional[float] = None
     residual_risk_rating: Optional[float] = None
@@ -185,19 +185,19 @@ class POAMResponse(DBModel):
 class ComplianceEvidenceResponse(DBModel):
     """Compliance Evidence Response"""
 
-    id: str
-    control_id_ref: str
+    id: str = ""
+    control_id_ref: str = ""
     evidence_type: EvidenceType
-    title: str
+    title: str = ""
     description: Optional[str] = None
     file_path: Optional[str] = None
     file_hash: Optional[str] = None
     content: Optional[str] = None
     source_system: Optional[str] = None
     collected_at: Optional[datetime] = None
-    collected_by: str
-    is_automated: bool
-    is_valid: bool
+    collected_by: str = ""
+    is_automated: bool = False
+    is_valid: bool = False
     expires_at: Optional[datetime] = None
     review_status: ReviewStatus
     reviewed_by: Optional[str] = None
@@ -213,16 +213,16 @@ class ComplianceEvidenceResponse(DBModel):
 class ComplianceAssessmentResponse(DBModel):
     """Compliance Assessment Response"""
 
-    id: str
-    framework_id: str
-    assessment_type: str
-    assessor: str
+    id: str = ""
+    framework_id: str = ""
+    assessment_type: str = ""
+    assessor: str = ""
     assessment_date: Optional[datetime] = None
-    status: str
+    status: str = ""
     scope: Optional[str] = None
-    findings_count: int
-    satisfied_count: int
-    other_than_satisfied_count: int
+    findings_count: int = 0
+    satisfied_count: int = 0
+    other_than_satisfied_count: int = 0
     overall_result: Optional[str] = None
     report_path: Optional[str] = None
     next_steps: List[Dict[str, Any]] = []
@@ -236,17 +236,17 @@ class ComplianceAssessmentResponse(DBModel):
 class CUIMarkingResponse(DBModel):
     """CUI Marking Response"""
 
-    id: str
-    asset_id: str
-    asset_type: str
-    cui_category: str
-    cui_designation: str
+    id: str = ""
+    asset_id: str = ""
+    asset_type: str = ""
+    cui_category: str = ""
+    cui_designation: str = ""
     dissemination_controls: List[str] = []
     handling_instructions: Optional[str] = None
-    classification_authority: str
+    classification_authority: str = ""
     declassification_date: Optional[datetime] = None
     access_list: List[str] = []
-    is_active: bool
+    is_active: bool = False
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -257,16 +257,16 @@ class CUIMarkingResponse(DBModel):
 class CISADirectiveResponse(DBModel):
     """CISA Directive Response"""
 
-    id: str
-    directive_id: str
-    title: str
+    id: str = ""
+    directive_id: str = ""
+    title: str = ""
     description: Optional[str] = None
-    directive_type: str
+    directive_type: str = ""
     effective_date: Optional[datetime] = None
     compliance_deadline: Optional[datetime] = None
-    status: str
+    status: str = ""
     requirements: List[Dict[str, Any]] = []
-    compliance_status: str
+    compliance_status: str = ""
     actions_taken: List[Dict[str, Any]] = []
     evidence_ids: List[str] = []
     created_at: Optional[datetime] = None
@@ -280,10 +280,10 @@ class CISADirectiveResponse(DBModel):
 class POAMCreateRequest(BaseModel):
     """Create POA&M Request"""
 
-    control_id_ref: str
-    weakness_name: str
+    control_id_ref: str = ""
+    weakness_name: str = ""
     weakness_description: Optional[str] = None
-    weakness_source: str
+    weakness_source: str = ""
     risk_level: RiskLevel
     scheduled_completion_date: datetime
     resources_required: Optional[str] = None
@@ -305,7 +305,7 @@ class POAMUpdateRequest(BaseModel):
 class SSPGenerationRequest(BaseModel):
     """SSP Generation Request"""
 
-    framework_id: str
+    framework_id: str = ""
     include_controls: Optional[List[str]] = None
     baseline: Optional[str] = None
 
@@ -313,13 +313,13 @@ class SSPGenerationRequest(BaseModel):
 class CUIMarkingRequest(BaseModel):
     """CUI Marking Request"""
 
-    asset_id: str
-    asset_type: str
-    cui_category: str
-    cui_designation: str
+    asset_id: str = ""
+    asset_type: str = ""
+    cui_category: str = ""
+    cui_designation: str = ""
     dissemination_controls: List[str] = []
     handling_instructions: Optional[str] = None
-    classification_authority: str
+    classification_authority: str = ""
     declassification_date: Optional[datetime] = None
     access_list: List[str] = []
 
@@ -328,21 +328,21 @@ class CUIMarkingRequest(BaseModel):
 class FrameworkAssessmentResponse(BaseModel):
     """Framework Assessment Response"""
 
-    framework_id: str
-    assessment_id: str
-    total_controls: int
-    implemented: int
-    satisfied: int
-    compliance_score: float
-    status: str
+    framework_id: str = ""
+    assessment_id: str = ""
+    total_controls: int = 0
+    implemented: int = 0
+    satisfied: int = 0
+    compliance_score: float = 0.0
+    status: str = ""
     assessment_date: Optional[datetime] = None
 
 
 class SSPGenerationResponse(BaseModel):
     """SSP Generation Response"""
 
-    framework: str
-    baseline: str
+    framework: str = ""
+    baseline: str = ""
     generated_at: Optional[datetime] = None
     control_families: Dict[str, Any]
 
@@ -350,35 +350,35 @@ class SSPGenerationResponse(BaseModel):
 class ConMonReportResponse(BaseModel):
     """Continuous Monitoring Report Response"""
 
-    conmon_type: str
+    conmon_type: str = ""
     conmon_date: Optional[datetime] = None
-    frameworks_assessed: int
+    frameworks_assessed: int = 0
     results: List[Dict[str, Any]]
 
 
 class ComplianceDashboardStats(BaseModel):
     """Compliance Dashboard Statistics"""
 
-    frameworks_total: int
-    frameworks_compliant: int
-    overall_compliance_score: float
+    frameworks_total: int = 0
+    frameworks_compliant: int = 0
+    overall_compliance_score: float = 0.0
     framework_scores: List[Dict[str, Any]]
-    overdue_poams: int
-    upcoming_poams: int
-    upcoming_assessments: int
+    overdue_poams: int = 0
+    upcoming_poams: int = 0
+    upcoming_assessments: int = 0
     control_status_breakdown: Dict[str, int]
-    active_cisa_directives: int
-    cui_assets_total: int
-    cui_assets_active: int
+    active_cisa_directives: int = 0
+    cui_assets_total: int = 0
+    cui_assets_active: int = 0
     last_updated: datetime
 
 
 class ControlGapAnalysisResponse(BaseModel):
     """Control Gap Analysis Response"""
 
-    framework_id: str
-    total_controls: int
-    gaps_count: int
+    framework_id: str = ""
+    total_controls: int = 0
+    gaps_count: int = 0
     gaps: List[Dict[str, Any]]
     priority_distribution: Dict[str, int]
     risk_distribution: Dict[str, int]
@@ -387,24 +387,24 @@ class ControlGapAnalysisResponse(BaseModel):
 class CrossFrameworkMappingResponse(BaseModel):
     """Cross-Framework Control Mapping Response"""
 
-    source_framework: str
-    target_framework: str
+    source_framework: str = ""
+    target_framework: str = ""
     mapped_controls: List[Dict[str, Any]]
     unmapped_source_controls: List[str]
-    coverage_percentage: float
+    coverage_percentage: float = 0.0
 
 
 class CISADirectiveStatusResponse(BaseModel):
     """CISA Directive Status Response"""
 
-    directive_id: str
-    title: str
-    directive_type: str
+    directive_id: str = ""
+    title: str = ""
+    directive_type: str = ""
     compliance_deadline: Optional[datetime] = None
-    compliance_status: str
-    actions_taken: int
-    evidence_count: int
-    days_until_deadline: int
+    compliance_status: str = ""
+    actions_taken: int = 0
+    evidence_count: int = 0
+    days_until_deadline: int = 0
 
 
 # Pagination Models
@@ -428,8 +428,8 @@ class ControlStatusUpdateRequest(BaseModel):
 class ControlAssessmentRequest(BaseModel):
     """Control Assessment Request"""
 
-    assessment_method: str
-    assessment_frequency: str
-    assessor: str
+    assessment_method: str = ""
+    assessment_frequency: str = ""
+    assessor: str = ""
     findings: Optional[List[str]] = None
     result: Optional[AssessmentResult] = None

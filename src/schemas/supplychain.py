@@ -48,10 +48,10 @@ class SoftwareComponentUpdate(BaseModel):
 class SoftwareComponentResponse(SoftwareComponentBase, DBModel):
     """Schema for component response"""
 
-    id: str
-    organization_id: str
+    id: str = ""
+    organization_id: str = ""
     parent_component_id: Optional[str] = None
-    depth_level: int
+    depth_level: int = 0
     known_vulnerabilities_count: int = 0
     risk_score: float = 0.0
     last_scanned: Optional[datetime] = None
@@ -89,8 +89,8 @@ class SBOMUpdate(BaseModel):
 class SBOMResponse(SBOMBase, DBModel):
     """Schema for SBOM response"""
 
-    id: str
-    organization_id: str
+    id: str = ""
+    organization_id: str = ""
     components_count: int = 0
     total_dependencies: int = 0
     direct_dependencies: int = 0
@@ -115,16 +115,16 @@ class SBOMComponentBase(BaseModel):
 class SBOMComponentCreate(SBOMComponentBase):
     """Schema for creating SBOM component mapping"""
 
-    sbom_id: str
-    component_id: str
+    sbom_id: str = ""
+    component_id: str = ""
 
 
 class SBOMComponentResponse(SBOMComponentBase, DBModel):
     """Schema for SBOM component response"""
 
-    id: str
-    sbom_id: str
-    component_id: str
+    id: str = ""
+    sbom_id: str = ""
+    component_id: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -135,10 +135,10 @@ class SBOMComponentResponse(SBOMComponentBase, DBModel):
 class SupplyChainRiskBase(BaseModel):
     """Base schema for supply chain risk"""
 
-    component_id: str
-    risk_type: str
-    severity: str
-    description: str
+    component_id: str = ""
+    risk_type: str = ""
+    severity: str = ""
+    description: str = ""
     evidence: Optional[dict[str, Any]] = None
     cve_ids: Optional[list[str]] = None
     remediation_advice: Optional[str] = None
@@ -162,8 +162,8 @@ class SupplyChainRiskUpdate(BaseModel):
 class SupplyChainRiskResponse(SupplyChainRiskBase, DBModel):
     """Schema for supply chain risk response"""
 
-    id: str
-    organization_id: str
+    id: str = ""
+    organization_id: str = ""
     detected_date: Optional[datetime] = None
     remediation_date: Optional[datetime] = None
     created_at: Optional[datetime] = None
@@ -205,8 +205,8 @@ class VendorAssessmentUpdate(BaseModel):
 class VendorAssessmentResponse(VendorAssessmentBase, DBModel):
     """Schema for vendor assessment response"""
 
-    id: str
-    organization_id: str
+    id: str = ""
+    organization_id: str = ""
     assessment_date: Optional[datetime] = None
     last_incident_date: Optional[datetime] = None
     incident_count: int = 0
@@ -225,40 +225,40 @@ class SBOMListResponse(BaseModel):
     """List response for SBOMs"""
 
     items: list[SBOMResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class SoftwareComponentListResponse(BaseModel):
     """List response for software components"""
 
     items: list[SoftwareComponentResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class SupplyChainRiskListResponse(BaseModel):
     """List response for supply chain risks"""
 
     items: list[SupplyChainRiskResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class VendorAssessmentListResponse(BaseModel):
     """List response for vendor assessments"""
 
     items: list[VendorAssessmentResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 # Specialized Request/Response Schemas
@@ -302,8 +302,8 @@ class ComponentVulnerabilityLookup(BaseModel):
 class SBOMComparisonRequest(BaseModel):
     """Request for comparing SBOM versions"""
 
-    sbom_id_1: str
-    sbom_id_2: str
+    sbom_id_1: str = ""
+    sbom_id_2: str = ""
 
 
 class SBOMComparisonResponse(BaseModel):
@@ -320,9 +320,9 @@ class SBOMComparisonResponse(BaseModel):
 class RiskAssessmentResult(BaseModel):
     """Risk assessment result for component"""
 
-    component_id: str
-    component_name: str
-    risk_score: float
+    component_id: str = ""
+    component_name: str = ""
+    risk_score: float = 0.0
     risk_factors: list[str] = []
     known_vulnerabilities: int = 0
     outdated: bool = False
@@ -335,11 +335,11 @@ class SupplyChainRiskReport(BaseModel):
     """Supply chain risk report"""
 
     report_generated: datetime
-    total_components: int
-    critical_risks: int
-    high_risks: int
-    medium_risks: int
-    average_risk_score: float
+    total_components: int = 0
+    critical_risks: int = 0
+    high_risks: int = 0
+    medium_risks: int = 0
+    average_risk_score: float = 0.0
     recommendations: list[str]
 
 
@@ -347,26 +347,26 @@ class VendorRiskReport(BaseModel):
     """Vendor risk report"""
 
     report_generated: datetime
-    total_vendors: int
-    critical_risk_vendors: int
-    high_risk_vendors: int
-    average_vendor_score: float
+    total_vendors: int = 0
+    critical_risk_vendors: int = 0
+    high_risk_vendors: int = 0
+    average_vendor_score: float = 0.0
 
 
 class ComplianceValidationResult(BaseModel):
     """SBOM compliance validation result"""
 
-    compliant: bool
+    compliant: bool = False
     required_elements: dict[str, bool]
     missing_elements: list[str]
-    compliance_percentage: float
+    compliance_percentage: float = 0.0
     recommendations: list[str]
 
 
 class CISAComplianceReport(BaseModel):
     """CISA compliance report"""
 
-    overall_compliant: bool
+    overall_compliant: bool = False
     cisa_compliance: ComplianceValidationResult
     ntia_compliance: ComplianceValidationResult
     recommendations: list[str]
@@ -375,59 +375,59 @@ class CISAComplianceReport(BaseModel):
 class DashboardOverview(BaseModel):
     """Supply chain dashboard overview"""
 
-    total_sboms: int
-    total_components: int
-    components_with_vulnerabilities: int
-    critical_risks_open: int
-    high_risks_open: int
-    vendors_assessed: int
-    critical_risk_vendors: int
-    average_component_risk: float
-    average_vendor_score: float
+    total_sboms: int = 0
+    total_components: int = 0
+    components_with_vulnerabilities: int = 0
+    critical_risks_open: int = 0
+    high_risks_open: int = 0
+    vendors_assessed: int = 0
+    critical_risk_vendors: int = 0
+    average_component_risk: float = 0.0
+    average_vendor_score: float = 0.0
 
 
 class RiskyComponentSummary(BaseModel):
     """Summary of risky components"""
 
-    component_id: str
-    component_name: str
-    version: str
-    risk_score: float
-    vulnerability_count: int
-    risk_type: str
-    severity: str
+    component_id: str = ""
+    component_name: str = ""
+    version: str = ""
+    risk_score: float = 0.0
+    vulnerability_count: int = 0
+    risk_type: str = ""
+    severity: str = ""
 
 
 class VendorScoreSummary(BaseModel):
     """Summary of vendor scores"""
 
-    vendor_id: str
-    vendor_name: str
-    risk_score: float
-    risk_tier: str
+    vendor_id: str = ""
+    vendor_name: str = ""
+    risk_score: float = 0.0
+    risk_tier: str = ""
     last_assessment: datetime
-    incident_count: int
+    incident_count: int = 0
 
 
 class LicenseBreakdown(BaseModel):
     """License distribution across components"""
 
-    total_components: int
+    total_components: int = 0
     licenses: dict[str, int]
-    gpl_components: int
-    proprietary_components: int
-    permissive_components: int
+    gpl_components: int = 0
+    proprietary_components: int = 0
+    permissive_components: int = 0
     conflicts: list[str]
-    compliance_status: str
+    compliance_status: str = ""
 
 
 class ComplianceAudit(BaseModel):
     """Compliance audit record"""
 
     audit_date: datetime
-    sbom_id: str
-    cisa_compliant: bool
-    ntia_compliant: bool
-    license_compliant: bool
+    sbom_id: str = ""
+    cisa_compliant: bool = False
+    ntia_compliant: bool = False
+    license_compliant: bool = False
     recommendations: list[str]
-    auditor: str
+    auditor: str = ""

@@ -17,8 +17,8 @@ class WarRoomBase(BaseModel):
 
     name: str = Field(..., min_length=1, max_length=255)
     description: Optional[str] = None
-    room_type: str
-    severity_level: str
+    room_type: str = ""
+    severity_level: str = ""
     max_participants: int = Field(default=50, ge=1, le=500)
     auto_archive_hours: Optional[int] = Field(None, ge=1)
     is_encrypted: bool = False
@@ -46,13 +46,13 @@ class WarRoomUpdate(BaseModel):
 class WarRoomResponse(WarRoomBase, DBModel):
     """Schema for war room response"""
 
-    id: str
-    organization_id: str
+    id: str = ""
+    organization_id: str = ""
     incident_id: Optional[str] = None
-    status: str
+    status: str = ""
     commander_id: Optional[str] = None
     participants: list[str] = Field(default_factory=list)
-    created_by: str
+    created_by: str = ""
     pinned_items: list[str] = Field(default_factory=list)
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -65,24 +65,24 @@ class WarRoomListResponse(BaseModel):
     """Schema for paginated war room list"""
 
     items: list[WarRoomResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class WarRoomSummary(BaseModel):
     """War room summary with metrics"""
 
-    id: str
-    name: str
-    status: str
-    room_type: str
-    severity_level: str
+    id: str = ""
+    name: str = ""
+    status: str = ""
+    room_type: str = ""
+    severity_level: str = ""
     participants: list[str]
-    message_count: int
-    action_count: int
-    artifact_count: int
+    message_count: int = 0
+    action_count: int = 0
+    artifact_count: int = 0
     created_at: datetime
     updated_at: datetime
 
@@ -116,12 +116,12 @@ class WarRoomMessageUpdate(BaseModel):
 class WarRoomMessageResponse(WarRoomMessageBase, DBModel):
     """Schema for message response"""
 
-    id: str
-    room_id: str
-    sender_id: str
-    sender_name: str
-    is_pinned: bool
-    is_edited: bool
+    id: str = ""
+    room_id: str = ""
+    sender_id: str = ""
+    sender_name: str = ""
+    is_pinned: bool = False
+    is_edited: bool = False
     edited_at: Optional[datetime] = None
     parent_message_id: Optional[str] = None
     reactions: dict[str, list[str]] = Field(default_factory=dict)
@@ -136,9 +136,9 @@ class WarRoomMessageListResponse(BaseModel):
     """Schema for paginated message list"""
 
     items: list[WarRoomMessageResponse]
-    total: int
-    page: int
-    size: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
 
 
 class MessageThreadResponse(BaseModel):
@@ -156,16 +156,16 @@ class MessageThreadResponse(BaseModel):
 class SharedArtifactBase(BaseModel):
     """Base artifact schema"""
 
-    artifact_type: str
+    artifact_type: str = ""
     file_name: str = Field(..., min_length=1, max_length=255)
-    classification_level: str
+    classification_level: str = ""
     description: Optional[str] = None
 
 
 class SharedArtifactCreate(SharedArtifactBase):
     """Schema for creating an artifact"""
 
-    file_hash: str
+    file_hash: str = ""
     file_size_bytes: int = Field(..., ge=0)
     access_restricted_to: Optional[list[str]] = None
 
@@ -173,13 +173,13 @@ class SharedArtifactCreate(SharedArtifactBase):
 class SharedArtifactResponse(SharedArtifactBase, DBModel):
     """Schema for artifact response"""
 
-    id: str
-    room_id: str
-    uploaded_by: str
-    file_hash: str
-    file_size_bytes: int
-    download_count: int
-    analysis_status: str
+    id: str = ""
+    room_id: str = ""
+    uploaded_by: str = ""
+    file_hash: str = ""
+    file_size_bytes: int = 0
+    download_count: int = 0
+    analysis_status: str = ""
     access_restricted_to: list[str] = Field(default_factory=list)
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -192,15 +192,15 @@ class SharedArtifactListResponse(BaseModel):
     """Schema for paginated artifact list"""
 
     items: list[SharedArtifactResponse]
-    total: int
-    page: int
-    size: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
 
 
 class ArtifactIndex(BaseModel):
     """Index of artifacts in room"""
 
-    total: int
+    total: int = 0
     by_type: dict[str, int]
     artifacts: list[dict[str, Any]]
 
@@ -240,11 +240,11 @@ class ActionItemUpdate(BaseModel):
 class ActionItemResponse(ActionItemBase, DBModel):
     """Schema for action item response"""
 
-    id: str
-    room_id: str
-    status: str
+    id: str = ""
+    room_id: str = ""
+    status: str = ""
     assigned_to: Optional[str] = None
-    assigned_by: str
+    assigned_by: str = ""
     linked_alert_id: Optional[str] = None
     linked_incident_id: Optional[str] = None
     notes: Optional[str] = None
@@ -260,18 +260,18 @@ class ActionItemListResponse(BaseModel):
     """Schema for paginated action item list"""
 
     items: list[ActionItemResponse]
-    total: int
-    page: int
-    size: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
 
 
 class ActionReport(BaseModel):
     """Action items report"""
 
-    total: int
+    total: int = 0
     by_status: dict[str, int]
     by_priority: dict[str, int]
-    overdue: int
+    overdue: int = 0
     actions: list[dict[str, Any]]
 
 
@@ -283,7 +283,7 @@ class ActionReport(BaseModel):
 class IncidentTimelineBase(BaseModel):
     """Base timeline event schema"""
 
-    event_type: str
+    event_type: str = ""
     description: str = Field(..., min_length=1)
     event_time: Optional[datetime] = None
     is_key_event: bool = False
@@ -299,9 +299,9 @@ class IncidentTimelineCreate(IncidentTimelineBase):
 class IncidentTimelineResponse(IncidentTimelineBase, DBModel):
     """Schema for timeline event response"""
 
-    id: str
-    room_id: str
-    created_by: str
+    id: str = ""
+    room_id: str = ""
+    created_by: str = ""
     evidence_ids: list[str] = Field(default_factory=list)
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -314,9 +314,9 @@ class IncidentTimelineListResponse(BaseModel):
     """Schema for paginated timeline list"""
 
     items: list[IncidentTimelineResponse]
-    total: int
-    page: int
-    size: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
 
 
 # ============================================================================
@@ -327,13 +327,13 @@ class IncidentTimelineListResponse(BaseModel):
 class PostMortemReport(BaseModel):
     """Post-mortem report"""
 
-    title: str
+    title: str = ""
     incident_id: Optional[str] = None
-    room_type: str
-    severity: str
-    duration_minutes: int
+    room_type: str = ""
+    severity: str = ""
+    duration_minutes: int = 0
     timeline: list[dict[str, Any]]
-    actions_taken: int
+    actions_taken: int = 0
     key_decisions: list[str]
     participants: list[str]
     generated_at: datetime
@@ -342,14 +342,14 @@ class PostMortemReport(BaseModel):
 class SituationReport(BaseModel):
     """Situation report (SITREP)"""
 
-    room_id: str
-    period_hours: int
+    room_id: str = ""
+    period_hours: int = 0
     generated_at: datetime
-    message_count: int
+    message_count: int = 0
     key_updates: list[str]
     decisions: list[str]
-    action_items_open: int
-    action_items_completed: int
+    action_items_open: int = 0
+    action_items_completed: int = 0
 
 
 class ResponseMetrics(BaseModel):
@@ -358,15 +358,15 @@ class ResponseMetrics(BaseModel):
     mttd: Optional[float] = None  # Mean time to detect (minutes)
     mttr: Optional[float] = None  # Mean time to respond (minutes)
     mttc: Optional[float] = None  # Mean time to contain (minutes)
-    total_timeline_events: int
-    key_events: int
+    total_timeline_events: int = 0
+    key_events: int = 0
 
 
 class ImprovementRecommendation(BaseModel):
     """Improvement recommendation"""
 
-    category: str
-    recommendation: str
+    category: str = ""
+    recommendation: str = ""
     priority: str = "medium"
     implementation_effort: str = "medium"
 
@@ -388,20 +388,20 @@ class PostMortemAnalysis(BaseModel):
 class RoomActivityMetrics(BaseModel):
     """Activity metrics for a room"""
 
-    messages_last_hour: int
-    messages_last_24h: int
-    active_participants_last_hour: int
-    pending_actions: int
-    overdue_actions: int
+    messages_last_hour: int = 0
+    messages_last_24h: int = 0
+    active_participants_last_hour: int = 0
+    pending_actions: int = 0
+    overdue_actions: int = 0
 
 
 class CollaborationDashboard(BaseModel):
     """Collaboration module dashboard"""
 
-    active_rooms: int
-    total_participants: int
-    pending_actions: int
-    overdue_actions: int
+    active_rooms: int = 0
+    total_participants: int = 0
+    pending_actions: int = 0
+    overdue_actions: int = 0
     recent_rooms: list[WarRoomSummary]
     critical_actions: list[ActionItemResponse]
     response_metrics: dict[str, Optional[float]]
@@ -412,7 +412,7 @@ class SearchResultsResponse(BaseModel):
 
     messages: list[WarRoomMessageResponse] = Field(default_factory=list)
     artifacts: list[SharedArtifactResponse] = Field(default_factory=list)
-    total_results: int
+    total_results: int = 0
 
 
 # ============================================================================
@@ -432,6 +432,6 @@ class BulkActionUpdate(BaseModel):
 class BulkParticipantUpdate(BaseModel):
     """Bulk add/remove participants"""
 
-    room_id: str
+    room_id: str = ""
     user_ids: list[str]
     action: str = Field(..., pattern="^(add|remove)$")

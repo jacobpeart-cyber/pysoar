@@ -52,13 +52,13 @@ class ThreatFeedUpdate(BaseModel):
 class ThreatFeedResponse(ThreatFeedBase, DBModel):
     """Schema for threat feed response"""
 
-    id: str
-    is_builtin: bool
+    id: str = ""
+    is_builtin: bool = False
     auth_type: Optional[str] = None
     last_poll_at: Optional[datetime] = None
     last_success_at: Optional[datetime] = None
     last_error: Optional[str] = None
-    total_indicators: int
+    total_indicators: int = 0
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -70,10 +70,10 @@ class ThreatFeedListResponse(BaseModel):
     """Schema for paginated threat feed list"""
 
     items: list[ThreatFeedResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 # ============================================================================
@@ -126,15 +126,15 @@ class ThreatIndicatorUpdate(BaseModel):
 class ThreatIndicatorResponse(ThreatIndicatorBase, DBModel):
     """Schema for threat indicator response"""
 
-    id: str
+    id: str = ""
     feed_id: Optional[str] = None
     first_seen: Optional[datetime] = None
     last_seen: Optional[datetime] = None
-    is_active: bool
-    is_whitelisted: bool
-    sighting_count: int
+    is_active: bool = False
+    is_whitelisted: bool = False
+    sighting_count: int = 0
     last_sighting_at: Optional[datetime] = None
-    false_positive_count: int
+    false_positive_count: int = 0
     related_indicators: list[str] = Field(default_factory=list)
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -147,10 +147,10 @@ class ThreatIndicatorListResponse(BaseModel):
     """Schema for paginated threat indicator list"""
 
     items: list[ThreatIndicatorResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class BulkIndicatorImport(BaseModel):
@@ -158,7 +158,7 @@ class BulkIndicatorImport(BaseModel):
 
     indicators: list[ThreatIndicatorCreate]
     feed_id: Optional[str] = None
-    source: str
+    source: str = ""
 
 
 # ============================================================================
@@ -215,7 +215,7 @@ class ThreatActorUpdate(BaseModel):
 class ThreatActorResponse(ThreatActorBase, DBModel):
     """Schema for threat actor response"""
 
-    id: str
+    id: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -227,10 +227,10 @@ class ThreatActorListResponse(BaseModel):
     """Schema for paginated threat actor list"""
 
     items: list[ThreatActorResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 # ============================================================================
@@ -280,7 +280,7 @@ class ThreatCampaignUpdate(BaseModel):
 class ThreatCampaignResponse(ThreatCampaignBase, DBModel):
     """Schema for threat campaign response"""
 
-    id: str
+    id: str = ""
     actor_id: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -293,10 +293,10 @@ class ThreatCampaignListResponse(BaseModel):
     """Schema for paginated threat campaign list"""
 
     items: list[ThreatCampaignResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 # ============================================================================
@@ -311,9 +311,9 @@ class IntelReportBase(BaseModel):
     report_type: str = Field(..., description="threat_analysis, incident, attack_campaign, trend_analysis")
     tlp: str = Field(default="amber", description="white, green, amber, red")
     severity: str = Field(default="medium", description="critical, high, medium, low")
-    executive_summary: str
-    detailed_analysis: str
-    recommendations: str
+    executive_summary: str = ""
+    detailed_analysis: str = ""
+    recommendations: str = ""
     associated_actors: list[str] = Field(default_factory=list)
     associated_campaigns: list[str] = Field(default_factory=list)
     associated_indicators: list[str] = Field(default_factory=list)
@@ -354,9 +354,9 @@ class IntelReportUpdate(BaseModel):
 class IntelReportResponse(IntelReportBase, DBModel):
     """Schema for intel report response"""
 
-    id: str
-    author_id: str
-    status: str
+    id: str = ""
+    author_id: str = ""
+    status: str = ""
     published_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -369,10 +369,10 @@ class IntelReportListResponse(BaseModel):
     """Schema for paginated intel report list"""
 
     items: list[IntelReportResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 # ============================================================================
@@ -383,8 +383,8 @@ class IntelReportListResponse(BaseModel):
 class IndicatorSightingCreate(BaseModel):
     """Schema for recording an indicator sighting"""
 
-    indicator_id: str
-    source: str
+    indicator_id: str = ""
+    source: str = ""
     sighting_type: str = Field(default="detected", description="detected, reported, confirmed")
     context: dict[str, Any] = Field(default_factory=dict)
 
@@ -392,10 +392,10 @@ class IndicatorSightingCreate(BaseModel):
 class IndicatorSightingResponse(DBModel):
     """Schema for indicator sighting response"""
 
-    id: str
-    indicator_id: str
+    id: str = ""
+    indicator_id: str = ""
     source: Optional[str] = None
-    sighting_type: str
+    sighting_type: str = ""
     source_ref: Optional[str] = None
     raw_data: Optional[dict[str, Any]] = None
     context: dict[str, Any]
@@ -427,14 +427,14 @@ class IntelSearchRequest(BaseModel):
 class IntelDashboardStats(BaseModel):
     """Schema for intel dashboard statistics"""
 
-    total_indicators: int
-    active_indicators: int
-    feeds_enabled: int
-    feeds_total: int
+    total_indicators: int = 0
+    active_indicators: int = 0
+    feeds_enabled: int = 0
+    feeds_total: int = 0
     indicators_by_type: dict[str, int]
     indicators_by_severity: dict[str, int]
-    recent_sightings: int
-    actors_tracked: int
-    active_campaigns: int
+    recent_sightings: int = 0
+    actors_tracked: int = 0
+    active_campaigns: int = 0
     top_tags: list[str]
     coverage_score: float = Field(ge=0.0, le=100.0)

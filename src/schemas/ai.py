@@ -45,10 +45,10 @@ class NLQueryResponse(DBModel):
 class QueryHistoryResponse(DBModel):
     """Query history entry."""
 
-    id: str
-    natural_language: str
-    interpreted_intent: str
-    results_count: int
+    id: str = ""
+    natural_language: str = ""
+    interpreted_intent: str = ""
+    results_count: int = 0
     created_at: Optional[datetime] = None
     was_helpful: bool | None = None
 
@@ -70,7 +70,7 @@ class AlertTriageRequest(BaseModel):
 class AlertTriageResponse(DBModel):
     """Alert triage analysis response."""
 
-    alert_id: str
+    alert_id: str = ""
     priority: str = Field(..., description="p1, p2, p3, or p4")
     reasoning: str = Field(..., description="Explanation of priority assignment")
     confidence: float = Field(..., ge=0.0, le=1.0, description="Confidence in analysis")
@@ -98,9 +98,9 @@ class BatchTriageRequest(BaseModel):
 class BatchTriageResponse(BaseModel):
     """Batch triage results."""
 
-    alerts_triaged: int
-    average_confidence: float
-    average_false_positive_probability: float
+    alerts_triaged: int = 0
+    average_confidence: float = 0.0
+    average_false_positive_probability: float = 0.0
     triaged_alerts: list[AlertTriageResponse]
     timestamp: Optional[datetime] = None
 
@@ -108,8 +108,8 @@ class BatchTriageResponse(BaseModel):
 class TriageStatsResponse(BaseModel):
     """Alert triage statistics."""
 
-    total_triaged: int
-    average_confidence: float
+    total_triaged: int = 0
+    average_confidence: float = 0.0
     accuracy_rate: float = Field(..., description="Percentage of correct triages")
     false_positive_reduction: float = Field(
         ..., description="Reduction in false positives from AI triage"
@@ -140,14 +140,14 @@ class ImpactAssessment(BaseModel):
 class IncidentAnalysisResponse(DBModel):
     """Full incident analysis response."""
 
-    incident_id: str
+    incident_id: str = ""
     executive_summary: str = Field(..., description="1-2 sentence executive summary")
     technical_details: str = Field(..., description="Detailed technical analysis")
     impact_assessment: ImpactAssessment
     recommendations: list[str] = Field(
         default=[], description="Recommended actions and improvements"
     )
-    analysis_complete: bool
+    analysis_complete: bool = False
 
     class Config:
         from_attributes = True
@@ -156,7 +156,7 @@ class IncidentAnalysisResponse(DBModel):
 class RootCauseAnalysis(BaseModel):
     """Root cause analysis results."""
 
-    incident_id: str
+    incident_id: str = ""
     root_cause: str = Field(..., description="Identified root cause")
     attack_chain: list[str] = Field(..., description="Step-by-step attack progression")
     entry_point: str = Field(..., description="Initial compromise entry point")
@@ -168,7 +168,7 @@ class RootCauseAnalysis(BaseModel):
 class ResponseRecommendationRequest(BaseModel):
     """Request for incident response recommendations."""
 
-    incident_id: str
+    incident_id: str = ""
     incident_type: str = Field(..., description="Type of incident")
     severity: str = Field(..., description="Severity level")
     include_timeline: bool = Field(default=True, description="Include timeline estimates")
@@ -193,7 +193,7 @@ class ResponseRecommendation(BaseModel):
 class AnomalyDetectionResponse(DBModel):
     """Detected anomaly with explanation."""
 
-    id: str
+    id: str = ""
     entity_type: str = Field(..., description="Type of entity (user, host, etc.)")
     entity_id: str = Field(..., description="ID of entity")
     anomaly_type: str = Field(
@@ -234,9 +234,9 @@ class AnomalyFeedback(BaseModel):
 class AnomalyListResponse(BaseModel):
     """List of anomalies with filtering and pagination."""
 
-    total: int
-    skip: int
-    limit: int
+    total: int = 0
+    skip: int = 0
+    limit: int = 0
     anomalies: list[AnomalyDetectionResponse]
 
 
@@ -251,7 +251,7 @@ class AnomalyStatsResponse(BaseModel):
     )
     confirmed_rate: float = Field(..., description="Percentage confirmed as true positive")
     false_positive_rate: float = Field(..., description="Percentage false positives")
-    avg_detection_latency_seconds: float
+    avg_detection_latency_seconds: float = 0.0
 
 
 # Threat Predictions
@@ -271,16 +271,16 @@ class ThreatPredictionRequest(BaseModel):
 class ThreatPredictionResponse(DBModel):
     """Threat prediction result."""
 
-    id: str
-    entity_type: str
-    entity_id: str
+    id: str = ""
+    entity_type: str = ""
+    entity_id: str = ""
     prediction_type: str = Field(
         ...,
         description="Type of prediction (attack_probability, lateral_movement, etc.)",
     )
     risk_score: float = Field(..., ge=0.0, le=100.0, description="Risk score (0-100)")
     probability: float = Field(..., ge=0.0, le=1.0, description="Attack probability")
-    time_horizon_hours: int
+    time_horizon_hours: int = 0
     contributing_factors: list[str] = Field(
         ..., description="Factors contributing to prediction"
     )
@@ -303,7 +303,7 @@ class LateralMovementPrediction(BaseModel):
 
     target: str = Field(..., description="Target system/host")
     risk_score: float = Field(..., ge=0.0, le=1.0, description="Risk score for this path")
-    probability: float
+    probability: float = 0.0
     attack_vector: str = Field(..., description="Predicted attack vector")
     supporting_evidence: list[str] = Field(..., description="Evidence supporting prediction")
 
@@ -311,9 +311,9 @@ class LateralMovementPrediction(BaseModel):
 class PredictionDashboard(BaseModel):
     """Threat prediction dashboard data."""
 
-    active_predictions: int
-    critical_risk_entities: int
-    avg_risk_score: float
+    active_predictions: int = 0
+    critical_risk_entities: int = 0
+    avg_risk_score: float = 0.0
     predictions_by_type: dict[str, int]
     trending_threats: list[str]
     top_at_risk_entities: list[dict[str, Any]]
@@ -344,21 +344,21 @@ class ModelTrainingRequest(BaseModel):
 class MLModelResponse(DBModel):
     """ML model details."""
 
-    id: str
-    name: str
-    model_type: str
-    algorithm: str
-    version: str
+    id: str = ""
+    name: str = ""
+    model_type: str = ""
+    algorithm: str = ""
+    version: str = ""
     status: str = Field(..., description="training, ready, deployed, retired, failed")
     description: str | None
     feature_columns: list[str]
     hyperparameters: dict[str, Any]
     training_metrics: dict[str, float]
-    training_data_size: int
+    training_data_size: int = 0
     last_trained_at: datetime | None
     last_prediction_at: datetime | None
-    prediction_count: int
-    drift_score: float
+    prediction_count: int = 0
+    drift_score: float = 0.0
     tags: list[str]
     created_at: Optional[datetime] = None
 
@@ -369,7 +369,7 @@ class MLModelResponse(DBModel):
 class ModelDriftResponse(BaseModel):
     """Model drift check results."""
 
-    model_id: str
+    model_id: str = ""
     drift_score: float = Field(..., ge=0.0, le=1.0, description="Current drift score")
     status: str = Field(
         ...,
@@ -386,7 +386,7 @@ class ModelDriftResponse(BaseModel):
 class AIFeedbackRequest(BaseModel):
     """Feedback on AI analysis."""
 
-    analysis_id: str
+    analysis_id: str = ""
     feedback_score: int = Field(..., ge=-1, le=1, description="-1 (wrong), 0 (partial), 1 (correct)")
     feedback_notes: str | None = Field(default=None, description="Detailed feedback")
 
@@ -397,24 +397,24 @@ class AIDashboardResponse(BaseModel):
     """AI engine dashboard statistics."""
 
     total_analyses: int = Field(..., description="Total AI analyses performed")
-    analyses_today: int
-    average_confidence: float
+    analyses_today: int = 0
+    average_confidence: float = 0.0
     accuracy_rate: float = Field(..., description="Overall analysis accuracy")
 
-    total_anomalies_detected: int
-    anomalies_confirmed_rate: float
-    false_positive_rate: float
+    total_anomalies_detected: int = 0
+    anomalies_confirmed_rate: float = 0.0
+    false_positive_rate: float = 0.0
 
-    models_deployed: int
-    models_in_training: int
-    avg_model_drift: float
-    models_needing_retrain: int
+    models_deployed: int = 0
+    models_in_training: int = 0
+    avg_model_drift: float = 0.0
+    models_needing_retrain: int = 0
 
-    active_threat_predictions: int
-    critical_risk_entities: int
+    active_threat_predictions: int = 0
+    critical_risk_entities: int = 0
 
-    queries_processed: int
-    queries_today: int
-    avg_query_accuracy: float
+    queries_processed: int = 0
+    queries_today: int = 0
+    avg_query_accuracy: float = 0.0
 
     last_updated: Optional[datetime] = None

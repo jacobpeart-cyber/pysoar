@@ -47,14 +47,14 @@ class DataSourceUpdate(BaseModel):
 class DataSourceResponse(DataSourceBase, DBModel):
     """Schema for data source response"""
 
-    id: str
-    status: str
+    id: str = ""
+    status: str = ""
     ingestion_rate_eps: Optional[int] = None
-    total_events_ingested: int
-    storage_size_bytes: int
+    total_events_ingested: int = 0
+    storage_size_bytes: int = 0
     last_event_received: Optional[str] = None
     last_error: Optional[str] = None
-    is_enabled: bool
+    is_enabled: bool = False
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -66,10 +66,10 @@ class DataSourceListResponse(BaseModel):
     """Schema for paginated data source list"""
 
     items: list[DataSourceResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 # Data Partition Schemas
@@ -78,7 +78,7 @@ class DataSourceListResponse(BaseModel):
 class DataPartitionBase(BaseModel):
     """Base schema for data partitions"""
 
-    partition_key: str
+    partition_key: str = ""
     time_range_start: Optional[str] = None
     time_range_end: Optional[str] = None
     format: str = "parquet"
@@ -89,8 +89,8 @@ class DataPartitionBase(BaseModel):
 class DataPartitionCreate(DataPartitionBase):
     """Schema for creating a data partition"""
 
-    source_id: str
-    location: str
+    source_id: str = ""
+    location: str = ""
 
 
 class DataPartitionUpdate(BaseModel):
@@ -104,14 +104,14 @@ class DataPartitionUpdate(BaseModel):
 class DataPartitionResponse(DataPartitionBase, DBModel):
     """Schema for data partition response"""
 
-    id: str
-    source_id: str
-    record_count: int
-    size_bytes: int
-    location: str
-    is_indexed: bool
+    id: str = ""
+    source_id: str = ""
+    record_count: int = 0
+    size_bytes: int = 0
+    location: str = ""
+    is_indexed: bool = False
     index_columns: Optional[list[str]] = None
-    query_count_30d: int
+    query_count_30d: int = 0
     last_accessed: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -124,10 +124,10 @@ class DataPartitionListResponse(BaseModel):
     """Schema for paginated partition list"""
 
     items: list[DataPartitionResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 # Data Pipeline Schemas
@@ -136,8 +136,8 @@ class DataPartitionListResponse(BaseModel):
 class TransformRule(BaseModel):
     """Schema for transform rule definition"""
 
-    type: str
-    name: str
+    type: str = ""
+    name: str = ""
     config: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -147,7 +147,7 @@ class DataPipelineBase(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
     description: Optional[str] = None
     pipeline_type: str = Field(..., description="Type of pipeline (ingestion, transformation, etc.)")
-    destination: str
+    destination: str = ""
     transform_rules: list[TransformRule] = Field(default_factory=list)
     schedule_cron: Optional[str] = None
 
@@ -172,14 +172,14 @@ class DataPipelineUpdate(BaseModel):
 class DataPipelineResponse(DataPipelineBase, DBModel):
     """Schema for data pipeline response"""
 
-    id: str
+    id: str = ""
     source_id: Optional[str] = None
-    status: str
+    status: str = ""
     last_run: Optional[str] = None
     next_run: Optional[str] = None
-    avg_processing_time_ms: int
-    records_processed_total: int
-    error_count: int
+    avg_processing_time_ms: int = 0
+    records_processed_total: int = 0
+    error_count: int = 0
     last_error: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -192,10 +192,10 @@ class DataPipelineListResponse(BaseModel):
     """Schema for paginated pipeline list"""
 
     items: list[DataPipelineResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 # Unified Data Model Schemas
@@ -204,8 +204,8 @@ class DataPipelineListResponse(BaseModel):
 class FieldDefinition(BaseModel):
     """Field definition for unified data model"""
 
-    name: str
-    type: str
+    name: str = ""
+    type: str = ""
     description: Optional[str] = None
     required: bool = False
     source_mapping: Optional[dict[str, Any]] = None
@@ -243,10 +243,10 @@ class UnifiedDataModelUpdate(BaseModel):
 class UnifiedDataModelResponse(UnifiedDataModelBase, DBModel):
     """Schema for unified data model response"""
 
-    id: str
-    schema_version: str
+    id: str = ""
+    schema_version: str = ""
     sample_data: Optional[dict[str, Any]] = None
-    is_active: bool
+    is_active: bool = False
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -258,10 +258,10 @@ class UnifiedDataModelListResponse(BaseModel):
     """Schema for paginated unified data model list"""
 
     items: list[UnifiedDataModelResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 # Query Job Schemas
@@ -286,15 +286,15 @@ class QueryJobCreate(QueryJobBase):
 class QueryJobResponse(QueryJobBase, DBModel):
     """Schema for query job response"""
 
-    id: str
-    status: str
+    id: str = ""
+    status: str = ""
     records_scanned: int = 0
     records_returned: int = 0
     execution_time_ms: int = 0
     result_location: Optional[str] = None
     cost_estimate: Optional[float] = None
-    submitted_by: str
-    cached: bool
+    submitted_by: str = ""
+    cached: bool = False
     error_message: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -307,10 +307,10 @@ class QueryJobListResponse(BaseModel):
     """Schema for paginated query job list"""
 
     items: list[QueryJobResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 # Engine Operation Schemas
@@ -319,34 +319,34 @@ class QueryJobListResponse(BaseModel):
 class SourceConfigurationResult(BaseModel):
     """Result of source configuration"""
 
-    source_id: str
-    status: str
+    source_id: str = ""
+    status: str = ""
     validation: dict[str, Any]
 
 
 class IngestionMetrics(BaseModel):
     """Ingestion performance metrics"""
 
-    source_id: str
-    status: str
-    events_per_second: int
-    total_events: int
-    daily_ingestion_gb: float
-    success_rate: float
-    error_rate: float
-    avg_latency_ms: int
-    time_window_seconds: int
+    source_id: str = ""
+    status: str = ""
+    events_per_second: int = 0
+    total_events: int = 0
+    daily_ingestion_gb: float = 0.0
+    success_rate: float = 0.0
+    error_rate: float = 0.0
+    avg_latency_ms: int = 0
+    time_window_seconds: int = 0
 
 
 class QueryExecutionResult(BaseModel):
     """Result of query execution"""
 
-    query_id: str
-    status: str
-    cached: bool
-    records_scanned: int
-    records_returned: int
-    execution_time_ms: int
+    query_id: str = ""
+    status: str = ""
+    cached: bool = False
+    records_scanned: int = 0
+    records_returned: int = 0
+    execution_time_ms: int = 0
     data_sources_queried: list[str]
     result_location: Optional[str] = None
     cost_estimate: Optional[float] = None
@@ -355,37 +355,37 @@ class QueryExecutionResult(BaseModel):
 class CostEstimate(BaseModel):
     """Query cost estimate"""
 
-    data_scanned_gb: int
-    query_complexity: str
-    base_cost_usd: float
-    estimated_cost_usd: float
-    pricing_per_tb_usd: float
+    data_scanned_gb: int = 0
+    query_complexity: str = ""
+    base_cost_usd: float = 0.0
+    estimated_cost_usd: float = 0.0
+    pricing_per_tb_usd: float = 0.0
 
 
 class StorageCost(BaseModel):
     """Storage cost calculation"""
 
-    storage_gb: int
-    tier: str
-    monthly_cost_usd: float
-    annual_cost_usd: float
-    cost_per_gb_month: float
+    storage_gb: int = 0
+    tier: str = ""
+    monthly_cost_usd: float = 0.0
+    annual_cost_usd: float = 0.0
+    cost_per_gb_month: float = 0.0
 
 
 class DataQualityReport(BaseModel):
     """Data quality validation report"""
 
-    dataset_id: str
-    total_records: int
-    quality_issues: int
-    quality_score: float
-    status: str
+    dataset_id: str = ""
+    total_records: int = 0
+    quality_issues: int = 0
+    quality_score: float = 0.0
+    status: str = ""
 
 
 class LineageInfo(BaseModel):
     """Data lineage information"""
 
-    dataset_id: str
+    dataset_id: str = ""
     upstream_sources: list[str]
     downstream_consumers: list[str] = Field(default_factory=list)
 
@@ -407,32 +407,32 @@ class DashboardMetrics(BaseModel):
 class StorageUsage(BaseModel):
     """Storage usage breakdown"""
 
-    total_bytes: int
+    total_bytes: int = 0
     by_tier: dict[str, int] = Field(default_factory=dict)
     by_source: dict[str, int] = Field(default_factory=dict)
-    hot_percentage: float
-    warm_percentage: float
-    cold_percentage: float
+    hot_percentage: float = 0.0
+    warm_percentage: float = 0.0
+    cold_percentage: float = 0.0
 
 
 class QueryPerformance(BaseModel):
     """Query performance metrics"""
 
-    avg_execution_time_ms: int
-    p50_execution_time_ms: int
-    p95_execution_time_ms: int
-    p99_execution_time_ms: int
-    cached_queries_percentage: float
-    total_queries_24h: int
-    failed_queries_24h: int
+    avg_execution_time_ms: int = 0
+    p50_execution_time_ms: int = 0
+    p95_execution_time_ms: int = 0
+    p99_execution_time_ms: int = 0
+    cached_queries_percentage: float = 0.0
+    total_queries_24h: int = 0
+    failed_queries_24h: int = 0
 
 
 class PipelineHealth(BaseModel):
     """Pipeline health metrics"""
 
-    total_pipelines: int
-    active_pipelines: int
-    failed_pipelines: int
-    avg_success_rate: float
-    total_records_processed_24h: int
-    avg_processing_time_ms: int
+    total_pipelines: int = 0
+    active_pipelines: int = 0
+    failed_pipelines: int = 0
+    avg_success_rate: float = 0.0
+    total_records_processed_24h: int = 0
+    avg_processing_time_ms: int = 0

@@ -52,8 +52,8 @@ class IncidentUpdate(BaseModel):
 class IncidentResponse(IncidentBase, DBModel):
     """Schema for incident response"""
 
-    id: str
-    status: str
+    id: str = ""
+    status: str = ""
     assigned_to: Optional[str] = None
     impact: Optional[str] = None
     affected_systems: Optional[list[str]] = None
@@ -84,17 +84,17 @@ class IncidentListResponse(BaseModel):
     """Schema for paginated incident list"""
 
     items: list[IncidentResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class IncidentTimeline(BaseModel):
     """Schema for incident timeline entry"""
 
     timestamp: datetime
-    action: str
+    action: str = ""
     user: Optional[str] = None
     details: Optional[str] = None
 
@@ -102,9 +102,9 @@ class IncidentTimeline(BaseModel):
 class IncidentStats(BaseModel):
     """Schema for incident statistics"""
 
-    total: int
+    total: int = 0
     by_severity: dict[str, int]
     by_status: dict[str, int]
     by_type: dict[str, int]
-    open_count: int
+    open_count: int = 0
     mttr_hours: Optional[float] = None  # Mean time to resolve

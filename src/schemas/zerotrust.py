@@ -55,7 +55,7 @@ class ZeroTrustPolicyUpdate(BaseModel):
 class ZeroTrustPolicyResponse(ZeroTrustPolicyBase, DBModel):
     """Schema for policy response"""
 
-    id: str
+    id: str = ""
     hit_count: int = 0
     last_triggered_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
@@ -65,8 +65,8 @@ class ZeroTrustPolicyResponse(ZeroTrustPolicyBase, DBModel):
 class DeviceTrustProfileBase(BaseModel):
     """Base schema for device trust profiles"""
 
-    device_id: str
-    device_type: str
+    device_id: str = ""
+    device_type: str = ""
     hostname: Optional[str] = None
     os_type: Optional[str] = None
     os_version: Optional[str] = None
@@ -101,9 +101,9 @@ class DeviceComplianceUpdate(BaseModel):
 class DeviceTrustProfileResponse(DeviceTrustProfileBase, DBModel):
     """Schema for device trust profile response"""
 
-    id: str
-    trust_score: float
-    trust_level: str
+    id: str = ""
+    trust_score: float = 0.0
+    trust_level: str = ""
     last_seen_at: Optional[datetime] = None
     last_assessment_at: Optional[datetime] = None
     risk_factors: list[str] = Field(default_factory=list)
@@ -119,11 +119,11 @@ class AccessRequestSchema(BaseModel):
     """Schema for access request evaluation"""
 
     subject_type: str = Field(..., description="user, service, device, application")
-    subject_id: str
+    subject_id: str = ""
     resource_type: str = Field(
         ..., description="application, data, network_segment, api, file, database"
     )
-    resource_id: str
+    resource_id: str = ""
     context: dict[str, Any] = Field(
         default_factory=dict,
         description="location, device, time, behavior_score, etc",
@@ -133,11 +133,11 @@ class AccessRequestSchema(BaseModel):
 class AccessDecisionResponse(DBModel):
     """Schema for access decision response"""
 
-    id: str
+    id: str = ""
     decision: str = Field(..., description="allow, deny, challenge, step_up, isolate")
-    risk_score: float
+    risk_score: float = 0.0
     risk_factors: list[str] = Field(default_factory=list)
-    reason: str
+    reason: str = ""
     required_actions: list[str] = Field(default_factory=list)
     mfa_required: bool = False
     challenge_id: Optional[str] = None
@@ -184,8 +184,8 @@ class MicroSegmentUpdate(BaseModel):
 class MicroSegmentResponse(MicroSegmentBase, DBModel):
     """Schema for micro-segment response"""
 
-    id: str
-    violation_count: int
+    id: str = ""
+    violation_count: int = 0
     last_violation_at: Optional[datetime] = None
     traffic_stats: dict[str, Any] = Field(default_factory=dict)
     created_at: Optional[datetime] = None
@@ -198,24 +198,24 @@ class MicroSegmentResponse(MicroSegmentBase, DBModel):
 class SegmentTrafficRequest(BaseModel):
     """Schema for evaluating segment traffic"""
 
-    source: str
-    destination: str
-    protocol: str
-    port: int
+    source: str = ""
+    destination: str = ""
+    protocol: str = ""
+    port: int = 0
 
 
 class SegmentTrafficResponse(BaseModel):
     """Schema for segment traffic evaluation response"""
 
-    allowed: bool
-    reason: str
+    allowed: bool = False
+    reason: str = ""
     segments: list[dict[str, Any]]
 
 
 class IdentityVerificationBase(BaseModel):
     """Base schema for identity verifications"""
 
-    user_id: str
+    user_id: str = ""
     verification_type: str = Field(
         ..., description="initial_auth, step_up, continuous, re_auth, mfa_challenge"
     )
@@ -237,10 +237,10 @@ class IdentityVerificationCreate(IdentityVerificationBase):
 class IdentityVerificationResponse(IdentityVerificationBase, DBModel):
     """Schema for identity verification response"""
 
-    id: str
+    id: str = ""
     result: str = Field(..., description="success, failure, timeout, cancelled")
-    risk_score_before: float
-    risk_score_after: float
+    risk_score_before: float = 0.0
+    risk_score_after: float = 0.0
     session_id: Optional[str] = None
     created_at: Optional[datetime] = None
 
@@ -267,28 +267,28 @@ class PillarAssessmentResponse(BaseModel):
         ..., description="identity, devices, networks, applications, data"
     )
     score: float = Field(..., ge=0, le=100)
-    maturity_level: str
+    maturity_level: str = ""
     details: dict[str, Any] = Field(default_factory=dict)
 
 
 class ZeroTrustDashboardStats(BaseModel):
     """Schema for Zero Trust dashboard statistics"""
 
-    total_policies: int
-    enabled_policies: int
-    total_devices: int
-    compliant_devices: int
-    non_compliant_devices: int
-    average_device_trust_score: float
-    total_access_decisions: int
-    allowed_decisions: int
-    denied_decisions: int
-    challenged_decisions: int
-    total_segments: int
-    active_segments: int
-    violation_count: int
-    maturity_score: float
-    maturity_level: str
+    total_policies: int = 0
+    enabled_policies: int = 0
+    total_devices: int = 0
+    compliant_devices: int = 0
+    non_compliant_devices: int = 0
+    average_device_trust_score: float = 0.0
+    total_access_decisions: int = 0
+    allowed_decisions: int = 0
+    denied_decisions: int = 0
+    challenged_decisions: int = 0
+    total_segments: int = 0
+    active_segments: int = 0
+    violation_count: int = 0
+    maturity_score: float = 0.0
+    maturity_level: str = ""
     last_updated: datetime
 
 
@@ -296,9 +296,9 @@ class ZeroTrustRecommendation(BaseModel):
     """Schema for improvement recommendation"""
 
     priority: int = Field(..., ge=1, le=5, description="1=highest, 5=lowest")
-    category: str
-    title: str
-    description: str
+    category: str = ""
+    title: str = ""
+    description: str = ""
     impact: str = Field(..., description="high, medium, low")
     effort: str = Field(..., description="high, medium, low")
     estimated_cost: Optional[str] = None

@@ -23,8 +23,8 @@ class PlaybookNodeCreate(PlaybookNodeConfigBase):
     """Schema for creating a node"""
 
     node_type: str = Field(..., pattern="^(trigger|action|condition|loop|parallel|delay|human_approval|transform|subplaybook|error_handler|variable_set|api_call|notification|enrichment)$")
-    position_x: float
-    position_y: float
+    position_x: float = 0.0
+    position_y: float = 0.0
     input_schema: Optional[dict[str, Any]] = None
     output_schema: Optional[dict[str, Any]] = None
 
@@ -45,11 +45,11 @@ class PlaybookNodeUpdate(BaseModel):
 class PlaybookNodeResponse(DBModel):
     """Schema for node response"""
 
-    id: str
-    node_id: str
-    node_type: str
-    position_x: float
-    position_y: float
+    id: str = ""
+    node_id: str = ""
+    node_type: str = ""
+    position_x: float = 0.0
+    position_y: float = 0.0
     input_schema: Optional[dict[str, Any]] = None
     output_schema: Optional[dict[str, Any]] = None
     created_at: Optional[datetime] = None
@@ -63,8 +63,8 @@ class PlaybookNodeResponse(DBModel):
 class PlaybookEdgeBase(BaseModel):
     """Base edge schema"""
 
-    source_node_id: str
-    target_node_id: str
+    source_node_id: str = ""
+    target_node_id: str = ""
     edge_type: str = Field("success", pattern="^(success|failure|conditional|always|timeout|error)$")
     condition_expression: Optional[str] = None
     label: Optional[str] = Field(None, max_length=255)
@@ -89,8 +89,8 @@ class PlaybookEdgeUpdate(BaseModel):
 class PlaybookEdgeResponse(PlaybookEdgeBase, DBModel):
     """Schema for edge response"""
 
-    id: str
-    playbook_id: str
+    id: str = ""
+    playbook_id: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -137,7 +137,7 @@ class PlaybookValidateRequest(BaseModel):
 class PlaybookValidateResponse(BaseModel):
     """Schema for validation response"""
 
-    is_valid: bool
+    is_valid: bool = False
     errors: list[str] = []
     warnings: list[str] = []
 
@@ -145,15 +145,15 @@ class PlaybookValidateResponse(BaseModel):
 class PlaybookResponse(PlaybookBase, DBModel):
     """Schema for playbook response"""
 
-    id: str
-    organization_id: str
-    version: int
-    status: str
-    execution_count: int
-    avg_execution_time_ms: float
-    success_rate: float
+    id: str = ""
+    organization_id: str = ""
+    version: int = 0
+    status: str = ""
+    execution_count: int = 0
+    avg_execution_time_ms: float = 0.0
+    success_rate: float = 0.0
     last_executed: Optional[str] = None
-    is_template: bool
+    is_template: bool = False
     template_category: Optional[str] = None
     created_by: Optional[str] = None
     nodes: list[PlaybookNodeResponse] = []
@@ -169,10 +169,10 @@ class PlaybookListResponse(BaseModel):
     """Schema for paginated playbook list"""
 
     items: list[PlaybookResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class PlaybookCloneRequest(BaseModel):
@@ -192,12 +192,12 @@ class PlaybookImportRequest(BaseModel):
 class PlaybookExportResponse(BaseModel):
     """Schema for exported playbook"""
 
-    id: str
-    name: str
+    id: str = ""
+    name: str = ""
     description: Optional[str] = None
-    version: int
-    category: str
-    trigger_type: str
+    version: int = 0
+    category: str = ""
+    trigger_type: str = ""
     trigger_config: Optional[dict[str, Any]] = None
     canvas_data: Optional[dict[str, Any]] = None
     nodes: list[dict[str, Any]]
@@ -215,11 +215,11 @@ class PlaybookExecutionTrigger(BaseModel):
 class PlaybookExecutionResponse(DBModel):
     """Schema for execution response"""
 
-    id: str
-    playbook_id: str
-    organization_id: str
+    id: str = ""
+    playbook_id: str = ""
+    organization_id: str = ""
     trigger_event: Optional[dict[str, Any]] = None
-    status: str
+    status: str = ""
     current_node_id: Optional[str] = None
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
@@ -238,17 +238,17 @@ class PlaybookExecutionResponse(DBModel):
 class PlaybookNodeExecutionResponse(DBModel):
     """Schema for node execution response"""
 
-    id: str
-    execution_id: str
-    node_id: str
-    status: str
+    id: str = ""
+    execution_id: str = ""
+    node_id: str = ""
+    status: str = ""
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
     duration_ms: Optional[int] = None
     input_data: Optional[dict[str, Any]] = None
     output_data: Optional[dict[str, Any]] = None
     error_message: Optional[str] = None
-    retry_attempt: int
+    retry_attempt: int = 0
     approved_by: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -261,20 +261,20 @@ class PlaybookExecutionListResponse(BaseModel):
     """Schema for paginated execution list"""
 
     items: list[PlaybookExecutionResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class PlaybookExecutionStatusResponse(BaseModel):
     """Schema for execution status"""
 
-    execution_id: str
-    playbook_id: str
-    status: str
+    execution_id: str = ""
+    playbook_id: str = ""
+    status: str = ""
     current_node_id: Optional[str] = None
-    progress_percent: float
+    progress_percent: float = 0.0
     node_executions: list[PlaybookNodeExecutionResponse] = []
     error_message: Optional[str] = None
 
@@ -285,13 +285,13 @@ class PlaybookTemplateBase(BaseModel):
 
     name: str = Field(..., min_length=1, max_length=255)
     description: Optional[str] = None
-    category: str
+    category: str = ""
 
 
 class PlaybookTemplateResponse(PlaybookTemplateBase, DBModel):
     """Schema for template response"""
 
-    id: str
+    id: str = ""
     nodes: list[dict[str, Any]]
     edges: list[dict[str, Any]]
     created_at: Optional[datetime] = None
@@ -305,16 +305,16 @@ class PlaybookTemplateListResponse(BaseModel):
     """Schema for paginated template list"""
 
     items: list[PlaybookTemplateResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class CreateFromTemplateRequest(BaseModel):
     """Schema for creating playbook from template"""
 
-    template_id: str
+    template_id: str = ""
     playbook_name: str = Field(..., min_length=1, max_length=255)
     organization_id: Optional[str] = None
 
@@ -323,20 +323,20 @@ class CreateFromTemplateRequest(BaseModel):
 class PlaybookExecutionStats(BaseModel):
     """Schema for execution statistics"""
 
-    total_executions: int
-    successful_executions: int
-    failed_executions: int
-    avg_execution_time_ms: float
-    success_rate: float
+    total_executions: int = 0
+    successful_executions: int = 0
+    failed_executions: int = 0
+    avg_execution_time_ms: float = 0.0
+    success_rate: float = 0.0
 
 
 class PlaybookDashboardResponse(BaseModel):
     """Schema for playbook dashboard"""
 
-    total_playbooks: int
-    active_playbooks: int
-    draft_playbooks: int
-    total_templates: int
+    total_playbooks: int = 0
+    active_playbooks: int = 0
+    draft_playbooks: int = 0
+    total_templates: int = 0
     execution_stats: PlaybookExecutionStats
     top_playbooks: list[PlaybookResponse] = []
     failure_rates: dict[str, float] = {}
@@ -347,7 +347,7 @@ class PlaybookDashboardResponse(BaseModel):
 class ErrorResponse(BaseModel):
     """Schema for error response"""
 
-    detail: str
+    detail: str = ""
     error_code: Optional[str] = None
     timestamp: datetime = Field(default_factory=datetime.utcnow)
 
@@ -355,5 +355,5 @@ class ErrorResponse(BaseModel):
 class ValidationErrorResponse(BaseModel):
     """Schema for validation error"""
 
-    detail: str
+    detail: str = ""
     errors: list[dict[str, str]]

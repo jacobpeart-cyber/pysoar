@@ -43,14 +43,14 @@ class SOCAgentUpdate(BaseModel):
 class SOCAgentResponse(SOCAgentBase, DBModel):
     """Schema for SOC Agent response"""
 
-    id: str
-    organization_id: str
-    status: str
+    id: str = ""
+    organization_id: str = ""
+    status: str = ""
     current_task_id: Optional[str] = None
-    total_investigations: int
-    avg_resolution_time_minutes: float
-    accuracy_score: float
-    false_positive_rate: float
+    total_investigations: int = 0
+    avg_resolution_time_minutes: float = 0.0
+    accuracy_score: float = 0.0
+    false_positive_rate: float = 0.0
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -62,22 +62,22 @@ class SOCAgentListResponse(BaseModel):
     """Schema for paginated agent list"""
 
     items: list[SOCAgentResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class SOCAgentPerformance(BaseModel):
     """Agent performance metrics"""
 
-    agent_id: str
-    name: str
-    total_investigations: int
-    avg_resolution_time_minutes: float
-    accuracy_score: float
-    false_positive_rate: float
-    status: str
+    agent_id: str = ""
+    name: str = ""
+    total_investigations: int = 0
+    avg_resolution_time_minutes: float = 0.0
+    accuracy_score: float = 0.0
+    false_positive_rate: float = 0.0
+    status: str = ""
 
 
 # ============================================================================
@@ -88,16 +88,16 @@ class SOCAgentPerformance(BaseModel):
 class ReasoningStepResponse(DBModel):
     """Single reasoning step"""
 
-    id: str
-    step_number: int
-    step_type: str
+    id: str = ""
+    step_number: int = 0
+    step_type: str = ""
     thought_process: Optional[str] = None
     action_taken: Optional[str] = None
     action_tool: Optional[str] = None
     observation: Optional[dict[str, Any]] = None
-    confidence_delta: float
-    duration_ms: int
-    tokens_used: int
+    confidence_delta: float = 0.0
+    duration_ms: int = 0
+    tokens_used: int = 0
     created_at: Optional[datetime] = None
 
     class Config:
@@ -116,7 +116,7 @@ class InvestigationBase(BaseModel):
 class InvestigationCreate(InvestigationBase):
     """Schema for creating investigation"""
 
-    agent_id: str
+    agent_id: str = ""
     hypothesis: Optional[str] = None
     initial_context: Optional[dict[str, Any]] = None
 
@@ -135,12 +135,12 @@ class InvestigationUpdate(BaseModel):
 class InvestigationResponse(InvestigationBase, DBModel):
     """Schema for investigation response"""
 
-    id: str
-    agent_id: str
-    organization_id: str
+    id: str = ""
+    agent_id: str = ""
+    organization_id: str = ""
     hypothesis: Optional[str] = None
-    status: str
-    confidence_score: float
+    status: str = ""
+    confidence_score: float = 0.0
     reasoning_chain: Optional[list[dict[str, Any]]] = None
     evidence_collected: Optional[dict[str, Any]] = None
     actions_taken: Optional[list[dict[str, Any]]] = None
@@ -162,19 +162,19 @@ class InvestigationListResponse(BaseModel):
     """Schema for paginated investigation list"""
 
     items: list[InvestigationResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class InvestigationTimeline(BaseModel):
     """Investigation timeline view"""
 
-    investigation_id: str
-    title: str
-    status: str
-    confidence_score: float
+    investigation_id: str = ""
+    title: str = ""
+    status: str = ""
+    confidence_score: float = 0.0
     start_time: datetime
     steps: list[ReasoningStepResponse]
     actions: list["AgentActionResponse"]
@@ -189,7 +189,7 @@ class InvestigationTimeline(BaseModel):
 class AgentActionBase(BaseModel):
     """Base agent action schema"""
 
-    action_type: str
+    action_type: str = ""
     target: str = Field(..., min_length=1)
     parameters: Optional[dict[str, Any]] = None
     requires_approval: bool = True
@@ -204,21 +204,21 @@ class AgentActionCreate(AgentActionBase):
 class AgentActionApproval(BaseModel):
     """Schema for approving/denying action"""
 
-    approved: bool
+    approved: bool = False
     approval_notes: Optional[str] = None
 
 
 class AgentActionResponse(AgentActionBase, DBModel):
     """Schema for action response"""
 
-    id: str
-    investigation_id: str
+    id: str = ""
+    investigation_id: str = ""
     approved_by: Optional[str] = None
     approval_timestamp: Optional[datetime] = None
-    execution_status: str
+    execution_status: str = ""
     result: Optional[dict[str, Any]] = None
-    rollback_available: bool
-    rollback_executed: bool
+    rollback_available: bool = False
+    rollback_executed: bool = False
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -229,24 +229,24 @@ class AgentActionResponse(AgentActionBase, DBModel):
 class ActionPendingApproval(BaseModel):
     """Pending action requiring approval"""
 
-    action_id: str
-    action_type: str
-    target: str
-    investigation_id: str
-    investigation_title: str
-    agent_id: str
-    agent_name: str
-    confidence_score: float
+    action_id: str = ""
+    action_type: str = ""
+    target: str = ""
+    investigation_id: str = ""
+    investigation_title: str = ""
+    agent_id: str = ""
+    agent_name: str = ""
+    confidence_score: float = 0.0
     created_at: datetime
 
 
 class ActionHistory(BaseModel):
     """Action execution history"""
 
-    action_id: str
-    action_type: str
-    target: str
-    execution_status: str
+    action_id: str = ""
+    action_type: str = ""
+    target: str = ""
+    execution_status: str = ""
     executed_at: Optional[datetime] = None
     result: Optional[dict[str, Any]] = None
 
@@ -259,12 +259,12 @@ class ActionHistory(BaseModel):
 class AgentMemoryResponse(DBModel):
     """Agent memory entry"""
 
-    id: str
-    memory_type: str
-    key: str
+    id: str = ""
+    memory_type: str = ""
+    key: str = ""
     value: Optional[dict[str, Any]] = None
-    confidence: float
-    access_count: int
+    confidence: float = 0.0
+    access_count: int = 0
     last_accessed: Optional[datetime] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -277,21 +277,21 @@ class AgentMemoryListResponse(BaseModel):
     """Paginated memory list"""
 
     items: list[AgentMemoryResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class MemoryStats(BaseModel):
     """Agent memory statistics"""
 
-    agent_id: str
-    total_memories: int
+    agent_id: str = ""
+    total_memories: int = 0
     by_type: dict[str, int]
-    avg_confidence: float
-    memories_decaying: int
-    memories_high_confidence: int
+    avg_confidence: float = 0.0
+    memories_decaying: int = 0
+    memories_high_confidence: int = 0
 
 
 # ============================================================================
@@ -309,18 +309,18 @@ class NaturalLanguageQuery(BaseModel):
 class NaturalLanguageResponse(BaseModel):
     """Response from natural language query"""
 
-    response: str
-    agent_id: str
-    agent_name: str
+    response: str = ""
+    agent_id: str = ""
+    agent_name: str = ""
     interpretation: dict[str, Any]
 
 
 class AlertExplanation(BaseModel):
     """Explanation of alert"""
 
-    alert_id: str
-    explanation: str
-    risk_assessment: str
+    alert_id: str = ""
+    explanation: str = ""
+    risk_assessment: str = ""
     recommended_actions: list[str]
     mitre_techniques: Optional[list[str]] = None
 
@@ -328,11 +328,11 @@ class AlertExplanation(BaseModel):
 class InvestigationExplanation(BaseModel):
     """Natural language explanation of investigation"""
 
-    investigation_id: str
-    title: str
-    narrative: str
+    investigation_id: str = ""
+    title: str = ""
+    narrative: str = ""
     key_findings: list[str]
-    confidence_score: float
+    confidence_score: float = 0.0
     recommendations: list[str]
 
 
@@ -344,60 +344,60 @@ class InvestigationExplanation(BaseModel):
 class AgentWorkload(BaseModel):
     """Current agent workload"""
 
-    agent_id: str
-    agent_name: str
-    status: str
+    agent_id: str = ""
+    agent_name: str = ""
+    status: str = ""
     current_task_id: Optional[str] = None
-    pending_investigations: int
-    active_investigations: int
-    pending_approvals: int
-    memory_count: int
+    pending_investigations: int = 0
+    active_investigations: int = 0
+    pending_approvals: int = 0
+    memory_count: int = 0
 
 
 class DashboardMetrics(BaseModel):
     """SOC dashboard metrics"""
 
-    total_agents: int
-    agents_active: int
-    total_investigations: int
-    investigations_in_progress: int
-    investigations_completed_24h: int
-    avg_investigation_time_minutes: float
-    overall_accuracy: float
-    overall_false_positive_rate: float
-    pending_approvals: int
+    total_agents: int = 0
+    agents_active: int = 0
+    total_investigations: int = 0
+    investigations_in_progress: int = 0
+    investigations_completed_24h: int = 0
+    avg_investigation_time_minutes: float = 0.0
+    overall_accuracy: float = 0.0
+    overall_false_positive_rate: float = 0.0
+    pending_approvals: int = 0
 
 
 class InvestigationMetrics(BaseModel):
     """Investigation statistics"""
 
-    total: int
+    total: int = 0
     by_status: dict[str, int]
     by_resolution: dict[str, int]
     by_priority: dict[int, int]
-    avg_confidence_score: float
-    avg_resolution_time_minutes: float
+    avg_confidence_score: float = 0.0
+    avg_resolution_time_minutes: float = 0.0
 
 
 class AccuracyStats(BaseModel):
     """Accuracy statistics"""
 
-    total_investigations: int
-    true_positives: int
-    false_positives: int
-    inconclusive: int
-    escalated: int
-    accuracy_score: float
-    false_positive_rate: float
+    total_investigations: int = 0
+    true_positives: int = 0
+    false_positives: int = 0
+    inconclusive: int = 0
+    escalated: int = 0
+    accuracy_score: float = 0.0
+    false_positive_rate: float = 0.0
 
 
 class ResolutionTimes(BaseModel):
     """Investigation resolution time stats"""
 
-    min_minutes: float
-    max_minutes: float
-    avg_minutes: float
-    median_minutes: float
+    min_minutes: float = 0.0
+    max_minutes: float = 0.0
+    avg_minutes: float = 0.0
+    median_minutes: float = 0.0
     by_agent: dict[str, float]
 
 
@@ -409,7 +409,7 @@ class ResolutionTimes(BaseModel):
 class InvestigationFeedback(BaseModel):
     """Feedback on investigation quality"""
 
-    investigation_id: str
+    investigation_id: str = ""
     rating: int = Field(..., ge=1, le=5)
     feedback: Optional[str] = None
     correction: Optional[dict[str, Any]] = None
@@ -418,10 +418,10 @@ class InvestigationFeedback(BaseModel):
 class FeedbackImpact(BaseModel):
     """Impact of feedback on agent learning"""
 
-    investigation_id: str
-    memory_entries_updated: int
-    confidence_adjustments: int
-    pattern_refinements: int
+    investigation_id: str = ""
+    memory_entries_updated: int = 0
+    confidence_adjustments: int = 0
+    pattern_refinements: int = 0
 
 
 # ============================================================================
@@ -441,14 +441,14 @@ class ThreatHuntRequest(BaseModel):
 class ThreatHuntResult(BaseModel):
     """Threat hunt results"""
 
-    hunt_id: str
-    agent_id: str
-    profile: str
-    status: str
-    indicators_found: int
-    investigations_created: int
-    high_confidence_findings: int
-    execution_time_minutes: float
+    hunt_id: str = ""
+    agent_id: str = ""
+    profile: str = ""
+    status: str = ""
+    indicators_found: int = 0
+    investigations_created: int = 0
+    high_confidence_findings: int = 0
+    execution_time_minutes: float = 0.0
     timestamp: datetime
 
 
@@ -460,11 +460,11 @@ class ThreatHuntResult(BaseModel):
 class AgentConfig(BaseModel):
     """Agent configuration"""
 
-    agent_id: str
-    llm_model: str
-    temperature: float
-    max_reasoning_steps: int
-    autonomy_level: str
+    agent_id: str = ""
+    llm_model: str = ""
+    temperature: float = 0.0
+    max_reasoning_steps: int = 0
+    autonomy_level: str = ""
     capabilities: list[str]
 
 

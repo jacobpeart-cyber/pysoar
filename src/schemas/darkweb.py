@@ -49,8 +49,8 @@ class DarkWebMonitorUpdate(BaseModel):
 class DarkWebMonitorResponse(DarkWebMonitorBase, DBModel):
     """Schema for monitor response"""
 
-    id: str
-    organization_id: str
+    id: str = ""
+    organization_id: str = ""
     last_check: Optional[str] = None
     findings_count: int = 0
     created_at: Optional[datetime] = None
@@ -64,10 +64,10 @@ class DarkWebMonitorListResponse(BaseModel):
     """Schema for paginated monitor list"""
 
     items: list[DarkWebMonitorResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class DarkWebFindingBase(BaseModel):
@@ -86,7 +86,7 @@ class DarkWebFindingBase(BaseModel):
 class DarkWebFindingCreate(DarkWebFindingBase):
     """Schema for creating dark web finding"""
 
-    monitor_id: str
+    monitor_id: str = ""
     source_url_hash: Optional[str] = None
     raw_data_hash: Optional[str] = None
 
@@ -103,9 +103,9 @@ class DarkWebFindingUpdate(BaseModel):
 class DarkWebFindingResponse(DarkWebFindingBase, DBModel):
     """Schema for finding response"""
 
-    id: str
-    monitor_id: str
-    organization_id: str
+    id: str = ""
+    monitor_id: str = ""
+    organization_id: str = ""
     status: str = "new"
     source_url_hash: Optional[str] = None
     raw_data_hash: Optional[str] = None
@@ -122,10 +122,10 @@ class DarkWebFindingListResponse(BaseModel):
     """Schema for paginated finding list"""
 
     items: list[DarkWebFindingResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class DarkWebFindingDetailResponse(DarkWebFindingResponse):
@@ -150,7 +150,7 @@ class CredentialLeakBase(BaseModel):
 class CredentialLeakCreate(CredentialLeakBase):
     """Schema for creating credential leak"""
 
-    finding_id: str
+    finding_id: str = ""
 
 
 class CredentialLeakUpdate(BaseModel):
@@ -164,9 +164,9 @@ class CredentialLeakUpdate(BaseModel):
 class CredentialLeakResponse(CredentialLeakBase, DBModel):
     """Schema for credential leak response"""
 
-    id: str
-    finding_id: str
-    organization_id: str
+    id: str = ""
+    finding_id: str = ""
+    organization_id: str = ""
     is_remediated: bool = False
     remediation_action: Optional[str] = None
     created_at: Optional[datetime] = None
@@ -180,11 +180,11 @@ class CredentialLeakListResponse(BaseModel):
     """Schema for paginated credential leak list"""
 
     items: list[CredentialLeakResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
-    unremediated_count: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
+    unremediated_count: int = 0
 
 
 class BrandThreatBase(BaseModel):
@@ -202,7 +202,7 @@ class BrandThreatBase(BaseModel):
 class BrandThreatCreate(BrandThreatBase):
     """Schema for creating brand threat"""
 
-    finding_id: str
+    finding_id: str = ""
 
 
 class BrandThreatUpdate(BaseModel):
@@ -215,9 +215,9 @@ class BrandThreatUpdate(BaseModel):
 class BrandThreatResponse(BrandThreatBase, DBModel):
     """Schema for brand threat response"""
 
-    id: str
-    finding_id: str
-    organization_id: str
+    id: str = ""
+    finding_id: str = ""
+    organization_id: str = ""
     takedown_status: str = "identified"
     takedown_provider: Optional[str] = None
     created_at: Optional[datetime] = None
@@ -231,55 +231,55 @@ class BrandThreatListResponse(BaseModel):
     """Schema for paginated brand threat list"""
 
     items: list[BrandThreatResponse]
-    total: int
-    page: int
-    size: int
-    pages: int
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
 
 
 class DarkWebExposureSummary(BaseModel):
     """Summary of organization's dark web exposure"""
 
-    total_findings: int
-    critical_findings: int
-    exposed_credentials: int
-    exposed_domains: int
-    exposed_emails: int
-    brand_threats: int
-    remediated_credentials: int
-    pending_remediation: int
+    total_findings: int = 0
+    critical_findings: int = 0
+    exposed_credentials: int = 0
+    exposed_domains: int = 0
+    exposed_emails: int = 0
+    brand_threats: int = 0
+    remediated_credentials: int = 0
+    pending_remediation: int = 0
     last_scan: Optional[str] = None
 
 
 class CredentialStatistics(BaseModel):
     """Credential leak statistics"""
 
-    total_credentials: int
+    total_credentials: int = 0
     by_password_type: dict[str, int]
     by_source: dict[str, int]
-    crackable_credentials: int
-    plaintext_credentials: int
-    affected_users: int
-    remediation_rate: float
+    crackable_credentials: int = 0
+    plaintext_credentials: int = 0
+    affected_users: int = 0
+    remediation_rate: float = 0.0
 
 
 class BrandThreatMap(BaseModel):
     """Brand threat mapping and statistics"""
 
-    total_threats: int
+    total_threats: int = 0
     by_threat_type: dict[str, int]
     by_takedown_status: dict[str, int]
-    active_takedowns: int
-    completed_takedowns: int
-    failed_takedowns: int
+    active_takedowns: int = 0
+    completed_takedowns: int = 0
+    failed_takedowns: int = 0
 
 
 class TrendingThreats(BaseModel):
     """Trending threats in dark web"""
 
-    threat_type: str
-    occurrences_last_7_days: int
-    occurrences_last_30_days: int
+    threat_type: str = ""
+    occurrences_last_7_days: int = 0
+    occurrences_last_30_days: int = 0
     trend: str  # "rising", "stable", "declining"
     affected_industries: list[str]
 
@@ -291,9 +291,9 @@ class DarkWebDashboard(BaseModel):
     credential_stats: CredentialStatistics
     brand_threat_map: BrandThreatMap
     trending_threats: list[TrendingThreats]
-    monitored_items: int
-    active_monitors: int
-    scan_frequency: str
+    monitored_items: int = 0
+    active_monitors: int = 0
+    scan_frequency: str = ""
 
 
 class BulkFindingAction(BaseModel):
@@ -316,11 +316,11 @@ class BulkCredentialRemediateAction(BaseModel):
 class CredentialRemediationReport(BaseModel):
     """Report on credential remediation"""
 
-    total_affected: int
-    password_reset_sent: int
-    account_disabled: int
-    mfa_enforced: int
-    failed_actions: int
+    total_affected: int = 0
+    password_reset_sent: int = 0
+    account_disabled: int = 0
+    mfa_enforced: int = 0
+    failed_actions: int = 0
     remediation_date: datetime
     estimated_completion: Optional[str] = None
 
@@ -335,10 +335,10 @@ class ScanTriggerRequest(BaseModel):
 class ScanStatusResponse(BaseModel):
     """Response with scan status"""
 
-    scan_id: str
+    scan_id: str = ""
     monitor_id: Optional[str]
     status: str  # running, completed, failed
-    start_time: str
+    start_time: str = ""
     completion_time: Optional[str] = None
-    findings: int
-    new_findings: int
+    findings: int = 0
+    new_findings: int = 0

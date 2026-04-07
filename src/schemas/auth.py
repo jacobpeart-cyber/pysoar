@@ -9,29 +9,29 @@ class LoginRequest(BaseModel):
     """Login request schema"""
 
     email: EmailStr
-    password: str
+    password: str = ""
 
 
 class TokenResponse(BaseModel):
     """Token response schema"""
 
-    access_token: str
-    refresh_token: str
+    access_token: str = ""
+    refresh_token: str = ""
     token_type: str = "bearer"
-    expires_in: int
+    expires_in: int = 0
 
 
 class RefreshTokenRequest(BaseModel):
     """Refresh token request schema"""
 
-    refresh_token: str
+    refresh_token: str = ""
 
 
 class PasswordChangeRequest(BaseModel):
     """Password change request schema"""
 
-    current_password: str
-    new_password: str
+    current_password: str = ""
+    new_password: str = ""
 
 
 class PasswordResetRequest(BaseModel):
@@ -43,16 +43,16 @@ class PasswordResetRequest(BaseModel):
 class PasswordResetConfirm(BaseModel):
     """Password reset confirmation schema"""
 
-    token: str
-    new_password: str
+    token: str = ""
+    new_password: str = ""
 
 
 class TokenPayload(BaseModel):
     """Token payload schema"""
 
-    sub: str
-    exp: int
-    type: str
+    sub: str = ""
+    exp: int = 0
+    type: str = ""
     role: Optional[str] = None
 
 
@@ -60,5 +60,5 @@ class MFARequiredResponse(BaseModel):
     """MFA required response schema"""
 
     mfa_required: bool = True
-    mfa_token: str
-    expires_in: int
+    mfa_token: str = ""
+    expires_in: int = 0
