@@ -34,8 +34,8 @@ class ConnectorResponse(ConnectorBase, DBModel):
     rating: Optional[float] = None
     install_count: int
     last_updated: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -105,8 +105,8 @@ class InstalledIntegrationResponse(InstalledIntegrationBase, DBModel):
     error_message: Optional[str] = None
     rate_limit_remaining: Optional[int] = None
     rate_limit_reset: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -183,8 +183,8 @@ class IntegrationActionResponse(DBModel):
     requires_approval: bool
     timeout_seconds: int
     is_idempotent: bool
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -231,8 +231,8 @@ class IntegrationExecutionResponse(DBModel):
     duration_ms: Optional[int] = None
     error_message: Optional[str] = None
     retry_count: int
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -278,8 +278,8 @@ class WebhookResponse(DBModel):
     is_active: bool
     last_received: Optional[str] = None
     received_count: int
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
