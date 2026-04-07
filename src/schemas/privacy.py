@@ -209,7 +209,7 @@ class DataSubjectRequestResponse(DataSubjectRequestBase, DBModel):
 
     id: str = ""
     status: DSRStatus
-    deadline: Optional[str]
+    deadline: Optional[str] = None
     data_systems_searched: Optional[List[str]] = None
     response_sent: Optional[str] = None
     created_at: Optional[datetime] = None
@@ -267,7 +267,7 @@ class PrivacyImpactAssessmentResponse(PrivacyImpactAssessmentBase, DBModel):
     status: PIAStatus
     risk_level: RiskLevel
     dpo_review: bool = False
-    dpo_approval_date: Optional[str]
+    dpo_approval_date: Optional[str] = None
     mitigations: Optional[List[str]] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -309,8 +309,8 @@ class ConsentRecordResponse(ConsentRecordBase, DBModel):
 
     id: str = ""
     consent_given: bool = False
-    consent_date: Optional[str]
-    withdrawal_date: Optional[str]
+    consent_date: Optional[str] = None
+    withdrawal_date: Optional[str] = None
     version: int = 0
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -370,7 +370,7 @@ class DataProcessingRecordResponse(DataProcessingRecordBase, DBModel):
     """Data Processing Record response"""
 
     id: str = ""
-    last_reviewed: Optional[str]
+    last_reviewed: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -433,10 +433,10 @@ class PrivacyIncidentResponse(PrivacyIncidentBase, DBModel):
     id: str = ""
     status: IncidentStatus
     notification_required: bool = False
-    notification_deadline: Optional[str]
+    notification_deadline: Optional[str] = None
     supervisory_authority_notified: bool = False
     subjects_notified: bool = False
-    root_cause: Optional[str]
+    root_cause: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 

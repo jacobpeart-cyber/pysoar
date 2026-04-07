@@ -130,13 +130,13 @@ class ImageVulnerabilityResponse(DBModel):
     cve_id: str = ""
     package_name: str = ""
     package_version: str = ""
-    fixed_version: Optional[str]
+    fixed_version: Optional[str] = None
     severity: VulnerabilitySeverity
-    cvss_score: Optional[float]
+    cvss_score: Optional[float] = None
     exploit_available: bool = False
-    description: Optional[str]
-    layer_introduced: Optional[str]
-    remediation: Optional[str]
+    description: Optional[str] = None
+    layer_introduced: Optional[str] = None
+    remediation: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -165,10 +165,10 @@ class ContainerImageResponse(DBModel):
     repository: str = ""
     tag: str = ""
     digest_sha256: str = ""
-    image_size_mb: Optional[float]
-    os: Optional[str]
-    architecture: Optional[str]
-    created_at_source: Optional[datetime]
+    image_size_mb: Optional[float] = None
+    os: Optional[str] = None
+    architecture: Optional[str] = None
+    created_at_source: Optional[datetime] = None
     scanned_at: Optional[datetime] = None
     vulnerability_count_critical: int = 0
     vulnerability_count_high: int = 0
@@ -176,12 +176,12 @@ class ContainerImageResponse(DBModel):
     vulnerability_count_low: int = 0
     is_signed: bool = False
     signature_verified: bool = False
-    base_image: Optional[str]
+    base_image: Optional[str] = None
     sbom_generated: bool = False
     compliance_status: ComplianceStatus
     risk_score: int = 0
     labels: Dict[str, Any]
-    last_deployed: Optional[datetime]
+    last_deployed: Optional[datetime] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -230,7 +230,7 @@ class KubernetesClusterResponse(DBModel):
     encryption_at_rest: bool = False
     secrets_encrypted: bool = False
     admission_controllers: Dict[str, Any]
-    last_audit: Optional[datetime]
+    last_audit: Optional[datetime] = None
     compliance_score: int = 0
     risk_score: int = 0
     created_at: Optional[datetime] = None
@@ -277,8 +277,8 @@ class K8sSecurityFindingResponse(DBModel):
     resource_name: str = ""
     severity: Severity
     description: str = ""
-    remediation: Optional[str]
-    cis_benchmark_id: Optional[str]
+    remediation: Optional[str] = None
+    cis_benchmark_id: Optional[str] = None
     status: FindingStatus
     detected_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
@@ -318,15 +318,15 @@ class RuntimeAlertResponse(DBModel):
     alert_type: AlertType
     namespace: str = ""
     pod_name: str = ""
-    container_name: Optional[str]
-    process_name: Optional[str]
-    process_args: Optional[str]
+    container_name: Optional[str] = None
+    process_name: Optional[str] = None
+    process_args: Optional[str] = None
     severity: Severity
     description: str = ""
-    source_ip: Optional[str]
-    destination_ip: Optional[str]
-    destination_port: Optional[int]
-    mitre_technique: Optional[str]
+    source_ip: Optional[str] = None
+    destination_ip: Optional[str] = None
+    destination_port: Optional[int] = None
+    mitre_technique: Optional[str] = None
     status: RuntimeAlertStatus
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None

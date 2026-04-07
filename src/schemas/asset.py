@@ -67,29 +67,29 @@ class AssetResponse(AssetBase, DBModel):
     """Schema for asset response"""
     id: str = ""
     name: str = ""
-    hostname: Optional[str]
+    hostname: Optional[str] = None
     asset_type: str = ""
     status: str = ""
-    ip_address: Optional[str]
-    mac_address: Optional[str]
-    fqdn: Optional[str]
+    ip_address: Optional[str] = None
+    mac_address: Optional[str] = None
+    fqdn: Optional[str] = None
     criticality: str = ""
-    business_unit: Optional[str]
-    department: Optional[str]
-    owner: Optional[str]
-    location: Optional[str]
-    operating_system: Optional[str]
-    os_version: Optional[str]
-    cloud_provider: Optional[str]
-    cloud_region: Optional[str]
-    cloud_instance_id: Optional[str]
-    security_score: Optional[int]
-    last_scan: Optional[str]
-    description: Optional[str]
-    tags: Optional[list[str]]
+    business_unit: Optional[str] = None
+    department: Optional[str] = None
+    owner: Optional[str] = None
+    location: Optional[str] = None
+    operating_system: Optional[str] = None
+    os_version: Optional[str] = None
+    cloud_provider: Optional[str] = None
+    cloud_region: Optional[str] = None
+    cloud_instance_id: Optional[str] = None
+    security_score: Optional[int] = None
+    last_scan: Optional[str] = None
+    description: Optional[str] = None
+    tags: Optional[list[str]] = None
     is_monitored: bool = False
     agent_installed: bool = False
-    last_seen: Optional[str]
+    last_seen: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 

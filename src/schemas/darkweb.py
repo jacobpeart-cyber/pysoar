@@ -336,7 +336,7 @@ class ScanStatusResponse(BaseModel):
     """Response with scan status"""
 
     scan_id: str = ""
-    monitor_id: Optional[str]
+    monitor_id: Optional[str] = None
     status: str  # running, completed, failed
     start_time: str = ""
     completion_time: Optional[str] = None
