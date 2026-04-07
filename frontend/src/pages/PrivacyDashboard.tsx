@@ -122,7 +122,7 @@ export default function PrivacyDashboard() {
     purpose: '',
     legal_basis: 'consent',
     consent_given: true,
-    consent_mechanism: 'web_form',
+    consent_mechanism: 'explicit_opt_in',
   });
 
   // --- ROPA Form State ---
@@ -208,7 +208,7 @@ export default function PrivacyDashboard() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['privacy-consent'] });
       setShowCreateConsent(false);
-      setConsentForm({ subject_id: '', purpose: '', legal_basis: 'consent', consent_given: true, consent_mechanism: 'web_form' });
+      setConsentForm({ subject_id: '', purpose: '', legal_basis: 'consent', consent_given: true, consent_mechanism: 'explicit_opt_in' });
     },
   });
 

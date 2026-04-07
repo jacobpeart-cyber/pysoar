@@ -1,6 +1,6 @@
 """Organization and Team management endpoints"""
 
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from pydantic import BaseModel, Field
@@ -41,12 +41,12 @@ class OrganizationResponse(BaseModel):
     id: str
     name: str
     slug: str
-    description: Optional[str]
-    plan: str
-    max_users: int
-    is_active: bool
+    description: Optional[str] = None
+    plan: str = "free"
+    max_users: int = 10
+    is_active: bool = True
     member_count: int = 0
-    created_at: str
+    created_at: Optional[Any] = None
 
     class Config:
         from_attributes = True

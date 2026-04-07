@@ -44,7 +44,7 @@ class PhishingTemplateBase(BaseModel):
 class PhishingTemplateCreateRequest(PhishingTemplateBase):
     """Request schema for creating a phishing template."""
 
-    organization_id: str
+    organization_id: Optional[str] = None
 
 
 class PhishingTemplateUpdateRequest(BaseModel):
@@ -107,7 +107,7 @@ class TargetGroupBase(BaseModel):
 class TargetGroupCreateRequest(TargetGroupBase):
     """Request schema for creating a target group."""
 
-    organization_id: str
+    organization_id: Optional[str] = None
 
 
 class TargetGroupUpdateRequest(BaseModel):
@@ -166,7 +166,7 @@ class PhishingCampaignBase(BaseModel):
 class PhishingCampaignCreateRequest(PhishingCampaignBase):
     """Request schema for creating a campaign."""
 
-    organization_id: str
+    organization_id: Optional[str] = None
 
 
 class PhishingCampaignUpdateRequest(BaseModel):
