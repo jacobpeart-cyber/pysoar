@@ -266,6 +266,7 @@ export default function ComplianceDashboard() {
         <CUITab
           assets={cuiAssets || []}
           loading={cuiLoading}
+          onRefresh={() => queryClient.invalidateQueries({ queryKey: ['compliance-cui'] })}
         />
       )}
 
@@ -961,10 +962,14 @@ function POAMsTab({
 function CUITab({
   assets,
   loading,
+  onRefresh,
 }: {
   assets: CUIAsset[];
   loading: boolean;
+  onRefresh: () => void;
 }) {
+  const [showModal, setShowModal] = useState(false);
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
@@ -975,83 +980,125 @@ function CUITab({
 
   return (
     <div className="space-y-6">
-      {/* Stats */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
         <StatCard label="CUI Assets" value={assets.length} icon={FileText} color="blue" />
-        <StatCard
-          label="Active Markings"
-          value={assets.filter((a) => a.cui_designation).length}
-          icon={CheckCircle}
-          color="green"
-        />
-        <StatCard
-          label="Categories Tracked"
-          value={new Set(assets.map((a) => a.cui_category)).size}
-          icon={AlertTriangle}
-          color="orange"
-        />
+        <StatCard label="Active Markings" value={assets.filter((a) => a.cui_designation).length} icon={CheckCircle} color="green" />
+        <StatCard label="Categories Tracked" value={new Set(assets.map((a) => a.cui_category)).size} icon={AlertTriangle} color="orange" />
       </div>
 
-      {/* CUI Assets Table */}
       <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
         <table className="w-full">
           <thead>
             <tr className="border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-700/50">
-              <th className="px-6 py-3 text-left text-xs font-semibold text-gray-700 dark:text-gray-300">
-                Asset
-              </th>
-              <th className="px-6 py-3 text-left text-xs font-semibold text-gray-700 dark:text-gray-300">
-                Type
-              </th>
-              <th className="px-6 py-3 text-left text-xs font-semibold text-gray-700 dark:text-gray-300">
-                CUI Category
-              </th>
-              <th className="px-6 py-3 text-left text-xs font-semibold text-gray-700 dark:text-gray-300">
-                Designation
-              </th>
-              <th className="px-6 py-3 text-left text-xs font-semibold text-gray-700 dark:text-gray-300">
-                Dissemination Controls
-              </th>
-              <th className="px-6 py-3 text-left text-xs font-semibold text-gray-700 dark:text-gray-300">
-                Classification Authority
-              </th>
+              <th className="px-6 py-3 text-left text-xs font-semibold text-gray-700 dark:text-gray-300">Asset</th>
+              <th className="px-6 py-3 text-left text-xs font-semibold text-gray-700 dark:text-gray-300">Type</th>
+              <th className="px-6 py-3 text-left text-xs font-semibold text-gray-700 dark:text-gray-300">CUI Category</th>
+              <th className="px-6 py-3 text-left text-xs font-semibold text-gray-700 dark:text-gray-300">Designation</th>
+              <th className="px-6 py-3 text-left text-xs font-semibold text-gray-700 dark:text-gray-300">Dissemination Controls</th>
+              <th className="px-6 py-3 text-left text-xs font-semibold text-gray-700 dark:text-gray-300">Authority</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
-            {assets.map((asset) => (
+            {assets.length === 0 ? (
+              <tr><td colSpan={6} className="px-6 py-8 text-center text-gray-500">No CUI markings yet. Click "Mark as CUI" to add one.</td></tr>
+            ) : assets.map((asset) => (
               <tr key={asset.id} className="hover:bg-gray-50 dark:hover:bg-gray-700/50">
-                <td className="px-6 py-4 text-sm font-medium text-gray-900 dark:text-white">
-                  {asset.asset_id ?? ''}
-                </td>
-                <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                  {asset.asset_type ?? ''}
-                </td>
-                <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                  {asset.cui_category ?? ''}
-                </td>
-                <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                  {asset.cui_designation ?? ''}
-                </td>
-                <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                  {Array.isArray(asset.dissemination_controls) ? asset.dissemination_controls.join(', ') : ''}
-                </td>
-                <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                  {asset.classification_authority ?? ''}
-                </td>
+                <td className="px-6 py-4 text-sm font-medium text-gray-900 dark:text-white">{asset.asset_id || '-'}</td>
+                <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">{asset.asset_type || '-'}</td>
+                <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">{asset.cui_category || '-'}</td>
+                <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">{asset.cui_designation || '-'}</td>
+                <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">{Array.isArray(asset.dissemination_controls) ? asset.dissemination_controls.join(', ') : ''}</td>
+                <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">{asset.classification_authority || '-'}</td>
               </tr>
             ))}
           </tbody>
         </table>
       </div>
 
-      {/* Mark as CUI Button */}
-      <button
-        onClick={() => { setActiveTab('controls'); }}
-        className="inline-flex items-center gap-2 px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium"
-      >
-        <Plus className="w-5 h-5" />
-        Mark as CUI
+      <button onClick={() => setShowModal(true)} className="inline-flex items-center gap-2 px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium">
+        <Plus className="w-5 h-5" /> Mark as CUI
       </button>
+
+      {showModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50" onClick={() => setShowModal(false)}>
+          <div className="bg-white dark:bg-gray-800 rounded-lg shadow-xl w-full max-w-lg mx-4 max-h-[80vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+            <div className="px-6 py-4 border-b border-gray-200 dark:border-gray-700 flex justify-between items-center">
+              <h2 className="text-lg font-semibold">Mark Asset as CUI</h2>
+              <button onClick={() => setShowModal(false)} className="text-gray-400 hover:text-gray-600">✕</button>
+            </div>
+            <form className="p-6 space-y-4" onSubmit={async (e) => {
+              e.preventDefault();
+              const fd = new FormData(e.currentTarget);
+              try {
+                await api.post('/compliance/cui', {
+                  asset_id: fd.get('asset_id'),
+                  asset_type: fd.get('asset_type'),
+                  cui_category: fd.get('cui_category'),
+                  cui_designation: fd.get('cui_designation'),
+                  classification_authority: fd.get('classification_authority'),
+                  dissemination_controls: (fd.get('dissemination_controls') as string || '').split(',').map(s => s.trim()).filter(Boolean),
+                  handling_instructions: fd.get('handling_instructions') || null,
+                });
+                setShowModal(false);
+                onRefresh();
+              } catch (err) { console.error('CUI marking failed:', err); }
+            }}>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-sm font-medium mb-1">Asset ID</label>
+                  <input name="asset_id" required className="w-full border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 text-sm" placeholder="e.g., SRV-001" />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium mb-1">Asset Type</label>
+                  <select name="asset_type" className="w-full border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 text-sm">
+                    <option value="server">Server</option>
+                    <option value="database">Database</option>
+                    <option value="application">Application</option>
+                    <option value="document">Document</option>
+                    <option value="network">Network Device</option>
+                  </select>
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-sm font-medium mb-1">CUI Category</label>
+                  <select name="cui_category" className="w-full border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 text-sm">
+                    <option value="CTI">CTI (Controlled Technical Information)</option>
+                    <option value="ITAR">ITAR (Export Controlled)</option>
+                    <option value="PRVCY">PRVCY (Privacy)</option>
+                    <option value="PROPIN">PROPIN (Proprietary)</option>
+                    <option value="LES">LES (Law Enforcement Sensitive)</option>
+                    <option value="SP-CTI">SP-CTI (Specified CTI)</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium mb-1">Designation</label>
+                  <select name="cui_designation" className="w-full border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 text-sm">
+                    <option value="CUI">CUI (Basic)</option>
+                    <option value="CUI//SP">CUI//SP (Specified)</option>
+                  </select>
+                </div>
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Classification Authority</label>
+                <input name="classification_authority" className="w-full border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 text-sm" placeholder="e.g., NIST SP 800-171" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Dissemination Controls (comma-separated)</label>
+                <input name="dissemination_controls" className="w-full border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 text-sm" placeholder="e.g., NOFORN, REL TO USA" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Handling Instructions</label>
+                <textarea name="handling_instructions" rows={2} className="w-full border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 text-sm" placeholder="Special handling requirements..." />
+              </div>
+              <div className="flex gap-3 pt-4">
+                <button type="button" onClick={() => setShowModal(false)} className="flex-1 px-4 py-2 border border-gray-300 rounded-lg hover:bg-gray-50">Cancel</button>
+                <button type="submit" className="flex-1 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg">Mark as CUI</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
