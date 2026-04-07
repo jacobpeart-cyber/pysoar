@@ -1099,8 +1099,13 @@ export const collaborationApi = {
     return response.data;
   },
 
-  createWarRoom: async (data: { title: string; description?: string }): Promise<WarRoom> => {
-    const response = await api.post('/collaboration/rooms', data);
+  createWarRoom: async (data: { title?: string; name?: string; description?: string; room_type?: string; severity_level?: string }): Promise<WarRoom> => {
+    const response = await api.post('/collaboration/rooms', {
+      name: data.name || data.title || 'New Room',
+      room_type: data.room_type || 'incident',
+      severity_level: data.severity_level || 'medium',
+      description: data.description || '',
+    });
     return response.data;
   },
 
@@ -1146,10 +1151,15 @@ export const phishingApi = {
 
   createCampaign: async (data: {
     name: string;
-    description: string;
-    targets: string[];
+    description?: string;
+    targets?: string[];
+    campaign_type?: string;
   }): Promise<PhishingCampaign> => {
-    const response = await api.post('/phishing_sim/campaigns', data);
+    const response = await api.post('/phishing_sim/campaigns', {
+      ...data,
+      campaign_type: data.campaign_type || 'phishing',
+      organization_id: localStorage.getItem('organization_id') || '',
+    });
     return response.data;
   },
 
