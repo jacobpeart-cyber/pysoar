@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo } from 'react';
-import { useQuery, useMutation } from '@tanstack/react-query';
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   AreaChart,
   Area,
@@ -153,10 +153,13 @@ const integrationTypeColors: Record<string, string> = {
 };
 
 export default function Remediation() {
+  const queryClient = useQueryClient();
   const [activeTab, setActiveTab] = useState<string>('dashboard');
   const [expandedExecution, setExpandedExecution] = useState<string | null>(null);
   const [policyTypeFilter, setPolicyTypeFilter] = useState('');
   const [policyEnabledFilter, setPolicyEnabledFilter] = useState('');
+  const [showCreatePolicyModal, setShowCreatePolicyModal] = useState(false);
+  const [showAddIntegrationModal, setShowAddIntegrationModal] = useState(false);
   const [executionStatusFilter, setExecutionStatusFilter] = useState('');
   const [executionTriggerFilter, setExecutionTriggerFilter] = useState('');
   const [blockIPValue, setBlockIPValue] = useState('');
@@ -584,7 +587,10 @@ export default function Remediation() {
             </select>
           </div>
 
-          <button className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition">
+          <button
+            onClick={() => setShowCreatePolicyModal(true)}
+            className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition"
+          >
             <Plus className="w-5 h-5" />
             Create Policy
           </button>
@@ -1159,7 +1165,10 @@ export default function Remediation() {
       <div className="space-y-6">
         {/* Action Buttons */}
         <div className="flex flex-col sm:flex-row gap-4">
-          <button className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition">
+          <button
+            onClick={() => setShowAddIntegrationModal(true)}
+            className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-medium transition"
+          >
             <Plus className="w-5 h-5" />
             Add Integration
           </button>
@@ -1292,6 +1301,136 @@ export default function Remediation() {
           {activeTab === 'integrations' && renderIntegrations()}
         </div>
       </div>
+
+      {/* Create Policy Modal */}
+      {showCreatePolicyModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50" onClick={() => setShowCreatePolicyModal(false)}>
+          <div className="bg-white dark:bg-gray-800 rounded-lg shadow-xl w-full max-w-lg mx-4 max-h-[80vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+            <div className="px-6 py-4 border-b border-gray-200 dark:border-gray-700 flex justify-between items-center">
+              <h2 className="text-lg font-semibold">Create Remediation Policy</h2>
+              <button onClick={() => setShowCreatePolicyModal(false)} className="text-gray-400 hover:text-gray-600">✕</button>
+            </div>
+            <form className="p-6 space-y-4" onSubmit={async (e) => {
+              e.preventDefault();
+              const fd = new FormData(e.currentTarget);
+              try {
+                await api.post('/remediation/policies', {
+                  name: fd.get('name'),
+                  description: fd.get('description'),
+                  policy_type: fd.get('policy_type'),
+                  trigger_type: fd.get('trigger_type'),
+                  trigger_conditions: { severity: fd.get('severity') || 'critical' },
+                  action_type: fd.get('policy_type'),
+                  action_config: {},
+                  enabled: true,
+                  priority: 50,
+                  cooldown_minutes: 15,
+                });
+                setShowCreatePolicyModal(false);
+                queryClient.invalidateQueries({ queryKey: ['remediation-policies'] });
+              } catch (err: any) { console.error('Create policy failed:', err); }
+            }}>
+              <div>
+                <label className="block text-sm font-medium mb-1">Policy Name</label>
+                <input name="name" required className="w-full border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" placeholder="e.g., Auto-block critical threats" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Description</label>
+                <textarea name="description" rows={2} className="w-full border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+              </div>
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="block text-sm font-medium mb-1">Policy Type</label>
+                  <select name="policy_type" required className="w-full border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
+                    <option value="auto_block">Auto Block</option>
+                    <option value="auto_isolate">Auto Isolate</option>
+                    <option value="auto_patch">Auto Patch</option>
+                    <option value="auto_disable">Auto Disable</option>
+                    <option value="auto_quarantine">Auto Quarantine</option>
+                    <option value="notification">Notification</option>
+                    <option value="escalation">Escalation</option>
+                    <option value="custom">Custom</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium mb-1">Trigger</label>
+                  <select name="trigger_type" required className="w-full border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
+                    <option value="alert_severity">Alert Severity</option>
+                    <option value="anomaly_score">Anomaly Score</option>
+                    <option value="threat_intel_match">Threat Intel Match</option>
+                    <option value="vulnerability_score">Vulnerability Score</option>
+                    <option value="ueba_risk">UEBA Risk</option>
+                    <option value="detection_rule">Detection Rule</option>
+                  </select>
+                </div>
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Severity Threshold</label>
+                <select name="severity" className="w-full border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
+                  <option value="critical">Critical</option>
+                  <option value="high">High</option>
+                  <option value="medium">Medium</option>
+                </select>
+              </div>
+              <div className="flex gap-3 pt-4">
+                <button type="button" onClick={() => setShowCreatePolicyModal(false)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700">Cancel</button>
+                <button type="submit" className="flex-1 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg">Create Policy</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Add Integration Modal */}
+      {showAddIntegrationModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black bg-opacity-50" onClick={() => setShowAddIntegrationModal(false)}>
+          <div className="bg-white dark:bg-gray-800 rounded-lg shadow-xl w-full max-w-lg mx-4" onClick={(e) => e.stopPropagation()}>
+            <div className="px-6 py-4 border-b border-gray-200 dark:border-gray-700 flex justify-between items-center">
+              <h2 className="text-lg font-semibold">Add Integration</h2>
+              <button onClick={() => setShowAddIntegrationModal(false)} className="text-gray-400 hover:text-gray-600">✕</button>
+            </div>
+            <form className="p-6 space-y-4" onSubmit={async (e) => {
+              e.preventDefault();
+              const fd = new FormData(e.currentTarget);
+              try {
+                await api.post('/integrations/install', {
+                  connector_name: fd.get('connector'),
+                  config: { api_key: fd.get('api_key'), endpoint: fd.get('endpoint') },
+                });
+                setShowAddIntegrationModal(false);
+                queryClient.invalidateQueries({ queryKey: ['remediation-integrations'] });
+              } catch (err: any) { console.error('Add integration failed:', err); }
+            }}>
+              <div>
+                <label className="block text-sm font-medium mb-1">Integration Type</label>
+                <select name="connector" required className="w-full border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
+                  <option value="crowdstrike">CrowdStrike</option>
+                  <option value="sentinelone">SentinelOne</option>
+                  <option value="palo_alto">Palo Alto</option>
+                  <option value="fortinet">Fortinet</option>
+                  <option value="aws_security_hub">AWS Security Hub</option>
+                  <option value="azure_sentinel">Azure Sentinel</option>
+                  <option value="slack">Slack</option>
+                  <option value="jira">Jira</option>
+                  <option value="servicenow">ServiceNow</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">API Endpoint</label>
+                <input name="endpoint" className="w-full border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" placeholder="https://api.example.com" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">API Key</label>
+                <input name="api_key" type="password" className="w-full border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" placeholder="Enter API key" />
+              </div>
+              <div className="flex gap-3 pt-4">
+                <button type="button" onClick={() => setShowAddIntegrationModal(false)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700">Cancel</button>
+                <button type="submit" className="flex-1 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg">Connect</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
