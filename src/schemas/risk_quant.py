@@ -55,8 +55,8 @@ class RiskScenarioResponse(RiskScenarioBase, DBModel):
     id: str
     status: str
     review_date: Optional[datetime]
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -138,8 +138,8 @@ class FAIRAnalysisResponse(FAIRAnalysisBase, DBModel):
     ale_p99: Optional[float]
     loss_exceedance_curve: Optional[dict]
     completed_at: Optional[datetime]
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -216,8 +216,8 @@ class RiskRegisterResponse(RiskRegisterBase, DBModel):
     last_review: Optional[datetime]
     next_review: Optional[datetime]
     is_within_appetite: bool
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -271,8 +271,8 @@ class RiskControlResponse(RiskControlBase, DBModel):
     roi_percentage: Optional[float]
     last_tested: Optional[datetime]
     test_result: Optional[str]
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -334,8 +334,8 @@ class BusinessImpactAssessmentResponse(BusinessImpactAssessmentBase, DBModel):
 
     id: str
     organization_id: str
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True

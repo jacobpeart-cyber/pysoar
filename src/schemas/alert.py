@@ -69,8 +69,8 @@ class AlertResponse(AlertBase, DBModel):
     resolution_notes: Optional[str] = None
     resolved_at: Optional[str] = None
     enrichment_data: Optional[dict[str, Any]] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True

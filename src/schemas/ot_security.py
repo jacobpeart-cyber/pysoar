@@ -212,8 +212,8 @@ class OTAssetResponse(DBModel):
     firmware_current: bool
     known_vulnerabilities_count: int
     risk_score: float
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -276,8 +276,8 @@ class OTAlertResponse(DBModel):
     mitre_ics_technique: Optional[str] = None
     status: AlertStatus
     response_action: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -332,8 +332,8 @@ class OTZoneResponse(DBModel):
     last_audit: Optional[datetime] = None
     firewall_rules: Dict[str, Any] = {}
     segmentation_verified: bool
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -386,11 +386,11 @@ class OTIncidentResponse(DBModel):
     status: IncidentStatus
     containment_strategy: Optional[ContainmentStrategy] = None
     safe_shutdown_initiated: bool
-    detected_at: datetime
+    detected_at: Optional[datetime] = None
     contained_at: Optional[datetime] = None
     resolved_at: Optional[datetime] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -442,8 +442,8 @@ class OTPolicyRuleResponse(DBModel):
     enabled: bool
     violations_count: int
     last_violation: Optional[datetime] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -514,7 +514,7 @@ class ComplianceScores(BaseModel):
 class OTDashboardResponse(BaseModel):
     """OT Security Dashboard Response"""
 
-    timestamp: datetime
+    timestamp: Optional[datetime] = None
     asset_inventory: AssetInventoryStats
     alert_summary: AlertStats
     critical_risks: List[str] = []
@@ -528,7 +528,7 @@ class OTDashboardResponse(BaseModel):
 class ComplianceReportResponse(BaseModel):
     """ICS Compliance Report Response"""
 
-    timestamp: datetime
+    timestamp: Optional[datetime] = None
     nerc_cip: Dict[str, Any] = {}
     iec_62443: Dict[str, Any] = {}
     nist_sp_800_82: Dict[str, Any] = {}
@@ -551,7 +551,7 @@ class AssetRisk(BaseModel):
 class OTRiskAssessmentResponse(BaseModel):
     """OT Risk Assessment Report Response"""
 
-    timestamp: datetime
+    timestamp: Optional[datetime] = None
     total_assets: int
     critical_risk_assets: int
     high_risk_assets: int

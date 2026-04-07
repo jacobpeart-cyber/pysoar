@@ -137,8 +137,8 @@ class ImageVulnerabilityResponse(DBModel):
     description: Optional[str]
     layer_introduced: Optional[str]
     remediation: Optional[str]
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -169,7 +169,7 @@ class ContainerImageResponse(DBModel):
     os: Optional[str]
     architecture: Optional[str]
     created_at_source: Optional[datetime]
-    scanned_at: datetime
+    scanned_at: Optional[datetime] = None
     vulnerability_count_critical: int
     vulnerability_count_high: int
     vulnerability_count_medium: int
@@ -182,8 +182,8 @@ class ContainerImageResponse(DBModel):
     risk_score: int
     labels: Dict[str, Any]
     last_deployed: Optional[datetime]
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -233,8 +233,8 @@ class KubernetesClusterResponse(DBModel):
     last_audit: Optional[datetime]
     compliance_score: int
     risk_score: int
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -280,9 +280,9 @@ class K8sSecurityFindingResponse(DBModel):
     remediation: Optional[str]
     cis_benchmark_id: Optional[str]
     status: FindingStatus
-    detected_at: datetime
-    created_at: datetime
-    updated_at: datetime
+    detected_at: Optional[datetime] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -328,8 +328,8 @@ class RuntimeAlertResponse(DBModel):
     destination_port: Optional[int]
     mitre_technique: Optional[str]
     status: RuntimeAlertStatus
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -465,7 +465,7 @@ class ComplianceMatrixResponse(BaseModel):
     dod_stig_score: int
     soc2_score: int
     overall_compliance: int
-    timestamp: datetime
+    timestamp: Optional[datetime] = None
 
 
 class PaginationParams(BaseModel):

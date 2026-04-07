@@ -59,8 +59,8 @@ class ThreatFeedResponse(ThreatFeedBase, DBModel):
     last_success_at: Optional[datetime] = None
     last_error: Optional[str] = None
     total_indicators: int
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -136,8 +136,8 @@ class ThreatIndicatorResponse(ThreatIndicatorBase, DBModel):
     last_sighting_at: Optional[datetime] = None
     false_positive_count: int
     related_indicators: list[str] = Field(default_factory=list)
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -216,8 +216,8 @@ class ThreatActorResponse(ThreatActorBase, DBModel):
     """Schema for threat actor response"""
 
     id: str
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -282,8 +282,8 @@ class ThreatCampaignResponse(ThreatCampaignBase, DBModel):
 
     id: str
     actor_id: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -358,8 +358,8 @@ class IntelReportResponse(IntelReportBase, DBModel):
     author_id: str
     status: str
     published_at: Optional[datetime] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -399,7 +399,7 @@ class IndicatorSightingResponse(DBModel):
     source_ref: Optional[str] = None
     raw_data: Optional[dict[str, Any]] = None
     context: dict[str, Any]
-    created_at: datetime
+    created_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True

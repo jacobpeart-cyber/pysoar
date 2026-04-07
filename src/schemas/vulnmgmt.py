@@ -58,8 +58,8 @@ class VulnerabilityResponse(VulnerabilityBase, DBModel):
     id: str
     organization_id: str
     mitre_technique_ids: Optional[list[str]] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -110,8 +110,8 @@ class VulnerabilityInstanceResponse(VulnerabilityInstanceBase, DBModel):
 
     id: str
     organization_id: str
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -156,8 +156,8 @@ class ScanProfileResponse(ScanProfileBase, DBModel):
     organization_id: str
     last_scan_date: Optional[str] = None
     next_scan_date: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -201,8 +201,8 @@ class PatchOperationResponse(PatchOperationBase, DBModel):
 
     id: str
     organization_id: str
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -245,8 +245,8 @@ class VulnerabilityExceptionResponse(VulnerabilityExceptionBase, DBModel):
 
     id: str
     organization_id: str
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True

@@ -61,8 +61,8 @@ class DecoyResponse(DecoyBase, DBModel):
     last_interaction_at: datetime | None
     deployed_at: datetime | None
     deployed_by: str | None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -113,8 +113,8 @@ class DecoyInteractionResponse(DecoyInteractionBase, DBModel):
     id: UUID
     alert_generated: bool
     alert_id: str | None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -180,8 +180,8 @@ class HoneyTokenGenerateResponse(DBModel):
     triggered_count: int
     last_triggered_at: datetime | None
     last_triggered_by: str | None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -239,8 +239,8 @@ class DeceptionCampaignResponse(DeceptionCampaignBase, DBModel):
     completed_at: datetime | None
     effectiveness_score: float | None
     created_by: str
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True

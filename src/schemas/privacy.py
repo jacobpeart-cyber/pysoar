@@ -212,8 +212,8 @@ class DataSubjectRequestResponse(DataSubjectRequestBase, DBModel):
     deadline: Optional[str]
     data_systems_searched: Optional[List[str]] = None
     response_sent: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -269,8 +269,8 @@ class PrivacyImpactAssessmentResponse(PrivacyImpactAssessmentBase, DBModel):
     dpo_review: bool
     dpo_approval_date: Optional[str]
     mitigations: Optional[List[str]] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -312,8 +312,8 @@ class ConsentRecordResponse(ConsentRecordBase, DBModel):
     consent_date: Optional[str]
     withdrawal_date: Optional[str]
     version: int
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -371,8 +371,8 @@ class DataProcessingRecordResponse(DataProcessingRecordBase, DBModel):
 
     id: str
     last_reviewed: Optional[str]
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -437,8 +437,8 @@ class PrivacyIncidentResponse(PrivacyIncidentBase, DBModel):
     supervisory_authority_notified: bool
     subjects_notified: bool
     root_cause: Optional[str]
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True

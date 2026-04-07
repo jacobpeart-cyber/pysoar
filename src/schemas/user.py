@@ -43,8 +43,8 @@ class UserResponse(UserBase, DBModel):
     is_superuser: bool
     avatar_url: Optional[str] = None
     last_login: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True

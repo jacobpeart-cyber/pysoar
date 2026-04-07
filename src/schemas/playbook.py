@@ -70,8 +70,8 @@ class PlaybookResponse(PlaybookBase, DBModel):
     timeout_seconds: int
     max_retries: int
     created_by: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -113,8 +113,8 @@ class PlaybookExecutionResponse(DBModel):
     error_step: Optional[int] = None
     triggered_by: Optional[str] = None
     trigger_source: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True

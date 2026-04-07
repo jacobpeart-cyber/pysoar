@@ -61,8 +61,8 @@ class RemediationPolicyUpdate(BaseModel):
 class RemediationPolicyResponse(RemediationPolicyBase):
     """Response with metadata."""
     id: str
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
     execution_count: int
     last_executed_at: Optional[datetime] = None
     success_rate: Optional[float] = None
@@ -103,8 +103,8 @@ class RemediationActionCreate(RemediationActionBase):
 class RemediationActionResponse(RemediationActionBase):
     """Response with metadata."""
     id: str
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
     organization_id: str
 
     model_config = ConfigDict(from_attributes=True)
@@ -167,8 +167,8 @@ class RemediationExecutionResponse(RemediationExecutionBase):
     rolled_back_at: Optional[datetime] = None
     metrics: dict = Field(default_factory=dict)
     notes: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
     created_by: Optional[str] = None
     organization_id: str
 
@@ -189,7 +189,7 @@ class ApprovalResponse(BaseModel):
     """Approval response."""
     execution_id: str
     approval_status: str
-    approved_at: datetime
+    approved_at: Optional[datetime] = None
 
 
 class RejectionRequest(BaseModel):
@@ -272,8 +272,8 @@ class RemediationPlaybookCreate(RemediationPlaybookBase):
 class RemediationPlaybookResponse(RemediationPlaybookBase):
     """Response with metadata."""
     id: str
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
     success_count: int
     failure_count: int
     avg_execution_minutes: Optional[float] = None
@@ -308,8 +308,8 @@ class RemediationIntegrationCreate(RemediationIntegrationBase):
 class RemediationIntegrationResponse(RemediationIntegrationBase):
     """Response with metadata."""
     id: str
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
     is_connected: bool
     last_health_check: Optional[datetime] = None
     health_status: str

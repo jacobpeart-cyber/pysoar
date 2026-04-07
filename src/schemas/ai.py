@@ -49,7 +49,7 @@ class QueryHistoryResponse(DBModel):
     natural_language: str
     interpreted_intent: str
     results_count: int
-    created_at: datetime
+    created_at: Optional[datetime] = None
     was_helpful: bool | None = None
 
     class Config:
@@ -102,7 +102,7 @@ class BatchTriageResponse(BaseModel):
     average_confidence: float
     average_false_positive_probability: float
     triaged_alerts: list[AlertTriageResponse]
-    timestamp: datetime
+    timestamp: Optional[datetime] = None
 
 
 class TriageStatsResponse(BaseModel):
@@ -213,7 +213,7 @@ class AnomalyDetectionResponse(DBModel):
     is_false_positive: bool = Field(default=False, description="False positive flag")
     related_alerts: list[str] = Field(default=[], description="Related alert IDs")
     mitre_techniques: list[str] = Field(default=[], description="MITRE ATT&CK techniques")
-    created_at: datetime
+    created_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -292,7 +292,7 @@ class ThreatPredictionResponse(DBModel):
     )
     expires_at: datetime = Field(..., description="When this prediction expires")
     was_accurate: bool | None = Field(default=None, description="Prediction accuracy feedback")
-    created_at: datetime
+    created_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -360,7 +360,7 @@ class MLModelResponse(DBModel):
     prediction_count: int
     drift_score: float
     tags: list[str]
-    created_at: datetime
+    created_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -375,7 +375,7 @@ class ModelDriftResponse(BaseModel):
         ...,
         description="ok, warning, critical - whether retraining is recommended",
     )
-    last_checked_at: datetime
+    last_checked_at: Optional[datetime] = None
     recommendation: str | None = Field(
         default=None, description="Recommendation for model maintenance"
     )
@@ -417,4 +417,4 @@ class AIDashboardResponse(BaseModel):
     queries_today: int
     avg_query_accuracy: float
 
-    last_updated: datetime
+    last_updated: Optional[datetime] = None

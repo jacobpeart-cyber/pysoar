@@ -56,8 +56,8 @@ class ForensicCaseResponse(ForensicCaseBase, DBModel):
     classification_level: Optional[str] = None
     court_admissible: bool = False
     created_by: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -134,8 +134,8 @@ class ForensicEvidenceResponse(ForensicEvidenceBase, DBModel):
     verified_by: Optional[str] = None
     verification_date: Optional[str] = None
     handling_notes: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -220,8 +220,8 @@ class ForensicTimelineResponse(ForensicTimelineBase, DBModel):
     event_timestamp: str
     source_evidence_id: Optional[str] = None
     artifact_data: dict[str, Any] = Field(default_factory=dict)
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -289,8 +289,8 @@ class ForensicArtifactResponse(ForensicArtifactBase, DBModel):
     case_id: str
     evidence_id: str
     ioc_extracted: dict[str, Any] = Field(default_factory=dict)
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -370,8 +370,8 @@ class LegalHoldResponse(LegalHoldBase, DBModel):
     case_id: str
     acknowledgments: dict[str, Any] = Field(default_factory=dict)
     status: str = "active"
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -426,7 +426,7 @@ class CaseReportResponse(BaseModel):
     """Case report response"""
 
     case_id: str
-    generated_at: datetime
+    generated_at: Optional[datetime] = None
     sections: list[str]
     evidence_count: int = 0
     artifact_count: int = 0
@@ -439,7 +439,7 @@ class TimelineExportResponse(BaseModel):
     """Timeline export response"""
 
     case_id: str
-    generated_at: datetime
+    generated_at: Optional[datetime] = None
     event_count: int
     events: list[ForensicTimelineResponse] = Field(default_factory=list)
 
@@ -448,7 +448,7 @@ class ChainOfCustodyReportResponse(BaseModel):
     """Chain of custody report"""
 
     evidence_id: str
-    generated_at: datetime
+    generated_at: Optional[datetime] = None
     log_entries: list[ChainOfCustodyEntry] = Field(default_factory=list)
     is_court_admissible: bool = True
 

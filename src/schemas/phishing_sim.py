@@ -74,8 +74,8 @@ class PhishingTemplateResponse(PhishingTemplateBase, DBModel):
     id: UUID
     usage_count: int
     average_click_rate: float
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -128,8 +128,8 @@ class TargetGroupResponse(TargetGroupBase, DBModel):
     avg_click_rate: float
     campaigns_participated: int
     last_campaign_date: datetime | None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -196,8 +196,8 @@ class PhishingCampaignResponse(PhishingCampaignBase, DBModel):
     attachments_opened: int
     reported_count: int
     created_by: str
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -265,13 +265,13 @@ class CampaignEventResponse(CampaignEventBase, DBModel):
 
     id: UUID
     campaign_id: str
-    event_timestamp: datetime
+    event_timestamp: Optional[datetime] = None
     ip_address: str | None
     user_agent: str | None
     geo_location: dict[str, Any] | None
     device_type: str | None
     time_to_action_seconds: int | None
-    created_at: datetime
+    created_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -321,8 +321,8 @@ class SecurityAwarenessScoreResponse(SecurityAwarenessScoreBase, DBModel):
     risk_category: str
     training_assignments: list[TrainingAssignment]
     certifications: list[Certification]
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -374,8 +374,8 @@ class TrainingCertificateResponse(BaseModel):
     user_email: str
     user_name: str
     module: str
-    issued_at: datetime
-    valid_until: datetime
+    issued_at: Optional[datetime] = None
+    valid_until: Optional[datetime] = None
     certificate_number: str
 
 

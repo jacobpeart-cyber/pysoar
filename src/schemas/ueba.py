@@ -61,8 +61,8 @@ class EntityProfileResponse(EntityProfileBase, DBModel):
     anomaly_count_30d: int
     last_activity_at: Optional[datetime] = None
     last_anomaly_at: Optional[datetime] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -85,8 +85,8 @@ class BehaviorBaselineResponse(DBModel):
     peer_comparison: dict
     confidence: float
     sample_count: int
-    last_updated_at: datetime
-    created_at: datetime
+    last_updated_at: Optional[datetime] = None
+    created_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -122,8 +122,8 @@ class BehaviorEventResponse(BehaviorEventBase, DBModel):
     risk_contribution: float
     is_anomalous: bool
     anomaly_reasons: list
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -175,8 +175,8 @@ class UEBARiskAlertResponse(UEBARiskAlertBase, DBModel):
     status: str
     analyst_notes: Optional[str] = None
     escalated_to_incident: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -208,8 +208,8 @@ class PeerGroupResponse(PeerGroupBase, DBModel):
     member_count: int
     baseline_data: dict
     members: list
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -242,7 +242,7 @@ class EntityRiskResponse(BaseModel):
     risk_level: str
     risk_factors: list[RiskFactorResponse]
     risk_trend: list[RiskTrendPoint]
-    updated_at: datetime
+    updated_at: Optional[datetime] = None
 
 
 # ============================================================================
@@ -359,7 +359,7 @@ class RiskHeatmapResponse(BaseModel):
 
     heatmap_data: list[RiskHeatmapCell]
     total_entities: int
-    generated_at: datetime
+    generated_at: Optional[datetime] = None
 
 
 # ============================================================================

@@ -72,8 +72,8 @@ class ThreatModelResponse(ThreatModelBase, DBModel):
     reviewed_by: Optional[str] = None
     review_date: Optional[str] = None
     data_flow_diagram: Optional[dict[str, Any]] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -122,8 +122,8 @@ class ComponentResponse(ComponentBase, DBModel):
     id: str
     model_id: str
     organization_id: str
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -173,8 +173,8 @@ class ThreatResponse(ThreatBase, DBModel):
     risk_score: int
     mitre_technique_ids: Optional[list[str]] = None
     cwe_ids: Optional[list[str]] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -228,8 +228,8 @@ class MitigationResponse(MitigationBase, DBModel):
     threat_id: str
     organization_id: str
     assigned_to: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -276,8 +276,8 @@ class AttackTreeResponse(AttackTreeBase, DBModel):
     minimum_skill_path: Optional[str] = None
     highest_probability_path: Optional[str] = None
     generated_from_stride: bool
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True

@@ -52,8 +52,8 @@ class PlaybookNodeResponse(DBModel):
     position_y: float
     input_schema: Optional[dict[str, Any]] = None
     output_schema: Optional[dict[str, Any]] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -91,8 +91,8 @@ class PlaybookEdgeResponse(PlaybookEdgeBase, DBModel):
 
     id: str
     playbook_id: str
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -158,8 +158,8 @@ class PlaybookResponse(PlaybookBase, DBModel):
     created_by: Optional[str] = None
     nodes: list[PlaybookNodeResponse] = []
     edges: list[PlaybookEdgeResponse] = []
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -228,8 +228,8 @@ class PlaybookExecutionResponse(DBModel):
     variables: Optional[dict[str, Any]] = None
     error_message: Optional[str] = None
     triggered_by: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -250,8 +250,8 @@ class PlaybookNodeExecutionResponse(DBModel):
     error_message: Optional[str] = None
     retry_attempt: int
     approved_by: Optional[str] = None
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -294,8 +294,8 @@ class PlaybookTemplateResponse(PlaybookTemplateBase, DBModel):
     id: str
     nodes: list[dict[str, Any]]
     edges: list[dict[str, Any]]
-    created_at: datetime
-    updated_at: datetime
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
