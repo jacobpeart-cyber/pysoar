@@ -6,7 +6,7 @@ queries, anomaly detection, threat predictions, and incident analysis.
 """
 
 from datetime import datetime
-from typing import Any
+from typing import Optional, Any
 
 from src.schemas.base import DBModel
 from pydantic import BaseModel, Field

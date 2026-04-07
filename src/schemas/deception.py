@@ -5,7 +5,7 @@ Request/response models for REST API endpoints.
 """
 
 from datetime import datetime
-from typing import Any
+from typing import Any, Optional
 from uuid import UUID
 
 from src.schemas.base import DBModel
