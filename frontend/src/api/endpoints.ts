@@ -672,9 +672,19 @@ export const darkwebApi = {
     return response.data;
   },
 
-  createMonitor: async (data: { name: string; keyword: string; frequency: string }): Promise<any> => {
-    const response = await api.post('/darkweb/brand-monitors', data);
+  createMonitor: async (data: { name: string; keywords?: string[]; monitor_type?: string; keyword?: string }): Promise<any> => {
+    const response = await api.post('/darkweb/monitors', {
+      name: data.name,
+      keywords: data.keywords || (data.keyword ? [data.keyword] : []),
+      monitor_type: data.monitor_type || 'keyword',
+    });
     return response.data;
+  },
+
+  getMonitors: async (): Promise<any[]> => {
+    const response = await api.get('/darkweb/monitors');
+    const d = response.data;
+    return Array.isArray(d) ? d : (d?.items ?? []);
   },
 
   requestTakedown: async (threatId: string): Promise<any> => {

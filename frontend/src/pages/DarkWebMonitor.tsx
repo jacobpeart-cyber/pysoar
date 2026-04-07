@@ -70,15 +70,18 @@ export default function DarkWebMonitor() {
     const loadData = async () => {
       setLoading(true);
       try {
-        const [alertsData, credentialsData, brandData] = await Promise.all([
-          darkwebApi.getAlerts(),
-          darkwebApi.getCredentialLeaks(),
-          darkwebApi.getBrandMonitors(),
+        const [alertsData, credentialsData, brandData, monitorsData] = await Promise.all([
+          darkwebApi.getAlerts().catch(() => ({ items: [] })),
+          darkwebApi.getCredentialLeaks().catch(() => ({ items: [] })),
+          darkwebApi.getBrandMonitors().catch(() => []),
+          darkwebApi.getMonitors().catch(() => []),
         ]);
-        setMonitors(Array.isArray(brandData) ? brandData : (brandData?.items || []));
-        setFindings(Array.isArray(alertsData) ? alertsData : (alertsData?.items || alertsData?.data || []));
-        setCredentials(Array.isArray(credentialsData) ? credentialsData : (credentialsData?.items || credentialsData?.data || []));
-        setThreats(Array.isArray(brandData) ? brandData : (brandData?.items || []));
+        const alerts: any = alertsData;
+        const creds: any = credentialsData;
+        setMonitors(Array.isArray(monitorsData) ? monitorsData : []);
+        setFindings(Array.isArray(alerts) ? alerts : (alerts?.items || []));
+        setCredentials(Array.isArray(creds) ? creds : (creds?.items || []));
+        setThreats(Array.isArray(brandData) ? brandData : []);
       } catch (error) {
         console.error('Error loading dark web data:', error);
       } finally {
@@ -300,7 +303,7 @@ export default function DarkWebMonitor() {
                       <div className="border-t border-gray-200 dark:border-gray-700 pt-3 mt-3">
                         <p className="text-xs text-gray-600 dark:text-gray-400 mb-2">Affected Assets:</p>
                         <div className="flex flex-wrap gap-2">
-                          {finding.affectedAssets.map((asset, idx) => (
+                          {(finding.affectedAssets || []).map((asset: any, idx: number) => (
                             <span key={idx} className="px-2 py-1 bg-red-100 dark:bg-red-900 text-red-800 dark:text-red-100 rounded text-xs">
                               {asset}
                             </span>
@@ -577,18 +580,14 @@ export default function DarkWebMonitor() {
                 </button>
                 <button
                   onClick={async () => {
+                    if (!newMonitorName.trim()) return;
                     try {
-                      await darkwebApi.getBrandMonitors();
-                      setMonitors(prev => [...prev, {
-                        id: Date.now().toString(),
-                        name: newMonitorName,
-                        keyword: newMonitorKeywords,
-                        status: 'active',
-                        darkWebSources: 0,
-                        findingsCount: 0,
-                        createdDate: new Date().toLocaleDateString(),
-                        lastScan: new Date().toISOString(),
-                      }]);
+                      const created = await darkwebApi.createMonitor({
+                        name: newMonitorName.trim(),
+                        keywords: newMonitorKeywords.split(',').map(k => k.trim()).filter(Boolean),
+                        monitor_type: 'keyword',
+                      });
+                      setMonitors(prev => [...prev, created]);
                       setNewMonitorName('');
                       setNewMonitorKeywords('');
                       setNewMonitorFrequency('Every 6 hours');
