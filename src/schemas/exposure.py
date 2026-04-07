@@ -35,7 +35,7 @@ class ExposureAssetBase(BaseModel):
     software_inventory: list[dict] = Field(default_factory=list, description="Software and versions installed")
     tags: list[str] = Field(default_factory=list)
     network_zone: Optional[str] = Field(None, max_length=100)
-    metadata: dict = Field(default_factory=dict, description="Additional metadata")
+    extra_metadata: dict = Field(default_factory=dict, description="Additional metadata")
 
 
 class ExposureAssetCreate(ExposureAssetBase):
@@ -66,7 +66,7 @@ class ExposureAssetUpdate(BaseModel):
     software_inventory: Optional[list[dict]] = None
     tags: Optional[list[str]] = None
     network_zone: Optional[str] = Field(None, max_length=100)
-    metadata: Optional[dict] = None
+    extra_metadata: Optional[dict] = None
 
 
 class ExposureAssetResponse(ExposureAssetBase, DBModel):
