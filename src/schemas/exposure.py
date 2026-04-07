@@ -74,8 +74,8 @@ class ExposureAssetResponse(ExposureAssetBase, DBModel):
 
     id: str = ""
     is_active: bool = False
-    last_seen: Optional[datetime]
-    last_scan_at: Optional[datetime]
+    last_seen: Optional[datetime] = None
+    last_scan_at: Optional[datetime] = None
     risk_score: float = 0.0
     vulnerability_count: int = 0
     open_ports: list[int] = Field(default_factory=list)

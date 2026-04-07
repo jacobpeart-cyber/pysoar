@@ -54,7 +54,7 @@ class RiskScenarioResponse(RiskScenarioBase, DBModel):
 
     id: str = ""
     status: str = ""
-    review_date: Optional[datetime]
+    review_date: Optional[datetime] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -131,13 +131,13 @@ class FAIRAnalysisResponse(FAIRAnalysisBase, DBModel):
 
     id: str = ""
     organization_id: str = ""
-    ale_mean: Optional[float]
-    ale_p10: Optional[float]
-    ale_p50: Optional[float]
-    ale_p90: Optional[float]
-    ale_p99: Optional[float]
-    loss_exceedance_curve: Optional[dict]
-    completed_at: Optional[datetime]
+    ale_mean: Optional[float] = None
+    ale_p10: Optional[float] = None
+    ale_p50: Optional[float] = None
+    ale_p90: Optional[float] = None
+    ale_p99: Optional[float] = None
+    loss_exceedance_curve: Optional[dict] = None
+    completed_at: Optional[datetime] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -213,8 +213,8 @@ class RiskRegisterResponse(RiskRegisterBase, DBModel):
     id: str = ""
     organization_id: str = ""
     status: str = ""
-    last_review: Optional[datetime]
-    next_review: Optional[datetime]
+    last_review: Optional[datetime] = None
+    next_review: Optional[datetime] = None
     is_within_appetite: bool = False
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
@@ -268,9 +268,9 @@ class RiskControlResponse(RiskControlBase, DBModel):
 
     id: str = ""
     organization_id: str = ""
-    roi_percentage: Optional[float]
-    last_tested: Optional[datetime]
-    test_result: Optional[str]
+    roi_percentage: Optional[float] = None
+    last_tested: Optional[datetime] = None
+    test_result: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
