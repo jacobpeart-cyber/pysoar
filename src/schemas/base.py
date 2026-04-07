@@ -1,63 +1,71 @@
-"""Base schema with JSON string parsing for DB compatibility.
-
-Uses Pydantic's native from_attributes for ORM handling.
-Only adds field-level JSON string parsing via a custom validator.
-"""
+"""Base schema with JSON string parsing and ORM compatibility."""
 
 import json
-from typing import Any, List, Optional
+from typing import Any
 
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, model_validator
 
 
 class DBModel(BaseModel):
-    """Response model base that handles JSON strings from DB columns.
-
-    Uses Pydantic's native from_attributes for ORM object conversion.
-    Only intervenes to parse JSON string values like '[]' and '{}'.
-    Does NOT convert ORM objects to dicts manually.
-    """
+    """Response model base that handles ORM objects with JSON string fields
+    and None values for fields that have defaults."""
 
     model_config = {"from_attributes": True}
 
     @model_validator(mode="wrap")
     @classmethod
     def _handle_orm_and_json(cls, data: Any, handler: Any) -> Any:
-        """Wrap the default validator to catch and fix JSON string issues."""
         try:
             return handler(data)
         except Exception:
-            # If default validation fails (likely JSON string fields),
-            # convert to dict manually and parse JSON strings
-            if hasattr(data, "__dict__") and not isinstance(data, dict):
-                raw = {}
-                for key in cls.model_fields:
-                    try:
-                        val = getattr(data, key, None)
-                        # Parse JSON strings
-                        if isinstance(val, str) and len(val) >= 2 and val[0] in ('[', '{'):
-                            try:
-                                val = json.loads(val)
-                            except (json.JSONDecodeError, ValueError):
-                                pass
-                        # Convert non-serializable objects to None
-                        if val is not None and not isinstance(val, (str, int, float, bool, list, dict, tuple)):
-                            try:
-                                json.dumps(val, default=str)
-                            except (TypeError, ValueError):
-                                val = None
-                        raw[key] = val
-                    except Exception:
-                        pass
+            pass
+
+        # Convert ORM to dict, use field defaults for None values
+        if hasattr(data, "__dict__") and not isinstance(data, dict):
+            raw = {}
+            for field_name, field_info in cls.model_fields.items():
                 try:
-                    return handler(raw)
+                    val = getattr(data, field_name, None)
                 except Exception:
-                    # Last resort: fill missing required fields with defaults
-                    for field_name, field_info in cls.model_fields.items():
-                        if field_name not in raw:
-                            if field_info.default is not None:
-                                raw[field_name] = field_info.default
-                            elif field_info.is_required():
-                                raw[field_name] = None
-                    return handler(raw)
-            raise
+                    val = None
+
+                # Use field default when ORM returns None
+                if val is None:
+                    if field_info.default is not None:
+                        raw[field_name] = field_info.default
+                    elif not field_info.is_required():
+                        raw[field_name] = None
+                    else:
+                        raw[field_name] = None
+                    continue
+
+                # Parse JSON strings
+                if isinstance(val, str) and len(val) >= 2 and val[0] in ('[', '{'):
+                    try:
+                        val = json.loads(val)
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+
+                # Handle non-serializable objects
+                if not isinstance(val, (str, int, float, bool, list, dict, tuple, type(None))):
+                    try:
+                        json.dumps(val, default=str)
+                    except (TypeError, ValueError):
+                        val = str(val) if val is not None else None
+
+                raw[field_name] = val
+
+            return handler(raw)
+
+        # Dict input — just parse JSON strings
+        if isinstance(data, dict):
+            for key in list(data.keys()):
+                val = data[key]
+                if isinstance(val, str) and len(val) >= 2 and val[0] in ('[', '{'):
+                    try:
+                        data[key] = json.loads(val)
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+            return handler(data)
+
+        raise ValueError(f"Cannot validate {type(data)}")
