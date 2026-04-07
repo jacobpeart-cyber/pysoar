@@ -66,6 +66,14 @@ import {
   PhishingResult,
 } from './types';
 
+// Auto-extract items from paginated responses
+function extractData(data: any): any {
+  if (data && typeof data === 'object' && !Array.isArray(data) && 'items' in data) {
+    return data.items;
+  }
+  return data;
+}
+
 // Alerts
 export const alertsApi = {
   getAlerts: async (params?: {
@@ -142,7 +150,7 @@ export const siemApi = {
 
   getSIEMRules: async (): Promise<SIEMRule[]> => {
     const response = await api.get('/siem/rules');
-    return response.data;
+    return extractData(response.data);
   },
 
   createRule: async (data: {
@@ -165,7 +173,7 @@ export const siemApi = {
 export const threatIntelApi = {
   getFeeds: async (): Promise<ThreatIntelFeed[]> => {
     const response = await api.get('/threat-intel/feeds');
-    return response.data;
+    return extractData(response.data);
   },
 
   getIndicators: async (params?: {
@@ -275,7 +283,7 @@ export const uebaApi = {
 
   getRiskScores: async (): Promise<RiskScore[]> => {
     const response = await api.get('/ueba/risk-scores');
-    return response.data;
+    return extractData(response.data);
   },
 
   getAnomalies: async (params?: {
@@ -320,12 +328,12 @@ export const simulationApi = {
 export const deceptionApi = {
   getHoneypots: async (): Promise<Honeypot[]> => {
     const response = await api.get('/deception/honeypots');
-    return response.data;
+    return extractData(response.data);
   },
 
   getHoneytokens: async (): Promise<Honeytoken[]> => {
     const response = await api.get('/deception/honeytokens');
-    return response.data;
+    return extractData(response.data);
   },
 
   getDeceptionAlerts: async (params?: {
@@ -341,7 +349,7 @@ export const deceptionApi = {
 export const remediationApi = {
   getPolicies: async (): Promise<RemediationPolicy[]> => {
     const response = await api.get('/remediation/policies');
-    return response.data;
+    return extractData(response.data);
   },
 
   getActions: async (params?: {
@@ -368,7 +376,7 @@ export const remediationApi = {
 export const complianceApi = {
   getFrameworks: async (): Promise<ComplianceFramework[]> => {
     const response = await api.get('/compliance/frameworks');
-    return response.data;
+    return extractData(response.data);
   },
 
   getControls: async (frameworkId: string, params?: {
@@ -399,7 +407,7 @@ export const complianceApi = {
 export const zerotrustApi = {
   getPolicies: async (): Promise<ZeroTrustPolicy[]> => {
     const response = await api.get('/zerotrust/policies');
-    return response.data;
+    return extractData(response.data);
   },
 
   getDeviceTrust: async (params?: {
@@ -423,7 +431,7 @@ export const zerotrustApi = {
 export const stigApi = {
   getBenchmarks: async (): Promise<STIGBenchmark[]> => {
     const response = await api.get('/stig/benchmarks');
-    return response.data;
+    return extractData(response.data);
   },
 
   runScan: async (benchmarkId: string): Promise<{ task_id: string }> => {
@@ -556,7 +564,7 @@ export const itdrApi = {
 
   getCredentialMonitors: async (): Promise<CredentialMonitor[]> => {
     const response = await api.get('/itdr/credential-monitors');
-    return response.data;
+    return extractData(response.data);
   },
 
   getIdentities: async (params?: {
@@ -660,7 +668,7 @@ export const darkwebApi = {
 
   getBrandMonitors: async (): Promise<{ brand_name: string; mentions: number; alerts: DarkWebAlert[] }[]> => {
     const response = await api.get('/darkweb/brand-monitors');
-    return response.data;
+    return extractData(response.data);
   },
 
   deleteMonitor: async (monitorId: string): Promise<void> => {
@@ -737,7 +745,7 @@ export const integrationsApi = {
 export const agenticApi = {
   getAgents: async (): Promise<Agent[]> => {
     const response = await api.get('/agentic/agents');
-    return response.data;
+    return extractData(response.data);
   },
 
   getInvestigations: async (params?: {
@@ -782,7 +790,7 @@ export const playbookApi = {
 
   getNodes: async (playbookId: string): Promise<PlaybookNode[]> => {
     const response = await api.get(`/playbooks/${playbookId}/nodes`);
-    return response.data;
+    return extractData(response.data);
   },
 
   executePlaybook: async (playbookId: string, input_data?: Record<string, any>): Promise<{ execution_id: string }> => {
@@ -795,7 +803,7 @@ export const playbookApi = {
 export const dlpApi = {
   getPolicies: async (): Promise<DLPPolicy[]> => {
     const response = await api.get('/dlp/policies');
-    return response.data;
+    return extractData(response.data);
   },
 
   getIncidents: async (params?: {
@@ -809,7 +817,7 @@ export const dlpApi = {
 
   getClassifications: async (): Promise<string[]> => {
     const response = await api.get('/dlp/classifications');
-    return response.data;
+    return extractData(response.data);
   },
 };
 
@@ -858,7 +866,7 @@ export const otsecurityApi = {
 
   getZones: async (): Promise<OTZone[]> => {
     const response = await api.get('/ot_security/zones');
-    return response.data;
+    return extractData(response.data);
   },
 
   getPurdueMap: async (): Promise<any> => {
@@ -1002,22 +1010,22 @@ export const threatmodelApi = {
 
   getAttackTrees: async (modelId: string): Promise<AttackTree[]> => {
     const response = await api.get(`/threatmodel/models/${modelId}/attack-trees`);
-    return response.data;
+    return extractData(response.data);
   },
 
   getMitigations: async (modelId: string): Promise<any[]> => {
     const response = await api.get(`/threatmodel/models/${modelId}/mitigations`);
-    return response.data;
+    return extractData(response.data);
   },
 
   getSTRIDEAnalysis: async (): Promise<any[]> => {
     const response = await api.get('/threat-modeling/stride');
-    return response.data;
+    return extractData(response.data);
   },
 
   getThreats: async (): Promise<any[]> => {
     const response = await api.get('/threat-modeling/threats');
-    return response.data;
+    return extractData(response.data);
   },
 
   createModel: async (data: any): Promise<any> => {
@@ -1092,7 +1100,7 @@ export const datalakeApi = {
 
   getCatalog: async (): Promise<any[]> => {
     const response = await api.get('/data-lake/catalog');
-    return response.data;
+    return extractData(response.data);
   },
 
   createDataSource: async (data: { name: string; connection_string: string }): Promise<any> => {
@@ -1131,7 +1139,7 @@ export const collaborationApi = {
 
   getActionItems: async (warRoomId: string): Promise<ActionItem[]> => {
     const response = await api.get(`/collaboration/rooms/${warRoomId}/action-items`);
-    return response.data;
+    return extractData(response.data);
   },
 
   createActionItem: async (data: { title: string; priority: string }): Promise<any> => {
@@ -1185,17 +1193,17 @@ export const phishingApi = {
 
   getAwarenessScores: async (): Promise<{ user_email: string; awareness_score: number }[]> => {
     const response = await api.get('/phishing_sim/awareness-scores');
-    return response.data;
+    return extractData(response.data);
   },
 
   getTemplates: async (): Promise<any[]> => {
     const response = await api.get('/phishing_sim/templates');
-    return response.data;
+    return extractData(response.data);
   },
 
   getTargetGroups: async (): Promise<any[]> => {
     const response = await api.get('/phishing_sim/target-groups');
-    return response.data;
+    return extractData(response.data);
   },
 
   launchCampaign: async (groupId: string): Promise<any> => {
