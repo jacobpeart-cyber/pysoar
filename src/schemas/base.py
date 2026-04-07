@@ -7,7 +7,11 @@ from pydantic import BaseModel, model_validator
 
 
 class DBModel(BaseModel):
-    """Base model that auto-parses JSON string fields from ORM objects."""
+    """Base model that auto-parses JSON string fields from ORM objects.
+
+    Converts ORM objects to dicts, parses JSON strings like '[]' and '{}',
+    and includes all field values (even None) so required fields don't fail.
+    """
 
     @model_validator(mode="before")
     @classmethod
@@ -18,25 +22,24 @@ class DBModel(BaseModel):
             for key in cls.model_fields:
                 try:
                     val = getattr(data, key, None)
-                    # Ensure we never store exception objects as values
                     if isinstance(val, Exception):
-                        continue
-                    if val is not None:
+                        raw[key] = None
+                    else:
                         raw[key] = val
                 except Exception:
-                    continue
+                    raw[key] = None
             data = raw
 
         if isinstance(data, dict):
-            for key, value in list(data.items()):
+            for key in list(data.keys()):
+                value = data[key]
                 if isinstance(value, str) and len(value) >= 2 and value[0] in ('[', '{'):
                     try:
                         data[key] = json.loads(value)
                     except (json.JSONDecodeError, ValueError, TypeError):
                         pass
-                # Safety: never allow exception objects in values
-                if isinstance(data[key], Exception):
-                    del data[key]
+                if isinstance(value, Exception):
+                    data[key] = None
 
         return data
 

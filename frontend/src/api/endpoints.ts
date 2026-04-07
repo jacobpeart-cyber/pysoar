@@ -1095,12 +1095,12 @@ export const collaborationApi = {
     page?: number;
     size?: number;
   }): Promise<PaginatedResponse<WarRoom>> => {
-    const response = await api.get('/collaboration/warrooms', { params });
+    const response = await api.get('/collaboration/rooms', { params });
     return response.data;
   },
 
   createWarRoom: async (data: { title: string; description?: string }): Promise<WarRoom> => {
-    const response = await api.post('/collaboration/warrooms', data);
+    const response = await api.post('/collaboration/rooms', data);
     return response.data;
   },
 
@@ -1108,12 +1108,12 @@ export const collaborationApi = {
     page?: number;
     size?: number;
   }): Promise<PaginatedResponse<WarRoomMessage>> => {
-    const response = await api.get(`/collaboration/warrooms/${warRoomId}/messages`, { params });
+    const response = await api.get(`/collaboration/rooms/${warRoomId}/messages`, { params });
     return response.data;
   },
 
   getActionItems: async (warRoomId: string): Promise<ActionItem[]> => {
-    const response = await api.get(`/collaboration/warrooms/${warRoomId}/action-items`);
+    const response = await api.get(`/collaboration/rooms/${warRoomId}/action-items`);
     return response.data;
   },
 
@@ -1123,12 +1123,12 @@ export const collaborationApi = {
   },
 
   sendMessage: async (warRoomId: string, data: { text: string }): Promise<any> => {
-    const response = await api.post(`/collaboration/warrooms/${warRoomId}/messages`, data);
+    const response = await api.post(`/collaboration/rooms/${warRoomId}/messages`, data);
     return response.data;
   },
 
   closeWarRoom: async (warRoomId: string): Promise<any> => {
-    const response = await api.post(`/collaboration/warrooms/${warRoomId}/close`);
+    const response = await api.post(`/collaboration/rooms/${warRoomId}/close`);
     return response.data;
   },
 };
