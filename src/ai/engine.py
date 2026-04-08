@@ -444,8 +444,8 @@ class AIAnalyzer:
     """
 
     # Gemini API configuration
-    GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyDmwl7YE-xvboorsujYxgevE2lFq3UAp9I")
-    GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+    GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+    GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
 
     def __init__(self, provider: str = "gemini"):
         """
@@ -454,7 +454,7 @@ class AIAnalyzer:
         self.logger = get_logger(__name__)
         self.provider = provider
         self.model_map = {
-            "gemini": "gemini-2.0-flash",
+            "gemini": "gemini-2.5-flash",
             "openai": "gpt-4",
             "claude": "claude-3-opus",
         }
