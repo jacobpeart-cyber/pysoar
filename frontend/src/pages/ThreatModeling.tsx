@@ -345,13 +345,18 @@ export default function ThreatModeling() {
             Models List
           </button>
           <button
-            disabled={!selectedModelId}
-            onClick={() => setActiveTab('detail')}
+            onClick={() => {
+              if (!selectedModelId && models.length > 0) {
+                openModel(models[0].id);
+              } else if (selectedModelId) {
+                setActiveTab('detail');
+              }
+            }}
             className={`pb-3 px-2 text-sm font-medium border-b-2 transition-colors ${
               activeTab === 'detail'
                 ? 'border-red-400 text-red-400'
                 : 'border-transparent text-gray-400 hover:text-white'
-            } ${!selectedModelId ? 'opacity-40 cursor-not-allowed' : ''}`}
+            } ${!selectedModelId && models.length === 0 ? 'opacity-40 cursor-not-allowed' : ''}`}
           >
             Model Detail
           </button>
@@ -385,7 +390,7 @@ export default function ThreatModeling() {
                 </thead>
                 <tbody>
                   {models.map((m) => (
-                    <tr key={m.id} className="border-t border-gray-700 hover:bg-gray-700/30">
+                    <tr key={m.id} className="border-t border-gray-700 hover:bg-gray-700/30 cursor-pointer" onClick={() => openModel(m.id)}>
                       <td className="px-4 py-3 text-sm font-medium text-white">{m.name ?? '-'}</td>
                       <td className="px-4 py-3 text-sm text-gray-300">{m.application_name ?? '-'}</td>
                       <td className="px-4 py-3 text-sm text-gray-300">{capitalize(m.methodology)}</td>
