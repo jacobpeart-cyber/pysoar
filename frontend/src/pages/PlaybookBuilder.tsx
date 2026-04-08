@@ -186,17 +186,21 @@ export default function PlaybookBuilder() {
           </div>
           <button
             disabled={actionLoading === 'create'}
-            onClick={async () => {
-              setActionLoading('create');
-              try {
-                const res = await api.post('/playbook-builder', { name: 'New Playbook', description: '', status: 'draft' });
-                setPlaybooks((prev) => [...prev, res.data]);
-                setNotification({ type: 'success', text: 'Playbook created' });
-              } catch (err) {
-                setNotification({ type: 'error', text: 'Failed to create playbook' });
-              } finally {
-                setActionLoading(null);
-              }
+            onClick={() => {
+              const name = window.prompt('Playbook name:');
+              if (!name?.trim()) return;
+              (async () => {
+                setActionLoading('create');
+                try {
+                  const res = await api.post('/playbook-builder', { name: name.trim(), description: '', status: 'draft' });
+                  setPlaybooks((prev) => [...prev, res.data]);
+                  setNotification({ type: 'success', text: 'Playbook created' });
+                } catch (err) {
+                  setNotification({ type: 'error', text: 'Failed to create playbook' });
+                } finally {
+                  setActionLoading(null);
+                }
+              })();
             }}
             className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg transition disabled:opacity-50"
           >
@@ -317,9 +321,11 @@ export default function PlaybookBuilder() {
                     <button
                       disabled={actionLoading === 'create-first'}
                       onClick={async () => {
+                        const pbName = window.prompt('Playbook name:');
+                        if (!pbName?.trim()) return;
                         setActionLoading('create-first');
                         try {
-                          const res = await api.post('/playbook-builder', { name: 'New Playbook', description: '', status: 'draft' });
+                          const res = await api.post('/playbook-builder', { name: pbName.trim(), description: '', status: 'draft' });
                           setPlaybooks((prev) => [...prev, res.data]);
                           setNotification({ type: 'success', text: 'Playbook created' });
                         } catch (err) {
