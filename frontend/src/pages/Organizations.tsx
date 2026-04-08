@@ -485,7 +485,11 @@ function CreateModal({
       if (type === 'organization') {
         await api.post('/organizations', { name, slug, description, plan });
       } else {
-        await api.post('/teams', { name, description });
+        // Get first org ID for the team
+        const orgsRes = await api.get('/organizations');
+        const orgs = Array.isArray(orgsRes.data) ? orgsRes.data : (orgsRes.data?.items || orgsRes.data || []);
+        const orgId = orgs[0]?.id || '';
+        await api.post('/teams', { name, description, organization_id: orgId });
       }
     },
     onSuccess: () => {
