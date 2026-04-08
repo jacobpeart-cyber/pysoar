@@ -81,13 +81,13 @@ class TeamUpdate(BaseModel):
 
 
 class TeamResponse(BaseModel):
-    id: str
-    name: str
-    description: Optional[str]
-    organization_id: str
-    is_default: bool
+    id: str = ""
+    name: str = ""
+    description: Optional[str] = None
+    organization_id: str = ""
+    is_default: bool = False
     member_count: int = 0
-    created_at: str
+    created_at: Optional[Any] = None
 
     class Config:
         from_attributes = True
