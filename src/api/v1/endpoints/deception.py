@@ -143,6 +143,7 @@ async def deploy_decoy(
         data["deployed_by"] = data.get("deployed_by") or user_id
         data["deployed_at"] = datetime.utcnow()
         data["status"] = "active"
+        data["organization_id"] = getattr(current_user, 'organization_id', None) or data.get("organization_id")
 
         decoy = Decoy(**data)
         db.add(decoy)
