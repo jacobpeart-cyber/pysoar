@@ -190,8 +190,8 @@ class IdentityThreat(BaseModel):
     __tablename__ = "identity_threats"
 
     organization_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
-    identity_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("identity_profiles.id"), nullable=False, index=True
+    identity_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("identity_profiles.id"), nullable=True, index=True
     )
 
     # Threat classification
