@@ -754,7 +754,7 @@ export default function DeceptionTech() {
                   onClick={async () => {
                     setModalError(null);
                     try {
-                      await api.post('/deception/tokens', { token_type: tokenType, organization_id: 'default' });
+                      await api.post('/deception/tokens', { name: tokenName, token_type: tokenType });
                       setShowGenerateTokenModal(false);
                       setShowGenerateTokenModal(false);
                       setTokenName(''); setTokenType('aws_key');
