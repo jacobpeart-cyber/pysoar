@@ -353,9 +353,13 @@ async def create_threat(
     db: DatabaseSession = None,
 ):
     """Create new identity threat"""
+    threat_data = data.dict()
+    # Convert empty identity_id to None to avoid FK violation
+    if not threat_data.get("identity_id"):
+        threat_data["identity_id"] = None
     threat = IdentityThreat(
         organization_id=getattr(current_user, "organization_id", None),
-        **data.dict()
+        **threat_data
     )
     db.add(threat)
     await db.commit()
