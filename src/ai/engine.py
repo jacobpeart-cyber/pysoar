@@ -940,30 +940,17 @@ class NaturalLanguageQueryEngine:
         if not results:
             return "No results found for your query."
 
-        # Use Gemini for intelligent summarization
         try:
-            import httpx
-            prompt = f"""You are a SOC analyst assistant. The user asked: "{query}"
-
-Here are the results ({len(results)} items, showing first 5):
-{json.dumps(results[:5], indent=2, default=str)[:2000]}
-
-Provide a brief, actionable summary in 2-3 sentences. Focus on what matters for security operations."""
-
-            response = httpx.post(
-                f"{AIAnalyzer.GEMINI_URL}?key={AIAnalyzer.GEMINI_API_KEY}",
-                json={
-                    "contents": [{"parts": [{"text": prompt}]}],
-                    "generationConfig": {"temperature": 0.3, "maxOutputTokens": 300},
-                },
-                timeout=15.0,
+            analyzer = AIAnalyzer()
+            summary = analyzer._call_llm(
+                system_prompt="You are a SOC analyst assistant. Summarize security query results in 2-3 actionable sentences.",
+                user_prompt=f'User asked: "{query}"\n\nResults ({len(results)} items, first 5):\n{json.dumps(results[:5], indent=2, default=str)[:2000]}',
+                structured_output=False,
             )
-            response.raise_for_status()
-            text = response.json()["candidates"][0]["content"]["parts"][0]["text"]
-            return text.strip()
+            return str(summary).strip() if summary else f"Found {len(results)} results matching your query about '{query}'."
         except Exception as e:
             self.logger.warning(f"Gemini summarization failed: {e}")
-            return f"Found {len(results)} matching items for your query."
+            return f"Found {len(results)} results matching your query about '{query}'."
 
 
 class ThreatPredictor:
