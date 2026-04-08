@@ -532,17 +532,55 @@ export default function DataLakeDashboard() {
                 e.preventDefault();
                 const fd = new FormData(e.currentTarget);
                 try {
-                  await api.post('/data-lake/sources', { name: fd.get('name'), connection_string: fd.get('conn') });
+                  await api.post('/data-lake/sources', {
+                    name: fd.get('name'),
+                    source_type: fd.get('source_type'),
+                    ingestion_type: fd.get('ingestion_type'),
+                    format: fd.get('format'),
+                    connection_config: { connection_string: fd.get('conn') || '' },
+                  });
                   setShowModal(false);
+                  window.location.reload();
                 } catch (err) { console.error('Failed to add source:', err); }
               }}>
                 <div>
                   <label className="block text-sm font-medium text-gray-300 mb-2">Source Name</label>
                   <input name="name" required type="text" className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white placeholder-gray-500" placeholder="e.g., Customer Events" />
                 </div>
+                <div className="grid grid-cols-3 gap-3">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-300 mb-2">Type</label>
+                    <select name="source_type" required className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white">
+                      <option value="syslog">Syslog</option>
+                      <option value="api">API</option>
+                      <option value="database">Database</option>
+                      <option value="file">File</option>
+                      <option value="cloud">Cloud</option>
+                      <option value="stream">Stream</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-300 mb-2">Ingestion</label>
+                    <select name="ingestion_type" required className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white">
+                      <option value="batch">Batch</option>
+                      <option value="streaming">Streaming</option>
+                      <option value="polling">Polling</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-300 mb-2">Format</label>
+                    <select name="format" required className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white">
+                      <option value="json">JSON</option>
+                      <option value="csv">CSV</option>
+                      <option value="syslog">Syslog</option>
+                      <option value="cef">CEF</option>
+                      <option value="parquet">Parquet</option>
+                    </select>
+                  </div>
+                </div>
                 <div>
                   <label className="block text-sm font-medium text-gray-300 mb-2">Connection String</label>
-                  <input name="conn" type="text" className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white placeholder-gray-500" placeholder="Connection details" />
+                  <input name="conn" type="text" className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white placeholder-gray-500" placeholder="e.g., postgresql://host/db or https://api.example.com" />
                 </div>
                 <div className="flex gap-4 mt-6">
                   <button type="button" onClick={() => setShowModal(false)} className="flex-1 bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded transition-colors">Cancel</button>
