@@ -900,12 +900,12 @@ async def create_campaign(
             name=request.name,
             description=request.description,
             objective=request.objective,
-            coverage_zones=request.coverage_zones,
+            coverage_zones=request.coverage_zones or [],
             decoy_ids=[],
             status="active",
-            started_at=datetime.now(timezone.utc),
-            created_by=request.created_by or (str(getattr(current_user, 'id', '')) if current_user else ''),
-            organization_id=request.organization_id,
+            started_at=datetime.utcnow(),
+            created_by=str(current_user.id) if current_user else None,
+            organization_id=getattr(current_user, 'organization_id', None) or request.organization_id,
         )
 
         db.add(campaign)
