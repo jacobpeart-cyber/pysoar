@@ -854,6 +854,7 @@ function SegmentationTab({
   segments: Segment[];
   loading: boolean;
 }) {
+  const queryClient = useQueryClient();
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
@@ -865,7 +866,17 @@ function SegmentationTab({
   return (
     <div className="space-y-6">
       {/* Create Segment Button */}
-      <button className="inline-flex items-center gap-2 px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium">
+      <button
+        onClick={async () => {
+          const name = window.prompt('Segment name:');
+          if (!name?.trim()) return;
+          try {
+            await api.post('/zerotrust/segments', { name: name.trim(), segment_type: 'workload', description: '' });
+            queryClient.invalidateQueries({ queryKey: ['zerotrust-segments'] });
+          } catch (err) { console.error('Create segment failed:', err); }
+        }}
+        className="inline-flex items-center gap-2 px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium"
+      >
         <Plus className="w-5 h-5" />
         Create Segment
       </button>
@@ -938,6 +949,7 @@ function PoliciesTab({
   policies: Policy[];
   loading: boolean;
 }) {
+  const queryClient = useQueryClient();
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
@@ -949,7 +961,17 @@ function PoliciesTab({
   return (
     <div className="space-y-6">
       {/* Create Policy Button */}
-      <button className="inline-flex items-center gap-2 px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium">
+      <button
+        onClick={async () => {
+          const name = window.prompt('Policy name:');
+          if (!name?.trim()) return;
+          try {
+            await api.post('/zerotrust/policies', { name: name.trim(), description: '', policy_type: 'access', enforcement: 'block' });
+            queryClient.invalidateQueries({ queryKey: ['zerotrust-policies'] });
+          } catch (err) { console.error('Create policy failed:', err); }
+        }}
+        className="inline-flex items-center gap-2 px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium"
+      >
         <Plus className="w-5 h-5" />
         Create Policy
       </button>
