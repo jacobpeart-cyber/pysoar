@@ -1080,17 +1080,17 @@ export const datalakeApi = {
   getDataSources: async (params?: {
     page?: number;
     size?: number;
-  }): Promise<PaginatedResponse<DataSource>> => {
+  }): Promise<any[]> => {
     const response = await api.get('/data-lake/sources', { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   getPipelines: async (params?: {
     page?: number;
     size?: number;
-  }): Promise<PaginatedResponse<DataLakePipeline>> => {
+  }): Promise<any[]> => {
     const response = await api.get('/data-lake/pipelines', { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   runQuery: async (query: string): Promise<any> => {
