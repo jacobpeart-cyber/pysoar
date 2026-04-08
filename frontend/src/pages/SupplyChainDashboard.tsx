@@ -16,6 +16,7 @@ import {
   Trash2,
 } from 'lucide-react';
 import clsx from 'clsx';
+import { api } from '../lib/api';
 import { supplychainApi } from '../api/endpoints';
 
 
@@ -62,25 +63,27 @@ export default function SupplyChainDashboard() {
   const [selectedVendor, setSelectedVendor] = useState<any | null>(null);
   const [showFilter, setShowFilter] = useState(false);
 
+  const loadData = async () => {
+    setLoading(true);
+    try {
+      const [sbomData, vendorData, riskData, compData] = await Promise.all([
+        supplychainApi.getSBOMs(),
+        supplychainApi.getVendorAssessments(),
+        supplychainApi.getSupplyChainRisks(),
+        api.get('/supplychain/components').then(r => Array.isArray(r.data) ? r.data : (r.data?.items || [])).catch(() => []),
+      ]);
+      setSBOMs(Array.isArray(sbomData) ? sbomData : (sbomData?.items || []));
+      setComponents(compData);
+      setVendors(Array.isArray(vendorData) ? vendorData : (vendorData?.items || []));
+      setRisks(Array.isArray(riskData) ? riskData : (riskData?.findings || []));
+    } catch (error) {
+      console.error('Error loading supply chain data:', error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   React.useEffect(() => {
-    const loadData = async () => {
-      setLoading(true);
-      try {
-        const [sbomData, vendorData, riskData] = await Promise.all([
-          supplychainApi.getSBOMs(),
-          supplychainApi.getVendorAssessments(),
-          supplychainApi.getSupplyChainRisks(),
-        ]);
-        setSBOMs(Array.isArray(sbomData) ? sbomData : (sbomData?.items || sbomData?.data || []));
-        setComponents([]);
-        setVendors(Array.isArray(vendorData) ? vendorData : (vendorData?.items || vendorData?.data || []));
-        setRisks(Array.isArray(riskData) ? riskData : (riskData?.items || riskData?.findings || []));
-      } catch (error) {
-        console.error('Error loading supply chain data:', error);
-      } finally {
-        setLoading(false);
-      }
-    };
     loadData();
   }, []);
 
@@ -235,7 +238,8 @@ export default function SupplyChainDashboard() {
                           onClick={async () => {
                             try {
                               const res = await supplychainApi.getSBOMs();
-                              const blob = new Blob([JSON.stringify(res.data?.find((s: any) => s.id === sbom.id) || sbom, null, 2)], { type: 'application/json' });
+                              const items = Array.isArray(res) ? res : (res as any)?.items || [];
+                              const blob = new Blob([JSON.stringify(items.find((s: any) => s.id === sbom.id) || sbom, null, 2)], { type: 'application/json' });
                               const url = URL.createObjectURL(blob);
                               const a = document.createElement('a');
                               a.href = url;
@@ -435,7 +439,7 @@ export default function SupplyChainDashboard() {
                           <p className="text-sm font-medium mb-2">Certifications</p>
                           <div className="flex flex-wrap gap-2">
                             {vendor.certifications.length > 0 ? (
-                              vendor.certifications.map((cert, idx) => (
+                              vendor.certifications.map((cert: any, idx: number) => (
                                 <span key={idx} className="px-2 py-1 bg-blue-100 dark:bg-blue-900 text-blue-800 dark:text-blue-100 rounded text-xs">
                                   {cert}
                                 </span>
