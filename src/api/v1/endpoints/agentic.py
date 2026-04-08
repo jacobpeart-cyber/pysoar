@@ -644,22 +644,36 @@ async def chat_with_agent(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Chat with SOC agent in natural language"""
-    nl_interface = NaturalLanguageInterface(db)
+    """Chat with SOC agent in natural language, powered by Gemini AI."""
+    from src.ai.engine import AIAnalyzer
 
-    request = await nl_interface.process_query(
-        query=query_data.query,
-        agent_id=query_data.agent_id or "",
-        organization_id=getattr(current_user, "organization_id", None) or "",
-    )
-
-    response_text = f"I analyzed your query: {request['intent']}. Checking {request['entity']} over {request['time_range']}."
+    # Use Gemini for intelligent response
+    analyzer = AIAnalyzer()
+    try:
+        ai_response = analyzer._call_llm(
+            system_prompt="""You are an expert SOC analyst assistant for PySOAR, a Security Orchestration platform.
+Answer security operations questions concisely. If asked about alerts, incidents, threats, or security events,
+provide actionable guidance. Keep responses under 3 sentences.""",
+            user_prompt=query_data.query,
+            structured_output=False,
+        )
+        response_text = str(ai_response)
+    except Exception as e:
+        logger.warning(f"Gemini chat failed: {e}")
+        # Fallback to basic NL processing
+        nl_interface = NaturalLanguageInterface(db)
+        request = await nl_interface.process_query(
+            query=query_data.query,
+            agent_id=query_data.agent_id or "",
+            organization_id=getattr(current_user, "organization_id", None) or "",
+        )
+        response_text = f"I analyzed your query: {request.get('intent', 'general')}. {request.get('entity', '')} — checking over {request.get('time_range', '24h')}."
 
     return NaturalLanguageResponse(
         response=response_text,
         agent_id=query_data.agent_id or "auto",
         agent_name="SOC Agent",
-        interpretation=request,
+        interpretation={},
     )
 
 
