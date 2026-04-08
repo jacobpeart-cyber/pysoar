@@ -16,6 +16,7 @@ import {
 } from 'lucide-react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, PieChart, Pie, Cell, LineChart, Line } from 'recharts';
 import clsx from 'clsx';
+import { api } from '../lib/api';
 import { datalakeApi } from '../api/endpoints';
 
 
