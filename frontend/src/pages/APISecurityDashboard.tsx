@@ -527,8 +527,16 @@ export default function APISecurityDashboard() {
                 e.preventDefault();
                 const fd = new FormData(e.currentTarget);
                 try {
-                  await api.post('/api-security/endpoints', { name: fd.get('name'), api_type: fd.get('type') });
+                  await api.post('/api-security/endpoints', {
+                    name: fd.get('name'),
+                    service_name: fd.get('service_name') || fd.get('name'),
+                    base_url: fd.get('base_url'),
+                    api_type: (fd.get('type') as string || 'rest').toLowerCase(),
+                    method: fd.get('method') || 'GET',
+                    path: fd.get('path') || '/',
+                  });
                   setShowModal(false);
+                  window.location.reload();
                 } catch (err) { console.error('Failed to register API:', err); }
               }}>
                 <div>
@@ -536,13 +544,36 @@ export default function APISecurityDashboard() {
                   <input name="name" required type="text" className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white placeholder-gray-500" placeholder="e.g., Payment Service" />
                 </div>
                 <div>
-                  <label className="block text-sm font-medium text-gray-300 mb-2">API Type</label>
-                  <select name="type" className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white">
-                    <option>REST</option>
-                    <option>GraphQL</option>
-                    <option>gRPC</option>
-                    <option>SOAP</option>
-                  </select>
+                  <label className="block text-sm font-medium text-gray-300 mb-2">Service Name</label>
+                  <input name="service_name" required type="text" className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white placeholder-gray-500" placeholder="e.g., payment-service" />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-300 mb-2">Base URL</label>
+                  <input name="base_url" required type="text" className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white placeholder-gray-500" placeholder="e.g., https://api.example.com" />
+                </div>
+                <div className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-300 mb-2">API Type</label>
+                    <select name="type" className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white">
+                      <option value="rest">REST</option>
+                      <option value="graphql">GraphQL</option>
+                      <option value="grpc">gRPC</option>
+                      <option value="soap">SOAP</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-300 mb-2">Method</label>
+                    <select name="method" className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white">
+                      <option value="GET">GET</option>
+                      <option value="POST">POST</option>
+                      <option value="PUT">PUT</option>
+                      <option value="DELETE">DELETE</option>
+                    </select>
+                  </div>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-300 mb-2">Path</label>
+                  <input name="path" type="text" className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white placeholder-gray-500" placeholder="e.g., /api/v1/payments" />
                 </div>
                 <div className="flex gap-4 mt-6">
                   <button type="button" onClick={() => setShowModal(false)} className="flex-1 bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded transition-colors">Cancel</button>
