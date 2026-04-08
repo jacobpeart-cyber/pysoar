@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useCallback } from 'react';
 import {
   Bug,
   Shield,
@@ -14,6 +14,7 @@ import {
   Download,
 } from 'lucide-react';
 import clsx from 'clsx';
+import { api } from '../lib/api';
 import { vulnmgmtApi } from '../api/endpoints';
 
 const getSeverityColor = (severity: string) => {
@@ -66,24 +67,25 @@ export default function VulnManagement() {
   const [showFilterPanel, setShowFilterPanel] = useState(false);
   const [remediatingVuln, setRemediatingVuln] = useState<any | null>(null);
 
+  const loadData = async () => {
+    setLoading(true);
+    try {
+      const [vulnsData, patchData] = await Promise.all([
+        vulnmgmtApi.getVulnerabilities(),
+        vulnmgmtApi.getPatchOperations(),
+      ]);
+      setVulnerabilities(Array.isArray(vulnsData) ? vulnsData : (vulnsData?.items || []));
+      setScanProfiles([]);
+      setPatchOps(Array.isArray(patchData) ? patchData : (patchData?.items || []));
+      setExceptions([]);
+    } catch (error) {
+      console.error('Error loading vulnerability data:', error);
+    } finally {
+      setLoading(false);
+    }
+  };
+
   React.useEffect(() => {
-    const loadData = async () => {
-      setLoading(true);
-      try {
-        const [vulnsData, patchData] = await Promise.all([
-          vulnmgmtApi.getVulnerabilities(),
-          vulnmgmtApi.getPatchOperations(),
-        ]);
-        setVulnerabilities(Array.isArray(vulnsData) ? vulnsData : (vulnsData?.items || vulnsData?.data || []));
-        setScanProfiles([]);
-        setPatchOps(Array.isArray(patchData) ? patchData : (patchData?.items || patchData?.data || []));
-        setExceptions([]);
-      } catch (error) {
-        console.error('Error loading vulnerability data:', error);
-      } finally {
-        setLoading(false);
-      }
-    };
     loadData();
   }, []);
 
@@ -332,7 +334,7 @@ export default function VulnManagement() {
                           onClick={async () => {
                             try {
                               await vulnmgmtApi.runScan(profile.id);
-                              queryClient.invalidateQueries({ queryKey: ['vulnmgmt'] });
+                              loadData();
                             } catch (error) {
                               console.error('Error running scan:', error);
                             }
@@ -615,7 +617,7 @@ export default function VulnManagement() {
             <h2 className="text-xl font-bold mb-4">Remediate: {remediatingVuln.cveId}</h2>
             <div className="space-y-3">
               <p className="text-sm text-gray-600 dark:text-gray-400">{remediatingVuln.title}</p>
-              <button onClick={async () => { try { await vulnmgmtApi.runScan(remediatingVuln.id); setRemediatingVuln(null); queryClient.invalidateQueries({ queryKey: ['vulnmgmt'] }); } catch (e) { console.error(e); } }} className="w-full px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition">Apply Patch</button>
+              <button onClick={async () => { try { await vulnmgmtApi.runScan(remediatingVuln.id); setRemediatingVuln(null); loadData(); } catch (e) { console.error(e); } }} className="w-full px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition">Apply Patch</button>
               <button onClick={() => { setRemediatingVuln(null); }} className="w-full px-4 py-2 bg-orange-600 hover:bg-orange-700 text-white rounded-lg transition">Apply Compensating Control</button>
               <button onClick={() => setRemediatingVuln(null)} className="w-full px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
             </div>
@@ -625,37 +627,65 @@ export default function VulnManagement() {
 
       {/* New Vulnerability Modal */}
       {showNewVulnModal && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-96 max-h-screen overflow-y-auto">
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" onClick={() => setShowNewVulnModal(false)}>
+          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-96 max-h-screen overflow-y-auto" onClick={(e) => e.stopPropagation()}>
             <h2 className="text-xl font-bold mb-4">Create Vulnerability Record</h2>
-            <div className="space-y-4">
+            <form className="space-y-4" onSubmit={async (e) => {
+              e.preventDefault();
+              const fd = new FormData(e.currentTarget);
+              try {
+                await api.post('/vulnmgmt/vulnerabilities', {
+                  cve_id: fd.get('cve_id'),
+                  title: fd.get('title'),
+                  severity: fd.get('severity') || 'medium',
+                  cvss_score: parseFloat(fd.get('cvss_score') as string) || 0,
+                  description: fd.get('description') || '',
+                });
+                setShowNewVulnModal(false);
+                loadData();
+              } catch (err) { console.error('Create vuln failed:', err); }
+            }}>
               <div>
                 <label className="block text-sm font-medium mb-1">CVE ID</label>
-                <input type="text" placeholder="CVE-2025-XXXX" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+                <input name="cve_id" required type="text" placeholder="CVE-2025-XXXX" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
               </div>
               <div>
                 <label className="block text-sm font-medium mb-1">Title</label>
-                <input type="text" placeholder="Vulnerability title" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+                <input name="title" required type="text" placeholder="Vulnerability title" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Severity</label>
+                <select name="severity" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
+                  <option value="critical">Critical</option>
+                  <option value="high">High</option>
+                  <option value="medium" selected>Medium</option>
+                  <option value="low">Low</option>
+                </select>
               </div>
               <div>
                 <label className="block text-sm font-medium mb-1">CVSS Score</label>
-                <input type="number" placeholder="0.0" step="0.1" min="0" max="10" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+                <input name="cvss_score" type="number" placeholder="0.0" step="0.1" min="0" max="10" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Description</label>
+                <textarea name="description" rows={2} placeholder="Vulnerability description" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
               </div>
               <div className="flex gap-2 mt-6">
                 <button
+                  type="button"
                   onClick={() => setShowNewVulnModal(false)}
                   className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
                 >
                   Cancel
                 </button>
                 <button
-                  onClick={() => setShowNewVulnModal(false)}
+                  type="submit"
                   className="flex-1 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition"
                 >
                   Create
                 </button>
               </div>
-            </div>
+            </form>
           </div>
         </div>
       )}
