@@ -25,6 +25,27 @@ type TabType = 'overview' | 'access-control' | 'devices' | 'segmentation' | 'pol
 
 type MaturityLevel = 'traditional' | 'initial' | 'advanced' | 'optimal';
 
+function getMaturityColor(level: string) {
+  const colors: Record<string, string> = {
+    traditional: 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400',
+    initial: 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-400',
+    advanced: 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400',
+    optimal: 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400',
+  };
+  return colors[level] || colors.traditional;
+}
+
+function getStatusColor(status: string) {
+  const colors: Record<string, string> = {
+    healthy: 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400',
+    'at-risk': 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-400',
+    critical: 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400',
+    active: 'bg-green-100 text-green-800',
+    inactive: 'bg-gray-100 text-gray-800',
+  };
+  return colors[status] || colors.healthy;
+}
+
 interface Pillar {
   name: string;
   score: number;
@@ -48,6 +69,7 @@ interface DashboardData {
   maturity_score: number;
   maturity_level: string;
   last_updated: string;
+  pillars?: any;
 }
 
 interface AccessDecision {
@@ -67,6 +89,7 @@ interface Device {
   trust_score: number;
   is_compliant: boolean;
   compliance_checks: Record<string, boolean>;
+  checks?: Record<string, boolean>;
   last_seen: string;
   status: string;
 }
@@ -75,6 +98,7 @@ interface Segment {
   id: string;
   name: string;
   segment_type: string;
+  type?: string;
   member_count: number;
   allowed_protocols: string[];
   violation_count: number;
@@ -85,6 +109,8 @@ interface Policy {
   id: string;
   name: string;
   policy_type: string;
+  type?: string;
+  status?: string;
   risk_threshold: number;
   mfa_required: boolean;
   device_trust_required: boolean;
@@ -187,7 +213,8 @@ export default function ZeroTrustDashboard() {
     },
   });
 
-  const getMaturityColor = (level: MaturityLevel) => {
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const _getMaturityColor = (level: MaturityLevel) => {
     const colors: Record<MaturityLevel, string> = {
       traditional: 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400',
       initial: 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-400',
@@ -437,7 +464,7 @@ function OverviewTab({
           Recent Access Decisions
         </h2>
         <div className="space-y-2">
-          {(([] as AccessDecision[]) || []).slice(0, 5).map((decision) => (
+          {([] as AccessDecision[]).slice(0, 5).map((decision) => (
             <div
               key={decision.id}
               className="flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-700/50 rounded-lg"
@@ -751,7 +778,7 @@ function DeviceTrustTab({
                   {device.hostname}
                 </h3>
                 <p className="text-xs text-gray-600 dark:text-gray-400 mt-1">
-                  {device.device_type.charAt(0).toUpperCase() + device.device_type.slice(1)} • {device.os_type}
+                  {(device.device_type || 'unknown').charAt(0).toUpperCase() + (device.device_type || 'unknown').slice(1)} • {device.os_type || 'N/A'}
                 </p>
               </div>
               <span
@@ -791,10 +818,10 @@ function DeviceTrustTab({
 
             {/* Compliance Checks */}
             <div className="space-y-1 text-xs">
-              <CheckItem label="Patch" status={device.checks.patch} />
-              <CheckItem label="Antivirus" status={device.checks.av} />
-              <CheckItem label="Encryption" status={device.checks.encryption} />
-              <CheckItem label="Firewall" status={device.checks.firewall} />
+              <CheckItem label="Patch" status={device.checks?.patch ?? device.compliance_checks?.patch} />
+              <CheckItem label="Antivirus" status={device.checks?.av ?? device.compliance_checks?.av} />
+              <CheckItem label="Encryption" status={device.checks?.encryption ?? device.compliance_checks?.encryption} />
+              <CheckItem label="Firewall" status={device.checks?.firewall ?? device.compliance_checks?.firewall} />
             </div>
 
             {/* Last Seen */}
