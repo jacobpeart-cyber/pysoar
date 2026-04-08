@@ -84,7 +84,7 @@ export const alertsApi = {
     search?: string;
   }): Promise<PaginatedResponse<Alert>> => {
     const response = await api.get('/alerts', { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   getAlert: async (id: string): Promise<Alert> => {
@@ -112,7 +112,7 @@ export const incidentsApi = {
     search?: string;
   }): Promise<PaginatedResponse<Incident>> => {
     const response = await api.get('/incidents', { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   getIncident: async (id: string): Promise<Incident> => {
@@ -145,7 +145,7 @@ export const siemApi = {
     date_range?: string;
   }): Promise<PaginatedResponse<SIEMEvent>> => {
     const response = await api.get('/siem/events', { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   getSIEMRules: async (): Promise<SIEMRule[]> => {
@@ -184,7 +184,7 @@ export const threatIntelApi = {
     search?: string;
   }): Promise<PaginatedResponse<ThreatIndicator>> => {
     const response = await api.get('/threat-intel/indicators', { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   enrichIOC: async (value: string): Promise<EnrichmentResult> => {
@@ -202,7 +202,7 @@ export const huntingApi = {
     search?: string;
   }): Promise<PaginatedResponse<Hunt>> => {
     const response = await api.get('/hunting', { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   createHunt: async (data: {
@@ -219,7 +219,7 @@ export const huntingApi = {
     size?: number;
   }): Promise<PaginatedResponse<HuntFinding>> => {
     const response = await api.get(`/hunting/${huntId}/findings`, { params });
-    return response.data;
+    return extractData(response.data);
   },
 };
 
@@ -231,7 +231,7 @@ export const exposureApi = {
     status?: string;
   }): Promise<PaginatedResponse<ExposureAssessment>> => {
     const response = await api.get('/exposure', { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   getAttackSurface: async (): Promise<AttackSurface> => {
@@ -253,7 +253,7 @@ export const aiApi = {
     type?: string;
   }): Promise<PaginatedResponse<AIPrediction>> => {
     const response = await api.get('/ai/predictions', { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   runAnalysis: async (data: {
@@ -278,7 +278,7 @@ export const uebaApi = {
     search?: string;
   }): Promise<PaginatedResponse<UserBehavior>> => {
     const response = await api.get('/ueba/behaviors', { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   getRiskScores: async (): Promise<RiskScore[]> => {
@@ -291,7 +291,7 @@ export const uebaApi = {
     size?: number;
   }): Promise<PaginatedResponse<{ user_id: string; anomaly_type: string; risk_score: number }>> => {
     const response = await api.get('/ueba/anomalies', { params });
-    return response.data;
+    return extractData(response.data);
   },
 };
 
@@ -303,7 +303,7 @@ export const simulationApi = {
     status?: string;
   }): Promise<PaginatedResponse<SimulationCampaign>> => {
     const response = await api.get('/simulation/campaigns', { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   launchSimulation: async (data: {
@@ -320,7 +320,7 @@ export const simulationApi = {
     size?: number;
   }): Promise<PaginatedResponse<SimulationResult>> => {
     const response = await api.get(`/simulation/campaigns/${campaignId}/results`, { params });
-    return response.data;
+    return extractData(response.data);
   },
 };
 
@@ -341,7 +341,7 @@ export const deceptionApi = {
     size?: number;
   }): Promise<PaginatedResponse<{ id: string; type: string; timestamp: string; data: Record<string, any> }>> => {
     const response = await api.get('/deception/alerts', { params });
-    return response.data;
+    return extractData(response.data);
   },
 };
 
@@ -358,7 +358,7 @@ export const remediationApi = {
     status?: string;
   }): Promise<PaginatedResponse<RemediationAction>> => {
     const response = await api.get('/remediation/actions', { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   approveAction: async (id: string): Promise<RemediationAction> => {
@@ -385,7 +385,7 @@ export const complianceApi = {
     status?: string;
   }): Promise<PaginatedResponse<ComplianceControl>> => {
     const response = await api.get(`/compliance/frameworks/${frameworkId}/controls`, { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   runAssessment: async (frameworkId: string): Promise<{ task_id: string }> => {
@@ -399,7 +399,7 @@ export const complianceApi = {
     status?: string;
   }): Promise<PaginatedResponse<POAM>> => {
     const response = await api.get('/compliance/poams', { params });
-    return response.data;
+    return extractData(response.data);
   },
 };
 
@@ -415,7 +415,7 @@ export const zerotrustApi = {
     size?: number;
   }): Promise<PaginatedResponse<DeviceTrust>> => {
     const response = await api.get('/zerotrust/device-trust', { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   getAccessDecisions: async (params?: {
@@ -423,7 +423,7 @@ export const zerotrustApi = {
     size?: number;
   }): Promise<PaginatedResponse<{ device_id: string; access_granted: boolean; reason: string }>> => {
     const response = await api.get('/zerotrust/access-decisions', { params });
-    return response.data;
+    return extractData(response.data);
   },
 };
 
@@ -445,7 +445,7 @@ export const stigApi = {
     status?: string;
   }): Promise<PaginatedResponse<STIGFinding>> => {
     const response = await api.get(`/stig/benchmarks/${benchmarkId}/findings`, { params });
-    return response.data;
+    return extractData(response.data);
   },
 };
 
@@ -457,7 +457,7 @@ export const auditEvidenceApi = {
     type?: string;
   }): Promise<PaginatedResponse<AuditEvidence>> => {
     const response = await api.get('/audit/evidence', { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   collectEvidence: async (data: {
@@ -484,7 +484,7 @@ export const dfirApi = {
     status?: string;
   }): Promise<PaginatedResponse<DFIRCase>> => {
     const response = await api.get('/dfir/cases', { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   createCase: async (data: {
@@ -503,7 +503,7 @@ export const dfirApi = {
     size?: number;
   }): Promise<PaginatedResponse<AuditEvidence>> => {
     const response = await api.get(`/dfir/cases/${caseId}/evidence`, { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   getTimeline: async (caseId: string): Promise<any> => {
@@ -533,7 +533,7 @@ export const itdrApi = {
     severity?: string;
   }): Promise<PaginatedResponse<IdentityThreat>> => {
     const response = await api.get('/itdr/threats', { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   createThreat: async (data: {
@@ -551,7 +551,7 @@ export const itdrApi = {
     size?: number;
   }): Promise<PaginatedResponse<any>> => {
     const response = await api.get('/itdr/credential-exposures', { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   getAccessAnomalies: async (params?: {
@@ -559,7 +559,7 @@ export const itdrApi = {
     size?: number;
   }): Promise<PaginatedResponse<any>> => {
     const response = await api.get('/itdr/anomalies', { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   getCredentialMonitors: async (): Promise<CredentialMonitor[]> => {
@@ -572,7 +572,7 @@ export const itdrApi = {
     size?: number;
   }): Promise<PaginatedResponse<any>> => {
     const response = await api.get('/itdr/identities', { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   getPrivilegedAccess: async (params?: {
@@ -580,7 +580,7 @@ export const itdrApi = {
     size?: number;
   }): Promise<PaginatedResponse<any>> => {
     const response = await api.get('/itdr/privileged-access', { params });
-    return response.data;
+    return extractData(response.data);
   },
 };
 
@@ -594,7 +594,7 @@ export const vulnmgmtApi = {
     search?: string;
   }): Promise<PaginatedResponse<Vulnerability>> => {
     const response = await api.get('/vulnmgmt/vulnerabilities', { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   runScan: async (assetId?: string): Promise<{ task_id: string }> => {
@@ -608,7 +608,7 @@ export const vulnmgmtApi = {
     status?: string;
   }): Promise<PaginatedResponse<PatchOperation>> => {
     const response = await api.get('/vulnmgmt/patch-operations', { params });
-    return response.data;
+    return extractData(response.data);
   },
 };
 
@@ -619,7 +619,7 @@ export const supplychainApi = {
     size?: number;
   }): Promise<PaginatedResponse<SBOM>> => {
     const response = await api.get('/supplychain/sboms', { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   getSupplyChainRisks: async (): Promise<{ risk_score: number; findings: Record<string, any>[] }> => {
@@ -632,7 +632,7 @@ export const supplychainApi = {
     size?: number;
   }): Promise<PaginatedResponse<VendorAssessment>> => {
     const response = await api.get('/supplychain/vendor-assessments', { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   addComponent: async (data: { name: string; version: string; license: string }): Promise<any> => {
@@ -655,7 +655,7 @@ export const darkwebApi = {
     status?: string;
   }): Promise<PaginatedResponse<DarkWebAlert>> => {
     const response = await api.get('/darkweb/alerts', { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   getCredentialLeaks: async (params?: {
@@ -663,7 +663,7 @@ export const darkwebApi = {
     size?: number;
   }): Promise<PaginatedResponse<{ email: string; password_hash: string; source: string; date_found: string }>> => {
     const response = await api.get('/darkweb/credential-leaks', { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   getBrandMonitors: async (): Promise<{ brand_name: string; mentions: number; alerts: DarkWebAlert[] }[]> => {
@@ -754,7 +754,7 @@ export const agenticApi = {
     status?: string;
   }): Promise<PaginatedResponse<Investigation>> => {
     const response = await api.get('/agentic/investigations', { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   startInvestigation: async (data: { description: string; target_data: Record<string, any> }): Promise<Investigation> => {
@@ -776,7 +776,7 @@ export const playbookApi = {
     status?: string;
   }): Promise<PaginatedResponse<Playbook>> => {
     const response = await api.get('/playbooks', { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   createPlaybook: async (data: {
@@ -812,7 +812,7 @@ export const dlpApi = {
     status?: string;
   }): Promise<PaginatedResponse<DLPIncident>> => {
     const response = await api.get('/dlp/incidents', { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   getClassifications: async (): Promise<string[]> => {
@@ -853,7 +853,7 @@ export const otsecurityApi = {
     status?: string;
   }): Promise<PaginatedResponse<OTAsset>> => {
     const response = await api.get('/ot_security/assets', { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   getAlerts: async (params?: {
@@ -861,7 +861,7 @@ export const otsecurityApi = {
     size?: number;
   }): Promise<PaginatedResponse<Alert>> => {
     const response = await api.get('/ot_security/alerts', { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   getZones: async (): Promise<OTZone[]> => {
@@ -949,7 +949,7 @@ export const privacyApi = {
     status?: string;
   }): Promise<PaginatedResponse<DataSubjectRequest>> => {
     const response = await api.get('/privacy/dsrs', { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   createDSR: async (data: {
@@ -965,7 +965,7 @@ export const privacyApi = {
     size?: number;
   }): Promise<PaginatedResponse<PrivacyImpactAssessment>> => {
     const response = await api.get('/privacy/pias', { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   getConsentRecords: async (params?: {
@@ -973,7 +973,7 @@ export const privacyApi = {
     size?: number;
   }): Promise<PaginatedResponse<any>> => {
     const response = await api.get('/privacy/consent-records', { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   getProcessingRecords: async (params?: {
@@ -1000,7 +1000,7 @@ export const threatmodelApi = {
     size?: number;
   }): Promise<PaginatedResponse<ThreatModel>> => {
     const response = await api.get('/threat-modeling/models', { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   runSTRIDE: async (data: { application_id: string }): Promise<{ model_id: string }> => {
@@ -1172,9 +1172,9 @@ export const phishingApi = {
     page?: number;
     size?: number;
     status?: string;
-  }): Promise<PaginatedResponse<PhishingCampaign>> => {
+  }): Promise<any[]> => {
     const response = await api.get('/phishing_sim/campaigns', { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   createCampaign: async (data: {
@@ -1196,7 +1196,7 @@ export const phishingApi = {
     size?: number;
   }): Promise<PaginatedResponse<PhishingResult>> => {
     const response = await api.get(`/phishing/campaigns/${campaignId}/results`, { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   getAwarenessScores: async (): Promise<{ user_email: string; awareness_score: number }[]> => {
