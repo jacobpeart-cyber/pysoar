@@ -43,15 +43,17 @@ interface UnifiedTicket {
   source_type: SourceType;
   source_id: string;
   title: string;
-  description: string;
+  description: string | null;
   status: string;
+  kanban_column: string;
   priority: string;
+  severity: string | null;
   assigned_to: string | null;
   created_at: string;
-  updated_at: string;
+  updated_at: string | null;
   due_date: string | null;
+  source_url: string;
   tags: string[];
-  metadata: Record<string, unknown>;
 }
 
 interface TicketListResponse {
@@ -61,48 +63,55 @@ interface TicketListResponse {
   size: number;
 }
 
-interface KanbanColumn {
-  column: string;
-  tickets: UnifiedTicket[];
-}
-
 interface KanbanResponse {
-  columns: KanbanColumn[];
+  new: UnifiedTicket[];
+  in_progress: UnifiedTicket[];
+  review: UnifiedTicket[];
+  closed: UnifiedTicket[];
 }
 
 interface AutomationRule {
   id: string;
   name: string;
+  description: string | null;
   trigger_type: string;
-  conditions: Record<string, unknown>;
-  actions: Record<string, unknown>;
+  trigger_conditions: string | Record<string, unknown>;
+  actions: string | Record<string, unknown>;
   is_enabled: boolean;
+  priority: number;
+  cooldown_minutes: number;
   execution_count: number;
   last_triggered_at: string | null;
   created_at: string;
 }
 
 interface DashboardStats {
-  total: number;
-  open: number;
-  in_progress: number;
-  overdue: number;
-  by_source: Record<string, number>;
+  total_tickets: number;
+  open_count: number;
+  closed_count: number;
+  overdue_count: number;
+  by_source_type: Record<string, number>;
+  by_kanban_column: Record<string, number>;
+  by_priority: Record<string, number>;
 }
 
 interface Comment {
   id: string;
-  author: string;
-  text: string;
+  content: string;
+  author_id: string;
+  parent_comment_id: string | null;
+  is_edited: boolean;
   created_at: string;
 }
 
 interface ActivityEntry {
   id: string;
-  action: string;
-  actor: string;
-  timestamp: string;
-  details: string | null;
+  activity_type: string;
+  description: string;
+  actor_id: string | null;
+  old_value: string | null;
+  new_value: string | null;
+  created_at: string;
 }
 
 type SourceType = 'incident' | 'remediation_ticket' | 'poam' | 'case_task' | 'action_item';
@@ -122,9 +131,20 @@ const SOURCE_TYPE_OPTIONS: { value: string; label: string }[] = [
   { value: 'action_item', label: 'Action Item' },
 ];
 
-const STATUS_OPTIONS = ['', 'new', 'open', 'in_progress', 'review', 'closed'];
+const STATUS_OPTIONS = [
+  { value: '', label: 'All Statuses' },
+  { value: 'new', label: 'New' },
+  { value: 'in_progress', label: 'In Progress' },
+  { value: 'review', label: 'Review' },
+  { value: 'closed', label: 'Closed' },
+];
 const PRIORITY_OPTIONS = ['', 'critical', 'high', 'medium', 'low'];
-const KANBAN_COLUMNS = ['New', 'In Progress', 'Review', 'Closed'];
+const KANBAN_COLUMNS = [
+  { key: 'new', label: 'New' },
+  { key: 'in_progress', label: 'In Progress' },
+  { key: 'review', label: 'Review' },
+  { key: 'closed', label: 'Closed' },
+];
 const TRIGGER_TYPES = ['siem_alert', 'incident_created', 'ticket_status_change', 'manual'];
 
 const PAGE_SIZE = 15;
@@ -326,7 +346,7 @@ function DetailPanel({
     mutationFn: async (text: string) => {
       await api.post(
         `/tickethub/tickets/${ticket.source_type}/${ticket.source_id}/comments`,
-        { text }
+        { content: text }
       );
     },
     onSuccess: () => {
@@ -342,7 +362,7 @@ function DetailPanel({
 
   const statusChangeMutation = useMutation({
     mutationFn: async (newStatus: string) => {
-      await api.put(`/tickethub/tickets/${ticket.source_type}/${ticket.source_id}`, {
+      await api.patch(`/tickethub/tickets/${ticket.source_type}/${ticket.source_id}/status`, {
         status: newStatus,
       });
     },
@@ -466,18 +486,18 @@ function DetailPanel({
             Change Status
           </h3>
           <div className="flex flex-wrap gap-2">
-            {STATUS_OPTIONS.filter((s) => s !== '' && s !== ticket.status).map((st) => (
+            {STATUS_OPTIONS.filter((o) => o.value !== '' && o.value !== ticket.kanban_column).map((o) => (
               <button
-                key={st}
-                onClick={() => statusChangeMutation.mutate(st)}
+                key={o.value}
+                onClick={() => statusChangeMutation.mutate(o.value)}
                 disabled={statusChangeMutation.isPending}
                 className={clsx(
                   'px-3 py-1 rounded text-xs font-medium border transition-colors',
                   'hover:opacity-80 disabled:opacity-50',
-                  statusColors[st] ?? 'bg-gray-100 text-gray-700'
+                  statusColors[o.value] ?? 'bg-gray-100 text-gray-700'
                 )}
               >
-                {st.replace('_', ' ')}
+                {o.label}
               </button>
             ))}
           </div>
@@ -501,11 +521,11 @@ function DetailPanel({
                 >
                   <div className="flex items-center justify-between mb-1">
                     <span className="font-medium text-gray-900 dark:text-white">
-                      {c.author}
+                      {c.author_id?.slice(0, 8) ?? 'Unknown'}
                     </span>
                     <span className="text-xs text-gray-400">{formatDateTime(c.created_at)}</span>
                   </div>
-                  <p className="text-gray-700 dark:text-gray-300">{c.text}</p>
+                  <p className="text-gray-700 dark:text-gray-300">{c.content}</p>
                 </div>
               ))}
             </div>
@@ -546,17 +566,17 @@ function DetailPanel({
                 >
                   <div className="flex-1">
                     <span className="font-medium text-gray-900 dark:text-white">
-                      {entry.actor}
+                      {entry.actor_id?.slice(0, 8) ?? 'System'}
                     </span>{' '}
-                    <span className="text-gray-600 dark:text-gray-400">{entry.action}</span>
-                    {entry.details && (
+                    <span className="text-gray-600 dark:text-gray-400">{entry.description}</span>
+                    {entry.old_value && entry.new_value && (
                       <p className="text-gray-500 dark:text-gray-500 text-xs mt-0.5">
-                        {entry.details}
+                        {entry.old_value} �� {entry.new_value}
                       </p>
                     )}
                   </div>
                   <span className="text-xs text-gray-400 whitespace-nowrap">
-                    {formatDateTime(entry.timestamp)}
+                    {formatDateTime(entry.created_at)}
                   </span>
                 </div>
               ))}
@@ -638,14 +658,14 @@ function KanbanCard({
             <div className="absolute right-0 bottom-6 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-600 rounded shadow-lg z-10 py-1 min-w-[120px]">
               {KANBAN_COLUMNS.map((col) => (
                 <button
-                  key={col}
+                  key={col.key}
                   onClick={() => {
-                    onMove(ticket.source_type, ticket.source_id, col);
+                    onMove(ticket.source_type, ticket.source_id, col.key);
                     setShowMoveMenu(false);
                   }}
                   className="block w-full text-left px-3 py-1.5 text-xs text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700"
                 >
-                  {col}
+                  {col.label}
                 </button>
               ))}
             </div>
@@ -808,7 +828,7 @@ export default function TicketHub() {
   const ticketParams = useMemo(() => {
     const params: Record<string, string | number> = { page, size: PAGE_SIZE };
     if (sourceFilter) params.source_type = sourceFilter;
-    if (statusFilter) params.status = statusFilter;
+    if (statusFilter) params.kanban_column = statusFilter;
     if (priorityFilter) params.priority = priorityFilter;
     if (searchQuery.trim()) params.search = searchQuery.trim();
     return params;
@@ -890,7 +910,7 @@ export default function TicketHub() {
       await api.post('/tickethub/automation/rules', {
         name: data.name,
         trigger_type: data.trigger_type,
-        conditions: parsedConditions,
+        trigger_conditions: parsedConditions,
         actions: parsedActions,
       });
     },
@@ -930,16 +950,19 @@ export default function TicketHub() {
 
   const kanbanColumns = useMemo(() => {
     const map: Record<string, UnifiedTicket[]> = {};
-    KANBAN_COLUMNS.forEach((col) => (map[col] = []));
-    if (kanbanData?.columns) {
-      kanbanData.columns.forEach((col) => {
-        map[col.column] = col.tickets ?? [];
-      });
+    KANBAN_COLUMNS.forEach((col) => (map[col.key] = []));
+    if (kanbanData) {
+      for (const col of KANBAN_COLUMNS) {
+        const tickets = (kanbanData as any)[col.key];
+        if (Array.isArray(tickets)) {
+          map[col.key] = tickets;
+        }
+      }
     }
     return map;
   }, [kanbanData]);
 
-  const stats = dashboard ?? { total: 0, open: 0, in_progress: 0, overdue: 0, by_source: {} };
+  const stats = dashboard ?? { total_tickets: 0, open_count: 0, closed_count: 0, overdue_count: 0, by_source_type: {}, by_kanban_column: {}, by_priority: {} };
 
   // ---------------------------------------------------------------------------
   // Render
@@ -990,25 +1013,25 @@ export default function TicketHub() {
           <>
             <StatCard
               label="Total Tickets"
-              value={stats.total}
+              value={stats.total_tickets}
               icon={<BarChart3 className="w-5 h-5" />}
               accent="bg-blue-100 text-blue-600 dark:bg-blue-900/40 dark:text-blue-300"
             />
             <StatCard
               label="Open"
-              value={stats.open}
+              value={stats.open_count}
               icon={<AlertCircle className="w-5 h-5" />}
               accent="bg-yellow-100 text-yellow-600 dark:bg-yellow-900/40 dark:text-yellow-300"
             />
             <StatCard
               label="In Progress"
-              value={stats.in_progress}
+              value={stats.by_kanban_column?.in_progress ?? 0}
               icon={<Clock className="w-5 h-5" />}
               accent="bg-indigo-100 text-indigo-600 dark:bg-indigo-900/40 dark:text-indigo-300"
             />
             <StatCard
               label="Overdue"
-              value={stats.overdue}
+              value={stats.overdue_count}
               icon={<AlertTriangle className="w-5 h-5" />}
               accent="bg-red-100 text-red-600 dark:bg-red-900/40 dark:text-red-300"
             />
@@ -1017,9 +1040,9 @@ export default function TicketHub() {
       </div>
 
       {/* Source Breakdown */}
-      {!dashboardLoading && stats.by_source && Object.keys(stats.by_source).length > 0 && (
+      {!dashboardLoading && stats.by_source_type && Object.keys(stats.by_source_type).length > 0 && (
         <div className="flex flex-wrap gap-3">
-          {Object.entries(stats.by_source).map(([src, count]) => (
+          {Object.entries(stats.by_source_type).map(([src, count]) => (
             <div
               key={src}
               className="flex items-center gap-2 bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 px-3 py-2"
@@ -1083,10 +1106,9 @@ export default function TicketHub() {
               }}
               className="rounded border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-sm text-gray-900 dark:text-white p-1.5 focus:ring-2 focus:ring-blue-500"
             >
-              <option value="">All Statuses</option>
-              {STATUS_OPTIONS.filter(Boolean).map((s) => (
-                <option key={s} value={s}>
-                  {s.replace('_', ' ')}
+              {STATUS_OPTIONS.map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
                 </option>
               ))}
             </select>
@@ -1265,16 +1287,16 @@ export default function TicketHub() {
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
               {KANBAN_COLUMNS.map((column) => {
-                const columnTickets = kanbanColumns[column] ?? [];
+                const columnTickets = kanbanColumns[column.key] ?? [];
                 return (
                   <div
-                    key={column}
+                    key={column.key}
                     className="bg-gray-100 dark:bg-gray-800/50 rounded-lg border border-gray-200 dark:border-gray-700 flex flex-col"
                   >
                     {/* Column Header */}
                     <div className="flex items-center justify-between p-3 border-b border-gray-200 dark:border-gray-700">
                       <h3 className="text-sm font-semibold text-gray-700 dark:text-gray-300">
-                        {column}
+                        {column.label}
                       </h3>
                       <span className="text-xs font-medium bg-gray-200 dark:bg-gray-700 text-gray-600 dark:text-gray-400 px-2 py-0.5 rounded-full">
                         {columnTickets.length}
