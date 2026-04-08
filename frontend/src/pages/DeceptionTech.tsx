@@ -755,7 +755,7 @@ export default function DeceptionTech() {
                     setModalError(null);
                     try {
                       await api.post('/deception/tokens', { token_type: tokenType, organization_id: 'default' });
-                      setShowTokenModal(false);
+                      setShowGenerateTokenModal(false);
                       setShowGenerateTokenModal(false);
                       setTokenName(''); setTokenType('aws_key');
                       queryClient.invalidateQueries({ queryKey: ['honeyTokens'] });
@@ -805,8 +805,8 @@ export default function DeceptionTech() {
                   onClick={async () => {
                     setModalError(null);
                     try {
-                      await api.post('/deception/campaigns', { name: campaignName, objective: campaignObjective, description: campaignDescription, organization_id: 'default', created_by: 'current_user' });
-                      setShowCampaignModal(false);
+                      await api.post('/deception/campaigns', { name: campaignName, objective: campaignObjective, description: campaignDescription });
+                      setShowCreateCampaignModal(false);
                       setShowCreateCampaignModal(false);
                       setCampaignName(''); setCampaignObjective('general_detection'); setCampaignDescription('');
                       queryClient.invalidateQueries({ queryKey: ['campaigns'] });
