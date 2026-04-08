@@ -97,7 +97,7 @@ async def create_policy(
         rollback_enabled=request.rollback_enabled,
         rollback_actions=request.rollback_actions,
         tags=request.tags,
-        created_by=request.created_by,
+        created_by=str(current_user.id) if current_user else None,
         organization_id=getattr(current_user, "organization_id", None),
     )
     db.add(policy)
