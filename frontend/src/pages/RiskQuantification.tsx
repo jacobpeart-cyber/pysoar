@@ -65,24 +65,25 @@ export default function RiskQuantification() {
   const [selectedControl, setSelectedControl] = useState<any | null>(null);
   const [showFilter, setShowFilter] = useState(false);
 
+  const loadData = async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const [scenariosData, lossData] = await Promise.allSettled([
+        riskquantApi.getScenarios(),
+        riskquantApi.getLossExceedance(),
+      ]);
+      setScenarios(scenariosData.status === 'fulfilled' ? (scenariosData.value || []) : []);
+      setAnalysisResults(lossData.status === 'fulfilled' ? (lossData.value || null) : null);
+    } catch (err) {
+      console.error('Error loading risk quantification data:', err);
+      setError('Failed to load risk quantification data. Please try again.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
   React.useEffect(() => {
-    const loadData = async () => {
-      setLoading(true);
-      setError(null);
-      try {
-        const [scenariosData, lossData] = await Promise.all([
-          riskquantApi.getScenarios(),
-          riskquantApi.getLossExceedance(),
-        ]);
-        setScenarios(scenariosData || []);
-        setAnalysisResults(lossData || null);
-      } catch (err) {
-        console.error('Error loading risk quantification data:', err);
-        setError('Failed to load risk quantification data. Please try again.');
-      } finally {
-        setLoading(false);
-      }
-    };
     loadData();
   }, []);
 
@@ -665,7 +666,7 @@ export default function RiskQuantification() {
                   loss_magnitude: parseFloat(fd.get('magnitude') as string) || 0,
                 });
                 setShowNewScenarioModal(false);
-                queryClient.invalidateQueries({ queryKey: ['riskquant'] });
+                loadData();
               } catch (err) { console.error('Failed to create scenario:', err); }
             }}>
               <div>
