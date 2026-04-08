@@ -181,7 +181,7 @@ async def get_organization(
     current_user: CurrentUser = None,
 ):
     """Get an organization by ID"""
-    org = await _get_organization(db, org_id, current_user)
+    org = await _get_organization(org_id, current_user, db)
 
     count_result = await db.execute(
         select(func.count(OrganizationMember.id)).where(
@@ -201,7 +201,7 @@ async def update_organization(
     current_user: CurrentUser = None,
 ):
     """Update an organization"""
-    org = await _get_organization(db, org_id, current_user, require_admin=True)
+    org = await _get_organization(org_id, current_user, db, require_admin=True)
 
     if data.name is not None:
         org.name = data.name
@@ -246,7 +246,7 @@ async def list_organization_members(
     current_user: CurrentUser = None,
 ):
     """List members of an organization"""
-    await _get_organization(db, org_id, current_user)
+    await _get_organization(org_id, current_user, db)
 
     result = await db.execute(
         select(OrganizationMember)
@@ -279,7 +279,7 @@ async def add_organization_member(
     current_user: CurrentUser = None,
 ):
     """Add a member to an organization"""
-    await _get_organization(db, org_id, current_user, require_admin=True)
+    await _get_organization(org_id, current_user, db, require_admin=True)
 
     # Check if user exists
     user_result = await db.execute(select(User).where(User.id == data.user_id))
@@ -321,7 +321,7 @@ async def remove_organization_member(
     current_user: CurrentUser = None,
 ):
     """Remove a member from an organization"""
-    await _get_organization(db, org_id, current_user, require_admin=True)
+    await _get_organization(org_id, current_user, db, require_admin=True)
 
     result = await db.execute(
         select(OrganizationMember).where(
@@ -399,7 +399,7 @@ async def create_team(
         )
 
     # Verify organization access
-    await _get_organization(db, data.organization_id, current_user, require_admin=True)
+    await _get_organization(data.organization_id, current_user, db, require_admin=True)
 
     team = Team(
         name=data.name,
