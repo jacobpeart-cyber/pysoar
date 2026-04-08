@@ -430,13 +430,13 @@ async def generate_token(
         token_hash = hashlib.sha256(token_value.encode()).hexdigest()
 
         token = HoneyToken(
-            name=f"{token_type}-{token_hash[:8]}",
+            name=data.get("name") or f"{token_type}-{token_hash[:8]}",
             token_type=token_type,
             token_value=token_value,
             token_hash=token_hash,
             status="active",
-            organization_id=data.get("organization_id"),
-            deployed_by=data.get("deployed_by") or (str(getattr(current_user, 'id', '')) if current_user else ''),
+            organization_id=getattr(current_user, 'organization_id', None) or data.get("organization_id"),
+            deployed_by=str(current_user.id) if current_user else None,
         )
 
         db.add(token)
