@@ -1114,9 +1114,9 @@ export const collaborationApi = {
   getWarRooms: async (params?: {
     page?: number;
     size?: number;
-  }): Promise<PaginatedResponse<WarRoom>> => {
+  }): Promise<any[]> => {
     const response = await api.get('/collaboration/rooms', { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   createWarRoom: async (data: { title?: string; name?: string; description?: string; room_type?: string; severity_level?: string }): Promise<WarRoom> => {
@@ -1132,9 +1132,9 @@ export const collaborationApi = {
   getMessages: async (warRoomId: string, params?: {
     page?: number;
     size?: number;
-  }): Promise<PaginatedResponse<WarRoomMessage>> => {
+  }): Promise<any[]> => {
     const response = await api.get(`/collaboration/rooms/${warRoomId}/messages`, { params });
-    return response.data;
+    return extractData(response.data);
   },
 
   getActionItems: async (warRoomId: string): Promise<ActionItem[]> => {
@@ -1155,6 +1155,14 @@ export const collaborationApi = {
   closeWarRoom: async (warRoomId: string): Promise<any> => {
     const response = await api.post(`/collaboration/rooms/${warRoomId}/close`);
     return response.data;
+  },
+
+  getPostMortems: async (): Promise<any[]> => {
+    // Post-mortems are derived from closed/archived war rooms
+    try {
+      const response = await api.get('/collaboration/rooms', { params: { status: 'closed' } });
+      return extractData(response.data);
+    } catch { return []; }
   },
 };
 
