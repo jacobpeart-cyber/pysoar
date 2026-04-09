@@ -1182,6 +1182,24 @@ async def get_event_timeline(
 
 
 @router.get(
+    "/awareness-scores",
+    response_model=list[SecurityAwarenessScoreResponse],
+)
+async def list_awareness_scores(
+    db: DatabaseSession,
+    current_user: CurrentUser,
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
+):
+    """List all awareness scores for the organization."""
+    query = select(SecurityAwarenessScore).where(
+        SecurityAwarenessScore.organization_id == getattr(current_user, "organization_id", None)
+    ).offset(skip).limit(limit)
+    result = await db.execute(query)
+    return result.scalars().all()
+
+
+@router.get(
     "/awareness-scores/{user_email}",
     response_model=SecurityAwarenessScoreResponse,
 )

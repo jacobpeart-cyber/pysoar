@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import { useState, useMemo } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   Mail,
@@ -8,81 +8,209 @@ import {
   Award,
   Plus,
   X,
-  CheckCircle,
   AlertCircle,
-  Clock,
-  BarChart3,
 } from 'lucide-react';
-import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, LineChart, Line, PieChart, Pie, Cell, FunnelChart, Funnel } from 'recharts';
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, LineChart, Line, Cell } from 'recharts';
 import clsx from 'clsx';
-import { phishingApi } from '../api/endpoints';
+import { api } from '../api/client';
 
+// ---------------------------------------------------------------------------
+// Types matching actual backend response schemas
+// ---------------------------------------------------------------------------
+
+interface Campaign {
+  id: string;
+  name: string;
+  description: string | null;
+  campaign_type: string;
+  status: string;
+  template_id: string | null;
+  target_group_id: string | null;
+  difficulty_level: string;
+  total_targets: number;
+  emails_sent: number;
+  emails_opened: number;
+  links_clicked: number;
+  credentials_submitted: number;
+  attachments_opened: number;
+  reported_count: number;
+  start_date: string | null;
+  end_date: string | null;
+  created_by: string;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+interface Template {
+  id: string;
+  name: string;
+  description: string | null;
+  category: string;
+  difficulty: string;
+  subject_line: string;
+  usage_count: number;
+  average_click_rate: number;
+  created_at: string | null;
+}
+
+interface TargetGroupType {
+  id: string;
+  name: string;
+  description: string | null;
+  department: string | null;
+  member_count: number;
+  risk_level: string;
+  avg_click_rate: number;
+  campaigns_participated: number;
+  last_campaign_date: string | null;
+  created_at: string | null;
+}
+
+interface AwarenessScore {
+  id: string;
+  user_email: string;
+  user_name: string;
+  department: string | null;
+  overall_score: number;
+  phishing_score: number;
+  training_completion_rate: number;
+  campaigns_participated: number;
+  times_clicked: number;
+  times_reported: number;
+  times_submitted_credentials: number;
+  risk_category: string;
+  last_failed_campaign: string | null;
+  created_at: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function extractData(data: any): any {
+  if (data && typeof data === 'object' && !Array.isArray(data) && 'items' in data) {
+    return data.items;
+  }
+  return data;
+}
+
+function safeRate(numerator: number, denominator: number): string {
+  if (!denominator) return '0.0';
+  return ((numerator / denominator) * 100).toFixed(1);
+}
+
+const COLORS = ['#06B6D4', '#10B981', '#F59E0B', '#EF4444', '#8B5CF6'];
 
 export default function PhishingSimulation() {
+  const queryClient = useQueryClient();
   const [activeTab, setActiveTab] = useState<'campaigns' | 'templates' | 'groups' | 'awareness' | 'training'>('campaigns');
   const [selectedCampaign, setSelectedCampaign] = useState<Campaign | null>(null);
   const [showModal, setShowModal] = useState(false);
-  const [selectedTraining, setSelectedTraining] = useState<{ id: string; title: string; completions: number; duration: string; certification: boolean } | null>(null);
 
-  const { data: campaigns = [] } = useQuery({ queryKey: ['campaigns'], queryFn: phishingApi.getCampaigns });
-  const { data: templates = [] } = useQuery({ queryKey: ['templates'], queryFn: phishingApi.getTemplates });
-  const { data: targetGroups = [] } = useQuery({ queryKey: ['targetGroups'], queryFn: phishingApi.getTargetGroups });
-  const { data: awarenessScores = [] } = useQuery({ queryKey: ['awarenessScores'], queryFn: phishingApi.getAwarenessScores });
+  // ---------------------------------------------------------------------------
+  // Queries
+  // ---------------------------------------------------------------------------
+
+  const { data: campaigns = [] } = useQuery<Campaign[]>({
+    queryKey: ['phishing-campaigns'],
+    queryFn: async () => {
+      const res = await api.get('/phishing_sim/campaigns');
+      return extractData(res.data) ?? [];
+    },
+  });
+
+  const { data: templates = [] } = useQuery<Template[]>({
+    queryKey: ['phishing-templates'],
+    queryFn: async () => {
+      const res = await api.get('/phishing_sim/templates');
+      return extractData(res.data) ?? [];
+    },
+  });
+
+  const { data: targetGroups = [] } = useQuery<TargetGroupType[]>({
+    queryKey: ['phishing-target-groups'],
+    queryFn: async () => {
+      const res = await api.get('/phishing_sim/target-groups');
+      return extractData(res.data) ?? [];
+    },
+  });
+
+  const { data: awarenessScores = [] } = useQuery<AwarenessScore[]>({
+    queryKey: ['phishing-awareness-scores'],
+    queryFn: async () => {
+      const res = await api.get('/phishing_sim/awareness-scores');
+      return extractData(res.data) ?? [];
+    },
+  });
+
+  // ---------------------------------------------------------------------------
+  // Mutations
+  // ---------------------------------------------------------------------------
+
+  const createCampaignMutation = useMutation({
+    mutationFn: async (data: { name: string; description: string; campaign_type: string; target_group_id: string }) => {
+      const res = await api.post('/phishing_sim/campaigns', data);
+      return res.data;
+    },
+    onSuccess: () => {
+      setShowModal(false);
+      queryClient.invalidateQueries({ queryKey: ['phishing-campaigns'] });
+    },
+  });
+
+  // ---------------------------------------------------------------------------
+  // Derived Stats
+  // ---------------------------------------------------------------------------
 
   const stats = useMemo(() => {
-    const activeCampaigns = campaigns.filter((c: Campaign) => c.status === 'Active').length;
-    const totalClicked = campaigns.reduce((sum: number, c: Campaign) => sum + c.clicked, 0);
-    const totalReported = campaigns.reduce((sum: number, c: Campaign) => sum + c.reported, 0);
-    const totalSent = campaigns.reduce((sum: number, c: Campaign) => sum + c.sent, 0);
-    const avgClickRate = ((totalClicked / (totalSent || 1)) * 100).toFixed(1);
-    const avgReportRate = ((totalReported / (totalSent || 1)) * 100).toFixed(1);
-    const avgAwareness = (awarenessScores.reduce((sum: number, s: AwarenessScore) => sum + s.score, 0) / (awarenessScores.length || 1)).toFixed(1);
+    const activeCampaigns = campaigns.filter((c) => c.status === 'active' || c.status === 'Active' || c.status === 'running').length;
+    const totalSent = campaigns.reduce((sum, c) => sum + (c.emails_sent || 0), 0);
+    const totalClicked = campaigns.reduce((sum, c) => sum + (c.links_clicked || 0), 0);
+    const totalReported = campaigns.reduce((sum, c) => sum + (c.reported_count || 0), 0);
+    const avgClickRate = safeRate(totalClicked, totalSent);
+    const avgReportRate = safeRate(totalReported, totalSent);
+    const avgAwareness = awarenessScores.length > 0
+      ? (awarenessScores.reduce((sum, s) => sum + s.overall_score, 0) / awarenessScores.length).toFixed(1)
+      : '0';
     return { activeCampaigns, avgClickRate, avgReportRate, avgAwareness };
   }, [campaigns, awarenessScores]);
 
   const funnelData = campaigns[0]
     ? [
-        { name: 'Sent', value: campaigns[0].sent },
-        { name: 'Opened', value: campaigns[0].opened },
-        { name: 'Clicked', value: campaigns[0].clicked },
-        { name: 'Submitted', value: campaigns[0].submitted },
-        { name: 'Reported', value: campaigns[0].reported },
+        { name: 'Sent', value: campaigns[0].emails_sent },
+        { name: 'Opened', value: campaigns[0].emails_opened },
+        { name: 'Clicked', value: campaigns[0].links_clicked },
+        { name: 'Submitted', value: campaigns[0].credentials_submitted },
+        { name: 'Reported', value: campaigns[0].reported_count },
       ]
     : [];
 
-  const departmentRiskData = targetGroups.map((group: TargetGroup) => ({
-    department: group.name,
-    risk: group.avgAwarenessScore,
-  }));
-
-  const awarenessData = useMemo(() => {
-    // Derive awareness trend from awareness scores grouped by department
+  const departmentRiskData = useMemo(() => {
     const deptScores: Record<string, number[]> = {};
-    awarenessScores.forEach((s: AwarenessScore) => {
-      if (!deptScores[s.department]) deptScores[s.department] = [];
-      deptScores[s.department].push(s.score);
+    awarenessScores.forEach((s) => {
+      const dept = s.department || 'Unknown';
+      if (!deptScores[dept]) deptScores[dept] = [];
+      deptScores[dept].push(s.overall_score);
     });
-    const depts = Object.keys(deptScores);
-    if (depts.length === 0) return [];
-    // Use departments as x-axis points with their average scores
-    return depts.map((dept) => ({
-      month: dept,
-      score: Math.round(deptScores[dept].reduce((a, b) => a + b, 0) / (deptScores[dept].length || 1)),
+    return Object.entries(deptScores).map(([dept, scores]) => ({
+      department: dept,
+      score: Math.round(scores.reduce((a, b) => a + b, 0) / scores.length),
     }));
   }, [awarenessScores]);
 
   const trainingData = useMemo(() => {
-    // Derive training data from templates (each template represents a training module)
-    return templates.map((t: Template, idx: number) => ({
+    return templates.map((t, idx) => ({
       id: `TR-${String(idx + 1).padStart(3, '0')}`,
       title: t.name,
-      completions: t.used || 0,
-      duration: t.difficulty === 'Hard' ? '45 min' : t.difficulty === 'Medium' ? '25 min' : '15 min',
-      certification: t.difficulty !== 'Easy',
+      completions: t.usage_count || 0,
+      duration: t.difficulty === 'hard' || t.difficulty === 'Hard' ? '45 min' : t.difficulty === 'medium' || t.difficulty === 'Medium' ? '25 min' : '15 min',
+      certification: t.difficulty !== 'easy' && t.difficulty !== 'Easy',
     }));
   }, [templates]);
 
-  const COLORS = ['#06B6D4', '#10B981', '#F59E0B', '#EF4444', '#8B5CF6'];
+  // ---------------------------------------------------------------------------
+  // Render
+  // ---------------------------------------------------------------------------
 
   return (
     <div className="min-h-screen bg-gray-900 text-white p-8">
@@ -98,7 +226,7 @@ export default function PhishingSimulation() {
 
         {/* Summary Cards */}
         <div className="grid grid-cols-4 gap-4 mb-8">
-          <div className="bg-gray-800 border border-gray-700 rounded-lg p-6 dark:bg-gray-800 dark:border-gray-700">
+          <div className="bg-gray-800 border border-gray-700 rounded-lg p-6">
             <div className="flex items-start justify-between">
               <div>
                 <p className="text-gray-400 text-sm mb-2">Active Campaigns</p>
@@ -108,7 +236,7 @@ export default function PhishingSimulation() {
             </div>
           </div>
 
-          <div className={clsx('border rounded-lg p-6 dark:border-gray-700', parseFloat(stats.avgClickRate as string) > 15 ? 'bg-red-900/20 border-red-700' : 'bg-gray-800 border-gray-700')}>
+          <div className={clsx('border rounded-lg p-6', parseFloat(stats.avgClickRate) > 15 ? 'bg-red-900/20 border-red-700' : 'bg-gray-800 border-gray-700')}>
             <div className="flex items-start justify-between">
               <div>
                 <p className="text-gray-400 text-sm mb-2">Click Rate %</p>
@@ -118,7 +246,7 @@ export default function PhishingSimulation() {
             </div>
           </div>
 
-          <div className={clsx('border rounded-lg p-6 dark:border-gray-700', parseFloat(stats.avgReportRate as string) < 5 ? 'bg-yellow-900/20 border-yellow-700' : 'bg-gray-800 border-gray-700')}>
+          <div className={clsx('border rounded-lg p-6', parseFloat(stats.avgReportRate) < 5 ? 'bg-yellow-900/20 border-yellow-700' : 'bg-gray-800 border-gray-700')}>
             <div className="flex items-start justify-between">
               <div>
                 <p className="text-gray-400 text-sm mb-2">Report Rate %</p>
@@ -128,7 +256,7 @@ export default function PhishingSimulation() {
             </div>
           </div>
 
-          <div className="bg-gray-800 border border-gray-700 rounded-lg p-6 dark:bg-gray-800 dark:border-gray-700">
+          <div className="bg-gray-800 border border-gray-700 rounded-lg p-6">
             <div className="flex items-start justify-between">
               <div>
                 <p className="text-gray-400 text-sm mb-2">Avg Awareness Score</p>
@@ -169,7 +297,9 @@ export default function PhishingSimulation() {
           </div>
         </div>
 
-        {/* Campaigns Tab */}
+        {/* ================================================================= */}
+        {/* Campaigns Tab                                                      */}
+        {/* ================================================================= */}
         {activeTab === 'campaigns' && (
           <div>
             <div className="mb-6 flex justify-end">
@@ -182,41 +312,53 @@ export default function PhishingSimulation() {
               </button>
             </div>
 
-            <div className="mb-8">
-              <div className="bg-gray-800 border border-gray-700 rounded-lg p-6 dark:bg-gray-800 dark:border-gray-700">
-                <h3 className="text-lg font-semibold mb-4">Campaign Funnel (Latest)</h3>
-                <ResponsiveContainer width="100%" height={300}>
-                  <FunnelChart margin={{ top: 20, right: 160, bottom: 20, left: 20 }}>
-                    <Tooltip contentStyle={{ backgroundColor: '#1F2937', border: '1px solid #374151', borderRadius: '8px' }} />
-                    <Funnel dataKey="value" data={funnelData} fill="#8884d8">
-                      {funnelData.map((entry, index) => (
-                        <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
-                      ))}
-                    </Funnel>
-                  </FunnelChart>
-                </ResponsiveContainer>
+            {/* Funnel Chart */}
+            {funnelData.length > 0 && (
+              <div className="mb-8">
+                <div className="bg-gray-800 border border-gray-700 rounded-lg p-6">
+                  <h3 className="text-lg font-semibold mb-4">Campaign Funnel (Latest)</h3>
+                  <ResponsiveContainer width="100%" height={300}>
+                    <BarChart data={funnelData} layout="vertical">
+                      <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                      <XAxis type="number" stroke="#9CA3AF" />
+                      <YAxis type="category" dataKey="name" stroke="#9CA3AF" width={80} />
+                      <Tooltip contentStyle={{ backgroundColor: '#1F2937', border: '1px solid #374151', borderRadius: '8px' }} />
+                      <Bar dataKey="value" fill="#3B82F6">
+                        {funnelData.map((_, index) => (
+                          <Cell key={`cell-${index}`} fill={COLORS[index % COLORS.length]} />
+                        ))}
+                      </Bar>
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
               </div>
-            </div>
+            )}
 
-            <div className="space-y-4">
-              {campaigns.map((campaign: Campaign) => (
-                <div
-                  key={campaign.id}
-                  onClick={() => setSelectedCampaign(campaign)}
-                  className="bg-gray-800 border border-gray-700 rounded-lg p-6 cursor-pointer hover:border-gray-600 transition-colors dark:bg-gray-800 dark:border-gray-700"
-                >
-                  <div className="flex items-start justify-between mb-4">
-                    <div>
-                      <h3 className="text-lg font-semibold text-white mb-2">{campaign.name}</h3>
-                      <p className="text-sm text-gray-400">{campaign.templateCount} templates | Sent: {campaign.sent.toLocaleString()}</p>
-                    </div>
-                    <div className="text-right">
+            {/* Campaign List */}
+            {campaigns.length === 0 ? (
+              <div className="text-center py-16 text-gray-500">
+                <Mail className="w-12 h-12 mx-auto mb-4 opacity-50" />
+                <p>No campaigns yet. Create your first phishing simulation campaign.</p>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                {campaigns.map((campaign) => (
+                  <div
+                    key={campaign.id}
+                    onClick={() => setSelectedCampaign(campaign)}
+                    className="bg-gray-800 border border-gray-700 rounded-lg p-6 cursor-pointer hover:border-gray-600 transition-colors"
+                  >
+                    <div className="flex items-start justify-between mb-4">
+                      <div>
+                        <h3 className="text-lg font-semibold text-white mb-2">{campaign.name}</h3>
+                        <p className="text-sm text-gray-400">{campaign.campaign_type} | Sent: {(campaign.emails_sent || 0).toLocaleString()}</p>
+                      </div>
                       <span
                         className={clsx(
                           'px-3 py-1 rounded text-xs font-medium',
-                          campaign.status === 'Active'
+                          campaign.status === 'active' || campaign.status === 'running'
                             ? 'bg-green-900/40 text-green-300'
-                            : campaign.status === 'Completed'
+                            : campaign.status === 'completed'
                               ? 'bg-blue-900/40 text-blue-300'
                               : 'bg-gray-900/40 text-gray-300'
                         )}
@@ -224,53 +366,63 @@ export default function PhishingSimulation() {
                         {campaign.status}
                       </span>
                     </div>
-                  </div>
 
-                  <div className="grid grid-cols-5 gap-4">
-                    <div className="bg-gray-700/50 rounded p-3 text-center">
-                      <p className="text-xs text-gray-400 mb-1">Opened</p>
-                      <p className="text-xl font-bold text-blue-400">{((campaign.opened / campaign.sent) * 100).toFixed(1)}%</p>
-                    </div>
-                    <div className="bg-gray-700/50 rounded p-3 text-center">
-                      <p className="text-xs text-gray-400 mb-1">Clicked</p>
-                      <p className="text-xl font-bold text-yellow-400">{campaign.clickRate.toFixed(1)}%</p>
-                    </div>
-                    <div className="bg-gray-700/50 rounded p-3 text-center">
-                      <p className="text-xs text-gray-400 mb-1">Submitted</p>
-                      <p className="text-xl font-bold text-red-400">{((campaign.submitted / campaign.sent) * 100).toFixed(1)}%</p>
-                    </div>
-                    <div className="bg-gray-700/50 rounded p-3 text-center">
-                      <p className="text-xs text-gray-400 mb-1">Reported</p>
-                      <p className="text-xl font-bold text-green-400">{campaign.reportRate.toFixed(1)}%</p>
-                    </div>
-                    <div className="bg-gray-700/50 rounded p-3 text-center">
-                      <p className="text-xs text-gray-400 mb-1">Total Emails</p>
-                      <p className="text-xl font-bold text-white">{campaign.sent.toLocaleString()}</p>
+                    <div className="grid grid-cols-5 gap-4">
+                      <div className="bg-gray-700/50 rounded p-3 text-center">
+                        <p className="text-xs text-gray-400 mb-1">Opened</p>
+                        <p className="text-xl font-bold text-blue-400">{safeRate(campaign.emails_opened, campaign.emails_sent)}%</p>
+                      </div>
+                      <div className="bg-gray-700/50 rounded p-3 text-center">
+                        <p className="text-xs text-gray-400 mb-1">Clicked</p>
+                        <p className="text-xl font-bold text-yellow-400">{safeRate(campaign.links_clicked, campaign.emails_sent)}%</p>
+                      </div>
+                      <div className="bg-gray-700/50 rounded p-3 text-center">
+                        <p className="text-xs text-gray-400 mb-1">Submitted</p>
+                        <p className="text-xl font-bold text-red-400">{safeRate(campaign.credentials_submitted, campaign.emails_sent)}%</p>
+                      </div>
+                      <div className="bg-gray-700/50 rounded p-3 text-center">
+                        <p className="text-xs text-gray-400 mb-1">Reported</p>
+                        <p className="text-xl font-bold text-green-400">{safeRate(campaign.reported_count, campaign.emails_sent)}%</p>
+                      </div>
+                      <div className="bg-gray-700/50 rounded p-3 text-center">
+                        <p className="text-xs text-gray-400 mb-1">Total Emails</p>
+                        <p className="text-xl font-bold text-white">{(campaign.emails_sent || 0).toLocaleString()}</p>
+                      </div>
                     </div>
                   </div>
-                </div>
-              ))}
-            </div>
+                ))}
+              </div>
+            )}
           </div>
         )}
 
-        {/* Templates Tab */}
+        {/* ================================================================= */}
+        {/* Templates Tab                                                      */}
+        {/* ================================================================= */}
         {activeTab === 'templates' && (
           <div className="grid grid-cols-1 gap-4">
-            {templates.map((template: Template) => (
-              <div key={template.id} className="bg-gray-800 border border-gray-700 rounded-lg p-6 dark:bg-gray-800 dark:border-gray-700">
-                <div className="flex items-start justify-between mb-4">
-                  <div className="flex-1">
-                    <h3 className="text-lg font-semibold text-white mb-2">{template.name}</h3>
-                    <p className="text-sm text-gray-400 mb-2">{template.category}</p>
-                  </div>
-                  <div className="text-right">
+            {templates.length === 0 ? (
+              <div className="text-center py-16 text-gray-500">
+                <Target className="w-12 h-12 mx-auto mb-4 opacity-50" />
+                <p>No templates configured yet.</p>
+              </div>
+            ) : (
+              templates.map((template) => (
+                <div key={template.id} className="bg-gray-800 border border-gray-700 rounded-lg p-6">
+                  <div className="flex items-start justify-between mb-4">
+                    <div className="flex-1">
+                      <h3 className="text-lg font-semibold text-white mb-2">{template.name}</h3>
+                      <p className="text-sm text-gray-400 mb-1">{template.category}</p>
+                      {template.subject_line && (
+                        <p className="text-xs text-gray-500">Subject: {template.subject_line}</p>
+                      )}
+                    </div>
                     <span
                       className={clsx(
                         'px-3 py-1 rounded text-xs font-medium',
-                        template.difficulty === 'Hard'
+                        template.difficulty === 'hard' || template.difficulty === 'Hard'
                           ? 'bg-red-900/40 text-red-300'
-                          : template.difficulty === 'Medium'
+                          : template.difficulty === 'medium' || template.difficulty === 'Medium'
                             ? 'bg-yellow-900/40 text-yellow-300'
                             : 'bg-green-900/40 text-green-300'
                       )}
@@ -278,304 +430,264 @@ export default function PhishingSimulation() {
                       {template.difficulty} Difficulty
                     </span>
                   </div>
-                </div>
-
-                <div className="grid grid-cols-3 gap-4">
-                  <div>
-                    <p className="text-xs text-gray-400 mb-1">Effectiveness</p>
-                    <div className="flex items-center gap-2">
-                      <div className="flex-1 h-2 bg-gray-700 rounded-full dark:bg-gray-700">
-                        <div className="h-full bg-orange-500 rounded-full" style={{ width: `${template.effectiveness}%` }} />
-                      </div>
-                      <span className="text-sm font-semibold text-white">{template.effectiveness}%</span>
-                    </div>
-                  </div>
-                  <div>
-                    <p className="text-xs text-gray-400 mb-1">Times Used</p>
-                    <p className="text-xl font-bold text-white">{template.used.toLocaleString()}</p>
-                  </div>
-                  <button
-                    onClick={() => {
-                      setShowModal(true);
-                    }}
-                    className="text-blue-400 hover:text-blue-300 font-medium text-sm transition-colors mt-4"
-                  >
-                    Use Template →
-                  </button>
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-
-        {/* Target Groups Tab */}
-        {activeTab === 'groups' && (
-          <div>
-            <div className="mb-8">
-              <div className="bg-gray-800 border border-gray-700 rounded-lg p-6 dark:bg-gray-800 dark:border-gray-700">
-                <h3 className="text-lg font-semibold mb-4">Department Risk Comparison</h3>
-                <ResponsiveContainer width="100%" height={300}>
-                  <BarChart data={departmentRiskData}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
-                    <XAxis dataKey="department" stroke="#9CA3AF" />
-                    <YAxis stroke="#9CA3AF" label={{ value: 'Awareness Score', angle: -90, position: 'insideLeft' }} />
-                    <Tooltip contentStyle={{ backgroundColor: '#1F2937', border: '1px solid #374151', borderRadius: '8px' }} />
-                    <Bar dataKey="risk" fill="#3B82F6" />
-                  </BarChart>
-                </ResponsiveContainer>
-              </div>
-            </div>
-
-            <div className="grid grid-cols-1 gap-4">
-              {targetGroups.map((group: TargetGroup) => (
-                <div key={group.id} className="bg-gray-800 border border-gray-700 rounded-lg p-6 dark:bg-gray-800 dark:border-gray-700">
-                  <div className="flex items-start justify-between mb-4">
-                    <div className="flex-1">
-                      <h3 className="text-lg font-semibold text-white mb-2">{group.name}</h3>
-                      <p className="text-sm text-gray-400">Size: {group.size} employees | Last campaign: {group.lastCampaign}</p>
-                    </div>
-                    <span
-                      className={clsx(
-                        'px-3 py-1 rounded text-xs font-medium',
-                        group.riskLevel === 'Critical'
-                          ? 'bg-red-900/40 text-red-300'
-                          : group.riskLevel === 'High'
-                            ? 'bg-orange-900/40 text-orange-300'
-                            : group.riskLevel === 'Medium'
-                              ? 'bg-yellow-900/40 text-yellow-300'
-                              : 'bg-green-900/40 text-green-300'
-                      )}
-                    >
-                      {group.riskLevel} Risk
-                    </span>
-                  </div>
 
                   <div className="grid grid-cols-3 gap-4">
                     <div>
-                      <p className="text-xs text-gray-400 mb-1">Awareness Score</p>
-                      <p className="text-2xl font-bold text-blue-400">{group.avgAwarenessScore}</p>
+                      <p className="text-xs text-gray-400 mb-1">Avg Click Rate</p>
+                      <div className="flex items-center gap-2">
+                        <div className="flex-1 h-2 bg-gray-700 rounded-full">
+                          <div className="h-full bg-orange-500 rounded-full" style={{ width: `${Math.min(template.average_click_rate * 100, 100)}%` }} />
+                        </div>
+                        <span className="text-sm font-semibold text-white">{(template.average_click_rate * 100).toFixed(1)}%</span>
+                      </div>
                     </div>
                     <div>
-                      <p className="text-xs text-gray-400 mb-1">Team Size</p>
-                      <p className="text-2xl font-bold text-white">{group.size}</p>
+                      <p className="text-xs text-gray-400 mb-1">Times Used</p>
+                      <p className="text-xl font-bold text-white">{(template.usage_count || 0).toLocaleString()}</p>
                     </div>
                     <button
-                      onClick={async () => {
-                        try {
-                          await phishingApi.launchCampaign(group.id);
-                        } catch (err) {
-                          console.error('Launch campaign failed:', err);
-                        }
-                      }}
+                      onClick={() => setShowModal(true)}
                       className="text-blue-400 hover:text-blue-300 font-medium text-sm transition-colors mt-4"
                     >
-                      Launch Campaign →
+                      Use Template &rarr;
                     </button>
                   </div>
                 </div>
-              ))}
-            </div>
+              ))
+            )}
           </div>
         )}
 
-        {/* Awareness Scores Tab */}
+        {/* ================================================================= */}
+        {/* Target Groups Tab                                                  */}
+        {/* ================================================================= */}
+        {activeTab === 'groups' && (
+          <div>
+            {/* Department Risk Chart */}
+            {departmentRiskData.length > 0 && (
+              <div className="mb-8">
+                <div className="bg-gray-800 border border-gray-700 rounded-lg p-6">
+                  <h3 className="text-lg font-semibold mb-4">Department Awareness Comparison</h3>
+                  <ResponsiveContainer width="100%" height={300}>
+                    <BarChart data={departmentRiskData}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                      <XAxis dataKey="department" stroke="#9CA3AF" />
+                      <YAxis stroke="#9CA3AF" label={{ value: 'Awareness Score', angle: -90, position: 'insideLeft' }} />
+                      <Tooltip contentStyle={{ backgroundColor: '#1F2937', border: '1px solid #374151', borderRadius: '8px' }} />
+                      <Bar dataKey="score" fill="#3B82F6" />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+            )}
+
+            {/* Group List */}
+            {targetGroups.length === 0 ? (
+              <div className="text-center py-16 text-gray-500">
+                <Users className="w-12 h-12 mx-auto mb-4 opacity-50" />
+                <p>No target groups configured yet.</p>
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 gap-4">
+                {targetGroups.map((group) => (
+                  <div key={group.id} className="bg-gray-800 border border-gray-700 rounded-lg p-6">
+                    <div className="flex items-start justify-between mb-4">
+                      <div className="flex-1">
+                        <h3 className="text-lg font-semibold text-white mb-2">{group.name}</h3>
+                        <p className="text-sm text-gray-400">
+                          {group.member_count} members
+                          {group.department && ` | ${group.department}`}
+                          {group.last_campaign_date && ` | Last campaign: ${new Date(group.last_campaign_date).toLocaleDateString()}`}
+                        </p>
+                      </div>
+                      <span
+                        className={clsx(
+                          'px-3 py-1 rounded text-xs font-medium',
+                          group.risk_level === 'critical'
+                            ? 'bg-red-900/40 text-red-300'
+                            : group.risk_level === 'high'
+                              ? 'bg-orange-900/40 text-orange-300'
+                              : group.risk_level === 'medium'
+                                ? 'bg-yellow-900/40 text-yellow-300'
+                                : 'bg-green-900/40 text-green-300'
+                        )}
+                      >
+                        {group.risk_level || 'Unknown'} Risk
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-3 gap-4">
+                      <div>
+                        <p className="text-xs text-gray-400 mb-1">Avg Click Rate</p>
+                        <p className="text-2xl font-bold text-yellow-400">{(group.avg_click_rate * 100).toFixed(1)}%</p>
+                      </div>
+                      <div>
+                        <p className="text-xs text-gray-400 mb-1">Campaigns</p>
+                        <p className="text-2xl font-bold text-white">{group.campaigns_participated}</p>
+                      </div>
+                      <div>
+                        <p className="text-xs text-gray-400 mb-1">Team Size</p>
+                        <p className="text-2xl font-bold text-white">{group.member_count}</p>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ================================================================= */}
+        {/* Awareness Scores Tab                                               */}
+        {/* ================================================================= */}
         {activeTab === 'awareness' && (
           <div>
-            <div className="mb-8">
-              <div className="bg-gray-800 border border-gray-700 rounded-lg p-6 dark:bg-gray-800 dark:border-gray-700">
-                <h3 className="text-lg font-semibold mb-4">Awareness Score Trend</h3>
-                <ResponsiveContainer width="100%" height={300}>
-                  <LineChart data={awarenessData}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
-                    <XAxis dataKey="month" stroke="#9CA3AF" />
-                    <YAxis stroke="#9CA3AF" />
-                    <Tooltip contentStyle={{ backgroundColor: '#1F2937', border: '1px solid #374151', borderRadius: '8px' }} />
-                    <Line type="monotone" dataKey="score" stroke="#10B981" strokeWidth={2} />
-                  </LineChart>
-                </ResponsiveContainer>
+            {/* Department Awareness Chart */}
+            {departmentRiskData.length > 0 && (
+              <div className="mb-8">
+                <div className="bg-gray-800 border border-gray-700 rounded-lg p-6">
+                  <h3 className="text-lg font-semibold mb-4">Awareness Score by Department</h3>
+                  <ResponsiveContainer width="100%" height={300}>
+                    <LineChart data={departmentRiskData}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                      <XAxis dataKey="department" stroke="#9CA3AF" />
+                      <YAxis stroke="#9CA3AF" />
+                      <Tooltip contentStyle={{ backgroundColor: '#1F2937', border: '1px solid #374151', borderRadius: '8px' }} />
+                      <Line type="monotone" dataKey="score" stroke="#10B981" strokeWidth={2} />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
               </div>
-            </div>
+            )}
 
-            <div className="bg-gray-800 border border-gray-700 rounded-lg overflow-hidden dark:bg-gray-800 dark:border-gray-700">
-              <table className="w-full">
-                <thead className="bg-gray-700/50 border-b border-gray-700">
-                  <tr>
-                    <th className="px-6 py-4 text-left text-sm font-semibold text-gray-300">Employee</th>
-                    <th className="px-6 py-4 text-left text-sm font-semibold text-gray-300">Department</th>
-                    <th className="px-6 py-4 text-left text-sm font-semibold text-gray-300">Score</th>
-                    <th className="px-6 py-4 text-left text-sm font-semibold text-gray-300">Trend</th>
-                    <th className="px-6 py-4 text-left text-sm font-semibold text-gray-300">Last Assessment</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {awarenessScores.map((score: AwarenessScore) => (
-                    <tr key={score.id} className="border-t border-gray-700 hover:bg-gray-700/50">
-                      <td className="px-6 py-4 text-sm font-medium text-white">{score.name}</td>
-                      <td className="px-6 py-4 text-sm text-gray-300">{score.department}</td>
-                      <td className="px-6 py-4 text-sm">
-                        <div className="flex items-center gap-2">
-                          <div className="w-20 h-2 bg-gray-700 rounded-full dark:bg-gray-700">
-                            <div
-                              className="h-full bg-blue-500 rounded-full"
-                              style={{ width: `${score.score}%` }}
-                            />
-                          </div>
-                          <span className={clsx('font-semibold', score.score >= 75 ? 'text-green-400' : score.score >= 50 ? 'text-yellow-400' : 'text-red-400')}>
-                            {score.score}
-                          </span>
-                        </div>
-                      </td>
-                      <td className="px-6 py-4 text-sm">
-                        <span
-                          className={clsx(
-                            'px-2 py-1 rounded text-xs font-medium',
-                            score.trend === 'up'
-                              ? 'bg-green-900/40 text-green-300'
-                              : score.trend === 'down'
-                                ? 'bg-red-900/40 text-red-300'
-                                : 'bg-gray-900/40 text-gray-300'
-                          )}
-                        >
-                          {score.trend === 'up' ? '↑' : score.trend === 'down' ? '↓' : '→'} {score.trend}
-                        </span>
-                      </td>
-                      <td className="px-6 py-4 text-sm text-gray-400">{score.lastAssessment}</td>
+            {/* Scores Table */}
+            {awarenessScores.length === 0 ? (
+              <div className="text-center py-16 text-gray-500">
+                <TrendingUp className="w-12 h-12 mx-auto mb-4 opacity-50" />
+                <p>No awareness scores calculated yet.</p>
+              </div>
+            ) : (
+              <div className="bg-gray-800 border border-gray-700 rounded-lg overflow-hidden">
+                <table className="w-full">
+                  <thead className="bg-gray-700/50 border-b border-gray-700">
+                    <tr>
+                      <th className="px-6 py-4 text-left text-sm font-semibold text-gray-300">User</th>
+                      <th className="px-6 py-4 text-left text-sm font-semibold text-gray-300">Department</th>
+                      <th className="px-6 py-4 text-left text-sm font-semibold text-gray-300">Score</th>
+                      <th className="px-6 py-4 text-left text-sm font-semibold text-gray-300">Risk</th>
+                      <th className="px-6 py-4 text-left text-sm font-semibold text-gray-300">Campaigns</th>
+                      <th className="px-6 py-4 text-left text-sm font-semibold text-gray-300">Clicked</th>
+                      <th className="px-6 py-4 text-left text-sm font-semibold text-gray-300">Reported</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+                  </thead>
+                  <tbody>
+                    {awarenessScores.map((score) => (
+                      <tr key={score.id} className="border-t border-gray-700 hover:bg-gray-700/50">
+                        <td className="px-6 py-4 text-sm">
+                          <div>
+                            <p className="font-medium text-white">{score.user_name || score.user_email}</p>
+                            <p className="text-xs text-gray-500">{score.user_email}</p>
+                          </div>
+                        </td>
+                        <td className="px-6 py-4 text-sm text-gray-300">{score.department || '--'}</td>
+                        <td className="px-6 py-4 text-sm">
+                          <div className="flex items-center gap-2">
+                            <div className="w-20 h-2 bg-gray-700 rounded-full">
+                              <div
+                                className="h-full bg-blue-500 rounded-full"
+                                style={{ width: `${score.overall_score}%` }}
+                              />
+                            </div>
+                            <span className={clsx('font-semibold', score.overall_score >= 75 ? 'text-green-400' : score.overall_score >= 50 ? 'text-yellow-400' : 'text-red-400')}>
+                              {score.overall_score}
+                            </span>
+                          </div>
+                        </td>
+                        <td className="px-6 py-4 text-sm">
+                          <span
+                            className={clsx(
+                              'px-2 py-1 rounded text-xs font-medium',
+                              score.risk_category === 'high' || score.risk_category === 'critical'
+                                ? 'bg-red-900/40 text-red-300'
+                                : score.risk_category === 'medium'
+                                  ? 'bg-yellow-900/40 text-yellow-300'
+                                  : 'bg-green-900/40 text-green-300'
+                            )}
+                          >
+                            {score.risk_category || 'unknown'}
+                          </span>
+                        </td>
+                        <td className="px-6 py-4 text-sm text-gray-300">{score.campaigns_participated}</td>
+                        <td className="px-6 py-4 text-sm text-red-400">{score.times_clicked}</td>
+                        <td className="px-6 py-4 text-sm text-green-400">{score.times_reported}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
           </div>
         )}
 
-        {/* Training Tab */}
+        {/* ================================================================= */}
+        {/* Training Tab                                                       */}
+        {/* ================================================================= */}
         {activeTab === 'training' && (
           <div className="space-y-4">
-            {trainingData.map((training) => (
-              <div key={training.id} className="bg-gray-800 border border-gray-700 rounded-lg p-6 dark:bg-gray-800 dark:border-gray-700">
-                <div className="flex items-start justify-between mb-4">
-                  <div className="flex-1">
-                    <h3 className="text-lg font-semibold text-white mb-2">{training.title}</h3>
-                    <p className="text-sm text-gray-400">Duration: {training.duration}</p>
-                  </div>
-                  <div className="text-right">
+            {trainingData.length === 0 ? (
+              <div className="text-center py-16 text-gray-500">
+                <Award className="w-12 h-12 mx-auto mb-4 opacity-50" />
+                <p>No training modules available.</p>
+              </div>
+            ) : (
+              trainingData.map((training) => (
+                <div key={training.id} className="bg-gray-800 border border-gray-700 rounded-lg p-6">
+                  <div className="flex items-start justify-between mb-4">
+                    <div className="flex-1">
+                      <h3 className="text-lg font-semibold text-white mb-2">{training.title}</h3>
+                      <p className="text-sm text-gray-400">Duration: {training.duration}</p>
+                    </div>
                     {training.certification && (
-                      <span className="px-3 py-1 rounded text-xs font-medium bg-blue-900/40 text-blue-300 flex items-center gap-1 w-fit ml-auto mb-2">
+                      <span className="px-3 py-1 rounded text-xs font-medium bg-blue-900/40 text-blue-300 flex items-center gap-1">
                         <Award className="w-3 h-3" />
                         Certification
                       </span>
                     )}
                   </div>
-                </div>
 
-                <div className="grid grid-cols-3 gap-4">
-                  <div>
-                    <p className="text-xs text-gray-400 mb-1">Completions</p>
-                    <p className="text-2xl font-bold text-white">{training.completions.toLocaleString()}</p>
-                  </div>
-                  <div className="col-span-2">
-                    <p className="text-xs text-gray-400 mb-2">Completion Rate</p>
-                    <div className="flex items-center gap-2">
-                      <div className="flex-1 h-3 bg-gray-700 rounded-full dark:bg-gray-700">
-                        <div
-                          className="h-full bg-green-500 rounded-full"
-                          style={{ width: `${Math.min((training.completions / 1500) * 100, 100)}%` }}
-                        />
+                  <div className="grid grid-cols-3 gap-4">
+                    <div>
+                      <p className="text-xs text-gray-400 mb-1">Completions</p>
+                      <p className="text-2xl font-bold text-white">{training.completions.toLocaleString()}</p>
+                    </div>
+                    <div className="col-span-2">
+                      <p className="text-xs text-gray-400 mb-2">Completion Rate</p>
+                      <div className="flex items-center gap-2">
+                        <div className="flex-1 h-3 bg-gray-700 rounded-full">
+                          <div
+                            className="h-full bg-green-500 rounded-full"
+                            style={{ width: `${Math.min((training.completions / 1500) * 100, 100)}%` }}
+                          />
+                        </div>
+                        <span className="text-sm text-gray-400">{Math.min(Math.round((training.completions / 1500) * 100), 100)}%</span>
                       </div>
-                      <button
-                        onClick={() => setSelectedTraining(training)}
-                        className="text-blue-400 hover:text-blue-300 text-sm font-medium transition-colors"
-                      >
-                        View →
-                      </button>
                     </div>
                   </div>
                 </div>
-              </div>
-            ))}
+              ))
+            )}
           </div>
         )}
 
-        {/* Training Detail Modal */}
-        {selectedTraining && (
-          <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-            <div className="bg-gray-800 border border-gray-700 rounded-lg p-8 max-w-md w-full dark:bg-gray-800 dark:border-gray-700">
-              <div className="flex justify-between items-center mb-6">
-                <h2 className="text-xl font-bold text-white">{selectedTraining.title}</h2>
-                <button onClick={() => setSelectedTraining(null)} className="text-gray-400 hover:text-white transition-colors">
-                  <X className="w-5 h-5" />
-                </button>
-              </div>
-              <div className="space-y-4">
-                <div><p className="text-sm text-gray-400">Training ID</p><p className="text-white font-mono">{selectedTraining.id}</p></div>
-                <div><p className="text-sm text-gray-400">Duration</p><p className="text-white">{selectedTraining.duration}</p></div>
-                <div><p className="text-sm text-gray-400">Completions</p><p className="text-2xl font-bold text-white">{selectedTraining.completions.toLocaleString()}</p></div>
-                <div><p className="text-sm text-gray-400">Certification</p><p className="text-white">{selectedTraining.certification ? 'Yes' : 'No'}</p></div>
-              </div>
-              <button onClick={() => setSelectedTraining(null)} className="w-full bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded mt-6 transition-colors">Close</button>
-            </div>
-          </div>
-        )}
-
-        {/* Modal */}
-        {showModal && (
-          <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-            <div className="bg-gray-800 border border-gray-700 rounded-lg p-8 max-w-md w-full dark:bg-gray-800 dark:border-gray-700">
-              <div className="flex justify-between items-center mb-6">
-                <h2 className="text-xl font-bold text-white">New Campaign</h2>
-                <button
-                  onClick={() => setShowModal(false)}
-                  className="text-gray-400 hover:text-white transition-colors"
-                >
-                  <X className="w-5 h-5" />
-                </button>
-              </div>
-
-              <form className="space-y-4" onSubmit={async (e) => {
-                e.preventDefault();
-                const fd = new FormData(e.currentTarget);
-                try {
-                  await phishingApi.createCampaign({ name: fd.get('name') as string, description: fd.get('template') as string, targets: [(fd.get('group') as string) || 'all'] });
-                  setShowModal(false);
-                  loadData();
-                } catch (err) { console.error('Create campaign failed:', err); }
-              }}>
-                <div>
-                  <label className="block text-sm font-medium text-gray-300 mb-2">Campaign Name</label>
-                  <input name="name" required type="text" className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white placeholder-gray-500" placeholder="e.g., Invoice Scam Q2" />
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-gray-300 mb-2">Template</label>
-                  <select name="template" className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white">
-                    <option value="">Select a template...</option>
-                    {templates.map((t: any) => (<option key={t.id} value={t.name}>{t.name}</option>))}
-                  </select>
-                </div>
-                <div>
-                  <label className="block text-sm font-medium text-gray-300 mb-2">Target Group</label>
-                  <select name="group" className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white">
-                    <option value="">Select a group...</option>
-                    {targetGroups.map((g: any) => (<option key={g.id} value={g.name}>{g.name}</option>))}
-                  </select>
-                </div>
-                <div className="flex gap-4 mt-6">
-                  <button type="button" onClick={() => setShowModal(false)} className="flex-1 bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded transition-colors">Cancel</button>
-                  <button type="submit" className="flex-1 bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded transition-colors">Create Campaign</button>
-                </div>
-              </form>
-            </div>
-          </div>
-        )}
-
+        {/* ================================================================= */}
+        {/* Campaign Detail Modal                                              */}
+        {/* ================================================================= */}
         {selectedCampaign && (
           <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-            <div className="bg-gray-800 border border-gray-700 rounded-lg p-8 max-w-md w-full dark:bg-gray-800 dark:border-gray-700">
+            <div className="bg-gray-800 border border-gray-700 rounded-lg p-8 max-w-md w-full">
               <div className="flex justify-between items-center mb-6">
                 <h2 className="text-xl font-bold text-white">{selectedCampaign.name}</h2>
-                <button
-                  onClick={() => setSelectedCampaign(null)}
-                  className="text-gray-400 hover:text-white transition-colors"
-                >
+                <button onClick={() => setSelectedCampaign(null)} className="text-gray-400 hover:text-white transition-colors">
                   <X className="w-5 h-5" />
                 </button>
               </div>
@@ -586,16 +698,20 @@ export default function PhishingSimulation() {
                   <p className="text-white font-medium">{selectedCampaign.status}</p>
                 </div>
                 <div>
+                  <p className="text-sm text-gray-400">Type</p>
+                  <p className="text-white font-medium">{selectedCampaign.campaign_type}</p>
+                </div>
+                <div>
                   <p className="text-sm text-gray-400">Click Rate</p>
-                  <p className="text-2xl font-bold text-yellow-400">{selectedCampaign.clickRate}%</p>
+                  <p className="text-2xl font-bold text-yellow-400">{safeRate(selectedCampaign.links_clicked, selectedCampaign.emails_sent)}%</p>
                 </div>
                 <div>
                   <p className="text-sm text-gray-400">Report Rate</p>
-                  <p className="text-2xl font-bold text-green-400">{selectedCampaign.reportRate}%</p>
+                  <p className="text-2xl font-bold text-green-400">{safeRate(selectedCampaign.reported_count, selectedCampaign.emails_sent)}%</p>
                 </div>
                 <div>
                   <p className="text-sm text-gray-400">Total Sent</p>
-                  <p className="text-white font-medium">{selectedCampaign.sent.toLocaleString()}</p>
+                  <p className="text-white font-medium">{(selectedCampaign.emails_sent || 0).toLocaleString()}</p>
                 </div>
               </div>
 
@@ -605,6 +721,65 @@ export default function PhishingSimulation() {
               >
                 Close
               </button>
+            </div>
+          </div>
+        )}
+
+        {/* ================================================================= */}
+        {/* New Campaign Modal                                                 */}
+        {/* ================================================================= */}
+        {showModal && (
+          <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+            <div className="bg-gray-800 border border-gray-700 rounded-lg p-8 max-w-md w-full">
+              <div className="flex justify-between items-center mb-6">
+                <h2 className="text-xl font-bold text-white">New Campaign</h2>
+                <button onClick={() => setShowModal(false)} className="text-gray-400 hover:text-white transition-colors">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <form className="space-y-4" onSubmit={async (e) => {
+                e.preventDefault();
+                const fd = new FormData(e.currentTarget);
+                createCampaignMutation.mutate({
+                  name: fd.get('name') as string,
+                  description: (fd.get('description') as string) || '',
+                  campaign_type: (fd.get('campaign_type') as string) || 'email_phishing',
+                  target_group_id: (fd.get('group') as string) || '',
+                });
+              }}>
+                <div>
+                  <label className="block text-sm font-medium text-gray-300 mb-2">Campaign Name</label>
+                  <input name="name" required type="text" className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white placeholder-gray-500" placeholder="e.g., Invoice Scam Q2" />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-300 mb-2">Description</label>
+                  <input name="description" type="text" className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white placeholder-gray-500" placeholder="Campaign description" />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-300 mb-2">Campaign Type</label>
+                  <select name="campaign_type" className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white">
+                    <option value="email_phishing">Email Phishing</option>
+                    <option value="spear_phishing">Spear Phishing</option>
+                    <option value="smishing">Smishing</option>
+                    <option value="vishing">Vishing</option>
+                    <option value="business_email_compromise">Business Email Compromise</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-300 mb-2">Target Group</label>
+                  <select name="group" className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white">
+                    <option value="">Select a group...</option>
+                    {targetGroups.map((g) => (<option key={g.id} value={g.id}>{g.name}</option>))}
+                  </select>
+                </div>
+                <div className="flex gap-4 mt-6">
+                  <button type="button" onClick={() => setShowModal(false)} className="flex-1 bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded transition-colors">Cancel</button>
+                  <button type="submit" disabled={createCampaignMutation.isPending} className="flex-1 bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded transition-colors disabled:opacity-50">
+                    {createCampaignMutation.isPending ? 'Creating...' : 'Create Campaign'}
+                  </button>
+                </div>
+              </form>
             </div>
           </div>
         )}
