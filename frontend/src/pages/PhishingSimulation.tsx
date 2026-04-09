@@ -106,6 +106,8 @@ export default function PhishingSimulation() {
   const [activeTab, setActiveTab] = useState<'campaigns' | 'templates' | 'groups' | 'awareness' | 'training'>('campaigns');
   const [selectedCampaign, setSelectedCampaign] = useState<Campaign | null>(null);
   const [showModal, setShowModal] = useState(false);
+  const [showGroupModal, setShowGroupModal] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
 
   // ---------------------------------------------------------------------------
   // Queries
@@ -148,13 +150,31 @@ export default function PhishingSimulation() {
   // ---------------------------------------------------------------------------
 
   const createCampaignMutation = useMutation({
-    mutationFn: async (data: { name: string; description: string; campaign_type: string; target_group_id: string }) => {
-      const res = await api.post('/phishing_sim/campaigns', data);
+    mutationFn: async (data: { name: string; description: string; campaign_type: string; target_group_id: string | null }) => {
+      const payload: any = { name: data.name, description: data.description, campaign_type: data.campaign_type };
+      if (data.target_group_id) payload.target_group_id = data.target_group_id;
+      const res = await api.post('/phishing_sim/campaigns', payload);
       return res.data;
     },
     onSuccess: () => {
       setShowModal(false);
+      setCreateError(null);
       queryClient.invalidateQueries({ queryKey: ['phishing-campaigns'] });
+    },
+    onError: (err: any) => {
+      const msg = err?.response?.data?.detail || err?.message || 'Failed to create campaign';
+      setCreateError(typeof msg === 'string' ? msg : JSON.stringify(msg));
+    },
+  });
+
+  const createGroupMutation = useMutation({
+    mutationFn: async (data: { name: string; description: string; department: string }) => {
+      const res = await api.post('/phishing_sim/target-groups', data);
+      return res.data;
+    },
+    onSuccess: () => {
+      setShowGroupModal(false);
+      queryClient.invalidateQueries({ queryKey: ['phishing-target-groups'] });
     },
   });
 
@@ -463,6 +483,15 @@ export default function PhishingSimulation() {
         {/* ================================================================= */}
         {activeTab === 'groups' && (
           <div>
+            <div className="mb-6 flex justify-end">
+              <button
+                onClick={() => setShowGroupModal(true)}
+                className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded flex items-center gap-2 transition-colors"
+              >
+                <Plus className="w-4 h-4" />
+                New Target Group
+              </button>
+            </div>
             {/* Department Risk Chart */}
             {departmentRiskData.length > 0 && (
               <div className="mb-8">
@@ -738,14 +767,20 @@ export default function PhishingSimulation() {
                 </button>
               </div>
 
+              {createError && (
+                <div className="bg-red-900/30 border border-red-700 rounded p-3 text-sm text-red-300 mb-4">{createError}</div>
+              )}
+
               <form className="space-y-4" onSubmit={async (e) => {
                 e.preventDefault();
+                setCreateError(null);
                 const fd = new FormData(e.currentTarget);
+                const groupVal = fd.get('group') as string;
                 createCampaignMutation.mutate({
                   name: fd.get('name') as string,
                   description: (fd.get('description') as string) || '',
                   campaign_type: (fd.get('campaign_type') as string) || 'email_phishing',
-                  target_group_id: (fd.get('group') as string) || '',
+                  target_group_id: groupVal || null,
                 });
               }}>
                 <div>
@@ -769,14 +804,57 @@ export default function PhishingSimulation() {
                 <div>
                   <label className="block text-sm font-medium text-gray-300 mb-2">Target Group</label>
                   <select name="group" className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white">
-                    <option value="">Select a group...</option>
+                    <option value="">{targetGroups.length === 0 ? 'No groups — create one first' : 'Select a group (optional)...'}</option>
                     {targetGroups.map((g) => (<option key={g.id} value={g.id}>{g.name}</option>))}
                   </select>
                 </div>
                 <div className="flex gap-4 mt-6">
-                  <button type="button" onClick={() => setShowModal(false)} className="flex-1 bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded transition-colors">Cancel</button>
+                  <button type="button" onClick={() => { setShowModal(false); setCreateError(null); }} className="flex-1 bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded transition-colors">Cancel</button>
                   <button type="submit" disabled={createCampaignMutation.isPending} className="flex-1 bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded transition-colors disabled:opacity-50">
                     {createCampaignMutation.isPending ? 'Creating...' : 'Create Campaign'}
+                  </button>
+                </div>
+              </form>
+            </div>
+          </div>
+        )}
+
+        {/* Create Target Group Modal */}
+        {showGroupModal && (
+          <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+            <div className="bg-gray-800 border border-gray-700 rounded-lg p-8 max-w-md w-full">
+              <div className="flex justify-between items-center mb-6">
+                <h2 className="text-xl font-bold text-white">New Target Group</h2>
+                <button onClick={() => setShowGroupModal(false)} className="text-gray-400 hover:text-white transition-colors">
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <form className="space-y-4" onSubmit={(e) => {
+                e.preventDefault();
+                const fd = new FormData(e.currentTarget);
+                createGroupMutation.mutate({
+                  name: fd.get('name') as string,
+                  description: (fd.get('description') as string) || '',
+                  department: (fd.get('department') as string) || '',
+                });
+              }}>
+                <div>
+                  <label className="block text-sm font-medium text-gray-300 mb-2">Group Name</label>
+                  <input name="name" required type="text" className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white placeholder-gray-500" placeholder="e.g., Engineering Team" />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-300 mb-2">Description</label>
+                  <input name="description" type="text" className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white placeholder-gray-500" placeholder="Group description" />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-300 mb-2">Department</label>
+                  <input name="department" type="text" className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white placeholder-gray-500" placeholder="e.g., Engineering, Finance, HR" />
+                </div>
+                <div className="flex gap-4 mt-6">
+                  <button type="button" onClick={() => setShowGroupModal(false)} className="flex-1 bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded transition-colors">Cancel</button>
+                  <button type="submit" disabled={createGroupMutation.isPending} className="flex-1 bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded transition-colors disabled:opacity-50">
+                    {createGroupMutation.isPending ? 'Creating...' : 'Create Group'}
                   </button>
                 </div>
               </form>
