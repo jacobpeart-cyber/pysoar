@@ -14,6 +14,7 @@ from sqlalchemy import select, and_, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.logging import get_logger
+from src.services.automation import AutomationService
 from src.api.deps import get_current_active_user as get_current_user
 from src.core.database import get_db
 from src.schemas.compliance import (
@@ -398,6 +399,19 @@ async def update_control(
 
     await db.commit()
     await db.refresh(control)
+
+    # Trigger automation if control is non-compliant or not implemented
+    if req.status in ("non_compliant", "not_implemented"):
+        try:
+            org_id = getattr(current_user, "organization_id", None)
+            automation = AutomationService(db)
+            await automation.on_compliance_failure(
+                control_id=control.control_id,
+                control_title=control.title,
+                organization_id=org_id,
+            )
+        except Exception as e:
+            logger.error(f"Automation on_compliance_failure failed: {e}", exc_info=True)
 
     return control
 

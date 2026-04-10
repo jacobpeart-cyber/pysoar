@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.deps import CurrentUser, DatabaseSession
 from src.core.database import async_session_factory
 from src.core.logging import get_logger
+from src.services.automation import AutomationService
 from src.itdr.models import (
     IdentityProfile,
     IdentityThreat,
@@ -364,6 +365,20 @@ async def create_threat(
     db.add(threat)
     await db.commit()
     await db.refresh(threat)
+
+    # Trigger automation rules
+    try:
+        org_id = getattr(current_user, "organization_id", None)
+        automation = AutomationService(db)
+        await automation.on_itdr_threat(
+            threat_type=threat.threat_type,
+            identity=threat.identity_id or "unknown",
+            risk_level=threat.severity or "high",
+            organization_id=org_id,
+        )
+    except Exception as e:
+        logger.error(f"Automation failed for ITDR threat {threat.id}: {e}")
+
     logger.warning(f"Identity threat created: {threat.threat_type} ({threat.severity})")
     return IdentityThreatResponse.model_validate(threat)
 

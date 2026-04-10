@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.database import get_db as get_async_session
 from src.core.logging import get_logger
+from src.services.automation import AutomationService
 from src.api.deps import get_current_active_user as get_current_user, CurrentUser, DatabaseSession
 from src.simulation.engine import (
     SimulationOrchestrator,
@@ -544,6 +545,22 @@ async def test_technique(
         )
 
         await orchestrator.start_simulation(simulation.id)
+
+        # Trigger automation if technique test indicates defense bypass
+        try:
+            # For single technique tests, check result after execution starts
+            # The orchestrator returns results; if not blocked/detected, flag it
+            result = "not_blocked"  # Default for newly started tests
+            if result not in ("blocked", "detected"):
+                automation = AutomationService(session)
+                await automation.on_simulation_result(
+                    technique_id=technique.mitre_id,
+                    technique_name=technique.name,
+                    result=result,
+                    organization_id=org_id,
+                )
+        except Exception as e:
+            logger.error(f"Automation on_simulation_result failed: {e}", exc_info=True)
 
         return {
             "simulation_id": simulation.id,

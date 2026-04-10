@@ -21,6 +21,7 @@ from src.schemas.alert import (
     AlertUpdate,
 )
 from src.services.alert_correlation import process_new_alert
+from src.services.automation import AutomationService
 from src.services.websocket_manager import notify_new_alert, create_notification_callback
 
 router = APIRouter(prefix="/alerts", tags=["Alerts"])
@@ -156,8 +157,20 @@ async def create_alert(alert_data: AlertCreate, current_user: CurrentUser = None
     # Send WebSocket notification
     background_tasks.add_task(notify_new_alert, response.model_dump())
 
-    # Process through correlation rules (may create incident)
-    background_tasks.add_task(process_alert_correlation, alert.id)
+    # Run central automation service (includes correlation, incident creation, playbooks)
+    try:
+        org_id = getattr(current_user, "organization_id", None) if current_user else None
+        automation = AutomationService(db)
+        await automation.on_alert_created(
+            alert,
+            organization_id=org_id,
+            created_by=str(current_user.id) if current_user else None,
+        )
+    except Exception as e:
+        # Fall back to legacy correlation if automation service fails
+        import logging
+        logging.getLogger(__name__).error(f"AutomationService on_alert_created failed: {e}", exc_info=True)
+        background_tasks.add_task(process_alert_correlation, alert.id)
 
     return response
 

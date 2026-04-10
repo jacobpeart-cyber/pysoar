@@ -16,6 +16,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DatabaseSession
 from src.core.database import async_session_factory
+from src.core.logging import get_logger
+from src.services.automation import AutomationService
 from src.ot_security.models import (
     OTAsset,
     OTAlert,
@@ -62,6 +64,7 @@ from src.schemas.ot_security import (
     AssetRisk,
 )
 
+logger = get_logger(__name__)
 router = APIRouter(prefix="/ot_security", tags=["OT Security"])
 
 
@@ -389,6 +392,19 @@ async def create_alert(
     db.add(alert)
     await db.commit()
     await db.refresh(alert)
+
+    # Trigger automation rules
+    try:
+        org_id = getattr(current_user, "organization_id", None)
+        automation = AutomationService(db)
+        await automation.on_ot_security_alert(
+            asset_name=alert_data.asset_id,
+            alert_type=alert.alert_type,
+            severity=alert.severity,
+            organization_id=org_id,
+        )
+    except Exception as e:
+        logger.error(f"Automation failed for OT alert {alert.id}: {e}")
 
     return OTAlertResponse.model_validate(alert)
 

@@ -19,6 +19,7 @@ def _org_filter(model, org_id):
     if org_id:
         return model.organization_id == org_id
     return True
+from src.services.automation import AutomationService
 from src.api.deps import CurrentUser, DatabaseSession, get_current_active_user, get_db
 from src.ueba.models import (
     EntityProfile,
@@ -661,6 +662,20 @@ async def ingest_event(
     db.add(behavior_event)
     await db.flush()
     await db.refresh(behavior_event)
+
+    # Fire automation for UEBA anomaly if the event is anomalous
+    if getattr(behavior_event, "is_anomalous", False):
+        try:
+            automation = AutomationService(db)
+            await automation.on_ueba_anomaly(
+                entity_type=entity.entity_type,
+                entity_id=entity.entity_id,
+                anomaly_type=event.event_type,
+                risk_score=entity.risk_score or 0.0,
+                organization_id=org_id,
+            )
+        except Exception as e:
+            logger.error(f"Automation failed for UEBA anomaly: {e}")
 
     return behavior_event
 

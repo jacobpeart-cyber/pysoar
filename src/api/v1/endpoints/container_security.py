@@ -14,6 +14,7 @@ from sqlalchemy import select, and_, func, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.logging import get_logger
+from src.services.automation import AutomationService
 from src.api.deps import get_current_active_user as get_current_user
 from src.core.database import get_db
 from src.schemas.container_security import (
@@ -270,6 +271,22 @@ async def scan_image(
 
     await db.commit()
     await db.refresh(image)
+
+    # Trigger automation for each critical/high vulnerability found
+    try:
+        automation = AutomationService(db)
+        image_name = f"{image.repository or ''}:{image.tag or 'latest'}"
+        for vuln in scan_result.get("vulnerabilities", []):
+            if vuln.get("severity") in ("critical", "high"):
+                await automation.on_container_finding(
+                    image_name=image_name,
+                    finding_type=vuln.get("cve_id", "vulnerability"),
+                    cve_id=vuln.get("cve_id", ""),
+                    severity=vuln.get("severity", "medium"),
+                    organization_id=org_id,
+                )
+    except Exception as e:
+        logger.error(f"Automation failed for container scan {image_id}: {e}")
 
     logger.info(
         f"Scan complete for image {image_id}: "
