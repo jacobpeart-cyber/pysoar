@@ -1119,10 +1119,10 @@ export const collaborationApi = {
     return extractData(response.data);
   },
 
-  createWarRoom: async (data: { title?: string; name?: string; description?: string; room_type?: string; severity_level?: string }): Promise<WarRoom> => {
+  createWarRoom: async (data: { name: string; description?: string; room_type?: string; severity_level?: string }): Promise<any> => {
     const response = await api.post('/collaboration/rooms', {
-      name: data.name || data.title || 'New Room',
-      room_type: data.room_type || 'incident',
+      name: data.name,
+      room_type: data.room_type || 'incident_response',
       severity_level: data.severity_level || 'medium',
       description: data.description || '',
     });
@@ -1137,31 +1137,62 @@ export const collaborationApi = {
     return extractData(response.data);
   },
 
-  getActionItems: async (warRoomId: string): Promise<ActionItem[]> => {
-    const response = await api.get(`/collaboration/rooms/${warRoomId}/action-items`);
+  getAllActionItems: async (): Promise<any[]> => {
+    // Get action items across all active rooms
+    try {
+      const roomsRes = await api.get('/collaboration/rooms', { params: { size: 50 } });
+      const rooms = extractData(roomsRes.data) ?? [];
+      const allItems: any[] = [];
+      for (const room of rooms) {
+        try {
+          const res = await api.get(`/collaboration/rooms/${room.id}/actions`);
+          const items = extractData(res.data) ?? [];
+          for (const item of items) {
+            allItems.push({ ...item, _room_name: room.name });
+          }
+        } catch { /* room may have no actions */ }
+      }
+      return allItems;
+    } catch { return []; }
+  },
+
+  getActionItems: async (warRoomId: string): Promise<any[]> => {
+    const response = await api.get(`/collaboration/rooms/${warRoomId}/actions`);
     return extractData(response.data);
   },
 
-  createActionItem: async (data: { title: string; priority: string }): Promise<any> => {
-    const response = await api.post('/collaboration/action-items', data);
+  createActionItem: async (roomId: string, data: { title: string; priority?: string; description?: string }): Promise<any> => {
+    const response = await api.post(`/collaboration/rooms/${roomId}/actions`, data);
     return response.data;
   },
 
-  sendMessage: async (warRoomId: string, data: { text: string }): Promise<any> => {
-    const response = await api.post(`/collaboration/rooms/${warRoomId}/messages`, data);
+  sendMessage: async (warRoomId: string, data: { content: string; message_type?: string }): Promise<any> => {
+    const response = await api.post(`/collaboration/rooms/${warRoomId}/messages`, {
+      content: data.content,
+      message_type: data.message_type || 'text',
+    });
     return response.data;
   },
 
-  closeWarRoom: async (warRoomId: string): Promise<any> => {
-    const response = await api.post(`/collaboration/rooms/${warRoomId}/close`);
+  archiveWarRoom: async (warRoomId: string): Promise<any> => {
+    const response = await api.post(`/collaboration/rooms/${warRoomId}/archive`);
     return response.data;
   },
 
-  getPostMortems: async (): Promise<any[]> => {
-    // Post-mortems are derived from closed/archived war rooms
+  getDashboard: async (): Promise<any> => {
+    const response = await api.get('/collaboration/dashboard');
+    return response.data;
+  },
+
+  getPostMortem: async (roomId: string): Promise<any> => {
+    const response = await api.get(`/collaboration/rooms/${roomId}/postmortem/analysis`);
+    return response.data;
+  },
+
+  getArchivedRooms: async (): Promise<any[]> => {
     try {
-      const response = await api.get('/collaboration/rooms', { params: { status: 'closed' } });
-      return extractData(response.data);
+      const response = await api.get('/collaboration/rooms', { params: { status: 'archived', size: 50 } });
+      return extractData(response.data) ?? [];
     } catch { return []; }
   },
 };
