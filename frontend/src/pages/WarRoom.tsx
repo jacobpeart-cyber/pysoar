@@ -1,94 +1,251 @@
-import React, { useState, useMemo } from 'react';
+import { useState, useMemo } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
   Shield,
-  MessageSquare,
   Users,
   Clock,
   FileText,
   Plus,
   X,
   Send,
-  Pin,
   AlertTriangle,
-  CheckCircle,
-  User,
+  Archive,
 } from 'lucide-react';
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts';
 import clsx from 'clsx';
 import { collaborationApi } from '../api/endpoints';
 
+// ---------------------------------------------------------------------------
+// Types matching backend response schemas
+// ---------------------------------------------------------------------------
+
+interface WarRoomType {
+  id: string;
+  name: string;
+  description: string | null;
+  room_type: string;
+  status: string; // active, standby, archived
+  severity_level: string;
+  commander_id: string | null;
+  participants: string[];
+  incident_id: string | null;
+  created_by: string;
+  created_at: string | null;
+  updated_at: string | null;
+}
+
+interface ActionItemType {
+  id: string;
+  room_id: string;
+  title: string;
+  description: string | null;
+  assigned_to: string | null;
+  assigned_by: string;
+  priority: string; // critical, high, medium, low
+  status: string; // pending, in_progress, completed, blocked, cancelled
+  due_date: string | null;
+  completed_at: string | null;
+  notes: string | null;
+  created_at: string | null;
+  _room_name?: string; // added by frontend aggregation
+}
+
+interface MessageType {
+  id: string;
+  room_id: string;
+  sender_id: string;
+  sender_name: string;
+  content: string;
+  message_type: string;
+  is_pinned: boolean;
+  created_at: string | null;
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function formatTime(dateStr: string | null | undefined): string {
+  if (!dateStr) return '--';
+  try {
+    return new Date(dateStr).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  } catch { return '--'; }
+}
+
+function formatDateTime(dateStr: string | null | undefined): string {
+  if (!dateStr) return '--';
+  try {
+    return new Date(dateStr).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  } catch { return '--'; }
+}
+
+const severityColors: Record<string, string> = {
+  critical: 'bg-red-900/60 text-red-200',
+  high: 'bg-orange-900/60 text-orange-200',
+  medium: 'bg-yellow-900/60 text-yellow-200',
+  low: 'bg-green-900/60 text-green-200',
+};
+
+const statusColors: Record<string, string> = {
+  active: 'bg-red-900/40 text-red-300',
+  standby: 'bg-yellow-900/40 text-yellow-300',
+  archived: 'bg-green-900/40 text-green-300',
+  pending: 'bg-gray-900/40 text-gray-300',
+  in_progress: 'bg-blue-900/40 text-blue-300',
+  completed: 'bg-green-900/40 text-green-300',
+  blocked: 'bg-red-900/40 text-red-300',
+  cancelled: 'bg-gray-900/40 text-gray-400',
+};
+
+const priorityColors: Record<string, string> = {
+  critical: 'bg-red-900/60 text-red-200',
+  high: 'bg-orange-900/60 text-orange-200',
+  medium: 'bg-yellow-900/60 text-yellow-200',
+  low: 'bg-blue-900/60 text-blue-200',
+};
 
 export default function WarRoom() {
-  const [activeTab, setActiveTab] = useState<'rooms' | 'actions' | 'postmortems'>('rooms');
-  const [selectedRoom, setSelectedRoom] = useState<WarRoom | null>(null);
-  const [showModal, setShowModal] = useState(false);
-  const [newMessage, setNewMessage] = useState('');
-  const [selectedPostMortem, setSelectedPostMortem] = useState<PostMortem | null>(null);
-  const [pinnedMessages, setPinnedMessages] = useState<number[]>([]);
-  const [messages, setMessages] = useState([
-    { id: 1, author: 'Alice Johnson', text: 'Database node 3 is unresponsive, initiating failover', time: '13:47' },
-    { id: 2, author: 'Bob Smith', text: 'Confirmed, switching to replica. ETA 5 minutes', time: '13:48' },
-    { id: 3, author: 'Carol White', text: 'Monitoring DNS propagation, all clear', time: '13:49' },
-  ]);
-
-  const [actionTitle, setActionTitle] = useState('');
-  const [actionPriority, setActionPriority] = useState('Critical');
-
   const queryClient = useQueryClient();
-  const { data: warRooms = [] } = useQuery({ queryKey: ['warRooms'], queryFn: collaborationApi.getWarRooms });
-  const { data: actionItems = [] } = useQuery({ queryKey: ['actionItems'], queryFn: collaborationApi.getActionItems });
-  const { data: postMortems = [] } = useQuery({ queryKey: ['postMortems'], queryFn: collaborationApi.getPostMortems });
+  const [activeTab, setActiveTab] = useState<'rooms' | 'actions' | 'archived'>('rooms');
+  const [selectedRoom, setSelectedRoom] = useState<WarRoomType | null>(null);
+  const [showCreateRoom, setShowCreateRoom] = useState(false);
+  const [showCreateAction, setShowCreateAction] = useState(false);
+  const [newMessage, setNewMessage] = useState('');
+  const [createError, setCreateError] = useState<string | null>(null);
+
+  // ---------------------------------------------------------------------------
+  // Queries
+  // ---------------------------------------------------------------------------
+
+  const { data: warRooms = [] } = useQuery<WarRoomType[]>({
+    queryKey: ['warRooms'],
+    queryFn: async () => {
+      const data = await collaborationApi.getWarRooms();
+      return Array.isArray(data) ? data : [];
+    },
+  });
+
+  const { data: allActionItems = [] } = useQuery<ActionItemType[]>({
+    queryKey: ['allActionItems'],
+    queryFn: async () => {
+      const data = await collaborationApi.getAllActionItems();
+      return Array.isArray(data) ? data : [];
+    },
+  });
+
+  const { data: archivedRooms = [] } = useQuery<WarRoomType[]>({
+    queryKey: ['archivedRooms'],
+    queryFn: async () => {
+      const data = await collaborationApi.getArchivedRooms();
+      return Array.isArray(data) ? data : [];
+    },
+    enabled: activeTab === 'archived',
+  });
+
+  const { data: roomMessages = [] } = useQuery<MessageType[]>({
+    queryKey: ['roomMessages', selectedRoom?.id],
+    queryFn: async () => {
+      if (!selectedRoom) return [];
+      const data = await collaborationApi.getMessages(selectedRoom.id);
+      return Array.isArray(data) ? data : [];
+    },
+    enabled: !!selectedRoom,
+  });
+
+  const { data: dashboard } = useQuery({
+    queryKey: ['collaborationDashboard'],
+    queryFn: collaborationApi.getDashboard,
+  });
+
+  // ---------------------------------------------------------------------------
+  // Mutations
+  // ---------------------------------------------------------------------------
+
+  const createRoomMutation = useMutation({
+    mutationFn: async (data: { name: string; description: string; room_type: string; severity_level: string }) => {
+      return collaborationApi.createWarRoom(data);
+    },
+    onSuccess: () => {
+      setShowCreateRoom(false);
+      setCreateError(null);
+      queryClient.invalidateQueries({ queryKey: ['warRooms'] });
+    },
+    onError: (err: any) => {
+      setCreateError(err?.response?.data?.detail || err?.message || 'Failed to create room');
+    },
+  });
 
   const createActionMutation = useMutation({
-    mutationFn: (data: { title: string; priority: string }) => collaborationApi.createActionItem(data),
-    onSuccess: () => { queryClient.invalidateQueries({ queryKey: ['actionItems'] }); },
+    mutationFn: async (data: { roomId: string; title: string; priority: string; description: string }) => {
+      return collaborationApi.createActionItem(data.roomId, {
+        title: data.title,
+        priority: data.priority,
+        description: data.description,
+      });
+    },
+    onSuccess: () => {
+      setShowCreateAction(false);
+      setCreateError(null);
+      queryClient.invalidateQueries({ queryKey: ['allActionItems'] });
+    },
+    onError: (err: any) => {
+      setCreateError(err?.response?.data?.detail || err?.message || 'Failed to create action item');
+    },
   });
 
   const sendMessageMutation = useMutation({
-    mutationFn: (data: { warRoomId: string; text: string }) => collaborationApi.sendMessage(data.warRoomId, { text: data.text }),
+    mutationFn: async (data: { roomId: string; content: string }) => {
+      return collaborationApi.sendMessage(data.roomId, { content: data.content });
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['roomMessages', selectedRoom?.id] });
+    },
   });
 
-  const closeRoomMutation = useMutation({
-    mutationFn: (warRoomId: string) => collaborationApi.closeWarRoom(warRoomId),
-    onSuccess: () => { queryClient.invalidateQueries({ queryKey: ['warRooms'] }); },
+  const archiveRoomMutation = useMutation({
+    mutationFn: async (roomId: string) => {
+      return collaborationApi.archiveWarRoom(roomId);
+    },
+    onSuccess: () => {
+      setSelectedRoom(null);
+      queryClient.invalidateQueries({ queryKey: ['warRooms'] });
+      queryClient.invalidateQueries({ queryKey: ['archivedRooms'] });
+    },
   });
+
+  // ---------------------------------------------------------------------------
+  // Derived Stats
+  // ---------------------------------------------------------------------------
 
   const stats = useMemo(() => {
-    const activeRooms = warRooms.filter((r: WarRoom) => r.status === 'Active').length;
-    const myActionItems = actionItems.length;
-    const overdueActions = actionItems.filter((a: ActionItem) => a.status === 'Overdue').length;
-    const avgMTTR = postMortems.length > 0
-      ? `${Math.round(postMortems.reduce((sum: number, pm: PostMortem) => sum + (parseInt(pm.mttr) || 0), 0) / (postMortems.length || 1))}m`
-      : '0m';
-    return { activeRooms, myActionItems, overdueActions, avgMTTR };
-  }, [warRooms, actionItems, postMortems]);
-
-  const mttrTrendData = useMemo(() => {
-    if (postMortems.length === 0) return [];
-    const entries = postMortems.map((pm: PostMortem) => ({
-      incident: pm.title,
-      mttd: parseInt(pm.mttd) || 0,
-      mttr: parseInt(pm.mttr) || 0,
-    }));
-    if (entries.length > 1) {
-      const avgMttd = Math.round(entries.reduce((s: number, e: { mttd: number }) => s + e.mttd, 0) / (entries.length || 1));
-      const avgMttr = Math.round(entries.reduce((s: number, e: { mttr: number }) => s + e.mttr, 0) / (entries.length || 1));
-      entries.push({ incident: 'Avg', mttd: avgMttd, mttr: avgMttr });
+    if (dashboard) {
+      return {
+        activeRooms: dashboard.active_rooms ?? 0,
+        totalActions: dashboard.pending_actions ?? 0,
+        overdueActions: dashboard.overdue_actions ?? 0,
+        totalParticipants: dashboard.total_participants ?? 0,
+      };
     }
-    return entries;
-  }, [postMortems]);
+    const activeRooms = warRooms.filter((r) => r.status === 'active').length;
+    const totalActions = allActionItems.length;
+    const overdueActions = allActionItems.filter((a) => {
+      if (!a.due_date || a.status === 'completed' || a.status === 'cancelled') return false;
+      return new Date(a.due_date) < new Date();
+    }).length;
+    return { activeRooms, totalActions, overdueActions, totalParticipants: 0 };
+  }, [warRooms, allActionItems, dashboard]);
 
   const handleSendMessage = () => {
     if (newMessage.trim() && selectedRoom) {
-      sendMessageMutation.mutate({ warRoomId: selectedRoom.id, text: newMessage });
-      setMessages([
-        ...messages,
-        { id: messages.length + 1, author: 'You', text: newMessage, time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) },
-      ]);
+      sendMessageMutation.mutate({ roomId: selectedRoom.id, content: newMessage.trim() });
       setNewMessage('');
     }
   };
+
+  const activeRooms = warRooms.filter((r) => r.status === 'active' || r.status === 'standby');
+
+  // ---------------------------------------------------------------------------
+  // Render
+  // ---------------------------------------------------------------------------
 
   return (
     <div className="min-h-screen bg-gray-900 text-white p-8">
@@ -99,12 +256,12 @@ export default function WarRoom() {
             <Shield className="w-8 h-8 text-orange-400" />
             War Room
           </h1>
-          <p className="text-gray-400">Incident Response Coordination & Post-Mortem Management</p>
+          <p className="text-gray-400">Incident Response Coordination & Collaboration</p>
         </div>
 
         {/* Summary Cards */}
         <div className="grid grid-cols-4 gap-4 mb-8">
-          <div className={clsx('border rounded-lg p-6 dark:border-gray-700', stats.activeRooms > 0 ? 'bg-red-900/20 border-red-700' : 'bg-gray-800 border-gray-700')}>
+          <div className={clsx('border rounded-lg p-6', stats.activeRooms > 0 ? 'bg-red-900/20 border-red-700' : 'bg-gray-800 border-gray-700')}>
             <div className="flex items-start justify-between">
               <div>
                 <p className="text-gray-400 text-sm mb-2">Active War Rooms</p>
@@ -114,17 +271,17 @@ export default function WarRoom() {
             </div>
           </div>
 
-          <div className="bg-gray-800 border border-gray-700 rounded-lg p-6 dark:bg-gray-800 dark:border-gray-700">
+          <div className="bg-gray-800 border border-gray-700 rounded-lg p-6">
             <div className="flex items-start justify-between">
               <div>
-                <p className="text-gray-400 text-sm mb-2">My Action Items</p>
-                <p className="text-3xl font-bold">{stats.myActionItems}</p>
+                <p className="text-gray-400 text-sm mb-2">Action Items</p>
+                <p className="text-3xl font-bold">{stats.totalActions}</p>
               </div>
               <FileText className="w-8 h-8 text-blue-400" />
             </div>
           </div>
 
-          <div className={clsx('border rounded-lg p-6 dark:border-gray-700', stats.overdueActions > 0 ? 'bg-red-900/20 border-red-700' : 'bg-gray-800 border-gray-700')}>
+          <div className={clsx('border rounded-lg p-6', stats.overdueActions > 0 ? 'bg-red-900/20 border-red-700' : 'bg-gray-800 border-gray-700')}>
             <div className="flex items-start justify-between">
               <div>
                 <p className="text-gray-400 text-sm mb-2">Overdue Actions</p>
@@ -134,13 +291,13 @@ export default function WarRoom() {
             </div>
           </div>
 
-          <div className="bg-gray-800 border border-gray-700 rounded-lg p-6 dark:bg-gray-800 dark:border-gray-700">
+          <div className="bg-gray-800 border border-gray-700 rounded-lg p-6">
             <div className="flex items-start justify-between">
               <div>
-                <p className="text-gray-400 text-sm mb-2">Avg MTTR</p>
-                <p className="text-3xl font-bold">{stats.avgMTTR}</p>
+                <p className="text-gray-400 text-sm mb-2">Participants</p>
+                <p className="text-3xl font-bold">{stats.totalParticipants}</p>
               </div>
-              <Clock className="w-8 h-8 text-green-400" />
+              <Users className="w-8 h-8 text-green-400" />
             </div>
           </div>
         </div>
@@ -151,7 +308,7 @@ export default function WarRoom() {
             {[
               { id: 'rooms', label: 'Active War Rooms', icon: Shield },
               { id: 'actions', label: 'Action Items', icon: FileText },
-              { id: 'postmortems', label: 'Post-Mortems', icon: Clock },
+              { id: 'archived', label: 'Archived', icon: Archive },
             ].map((tab) => {
               const TabIcon = tab.icon;
               return (
@@ -173,270 +330,237 @@ export default function WarRoom() {
           </div>
         </div>
 
-        {/* War Rooms Tab */}
+        {/* ================================================================ */}
+        {/* War Rooms Tab                                                     */}
+        {/* ================================================================ */}
         {activeTab === 'rooms' && (
-          <div className="space-y-4">
-            {warRooms.map((room: WarRoom) => (
-              <div
-                key={room.id}
-                onClick={() => setSelectedRoom(room)}
-                className={clsx(
-                  'border rounded-lg p-6 cursor-pointer transition-colors dark:border-gray-700',
-                  room.severity === 'Critical'
-                    ? 'bg-red-900/20 border-red-700 hover:bg-red-900/30'
-                    : 'bg-gray-800 border-gray-700 hover:bg-gray-700/50'
-                )}
+          <div>
+            <div className="mb-6 flex justify-end">
+              <button
+                onClick={() => { setShowCreateRoom(true); setCreateError(null); }}
+                className="bg-orange-600 hover:bg-orange-700 text-white px-4 py-2 rounded flex items-center gap-2 transition-colors"
               >
-                <div className="flex items-start justify-between mb-4">
-                  <div className="flex-1">
-                    <h3 className="text-lg font-semibold text-white mb-2">{room.title}</h3>
-                    <div className="flex items-center gap-4 text-sm text-gray-400 mb-2">
-                      <span className="flex items-center gap-1">
-                        <Users className="w-4 h-4" />
-                        {room.participants} participants
-                      </span>
-                      <span className="flex items-center gap-1">
-                        <User className="w-4 h-4" />
-                        Commander: {room.commander}
-                      </span>
-                      <span className="flex items-center gap-1">
-                        <Clock className="w-4 h-4" />
-                        Started: {room.startTime}
-                      </span>
-                    </div>
-                  </div>
-                  <div className="text-right">
-                    <span
-                      className={clsx(
-                        'px-3 py-1 rounded text-xs font-medium mb-2 block',
-                        room.severity === 'Critical'
-                          ? 'bg-red-900/60 text-red-200'
-                          : 'bg-orange-900/60 text-orange-200'
-                      )}
-                    >
-                      {room.severity}
-                    </span>
-                    <span
-                      className={clsx(
-                        'px-3 py-1 rounded text-xs font-medium block',
-                        room.status === 'Active'
-                          ? 'bg-red-900/40 text-red-300'
-                          : 'bg-green-900/40 text-green-300'
-                      )}
-                    >
-                      {room.status}
-                    </span>
-                  </div>
-                </div>
+                <Plus className="w-4 h-4" />
+                New War Room
+              </button>
+            </div>
 
-                <div className="flex items-center justify-between">
-                  <span
+            {activeRooms.length === 0 ? (
+              <div className="text-center py-16 text-gray-500">
+                <Shield className="w-12 h-12 mx-auto mb-4 opacity-50" />
+                <p>No active war rooms. Create one to start coordinating.</p>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                {activeRooms.map((room) => (
+                  <div
+                    key={room.id}
+                    onClick={() => setSelectedRoom(room)}
                     className={clsx(
-                      'px-3 py-1 rounded text-xs font-medium',
-                      room.impact === 'Critical'
-                        ? 'bg-red-900/40 text-red-300'
-                        : room.impact === 'High'
-                          ? 'bg-orange-900/40 text-orange-300'
-                          : 'bg-yellow-900/40 text-yellow-300'
+                      'border rounded-lg p-6 cursor-pointer transition-colors',
+                      room.severity_level === 'critical'
+                        ? 'bg-red-900/20 border-red-700 hover:bg-red-900/30'
+                        : 'bg-gray-800 border-gray-700 hover:bg-gray-700/50'
                     )}
                   >
-                    Impact: {room.impact}
-                  </span>
-                  <button
-                    onClick={(e) => { e.stopPropagation(); setSelectedRoom(room); }}
-                    className="text-blue-400 hover:text-blue-300 text-sm font-medium transition-colors"
-                  >
-                    View Details →
-                  </button>
-                </div>
+                    <div className="flex items-start justify-between mb-4">
+                      <div className="flex-1">
+                        <h3 className="text-lg font-semibold text-white mb-2">{room.name}</h3>
+                        <div className="flex items-center gap-4 text-sm text-gray-400">
+                          <span className="flex items-center gap-1">
+                            <Users className="w-4 h-4" />
+                            {Array.isArray(room.participants) ? room.participants.length : 0} participants
+                          </span>
+                          <span className="flex items-center gap-1">
+                            <Clock className="w-4 h-4" />
+                            Started: {formatDateTime(room.created_at)}
+                          </span>
+                          {room.description && (
+                            <span className="text-gray-500 truncate max-w-xs">{room.description}</span>
+                          )}
+                        </div>
+                      </div>
+                      <div className="text-right space-y-1">
+                        <span className={clsx('px-3 py-1 rounded text-xs font-medium block', severityColors[room.severity_level] ?? 'bg-gray-900/40 text-gray-300')}>
+                          {room.severity_level}
+                        </span>
+                        <span className={clsx('px-3 py-1 rounded text-xs font-medium block', statusColors[room.status] ?? 'bg-gray-900/40 text-gray-300')}>
+                          {room.status}
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs text-gray-500">Type: {room.room_type?.replace(/_/g, ' ')}</span>
+                      <button
+                        onClick={(e) => { e.stopPropagation(); setSelectedRoom(room); }}
+                        className="text-blue-400 hover:text-blue-300 text-sm font-medium transition-colors"
+                      >
+                        Enter Room &rarr;
+                      </button>
+                    </div>
+                  </div>
+                ))}
               </div>
-            ))}
+            )}
           </div>
         )}
 
-        {/* Action Items Tab */}
+        {/* ================================================================ */}
+        {/* Action Items Tab                                                  */}
+        {/* ================================================================ */}
         {activeTab === 'actions' && (
           <div>
             <div className="mb-6 flex justify-end">
               <button
-                onClick={() => setShowModal(true)}
+                onClick={() => { setShowCreateAction(true); setCreateError(null); }}
                 className="bg-orange-600 hover:bg-orange-700 text-white px-4 py-2 rounded flex items-center gap-2 transition-colors"
+                disabled={activeRooms.length === 0}
+                title={activeRooms.length === 0 ? 'Create a war room first' : ''}
               >
                 <Plus className="w-4 h-4" />
                 New Action Item
               </button>
             </div>
 
-            <div className="space-y-4">
-              {actionItems.map((item: ActionItem) => (
-                <div
-                  key={item.id}
-                  className={clsx(
-                    'border rounded-lg p-6 dark:border-gray-700',
-                    item.status === 'Overdue'
-                      ? 'bg-red-900/20 border-red-700'
-                      : item.status === 'In Progress'
-                        ? 'bg-blue-900/20 border-blue-700'
+            {allActionItems.length === 0 ? (
+              <div className="text-center py-16 text-gray-500">
+                <FileText className="w-12 h-12 mx-auto mb-4 opacity-50" />
+                <p>No action items yet.</p>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                {allActionItems.map((item) => (
+                  <div
+                    key={item.id}
+                    className={clsx(
+                      'border rounded-lg p-6',
+                      item.status === 'blocked' ? 'bg-red-900/20 border-red-700'
+                        : item.status === 'in_progress' ? 'bg-blue-900/20 border-blue-700'
                         : 'bg-gray-800 border-gray-700'
-                  )}
-                >
-                  <div className="flex items-start justify-between mb-4">
-                    <div className="flex-1">
-                      <h3 className="text-lg font-semibold text-white mb-2">{item.title}</h3>
-                      <p className="text-sm text-gray-400 mb-2">Assigned to: {item.assignee}</p>
-                    </div>
-                    <span
-                      className={clsx(
-                        'px-3 py-1 rounded text-xs font-medium',
-                        item.priority === 'Critical'
-                          ? 'bg-red-900/60 text-red-200'
-                          : item.priority === 'High'
-                            ? 'bg-orange-900/60 text-orange-200'
-                            : 'bg-yellow-900/60 text-yellow-200'
-                      )}
-                    >
-                      {item.priority}
-                    </span>
-                  </div>
-
-                  <div className="grid grid-cols-3 gap-4">
-                    <div>
-                      <p className="text-xs text-gray-400 mb-1">War Room</p>
-                      <p className="text-white font-mono text-sm">{item.room}</p>
-                    </div>
-                    <div>
-                      <p className="text-xs text-gray-400 mb-1">Due Date</p>
-                      <p className="text-white text-sm">{item.dueDate}</p>
-                    </div>
-                    <div>
-                      <p className="text-xs text-gray-400 mb-1">Status</p>
-                      <span
-                        className={clsx(
-                          'px-2 py-1 rounded text-xs font-medium inline-block',
-                          item.status === 'In Progress'
-                            ? 'bg-blue-900/40 text-blue-300'
-                            : item.status === 'Overdue'
-                              ? 'bg-red-900/40 text-red-300'
-                              : 'bg-gray-900/40 text-gray-300'
-                        )}
-                      >
-                        {item.status}
+                    )}
+                  >
+                    <div className="flex items-start justify-between mb-4">
+                      <div className="flex-1">
+                        <h3 className="text-lg font-semibold text-white mb-2">{item.title}</h3>
+                        {item.description && <p className="text-sm text-gray-400 mb-1">{item.description}</p>}
+                        <p className="text-sm text-gray-500">Assigned to: {item.assigned_to || 'Unassigned'}</p>
+                      </div>
+                      <span className={clsx('px-3 py-1 rounded text-xs font-medium', priorityColors[item.priority] ?? 'bg-gray-900/40 text-gray-300')}>
+                        {item.priority}
                       </span>
                     </div>
-                  </div>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
 
-        {/* Post-Mortems Tab */}
-        {activeTab === 'postmortems' && (
-          <div>
-            <div className="mb-8">
-              <div className="bg-gray-800 border border-gray-700 rounded-lg p-6 dark:bg-gray-800 dark:border-gray-700">
-                <h3 className="text-lg font-semibold mb-4">MTTD/MTTR Trends</h3>
-                <ResponsiveContainer width="100%" height={300}>
-                  <LineChart data={mttrTrendData}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
-                    <XAxis dataKey="incident" stroke="#9CA3AF" />
-                    <YAxis stroke="#9CA3AF" />
-                    <Tooltip contentStyle={{ backgroundColor: '#1F2937', border: '1px solid #374151', borderRadius: '8px' }} />
-                    <Legend />
-                    <Line type="monotone" dataKey="mttd" stroke="#3B82F6" strokeWidth={2} name="MTTD (min)" />
-                    <Line type="monotone" dataKey="mttr" stroke="#10B981" strokeWidth={2} name="MTTR (min)" />
-                  </LineChart>
-                </ResponsiveContainer>
+                    <div className="grid grid-cols-3 gap-4">
+                      <div>
+                        <p className="text-xs text-gray-400 mb-1">War Room</p>
+                        <p className="text-white text-sm">{item._room_name || item.room_id?.slice(0, 8)}</p>
+                      </div>
+                      <div>
+                        <p className="text-xs text-gray-400 mb-1">Due Date</p>
+                        <p className="text-white text-sm">{item.due_date ? formatDateTime(item.due_date) : '--'}</p>
+                      </div>
+                      <div>
+                        <p className="text-xs text-gray-400 mb-1">Status</p>
+                        <span className={clsx('px-2 py-1 rounded text-xs font-medium inline-block', statusColors[item.status] ?? 'bg-gray-900/40 text-gray-300')}>
+                          {item.status?.replace(/_/g, ' ')}
+                        </span>
+                      </div>
+                    </div>
+                  </div>
+                ))}
               </div>
-            </div>
-
-            <div className="space-y-4">
-              {postMortems.map((pm: PostMortem) => (
-                <div key={pm.id} className="bg-gray-800 border border-gray-700 rounded-lg p-6 dark:bg-gray-800 dark:border-gray-700">
-                  <div className="flex items-start justify-between mb-4">
-                    <div>
-                      <h3 className="text-lg font-semibold text-white mb-2">{pm.title}</h3>
-                      <p className="text-sm text-gray-400">Timeline: {pm.timeline}</p>
-                    </div>
-                    <span
-                      className={clsx(
-                        'px-3 py-1 rounded text-xs font-medium',
-                        pm.severity === 'High' ? 'bg-orange-900/60 text-orange-200' : 'bg-yellow-900/60 text-yellow-200'
-                      )}
-                    >
-                      {pm.severity}
-                    </span>
-                  </div>
-
-                  <div className="grid grid-cols-3 gap-4">
-                    <div className="bg-gray-700/50 rounded p-3">
-                      <p className="text-xs text-gray-400 mb-1">Mean Time to Detect</p>
-                      <p className="text-2xl font-bold text-blue-400">{pm.mttd}</p>
-                    </div>
-                    <div className="bg-gray-700/50 rounded p-3">
-                      <p className="text-xs text-gray-400 mb-1">Mean Time to Resolve</p>
-                      <p className="text-2xl font-bold text-green-400">{pm.mttr}</p>
-                    </div>
-                    <div className="bg-gray-700/50 rounded p-3">
-                      <p className="text-xs text-gray-400 mb-1">Mean Time to Close</p>
-                      <p className="text-2xl font-bold text-purple-400">{pm.mttc}</p>
-                    </div>
-                  </div>
-
-                  <button
-                    onClick={() => setSelectedPostMortem(pm)}
-                    className="mt-4 text-blue-400 hover:text-blue-300 text-sm font-medium transition-colors"
-                  >
-                    View Full Report →
-                  </button>
-                </div>
-              ))}
-            </div>
+            )}
           </div>
         )}
 
-        {/* War Room Detail Modal */}
+        {/* ================================================================ */}
+        {/* Archived Tab                                                      */}
+        {/* ================================================================ */}
+        {activeTab === 'archived' && (
+          <div>
+            {archivedRooms.length === 0 ? (
+              <div className="text-center py-16 text-gray-500">
+                <Archive className="w-12 h-12 mx-auto mb-4 opacity-50" />
+                <p>No archived war rooms.</p>
+              </div>
+            ) : (
+              <div className="space-y-4">
+                {archivedRooms.map((room) => (
+                  <div key={room.id} className="bg-gray-800 border border-gray-700 rounded-lg p-6">
+                    <div className="flex items-start justify-between mb-4">
+                      <div>
+                        <h3 className="text-lg font-semibold text-white mb-2">{room.name}</h3>
+                        <p className="text-sm text-gray-400">{room.description}</p>
+                      </div>
+                      <span className={clsx('px-3 py-1 rounded text-xs font-medium', severityColors[room.severity_level] ?? 'bg-gray-900/40 text-gray-300')}>
+                        {room.severity_level}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-4 text-sm text-gray-500">
+                      <span>Type: {room.room_type?.replace(/_/g, ' ')}</span>
+                      <span>Created: {formatDateTime(room.created_at)}</span>
+                      <span>{Array.isArray(room.participants) ? room.participants.length : 0} participants</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ================================================================ */}
+        {/* War Room Detail Modal (Chat)                                      */}
+        {/* ================================================================ */}
         {selectedRoom && (
           <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-            <div className="bg-gray-800 border border-gray-700 rounded-lg max-w-2xl w-full max-h-96 flex flex-col dark:bg-gray-800 dark:border-gray-700">
+            <div className="bg-gray-800 border border-gray-700 rounded-lg max-w-2xl w-full flex flex-col" style={{ maxHeight: '80vh' }}>
               <div className="flex items-start justify-between p-6 border-b border-gray-700">
                 <div>
-                  <h2 className="text-2xl font-bold text-white mb-2">{selectedRoom.title}</h2>
-                  <p className="text-sm text-gray-400">Started: {selectedRoom.startTime}</p>
+                  <h2 className="text-2xl font-bold text-white mb-1">{selectedRoom.name}</h2>
+                  <div className="flex items-center gap-3 text-sm text-gray-400">
+                    <span className={clsx('px-2 py-0.5 rounded text-xs font-medium', severityColors[selectedRoom.severity_level])}>
+                      {selectedRoom.severity_level}
+                    </span>
+                    <span>{Array.isArray(selectedRoom.participants) ? selectedRoom.participants.length : 0} participants</span>
+                    <span>Started {formatDateTime(selectedRoom.created_at)}</span>
+                  </div>
                 </div>
-                <button
-                  onClick={() => setSelectedRoom(null)}
-                  className="text-gray-400 hover:text-white transition-colors"
-                >
+                <button onClick={() => setSelectedRoom(null)} className="text-gray-400 hover:text-white transition-colors">
                   <X className="w-5 h-5" />
                 </button>
               </div>
 
-              <div className="flex-1 overflow-y-auto p-6 space-y-4">
-                {messages.map((msg) => (
-                  <div key={msg.id} className="bg-gray-700/50 rounded-lg p-4">
-                    <div className="flex items-start justify-between mb-2">
-                      <p className="font-semibold text-white">{msg.author}</p>
-                      <span className="text-xs text-gray-400">{msg.time}</span>
+              <div className="flex-1 overflow-y-auto p-6 space-y-4 min-h-[200px]">
+                {roomMessages.length === 0 ? (
+                  <p className="text-gray-500 text-center py-8">No messages yet. Start the conversation.</p>
+                ) : (
+                  roomMessages.map((msg) => (
+                    <div key={msg.id} className={clsx('rounded-lg p-4', msg.is_pinned ? 'bg-yellow-900/20 border border-yellow-700' : 'bg-gray-700/50')}>
+                      <div className="flex items-start justify-between mb-2">
+                        <p className="font-semibold text-white">{msg.sender_name || 'Unknown'}</p>
+                        <span className="text-xs text-gray-400">{formatTime(msg.created_at)}</span>
+                      </div>
+                      <p className="text-gray-300">{msg.content}</p>
                     </div>
-                    <p className="text-gray-300">{msg.text}</p>
-                  </div>
-                ))}
+                  ))
+                )}
               </div>
 
-              <div className="border-t border-gray-700 p-6 space-y-4">
+              <div className="border-t border-gray-700 p-6 space-y-3">
                 <div className="flex gap-2">
                   <input
                     type="text"
                     value={newMessage}
                     onChange={(e) => setNewMessage(e.target.value)}
-                    onKeyPress={(e) => e.key === 'Enter' && handleSendMessage()}
+                    onKeyDown={(e) => e.key === 'Enter' && handleSendMessage()}
                     placeholder="Type your message..."
-                    className="flex-1 bg-gray-700 border border-gray-600 rounded px-4 py-2 text-white placeholder-gray-500 dark:bg-gray-700 dark:border-gray-600"
+                    className="flex-1 bg-gray-700 border border-gray-600 rounded px-4 py-2 text-white placeholder-gray-500"
                   />
                   <button
                     onClick={handleSendMessage}
-                    className="bg-orange-600 hover:bg-orange-700 text-white px-4 py-2 rounded flex items-center gap-2 transition-colors"
+                    disabled={!newMessage.trim() || sendMessageMutation.isPending}
+                    className="bg-orange-600 hover:bg-orange-700 text-white px-4 py-2 rounded flex items-center gap-2 transition-colors disabled:opacity-50"
                   >
                     <Send className="w-4 h-4" />
                   </button>
@@ -445,21 +569,19 @@ export default function WarRoom() {
                 <div className="flex gap-2">
                   <button
                     onClick={() => {
-                      const lastMsg = messages[messages.length - 1];
-                      if (lastMsg && !pinnedMessages.includes(lastMsg.id)) {
-                        setPinnedMessages([...pinnedMessages, lastMsg.id]);
-                      }
+                      archiveRoomMutation.mutate(selectedRoom.id);
                     }}
-                    className="flex-1 bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded text-sm transition-colors flex items-center justify-center gap-2"
+                    disabled={archiveRoomMutation.isPending}
+                    className="flex-1 bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded text-sm transition-colors flex items-center justify-center gap-2 disabled:opacity-50"
                   >
-                    <Pin className="w-4 h-4" />
-                    Pin Important ({pinnedMessages.length})
+                    <Archive className="w-4 h-4" />
+                    Archive Room
                   </button>
                   <button
                     onClick={() => setSelectedRoom(null)}
                     className="flex-1 bg-orange-600 hover:bg-orange-700 text-white px-4 py-2 rounded text-sm transition-colors"
                   >
-                    Close Room
+                    Close
                   </button>
                 </div>
               </div>
@@ -467,78 +589,137 @@ export default function WarRoom() {
           </div>
         )}
 
-        {/* Post-Mortem Detail Modal */}
-        {selectedPostMortem && !selectedRoom && (
+        {/* ================================================================ */}
+        {/* Create War Room Modal                                             */}
+        {/* ================================================================ */}
+        {showCreateRoom && (
           <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-            <div className="bg-gray-800 border border-gray-700 rounded-lg p-8 max-w-lg w-full dark:bg-gray-800 dark:border-gray-700">
+            <div className="bg-gray-800 border border-gray-700 rounded-lg p-8 max-w-md w-full">
               <div className="flex justify-between items-center mb-6">
-                <h2 className="text-xl font-bold text-white">{selectedPostMortem.title}</h2>
-                <button onClick={() => setSelectedPostMortem(null)} className="text-gray-400 hover:text-white transition-colors">
-                  <X className="w-5 h-5" />
-                </button>
-              </div>
-              <div className="space-y-4">
-                <div><p className="text-sm text-gray-400">Timeline</p><p className="text-white">{selectedPostMortem.timeline}</p></div>
-                <div><p className="text-sm text-gray-400">Severity</p><p className="text-white">{selectedPostMortem.severity}</p></div>
-                <div className="grid grid-cols-3 gap-4">
-                  <div className="bg-gray-700/50 rounded p-3"><p className="text-xs text-gray-400 mb-1">MTTD</p><p className="text-xl font-bold text-blue-400">{selectedPostMortem.mttd}</p></div>
-                  <div className="bg-gray-700/50 rounded p-3"><p className="text-xs text-gray-400 mb-1">MTTR</p><p className="text-xl font-bold text-green-400">{selectedPostMortem.mttr}</p></div>
-                  <div className="bg-gray-700/50 rounded p-3"><p className="text-xs text-gray-400 mb-1">MTTC</p><p className="text-xl font-bold text-purple-400">{selectedPostMortem.mttc}</p></div>
-                </div>
-              </div>
-              <button onClick={() => setSelectedPostMortem(null)} className="w-full bg-orange-600 hover:bg-orange-700 text-white px-4 py-2 rounded mt-6 transition-colors">Close</button>
-            </div>
-          </div>
-        )}
-
-        {/* New Action Item Modal */}
-        {showModal && (
-          <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-            <div className="bg-gray-800 border border-gray-700 rounded-lg p-8 max-w-md w-full dark:bg-gray-800 dark:border-gray-700">
-              <div className="flex justify-between items-center mb-6">
-                <h2 className="text-xl font-bold text-white">New Action Item</h2>
-                <button
-                  onClick={() => setShowModal(false)}
-                  className="text-gray-400 hover:text-white transition-colors"
-                >
+                <h2 className="text-xl font-bold text-white">New War Room</h2>
+                <button onClick={() => setShowCreateRoom(false)} className="text-gray-400 hover:text-white transition-colors">
                   <X className="w-5 h-5" />
                 </button>
               </div>
 
-              <div className="space-y-4">
-                <div>
-                  <label className="block text-sm font-medium text-gray-300 mb-2">Title</label>
-                  <input
-                    type="text"
-                    className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white placeholder-gray-500 dark:bg-gray-700 dark:border-gray-600"
-                    placeholder="Action item description"
-                  />
-                </div>
+              {createError && (
+                <div className="bg-red-900/30 border border-red-700 rounded p-3 text-sm text-red-300 mb-4">{createError}</div>
+              )}
 
+              <form className="space-y-4" onSubmit={(e) => {
+                e.preventDefault();
+                setCreateError(null);
+                const fd = new FormData(e.currentTarget);
+                createRoomMutation.mutate({
+                  name: fd.get('name') as string,
+                  description: (fd.get('description') as string) || '',
+                  room_type: (fd.get('room_type') as string) || 'incident_response',
+                  severity_level: (fd.get('severity_level') as string) || 'medium',
+                });
+              }}>
                 <div>
-                  <label className="block text-sm font-medium text-gray-300 mb-2">Priority</label>
-                  <select className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white dark:bg-gray-700 dark:border-gray-600">
-                    <option>Critical</option>
-                    <option>High</option>
-                    <option>Medium</option>
+                  <label className="block text-sm font-medium text-gray-300 mb-2">Room Name</label>
+                  <input name="name" required type="text" className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white placeholder-gray-500" placeholder="e.g., DB Outage Response" />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-300 mb-2">Description</label>
+                  <textarea name="description" rows={2} className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white placeholder-gray-500 resize-none" placeholder="Describe the incident..." />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-300 mb-2">Room Type</label>
+                  <select name="room_type" className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white">
+                    <option value="incident_response">Incident Response</option>
+                    <option value="threat_hunt">Threat Hunt</option>
+                    <option value="red_team">Red Team</option>
+                    <option value="blue_team">Blue Team</option>
+                    <option value="tabletop_exercise">Tabletop Exercise</option>
+                    <option value="general">General</option>
                   </select>
                 </div>
-
+                <div>
+                  <label className="block text-sm font-medium text-gray-300 mb-2">Severity</label>
+                  <select name="severity_level" className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white">
+                    <option value="critical">Critical</option>
+                    <option value="high">High</option>
+                    <option value="medium" selected>Medium</option>
+                    <option value="low">Low</option>
+                  </select>
+                </div>
                 <div className="flex gap-4 mt-6">
-                  <button
-                    onClick={() => setShowModal(false)}
-                    className="flex-1 bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded transition-colors"
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    onClick={() => setShowModal(false)}
-                    className="flex-1 bg-orange-600 hover:bg-orange-700 text-white px-4 py-2 rounded transition-colors"
-                  >
-                    Create
+                  <button type="button" onClick={() => setShowCreateRoom(false)} className="flex-1 bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded transition-colors">Cancel</button>
+                  <button type="submit" disabled={createRoomMutation.isPending} className="flex-1 bg-orange-600 hover:bg-orange-700 text-white px-4 py-2 rounded transition-colors disabled:opacity-50">
+                    {createRoomMutation.isPending ? 'Creating...' : 'Create Room'}
                   </button>
                 </div>
+              </form>
+            </div>
+          </div>
+        )}
+
+        {/* ================================================================ */}
+        {/* Create Action Item Modal                                          */}
+        {/* ================================================================ */}
+        {showCreateAction && (
+          <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+            <div className="bg-gray-800 border border-gray-700 rounded-lg p-8 max-w-md w-full">
+              <div className="flex justify-between items-center mb-6">
+                <h2 className="text-xl font-bold text-white">New Action Item</h2>
+                <button onClick={() => setShowCreateAction(false)} className="text-gray-400 hover:text-white transition-colors">
+                  <X className="w-5 h-5" />
+                </button>
               </div>
+
+              {createError && (
+                <div className="bg-red-900/30 border border-red-700 rounded p-3 text-sm text-red-300 mb-4">{createError}</div>
+              )}
+
+              <form className="space-y-4" onSubmit={(e) => {
+                e.preventDefault();
+                setCreateError(null);
+                const fd = new FormData(e.currentTarget);
+                const roomId = fd.get('room_id') as string;
+                if (!roomId) {
+                  setCreateError('Please select a war room');
+                  return;
+                }
+                createActionMutation.mutate({
+                  roomId,
+                  title: fd.get('title') as string,
+                  priority: (fd.get('priority') as string) || 'medium',
+                  description: (fd.get('description') as string) || '',
+                });
+              }}>
+                <div>
+                  <label className="block text-sm font-medium text-gray-300 mb-2">War Room</label>
+                  <select name="room_id" required className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white">
+                    <option value="">Select a war room...</option>
+                    {activeRooms.map((r) => (<option key={r.id} value={r.id}>{r.name}</option>))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-300 mb-2">Title</label>
+                  <input name="title" required type="text" className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white placeholder-gray-500" placeholder="Action item description" />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-300 mb-2">Description</label>
+                  <textarea name="description" rows={2} className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white placeholder-gray-500 resize-none" placeholder="Additional details..." />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-300 mb-2">Priority</label>
+                  <select name="priority" className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white">
+                    <option value="critical">Critical</option>
+                    <option value="high">High</option>
+                    <option value="medium" selected>Medium</option>
+                    <option value="low">Low</option>
+                  </select>
+                </div>
+                <div className="flex gap-4 mt-6">
+                  <button type="button" onClick={() => setShowCreateAction(false)} className="flex-1 bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded transition-colors">Cancel</button>
+                  <button type="submit" disabled={createActionMutation.isPending} className="flex-1 bg-orange-600 hover:bg-orange-700 text-white px-4 py-2 rounded transition-colors disabled:opacity-50">
+                    {createActionMutation.isPending ? 'Creating...' : 'Create'}
+                  </button>
+                </div>
+              </form>
             </div>
           </div>
         )}
