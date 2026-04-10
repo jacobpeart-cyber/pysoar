@@ -22,6 +22,8 @@ export default function Profile() {
   const queryClient = useQueryClient();
   const [activeTab, setActiveTab] = useState<'profile' | 'security'>('profile');
   const [showSuccess, setShowSuccess] = useState(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [passwordError, setPasswordError] = useState<string | null>(null);
 
   const [profileData, setProfileData] = useState({
     full_name: user?.full_name || '',
@@ -38,29 +40,40 @@ export default function Profile() {
 
   const updateProfileMutation = useMutation({
     mutationFn: async (data: typeof profileData) => {
-      try {
       const response = await api.patch(`/users/${user?.id}`, data);
       return response.data;
-      } catch { return null; }
     },
     onSuccess: () => {
+      setErrorMessage(null);
       setShowSuccess(true);
       setTimeout(() => setShowSuccess(false), 3000);
       queryClient.invalidateQueries({ queryKey: ['user', user?.id] });
+    },
+    onError: (err: any) => {
+      console.error('Profile update failed:', err);
+      setErrorMessage(
+        err?.response?.data?.detail || err?.message || 'Failed to update profile'
+      );
     },
   });
 
   const updatePasswordMutation = useMutation({
     mutationFn: async (data: { current_password: string; new_password: string }) => {
-      try {
       const response = await api.post('/auth/change-password', data);
       return response.data;
-      } catch { return null; }
     },
     onSuccess: () => {
+      setPasswordError(null);
+      setErrorMessage(null);
       setShowSuccess(true);
       setPasswordData({ current_password: '', new_password: '', confirm_password: '' });
       setTimeout(() => setShowSuccess(false), 3000);
+    },
+    onError: (err: any) => {
+      console.error('Password change failed:', err);
+      setPasswordError(
+        err?.response?.data?.detail || err?.message || 'Failed to update password'
+      );
     },
   });
 
@@ -72,9 +85,10 @@ export default function Profile() {
   const handlePasswordSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (passwordData.new_password !== passwordData.confirm_password) {
-      return;
+      setPasswordError('New password and confirmation do not match');
       return;
     }
+    setPasswordError(null);
     updatePasswordMutation.mutate({
       current_password: passwordData.current_password,
       new_password: passwordData.new_password,
@@ -88,6 +102,14 @@ export default function Profile() {
         <div className="flex items-center gap-2 p-4 bg-green-50 border border-green-200 rounded-lg text-green-700">
           <CheckCircle className="w-5 h-5" />
           Changes saved successfully
+        </div>
+      )}
+
+      {/* Error Message */}
+      {errorMessage && (
+        <div className="flex items-center gap-2 p-4 bg-red-50 border border-red-200 rounded-lg text-red-700">
+          <AlertCircle className="w-5 h-5" />
+          {errorMessage}
         </div>
       )}
 
@@ -250,6 +272,13 @@ export default function Profile() {
               <Key className="w-5 h-5 text-gray-500" />
               <h2 className="text-lg font-semibold text-gray-900">Change Password</h2>
             </div>
+
+            {passwordError && (
+              <div className="flex items-center gap-2 p-3 mb-4 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm">
+                <AlertCircle className="w-4 h-4" />
+                {passwordError}
+              </div>
+            )}
 
             <div className="space-y-4 max-w-md">
               <div>

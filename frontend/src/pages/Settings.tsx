@@ -63,6 +63,7 @@ const tabs = [
 
 export default function Settings() {
   const [activeTab, setActiveTab] = useState('general');
+  const [globalError, setGlobalError] = useState<string | null>(null);
   const queryClient = useQueryClient();
 
   const { data: settings, isLoading } = useQuery<SettingsData>({
@@ -77,20 +78,30 @@ export default function Settings() {
 
   const testEmailMutation = useMutation({
     mutationFn: async () => {
-      try {
       const response = await api.post('/settings/test-email');
       return response.data;
-      } catch { return null; }
     },
+    onError: (err: any) => {
+      console.error('Test email failed:', err);
+      setGlobalError(
+        err?.response?.data?.detail || err?.message || 'Failed to send test email'
+      );
+    },
+    onSuccess: () => setGlobalError(null),
   });
 
   const testIntegrationMutation = useMutation({
     mutationFn: async (integration: string) => {
-      try {
       const response = await api.post(`/settings/test-integration/${integration}`);
       return response.data;
-      } catch { return null; }
     },
+    onError: (err: any) => {
+      console.error('Test integration failed:', err);
+      setGlobalError(
+        err?.response?.data?.detail || err?.message || 'Integration test failed'
+      );
+    },
+    onSuccess: () => setGlobalError(null),
   });
 
   if (isLoading) {
@@ -107,6 +118,19 @@ export default function Settings() {
         <h1 className="text-2xl font-bold text-gray-900">Settings</h1>
         <p className="text-gray-500">Manage your PySOAR configuration</p>
       </div>
+
+      {globalError && (
+        <div className="flex items-start gap-2 p-4 bg-red-50 border border-red-200 rounded-lg text-red-700">
+          <XCircle className="w-5 h-5 flex-shrink-0 mt-0.5" />
+          <div className="flex-1">{globalError}</div>
+          <button
+            onClick={() => setGlobalError(null)}
+            className="text-red-700 hover:text-red-900"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
 
       <div className="flex gap-6">
         {/* Sidebar */}
@@ -164,15 +188,21 @@ export default function Settings() {
 function GeneralSettings({ settings }: { settings: SettingsData['general'] }) {
   const queryClient = useQueryClient();
   const [formData, setFormData] = useState(settings);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const saveMutation = useMutation({
     mutationFn: async (data: typeof formData) => {
-      try {
       const response = await api.patch('/settings/general', data);
       return response.data;
-      } catch { return null; }
     },
     onSuccess: () => {
+      setSaveError(null);
       queryClient.invalidateQueries({ queryKey: ['settings'] });
+    },
+    onError: (err: any) => {
+      console.error('Save general settings failed:', err);
+      setSaveError(
+        err?.response?.data?.detail || err?.message || 'Failed to save settings'
+      );
     },
   });
 
@@ -232,6 +262,13 @@ function GeneralSettings({ settings }: { settings: SettingsData['general'] }) {
         </div>
       </div>
 
+      {saveError && (
+        <div className="flex items-center gap-2 p-3 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm">
+          <XCircle className="w-4 h-4" />
+          {saveError}
+        </div>
+      )}
+
       <div className="flex justify-end pt-4 border-t border-gray-200">
         <button
           onClick={() => saveMutation.mutate(formData)}
@@ -249,15 +286,21 @@ function GeneralSettings({ settings }: { settings: SettingsData['general'] }) {
 function NotificationSettings({ settings }: { settings: SettingsData['notifications'] }) {
   const queryClient = useQueryClient();
   const [formData, setFormData] = useState(settings);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const saveMutation = useMutation({
     mutationFn: async (data: typeof formData) => {
-      try {
       const response = await api.patch('/settings/notifications', data);
       return response.data;
-      } catch { return null; }
     },
     onSuccess: () => {
+      setSaveError(null);
       queryClient.invalidateQueries({ queryKey: ['settings'] });
+    },
+    onError: (err: any) => {
+      console.error('Save notification settings failed:', err);
+      setSaveError(
+        err?.response?.data?.detail || err?.message || 'Failed to save notification settings'
+      );
     },
   });
 
@@ -321,6 +364,13 @@ function NotificationSettings({ settings }: { settings: SettingsData['notificati
           </div>
         </div>
       </div>
+
+      {saveError && (
+        <div className="flex items-center gap-2 p-3 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm">
+          <XCircle className="w-4 h-4" />
+          {saveError}
+        </div>
+      )}
 
       <div className="flex justify-end pt-4 border-t border-gray-200">
         <button
@@ -579,25 +629,33 @@ function IntegrationSettings({
 }: {
   integrations: Record<string, { enabled: boolean; configured: boolean }>;
   onTest: (name: string) => void;
-  testStatus: { isPending: boolean; isSuccess: boolean; isError: boolean };
+  testStatus: { isPending: boolean; isSuccess: boolean; isError: boolean; variables?: string };
 }) {
   const [configModal, setConfigModal] = useState<IntegrationConfig | null>(null);
   const [formData, setFormData] = useState<Record<string, string>>({});
   const [showPasswords, setShowPasswords] = useState<Record<string, boolean>>({});
-  const [testingId, setTestingId] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<string | null>(null);
   const queryClient = useQueryClient();
+
+  // Drive "testing" state directly off mutation state (which integration is being tested)
+  const testingId = testStatus.isPending ? (testStatus.variables ?? null) : null;
 
   const saveMutation = useMutation({
     mutationFn: async ({ integrationId, config }: { integrationId: string; config: Record<string, string> }) => {
-      try {
       const response = await api.post(`/settings/integrations/${integrationId}`, config);
       return response.data;
-      } catch { return null; }
     },
     onSuccess: () => {
+      setSaveError(null);
       queryClient.invalidateQueries({ queryKey: ['settings'] });
       setConfigModal(null);
       setFormData({});
+    },
+    onError: (err: any) => {
+      console.error('Save integration failed:', err);
+      setSaveError(
+        err?.response?.data?.detail || err?.message || 'Failed to save integration'
+      );
     },
   });
 
@@ -614,9 +672,7 @@ function IntegrationSettings({
   };
 
   const handleTest = (integrationId: string) => {
-    setTestingId(integrationId);
     onTest(integrationId);
-    setTimeout(() => setTestingId(null), 2000);
   };
 
   const togglePasswordVisibility = (key: string) => {
@@ -942,6 +998,13 @@ function IntegrationSettings({
                   </div>
                 ))}
               </div>
+
+              {saveError && (
+                <div className="mt-4 flex items-center gap-2 p-3 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm">
+                  <XCircle className="w-4 h-4" />
+                  {saveError}
+                </div>
+              )}
 
               <div className="flex items-center justify-between mt-6 pt-4 border-t border-gray-200 dark:border-gray-700">
                 <a

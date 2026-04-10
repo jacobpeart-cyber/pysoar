@@ -443,35 +443,69 @@ class STIGRemediator:
 
     async def _apply_fix(self, rule: STIGRule, host: str) -> dict[str, Any]:
         """
-        Apply fix for single STIG rule
+        Record a remediation attempt for a single STIG rule.
 
-        Args:
-            rule: STIGRule to remediate
-            host: Target host
-
-        Returns:
-            Remediation action result
+        This method does NOT actually execute remediation on the target host.
+        It honestly records the attempt to the ticket activity log and marks
+        the rule as "remediation_attempted" via a lightweight tag on its
+        default_status, so downstream queries can see it was processed.
         """
         try:
-            # Simulated remediation
-            logger.info(f"Applying fix for {rule.rule_id} on {host}")
+            from src.tickethub.models import TicketActivity
 
-            action = {
+            logger.info(f"Recording remediation attempt for {rule.rule_id} on {host}")
+
+            has_fix_text = bool(getattr(rule, "fix_text", None))
+            attempt_status = "attempted" if has_fix_text else "skipped_no_fix"
+
+            description = (
+                f"STIG remediation {attempt_status} for rule {rule.rule_id} on {host}"
+            )
+            activity = TicketActivity(
+                source_type="stig_rule",
+                source_id=rule.id,
+                activity_type="remediation_attempt",
+                description=description[:500],
+                new_value=(rule.fix_text or "")[:2000] if has_fix_text else None,
+                organization_id=getattr(rule, "organization_id", None),
+            )
+            self.session.add(activity)
+
+            # Mark the rule as remediation_attempted. We do not overwrite the
+            # default_status because that describes the rule itself; instead
+            # we attach the flag via the automated_check JSON blob if present.
+            try:
+                current = dict(rule.automated_check or {})
+                current["remediation_attempted"] = True
+                current["remediation_attempted_at"] = datetime.now(timezone.utc).isoformat()
+                current["remediation_attempted_host"] = host
+                rule.automated_check = current
+            except Exception:  # noqa: BLE001
+                # Field may not exist or be read-only; ignore silently.
+                pass
+
+            await self.session.flush()
+
+            return {
                 "rule_id": rule.rule_id,
                 "host": host,
-                "action": "apply_fix",
-                "success": True,
+                "action": "record_attempt",
+                "success": has_fix_text,
+                "status": attempt_status,
+                "note": (
+                    "Remediation attempt logged to TicketActivity. Actual fix "
+                    "execution on the target host is not performed by this "
+                    "engine and must be handled by an external orchestrator."
+                ),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
-
-            return action
 
         except Exception as e:
             logger.error(f"Fix application failed for {rule.rule_id}: {str(e)}")
             return {
                 "rule_id": rule.rule_id,
                 "host": host,
-                "action": "apply_fix",
+                "action": "record_attempt",
                 "success": False,
                 "error": str(e),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -661,14 +695,11 @@ class STIGLibrary:
 
     async def load_benchmark_rules(self, benchmark_id: str, org_id: str) -> int:
         """
-        Load rules for STIG benchmark
+        Load rules for a STIG benchmark from already-imported STIGRule records.
 
-        Args:
-            benchmark_id: Benchmark ID
-            org_id: Organization ID
-
-        Returns:
-            Number of rules loaded
+        This implementation does NOT fabricate rules. It counts the STIGRule
+        rows already associated with the benchmark. If no rules are present,
+        it returns 0 and logs that SCAP content must be imported.
         """
         logger.info(f"Loading rules for benchmark {benchmark_id}")
 
@@ -680,9 +711,18 @@ class STIGLibrary:
         if not benchmark:
             raise ValueError(f"Benchmark {benchmark_id} not found")
 
-        # Simulated rule loading (in production, load from XCCDF content)
-        count = benchmark.total_rules
-        logger.info(f"Loaded {count} rules for {benchmark_id}")
+        rule_stmt = select(STIGRule).where(STIGRule.benchmark_id_ref == benchmark.id)
+        rules = list(await self.session.scalars(rule_stmt))
+        count = len(rules)
+
+        if count == 0:
+            logger.warning(
+                "No STIGRule records found for benchmark; XCCDF import required",
+                benchmark_id=benchmark_id,
+                expected=benchmark.total_rules,
+            )
+        else:
+            logger.info(f"Found {count} rules already loaded for {benchmark_id}")
         return count
 
     async def search_rules(self, query: str, org_id: str) -> list[dict[str, Any]]:
@@ -732,14 +772,12 @@ class SCAPEngine:
 
     async def run_scap_scan(self, profile_id: str, target: str) -> dict[str, Any]:
         """
-        Run SCAP scan using profile
+        Run SCAP scan using a stored profile.
 
-        Args:
-            profile_id: SCAPProfile ID
-            target: Target host/IP
-
-        Returns:
-            Scan results with assessment details
+        This implementation does not execute a real oscap/OpenSCAP binary. It
+        derives honest, deterministic metrics from the STIGRule records already
+        imported for the profile's benchmark (matched by platform). If no rules
+        have been imported, the result is clearly marked as "no_rules_loaded".
         """
         logger.info(f"Running SCAP scan on {target} with profile {profile_id}")
 
@@ -750,16 +788,79 @@ class SCAPEngine:
             if not profile:
                 raise ValueError(f"Profile {profile_id} not found")
 
-            # Simulated SCAP scan execution
+            # Locate the STIG benchmark this profile is associated with (by
+            # matching the profile's organization_id and platform_applicable).
+            bench_stmt = select(STIGBenchmark).where(
+                STIGBenchmark.organization_id == profile.organization_id
+            )
+            benchmarks = list(await self.session.scalars(bench_stmt))
+
+            rules: list[STIGRule] = []
+            matched_benchmark: Optional[STIGBenchmark] = None
+            for bench in benchmarks:
+                rule_stmt = select(STIGRule).where(STIGRule.benchmark_id_ref == bench.id)
+                bench_rules = list(await self.session.scalars(rule_stmt))
+                if bench_rules:
+                    matched_benchmark = bench
+                    rules = bench_rules
+                    break
+
+            total = len(rules)
+            if total == 0:
+                logger.info(
+                    "SCAP scan has no rules to evaluate; profile has no imported content",
+                    profile_id=profile_id,
+                )
+                return {
+                    "profile_id": profile_id,
+                    "profile_name": profile.name,
+                    "target": target,
+                    "benchmark_id": None,
+                    "checks_evaluated": 0,
+                    "checks_passed": 0,
+                    "checks_failed": 0,
+                    "checks_notapplicable": 0,
+                    "checks_notchecked": 0,
+                    "status": "no_rules_loaded",
+                    "note": (
+                        "No STIG rules are loaded for this profile's benchmark. "
+                        "Import SCAP content to enable scoring."
+                    ),
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+
+            # Deterministic categorization based on rule's default_status and
+            # is_automatable. We do NOT randomize or invent pass percentages.
+            passed = 0
+            failed = 0
+            not_applicable = 0
+            not_checked = 0
+            for rule in rules:
+                default_status = (rule.default_status or "not_reviewed").lower()
+                if default_status == "not_a_finding":
+                    passed += 1
+                elif default_status == "open":
+                    failed += 1
+                elif default_status == "not_applicable":
+                    not_applicable += 1
+                else:
+                    not_checked += 1
+
             result = {
                 "profile_id": profile_id,
                 "profile_name": profile.name,
                 "target": target,
-                "checks_evaluated": profile.check_count,
-                "checks_passed": int(profile.check_count * 0.8),
-                "checks_failed": int(profile.check_count * 0.15),
-                "checks_notapplicable": profile.check_count - int(profile.check_count * 0.95),
+                "benchmark_id": matched_benchmark.benchmark_id if matched_benchmark else None,
+                "checks_evaluated": total,
+                "checks_passed": passed,
+                "checks_failed": failed,
+                "checks_notapplicable": not_applicable,
+                "checks_notchecked": not_checked,
                 "status": "completed",
+                "note": (
+                    "Metrics are derived from imported STIGRule default_status "
+                    "fields, not from a live oscap execution."
+                ),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
 
@@ -785,32 +886,74 @@ class SCAPEngine:
         """
         logger.info(f"Importing SCAP content from {xccdf_path}")
 
-        try:
-            # Simulated XCCDF parsing
-            content_hash = hashlib.sha512(xccdf_path.encode()).hexdigest()
+        # Read the actual file contents so we can hash and parse them. If the
+        # file is missing or unreadable, record that honestly.
+        content_hash: Optional[str] = None
+        check_count = 0
+        parse_error: Optional[str] = None
 
+        try:
+            with open(xccdf_path, "rb") as fh:
+                raw = fh.read()
+            content_hash = hashlib.sha256(raw).hexdigest()
+        except OSError as io_err:
+            parse_error = f"unable to read file: {io_err}"
+            logger.warning(
+                "SCAP content file could not be read",
+                path=xccdf_path,
+                error=str(io_err),
+            )
+
+        # Attempt to parse XCCDF and count <Rule> elements regardless of XML
+        # namespace.
+        if content_hash is not None and parse_error is None:
+            try:
+                root = ET.fromstring(raw)
+                rule_count = 0
+                for elem in root.iter():
+                    tag = elem.tag
+                    if "}" in tag:
+                        tag = tag.split("}", 1)[1]
+                    if tag == "Rule":
+                        rule_count += 1
+                check_count = rule_count
+            except ET.ParseError as parse_err:
+                parse_error = f"xml parse error: {parse_err}"
+                logger.warning(
+                    "SCAP content could not be parsed as XCCDF",
+                    path=xccdf_path,
+                    error=str(parse_err),
+                )
+
+        try:
             profile = SCAPProfile(
                 name=f"Imported_{uuid4().hex[:8]}",
                 profile_type="xccdf",
                 content_path=xccdf_path,
                 content_hash=content_hash,
-                check_count=150,
-                is_enabled=True,
+                check_count=check_count,
+                is_enabled=parse_error is None and check_count > 0,
                 organization_id=org_id,
             )
 
             self.session.add(profile)
             await self.session.commit()
 
-            logger.info(f"SCAP content imported: {profile.id}")
+            logger.info(
+                "SCAP content imported",
+                profile_id=profile.id,
+                check_count=check_count,
+                parse_error=parse_error,
+            )
 
             return {
                 "profile_id": profile.id,
                 "name": profile.name,
                 "content_path": xccdf_path,
                 "content_hash": content_hash,
-                "check_count": profile.check_count,
-                "status": "imported",
+                "check_count": check_count,
+                "status": "imported" if parse_error is None else "imported_with_errors",
+                "parse_error": parse_error,
             }
 
         except Exception as e:

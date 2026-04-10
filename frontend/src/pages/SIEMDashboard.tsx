@@ -110,6 +110,7 @@ export default function SIEMDashboard() {
   const [collectorStatus, setCollectorStatus] = useState<any>(null);
 
   const queryClient = useQueryClient();
+  const [collectorError, setCollectorError] = useState<string | null>(null);
 
   // Fetch dashboard stats
   const { data: stats, isLoading: statsLoading } = useQuery({
@@ -263,22 +264,36 @@ export default function SIEMDashboard() {
   // Collector start/stop mutations
   const collectorStartMutation = useMutation({
     mutationFn: async () => {
-      try {
       const response = await api.post('/siem/collector/start');
       return response.data;
-      } catch { return null; }
     },
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['siem-collector-status'] }),
+    onSuccess: () => {
+      setCollectorError(null);
+      queryClient.invalidateQueries({ queryKey: ['siem-collector-status'] });
+    },
+    onError: (err: any) => {
+      console.error('Collector start failed:', err);
+      setCollectorError(
+        err?.response?.data?.detail || err?.message || 'Failed to start collector'
+      );
+    },
   });
 
   const collectorStopMutation = useMutation({
     mutationFn: async () => {
-      try {
       const response = await api.post('/siem/collector/stop');
       return response.data;
-      } catch { return null; }
     },
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: ['siem-collector-status'] }),
+    onSuccess: () => {
+      setCollectorError(null);
+      queryClient.invalidateQueries({ queryKey: ['siem-collector-status'] });
+    },
+    onError: (err: any) => {
+      console.error('Collector stop failed:', err);
+      setCollectorError(
+        err?.response?.data?.detail || err?.message || 'Failed to stop collector'
+      );
+    },
   });
 
   // Live Tail polling
@@ -344,6 +359,19 @@ export default function SIEMDashboard() {
           <p className="text-gray-500 mt-1">Security information and event management</p>
         </div>
       </div>
+
+      {collectorError && (
+        <div className="flex items-start gap-2 p-4 bg-red-50 border border-red-200 rounded-lg text-red-700">
+          <AlertTriangle className="w-5 h-5 flex-shrink-0 mt-0.5" />
+          <div className="flex-1">{collectorError}</div>
+          <button
+            onClick={() => setCollectorError(null)}
+            className="text-red-700 hover:text-red-900 text-sm"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
 
       {/* Tab Navigation */}
       <div className="bg-white rounded-lg border border-gray-200">

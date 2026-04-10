@@ -4,12 +4,15 @@ Scheduled and background tasks for dark web scanning, credential leak detection,
 brand monitoring, and threat intelligence correlation.
 """
 
-from datetime import datetime, timezone
+import asyncio
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from celery import shared_task
+from sqlalchemy import select
 
 from src.core.config import settings
+from src.core.database import async_session_factory
 from src.core.logging import get_logger
 from src.darkweb.engine import (
     DarkWebScanner,
@@ -17,6 +20,9 @@ from src.darkweb.engine import (
     BrandProtection,
     ThreatIntelCorrelator,
 )
+from src.darkweb.models import DarkWebFinding, DarkWebMonitor
+from src.models.incident import Incident
+from src.models.ioc import IOC
 
 logger = get_logger(__name__)
 
@@ -128,15 +134,71 @@ def credential_leak_check(
 
         analyzer = CredentialAnalyzer()
 
-        # Simulated credential data (in production, fetch from finding)
-        raw_data = """
-        admin@company.com:p@ssw0rd123
-        user@company.com|hashedpassword
-        john.doe:secretpassword
-        """
+        async def _fetch_credential_context() -> dict[str, Any]:
+            async with async_session_factory() as session:
+                # Load the specific finding
+                finding_stmt = select(DarkWebFinding).where(
+                    DarkWebFinding.id == finding_id
+                )
+                finding = (await session.scalars(finding_stmt)).first()
 
-        # Parse credentials
-        credentials = analyzer.parse_credential_dumps(raw_data)
+                raw_text = ""
+                org_id: str | None = None
+                monitor_id: str | None = None
+                if finding is not None:
+                    org_id = finding.organization_id
+                    monitor_id = finding.monitor_id
+                    # DarkWebFinding stores a raw_data_hash, not raw text; use the
+                    # finding description and any analyst notes as the credential
+                    # text source. (Full raw payloads live in object storage
+                    # which is not yet wired up to the DB layer.)
+                    raw_text = "\n".join(
+                        part
+                        for part in (finding.description, finding.analyst_notes)
+                        if part
+                    )
+
+                monitored_domains: list[str] = []
+                monitored_emails: list[str] = []
+                if org_id:
+                    mon_stmt = select(DarkWebMonitor).where(
+                        DarkWebMonitor.organization_id == org_id
+                    )
+                    monitors = list((await session.scalars(mon_stmt)).all())
+                    for m in monitors:
+                        if m.domains_watched:
+                            monitored_domains.extend(m.domains_watched or [])
+                        if m.emails_watched:
+                            monitored_emails.extend(m.emails_watched or [])
+
+                return {
+                    "raw_text": raw_text,
+                    "monitored_domains": sorted(set(monitored_domains)),
+                    "monitored_emails": sorted(set(monitored_emails)),
+                    "organization_id": org_id,
+                    "monitor_id": monitor_id,
+                    "finding_found": finding is not None,
+                }
+
+        ctx = asyncio.run(_fetch_credential_context())
+
+        if not ctx["finding_found"]:
+            logger.warning(f"Credential leak check: finding {finding_id} not found")
+            return {
+                "finding_id": finding_id,
+                "credentials_extracted": 0,
+                "organizational_credentials": 0,
+                "analyzed_credentials": [],
+                "organizational_matches": [],
+                "status": "finding_not_found",
+            }
+
+        # Parse credentials from the finding's actual content
+        credentials = (
+            analyzer.parse_credential_dumps(ctx["raw_text"])
+            if extract_credentials and ctx["raw_text"]
+            else []
+        )
         logger.info(f"Extracted {len(credentials)} credentials")
 
         # Assess password risk for each credential
@@ -152,11 +214,11 @@ def credential_leak_check(
                 }
             )
 
-        # Identify organizational credentials
+        # Identify organizational credentials against this org's monitored assets
         organizational_creds = analyzer.identify_organizational_credentials(
             credentials,
-            monitored_domains=["company.com"],
-            monitored_emails=["admin@company.com", "user@company.com"],
+            monitored_domains=ctx["monitored_domains"],
+            monitored_emails=ctx["monitored_emails"],
         )
 
         logger.info(f"Found {len(organizational_creds)} organizational credentials")
@@ -309,41 +371,123 @@ def threat_correlation(
 
         correlator = ThreatIntelCorrelator()
 
-        # Simulated finding data
-        finding_data = {
-            "id": finding_id,
-            "domain": "example-malicious.com",
-            "severity": "high",
-            "confidence_score": 85,
-        }
+        async def _run_correlation() -> dict[str, Any]:
+            async with async_session_factory() as session:
+                # Load finding
+                finding = (
+                    await session.scalars(
+                        select(DarkWebFinding).where(DarkWebFinding.id == finding_id)
+                    )
+                ).first()
+                if finding is None:
+                    return {"finding_found": False}
 
-        # Simulate IOC database
-        ioc_database = [
-            {"value": "example-malicious.com", "type": "domain", "source": "internal"}
-        ]
+                affected = finding.affected_assets or {}
+                if isinstance(affected, str):
+                    try:
+                        import json as _json
+                        affected = _json.loads(affected)
+                    except Exception:  # noqa: BLE001
+                        affected = {}
 
-        # Correlate with IOCs
-        ioc_correlations = await_sync_wrapper(
-            correlator.correlate_with_iocs(finding_data, ioc_database)
-        )
+                finding_data = {
+                    "id": finding.id,
+                    "domain": affected.get("domain") if isinstance(affected, dict) else None,
+                    "ip": affected.get("ip") if isinstance(affected, dict) else None,
+                    "email": affected.get("email") if isinstance(affected, dict) else None,
+                    "hash": finding.raw_data_hash,
+                    "severity": finding.severity,
+                    "confidence_score": finding.confidence_score,
+                    "finding_type": finding.finding_type,
+                    "source_platform": finding.source_platform,
+                    "title": finding.title,
+                    "description": finding.description,
+                }
 
-        # Correlate with incidents
-        incident_database = [
-            {
-                "id": "incident-123",
-                "iocs": ["example-malicious.com"],
-                "status": "active",
+                # Load recent IOCs (last 90 days) for this org
+                ioc_cutoff = datetime.now(timezone.utc) - timedelta(days=90)
+                ioc_stmt = select(IOC).where(
+                    (IOC.organization_id == organization_id)
+                    & (IOC.created_at >= ioc_cutoff)
+                )
+                iocs = list((await session.scalars(ioc_stmt)).all())
+                ioc_database = [
+                    {
+                        "id": i.id,
+                        "value": i.value,
+                        "type": i.ioc_type,
+                        "source": i.source,
+                        "threat_level": i.threat_level,
+                        "confidence": i.confidence,
+                    }
+                    for i in iocs
+                ]
+
+                # Load recent incidents (last 90 days) for this org
+                inc_cutoff = datetime.now(timezone.utc) - timedelta(days=90)
+                inc_stmt = select(Incident).where(
+                    (Incident.organization_id == organization_id)
+                    & (Incident.created_at >= inc_cutoff)
+                )
+                incidents = list((await session.scalars(inc_stmt)).all())
+
+                import json as _json
+                incident_database = []
+                for inc in incidents:
+                    iocs_list: list[str] = []
+                    if inc.indicators:
+                        try:
+                            parsed = _json.loads(inc.indicators)
+                            if isinstance(parsed, list):
+                                iocs_list = [str(x) for x in parsed]
+                        except Exception:  # noqa: BLE001
+                            pass
+                    incident_database.append(
+                        {
+                            "id": inc.id,
+                            "title": inc.title,
+                            "status": inc.status,
+                            "severity": inc.severity,
+                            "iocs": iocs_list,
+                        }
+                    )
+
+                ioc_corr = await correlator.correlate_with_iocs(
+                    finding_data, ioc_database
+                )
+                incident_corr = await correlator.correlate_with_incidents(
+                    finding_data, incident_database
+                )
+                score = await correlator.calculate_risk_score(finding_data)
+
+                return {
+                    "finding_found": True,
+                    "finding_data": finding_data,
+                    "ioc_correlations": ioc_corr,
+                    "incident_correlations": incident_corr,
+                    "risk_score": score,
+                    "ioc_count": len(ioc_database),
+                    "incident_count": len(incident_database),
+                }
+
+        result = asyncio.run(_run_correlation())
+
+        if not result.get("finding_found"):
+            logger.warning(f"Threat correlation: finding {finding_id} not found")
+            return {
+                "finding_id": finding_id,
+                "ioc_matches": 0,
+                "incident_matches": 0,
+                "risk_score": 0,
+                "ioc_correlations": [],
+                "incident_correlations": [],
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "status": "finding_not_found",
             }
-        ]
 
-        incident_correlations = await_sync_wrapper(
-            correlator.correlate_with_incidents(finding_data, incident_database)
-        )
-
-        # Calculate risk score
-        risk_score = await_sync_wrapper(
-            correlator.calculate_risk_score(finding_data)
-        )
+        ioc_correlations = result["ioc_correlations"]
+        incident_correlations = result["incident_correlations"]
+        risk_score = result["risk_score"]
 
         logger.info(
             f"Finding {finding_id} correlated: "

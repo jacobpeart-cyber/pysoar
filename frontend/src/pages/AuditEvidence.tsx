@@ -85,6 +85,7 @@ export default function AuditEvidence() {
   const [dateRangeFilter, setDateRangeFilter] = useState<string>('7d');
   const [evidenceStatusFilter, setEvidenceStatusFilter] = useState<string>('all');
   const [evidenceTypeFilter, setEvidenceTypeFilter] = useState<string>('all');
+  const [actionError, setActionError] = useState<string | null>(null);
   const queryClient = useQueryClient();
 
   const { data: dashboardData, isLoading: dashboardLoading } = useQuery<DashboardData>({
@@ -161,14 +162,19 @@ export default function AuditEvidence() {
 
   const runConMonMutation = useMutation({
     mutationFn: async () => {
-      try {
       const response = await api.post('/audit-evidence/conmon/run');
       return response.data;
-      } catch { return null; }
     },
     onSuccess: () => {
+      setActionError(null);
       queryClient.invalidateQueries({ queryKey: ['conmon-status'] });
       queryClient.invalidateQueries({ queryKey: ['audit-evidence-dashboard'] });
+    },
+    onError: (err: any) => {
+      console.error('ConMon run failed:', err);
+      setActionError(
+        err?.response?.data?.detail || err?.message || 'Failed to run continuous monitoring'
+      );
     },
   });
 
@@ -234,6 +240,19 @@ export default function AuditEvidence() {
           Compliance evidence management and continuous monitoring
         </p>
       </div>
+
+      {actionError && (
+        <div className="flex items-start gap-2 p-4 bg-red-50 border border-red-200 rounded-lg text-red-700">
+          <AlertCircle className="w-5 h-5 flex-shrink-0 mt-0.5" />
+          <div className="flex-1">{actionError}</div>
+          <button
+            onClick={() => setActionError(null)}
+            className="text-red-700 hover:text-red-900 text-sm"
+          >
+            Dismiss
+          </button>
+        </div>
+      )}
 
       {/* Tab Navigation */}
       <div className="border-b border-gray-200 dark:border-gray-700">

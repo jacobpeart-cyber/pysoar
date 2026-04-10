@@ -87,6 +87,7 @@ export default function ComplianceDashboard() {
   const [statusFilter, setStatusFilter] = useState<string>('all');
   const [poamStatusFilter, setPOAMStatusFilter] = useState<string>('all');
   const [riskLevelFilter, setRiskLevelFilter] = useState<string>('all');
+  const [actionError, setActionError] = useState<string | null>(null);
   const queryClient = useQueryClient();
 
   const { data: dashboardData, isLoading: dashboardLoading } = useQuery<DashboardData>({
@@ -148,13 +149,18 @@ export default function ComplianceDashboard() {
 
   const createPOAMMutation = useMutation({
     mutationFn: async (data: Partial<POAM>) => {
-      try {
       const response = await api.post('/compliance/poams', data);
       return response.data;
-      } catch { return null; }
     },
     onSuccess: () => {
+      setActionError(null);
       queryClient.invalidateQueries({ queryKey: ['compliance-poams'] });
+    },
+    onError: (err: any) => {
+      console.error('Create POAM failed:', err);
+      setActionError(
+        err?.response?.data?.detail || err?.message || 'Failed to create POA&M'
+      );
     },
   });
 
@@ -197,6 +203,19 @@ export default function ComplianceDashboard() {
           Federal compliance framework tracking and management
         </p>
       </div>
+
+      {actionError && (
+        <div className="flex items-start gap-2 p-4 bg-red-50 border border-red-200 rounded-lg text-red-700">
+          <AlertCircle className="w-5 h-5 flex-shrink-0 mt-0.5" />
+          <div className="flex-1">{actionError}</div>
+          <button
+            onClick={() => setActionError(null)}
+            className="text-red-700 hover:text-red-900"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
 
       {/* Tab Navigation */}
       <div className="border-b border-gray-200 dark:border-gray-700">

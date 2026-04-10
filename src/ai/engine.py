@@ -357,18 +357,87 @@ class AnomalyDetector:
 
     def check_model_drift(self, model_id: str) -> float:
         """
-        Check for model drift by comparing recent predictions to baseline.
+        Check for model drift by comparing the recent alert distribution
+        to the prior window distribution.
+
+        Drift is computed as the L1 distance (total variation) between
+        the normalized severity distribution of alerts in the last 24h
+        vs the 24h window before that, scaled to [0.0, 1.0].
 
         Args:
-            model_id: ID of model to check
+            model_id: ID of model to check (used as a tag in the baseline cache)
 
         Returns:
             Drift score (0.0-1.0, higher = more drift)
         """
-        # In production, would compare recent prediction accuracy to baseline
-        # For now, return simulated drift score
-        import random
-        drift = random.uniform(0.0, 0.3)
+        try:
+            # Try to query real alert severity distributions from DB.
+            import asyncio
+            from sqlalchemy import select, func as sa_func
+            from src.core.database import async_session_factory
+            from src.models.alert import Alert
+
+            async def _fetch_distributions() -> tuple[dict[str, int], dict[str, int]]:
+                now = datetime.utcnow()
+                recent_start = now - timedelta(hours=24)
+                prior_start = now - timedelta(hours=48)
+                async with async_session_factory() as session:
+                    recent_stmt = (
+                        select(Alert.severity, sa_func.count(Alert.id))
+                        .where(Alert.created_at >= recent_start)
+                        .group_by(Alert.severity)
+                    )
+                    prior_stmt = (
+                        select(Alert.severity, sa_func.count(Alert.id))
+                        .where(
+                            (Alert.created_at >= prior_start)
+                            & (Alert.created_at < recent_start)
+                        )
+                        .group_by(Alert.severity)
+                    )
+                    recent_rows = (await session.execute(recent_stmt)).all()
+                    prior_rows = (await session.execute(prior_stmt)).all()
+                    return (
+                        {str(s): int(c) for s, c in recent_rows},
+                        {str(s): int(c) for s, c in prior_rows},
+                    )
+
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # Can't block on existing loop; fall back to no-data drift
+                    recent_counts, prior_counts = {}, {}
+                else:
+                    recent_counts, prior_counts = loop.run_until_complete(
+                        _fetch_distributions()
+                    )
+            except RuntimeError:
+                recent_counts, prior_counts = asyncio.run(_fetch_distributions())
+
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning(
+                f"Model drift check: unable to query alert data ({exc}); "
+                f"returning 0.0"
+            )
+            return 0.0
+
+        recent_total = sum(recent_counts.values())
+        prior_total = sum(prior_counts.values())
+
+        if recent_total == 0 or prior_total == 0:
+            self.logger.info(
+                f"Model {model_id} drift score: 0.00 (insufficient alert data)"
+            )
+            return 0.0
+
+        severities = set(recent_counts) | set(prior_counts)
+        l1 = 0.0
+        for sev in severities:
+            r = recent_counts.get(sev, 0) / recent_total
+            p = prior_counts.get(sev, 0) / prior_total
+            l1 += abs(r - p)
+        # Total variation distance = 0.5 * L1, already in [0, 1]
+        drift = min(1.0, max(0.0, 0.5 * l1))
         self.logger.info(f"Model {model_id} drift score: {drift:.2f}")
         return drift
 
@@ -395,23 +464,65 @@ class AnomalyDetector:
 
     def _calculate_training_metrics(self, model_type: str, features: dict) -> dict:
         """
-        Calculate training metrics for a model.
+        Calculate honest training metrics from the extracted features.
+
+        These are not model-quality metrics (which would require labels
+        and a held-out evaluation set) but rather descriptive statistics
+        of the training data actually supplied.
 
         Args:
             model_type: Type of model
-            features: Training features
+            features: Dict mapping feature name -> list of numeric values
 
         Returns:
-            Dictionary with training metrics
+            Dictionary with honest descriptive training metrics
         """
-        # Simulate training metrics
+        if not features:
+            return {
+                "model_type": model_type,
+                "samples_trained": 0,
+                "feature_count": 0,
+                "feature_names": [],
+                "feature_stats": {},
+                "note": "No numeric features could be extracted from training data",
+            }
+
+        # Sample count = max length across feature vectors (should be uniform).
+        samples_trained = max((len(v) for v in features.values()), default=0)
+
+        feature_stats: dict[str, dict[str, float]] = {}
+        for name, values in features.items():
+            if not values:
+                feature_stats[name] = {"count": 0}
+                continue
+            arr = np.asarray(values, dtype=float)
+            feature_stats[name] = {
+                "count": int(arr.size),
+                "mean": float(np.mean(arr)),
+                "std": float(np.std(arr)),
+                "min": float(np.min(arr)),
+                "max": float(np.max(arr)),
+            }
+
+        # Class distribution: if a 'label'/'class'/'severity_score' feature exists,
+        # derive a distribution by bucketing. Otherwise, report None.
+        class_distribution: dict[str, int] = {}
+        label_key = next(
+            (k for k in ("label", "class", "target", "severity_score") if k in features),
+            None,
+        )
+        if label_key:
+            for v in features[label_key]:
+                bucket = str(int(v)) if isinstance(v, (int, float)) else str(v)
+                class_distribution[bucket] = class_distribution.get(bucket, 0) + 1
+
         return {
-            "accuracy": 0.92,
-            "precision": 0.89,
-            "recall": 0.95,
-            "f1": 0.92,
-            "auc": 0.94,
-            "samples_used": len(features.get(list(features.keys())[0], [])) if features else 0,
+            "model_type": model_type,
+            "samples_trained": samples_trained,
+            "feature_count": len(features),
+            "feature_names": list(features.keys()),
+            "feature_stats": feature_stats,
+            "class_distribution": class_distribution,
         }
 
     def _score_to_severity(self, score: float) -> str:
