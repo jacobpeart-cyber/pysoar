@@ -224,6 +224,9 @@ async def natural_language_query(
         elif "critical" in text_lower or "high" in text_lower or "severity" in text_lower:
             intent = "severity_search"
             generated_query = "SELECT * FROM alerts WHERE severity IN ('critical','high') ORDER BY created_at DESC"
+        elif any(w in text_lower for w in ["alert", "alerts", "recent", "latest", "all", "show", "list"]):
+            intent = "list_alerts"
+            generated_query = "SELECT * FROM alerts ORDER BY created_at DESC LIMIT 20"
         else:
             intent = "general_search"
             generated_query = f"SELECT * FROM alerts ORDER BY created_at DESC LIMIT 20"
@@ -332,6 +335,9 @@ async def natural_language_query(
                     .order_by(Alert.created_at.desc())
                     .limit(20)
                 )
+            elif intent == "list_alerts":
+                # Just return latest alerts
+                alert_query = select(Alert).order_by(Alert.created_at.desc()).limit(20)
             else:
                 # General search: look for query terms in title/description
                 search_terms = text_lower[:60]
