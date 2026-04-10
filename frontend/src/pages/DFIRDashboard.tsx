@@ -102,6 +102,23 @@ export default function DFIRDashboard() {
   const [newCaseType, setNewCaseType] = useState('incident_response');
   const [newCaseError, setNewCaseError] = useState('');
 
+  // Edit Case modal state
+  const [showEditCaseModal, setShowEditCaseModal] = useState(false);
+  const [editCaseItem, setEditCaseItem] = useState<any>(null);
+  const [editCaseTitle, setEditCaseTitle] = useState('');
+  const [editCaseDescription, setEditCaseDescription] = useState('');
+  const [editCaseSeverity, setEditCaseSeverity] = useState('medium');
+  const [editCaseStatus, setEditCaseStatus] = useState('open');
+  const [editCaseError, setEditCaseError] = useState('');
+
+  // Edit Legal Hold modal state
+  const [showEditHoldModal, setShowEditHoldModal] = useState(false);
+  const [editHoldItem, setEditHoldItem] = useState<any>(null);
+  const [editHoldType, setEditHoldType] = useState('');
+  const [editHoldStatus, setEditHoldStatus] = useState('');
+  const [editHoldCustodians, setEditHoldCustodians] = useState('');
+  const [editHoldError, setEditHoldError] = useState('');
+
   // Data queries
   const { data: casesData, isLoading: casesLoading, error: casesError } = useQuery({
     queryKey: ['dfir-cases'],
@@ -161,6 +178,38 @@ export default function DFIRDashboard() {
     },
     onError: (err: any) => {
       setNewCaseError(err?.response?.data?.detail || err?.message || 'Failed to create case');
+    },
+  });
+
+  // Edit case mutation
+  const editCaseMutation = useMutation({
+    mutationFn: (data: { caseId: string; title: string; description: string; severity: string; status: string }) =>
+      dfirApi.updateCase(data.caseId, { title: data.title, description: data.description, severity: data.severity, status: data.status }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['dfir-cases'] });
+      queryClient.invalidateQueries({ queryKey: ['dfir-dashboard'] });
+      setShowEditCaseModal(false);
+      setEditCaseItem(null);
+      setEditCaseError('');
+    },
+    onError: (err: any) => {
+      setEditCaseError(err?.response?.data?.detail || err?.message || 'Failed to update case');
+    },
+  });
+
+  // Edit legal hold mutation
+  const editHoldMutation = useMutation({
+    mutationFn: (data: { holdId: string; hold_type: string; status: string; custodians: string[] }) =>
+      dfirApi.updateLegalHold(data.holdId, { hold_type: data.hold_type, status: data.status, custodians: data.custodians }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['dfir-legal-holds'] });
+      queryClient.invalidateQueries({ queryKey: ['dfir-dashboard'] });
+      setShowEditHoldModal(false);
+      setEditHoldItem(null);
+      setEditHoldError('');
+    },
+    onError: (err: any) => {
+      setEditHoldError(err?.response?.data?.detail || err?.message || 'Failed to update legal hold');
     },
   });
 
@@ -242,8 +291,13 @@ export default function DFIRDashboard() {
 
   const handleEditCase = useCallback((caseItem: any) => {
     setSelectedCase(caseItem);
-    // Navigate to edit or open edit modal - placeholder for now
-    console.log('Edit case:', caseItem.id);
+    setEditCaseItem(caseItem);
+    setEditCaseTitle(caseItem.title || '');
+    setEditCaseDescription(caseItem.description || '');
+    setEditCaseSeverity(caseItem.severity || 'medium');
+    setEditCaseStatus(caseItem.status || 'open');
+    setEditCaseError('');
+    setShowEditCaseModal(true);
   }, []);
 
   const handleViewEvidence = useCallback((item: any) => {
@@ -265,7 +319,12 @@ export default function DFIRDashboard() {
   }, []);
 
   const handleEditHold = useCallback((hold: any) => {
-    console.log('Edit legal hold:', hold.id);
+    setEditHoldItem(hold);
+    setEditHoldType(hold.hold_type || '');
+    setEditHoldStatus(hold.status || '');
+    setEditHoldCustodians(Array.isArray(hold.custodians) ? hold.custodians.join(', ') : (hold.custodians || ''));
+    setEditHoldError('');
+    setShowEditHoldModal(true);
   }, []);
 
   const tabs = [
@@ -876,6 +935,173 @@ export default function DFIRDashboard() {
                 >
                   {createCaseMutation.isPending && <Loader2 className="w-4 h-4 animate-spin" />}
                   Create
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Edit Case Modal */}
+      {showEditCaseModal && editCaseItem && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-96 max-h-screen overflow-y-auto">
+            <h2 className="text-xl font-bold mb-4">Edit Case</h2>
+            {editCaseError && (
+              <div className="mb-4 p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg text-sm text-red-700 dark:text-red-300">
+                {editCaseError}
+              </div>
+            )}
+            <div className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium mb-1">Case Title</label>
+                <input
+                  type="text"
+                  value={editCaseTitle}
+                  onChange={(e) => setEditCaseTitle(e.target.value)}
+                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Description</label>
+                <textarea
+                  value={editCaseDescription}
+                  onChange={(e) => setEditCaseDescription(e.target.value)}
+                  rows={3}
+                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Status</label>
+                <select
+                  value={editCaseStatus}
+                  onChange={(e) => setEditCaseStatus(e.target.value)}
+                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+                >
+                  <option value="open">Open</option>
+                  <option value="in_progress">In Progress</option>
+                  <option value="closed">Closed</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Severity</label>
+                <select
+                  value={editCaseSeverity}
+                  onChange={(e) => setEditCaseSeverity(e.target.value)}
+                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+                >
+                  <option value="critical">Critical</option>
+                  <option value="high">High</option>
+                  <option value="medium">Medium</option>
+                  <option value="low">Low</option>
+                </select>
+              </div>
+              <div className="flex gap-2 mt-6">
+                <button
+                  onClick={() => { setShowEditCaseModal(false); setEditCaseItem(null); }}
+                  className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                  disabled={editCaseMutation.isPending}
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => {
+                    if (!editCaseTitle.trim()) {
+                      setEditCaseError('Case title is required');
+                      return;
+                    }
+                    editCaseMutation.mutate({
+                      caseId: editCaseItem.id,
+                      title: editCaseTitle,
+                      description: editCaseDescription,
+                      severity: editCaseSeverity,
+                      status: editCaseStatus,
+                    });
+                  }}
+                  disabled={editCaseMutation.isPending}
+                  className="flex-1 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition disabled:opacity-50 flex items-center justify-center gap-2"
+                >
+                  {editCaseMutation.isPending && <Loader2 className="w-4 h-4 animate-spin" />}
+                  Save
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Edit Legal Hold Modal */}
+      {showEditHoldModal && editHoldItem && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-96 max-h-screen overflow-y-auto">
+            <h2 className="text-xl font-bold mb-4">Edit Legal Hold</h2>
+            {editHoldError && (
+              <div className="mb-4 p-3 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg text-sm text-red-700 dark:text-red-300">
+                {editHoldError}
+              </div>
+            )}
+            <div className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium mb-1">Hold Type</label>
+                <select
+                  value={editHoldType}
+                  onChange={(e) => setEditHoldType(e.target.value)}
+                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+                >
+                  <option value="litigation">Litigation</option>
+                  <option value="regulatory">Regulatory</option>
+                  <option value="investigation">Investigation</option>
+                  <option value="preservation">Preservation</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Status</label>
+                <select
+                  value={editHoldStatus}
+                  onChange={(e) => setEditHoldStatus(e.target.value)}
+                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+                >
+                  <option value="active">Active</option>
+                  <option value="released">Released</option>
+                  <option value="expired">Expired</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Custodians (comma-separated)</label>
+                <input
+                  type="text"
+                  value={editHoldCustodians}
+                  onChange={(e) => setEditHoldCustodians(e.target.value)}
+                  placeholder="e.g., John Doe, Jane Smith"
+                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+                />
+              </div>
+              <div className="flex gap-2 mt-6">
+                <button
+                  onClick={() => { setShowEditHoldModal(false); setEditHoldItem(null); }}
+                  className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                  disabled={editHoldMutation.isPending}
+                >
+                  Cancel
+                </button>
+                <button
+                  onClick={() => {
+                    const custodiansList = editHoldCustodians
+                      .split(',')
+                      .map((c) => c.trim())
+                      .filter((c) => c.length > 0);
+                    editHoldMutation.mutate({
+                      holdId: editHoldItem.id,
+                      hold_type: editHoldType,
+                      status: editHoldStatus,
+                      custodians: custodiansList,
+                    });
+                  }}
+                  disabled={editHoldMutation.isPending}
+                  className="flex-1 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition disabled:opacity-50 flex items-center justify-center gap-2"
+                >
+                  {editHoldMutation.isPending && <Loader2 className="w-4 h-4 animate-spin" />}
+                  Save
                 </button>
               </div>
             </div>

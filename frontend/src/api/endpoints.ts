@@ -519,6 +519,27 @@ export const dfirApi = {
     return response.data;
   },
 
+  updateCase: async (caseId: string, data: {
+    title?: string;
+    description?: string;
+    status?: string;
+    severity?: string;
+  }): Promise<DFIRCase> => {
+    const response = await api.put(`/dfir/cases/${caseId}`, data);
+    return response.data;
+  },
+
+  updateLegalHold: async (holdId: string, data: {
+    hold_type?: string;
+    status?: string;
+    custodians?: string[];
+    data_sources?: string[];
+    expiry_date?: string;
+  }): Promise<any> => {
+    const response = await api.put(`/dfir/legal-holds/${holdId}`, data);
+    return response.data;
+  },
+
   getDashboardMetrics: async (): Promise<any> => {
     const response = await api.get('/dfir/dashboard/metrics');
     return response.data;
@@ -823,6 +844,18 @@ export const dlpApi = {
   getClassifications: async (): Promise<string[]> => {
     const response = await api.get('/dlp/classifications');
     return extractData(response.data);
+  },
+
+  createPolicy: async (data: {
+    name: string;
+    description?: string;
+    policy_type?: string;
+    severity?: string;
+    enabled?: boolean;
+    data_patterns?: string[];
+  }): Promise<DLPPolicy> => {
+    const response = await api.post('/dlp/policies', data);
+    return response.data;
   },
 };
 
