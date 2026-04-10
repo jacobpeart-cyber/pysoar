@@ -204,26 +204,29 @@ async def natural_language_query(
         import time as _time
         _query_start = _time.monotonic()
 
-        # Simple intent classification heuristic
+        # Intent classification heuristic
         text_lower = request.natural_language.lower()
-        if "failed login" in text_lower or "authentication" in text_lower:
+        if "failed login" in text_lower or "authentication" in text_lower or "brute force" in text_lower:
             intent = "log_search"
             generated_query = "SELECT * FROM alerts WHERE title/description matches authentication failures"
-        elif "vulnerability" in text_lower or "cve" in text_lower:
+        elif "vulnerability" in text_lower or "cve" in text_lower or "patch" in text_lower:
             intent = "vulnerability_search"
             generated_query = "SELECT * FROM alerts WHERE category relates to vulnerabilities"
-        elif "lateral movement" in text_lower:
+        elif "lateral movement" in text_lower or "pivot" in text_lower:
             intent = "threat_hunt"
             generated_query = "SELECT * FROM alerts WHERE category relates to lateral movement"
-        elif "threat actor" in text_lower:
+        elif "threat actor" in text_lower or "apt" in text_lower or "threat intel" in text_lower:
             intent = "threat_intel"
             generated_query = "SELECT * FROM alerts WHERE category relates to threat actors"
-        elif "incident" in text_lower:
+        elif "incident" in text_lower and "alert" not in text_lower:
             intent = "incident_search"
             generated_query = "SELECT * FROM incidents matching query terms"
+        elif "critical" in text_lower or "high" in text_lower or "severity" in text_lower:
+            intent = "severity_search"
+            generated_query = "SELECT * FROM alerts WHERE severity IN ('critical','high') ORDER BY created_at DESC"
         else:
             intent = "general_search"
-            generated_query = f"SELECT * FROM alerts WHERE description ILIKE '%{text_lower[:30]}%' ORDER BY created_at DESC"
+            generated_query = f"SELECT * FROM alerts ORDER BY created_at DESC LIMIT 20"
 
         # Query real data from the database based on detected intent
         from src.models.alert import Alert
@@ -299,6 +302,25 @@ async def natural_language_query(
                     .order_by(Alert.created_at.desc())
                     .limit(20)
                 )
+            elif intent == "severity_search":
+                # Filter by severity
+                severities = []
+                if "critical" in text_lower:
+                    severities.append("critical")
+                if "high" in text_lower:
+                    severities.append("high")
+                if "medium" in text_lower:
+                    severities.append("medium")
+                if "low" in text_lower:
+                    severities.append("low")
+                if not severities:
+                    severities = ["critical", "high"]
+                alert_query = (
+                    select(Alert)
+                    .where(Alert.severity.in_(severities))
+                    .order_by(Alert.created_at.desc())
+                    .limit(20)
+                )
             elif intent == "threat_intel":
                 alert_query = (
                     select(Alert)
@@ -313,8 +335,8 @@ async def natural_language_query(
             else:
                 # General search: look for query terms in title/description
                 search_terms = text_lower[:60]
-                # Extract meaningful words (skip very short ones)
-                words = [w for w in search_terms.split() if len(w) > 2]
+                stop_words = {"show", "me", "all", "the", "get", "find", "list", "what", "are", "from", "last", "recent", "hours", "days", "my", "our", "with", "and", "for", "that", "this", "have", "has"}
+                words = [w for w in search_terms.split() if len(w) > 2 and w not in stop_words]
                 if words:
                     # Search for the first meaningful term
                     term = words[0]
