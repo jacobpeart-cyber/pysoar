@@ -567,11 +567,61 @@ class PlaybookAction:
         alert_id = params.get("alert_id", context.get("alert_id", ""))
         updates = params.get("updates", {})
 
-        logger.info(f"Updating alert {alert_id}")
+        logger.info(f"Updating alert {alert_id} with {updates}")
+
+        if not alert_id:
+            return {
+                "success": False,
+                "action": "update_alert",
+                "error": "No alert_id provided",
+                "details": {"updates": updates},
+            }
+
+        ALLOWED_FIELDS = {"status", "priority", "assigned_to", "severity", "resolution_notes"}
+        filtered_updates = {k: v for k, v in updates.items() if k in ALLOWED_FIELDS}
+
+        try:
+            from src.core.database import async_session_factory
+            from src.models.alert import Alert
+
+            async with async_session_factory() as session:
+                result = await session.execute(
+                    select(Alert).where(Alert.id == alert_id)
+                )
+                alert = result.scalar_one_or_none()
+
+                if not alert:
+                    return {
+                        "success": False,
+                        "action": "update_alert",
+                        "error": f"Alert {alert_id} not found",
+                        "details": {"alert_id": alert_id, "updates": filtered_updates},
+                    }
+
+                for field, value in filtered_updates.items():
+                    setattr(alert, field, value)
+
+                # If status changed to resolved, set resolved_at
+                if filtered_updates.get("status") == "resolved":
+                    alert.resolved_at = datetime.now(timezone.utc).isoformat()
+
+                await session.flush()
+                await session.commit()
+                logger.info(f"Successfully updated alert {alert_id}: {filtered_updates}")
+
+        except Exception as e:
+            logger.error(f"Failed to update alert {alert_id}: {e}")
+            return {
+                "success": False,
+                "action": "update_alert",
+                "error": str(e),
+                "details": {"alert_id": alert_id, "updates": filtered_updates},
+            }
+
         return {
             "success": True,
             "action": "update_alert",
-            "details": {"alert_id": alert_id, "updates": updates},
+            "details": {"alert_id": alert_id, "updates": filtered_updates},
         }
 
     @staticmethod
@@ -580,11 +630,62 @@ class PlaybookAction:
         incident_id = params.get("incident_id", context.get("incident_id", ""))
         updates = params.get("updates", {})
 
-        logger.info(f"Updating incident {incident_id}")
+        logger.info(f"Updating incident {incident_id} with {updates}")
+
+        if not incident_id:
+            return {
+                "success": False,
+                "action": "update_incident",
+                "error": "No incident_id provided",
+                "details": {"updates": updates},
+            }
+
+        ALLOWED_FIELDS = {"status", "priority", "assigned_to", "severity", "resolution",
+                          "root_cause", "impact", "lessons_learned", "recommendations"}
+        filtered_updates = {k: v for k, v in updates.items() if k in ALLOWED_FIELDS}
+
+        try:
+            from src.core.database import async_session_factory
+            from src.models.incident import Incident
+
+            async with async_session_factory() as session:
+                result = await session.execute(
+                    select(Incident).where(Incident.id == incident_id)
+                )
+                incident = result.scalar_one_or_none()
+
+                if not incident:
+                    return {
+                        "success": False,
+                        "action": "update_incident",
+                        "error": f"Incident {incident_id} not found",
+                        "details": {"incident_id": incident_id, "updates": filtered_updates},
+                    }
+
+                for field, value in filtered_updates.items():
+                    setattr(incident, field, value)
+
+                # If status changed to closed, set resolved_at
+                if filtered_updates.get("status") == "closed":
+                    incident.resolved_at = datetime.now(timezone.utc).isoformat()
+
+                await session.flush()
+                await session.commit()
+                logger.info(f"Successfully updated incident {incident_id}: {filtered_updates}")
+
+        except Exception as e:
+            logger.error(f"Failed to update incident {incident_id}: {e}")
+            return {
+                "success": False,
+                "action": "update_incident",
+                "error": str(e),
+                "details": {"incident_id": incident_id, "updates": filtered_updates},
+            }
+
         return {
             "success": True,
             "action": "update_incident",
-            "details": {"incident_id": incident_id, "updates": updates},
+            "details": {"incident_id": incident_id, "updates": filtered_updates},
         }
 
     @staticmethod

@@ -1091,6 +1091,105 @@ async def record_event(
 
     await db.flush()
 
+    # --- Auto-update Security Awareness Score on failure/report events ---
+    _failure_events = {"link_clicked", "credential_submitted", "attachment_opened"}
+    _positive_events = {"reported_as_phishing"}
+
+    if request.event_type in _failure_events | _positive_events:
+        try:
+            score_result = await db.execute(
+                select(SecurityAwarenessScore).where(
+                    SecurityAwarenessScore.user_email == request.target_email,
+                )
+            )
+            awareness = score_result.scalar_one_or_none()
+
+            if awareness is None:
+                # Create a new score record for this user
+                awareness = SecurityAwarenessScore(
+                    id=str(uuid_mod.uuid4()),
+                    user_email=request.target_email,
+                    user_name=request.target_name or request.target_email,
+                    overall_score=50,
+                    phishing_score=50,
+                    training_completion_rate=0.0,
+                    campaigns_participated=1,
+                    times_clicked=0,
+                    times_reported=0,
+                    times_submitted_credentials=0,
+                    risk_category="moderate_risk",
+                    training_assignments=[],
+                    certifications=[],
+                    organization_id=getattr(current_user, "organization_id", None) or "",
+                )
+                db.add(awareness)
+
+            if request.event_type == "link_clicked":
+                awareness.times_clicked = (awareness.times_clicked or 0) + 1
+                awareness.overall_score = max(0, (awareness.overall_score or 50) - 10)
+                awareness.phishing_score = max(0, (awareness.phishing_score or 50) - 10)
+                awareness.last_failed_campaign = datetime.now(timezone.utc)
+            elif request.event_type == "credential_submitted":
+                awareness.times_submitted_credentials = (awareness.times_submitted_credentials or 0) + 1
+                awareness.times_clicked = (awareness.times_clicked or 0) + 1
+                awareness.overall_score = max(0, (awareness.overall_score or 50) - 20)
+                awareness.phishing_score = max(0, (awareness.phishing_score or 50) - 20)
+                awareness.last_failed_campaign = datetime.now(timezone.utc)
+            elif request.event_type == "attachment_opened":
+                awareness.times_clicked = (awareness.times_clicked or 0) + 1
+                awareness.overall_score = max(0, (awareness.overall_score or 50) - 15)
+                awareness.phishing_score = max(0, (awareness.phishing_score or 50) - 15)
+                awareness.last_failed_campaign = datetime.now(timezone.utc)
+            elif request.event_type == "reported_as_phishing":
+                awareness.times_reported = (awareness.times_reported or 0) + 1
+                awareness.overall_score = min(100, (awareness.overall_score or 50) + 5)
+                awareness.phishing_score = min(100, (awareness.phishing_score or 50) + 5)
+
+            # Recalculate risk category based on overall score
+            score = awareness.overall_score or 0
+            if score >= 80:
+                awareness.risk_category = "champion"
+            elif score >= 60:
+                awareness.risk_category = "low_risk"
+            elif score >= 40:
+                awareness.risk_category = "moderate_risk"
+            elif score >= 20:
+                awareness.risk_category = "high_risk"
+            else:
+                awareness.risk_category = "critical_risk"
+
+            # Auto-assign training when score drops below 50
+            if score < 50 and request.event_type in _failure_events:
+                existing_assignments = awareness.training_assignments or []
+                # Avoid duplicate pending assignments
+                has_pending = any(
+                    a.get("status") == "pending" for a in existing_assignments
+                )
+                if not has_pending:
+                    new_assignment = {
+                        "module": "phishing_awareness_remedial",
+                        "status": "pending",
+                        "assigned_at": datetime.now(timezone.utc).isoformat(),
+                        "reason": f"Score dropped to {score} after {request.event_type}",
+                    }
+                    awareness.training_assignments = existing_assignments + [new_assignment]
+                    logger.info(
+                        f"Auto-assigned remedial training to {request.target_email} "
+                        f"(score={score})"
+                    )
+
+            await db.flush()
+
+            logger.info(
+                f"Updated awareness score for {request.target_email}: "
+                f"overall_score={awareness.overall_score}, "
+                f"risk_category={awareness.risk_category}"
+            )
+        except Exception as exc:
+            logger.error(
+                f"Failed to update awareness score for {request.target_email}: {exc}"
+            )
+
     logger.info(
         f"Recorded event: {request.event_type}",
         extra={
