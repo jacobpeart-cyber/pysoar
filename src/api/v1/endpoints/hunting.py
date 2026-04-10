@@ -11,6 +11,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DatabaseSession
 from src.core.database import async_session_factory
+from src.core.logging import get_logger
+from src.services.automation import AutomationService
+
+logger = get_logger(__name__)
 from src.hunting.models import (
     HuntFinding,
     HuntHypothesis,
@@ -561,6 +565,18 @@ async def create_finding(
     db.add(finding)
     await db.flush()
     await db.refresh(finding)
+
+    try:
+        org_id = getattr(current_user, "organization_id", None)
+        automation = AutomationService(db)
+        await automation.on_threat_hunt_finding(
+            hunt_name="hunt",
+            finding_title=finding.title,
+            severity=finding.severity,
+            organization_id=org_id,
+        )
+    except Exception as automation_exc:
+        logger.warning(f"Automation on_threat_hunt_finding failed: {automation_exc}")
 
     return HuntFindingResponse.model_validate(finding)
 

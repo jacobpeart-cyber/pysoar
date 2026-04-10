@@ -10,6 +10,8 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DatabaseSession
+from src.core.logging import get_logger
+from src.services.automation import AutomationService
 from src.data_lake.models import (
     DataPartition,
     DataPipeline,
@@ -53,6 +55,8 @@ from src.data_lake.engine import (
     QueryEngine,
     StorageManager,
 )
+
+logger = get_logger(__name__)
 
 router = APIRouter(prefix="/data-lake", tags=["Data Lake"])
 
@@ -603,6 +607,19 @@ async def submit_query(
             await db.refresh(job)
         except Exception:
             pass
+
+        try:
+            org_id = getattr(current_user, "organization_id", None)
+            source_name = (query_in.data_sources_queried or ["unknown"])[0] if query_in.data_sources_queried else "unknown"
+            automation = AutomationService(db)
+            await automation.on_data_lake_anomaly(
+                data_source=str(source_name),
+                anomaly_description=f"Query {job.id} executed ({job.records_scanned or 0} records scanned)",
+                severity="medium",
+                organization_id=org_id,
+            )
+        except Exception as automation_exc:
+            logger.warning(f"Automation on_data_lake_anomaly failed: {automation_exc}")
 
         return job
     except Exception as e:

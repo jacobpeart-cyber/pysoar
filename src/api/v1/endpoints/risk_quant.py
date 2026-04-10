@@ -13,6 +13,8 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DatabaseSession
+from src.core.logging import get_logger
+from src.services.automation import AutomationService
 from src.risk_quant.engine import (
     BIAEngine,
     ControlEffectivenessAnalyzer,
@@ -59,6 +61,8 @@ from src.schemas.risk_quant import (
     RiskScenarioResponse,
     RiskScenarioUpdate,
 )
+
+logger = get_logger(__name__)
 
 router = APIRouter(prefix="/risk-quantification", tags=["Risk Quantification"])
 
@@ -216,6 +220,17 @@ async def create_risk_scenario(
     db.add(scenario)
     await db.flush()
     await db.refresh(scenario)
+
+    try:
+        org_id = getattr(current_user, "organization_id", None)
+        automation = AutomationService(db)
+        await automation.on_risk_scenario_high_loss(
+            scenario_name=scenario.name,
+            loss_expectancy_usd=scenario.asset_value_usd or 0,
+            organization_id=org_id,
+        )
+    except Exception as automation_exc:
+        logger.warning(f"Automation on_risk_scenario_high_loss failed: {automation_exc}")
 
     return RiskScenarioResponse.model_validate(scenario)
 

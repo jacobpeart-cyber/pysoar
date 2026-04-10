@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DatabaseSession
 from src.core.logging import get_logger
+from src.services.automation import AutomationService
 from src.schemas.zerotrust import (
     AccessDecisionResponse,
     AccessRequestSchema,
@@ -94,6 +95,18 @@ async def evaluate_access_request(
             challenge_id = f"challenge_{decision.id}"
         elif decision.decision == "isolate":
             required_actions.append("network_isolation")
+
+        if decision.decision in ("deny", "isolate"):
+            try:
+                automation = AutomationService(db)
+                await automation.on_zerotrust_policy_violation(
+                    policy_name=getattr(decision, "policy_name", None) or "unknown",
+                    user_email=getattr(decision, "user_email", None) or getattr(decision, "subject_id", None) or "unknown",
+                    violation_type=decision.decision or "deny",
+                    organization_id=org_id,
+                )
+            except Exception as automation_exc:
+                logger.warning(f"Automation on_zerotrust_policy_violation failed: {automation_exc}")
 
         return AccessDecisionResponse(
             id=decision.id,

@@ -11,6 +11,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DatabaseSession
 from src.core.database import async_session_factory
+from src.core.logging import get_logger
+from src.services.automation import AutomationService
+
+logger = get_logger(__name__)
 from src.models.alert import Alert
 from src.api_security.models import (
     APIEndpointInventory,
@@ -294,6 +298,19 @@ async def create_vulnerability(
     db.add(vuln)
     await db.commit()
     await db.refresh(vuln)
+
+    try:
+        org_id = getattr(current_user, "organization_id", None)
+        automation = AutomationService(db)
+        await automation.on_api_security_threat(
+            api_endpoint=getattr(vuln, "endpoint", None) or getattr(vuln, "endpoint_id", None) or "",
+            threat_type=getattr(vuln, "vulnerability_type", None) or "",
+            severity=vuln.severity,
+            organization_id=org_id,
+        )
+    except Exception as automation_exc:
+        logger.warning(f"Automation on_api_security_threat failed: {automation_exc}")
+
     return APIVulnerabilityResponse.model_validate(vuln)
 
 
