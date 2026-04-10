@@ -676,102 +676,116 @@ async def chat_with_agent(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Chat with SOC agent - uses real tools + Gemini for function-calling style reasoning."""
+    """
+    Autonomous SOC agent chat with real function calling.
+
+    The agent loop:
+      1. Send user query + tool declarations to Gemini
+      2. If Gemini returns a tool_call, execute the tool against real DB
+      3. Feed tool result back to Gemini
+      4. Repeat up to MAX_STEPS times
+      5. Return final grounded answer + log of all tools invoked
+    """
     from src.ai.engine import AIAnalyzer
     from src.services.agent_tools import AgentToolRegistry
 
     org_id = getattr(current_user, "organization_id", None)
-
-    # Build tool registry and expose tool info to LLM
     tool_registry = AgentToolRegistry(db)
-    tools_summary = "\n".join(
-        f"- {t['name']} ({t['category']}): {t['description']}"
-        for t in tool_registry.list_tools()
+    tool_declarations = tool_registry.gemini_function_declarations()
+    analyzer = AIAnalyzer()
+
+    system_prompt = (
+        "You are an autonomous SOC agent for PySOAR. You have direct access to the security platform "
+        "via function tools. When the user asks for information, CALL the appropriate query tool. "
+        "When the user asks you to take an action (block, create, assign, execute), CALL the action tool. "
+        "Do not just suggest tools - actually call them. After calling tools, summarize the results for the user "
+        "in 2-4 sentences. If the user is authorizing you to act on a previous recommendation, execute the action now."
     )
 
-    # Auto-invoke query tools for any chat (gives AI grounded context)
-    tool_results_log = []
-    query_lower = query_data.query.lower()
+    tool_log: list[dict] = []
+    final_text: str = ""
+    MAX_STEPS = 4
 
-    # Heuristic: auto-run tools based on query keywords
-    try:
-        # Always get platform stats
-        stats = await tool_registry.execute("platform_stats", {})
-        tool_results_log.append(("platform_stats", stats.get("result", {})))
-
-        # If mentions alerts, search/list
-        if "alert" in query_lower:
-            if any(w in query_lower for w in ["critical", "high", "severity"]):
-                severity = "critical" if "critical" in query_lower else "high"
-                res = await tool_registry.execute("list_alerts", {"severity": severity, "limit": 10})
-                tool_results_log.append((f"list_alerts severity={severity}", res.get("result", [])))
-            else:
-                res = await tool_registry.execute("list_alerts", {"limit": 10})
-                tool_results_log.append(("list_alerts", res.get("result", [])))
-
-        # If mentions incidents
-        if "incident" in query_lower:
-            res = await tool_registry.execute("list_incidents", {"limit": 10})
-            tool_results_log.append(("list_incidents", res.get("result", [])))
-
-        # If mentions IOCs
-        if any(w in query_lower for w in ["ioc", "indicator", "threat intel"]):
-            res = await tool_registry.execute("list_iocs", {"limit": 10})
-            tool_results_log.append(("list_iocs", res.get("result", [])))
-    except Exception as e:
-        logger.warning(f"Tool auto-invocation failed: {e}")
-
-    # Build platform context from tool results
-    context_parts = ["=== LIVE PLATFORM DATA (via agent tools) ==="]
-    for tool_name, result in tool_results_log:
-        context_parts.append(f"\n[Tool: {tool_name}]")
-        if isinstance(result, list):
-            for item in result[:8]:
-                if isinstance(item, dict):
-                    # Format key fields
-                    parts = []
-                    for k in ("severity", "status", "title", "value", "type"):
-                        if k in item:
-                            parts.append(f"{k}={item[k]}")
-                    context_parts.append(f"  - {' | '.join(parts)}")
-        elif isinstance(result, dict):
-            for k, v in result.items():
-                context_parts.append(f"  {k}: {v}")
-    context_parts.append("=== END PLATFORM DATA ===")
-    platform_context = "\n".join(context_parts)
-
-    # Use Gemini with tool results + tool list as context
-    analyzer = AIAnalyzer()
-    try:
-        ai_response = analyzer._call_llm(
-            system_prompt=(
-                "You are an expert SOC analyst and autonomous agent for PySOAR. You have the following tools available (you can suggest the user run them for actions):\n\n"
-                f"{tools_summary}\n\n"
-                "Use the live platform data below to give specific, data-driven answers. Reference actual alert titles, severities, and counts. "
-                "When the user asks you to take an action, explain which tool would handle it and recommend running it. "
-                "Keep responses concise (3-5 sentences).\n\n"
-                f"{platform_context}"
-            ),
-            user_prompt=query_data.query,
-            structured_output=False,
+    # Initial query
+    current_prompt = query_data.query
+    for step in range(MAX_STEPS):
+        llm_result = analyzer.call_llm_with_tools(
+            system_prompt=system_prompt,
+            user_prompt=current_prompt,
+            tools=tool_declarations,
         )
-        response_text = str(ai_response)
+
+        if llm_result.get("type") == "error":
+            # Gemini failed - fall back to heuristic tool execution
+            logger.warning(f"Gemini tool call failed: {llm_result.get('error')}")
+            try:
+                stats_res = await tool_registry.execute("platform_stats", {})
+                final_text = (
+                    f"AI service temporarily unavailable. Current platform state: "
+                    f"{stats_res.get('result', {})}"
+                )
+            except Exception:
+                final_text = f"AI unavailable: {llm_result.get('error', 'unknown')[:200]}"
+            break
+
+        if llm_result.get("type") == "text":
+            final_text = llm_result.get("text", "")
+            break
+
+        if llm_result.get("type") == "tool_call":
+            tool_name = llm_result.get("name", "")
+            tool_args = llm_result.get("args", {}) or {}
+
+            logger.info(f"Agent step {step+1}: calling tool {tool_name} with {tool_args}")
+
+            exec_result = await tool_registry.execute(tool_name, tool_args)
+            tool_log.append({
+                "step": step + 1,
+                "tool": tool_name,
+                "args": tool_args,
+                "result": exec_result,
+            })
+
+            # Feed the result back to Gemini for a natural-language answer
+            followup = analyzer.call_llm_followup(
+                system_prompt=system_prompt,
+                user_prompt=current_prompt,
+                tool_name=tool_name,
+                tool_args=tool_args,
+                tool_result=exec_result,
+            )
+            final_text = followup
+
+            # Check if Gemini wants another tool call by feeding the followup back through
+            # For simplicity, stop after one tool execution unless the final_text is empty
+            if final_text and final_text.strip():
+                break
+
+            # If we got empty followup, try another round with context
+            current_prompt = (
+                f"Original question: {query_data.query}\n\n"
+                f"Tool {tool_name} returned: {json.dumps(exec_result, default=str)[:800]}\n\n"
+                f"Summarize this for the user or call another tool if needed."
+            )
+
+    if not final_text:
+        # Absolute fallback - build from tool log
+        if tool_log:
+            final_text = f"Executed {len(tool_log)} tools. Latest result: {json.dumps(tool_log[-1].get('result', {}), default=str)[:400]}"
+        else:
+            final_text = "I couldn't determine how to answer that. Please rephrase your question."
+
+    # Commit any DB changes made by action tools
+    try:
+        await db.commit()
     except Exception as e:
-        logger.warning(f"Gemini chat failed: {e}")
-        # Fallback to basic NL processing
-        nl_interface = NaturalLanguageInterface(db)
-        request = await nl_interface.process_query(
-            query=query_data.query,
-            agent_id=query_data.agent_id or "",
-            organization_id=org_id or "",
-        )
-        response_text = f"I analyzed your query: {request.get('intent', 'general')}. {request.get('entity', '')} — checking over {request.get('time_range', '24h')}."
+        logger.error(f"Failed to commit agent tool changes: {e}")
 
     return NaturalLanguageResponse(
-        response=response_text,
+        response=final_text,
         agent_id=query_data.agent_id or "auto",
         agent_name="SOC Agent",
-        interpretation={},
+        interpretation={"tools_invoked": tool_log},
     )
 
 
