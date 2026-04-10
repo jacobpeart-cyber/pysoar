@@ -187,7 +187,6 @@ class AutomationService:
             source="siem",
             status="new",
             category="detection",
-            organization_id=organization_id,
         )
         self.db.add(alert)
         await self.db.flush()
@@ -211,7 +210,6 @@ class AutomationService:
             status="new",
             category="intrusion",
             source_ip=attacker_ip,
-            organization_id=organization_id,
         )
         self.db.add(alert)
         await self.db.flush()
@@ -234,7 +232,6 @@ class AutomationService:
             severity="high" if data_classification in ("secret", "top_secret", "confidential") else "medium",
             status="open",
             incident_type="data_breach",
-            organization_id=organization_id,
         )
         self.db.add(incident)
         await self.db.flush()
@@ -259,7 +256,6 @@ class AutomationService:
             source="ueba",
             status="new",
             category="insider_threat",
-            organization_id=organization_id,
         )
         self.db.add(alert)
         await self.db.flush()
@@ -282,7 +278,6 @@ class AutomationService:
             source="dark_web",
             status="new",
             category="data_leak",
-            organization_id=organization_id,
         )
         self.db.add(alert)
         await self.db.flush()
@@ -305,7 +300,6 @@ class AutomationService:
             source="container_security",
             status="new",
             category="vulnerability",
-            organization_id=organization_id,
         )
         self.db.add(alert)
         await self.db.flush()
@@ -328,7 +322,6 @@ class AutomationService:
             source="itdr",
             status="new",
             category="identity_threat",
-            organization_id=organization_id,
         )
         self.db.add(alert)
         await self.db.flush()
@@ -352,7 +345,6 @@ class AutomationService:
             source="ot_security",
             status="new",
             category="ot_ics",
-            organization_id=organization_id,
         )
         self.db.add(alert)
         await self.db.flush()
@@ -406,7 +398,6 @@ class AutomationService:
             source="attack_simulation",
             status="new",
             category="defense_gap",
-            organization_id=organization_id,
         )
         self.db.add(alert)
         await self.db.flush()
@@ -509,8 +500,7 @@ class AutomationService:
             description=f"Auto-created from alert: {alert.title}. {getattr(alert, 'description', '') or ''}",
             severity=severity,
             status="open",
-            incident_type=category or "security",
-            organization_id=org_id,
+            incident_type=category or "other",
         )
         self.db.add(incident)
         await self.db.flush()
