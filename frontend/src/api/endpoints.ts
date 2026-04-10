@@ -144,7 +144,7 @@ export const siemApi = {
     severity?: string;
     date_range?: string;
   }): Promise<PaginatedResponse<SIEMEvent>> => {
-    const response = await api.get('/siem/events', { params });
+    const response = await api.post('/siem/logs/search', params);
     return extractData(response.data);
   },
 
@@ -164,7 +164,7 @@ export const siemApi = {
   },
 
   getSIEMDashboard: async (): Promise<SIEMDashboard> => {
-    const response = await api.get('/siem/dashboard');
+    const response = await api.get('/siem/logs/stats');
     return response.data;
   },
 };
@@ -201,7 +201,7 @@ export const huntingApi = {
     status?: string;
     search?: string;
   }): Promise<PaginatedResponse<Hunt>> => {
-    const response = await api.get('/hunting', { params });
+    const response = await api.get('/hunting/sessions', { params });
     return extractData(response.data);
   },
 
@@ -210,7 +210,7 @@ export const huntingApi = {
     description: string;
     query: string;
   }): Promise<Hunt> => {
-    const response = await api.post('/hunting', data);
+    const response = await api.post('/hunting/sessions', data);
     return response.data;
   },
 
@@ -218,7 +218,7 @@ export const huntingApi = {
     page?: number;
     size?: number;
   }): Promise<PaginatedResponse<HuntFinding>> => {
-    const response = await api.get(`/hunting/${huntId}/findings`, { params });
+    const response = await api.get(`/hunting/findings`, { params: { ...params, session_id: huntId } });
     return extractData(response.data);
   },
 };
@@ -230,7 +230,7 @@ export const exposureApi = {
     size?: number;
     status?: string;
   }): Promise<PaginatedResponse<ExposureAssessment>> => {
-    const response = await api.get('/exposure', { params });
+    const response = await api.get('/exposure/assets', { params });
     return extractData(response.data);
   },
 
@@ -239,8 +239,13 @@ export const exposureApi = {
     return response.data;
   },
 
+  getDashboard: async (): Promise<any> => {
+    const response = await api.get('/exposure/dashboard');
+    return response.data;
+  },
+
   runScan: async (): Promise<{ task_id: string }> => {
-    const response = await api.post('/exposure/scan');
+    const response = await api.post('/exposure/scans');
     return response.data;
   },
 };
@@ -414,7 +419,7 @@ export const zerotrustApi = {
     page?: number;
     size?: number;
   }): Promise<PaginatedResponse<DeviceTrust>> => {
-    const response = await api.get('/zerotrust/device-trust', { params });
+    const response = await api.get('/zerotrust/devices', { params });
     return extractData(response.data);
   },
 
@@ -422,7 +427,7 @@ export const zerotrustApi = {
     page?: number;
     size?: number;
   }): Promise<PaginatedResponse<{ device_id: string; access_granted: boolean; reason: string }>> => {
-    const response = await api.get('/zerotrust/access-decisions', { params });
+    const response = await api.get('/zerotrust/decisions', { params });
     return extractData(response.data);
   },
 };
@@ -986,7 +991,7 @@ export const privacyApi = {
     size?: number;
     status?: string;
   }): Promise<PaginatedResponse<DataSubjectRequest>> => {
-    const response = await api.get('/privacy/dsrs', { params });
+    const response = await api.get('/privacy/dsr/requests', { params });
     return extractData(response.data);
   },
 
@@ -994,7 +999,7 @@ export const privacyApi = {
     request_type: string;
     subject_email: string;
   }): Promise<DataSubjectRequest> => {
-    const response = await api.post('/privacy/dsrs', data);
+    const response = await api.post('/privacy/dsr/requests', data);
     return response.data;
   },
 
@@ -1002,23 +1007,20 @@ export const privacyApi = {
     page?: number;
     size?: number;
   }): Promise<PaginatedResponse<PrivacyImpactAssessment>> => {
-    const response = await api.get('/privacy/pias', { params });
+    const response = await api.get('/privacy/pia/assessments', { params });
     return extractData(response.data);
   },
 
-  getConsentRecords: async (params?: {
-    page?: number;
-    size?: number;
-  }): Promise<PaginatedResponse<any>> => {
-    const response = await api.get('/privacy/consent-records', { params });
-    return extractData(response.data);
+  getConsentRecords: async (subjectId: string): Promise<any[]> => {
+    const response = await api.get(`/privacy/consent/records/${subjectId}`);
+    return response.data;
   },
 
   getProcessingRecords: async (params?: {
     page?: number;
     size?: number;
   }): Promise<any[]> => {
-    const response = await api.get('/privacy/processing-records', { params });
+    const response = await api.get('/privacy/ropa/processing-records', { params });
     return response.data;
   },
 
@@ -1026,7 +1028,7 @@ export const privacyApi = {
     page?: number;
     size?: number;
   }): Promise<any[]> => {
-    const response = await api.get('/privacy/incidents', { params });
+    const response = await api.get('/privacy/incidents/reports', { params });
     return response.data;
   },
 };
@@ -1037,37 +1039,37 @@ export const threatmodelApi = {
     page?: number;
     size?: number;
   }): Promise<PaginatedResponse<ThreatModel>> => {
-    const response = await api.get('/threat-modeling/models', { params });
+    const response = await api.get('/threat-modeling', { params });
     return extractData(response.data);
   },
 
-  runSTRIDE: async (data: { application_id: string }): Promise<{ model_id: string }> => {
-    const response = await api.post('/threat-modeling/stride', data);
+  runSTRIDE: async (modelId: string): Promise<any> => {
+    const response = await api.post(`/threat-modeling/${modelId}/analyze/stride`);
     return response.data;
   },
 
   getAttackTrees: async (modelId: string): Promise<AttackTree[]> => {
-    const response = await api.get(`/threatmodel/models/${modelId}/attack-trees`);
+    const response = await api.get(`/threat-modeling/${modelId}/components`);
     return extractData(response.data);
   },
 
   getMitigations: async (modelId: string): Promise<any[]> => {
-    const response = await api.get(`/threatmodel/models/${modelId}/mitigations`);
+    const response = await api.get(`/threat-modeling/${modelId}/threats`);
     return extractData(response.data);
   },
 
-  getSTRIDEAnalysis: async (): Promise<any[]> => {
-    const response = await api.get('/threat-modeling/stride');
+  getSTRIDEAnalysis: async (modelId: string): Promise<any[]> => {
+    const response = await api.post(`/threat-modeling/${modelId}/analyze/stride`);
     return extractData(response.data);
   },
 
-  getThreats: async (): Promise<any[]> => {
-    const response = await api.get('/threat-modeling/threats');
+  getThreats: async (modelId: string): Promise<any[]> => {
+    const response = await api.get(`/threat-modeling/${modelId}/threats`);
     return extractData(response.data);
   },
 
   createModel: async (data: any): Promise<any> => {
-    const response = await api.post('/threat-modeling/models', data);
+    const response = await api.post('/threat-modeling', data);
     return response.data;
   },
 };
