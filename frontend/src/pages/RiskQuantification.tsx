@@ -660,17 +660,21 @@ export default function RiskQuantification() {
               try {
                 await api.post('/risk-quantification/scenarios', {
                   name: fd.get('name'),
-                  description: fd.get('description'),
-                  category: fd.get('category'),
-                  loss_event_frequency: parseFloat(fd.get('lef') as string) || 0,
-                  loss_magnitude: parseFloat(fd.get('magnitude') as string) || 0,
+                  description: fd.get('description') || undefined,
+                  asset_name: fd.get('asset_name'),
+                  asset_value_usd: parseFloat(fd.get('asset_value_usd') as string) || 0,
+                  threat_actor: fd.get('threat_actor') || 'external_attacker',
+                  threat_type: fd.get('threat_type'),
+                  vulnerability_exploited: fd.get('vulnerability_exploited'),
+                  loss_type: fd.get('loss_type') || 'productivity',
+                  confidence_level: parseFloat(fd.get('confidence_level') as string) || 0.5,
                 });
                 setShowNewScenarioModal(false);
                 loadData();
               } catch (err) { console.error('Failed to create scenario:', err); }
             }}>
               <div>
-                <label className="block text-sm font-medium mb-1">Scenario Name</label>
+                <label className="block text-sm font-medium mb-1">Scenario Name *</label>
                 <input name="name" type="text" required placeholder="e.g., Ransomware Attack on ERP" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
               </div>
               <div>
@@ -678,24 +682,48 @@ export default function RiskQuantification() {
                 <textarea name="description" placeholder="Describe the risk scenario..." rows={3} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
               </div>
               <div>
-                <label className="block text-sm font-medium mb-1">Category</label>
-                <select name="category" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
-                  <option value="cyber">Cyber Attack</option>
-                  <option value="insider">Insider Threat</option>
-                  <option value="compliance">Compliance Failure</option>
-                  <option value="operational">Operational Risk</option>
-                  <option value="third-party">Third-Party Risk</option>
-                </select>
+                <label className="block text-sm font-medium mb-1">Asset Name *</label>
+                <input name="asset_name" type="text" required placeholder="e.g., ERP System, Customer Database" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Asset Value (USD) *</label>
+                <input name="asset_value_usd" type="number" required placeholder="e.g., 500000" min="0" step="0.01" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Threat Type *</label>
+                <input name="threat_type" type="text" required placeholder="e.g., Ransomware, Data Exfiltration" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Vulnerability Exploited *</label>
+                <input name="vulnerability_exploited" type="text" required placeholder="e.g., Unpatched software, Weak credentials" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
               </div>
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="block text-sm font-medium mb-1">Loss Event Frequency</label>
-                  <input name="lef" type="number" placeholder="0.0 - 1.0" step="0.01" min="0" max="1" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+                  <label className="block text-sm font-medium mb-1">Threat Actor</label>
+                  <select name="threat_actor" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
+                    <option value="external_attacker">External Attacker</option>
+                    <option value="insider_threat">Insider Threat</option>
+                    <option value="nation_state">Nation State</option>
+                    <option value="hacktivist">Hacktivist</option>
+                    <option value="competitor">Competitor</option>
+                    <option value="accidental">Accidental</option>
+                  </select>
                 </div>
                 <div>
-                  <label className="block text-sm font-medium mb-1">Loss Magnitude ($)</label>
-                  <input name="magnitude" type="number" placeholder="e.g., 500000" min="0" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+                  <label className="block text-sm font-medium mb-1">Loss Type</label>
+                  <select name="loss_type" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
+                    <option value="productivity">Productivity</option>
+                    <option value="response">Response</option>
+                    <option value="replacement">Replacement</option>
+                    <option value="fines">Fines & Judgments</option>
+                    <option value="reputation">Reputation</option>
+                    <option value="competitive_advantage">Competitive Advantage</option>
+                  </select>
                 </div>
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Confidence Level (0-1)</label>
+                <input name="confidence_level" type="number" placeholder="0.5" step="0.1" min="0" max="1" defaultValue="0.5" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
               </div>
               <div className="flex gap-2 mt-6">
                 <button
