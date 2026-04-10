@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.deps import CurrentUser, DatabaseSession
 from src.core.database import async_session_factory
 from src.core.logging import get_logger
+from src.services.automation import AutomationService
 from src.schemas.vulnmgmt import (
     BulkAction,
     DashboardMetrics,
@@ -157,6 +158,20 @@ async def create_vulnerability(
     db.add(vuln)
     await db.commit()
     await db.refresh(vuln)
+
+    # Trigger automation for new vulnerability
+    try:
+        org_id = getattr(current_user, "organization_id", None)
+        automation = AutomationService(db)
+        await automation.on_vulnerability_found(
+            cve_id=vuln.cve_id,
+            title=vuln.title,
+            affected_asset="",
+            severity=vuln.severity,
+            organization_id=org_id,
+        )
+    except Exception as e:
+        logger.error(f"Automation on_vulnerability_found failed: {e}", exc_info=True)
 
     return VulnerabilityResponse.model_validate(vuln)
 

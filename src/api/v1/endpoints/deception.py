@@ -47,6 +47,8 @@ from src.schemas.deception import (
     RecommendationsResponse,
 )
 
+from src.services.automation import AutomationService
+
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/deception", tags=["deception"])
@@ -855,6 +857,25 @@ async def investigate_interaction(
                 "user_id": str(getattr(current_user, 'id', '')) if current_user else '',
             },
         )
+
+        # Fire automation for deception trigger
+        try:
+            # Look up the decoy for this interaction
+            decoy_result = await db.execute(
+                select(Decoy).where(Decoy.id == interaction.decoy_id)
+            )
+            decoy = decoy_result.scalar_one_or_none()
+            if decoy:
+                org_id = getattr(decoy, "organization_id", None) or getattr(current_user, "organization_id", None)
+                automation = AutomationService(db)
+                await automation.on_deception_triggered(
+                    decoy_name=decoy.name,
+                    decoy_type=decoy.decoy_type,
+                    attacker_ip=interaction.source_ip,
+                    organization_id=org_id,
+                )
+        except Exception as e:
+            logger.error(f"Automation failed for deception trigger: {e}")
 
         return InteractionInvestigationResponse(
             interaction_id=interaction_id,

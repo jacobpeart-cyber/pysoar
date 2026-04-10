@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.deps import CurrentUser, DatabaseSession
 from src.core.database import async_session_factory
 from src.core.logging import get_logger
+from src.services.automation import AutomationService
 from src.darkweb.models import (
     BrandThreat,
     CredentialLeak,
@@ -364,6 +365,49 @@ async def list_findings(
         size=size,
         pages=pages,
     )
+
+
+@router.post("/findings", response_model=DarkWebFindingResponse, status_code=201)
+async def create_finding(
+    finding_data: DarkWebFindingCreate,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+):
+    """Create a new dark web finding"""
+    org_id = getattr(current_user, "organization_id", None)
+    finding = DarkWebFinding(
+        organization_id=org_id,
+        monitor_id=finding_data.monitor_id,
+        finding_type=finding_data.finding_type,
+        source_platform=finding_data.source_platform,
+        title=finding_data.title,
+        description=finding_data.description,
+        affected_assets=finding_data.affected_assets,
+        affected_count=finding_data.affected_count,
+        severity=finding_data.severity,
+        confidence_score=finding_data.confidence_score,
+        source_url_hash=finding_data.source_url_hash,
+        raw_data_hash=finding_data.raw_data_hash,
+    )
+    db.add(finding)
+    await db.commit()
+    await db.refresh(finding)
+
+    # Trigger automation rules
+    try:
+        automation = AutomationService(db)
+        await automation.on_darkweb_finding(
+            finding_type=finding.finding_type or "credential_leak",
+            description=finding.description or "",
+            severity=finding.severity or "high",
+            organization_id=org_id,
+        )
+    except Exception as e:
+        logger.error(f"Automation failed for dark web finding {finding.id}: {e}")
+
+    logger.info(f"Created dark web finding: {finding.id}")
+
+    return DarkWebFindingResponse.model_validate(finding)
 
 
 @router.get("/findings/{finding_id}", response_model=DarkWebFindingDetailResponse)

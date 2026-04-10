@@ -66,6 +66,8 @@ from src.schemas.dlp import (
     ViolationTrendResponse,
 )
 
+from src.services.automation import AutomationService
+
 router = APIRouter(prefix="/dlp", tags=["DLP"])
 
 # Engines and tools
@@ -744,6 +746,37 @@ async def create_incident(
     db.add(incident)
     await db.flush()
     await db.refresh(incident)
+
+    # Fire automation for DLP violation/incident
+    try:
+        org_id = getattr(current_user, "organization_id", None)
+        # Look up the policy name from linked violations if available
+        policy_name = incident.incident_title or "Unknown Policy"
+        if incident_data.violation_ids:
+            try:
+                first_violation_result = await db.execute(
+                    select(DLPViolation).where(DLPViolation.id == incident_data.violation_ids[0])
+                )
+                first_violation = first_violation_result.scalar_one_or_none()
+                if first_violation and first_violation.policy_id:
+                    policy_result = await db.execute(
+                        select(DLPPolicy).where(DLPPolicy.id == first_violation.policy_id)
+                    )
+                    linked_policy = policy_result.scalar_one_or_none()
+                    if linked_policy:
+                        policy_name = linked_policy.name
+            except Exception:
+                pass
+        automation = AutomationService(db)
+        await automation.on_dlp_violation(
+            policy_name=policy_name,
+            violation_type=incident.severity or "unknown",
+            user_email=str(incident.incident_commander or "unknown"),
+            organization_id=org_id,
+        )
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"Automation failed for DLP violation: {e}")
 
     return convert_json_fields(incident)
 

@@ -34,6 +34,7 @@ from src.siem.models import (
     LogEntry,
     SIEMDataSource,
 )
+from src.services.automation import AutomationService
 
 router = APIRouter(prefix="/siem", tags=["SIEM"])
 
@@ -120,6 +121,23 @@ async def ingest_log(
         organization_id=org_id,
         tags=log_data.tags,
     )
+
+    # Fire automation for any correlations created during ingestion
+    if correlations:
+        try:
+            automation = AutomationService(db)
+            for corr in correlations:
+                corr_name = corr.get("name", "unknown") if isinstance(corr, dict) else getattr(corr, "name", "unknown")
+                corr_severity = corr.get("severity", "medium") if isinstance(corr, dict) else getattr(corr, "severity", "medium")
+                await automation.on_siem_rule_match(
+                    rule_name=corr_name,
+                    rule_severity=corr_severity,
+                    matched_events=[],
+                    organization_id=org_id,
+                )
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(f"Automation failed for SIEM correlation: {e}")
 
     return {
         "id": log_entry.id,
@@ -576,6 +594,21 @@ async def test_rule(
     for log in sample_logs:
         if rule.name.lower() in log.lower():
             matches += 1
+
+    # Fire automation when rule matches
+    if matches > 0:
+        try:
+            org_id = getattr(current_user, "organization_id", None)
+            automation = AutomationService(db)
+            await automation.on_siem_rule_match(
+                rule_name=rule.name,
+                rule_severity=rule.severity,
+                matched_events=[],
+                organization_id=org_id,
+            )
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(f"Automation failed for SIEM rule match: {e}")
 
     return {
         "rule_id": rule_id,
