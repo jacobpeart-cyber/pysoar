@@ -17,6 +17,7 @@ from src.core.database import get_db
 from src.core.logging import get_logger
 from src.stig.engine import STIGScanner, STIGRemediator, STIGLibrary, SCAPEngine
 from src.stig.models import STIGBenchmark, STIGRule, STIGScanResult, SCAPProfile
+from src.services.automation import AutomationService
 from src.schemas.stig import (
     STIGBenchmarkResponse,
     STIGRuleResponse,
@@ -188,6 +189,23 @@ async def launch_scan(
             scan_type=request.scan_type,
             target_ip=request.target_ip,
         )
+
+        try:
+            org_id = getattr(current_user, "organization_id", None)
+            failed_count = 0
+            if isinstance(result, dict):
+                failed_count = result.get("failed", 0) or result.get("failures", 0) or 0
+            if failed_count:
+                automation = AutomationService(db)
+                await automation.on_stig_finding(
+                    benchmark=request.benchmark_id,
+                    finding_title=f"STIG scan failures on {request.host}",
+                    severity="high",
+                    organization_id=org_id,
+                )
+        except Exception as automation_exc:
+            logger.warning(f"Automation on_stig_finding failed: {automation_exc}")
+
         return result
     except Exception as e:
         logger.error(f"Error launching scan: {str(e)}")

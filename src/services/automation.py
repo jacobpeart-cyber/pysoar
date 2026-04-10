@@ -433,6 +433,219 @@ class AutomationService:
             return None
 
     # =========================================================================
+    # ADDITIONAL MODULE HANDLERS
+    # =========================================================================
+
+    async def on_threat_hunt_finding(
+        self,
+        hunt_name: str,
+        finding_title: str,
+        severity: str = "medium",
+        details: str = "",
+        organization_id: Optional[str] = None,
+    ) -> Optional[Alert]:
+        """Threat hunting finding -> create Alert."""
+        alert = Alert(
+            title=f"Hunt Finding: {finding_title}",
+            description=f"Threat hunt '{hunt_name}' found: {finding_title}. {details}",
+            severity=severity,
+            source="threat_hunting",
+            status="new",
+            category="hunt_finding",
+        )
+        self.db.add(alert)
+        await self.db.flush()
+        await self.on_alert_created(alert, organization_id)
+        return alert
+
+    async def on_threat_model_risk(
+        self,
+        model_name: str,
+        threat_name: str,
+        stride_category: str,
+        risk_level: str = "medium",
+        organization_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Threat modeling identifies a high/critical risk -> create Remediation ticket."""
+        try:
+            from src.exposure.models import RemediationTicket
+            ticket = RemediationTicket(
+                title=f"Threat Model: {threat_name} ({stride_category})",
+                description=f"Threat model '{model_name}' identified {stride_category} risk: {threat_name}. Risk level: {risk_level}",
+                status="open",
+                priority=risk_level,
+                remediation_type="design_change",
+                organization_id=organization_id,
+            )
+            self.db.add(ticket)
+            await self.db.flush()
+            logger.info(f"Auto-created remediation ticket for threat model finding: {threat_name}")
+            return ticket.id
+        except Exception as e:
+            logger.error(f"Failed to create ticket for threat model {model_name}: {e}")
+            return None
+
+    async def on_risk_scenario_high_loss(
+        self,
+        scenario_name: str,
+        loss_expectancy_usd: float,
+        organization_id: Optional[str] = None,
+    ) -> Optional[Incident]:
+        """Risk quantification: scenario with high loss expectancy -> create Incident for review."""
+        if loss_expectancy_usd < 100000:
+            return None  # Only significant losses
+        incident = Incident(
+            title=f"Risk Scenario Review: {scenario_name}",
+            description=f"Risk scenario '{scenario_name}' has loss expectancy of ${loss_expectancy_usd:,.0f}. Review and mitigate.",
+            severity="high" if loss_expectancy_usd >= 1000000 else "medium",
+            status="open",
+            incident_type="risk_review",
+        )
+        self.db.add(incident)
+        await self.db.flush()
+        await self.on_incident_created(incident, organization_id)
+        return incident
+
+    async def on_privacy_dsr_created(
+        self,
+        dsr_id: str,
+        subject_email: str,
+        request_type: str,
+        regulation: str,
+        organization_id: Optional[str] = None,
+    ) -> Optional[Alert]:
+        """Privacy DSR created -> create Alert for SOC tracking (regulatory deadline)."""
+        alert = Alert(
+            title=f"Privacy DSR: {request_type} from {subject_email}",
+            description=f"Data Subject Request under {regulation}: {request_type}. DSR ID: {dsr_id}. Regulatory deadline applies.",
+            severity="medium",
+            source="privacy",
+            status="new",
+            category="privacy_request",
+        )
+        self.db.add(alert)
+        await self.db.flush()
+        # No full automation pipeline — DSRs don't need war rooms, just tracking
+        return alert
+
+    async def on_zerotrust_policy_violation(
+        self,
+        policy_name: str,
+        user_email: str,
+        violation_type: str,
+        organization_id: Optional[str] = None,
+    ) -> Optional[Alert]:
+        """Zero trust policy violation -> create Alert."""
+        alert = Alert(
+            title=f"Zero Trust Violation: {policy_name}",
+            description=f"User {user_email} violated zero trust policy '{policy_name}': {violation_type}",
+            severity="high",
+            source="zero_trust",
+            status="new",
+            category="policy_violation",
+        )
+        self.db.add(alert)
+        await self.db.flush()
+        await self.on_alert_created(alert, organization_id)
+        return alert
+
+    async def on_supply_chain_vuln(
+        self,
+        vendor_name: str,
+        component_name: str,
+        cve_id: str,
+        severity: str = "high",
+        organization_id: Optional[str] = None,
+    ) -> Optional[Alert]:
+        """Supply chain vulnerability discovered -> create Alert + Remediation ticket."""
+        alert = Alert(
+            title=f"Supply Chain: {cve_id} in {component_name} ({vendor_name})",
+            description=f"Vendor {vendor_name} component {component_name} has vulnerability {cve_id}",
+            severity=severity,
+            source="supply_chain",
+            status="new",
+            category="vulnerability",
+        )
+        self.db.add(alert)
+        await self.db.flush()
+        await self.on_alert_created(alert, organization_id)
+        # Also create remediation ticket
+        await self.on_vulnerability_found(cve_id, f"{component_name} ({vendor_name})", component_name, severity, organization_id)
+        return alert
+
+    async def on_api_security_threat(
+        self,
+        api_endpoint: str,
+        threat_type: str,
+        severity: str = "high",
+        details: str = "",
+        organization_id: Optional[str] = None,
+    ) -> Optional[Alert]:
+        """API security threat detected -> create Alert."""
+        alert = Alert(
+            title=f"API Threat: {threat_type} on {api_endpoint}",
+            description=f"API endpoint {api_endpoint} threat: {threat_type}. {details}",
+            severity=severity,
+            source="api_security",
+            status="new",
+            category="api_attack",
+        )
+        self.db.add(alert)
+        await self.db.flush()
+        await self.on_alert_created(alert, organization_id)
+        return alert
+
+    async def on_fedramp_evidence_gap(
+        self,
+        control_id: str,
+        control_title: str,
+        organization_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """FedRAMP evidence gap found -> create POAM."""
+        return await self.on_compliance_failure(control_id, control_title, framework="FedRAMP", organization_id=organization_id)
+
+    async def on_stig_finding(
+        self,
+        benchmark: str,
+        finding_title: str,
+        severity: str = "medium",
+        organization_id: Optional[str] = None,
+    ) -> Optional[Alert]:
+        """STIG/SCAP scan finding -> create Alert."""
+        alert = Alert(
+            title=f"STIG {benchmark}: {finding_title}",
+            description=f"STIG benchmark {benchmark} finding: {finding_title}",
+            severity=severity,
+            source="stig",
+            status="new",
+            category="compliance",
+        )
+        self.db.add(alert)
+        await self.db.flush()
+        return alert
+
+    async def on_data_lake_anomaly(
+        self,
+        data_source: str,
+        anomaly_description: str,
+        severity: str = "medium",
+        organization_id: Optional[str] = None,
+    ) -> Optional[Alert]:
+        """Data lake query anomaly -> create Alert."""
+        alert = Alert(
+            title=f"Data Lake Anomaly: {data_source}",
+            description=anomaly_description,
+            severity=severity,
+            source="data_lake",
+            status="new",
+            category="data_anomaly",
+        )
+        self.db.add(alert)
+        await self.db.flush()
+        await self.on_alert_created(alert, organization_id)
+        return alert
+
+    # =========================================================================
     # INTERNAL HELPERS
     # =========================================================================
 

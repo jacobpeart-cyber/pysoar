@@ -14,7 +14,11 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DatabaseSession
+from src.core.logging import get_logger
 from src.models.organization import Organization
+from src.services.automation import AutomationService
+
+logger = get_logger(__name__)
 from src.schemas.supplychain import (
     CISAComplianceReport,
     ComponentDependencyTree,
@@ -352,6 +356,20 @@ async def create_component(
     db.add(component)
     await db.commit()
     await db.refresh(component)
+
+    try:
+        org_id = getattr(current_user, "organization_id", None)
+        automation = AutomationService(db)
+        await automation.on_supply_chain_vuln(
+            vendor_name=getattr(component, "vendor", None) or "",
+            component_name=component.name,
+            cve_id=getattr(component, "cve_id", None) or "",
+            severity="high",
+            organization_id=org_id,
+        )
+    except Exception as automation_exc:
+        logger.warning(f"Automation on_supply_chain_vuln failed: {automation_exc}")
+
     return component
 
 

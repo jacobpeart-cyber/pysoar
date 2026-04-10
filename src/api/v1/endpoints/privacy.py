@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.core.logging import get_logger
 from src.api.deps import get_current_active_user as get_current_user
 from src.core.database import get_db
+from src.services.automation import AutomationService
 from src.schemas.privacy import (
     DataSubjectRequestCreate,
     DataSubjectRequestUpdate,
@@ -104,6 +105,20 @@ async def create_dsr(
             subject_identifier=dsr.subject_identifier,
         )
         await db.commit()
+
+        try:
+            org_id = getattr(current_user, "organization_id", None)
+            automation = AutomationService(db)
+            await automation.on_privacy_dsr_created(
+                dsr_id=request.id,
+                subject_email=request.subject_email,
+                request_type=request.request_type,
+                regulation=request.regulation,
+                organization_id=org_id,
+            )
+        except Exception as automation_exc:
+            logger.warning(f"Automation on_privacy_dsr_created failed: {automation_exc}")
+
         return request
 
     except Exception as e:

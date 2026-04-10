@@ -10,7 +10,11 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DatabaseSession
+from src.core.logging import get_logger
 from src.models.organization import Organization
+from src.services.automation import AutomationService
+
+logger = get_logger(__name__)
 from src.threat_modeling.models import (
     ThreatModel,
     ThreatModelComponent,
@@ -378,6 +382,20 @@ async def create_threat(
     # Update model threat count
     model.threats_count = (model.threats_count or 0) + 1
     await db.commit()
+
+    try:
+        org_id = getattr(current_user, "organization_id", None)
+        risk_level = "high" if (threat.risk_score or 0) > 15 else ("medium" if (threat.risk_score or 0) > 8 else "low")
+        automation = AutomationService(db)
+        await automation.on_threat_model_risk(
+            model_name=model.name,
+            threat_name=threat.threat_description or "threat",
+            stride_category=threat.stride_category or "",
+            risk_level=risk_level,
+            organization_id=org_id,
+        )
+    except Exception as automation_exc:
+        logger.warning(f"Automation on_threat_model_risk failed: {automation_exc}")
 
     return threat
 

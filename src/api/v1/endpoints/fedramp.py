@@ -22,6 +22,7 @@ from src.fedramp.controls import (
     FAMILY_CODES,
 )
 from src.fedramp.generator import FedRAMPGenerator
+from src.services.automation import AutomationService
 
 logger = get_logger(__name__)
 
@@ -416,6 +417,18 @@ async def update_control_status(
             logger.warning(
                 f"Could not persist control update to database: {db_exc}"
             )
+
+        if implementation_status in ("planned", "partially_implemented", "alternative"):
+            try:
+                org_id = getattr(current_user, "organization_id", None)
+                automation = AutomationService(db)
+                await automation.on_fedramp_evidence_gap(
+                    control_id=control_id,
+                    control_title=baseline_ctrl["title"],
+                    organization_id=org_id,
+                )
+            except Exception as automation_exc:
+                logger.warning(f"Automation on_fedramp_evidence_gap failed: {automation_exc}")
 
         return {
             "control_id": control_id,

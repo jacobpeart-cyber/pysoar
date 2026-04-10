@@ -643,107 +643,113 @@ async def rollback_action(
 # ============================================================================
 
 
+@router.get("/tools")
+async def list_agent_tools(
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+    category: Optional[str] = None,
+):
+    """List all tools the AI agent can invoke."""
+    from src.services.agent_tools import AgentToolRegistry
+    registry = AgentToolRegistry(db)
+    return {"tools": registry.list_tools(category=category), "total": len(registry.tools)}
+
+
+@router.post("/tools/{tool_name}/execute")
+async def execute_agent_tool(
+    tool_name: str,
+    params: dict,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+):
+    """Execute an agent tool directly."""
+    from src.services.agent_tools import AgentToolRegistry
+    registry = AgentToolRegistry(db)
+    result = await registry.execute(tool_name, params)
+    await db.commit()
+    return result
+
+
 @router.post("/chat", response_model=NaturalLanguageResponse)
 async def chat_with_agent(
     query_data: NaturalLanguageQuery,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Chat with SOC agent in natural language, powered by Gemini AI with real platform data."""
+    """Chat with SOC agent - uses real tools + Gemini for function-calling style reasoning."""
     from src.ai.engine import AIAnalyzer
+    from src.services.agent_tools import AgentToolRegistry
 
     org_id = getattr(current_user, "organization_id", None)
 
-    # ---- Gather real platform data from the database ----
+    # Build tool registry and expose tool info to LLM
+    tool_registry = AgentToolRegistry(db)
+    tools_summary = "\n".join(
+        f"- {t['name']} ({t['category']}): {t['description']}"
+        for t in tool_registry.list_tools()
+    )
+
+    # Auto-invoke query tools for any chat (gives AI grounded context)
+    tool_results_log = []
+    query_lower = query_data.query.lower()
+
+    # Heuristic: auto-run tools based on query keywords
     try:
-        # Recent open / non-closed alerts (up to 10)
-        alert_q = (
-            select(Alert)
-            .where(Alert.status != "closed")
-            .order_by(Alert.created_at.desc())
-            .limit(10)
-        )
-        alert_result = await db.execute(alert_q)
-        recent_alerts = list(alert_result.scalars().all())
+        # Always get platform stats
+        stats = await tool_registry.execute("platform_stats", {})
+        tool_results_log.append(("platform_stats", stats.get("result", {})))
 
-        # Recent active incidents (up to 5)
-        incident_q = (
-            select(Incident)
-            .where(Incident.status != "closed")
-            .order_by(Incident.created_at.desc())
-            .limit(5)
-        )
-        incident_result = await db.execute(incident_q)
-        recent_incidents = list(incident_result.scalars().all())
+        # If mentions alerts, search/list
+        if "alert" in query_lower:
+            if any(w in query_lower for w in ["critical", "high", "severity"]):
+                severity = "critical" if "critical" in query_lower else "high"
+                res = await tool_registry.execute("list_alerts", {"severity": severity, "limit": 10})
+                tool_results_log.append((f"list_alerts severity={severity}", res.get("result", [])))
+            else:
+                res = await tool_registry.execute("list_alerts", {"limit": 10})
+                tool_results_log.append(("list_alerts", res.get("result", [])))
 
-        # Pending approval actions
-        pending_q = select(func.count()).select_from(AgentAction).where(
-            AgentAction.execution_status == ActionExecutionStatus.PENDING_APPROVAL.value,
-        )
-        if org_id:
-            pending_q = pending_q.where(AgentAction.organization_id == org_id)
-        pending_result = await db.execute(pending_q)
-        pending_approvals = pending_result.scalar() or 0
+        # If mentions incidents
+        if "incident" in query_lower:
+            res = await tool_registry.execute("list_incidents", {"limit": 10})
+            tool_results_log.append(("list_incidents", res.get("result", [])))
 
-        # Basic stats
-        total_alerts_result = await db.execute(select(func.count()).select_from(Alert))
-        total_alerts = total_alerts_result.scalar() or 0
-
-        open_alerts_result = await db.execute(
-            select(func.count()).select_from(Alert).where(Alert.status != "closed")
-        )
-        open_alerts = open_alerts_result.scalar() or 0
-
-        critical_alerts_result = await db.execute(
-            select(func.count()).select_from(Alert).where(Alert.severity == "critical")
-        )
-        critical_alerts = critical_alerts_result.scalar() or 0
-
-        total_incidents_result = await db.execute(select(func.count()).select_from(Incident))
-        total_incidents = total_incidents_result.scalar() or 0
-
-        open_incidents_result = await db.execute(
-            select(func.count()).select_from(Incident).where(Incident.status != "closed")
-        )
-        open_incidents = open_incidents_result.scalar() or 0
-
-        # Build context string with real data
-        alert_lines = []
-        for a in recent_alerts:
-            alert_lines.append(
-                f"  - [{a.severity.upper()}] {a.title} (status={a.status}, source={a.source}, created={a.created_at})"
-            )
-        alerts_text = "\n".join(alert_lines) if alert_lines else "  (none)"
-
-        incident_lines = []
-        for inc in recent_incidents:
-            incident_lines.append(
-                f"  - [{inc.severity.upper()}] {inc.title} (status={inc.status}, type={inc.incident_type}, created={inc.created_at})"
-            )
-        incidents_text = "\n".join(incident_lines) if incident_lines else "  (none)"
-
-        platform_context = (
-            f"=== LIVE PLATFORM DATA ===\n"
-            f"Stats: {total_alerts} total alerts ({open_alerts} open, {critical_alerts} critical), "
-            f"{total_incidents} total incidents ({open_incidents} open), "
-            f"{pending_approvals} actions pending approval.\n\n"
-            f"Recent open alerts (up to 10):\n{alerts_text}\n\n"
-            f"Active incidents (up to 5):\n{incidents_text}\n"
-            f"=== END PLATFORM DATA ==="
-        )
+        # If mentions IOCs
+        if any(w in query_lower for w in ["ioc", "indicator", "threat intel"]):
+            res = await tool_registry.execute("list_iocs", {"limit": 10})
+            tool_results_log.append(("list_iocs", res.get("result", [])))
     except Exception as e:
-        logger.warning(f"Failed to query platform data for chat context: {e}")
-        platform_context = "(Platform data unavailable — database query failed.)"
+        logger.warning(f"Tool auto-invocation failed: {e}")
 
-    # Use Gemini with real context
+    # Build platform context from tool results
+    context_parts = ["=== LIVE PLATFORM DATA (via agent tools) ==="]
+    for tool_name, result in tool_results_log:
+        context_parts.append(f"\n[Tool: {tool_name}]")
+        if isinstance(result, list):
+            for item in result[:8]:
+                if isinstance(item, dict):
+                    # Format key fields
+                    parts = []
+                    for k in ("severity", "status", "title", "value", "type"):
+                        if k in item:
+                            parts.append(f"{k}={item[k]}")
+                    context_parts.append(f"  - {' | '.join(parts)}")
+        elif isinstance(result, dict):
+            for k, v in result.items():
+                context_parts.append(f"  {k}: {v}")
+    context_parts.append("=== END PLATFORM DATA ===")
+    platform_context = "\n".join(context_parts)
+
+    # Use Gemini with tool results + tool list as context
     analyzer = AIAnalyzer()
     try:
         ai_response = analyzer._call_llm(
             system_prompt=(
-                "You are an expert SOC analyst assistant for PySOAR, a Security Orchestration platform. "
-                "You have access to live platform data shown below. Use it to give specific, data-driven answers. "
-                "Reference actual alert titles, severities, and counts when relevant. "
-                "Keep responses concise but informative (3-5 sentences).\n\n"
+                "You are an expert SOC analyst and autonomous agent for PySOAR. You have the following tools available (you can suggest the user run them for actions):\n\n"
+                f"{tools_summary}\n\n"
+                "Use the live platform data below to give specific, data-driven answers. Reference actual alert titles, severities, and counts. "
+                "When the user asks you to take an action, explain which tool would handle it and recommend running it. "
+                "Keep responses concise (3-5 sentences).\n\n"
                 f"{platform_context}"
             ),
             user_prompt=query_data.query,

@@ -1,5 +1,7 @@
 """Celery application configuration"""
 
+from celery.schedules import crontab
+
 from celery import Celery
 
 from src.core.config import settings
@@ -11,6 +13,7 @@ celery_app = Celery(
     backend=settings.celery_result_backend,
     include=[
         "src.workers.tasks",
+        "src.tasks.automation_tasks",
     ],
 )
 
@@ -44,5 +47,26 @@ celery_app.conf.beat_schedule = {
     "check-scheduled-playbooks": {
         "task": "src.workers.tasks.check_scheduled_playbooks",
         "schedule": 60.0,  # Every minute
+    },
+    # --- Scheduled automation tasks (src.tasks.automation_tasks) ---
+    "auto-escalate-stale-alerts": {
+        "task": "automation.auto_escalate_stale_alerts",
+        "schedule": 1800.0,  # Every 30 minutes
+    },
+    "auto-close-resolved-alerts": {
+        "task": "automation.auto_close_resolved_alerts",
+        "schedule": 3600.0,  # Every 1 hour
+    },
+    "periodic-ioc-sweep": {
+        "task": "automation.periodic_ioc_sweep",
+        "schedule": 900.0,  # Every 15 minutes
+    },
+    "daily-threat-briefing": {
+        "task": "automation.daily_threat_briefing",
+        "schedule": crontab(hour=8, minute=0),  # Every day at 08:00 UTC
+    },
+    "hourly-correlation-sweep": {
+        "task": "automation.hourly_correlation_sweep",
+        "schedule": 3600.0,  # Every 1 hour
     },
 }
