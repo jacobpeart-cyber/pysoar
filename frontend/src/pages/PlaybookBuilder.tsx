@@ -756,22 +756,12 @@ export default function PlaybookBuilder() {
                                   <BarChart3 className="w-4 h-4" />
                                 </button>
                                 {execution.status === 'running' && (
-                                  <button
-                                    onClick={async () => {
-                                      try {
-                                        await api.put(`/playbook-builder/executions/${execution.id}/pause`);
-                                        setExecutions((prev) =>
-                                          prev.map((e) => (e.id === execution.id ? { ...e, status: 'paused' } : e))
-                                        );
-                                      } catch (err) {
-                                        setNotification({ type: 'error', text: 'Failed to pause execution' });
-                                      }
-                                    }}
-                                    className="p-1.5 text-gray-500 hover:text-yellow-600 dark:hover:text-yellow-400 hover:bg-gray-100 dark:hover:bg-gray-600 rounded transition"
-                                    title="Pause"
+                                  <span
+                                    className="p-1.5 text-gray-400 cursor-not-allowed rounded"
+                                    title="Pause not available"
                                   >
                                     <Pause className="w-4 h-4" />
-                                  </button>
+                                  </span>
                                 )}
                                 {execution.status !== 'running' && (
                                   <button

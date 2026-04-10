@@ -528,12 +528,10 @@ export default function APISecurityDashboard() {
                 const fd = new FormData(e.currentTarget);
                 try {
                   await api.post('/api-security/endpoints', {
-                    name: fd.get('name'),
-                    service_name: fd.get('service_name') || fd.get('name'),
+                    service_name: (fd.get('service_name') as string) || (fd.get('name') as string),
                     base_url: fd.get('base_url'),
-                    api_type: (fd.get('type') as string || 'rest').toLowerCase(),
-                    method: fd.get('method') || 'GET',
-                    path: fd.get('path') || '/',
+                    method: (fd.get('method') as string) || 'GET',
+                    path: (fd.get('path') as string) || '/',
                   });
                   setShowModal(false);
                   window.location.reload();

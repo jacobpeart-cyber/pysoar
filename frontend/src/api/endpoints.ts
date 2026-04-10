@@ -598,7 +598,7 @@ export const vulnmgmtApi = {
   },
 
   runScan: async (assetId?: string): Promise<{ task_id: string }> => {
-    const response = await api.post('/vulnmgmt/scan', assetId ? { asset_id: assetId } : {});
+    const response = await api.post('/vulnmgmt/vulnerabilities/import-scan', assetId ? { asset_id: assetId } : {});
     return response.data;
   },
 
@@ -672,11 +672,16 @@ export const darkwebApi = {
   },
 
   deleteMonitor: async (monitorId: string): Promise<void> => {
-    await api.delete(`/darkweb/brand-monitors/${monitorId}`);
+    await api.delete(`/darkweb/monitors/${monitorId}`);
   },
 
-  updateMonitor: async (monitorId: string, data: { name?: string; keyword?: string }): Promise<any> => {
-    const response = await api.put(`/darkweb/brand-monitors/${monitorId}`, data);
+  updateMonitor: async (monitorId: string, data: { name?: string; description?: string; search_terms?: string[]; enabled?: boolean }): Promise<any> => {
+    const response = await api.patch(`/darkweb/monitors/${monitorId}`, data);
+    return response.data;
+  },
+
+  updateFinding: async (findingId: string, data: { status?: string; analyst_notes?: string; severity?: string }): Promise<any> => {
+    const response = await api.patch(`/darkweb/findings/${findingId}`, data);
     return response.data;
   },
 
@@ -696,7 +701,7 @@ export const darkwebApi = {
   },
 
   requestTakedown: async (threatId: string): Promise<any> => {
-    const response = await api.post(`/darkweb/brand-monitors/${threatId}/takedown`);
+    const response = await api.post(`/darkweb/brand-threats/${threatId}/initiate-takedown`);
     return response.data;
   },
 };

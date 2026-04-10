@@ -247,7 +247,7 @@ export default function DarkWebMonitor() {
                           onClick={async () => {
                             if (confirm('Are you sure you want to delete this monitor?')) {
                               try {
-                                await darkwebApi.getAlerts({ status: 'deleted' });
+                                await darkwebApi.deleteMonitor(monitor.id);
                                 setMonitors(prev => prev.filter(m => m.id !== monitor.id));
                               } catch (error) {
                                 console.error('Error deleting monitor:', error);
@@ -445,8 +445,8 @@ export default function DarkWebMonitor() {
                             if (threat.status === 'active') {
                               if (confirm('Initiate takedown request for this threat?')) {
                                 try {
-                                  await darkwebApi.getAlerts({ type: 'takedown', status: threat.id });
-                                  setSelectedFinding(threat);
+                                  await darkwebApi.requestTakedown(threat.id);
+                                  setThreats(prev => prev.map(t => t.id === threat.id ? { ...t, status: 'takedown_requested', takedownAttempts: (t.takedownAttempts || 0) + 1 } : t));
                                 } catch (error) {
                                   console.error('Error initiating takedown:', error);
                                 }
@@ -498,9 +498,9 @@ export default function DarkWebMonitor() {
           <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-[500px] max-h-screen overflow-y-auto">
             <h2 className="text-xl font-bold mb-4">Take Action: {actionFinding.title}</h2>
             <div className="space-y-3">
-              <button onClick={async () => { try { await darkwebApi.getAlerts({ status: 'escalated' }); } catch(e) { console.error(e); } setActionFinding(null); }} className="w-full px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition">Escalate to Incident</button>
-              <button onClick={async () => { try { await darkwebApi.getAlerts({ status: 'notified' }); } catch(e) { console.error(e); } setActionFinding(null); }} className="w-full px-4 py-2 bg-orange-600 hover:bg-orange-700 text-white rounded-lg transition">Notify Stakeholders</button>
-              <button onClick={async () => { try { await darkwebApi.getAlerts({ status: 'reviewed' }); } catch(e) { console.error(e); } setActionFinding(null); }} className="w-full px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg transition">Mark as Reviewed</button>
+              <button onClick={async () => { try { await darkwebApi.updateFinding(actionFinding.id, { status: 'escalated' }); setFindings(prev => prev.map(f => f.id === actionFinding.id ? { ...f, status: 'escalated' } : f)); } catch(e) { console.error(e); } setActionFinding(null); }} className="w-full px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition">Escalate to Incident</button>
+              <button onClick={async () => { try { await darkwebApi.updateFinding(actionFinding.id, { status: 'notified' }); setFindings(prev => prev.map(f => f.id === actionFinding.id ? { ...f, status: 'notified' } : f)); } catch(e) { console.error(e); } setActionFinding(null); }} className="w-full px-4 py-2 bg-orange-600 hover:bg-orange-700 text-white rounded-lg transition">Notify Stakeholders</button>
+              <button onClick={async () => { try { await darkwebApi.updateFinding(actionFinding.id, { status: 'reviewed' }); setFindings(prev => prev.map(f => f.id === actionFinding.id ? { ...f, status: 'reviewed' } : f)); } catch(e) { console.error(e); } setActionFinding(null); }} className="w-full px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg transition">Mark as Reviewed</button>
               <button onClick={() => setActionFinding(null)} className="w-full px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
             </div>
           </div>
@@ -530,20 +530,35 @@ export default function DarkWebMonitor() {
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
           <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-96 max-h-screen overflow-y-auto">
             <h2 className="text-xl font-bold mb-4">Edit Monitor: {editingMonitor.name}</h2>
-            <div className="space-y-4">
+            <form onSubmit={async (e) => {
+              e.preventDefault();
+              const formData = new FormData(e.currentTarget);
+              const name = formData.get('name') as string;
+              const keyword = formData.get('keyword') as string;
+              try {
+                const updated = await darkwebApi.updateMonitor(editingMonitor.id, {
+                  name,
+                  search_terms: keyword.split(',').map((k: string) => k.trim()).filter(Boolean),
+                });
+                setMonitors(prev => prev.map(m => m.id === editingMonitor.id ? { ...m, ...updated, name, keyword } : m));
+                setEditingMonitor(null);
+              } catch (error) {
+                console.error('Error updating monitor:', error);
+              }
+            }} className="space-y-4">
               <div>
                 <label className="block text-sm font-medium mb-1">Monitor Name</label>
-                <input type="text" defaultValue={editingMonitor.name} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+                <input type="text" name="name" defaultValue={editingMonitor.name} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
               </div>
               <div>
                 <label className="block text-sm font-medium mb-1">Keywords</label>
-                <textarea defaultValue={editingMonitor.keyword} rows={3} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+                <textarea name="keyword" defaultValue={editingMonitor.keyword} rows={3} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
               </div>
               <div className="flex gap-2 mt-6">
-                <button onClick={() => setEditingMonitor(null)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
-                <button onClick={() => { setEditingMonitor(null); }} className="flex-1 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition">Save</button>
+                <button type="button" onClick={() => setEditingMonitor(null)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
+                <button type="submit" className="flex-1 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition">Save</button>
               </div>
-            </div>
+            </form>
           </div>
         </div>
       )}

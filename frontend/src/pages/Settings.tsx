@@ -352,10 +352,27 @@ function EmailSettings({
         <p className="text-sm text-gray-500">Configure email server for notifications</p>
       </div>
 
+      <form id="smtp-form" onSubmit={async (e) => {
+        e.preventDefault();
+        const fd = new FormData(e.currentTarget);
+        try {
+          await api.patch('/settings/smtp', {
+            host: fd.get('host'),
+            port: Number(fd.get('port')),
+            username: fd.get('username') || '',
+            password: fd.get('password') || undefined,
+            from_address: fd.get('from_address'),
+            use_tls: fd.get('use_tls') === 'on',
+          });
+        } catch (err) {
+          console.error('Failed to save SMTP settings:', err);
+        }
+      }}>
       <div className="grid grid-cols-2 gap-6">
         <div>
           <label className="block text-sm font-medium text-gray-700">SMTP Host</label>
           <input
+            name="host"
             type="text"
             defaultValue={settings.host}
             className="mt-1 block w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
@@ -364,6 +381,7 @@ function EmailSettings({
         <div>
           <label className="block text-sm font-medium text-gray-700">SMTP Port</label>
           <input
+            name="port"
             type="number"
             defaultValue={settings.port}
             className="mt-1 block w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
@@ -372,6 +390,7 @@ function EmailSettings({
         <div>
           <label className="block text-sm font-medium text-gray-700">Username</label>
           <input
+            name="username"
             type="text"
             defaultValue={settings.username || ''}
             placeholder="Enter SMTP username"
@@ -381,6 +400,7 @@ function EmailSettings({
         <div>
           <label className="block text-sm font-medium text-gray-700">Password</label>
           <input
+            name="password"
             type="password"
             placeholder="Enter SMTP password"
             className="mt-1 block w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
@@ -389,6 +409,7 @@ function EmailSettings({
         <div>
           <label className="block text-sm font-medium text-gray-700">From Address</label>
           <input
+            name="from_address"
             type="email"
             defaultValue={settings.from_address}
             className="mt-1 block w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
@@ -397,6 +418,7 @@ function EmailSettings({
         <div className="flex items-end">
           <label className="flex items-center gap-2">
             <input
+              name="use_tls"
               type="checkbox"
               defaultChecked={settings.use_tls}
               className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
@@ -405,6 +427,7 @@ function EmailSettings({
           </label>
         </div>
       </div>
+      </form>
 
       <div className="flex justify-between pt-4 border-t border-gray-200">
         <button
@@ -420,13 +443,8 @@ function EmailSettings({
           Test Connection
         </button>
         <button
-          onClick={async () => {
-            try {
-              await api.patch('/settings/smtp', settings);
-            } catch (err) {
-              console.error('Failed to save SMTP settings:', err);
-            }
-          }}
+          type="submit"
+          form="smtp-form"
           className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
         >
           <Save className="w-4 h-4" />
@@ -973,9 +991,9 @@ function SecuritySettings({
 }) {
   const queryClient = useQueryClient();
   const saveMutation = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (data: { alert_correlation: any; general: any }) => {
       try {
-      const response = await api.patch('/settings/security', { alert_correlation: settings, general });
+      const response = await api.patch('/settings/security', data);
       return response.data;
       } catch { return null; }
     },
@@ -985,6 +1003,22 @@ function SecuritySettings({
   });
 
   return (
+    <form id="security-form" onSubmit={(e) => {
+      e.preventDefault();
+      const fd = new FormData(e.currentTarget);
+      saveMutation.mutate({
+        general: {
+          session_timeout_minutes: Number(fd.get('session_timeout_minutes')),
+          max_login_attempts: Number(fd.get('max_login_attempts')),
+          lockout_duration_minutes: Number(fd.get('lockout_duration_minutes')),
+        },
+        alert_correlation: {
+          enabled: fd.get('enabled') === 'on',
+          time_window_minutes: Number(fd.get('time_window_minutes')),
+          min_alerts_for_incident: Number(fd.get('min_alerts_for_incident')),
+        },
+      });
+    }}>
     <div className="space-y-6">
       <div>
         <h2 className="text-lg font-semibold text-gray-900">Security Settings</h2>
@@ -1000,6 +1034,7 @@ function SecuritySettings({
                 Session Timeout (minutes)
               </label>
               <input
+                name="session_timeout_minutes"
                 type="number"
                 defaultValue={general.session_timeout_minutes}
                 className="mt-1 block w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
@@ -1010,6 +1045,7 @@ function SecuritySettings({
                 Max Login Attempts
               </label>
               <input
+                name="max_login_attempts"
                 type="number"
                 defaultValue={general.max_login_attempts}
                 className="mt-1 block w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
@@ -1020,6 +1056,7 @@ function SecuritySettings({
                 Lockout Duration (minutes)
               </label>
               <input
+                name="lockout_duration_minutes"
                 type="number"
                 defaultValue={general.lockout_duration_minutes}
                 className="mt-1 block w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
@@ -1040,6 +1077,7 @@ function SecuritySettings({
               </div>
               <label className="relative inline-flex items-center cursor-pointer">
                 <input
+                  name="enabled"
                   type="checkbox"
                   defaultChecked={settings.enabled}
                   className="sr-only peer"
@@ -1054,6 +1092,7 @@ function SecuritySettings({
                   Time Window (minutes)
                 </label>
                 <input
+                  name="time_window_minutes"
                   type="number"
                   defaultValue={settings.time_window_minutes}
                   className="mt-1 block w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
@@ -1064,6 +1103,7 @@ function SecuritySettings({
                   Min Alerts for Incident
                 </label>
                 <input
+                  name="min_alerts_for_incident"
                   type="number"
                   defaultValue={settings.min_alerts_for_incident}
                   className="mt-1 block w-full rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
@@ -1076,7 +1116,7 @@ function SecuritySettings({
 
       <div className="flex justify-end pt-4 border-t border-gray-200">
         <button
-          onClick={() => saveMutation.mutate()}
+          type="submit"
           disabled={saveMutation.isPending}
           className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
         >
@@ -1085,5 +1125,6 @@ function SecuritySettings({
         </button>
       </div>
     </div>
+    </form>
   );
 }
