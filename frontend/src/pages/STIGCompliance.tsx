@@ -89,7 +89,7 @@ export default function STIGCompliance() {
     queryKey: ['stig-dashboard'],
     queryFn: async () => {
       try {
-      const response = await api.get('/stig/dashboard');
+      const response = await api.get('/stig/dashboard/stats');
       return response.data;
       } catch { return null; }
     },
@@ -137,7 +137,7 @@ export default function STIGCompliance() {
       const params = new URLSearchParams();
       if (severityFilter !== 'all') params.append('severity', severityFilter);
       try {
-      const response = await api.get(`/stig/remediations?${params}`);
+      const response = await api.get(`/stig/scans?${params}`);
       return response.data;
       } catch { return null; }
     },
@@ -146,7 +146,7 @@ export default function STIGCompliance() {
   const runScanMutation = useMutation({
     mutationFn: async (benchmarkId: string) => {
       try {
-      const response = await api.post(`/stig/benchmarks/${benchmarkId}/scan`);
+      const response = await api.post('/stig/scans/launch', { benchmark_id: benchmarkId });
       return response.data;
       } catch { return null; }
     },
@@ -159,7 +159,7 @@ export default function STIGCompliance() {
   const autoRemediateMutation = useMutation({
     mutationFn: async () => {
       try {
-      const response = await api.post('/stig/auto-remediate-cat-i');
+      const response = await api.post('/stig/remediate/auto', { categories: ['CAT I'] });
       return response.data;
       } catch { return null; }
     },

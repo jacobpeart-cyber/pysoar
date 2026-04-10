@@ -541,14 +541,25 @@ export default function VulnManagement() {
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
           <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-96 max-h-screen overflow-y-auto">
             <h2 className="text-xl font-bold mb-4">Edit: {editingVulnerability.cveId}</h2>
-            <div className="space-y-4">
+            <form className="space-y-4" onSubmit={async (e) => {
+              e.preventDefault();
+              const fd = new FormData(e.currentTarget);
+              try {
+                await api.put(`/vulnmgmt/vulnerabilities/${editingVulnerability.id}`, {
+                  title: fd.get('title'),
+                  severity: fd.get('severity'),
+                });
+                setEditingVulnerability(null);
+                loadData();
+              } catch (err) { console.error('Update vulnerability failed:', err); }
+            }}>
               <div>
                 <label className="block text-sm font-medium mb-1">Title</label>
-                <input type="text" defaultValue={editingVulnerability.title} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+                <input name="title" type="text" defaultValue={editingVulnerability.title} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
               </div>
               <div>
                 <label className="block text-sm font-medium mb-1">Severity</label>
-                <select defaultValue={editingVulnerability.severity} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
+                <select name="severity" defaultValue={editingVulnerability.severity} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
                   <option value="critical">Critical</option>
                   <option value="high">High</option>
                   <option value="medium">Medium</option>
@@ -556,10 +567,10 @@ export default function VulnManagement() {
                 </select>
               </div>
               <div className="flex gap-2 mt-6">
-                <button onClick={() => setEditingVulnerability(null)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
-                <button onClick={() => { setEditingVulnerability(null); }} className="flex-1 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition">Save</button>
+                <button type="button" onClick={() => setEditingVulnerability(null)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
+                <button type="submit" className="flex-1 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition">Save</button>
               </div>
-            </div>
+            </form>
           </div>
         </div>
       )}
@@ -569,20 +580,31 @@ export default function VulnManagement() {
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
           <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-96 max-h-screen overflow-y-auto">
             <h2 className="text-xl font-bold mb-4">Edit Exception: {editingException.cveId}</h2>
-            <div className="space-y-4">
+            <form className="space-y-4" onSubmit={async (e) => {
+              e.preventDefault();
+              const fd = new FormData(e.currentTarget);
+              try {
+                await api.put(`/vulnmgmt/exceptions/${editingException.id}`, {
+                  reason: fd.get('reason'),
+                  expiry_date: fd.get('expiry_date'),
+                });
+                setEditingException(null);
+                loadData();
+              } catch (err) { console.error('Update exception failed:', err); }
+            }}>
               <div>
                 <label className="block text-sm font-medium mb-1">Reason</label>
-                <textarea defaultValue={editingException.reason} rows={3} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+                <textarea name="reason" defaultValue={editingException.reason} rows={3} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
               </div>
               <div>
                 <label className="block text-sm font-medium mb-1">Expiry Date</label>
-                <input type="date" defaultValue={editingException.expiryDate} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+                <input name="expiry_date" type="date" defaultValue={editingException.expiryDate} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
               </div>
               <div className="flex gap-2 mt-6">
-                <button onClick={() => setEditingException(null)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
-                <button onClick={() => { setEditingException(null); }} className="flex-1 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition">Save</button>
+                <button type="button" onClick={() => setEditingException(null)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
+                <button type="submit" className="flex-1 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition">Save</button>
               </div>
-            </div>
+            </form>
           </div>
         </div>
       )}
@@ -592,20 +614,31 @@ export default function VulnManagement() {
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
           <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-96 max-h-screen overflow-y-auto">
             <h2 className="text-xl font-bold mb-4">Edit Scan Profile: {editingScanProfile.name}</h2>
-            <div className="space-y-4">
+            <form className="space-y-4" onSubmit={async (e) => {
+              e.preventDefault();
+              const fd = new FormData(e.currentTarget);
+              try {
+                await api.put(`/vulnmgmt/scan-profiles/${editingScanProfile.id}`, {
+                  name: fd.get('name'),
+                  schedule: fd.get('schedule'),
+                });
+                setEditingScanProfile(null);
+                loadData();
+              } catch (err) { console.error('Update scan profile failed:', err); }
+            }}>
               <div>
                 <label className="block text-sm font-medium mb-1">Name</label>
-                <input type="text" defaultValue={editingScanProfile.name} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+                <input name="name" type="text" defaultValue={editingScanProfile.name} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
               </div>
               <div>
                 <label className="block text-sm font-medium mb-1">Schedule</label>
-                <input type="text" defaultValue={editingScanProfile.schedule} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+                <input name="schedule" type="text" defaultValue={editingScanProfile.schedule} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
               </div>
               <div className="flex gap-2 mt-6">
-                <button onClick={() => setEditingScanProfile(null)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
-                <button onClick={() => { setEditingScanProfile(null); }} className="flex-1 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition">Save</button>
+                <button type="button" onClick={() => setEditingScanProfile(null)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
+                <button type="submit" className="flex-1 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition">Save</button>
               </div>
-            </div>
+            </form>
           </div>
         </div>
       )}
@@ -618,7 +651,7 @@ export default function VulnManagement() {
             <div className="space-y-3">
               <p className="text-sm text-gray-600 dark:text-gray-400">{remediatingVuln.title}</p>
               <button onClick={async () => { try { await vulnmgmtApi.runScan(remediatingVuln.id); setRemediatingVuln(null); loadData(); } catch (e) { console.error(e); } }} className="w-full px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition">Apply Patch</button>
-              <button onClick={() => { setRemediatingVuln(null); }} className="w-full px-4 py-2 bg-orange-600 hover:bg-orange-700 text-white rounded-lg transition">Apply Compensating Control</button>
+              <button onClick={async () => { try { await api.post('/vulnmgmt/instances/bulk-action', { instance_ids: [remediatingVuln.id], action: 'update_status', value: 'mitigated' }); setRemediatingVuln(null); loadData(); } catch (e) { console.error('Apply compensating control failed:', e); } }} className="w-full px-4 py-2 bg-orange-600 hover:bg-orange-700 text-white rounded-lg transition">Apply Compensating Control</button>
               <button onClick={() => setRemediatingVuln(null)} className="w-full px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
             </div>
           </div>
@@ -638,7 +671,7 @@ export default function VulnManagement() {
                   cve_id: fd.get('cve_id'),
                   title: fd.get('title'),
                   severity: fd.get('severity') || 'medium',
-                  cvss_score: parseFloat(fd.get('cvss_score') as string) || 0,
+                  cvss_v3_score: parseFloat(fd.get('cvss_score') as string) || 0,
                   description: fd.get('description') || '',
                 });
                 setShowNewVulnModal(false);

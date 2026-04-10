@@ -919,7 +919,11 @@ function EvidenceTab() {
   });
 
   const collectEvidence = useMutation({
-    mutationFn: (family: string) => api.post('/fedramp/evidence/collect', { family }),
+    mutationFn: async (family: string) => {
+      // Evidence collection endpoint is not yet implemented on the backend.
+      // Refresh the status view instead.
+      return { message: `Evidence collection for ${family} is not yet available.` };
+    },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['fedramp', 'evidence', 'status'] });
     },

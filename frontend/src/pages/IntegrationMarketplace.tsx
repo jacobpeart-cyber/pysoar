@@ -235,7 +235,7 @@ export default function IntegrationMarketplace() {
                           </button>
                         </div>
                       ) : (
-                        <button onClick={async () => { try { await api.post(`/integrations/connectors/${connector.id}/install`, { config: {} }); loadData(); } catch(e) { console.error(e); } }} className="w-full px-3 py-2 text-sm bg-cyan-600 hover:bg-cyan-700 text-white rounded transition flex items-center justify-center gap-2">
+                        <button onClick={async () => { try { await api.post('/integrations/install', { connector_id: connector.id, config: {} }); loadData(); } catch(e) { console.error(e); } }} className="w-full px-3 py-2 text-sm bg-cyan-600 hover:bg-cyan-700 text-white rounded transition flex items-center justify-center gap-2">
                           <Download className="w-4 h-4" />
                           Install
                         </button>
@@ -283,7 +283,7 @@ export default function IntegrationMarketplace() {
                         <button onClick={() => setSelectedConnector(integration)} className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
                           Configure
                         </button>
-                        <button onClick={async () => { try { await api.post(`/integrations/connectors/${integration.id}/test`); } catch(e) { console.error(e); } }} className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                        <button onClick={async () => { try { await api.post(`/integrations/installed/${integration.id}/test`); } catch(e) { console.error(e); } }} className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
                           Test
                         </button>
                         <button onClick={() => setSelectedConnector(integration)} className="px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
@@ -397,19 +397,26 @@ export default function IntegrationMarketplace() {
             <form className="space-y-4" onSubmit={async (e) => {
               e.preventDefault();
               const fd = new FormData(e.currentTarget);
+              const integrationId = fd.get('integration_id');
+              if (!integrationId) { console.error('No integration selected'); return; }
               try {
-                await api.post('/integrations/webhooks', { name: fd.get('name'), url: fd.get('url'), event_type: fd.get('event') });
+                await api.post(`/integrations/installed/${integrationId}/webhooks`, { endpoint_path: fd.get('url'), http_method: 'POST', event_types: [fd.get('event')] });
                 setShowNewWebhookModal(false);
                 loadData();
               } catch (err) { console.error('Failed to create webhook:', err); }
             }}>
               <div>
-                <label className="block text-sm font-medium mb-1">Webhook Name</label>
-                <input name="name" required type="text" placeholder="e.g., Slack Alert Webhook" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+                <label className="block text-sm font-medium mb-1">Integration</label>
+                <select name="integration_id" required className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
+                  <option value="">Select an integration...</option>
+                  {installed.map((inst) => (
+                    <option key={inst.id} value={inst.id}>{inst.name || inst.display_name || inst.connector_id}</option>
+                  ))}
+                </select>
               </div>
               <div>
-                <label className="block text-sm font-medium mb-1">Webhook URL</label>
-                <input name="url" required type="url" placeholder="https://..." className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+                <label className="block text-sm font-medium mb-1">Endpoint Path</label>
+                <input name="url" required type="text" placeholder="/webhooks/my-hook" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
               </div>
               <div>
                 <label className="block text-sm font-medium mb-1">Event Type</label>

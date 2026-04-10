@@ -12,6 +12,7 @@ import {
   Loader2,
   CheckCircle,
   XCircle,
+  Save,
 } from 'lucide-react';
 import { api } from '../lib/api';
 import clsx from 'clsx';
@@ -733,12 +734,26 @@ function OrganizationDetailModal({
           )}
 
           {activeTab === 'settings' && (
+            <form id="org-settings-form" onSubmit={async (e) => {
+              e.preventDefault();
+              const fd = new FormData(e.currentTarget);
+              try {
+                await api.patch(`/organizations/${organization.id}`, {
+                  name: fd.get('name'),
+                  description: fd.get('description'),
+                });
+                queryClient.invalidateQueries({ queryKey: ['organizations'] });
+              } catch (err) {
+                console.error('Failed to save organization settings:', err);
+              }
+            }}>
             <div className="space-y-6">
               <div>
                 <label className="block text-sm font-medium text-gray-700 dark:text-gray-300">
                   Organization Name
                 </label>
                 <input
+                  name="name"
                   type="text"
                   defaultValue={organization.name}
                   className="mt-1 block w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm"
@@ -749,22 +764,34 @@ function OrganizationDetailModal({
                   Description
                 </label>
                 <textarea
+                  name="description"
                   defaultValue={organization.description || ''}
                   rows={3}
                   className="mt-1 block w-full rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 px-3 py-2 text-sm"
                 />
               </div>
             </div>
+            </form>
           )}
         </div>
 
-        <div className="p-6 border-t border-gray-200 dark:border-gray-700 flex justify-end">
+        <div className="p-6 border-t border-gray-200 dark:border-gray-700 flex justify-end gap-3">
           <button
             onClick={onClose}
             className="px-4 py-2 text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-700 rounded-lg"
           >
             Close
           </button>
+          {activeTab === 'settings' && (
+            <button
+              type="submit"
+              form="org-settings-form"
+              className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+            >
+              <Save className="w-4 h-4" />
+              Save Changes
+            </button>
+          )}
         </div>
       </div>
 

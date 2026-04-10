@@ -369,7 +369,7 @@ async def collect_evidence(
             "entries": [
                 {
                     "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "actor": current_user.username,
+                    "actor": getattr(current_user, "full_name", None) or current_user.email,
                     "action": "collected",
                     "hash": evidence_data.original_hash_sha256,
                 }
@@ -400,7 +400,7 @@ async def verify_evidence_integrity(
         is_valid = verify_data.evidence_hash.lower() == verify_data.original_hash.lower()
 
     evidence.is_verified = is_valid
-    evidence.verified_by = current_user.username
+    evidence.verified_by = getattr(current_user, "full_name", None) or current_user.email
     evidence.verification_date = datetime.now(timezone.utc).isoformat()
 
     if verify_data.hash_algorithm == "sha256":
