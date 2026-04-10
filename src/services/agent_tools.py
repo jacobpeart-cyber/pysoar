@@ -74,6 +74,49 @@ class AgentToolRegistry:
             for t in tools
         ]
 
+    def gemini_function_declarations(self) -> list[dict]:
+        """
+        Return tool definitions in Gemini function calling schema format.
+        Each declaration has: name, description, parameters (JSON schema).
+        """
+        declarations = []
+        for t in self.tools.values():
+            # Build JSON schema properties from the parameters dict
+            properties = {}
+            required = []
+            for param_name, param_desc in (t.parameters or {}).items():
+                desc_str = str(param_desc)
+                is_optional = "optional" in desc_str.lower()
+                param_type = "string"
+                if "int" in desc_str.lower() or "number" in desc_str.lower():
+                    param_type = "integer"
+                elif "bool" in desc_str.lower():
+                    param_type = "boolean"
+                elif "dict" in desc_str.lower() or "object" in desc_str.lower():
+                    param_type = "object"
+                elif "list" in desc_str.lower() or "array" in desc_str.lower():
+                    param_type = "array"
+
+                properties[param_name] = {
+                    "type": param_type,
+                    "description": desc_str,
+                }
+                if not is_optional:
+                    required.append(param_name)
+
+            decl = {
+                "name": t.name,
+                "description": f"[{t.category}] {t.description}",
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                },
+            }
+            if required:
+                decl["parameters"]["required"] = required
+            declarations.append(decl)
+        return declarations
+
     def _register(self, tool: Tool):
         self.tools[tool.name] = tool
 

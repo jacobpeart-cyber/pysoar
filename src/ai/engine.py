@@ -861,6 +861,118 @@ class AIAnalyzer:
             else:
                 return f"AI analysis unavailable: {str(e)[:100]}"
 
+    def call_llm_with_tools(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        tools: list[dict],
+    ) -> dict:
+        """
+        Call Gemini with function/tool declarations. Returns structured result
+        indicating whether the model wants to call a tool or has a final text answer.
+
+        Args:
+            system_prompt: System instructions for the model
+            user_prompt: User's question
+            tools: List of tool definitions in Gemini function calling format:
+                [{"name": "...", "description": "...", "parameters": {...}}, ...]
+
+        Returns:
+            dict with one of these shapes:
+              - {"type": "tool_call", "name": "...", "args": {...}}
+              - {"type": "text", "text": "..."}
+              - {"type": "error", "error": "..."}
+        """
+        import httpx
+
+        self.logger.info(f"Calling Gemini with {len(tools)} tools")
+
+        try:
+            response = httpx.post(
+                f"{self.GEMINI_URL}?key={self.GEMINI_API_KEY}",
+                json={
+                    "contents": [
+                        {"role": "user", "parts": [{"text": f"{system_prompt}\n\n{user_prompt}"}]}
+                    ],
+                    "tools": [{"function_declarations": tools}],
+                    "tool_config": {"function_calling_config": {"mode": "AUTO"}},
+                    "generationConfig": {
+                        "temperature": 0.2,
+                        "maxOutputTokens": 1024,
+                    },
+                },
+                timeout=30.0,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            candidate = data.get("candidates", [{}])[0]
+            parts = candidate.get("content", {}).get("parts", [])
+
+            for part in parts:
+                if "functionCall" in part:
+                    fc = part["functionCall"]
+                    return {
+                        "type": "tool_call",
+                        "name": fc.get("name", ""),
+                        "args": fc.get("args", {}),
+                    }
+                if "text" in part and part["text"]:
+                    return {"type": "text", "text": part["text"]}
+
+            return {"type": "text", "text": ""}
+
+        except Exception as e:
+            self.logger.error(f"Gemini tool call failed: {e}")
+            return {"type": "error", "error": str(e)[:200]}
+
+    def call_llm_followup(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        tool_name: str,
+        tool_args: dict,
+        tool_result: dict,
+    ) -> str:
+        """
+        After executing a tool, feed the result back to Gemini to get a final
+        natural-language answer grounded in the tool output.
+        """
+        import httpx
+
+        try:
+            response = httpx.post(
+                f"{self.GEMINI_URL}?key={self.GEMINI_API_KEY}",
+                json={
+                    "contents": [
+                        {"role": "user", "parts": [{"text": f"{system_prompt}\n\n{user_prompt}"}]},
+                        {"role": "model", "parts": [{"functionCall": {"name": tool_name, "args": tool_args}}]},
+                        {"role": "function", "parts": [{"functionResponse": {"name": tool_name, "response": tool_result}}]},
+                    ],
+                    "generationConfig": {
+                        "temperature": 0.3,
+                        "maxOutputTokens": 1024,
+                    },
+                },
+                timeout=30.0,
+            )
+            response.raise_for_status()
+            data = response.json()
+            parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+            for part in parts:
+                if "text" in part and part["text"]:
+                    return part["text"]
+            return "Action completed."
+        except Exception as e:
+            self.logger.error(f"Gemini followup failed: {e}")
+            # Build a deterministic response from the tool result
+            if isinstance(tool_result, dict):
+                if tool_result.get("success"):
+                    return f"Executed {tool_name}: {json.dumps(tool_result.get('result', {}))[:500]}"
+                else:
+                    return f"Tool {tool_name} failed: {tool_result.get('error', 'unknown error')}"
+            return str(tool_result)[:500]
+
     def _build_security_context(self, data: dict) -> str:
         """
         Format security data for LLM consumption.
