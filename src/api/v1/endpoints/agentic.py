@@ -1,8 +1,9 @@
 """API endpoints for Agentic AI SOC Analyst"""
 
 import json
+import logging
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Path, HTTPException, Query, status
@@ -10,6 +11,10 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DatabaseSession
+from src.models.alert import Alert
+from src.models.incident import Incident
+
+logger = logging.getLogger(__name__)
 from src.agentic.engine import (
     AgenticSOCEngine,
     AgentMemoryManager,
@@ -644,16 +649,103 @@ async def chat_with_agent(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Chat with SOC agent in natural language, powered by Gemini AI."""
+    """Chat with SOC agent in natural language, powered by Gemini AI with real platform data."""
     from src.ai.engine import AIAnalyzer
 
-    # Use Gemini for intelligent response
+    org_id = getattr(current_user, "organization_id", None)
+
+    # ---- Gather real platform data from the database ----
+    try:
+        # Recent open / non-closed alerts (up to 10)
+        alert_q = (
+            select(Alert)
+            .where(Alert.status != "closed")
+            .order_by(Alert.created_at.desc())
+            .limit(10)
+        )
+        alert_result = await db.execute(alert_q)
+        recent_alerts = list(alert_result.scalars().all())
+
+        # Recent active incidents (up to 5)
+        incident_q = (
+            select(Incident)
+            .where(Incident.status != "closed")
+            .order_by(Incident.created_at.desc())
+            .limit(5)
+        )
+        incident_result = await db.execute(incident_q)
+        recent_incidents = list(incident_result.scalars().all())
+
+        # Pending approval actions
+        pending_q = select(func.count()).select_from(AgentAction).where(
+            AgentAction.execution_status == ActionExecutionStatus.PENDING_APPROVAL.value,
+        )
+        if org_id:
+            pending_q = pending_q.where(AgentAction.organization_id == org_id)
+        pending_result = await db.execute(pending_q)
+        pending_approvals = pending_result.scalar() or 0
+
+        # Basic stats
+        total_alerts_result = await db.execute(select(func.count()).select_from(Alert))
+        total_alerts = total_alerts_result.scalar() or 0
+
+        open_alerts_result = await db.execute(
+            select(func.count()).select_from(Alert).where(Alert.status != "closed")
+        )
+        open_alerts = open_alerts_result.scalar() or 0
+
+        critical_alerts_result = await db.execute(
+            select(func.count()).select_from(Alert).where(Alert.severity == "critical")
+        )
+        critical_alerts = critical_alerts_result.scalar() or 0
+
+        total_incidents_result = await db.execute(select(func.count()).select_from(Incident))
+        total_incidents = total_incidents_result.scalar() or 0
+
+        open_incidents_result = await db.execute(
+            select(func.count()).select_from(Incident).where(Incident.status != "closed")
+        )
+        open_incidents = open_incidents_result.scalar() or 0
+
+        # Build context string with real data
+        alert_lines = []
+        for a in recent_alerts:
+            alert_lines.append(
+                f"  - [{a.severity.upper()}] {a.title} (status={a.status}, source={a.source}, created={a.created_at})"
+            )
+        alerts_text = "\n".join(alert_lines) if alert_lines else "  (none)"
+
+        incident_lines = []
+        for inc in recent_incidents:
+            incident_lines.append(
+                f"  - [{inc.severity.upper()}] {inc.title} (status={inc.status}, type={inc.incident_type}, created={inc.created_at})"
+            )
+        incidents_text = "\n".join(incident_lines) if incident_lines else "  (none)"
+
+        platform_context = (
+            f"=== LIVE PLATFORM DATA ===\n"
+            f"Stats: {total_alerts} total alerts ({open_alerts} open, {critical_alerts} critical), "
+            f"{total_incidents} total incidents ({open_incidents} open), "
+            f"{pending_approvals} actions pending approval.\n\n"
+            f"Recent open alerts (up to 10):\n{alerts_text}\n\n"
+            f"Active incidents (up to 5):\n{incidents_text}\n"
+            f"=== END PLATFORM DATA ==="
+        )
+    except Exception as e:
+        logger.warning(f"Failed to query platform data for chat context: {e}")
+        platform_context = "(Platform data unavailable — database query failed.)"
+
+    # Use Gemini with real context
     analyzer = AIAnalyzer()
     try:
         ai_response = analyzer._call_llm(
-            system_prompt="""You are an expert SOC analyst assistant for PySOAR, a Security Orchestration platform.
-Answer security operations questions concisely. If asked about alerts, incidents, threats, or security events,
-provide actionable guidance. Keep responses under 3 sentences.""",
+            system_prompt=(
+                "You are an expert SOC analyst assistant for PySOAR, a Security Orchestration platform. "
+                "You have access to live platform data shown below. Use it to give specific, data-driven answers. "
+                "Reference actual alert titles, severities, and counts when relevant. "
+                "Keep responses concise but informative (3-5 sentences).\n\n"
+                f"{platform_context}"
+            ),
             user_prompt=query_data.query,
             structured_output=False,
         )
@@ -665,7 +757,7 @@ provide actionable guidance. Keep responses under 3 sentences.""",
         request = await nl_interface.process_query(
             query=query_data.query,
             agent_id=query_data.agent_id or "",
-            organization_id=getattr(current_user, "organization_id", None) or "",
+            organization_id=org_id or "",
         )
         response_text = f"I analyzed your query: {request.get('intent', 'general')}. {request.get('entity', '')} — checking over {request.get('time_range', '24h')}."
 
@@ -769,15 +861,57 @@ async def get_dashboard_metrics(
     approval_result = await db.execute(approval_query)
     pending_approvals = approval_result.scalar() or 0
 
+    # Count active agents (status != 'paused')
+    active_agent_query = select(func.count()).select_from(SOCAgent).where(
+        SOCAgent.organization_id == getattr(current_user, "organization_id", None),
+        SOCAgent.status != "paused",
+    )
+    active_agent_result = await db.execute(active_agent_query)
+    agents_active = active_agent_result.scalar() or 0
+
+    # Investigations completed in last 24h
+    cutoff_24h = datetime.now(timezone.utc) - timedelta(hours=24)
+    completed_24h_query = select(func.count()).select_from(Investigation).where(
+        Investigation.organization_id == getattr(current_user, "organization_id", None),
+        Investigation.status == InvestigationStatus.COMPLETED.value,
+        Investigation.updated_at >= cutoff_24h.isoformat(),
+    )
+    completed_24h_result = await db.execute(completed_24h_query)
+    investigations_completed_24h = completed_24h_result.scalar() or 0
+
+    # Average resolution time from agent stats
+    avg_time_query = select(func.avg(SOCAgent.avg_resolution_time_minutes)).where(
+        SOCAgent.organization_id == getattr(current_user, "organization_id", None),
+        SOCAgent.total_investigations > 0,
+    )
+    avg_time_result = await db.execute(avg_time_query)
+    avg_investigation_time = avg_time_result.scalar() or 0.0
+
+    # Overall accuracy from agent stats
+    accuracy_query = select(func.avg(SOCAgent.accuracy_score)).where(
+        SOCAgent.organization_id == getattr(current_user, "organization_id", None),
+        SOCAgent.total_investigations > 0,
+    )
+    accuracy_result = await db.execute(accuracy_query)
+    overall_accuracy = accuracy_result.scalar() or 0.0
+
+    # Overall false positive rate from agent stats
+    fpr_query = select(func.avg(SOCAgent.false_positive_rate)).where(
+        SOCAgent.organization_id == getattr(current_user, "organization_id", None),
+        SOCAgent.total_investigations > 0,
+    )
+    fpr_result = await db.execute(fpr_query)
+    overall_fpr = fpr_result.scalar() or 0.0
+
     return DashboardMetrics(
         total_agents=total_agents,
-        agents_active=max(0, total_agents - 1),
+        agents_active=agents_active,
         total_investigations=total_investigations,
         investigations_in_progress=investigations_in_progress,
-        investigations_completed_24h=5,
-        avg_investigation_time_minutes=45.5,
-        overall_accuracy=82.3,
-        overall_false_positive_rate=12.5,
+        investigations_completed_24h=investigations_completed_24h,
+        avg_investigation_time_minutes=round(float(avg_investigation_time), 1),
+        overall_accuracy=round(float(overall_accuracy), 1),
+        overall_false_positive_rate=round(float(overall_fpr), 1),
         pending_approvals=pending_approvals,
     )
 
@@ -787,24 +921,64 @@ async def get_investigation_metrics(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Get investigation statistics"""
+    """Get investigation statistics from real database data"""
+    org_id = getattr(current_user, "organization_id", None)
+    base_filter = Investigation.organization_id == org_id
+
+    # Total investigations
+    total_result = await db.execute(
+        select(func.count()).select_from(Investigation).where(base_filter)
+    )
+    total = total_result.scalar() or 0
+
+    # Count by status
+    status_result = await db.execute(
+        select(Investigation.status, func.count())
+        .where(base_filter)
+        .group_by(Investigation.status)
+    )
+    by_status = {row[0]: row[1] for row in status_result.all()}
+
+    # Count by resolution type
+    resolution_result = await db.execute(
+        select(Investigation.resolution_type, func.count())
+        .where(base_filter, Investigation.resolution_type.isnot(None))
+        .group_by(Investigation.resolution_type)
+    )
+    by_resolution = {row[0]: row[1] for row in resolution_result.all()}
+
+    # Count by priority
+    priority_result = await db.execute(
+        select(Investigation.priority, func.count())
+        .where(base_filter)
+        .group_by(Investigation.priority)
+    )
+    by_priority = {row[0]: row[1] for row in priority_result.all()}
+
+    # Average confidence score
+    avg_conf_result = await db.execute(
+        select(func.avg(Investigation.confidence_score)).where(
+            base_filter, Investigation.confidence_score.isnot(None)
+        )
+    )
+    avg_confidence = avg_conf_result.scalar() or 0.0
+
+    # Average resolution time from agents
+    avg_time_result = await db.execute(
+        select(func.avg(SOCAgent.avg_resolution_time_minutes)).where(
+            SOCAgent.organization_id == org_id,
+            SOCAgent.total_investigations > 0,
+        )
+    )
+    avg_resolution_time = avg_time_result.scalar() or 0.0
+
     return InvestigationMetrics(
-        total=150,
-        by_status={
-            "completed": 120,
-            "in_progress": 15,
-            "escalated": 10,
-            "abandoned": 5,
-        },
-        by_resolution={
-            "true_positive": 95,
-            "false_positive": 40,
-            "inconclusive": 10,
-            "escalated": 5,
-        },
-        by_priority={1: 20, 2: 35, 3: 60, 4: 25, 5: 10},
-        avg_confidence_score=76.5,
-        avg_resolution_time_minutes=42.3,
+        total=total,
+        by_status=by_status,
+        by_resolution=by_resolution,
+        by_priority=by_priority,
+        avg_confidence_score=round(float(avg_confidence), 1),
+        avg_resolution_time_minutes=round(float(avg_resolution_time), 1),
     )
 
 
@@ -813,15 +987,46 @@ async def get_accuracy_stats(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Get accuracy and false positive statistics"""
+    """Get accuracy and false positive statistics from real database data"""
+    org_id = getattr(current_user, "organization_id", None)
+    base_filter = Investigation.organization_id == org_id
+
+    # Total investigations
+    total_result = await db.execute(
+        select(func.count()).select_from(Investigation).where(base_filter)
+    )
+    total = total_result.scalar() or 0
+
+    # Count by resolution type
+    resolution_result = await db.execute(
+        select(Investigation.resolution_type, func.count())
+        .where(base_filter, Investigation.resolution_type.isnot(None))
+        .group_by(Investigation.resolution_type)
+    )
+    resolution_counts = {row[0]: row[1] for row in resolution_result.all()}
+
+    true_positives = resolution_counts.get("true_positive", 0)
+    false_positives = resolution_counts.get("false_positive", 0)
+    inconclusive = resolution_counts.get("inconclusive", 0)
+    escalated = resolution_counts.get("escalated", 0)
+
+    # Calculate rates
+    resolved_total = true_positives + false_positives + inconclusive + escalated
+    accuracy_score = (
+        round((true_positives / resolved_total) * 100, 1) if resolved_total > 0 else 0.0
+    )
+    false_positive_rate = (
+        round((false_positives / resolved_total) * 100, 1) if resolved_total > 0 else 0.0
+    )
+
     return AccuracyStats(
-        total_investigations=150,
-        true_positives=95,
-        false_positives=40,
-        inconclusive=10,
-        escalated=5,
-        accuracy_score=82.3,
-        false_positive_rate=12.5,
+        total_investigations=total,
+        true_positives=true_positives,
+        false_positives=false_positives,
+        inconclusive=inconclusive,
+        escalated=escalated,
+        accuracy_score=accuracy_score,
+        false_positive_rate=false_positive_rate,
     )
 
 

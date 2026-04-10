@@ -201,38 +201,150 @@ async def natural_language_query(
     try:
         logger.info(f"Processing NL query: {request.natural_language[:50]}...")
 
+        import time as _time
+        _query_start = _time.monotonic()
+
         # Simple intent classification heuristic
         text_lower = request.natural_language.lower()
         if "failed login" in text_lower or "authentication" in text_lower:
             intent = "log_search"
-            generated_query = "SELECT * FROM logs WHERE event_type = 'auth_failure' ORDER BY timestamp DESC LIMIT 50"
+            generated_query = "SELECT * FROM alerts WHERE title/description matches authentication failures"
         elif "vulnerability" in text_lower or "cve" in text_lower:
             intent = "vulnerability_search"
-            generated_query = "SELECT * FROM vulnerabilities WHERE severity IN ('critical','high') ORDER BY cvss DESC"
+            generated_query = "SELECT * FROM alerts WHERE category relates to vulnerabilities"
         elif "lateral movement" in text_lower:
             intent = "threat_hunt"
-            generated_query = "SELECT * FROM network_flows WHERE lateral_movement_score > 0.7 ORDER BY score DESC"
+            generated_query = "SELECT * FROM alerts WHERE category relates to lateral movement"
         elif "threat actor" in text_lower:
             intent = "threat_intel"
-            generated_query = "SELECT * FROM threat_actors ORDER BY activity_score DESC LIMIT 10"
+            generated_query = "SELECT * FROM alerts WHERE category relates to threat actors"
+        elif "incident" in text_lower:
+            intent = "incident_search"
+            generated_query = "SELECT * FROM incidents matching query terms"
         else:
             intent = "general_search"
             generated_query = f"SELECT * FROM alerts WHERE description ILIKE '%{text_lower[:30]}%' ORDER BY created_at DESC"
 
-        results_count = abs(hash(request.natural_language)) % 50 + 1
-        summary = f"Found {results_count} results matching your query about '{request.natural_language[:60]}'."
-        execution_time_ms = abs(hash(request.natural_language)) % 200 + 50
+        # Query real data from the database based on detected intent
+        from src.models.alert import Alert
+        from src.models.incident import Incident
 
-        # Build synthetic result rows so the frontend receives actual data
-        results = [
-            {
-                "row": i + 1,
-                "intent": intent,
-                "query": generated_query,
-                "match": f"Result {i + 1} for: {request.natural_language[:40]}",
-            }
-            for i in range(min(results_count, 20))
-        ]
+        results = []
+
+        if intent == "incident_search":
+            # Search incidents
+            search_terms = text_lower.replace("incident", "").strip()
+            incident_query = select(Incident).order_by(Incident.created_at.desc()).limit(20)
+            if search_terms:
+                incident_query = (
+                    select(Incident)
+                    .where(
+                        Incident.title.ilike(f"%{search_terms}%")
+                        | Incident.description.ilike(f"%{search_terms}%")
+                    )
+                    .order_by(Incident.created_at.desc())
+                    .limit(20)
+                )
+            inc_result = await db.execute(incident_query)
+            incidents = list(inc_result.scalars().all())
+            for i, inc in enumerate(incidents):
+                results.append({
+                    "row": i + 1,
+                    "type": "incident",
+                    "id": inc.id,
+                    "title": inc.title,
+                    "severity": inc.severity,
+                    "status": inc.status,
+                    "created_at": inc.created_at.isoformat() if inc.created_at else "",
+                })
+        else:
+            # Search alerts based on intent-specific filters
+            alert_query = select(Alert).order_by(Alert.created_at.desc()).limit(20)
+
+            if intent == "log_search":
+                # Look for authentication-related alerts
+                alert_query = (
+                    select(Alert)
+                    .where(
+                        Alert.title.ilike("%login%")
+                        | Alert.title.ilike("%auth%")
+                        | Alert.title.ilike("%credential%")
+                        | Alert.description.ilike("%login%")
+                        | Alert.description.ilike("%auth%")
+                    )
+                    .order_by(Alert.created_at.desc())
+                    .limit(20)
+                )
+            elif intent == "vulnerability_search":
+                alert_query = (
+                    select(Alert)
+                    .where(
+                        Alert.title.ilike("%vuln%")
+                        | Alert.title.ilike("%cve%")
+                        | Alert.description.ilike("%vuln%")
+                        | Alert.description.ilike("%cve%")
+                        | Alert.category.ilike("%vuln%")
+                    )
+                    .order_by(Alert.created_at.desc())
+                    .limit(20)
+                )
+            elif intent == "threat_hunt":
+                alert_query = (
+                    select(Alert)
+                    .where(
+                        Alert.title.ilike("%lateral%")
+                        | Alert.description.ilike("%lateral%")
+                        | Alert.category.ilike("%lateral%")
+                    )
+                    .order_by(Alert.created_at.desc())
+                    .limit(20)
+                )
+            elif intent == "threat_intel":
+                alert_query = (
+                    select(Alert)
+                    .where(
+                        Alert.title.ilike("%threat%")
+                        | Alert.description.ilike("%threat%")
+                        | Alert.title.ilike("%actor%")
+                    )
+                    .order_by(Alert.created_at.desc())
+                    .limit(20)
+                )
+            else:
+                # General search: look for query terms in title/description
+                search_terms = text_lower[:60]
+                # Extract meaningful words (skip very short ones)
+                words = [w for w in search_terms.split() if len(w) > 2]
+                if words:
+                    # Search for the first meaningful term
+                    term = words[0]
+                    alert_query = (
+                        select(Alert)
+                        .where(
+                            Alert.title.ilike(f"%{term}%")
+                            | Alert.description.ilike(f"%{term}%")
+                        )
+                        .order_by(Alert.created_at.desc())
+                        .limit(20)
+                    )
+
+            alert_result = await db.execute(alert_query)
+            alerts = list(alert_result.scalars().all())
+            for i, a in enumerate(alerts):
+                results.append({
+                    "row": i + 1,
+                    "type": "alert",
+                    "id": a.id,
+                    "title": a.title,
+                    "severity": a.severity,
+                    "status": a.status,
+                    "source": a.source,
+                    "created_at": a.created_at.isoformat() if a.created_at else "",
+                })
+
+        results_count = len(results)
+        execution_time_ms = int((_time.monotonic() - _query_start) * 1000)
+        summary = f"Found {results_count} results matching your query about '{request.natural_language[:60]}'."
 
         # Resolve org_id
         org_id = getattr(current_user, "organization_id", None)
@@ -345,6 +457,12 @@ async def triage_single_alert(
 
         triage = _compute_triage_priority(severity, source)
 
+        # Write back the triage priority to the alert record
+        if alert:
+            priority_map = {"p1": 1, "p2": 2, "p3": 3, "p4": 4}
+            alert.priority = priority_map.get(triage["priority"], 3)
+            await db.flush()
+
         # Persist analysis
         analysis = AIAnalysis(
             analysis_type="alert_triage",
@@ -413,6 +531,10 @@ async def batch_triage_alerts(
             severity = getattr(alert_obj, "severity", "medium") or "medium"
             source = getattr(alert_obj, "source", "unknown") or "unknown"
             triage = _compute_triage_priority(severity, source)
+
+            # Write back the triage priority to the alert record
+            priority_map = {"p1": 1, "p2": 2, "p3": 3, "p4": 4}
+            alert_obj.priority = priority_map.get(triage["priority"], 3)
 
             # Persist each triage analysis
             analysis = AIAnalysis(

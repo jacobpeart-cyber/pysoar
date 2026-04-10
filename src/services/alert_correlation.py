@@ -2,14 +2,16 @@
 
 import json
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.logging import get_logger
-from src.models.alert import Alert, AlertStatus
+from src.models.alert import Alert, AlertSeverity, AlertStatus
 from src.models.incident import Incident, IncidentSeverity, IncidentStatus, IncidentType
+from src.models.ioc import IOC, IOCStatus
+from src.models.playbook import ExecutionStatus, Playbook, PlaybookExecution, PlaybookStatus, PlaybookTrigger
 
 logger = get_logger(__name__)
 
@@ -264,6 +266,69 @@ class AlertCorrelationService:
 
         return incident
 
+    async def check_threat_intel_match(self, alert: Alert) -> list[IOC]:
+        """Check if any indicators in the alert match known IOCs in the database.
+
+        Extracts IPs, domains, file hashes, and URLs from the alert and queries
+        the IOC table for active matches. If a match is found the alert severity
+        is escalated to critical and a note is appended to the description.
+
+        Returns the list of matched IOC records (may be empty).
+        """
+        # Collect indicator values from the alert fields
+        indicator_values: list[str] = []
+        for field in ("source_ip", "destination_ip", "domain", "file_hash", "url"):
+            value = getattr(alert, field, None)
+            if value:
+                indicator_values.append(value)
+
+        if not indicator_values:
+            return []
+
+        # Query active IOCs whose value matches any of the alert indicators
+        result = await self.db.execute(
+            select(IOC).where(
+                IOC.status == IOCStatus.ACTIVE.value,
+                IOC.is_whitelisted == False,
+                IOC.value.in_(indicator_values),
+            )
+        )
+        matched_iocs: list[IOC] = list(result.scalars().all())
+
+        if not matched_iocs:
+            return []
+
+        # Build a human-readable summary of the matches
+        match_details = []
+        for ioc in matched_iocs:
+            match_details.append(
+                f"  - IOC match: {ioc.ioc_type} = {ioc.value} "
+                f"(threat_level={ioc.threat_level}, source={ioc.source or 'N/A'})"
+            )
+
+            # Bump sighting count on the IOC
+            ioc.sighting_count = (ioc.sighting_count or 0) + 1
+            ioc.last_sighting = datetime.now(timezone.utc).isoformat()
+
+        note = (
+            "\n\n--- Threat Intel IOC Match ---\n"
+            + "\n".join(match_details)
+            + "\nAlert severity escalated to CRITICAL due to IOC match."
+        )
+
+        # Escalate the alert
+        alert.severity = AlertSeverity.CRITICAL.value
+        alert.description = (alert.description or "") + note
+
+        await self.db.flush()
+
+        logger.warning(
+            f"Alert {alert.id} matched {len(matched_iocs)} threat intel IOC(s) — "
+            f"severity escalated to critical"
+        )
+
+        return matched_iocs
+
     async def link_alert_to_incident(
         self,
         alert_id: str,
@@ -314,11 +379,166 @@ class AlertCorrelationService:
         return list(result.scalars().all())
 
 
+def _alert_matches_trigger_conditions(alert: Alert, conditions: dict[str, Any]) -> bool:
+    """Check if an alert matches a playbook's trigger conditions.
+
+    Supported condition keys:
+        - severity: single value or list, e.g. "critical" or ["critical", "high"]
+        - category: single value or list
+        - source: single value or list
+        - alert_type: single value or list
+        - any_alert: if True, matches every alert (catch-all)
+    All specified conditions must match (AND logic).
+    """
+    if conditions.get("any_alert"):
+        return True
+
+    for key in ("severity", "category", "source", "alert_type"):
+        expected = conditions.get(key)
+        if expected is None:
+            continue
+
+        actual = getattr(alert, key, None)
+        if actual is None:
+            return False
+
+        if isinstance(expected, list):
+            if actual not in expected:
+                return False
+        else:
+            if actual != expected:
+                return False
+
+    return True
+
+
+async def auto_trigger_playbooks(
+    db: AsyncSession,
+    alert: Alert,
+    incident: Optional[Incident] = None,
+) -> list[str]:
+    """Find playbooks whose trigger conditions match the alert and execute them.
+
+    Returns a list of execution IDs that were created.
+    """
+    from src.services.playbook_engine import PlaybookEngine
+
+    # Query all enabled, active playbooks with trigger_type == "alert"
+    result = await db.execute(
+        select(Playbook).where(
+            Playbook.is_enabled == True,
+            Playbook.status == PlaybookStatus.ACTIVE.value,
+            Playbook.trigger_type == PlaybookTrigger.ALERT.value,
+        )
+    )
+    playbooks = list(result.scalars().all())
+
+    if not playbooks:
+        logger.debug("No active alert-triggered playbooks found")
+        return []
+
+    execution_ids: list[str] = []
+
+    for playbook in playbooks:
+        # Parse trigger_conditions JSON
+        try:
+            conditions = json.loads(playbook.trigger_conditions) if playbook.trigger_conditions else {}
+        except (json.JSONDecodeError, TypeError):
+            logger.warning(f"Playbook {playbook.id} ({playbook.name}) has invalid trigger_conditions, skipping")
+            continue
+
+        if not _alert_matches_trigger_conditions(alert, conditions):
+            continue
+
+        logger.info(
+            f"Auto-triggering playbook '{playbook.name}' (id={playbook.id}) "
+            f"for alert {alert.id} (severity={alert.severity}, category={alert.category})"
+        )
+
+        # Build context / input_data for the execution
+        steps = json.loads(playbook.steps) if playbook.steps else []
+        input_data: dict[str, Any] = {
+            "alert_id": alert.id,
+            "alert_title": alert.title,
+            "alert_severity": alert.severity,
+            "alert_category": alert.category,
+            "alert_source": alert.source,
+            "source_ip": alert.source_ip,
+            "destination_ip": alert.destination_ip,
+            "hostname": alert.hostname,
+            "username": alert.username,
+        }
+        if incident:
+            input_data["incident_id"] = incident.id
+            input_data["incident_title"] = incident.title
+
+        # Create execution record
+        execution = PlaybookExecution(
+            playbook_id=playbook.id,
+            incident_id=incident.id if incident else None,
+            status=ExecutionStatus.PENDING.value,
+            total_steps=len(steps),
+            input_data=json.dumps(input_data),
+            triggered_by="system",
+            trigger_source=f"auto_alert:{alert.id}",
+        )
+        db.add(execution)
+        await db.flush()
+        await db.refresh(execution)
+
+        # Execute the playbook
+        try:
+            engine = PlaybookEngine(db)
+            await engine.execute(execution.id)
+            logger.info(
+                f"Playbook '{playbook.name}' execution {execution.id} finished "
+                f"with status={execution.status}"
+            )
+        except Exception as exc:
+            logger.error(
+                f"Playbook '{playbook.name}' execution {execution.id} "
+                f"raised an exception: {exc}"
+            )
+
+        execution_ids.append(execution.id)
+
+    if execution_ids:
+        logger.info(
+            f"Auto-triggered {len(execution_ids)} playbook(s) for alert {alert.id}: "
+            f"{execution_ids}"
+        )
+    else:
+        logger.debug(f"No playbooks matched trigger conditions for alert {alert.id}")
+
+    return execution_ids
+
+
 async def process_new_alert(
     db: AsyncSession,
     alert: Alert,
     notify_callback: Optional[callable] = None,
 ) -> Optional[Incident]:
-    """Convenience function to process a new alert through correlation"""
+    """Convenience function to process a new alert through correlation,
+    check threat intel IOCs, then auto-trigger any matching playbooks."""
     service = AlertCorrelationService(db)
-    return await service.process_alert(alert, notify_callback)
+
+    # Check alert indicators against known threat intel IOCs
+    try:
+        matched_iocs = await service.check_threat_intel_match(alert)
+        if matched_iocs:
+            logger.info(
+                f"Alert {alert.id} matched {len(matched_iocs)} IOC(s) — "
+                f"severity escalated before correlation"
+            )
+    except Exception as exc:
+        logger.error(f"Error during threat intel IOC check for alert {alert.id}: {exc}")
+
+    incident = await service.process_alert(alert, notify_callback)
+
+    # Auto-trigger playbooks whose conditions match this alert
+    try:
+        await auto_trigger_playbooks(db, alert, incident)
+    except Exception as exc:
+        logger.error(f"Error during auto-trigger playbooks for alert {alert.id}: {exc}")
+
+    return incident
