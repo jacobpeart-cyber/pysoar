@@ -5,11 +5,15 @@ Core DLP functionality for content evaluation, sensitive data detection,
 classification, exfiltration monitoring, discovery scanning, and breach assessment.
 """
 
+import asyncio
 import json
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
+from sqlalchemy import select
+
+from src.core.database import async_session_factory
 from src.core.logging import get_logger
 
 logger = get_logger(__name__)
@@ -627,141 +631,235 @@ class ExfiltrationDetector:
 
 
 class DiscoveryScanner:
-    """Scan systems for sensitive data discovery"""
+    """
+    Scan systems for sensitive data discovery.
+
+    This scanner is backed by DLP data in the database: prior scan records
+    (DLPDataDiscoveryScan) and incidents (DLPIncident). It does not fabricate
+    synthetic findings. Agent deployment is required to populate these tables
+    from real endpoints, cloud storage, databases, or code repositories.
+    """
+
+    def __init__(self, session=None):
+        """
+        Initialize scanner.
+
+        Args:
+            session: Optional AsyncSession. If not provided, a new session is
+                created via ``async_session_factory`` for each query.
+        """
+        self._session = session
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _run(coro):
+        try:
+            return asyncio.run(coro)
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(coro)
+            finally:
+                loop.close()
+
+    @staticmethod
+    def _load_scan_model():
+        try:
+            from src.dlp.models import SensitiveDataDiscovery
+
+            return SensitiveDataDiscovery
+        except Exception:  # noqa: BLE001
+            return None
+
+    @staticmethod
+    def _load_incident_model():
+        try:
+            from src.dlp.models import DLPIncident
+
+            return DLPIncident
+        except Exception:  # noqa: BLE001
+            return None
+
+    async def _query_scans(self, scan_type: str, target: str) -> list[Any]:
+        model = self._load_scan_model()
+        if model is None:
+            return []
+
+        stmt = select(model).where(model.scan_type == scan_type, model.target == target)
+
+        if self._session is not None:
+            result = await self._session.execute(stmt)
+            return list(result.scalars().all())
+
+        async with async_session_factory() as session:
+            result = await session.execute(stmt)
+            return list(result.scalars().all())
+
+    def _summarize_scans(self, scans: list[Any]) -> dict[str, Any]:
+        total_files = 0
+        sensitive_files = 0
+        findings: list[Any] = []
+        latest: Optional[datetime] = None
+
+        for s in scans:
+            total_files += int(getattr(s, "total_files_scanned", 0) or 0)
+            sensitive_files += int(getattr(s, "sensitive_files_found", 0) or 0)
+            raw = getattr(s, "findings", None)
+            if raw:
+                try:
+                    parsed = json.loads(raw) if isinstance(raw, str) else raw
+                    if isinstance(parsed, list):
+                        findings.extend(parsed)
+                except (ValueError, TypeError):
+                    pass
+            completed = getattr(s, "completed_at", None)
+            if completed and (latest is None or completed > latest):
+                latest = completed
+
+        return {
+            "scan_records": len(scans),
+            "files_scanned": total_files,
+            "sensitive_files_found": sensitive_files,
+            "findings": findings,
+            "last_scan_at": latest.isoformat() if latest else None,
+        }
+
+    # ------------------------------------------------------------------
+    # Public scan methods
+    # ------------------------------------------------------------------
 
     def scan_endpoint(self, endpoint_id: str, **kwargs) -> dict[str, Any]:
         """
-        Scan endpoint for sensitive data.
+        Return sensitive-data discovery results for an endpoint.
 
-        Args:
-            endpoint_id: Endpoint ID
-            **kwargs: Scan parameters
-
-        Returns:
-            Scan results
+        Reads from existing DLPDataDiscoveryScan rows for this target. Returns
+        empty metrics if no agent-reported scan data exists for this endpoint.
         """
+        summary = self._run(self._query_scans("endpoint", endpoint_id))
+        data = self._summarize_scans(summary)
         return {
-            "scan_id": f"scan_{endpoint_id}_{datetime.now().timestamp()}",
             "endpoint_id": endpoint_id,
             "scan_type": "endpoint",
-            "status": "completed",
-            "files_scanned": 15234,
-            "sensitive_files_found": 87,
-            "findings": [
-                {"file": "sensitive_data.xlsx", "classification": "restricted", "risk": "high"},
-                {"file": "passwords.txt", "classification": "top_secret", "risk": "critical"},
-            ],
+            "status": "completed" if data["scan_records"] else "no_data",
+            "note": (
+                None
+                if data["scan_records"]
+                else "No endpoint discovery data available; agent deployment required."
+            ),
+            **data,
         }
 
     def scan_cloud_storage(self, storage_id: str, **kwargs) -> dict[str, Any]:
         """
-        Scan cloud storage for sensitive data.
-
-        Args:
-            storage_id: Cloud storage ID
-            **kwargs: Scan parameters
-
-        Returns:
-            Scan results
+        Return sensitive-data discovery results for a cloud storage target.
         """
+        summary = self._run(self._query_scans("cloud_storage", storage_id))
+        data = self._summarize_scans(summary)
         return {
-            "scan_id": f"scan_{storage_id}_{datetime.now().timestamp()}",
             "storage_id": storage_id,
             "scan_type": "cloud_storage",
-            "status": "completed",
-            "objects_scanned": 5432,
-            "sensitive_objects_found": 43,
+            "status": "completed" if data["scan_records"] else "no_data",
+            "objects_scanned": data["files_scanned"],
+            "sensitive_objects_found": data["sensitive_files_found"],
+            "findings": data["findings"],
+            "scan_records": data["scan_records"],
+            "last_scan_at": data["last_scan_at"],
+            "note": (
+                None
+                if data["scan_records"]
+                else "No cloud storage discovery data available; connector required."
+            ),
         }
 
     def scan_database(self, database_id: str, **kwargs) -> dict[str, Any]:
         """
-        Scan database for sensitive data.
-
-        Args:
-            database_id: Database ID
-            **kwargs: Scan parameters
-
-        Returns:
-            Scan results
+        Return sensitive-data discovery results for a database target.
         """
+        summary = self._run(self._query_scans("database", database_id))
+        data = self._summarize_scans(summary)
         return {
-            "scan_id": f"scan_{database_id}_{datetime.now().timestamp()}",
             "database_id": database_id,
             "scan_type": "database",
-            "status": "completed",
-            "rows_scanned": 1000000,
-            "tables_with_sensitive_data": ["users", "payments", "medical_records"],
+            "status": "completed" if data["scan_records"] else "no_data",
+            "rows_scanned": data["files_scanned"],
+            "sensitive_rows_found": data["sensitive_files_found"],
+            "findings": data["findings"],
+            "scan_records": data["scan_records"],
+            "last_scan_at": data["last_scan_at"],
+            "note": (
+                None
+                if data["scan_records"]
+                else "No database discovery data available; agent or connector required."
+            ),
         }
 
     def scan_code_repository(self, repo_id: str, **kwargs) -> dict[str, Any]:
         """
-        Scan code repository for secrets and credentials.
-
-        Args:
-            repo_id: Repository ID
-            **kwargs: Scan parameters
-
-        Returns:
-            Scan results
+        Return secrets/credential findings for a code repository target.
         """
+        summary = self._run(self._query_scans("code_repository", repo_id))
+        data = self._summarize_scans(summary)
         return {
-            "scan_id": f"scan_{repo_id}_{datetime.now().timestamp()}",
             "repo_id": repo_id,
             "scan_type": "code_repository",
-            "status": "completed",
-            "commits_scanned": 5000,
-            "secrets_found": 12,
-            "findings": [
-                {"type": "aws_key", "file": "config.py", "commit": "abc123"},
-                {"type": "api_key", "file": "constants.js", "commit": "def456"},
-            ],
+            "status": "completed" if data["scan_records"] else "no_data",
+            "commits_scanned": data["files_scanned"],
+            "secrets_found": data["sensitive_files_found"],
+            "findings": data["findings"],
+            "scan_records": data["scan_records"],
+            "last_scan_at": data["last_scan_at"],
+            "note": (
+                None
+                if data["scan_records"]
+                else "No repository discovery data available; SCM connector required."
+            ),
         }
 
     def generate_data_map(self, organization_id: str) -> dict[str, Any]:
         """
-        Generate data map showing where sensitive data lives.
+        Generate a data map showing where sensitive data resides.
 
-        Args:
-            organization_id: Organization ID
-
-        Returns:
-            Data map
+        This honest implementation returns an empty structure with a note —
+        building a real data map requires agent deployment and discovery data
+        that this stub module does not collect on its own.
         """
         return {
             "organization_id": organization_id,
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "data_locations": {
-                "endpoints": {"count": 234, "sensitive_files": 1203},
-                "cloud_storage": {"count": 45, "sensitive_objects": 892},
-                "databases": {"count": 8, "sensitive_tables": 23},
-                "email": {"count": 500000, "sensitive_messages": 15000},
+                "endpoints": {"count": 0, "sensitive_files": 0},
+                "cloud_storage": {"count": 0, "sensitive_objects": 0},
+                "databases": {"count": 0, "sensitive_tables": 0},
+                "email": {"count": 0, "sensitive_messages": 0},
             },
-            "high_risk_locations": [
-                {"location": "shared_drive_finance", "risk": "critical", "reason": "unencrypted_pii"},
-                {"location": "cloud_bucket_temp", "risk": "high", "reason": "public_access"},
-            ],
+            "high_risk_locations": [],
+            "note": (
+                "Data map requires agent deployment and connector configuration. "
+                "Deploy DLP agents to endpoints and connect cloud/storage/database "
+                "sources to populate this map."
+            ),
         }
 
     def track_data_lineage(self, data_id: str) -> dict[str, Any]:
         """
-        Track lineage of sensitive data.
+        Track lineage of sensitive data across systems.
 
-        Args:
-            data_id: Data ID
-
-        Returns:
-            Lineage tracking
+        Honest implementation: data-flow lineage cannot be reconstructed without
+        instrumentation. Returns an empty structure with a note.
         """
         return {
             "data_id": data_id,
-            "origin": "database_pii_table",
-            "flows": [
-                {"step": 1, "location": "extraction_to_cache", "timestamp": "2024-03-24T10:00:00Z"},
-                {"step": 2, "location": "processing_server", "timestamp": "2024-03-24T10:15:00Z"},
-                {"step": 3, "location": "analytics_db", "timestamp": "2024-03-24T10:30:00Z"},
-            ],
-            "current_location": "analytics_db",
-            "access_count": 45,
+            "origin": None,
+            "flows": [],
+            "current_location": None,
+            "access_count": 0,
+            "note": (
+                "Data lineage tracking requires agent deployment and flow "
+                "instrumentation that is not available in this environment."
+            ),
         }
 
 

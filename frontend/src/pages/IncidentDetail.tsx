@@ -82,6 +82,7 @@ export default function IncidentDetail() {
   const [showAddAlertModal, setShowAddAlertModal] = useState(false);
   const [caseTab, setCaseTab] = useState<'notes' | 'tasks' | 'timeline' | 'attachments'>('notes');
   const [newNote, setNewNote] = useState('');
+  const [caseError, setCaseError] = useState<string | null>(null);
 
   const { data: incident, isLoading } = useQuery<Incident>({
     queryKey: ['incident', id],
@@ -121,47 +122,58 @@ export default function IncidentDetail() {
     },
   });
 
-  // TODO: Verify POST /incidents/{id}/notes endpoint exists on backend
   const addNoteMutation = useMutation({
     mutationFn: async (content: string) => {
-      try {
       const response = await api.post(`/incidents/${id}/notes`, { content, note_type: 'general' });
       return response.data;
-      } catch { return null; }
     },
     onSuccess: () => {
+      setCaseError(null);
       setNewNote('');
       queryClient.invalidateQueries({ queryKey: ['incident', id] });
     },
+    onError: (err: any) => {
+      console.error('Add note failed:', err);
+      setCaseError(
+        err?.response?.data?.detail || err?.message || 'Failed to add note'
+      );
+    },
   });
 
-  // TODO: Verify POST /incidents/{id}/tasks endpoint exists on backend
   const addTaskMutation = useMutation({
     mutationFn: async (title: string) => {
-      try {
       const response = await api.post(`/incidents/${id}/tasks`, { title, status: 'pending' });
       return response.data;
-      } catch { return null; }
     },
     onSuccess: () => {
+      setCaseError(null);
       queryClient.invalidateQueries({ queryKey: ['incident', id] });
+    },
+    onError: (err: any) => {
+      console.error('Add task failed:', err);
+      setCaseError(
+        err?.response?.data?.detail || err?.message || 'Failed to add task'
+      );
     },
   });
 
-  // TODO: Verify PATCH /incidents/{id}/tasks/{taskId} endpoint exists on backend
   const updateTaskMutation = useMutation({
     mutationFn: async ({ taskId, status }: { taskId: string; status: string }) => {
-      try {
       const response = await api.patch(`/incidents/${id}/tasks/${taskId}`, { status });
       return response.data;
-      } catch { return null; }
     },
     onSuccess: () => {
+      setCaseError(null);
       queryClient.invalidateQueries({ queryKey: ['incident', id] });
+    },
+    onError: (err: any) => {
+      console.error('Update task failed:', err);
+      setCaseError(
+        err?.response?.data?.detail || err?.message || 'Failed to update task'
+      );
     },
   });
 
-  // TODO: Verify POST /incidents/{id}/attachments endpoint exists on backend
   const uploadFileMutation = useMutation({
     mutationFn: async (file: File) => {
       const formData = new FormData();
@@ -172,7 +184,14 @@ export default function IncidentDetail() {
       return response.data;
     },
     onSuccess: () => {
+      setCaseError(null);
       queryClient.invalidateQueries({ queryKey: ['incident', id] });
+    },
+    onError: (err: any) => {
+      console.error('File upload failed:', err);
+      setCaseError(
+        err?.response?.data?.detail || err?.message || 'Failed to upload attachment'
+      );
     },
   });
 
@@ -306,6 +325,18 @@ export default function IncidentDetail() {
 
           {/* Case Management */}
           <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700">
+            {caseError && (
+              <div className="m-4 flex items-start gap-2 p-3 bg-red-50 border border-red-200 rounded-lg text-red-700 text-sm">
+                <XCircle className="w-4 h-4 flex-shrink-0 mt-0.5" />
+                <div className="flex-1">{caseError}</div>
+                <button
+                  onClick={() => setCaseError(null)}
+                  className="text-red-700 hover:text-red-900"
+                >
+                  Dismiss
+                </button>
+              </div>
+            )}
             {/* Tabs */}
             <div className="border-b border-gray-200 dark:border-gray-700 px-6">
               <nav className="flex gap-6">

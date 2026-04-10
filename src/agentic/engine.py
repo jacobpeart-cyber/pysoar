@@ -13,8 +13,11 @@ from typing import Any, Optional
 from uuid import uuid4
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func
 
+from src.models.alert import Alert
+from src.models.incident import Incident
+from src.models.ioc import IOC
 from src.agentic.models import (
     SOCAgent,
     Investigation,
@@ -41,6 +44,15 @@ try:
 except ImportError:
     LLM_AVAILABLE = False
     logger.warning("LLM modules not available, using deterministic investigation")
+
+# AI analyzer for LLM-powered analysis (optional)
+try:
+    from src.ai.engine import AIAnalyzer
+    AI_ANALYZER_AVAILABLE = True
+except ImportError:
+    AI_ANALYZER_AVAILABLE = False
+    AIAnalyzer = None  # type: ignore
+    logger.warning("AIAnalyzer not available, natural language responses will be deterministic")
 
 
 class AgenticSOCEngine:
@@ -285,35 +297,156 @@ class AgenticSOCEngine:
             "data": {},
         }
 
-        # Simulate evidence gathering from different sources
+        org_id = investigation.organization_id
+        trigger_source_id = investigation.trigger_source_id
+
+        # Try to load the primary triggering alert, if any
+        primary_alert: Optional[Alert] = None
+        if trigger_source_id:
+            try:
+                primary_alert = await self.db.get(Alert, trigger_source_id)
+            except Exception as e:
+                logger.debug(f"Could not load primary alert {trigger_source_id}: {e}")
+                primary_alert = None
+
+        # Query related alerts for this organization. If we have a primary alert,
+        # correlate by source_ip/hostname/username. Otherwise just look at recent alerts.
+        alerts_query = select(Alert).where(Alert.organization_id == org_id)
+        if primary_alert is not None:
+            filters = []
+            if primary_alert.source_ip:
+                filters.append(Alert.source_ip == primary_alert.source_ip)
+            if primary_alert.hostname:
+                filters.append(Alert.hostname == primary_alert.hostname)
+            if primary_alert.username:
+                filters.append(Alert.username == primary_alert.username)
+            if filters:
+                from sqlalchemy import or_
+                alerts_query = alerts_query.where(or_(*filters))
+
+        alerts_query = alerts_query.order_by(Alert.created_at.desc()).limit(50)
+
+        try:
+            alerts_result = await self.db.execute(alerts_query)
+            related_alerts = list(alerts_result.scalars().all())
+        except Exception as e:
+            logger.warning(f"Failed to query alerts: {e}")
+            related_alerts = []
+
+        severity_counts: dict[str, int] = {}
+        affected_hosts: set[str] = set()
+        affected_users: set[str] = set()
+        source_ips: set[str] = set()
+        for a in related_alerts:
+            sev = (a.severity or "unknown").lower()
+            severity_counts[sev] = severity_counts.get(sev, 0) + 1
+            if a.hostname:
+                affected_hosts.add(a.hostname)
+            if a.username:
+                affected_users.add(a.username)
+            if a.source_ip:
+                source_ips.add(a.source_ip)
+
+        # Query IOCs for this organization
+        try:
+            ioc_query = select(IOC).where(IOC.organization_id == org_id).limit(100)
+            ioc_result = await self.db.execute(ioc_query)
+            iocs = list(ioc_result.scalars().all())
+        except Exception as e:
+            logger.warning(f"Failed to query IOCs: {e}")
+            iocs = []
+
+        ioc_matches = []
+        if primary_alert is not None:
+            alert_indicators = {
+                primary_alert.source_ip,
+                primary_alert.destination_ip,
+                primary_alert.hostname,
+                primary_alert.file_hash,
+                primary_alert.domain,
+                primary_alert.url,
+            }
+            alert_indicators.discard(None)
+            for ioc in iocs:
+                if getattr(ioc, "value", None) and ioc.value in alert_indicators:
+                    ioc_matches.append({
+                        "value": ioc.value,
+                        "type": getattr(ioc, "ioc_type", None) or getattr(ioc, "type", None),
+                        "category": getattr(ioc, "category", None),
+                    })
+
+        # Query recent incidents for context
+        try:
+            incident_query = (
+                select(Incident)
+                .where(Incident.organization_id == org_id)
+                .order_by(Incident.created_at.desc())
+                .limit(10)
+            )
+            incident_result = await self.db.execute(incident_query)
+            recent_incidents = list(incident_result.scalars().all())
+        except Exception as e:
+            logger.warning(f"Failed to query incidents: {e}")
+            recent_incidents = []
+
+        base_data = {
+            "primary_alert_id": primary_alert.id if primary_alert else None,
+            "primary_alert_title": primary_alert.title if primary_alert else None,
+            "primary_alert_severity": primary_alert.severity if primary_alert else None,
+            "alert_count": len(related_alerts),
+            "severity_breakdown": severity_counts,
+            "affected_hosts": sorted(affected_hosts),
+            "affected_users": sorted(affected_users),
+            "source_ips": sorted(source_ips),
+            "ioc_total": len(iocs),
+            "ioc_matches": ioc_matches,
+            "recent_incident_count": len(recent_incidents),
+        }
+
         if evidence_type == StepType.OBSERVE.value:
             evidence["data"] = {
-                "alert_count": 5,
-                "affected_systems": 3,
-                "time_window": "last_24h",
+                **base_data,
+                "time_window": "recent",
+                "affected_systems": len(affected_hosts),
             }
         elif evidence_type == StepType.GATHER_EVIDENCE.value:
             evidence["data"] = {
-                "siem_events": 150,
-                "edr_detections": 8,
-                "threat_intel_hits": 2,
-                "anomaly_score": 0.78,
+                **base_data,
+                "siem_events": len(related_alerts),
+                "threat_intel_hits": len(ioc_matches),
             }
         elif evidence_type == StepType.ANALYZE.value:
             evidence["data"] = {
-                "event_correlation": "5 related events",
-                "pattern_match": "Lateral movement indicators",
-                "risk_assessment": "High",
+                **base_data,
+                "event_correlation": f"{len(related_alerts)} related alerts",
+                "risk_assessment": self._compute_risk_level(severity_counts, len(ioc_matches)),
             }
         elif evidence_type == StepType.CORRELATE.value:
             evidence["data"] = {
-                "related_investigations": 2,
-                "similar_patterns": "3 previous cases",
-                "threat_actor": "APT28",
-                "confidence": 0.85,
+                **base_data,
+                "related_incidents": [
+                    {"id": i.id, "title": i.title, "severity": i.severity}
+                    for i in recent_incidents
+                ],
             }
+        else:
+            evidence["data"] = base_data
 
         return evidence
+
+    @staticmethod
+    def _compute_risk_level(severity_counts: dict, ioc_match_count: int) -> str:
+        """Compute a coarse risk level from severity counts and IOC matches."""
+        critical = severity_counts.get("critical", 0)
+        high = severity_counts.get("high", 0)
+        medium = severity_counts.get("medium", 0)
+        if critical > 0 or ioc_match_count >= 3:
+            return "critical"
+        if high > 0 or ioc_match_count >= 1:
+            return "high"
+        if medium > 0:
+            return "medium"
+        return "low"
 
     async def analyze_evidence(self, evidence: dict) -> dict:
         """
@@ -333,24 +466,88 @@ class AgenticSOCEngine:
             "patterns_found": [],
             "correlations": [],
             "risk_level": "unknown",
+            "ai_summary": None,
         }
 
-        evidence_data = evidence.get("data", {})
+        evidence_data = evidence.get("data", {}) or {}
 
-        # Simulate pattern matching
-        if evidence_data.get("anomaly_score", 0) > 0.7:
-            analysis["anomaly_score"] = evidence_data["anomaly_score"]
-            analysis["risk_level"] = "high"
-            analysis["patterns_found"] = [
-                "Unusual process execution",
-                "Network anomaly",
-            ]
+        severity_counts = evidence_data.get("severity_breakdown", {}) or {}
+        alert_count = evidence_data.get("alert_count", 0)
+        ioc_matches = evidence_data.get("ioc_matches", []) or []
+        affected_hosts = evidence_data.get("affected_hosts", []) or []
+        affected_users = evidence_data.get("affected_users", []) or []
+        source_ips = evidence_data.get("source_ips", []) or []
+        related_incidents = evidence_data.get("related_incidents", []) or []
 
-        if "related_investigations" in evidence_data:
-            analysis["correlations"] = [
-                "Similar to investigation 2 weeks ago",
-                "Matches known APT pattern",
-            ]
+        # Compute an anomaly score from real signals (0.0 - 1.0)
+        score = 0.0
+        score += min(0.3, alert_count * 0.02)
+        score += min(0.3, len(ioc_matches) * 0.1)
+        score += min(0.2, len(affected_hosts) * 0.05)
+        score += 0.2 if severity_counts.get("critical", 0) > 0 else 0.0
+        score += 0.1 if severity_counts.get("high", 0) > 0 else 0.0
+        analysis["anomaly_score"] = round(min(1.0, score), 3)
+
+        # Risk level from real signals
+        analysis["risk_level"] = AgenticSOCEngine._compute_risk_level(
+            severity_counts, len(ioc_matches)
+        )
+
+        # Patterns found - derived from actual evidence
+        patterns: list[str] = []
+        if len(affected_hosts) > 1:
+            patterns.append(
+                f"Multi-host activity across {len(affected_hosts)} hosts (possible lateral movement)"
+            )
+        if len(affected_users) > 1:
+            patterns.append(
+                f"Multiple user accounts involved ({len(affected_users)} users)"
+            )
+        if len(source_ips) > 3:
+            patterns.append(
+                f"Distributed source activity across {len(source_ips)} IPs"
+            )
+        if ioc_matches:
+            patterns.append(
+                f"{len(ioc_matches)} known IOC match(es) in threat intel"
+            )
+        if severity_counts.get("critical", 0) > 0:
+            patterns.append(
+                f"{severity_counts['critical']} critical-severity alert(s)"
+            )
+        analysis["patterns_found"] = patterns
+
+        # Correlations - derived from real incidents
+        correlations: list[str] = []
+        for inc in related_incidents[:5]:
+            correlations.append(
+                f"Related incident: {inc.get('title', inc.get('id'))} "
+                f"(severity={inc.get('severity')})"
+            )
+        analysis["correlations"] = correlations
+
+        # Optional AI-powered summary
+        if AI_ANALYZER_AVAILABLE and AIAnalyzer is not None:
+            try:
+                analyzer = AIAnalyzer()
+                system_prompt = (
+                    "You are a senior SOC analyst. Given raw investigation evidence, "
+                    "produce a concise (2-3 sentence) analytical summary focusing on "
+                    "risk, likely attack stage, and what the evidence supports."
+                )
+                user_prompt = (
+                    f"Evidence data:\n{json.dumps(evidence_data, default=str)[:4000]}\n\n"
+                    f"Derived patterns: {patterns}\n"
+                    f"Risk level: {analysis['risk_level']}\n"
+                    f"Anomaly score: {analysis['anomaly_score']}"
+                )
+                ai_response = analyzer._call_llm(
+                    system_prompt, user_prompt, structured_output=False
+                )
+                if isinstance(ai_response, str) and ai_response.strip():
+                    analysis["ai_summary"] = ai_response.strip()
+            except Exception as e:
+                logger.debug(f"AI analysis skipped: {e}")
 
         return analysis
 
@@ -1000,11 +1197,70 @@ class NaturalLanguageInterface:
         Returns:
             Explanation text
         """
-        return (
-            f"Alert {alert_id}: Suspicious login detected from unusual location. "
-            "This could indicate account compromise or insider threat. "
-            "Recommended action: Review login details and check for lateral movement."
-        )
+        alert = await self.db.get(Alert, alert_id)
+        if alert is None:
+            return f"Alert {alert_id} not found."
+
+        # Try AI-powered explanation first
+        if AI_ANALYZER_AVAILABLE and AIAnalyzer is not None:
+            try:
+                analyzer = AIAnalyzer()
+                system_prompt = (
+                    "You are a senior SOC analyst. Explain the security alert below "
+                    "to another analyst in 3-5 clear sentences: what happened, why it "
+                    "matters, and what to check next."
+                )
+                user_prompt = (
+                    f"Alert:\n"
+                    f"- Title: {alert.title}\n"
+                    f"- Description: {alert.description or 'N/A'}\n"
+                    f"- Severity: {alert.severity}\n"
+                    f"- Source: {alert.source}\n"
+                    f"- Category: {alert.category or 'N/A'}\n"
+                    f"- Alert type: {alert.alert_type or 'N/A'}\n"
+                    f"- Source IP: {alert.source_ip or 'N/A'}\n"
+                    f"- Destination IP: {alert.destination_ip or 'N/A'}\n"
+                    f"- Hostname: {alert.hostname or 'N/A'}\n"
+                    f"- Username: {alert.username or 'N/A'}\n"
+                    f"- File hash: {alert.file_hash or 'N/A'}\n"
+                    f"- Created: {getattr(alert, 'created_at', 'N/A')}\n"
+                )
+                ai_response = analyzer._call_llm(
+                    system_prompt, user_prompt, structured_output=False
+                )
+                if isinstance(ai_response, str) and ai_response.strip():
+                    return ai_response.strip()
+            except Exception as e:
+                logger.debug(f"AI explain_alert failed, falling back: {e}")
+
+        # Deterministic structured explanation from real alert fields
+        parts = [
+            f"Alert {alert.id}: {alert.title}",
+            f"Severity: {alert.severity}. Source: {alert.source}.",
+        ]
+        if alert.category or alert.alert_type:
+            parts.append(
+                f"Category: {alert.category or 'N/A'} / Type: {alert.alert_type or 'N/A'}."
+            )
+        if alert.description:
+            parts.append(f"Details: {alert.description}")
+        entity_bits = []
+        if alert.source_ip:
+            entity_bits.append(f"source_ip={alert.source_ip}")
+        if alert.destination_ip:
+            entity_bits.append(f"dest_ip={alert.destination_ip}")
+        if alert.hostname:
+            entity_bits.append(f"host={alert.hostname}")
+        if alert.username:
+            entity_bits.append(f"user={alert.username}")
+        if alert.file_hash:
+            entity_bits.append(f"file_hash={alert.file_hash}")
+        if entity_bits:
+            parts.append("Entities: " + ", ".join(entity_bits) + ".")
+        created = getattr(alert, "created_at", None)
+        if created:
+            parts.append(f"Observed at {created}.")
+        return " ".join(parts)
 
     async def suggest_next_steps(
         self,
@@ -1019,12 +1275,72 @@ class NaturalLanguageInterface:
         Returns:
             List of suggested steps
         """
-        return [
-            "Check for data exfiltration indicators",
-            "Review endpoint logs for malware signatures",
-            "Correlate with other alerts from same source IP",
-            "Verify account credentials haven't been changed",
-        ]
+        # investigation_id here may actually reference an alert for the chat UI,
+        # so try both so callers get useful output either way.
+        alert: Optional[Alert] = None
+        investigation: Optional[Investigation] = None
+        try:
+            investigation = await self.db.get(Investigation, investigation_id)
+        except Exception:
+            investigation = None
+        if investigation is None:
+            try:
+                alert = await self.db.get(Alert, investigation_id)
+            except Exception:
+                alert = None
+        elif investigation.trigger_source_id:
+            try:
+                alert = await self.db.get(Alert, investigation.trigger_source_id)
+            except Exception:
+                alert = None
+
+        severity = (alert.severity if alert else None) or (
+            "high" if investigation and investigation.priority and investigation.priority <= 2 else "medium"
+        )
+        severity = severity.lower() if isinstance(severity, str) else "medium"
+
+        steps: list[str] = []
+        label = alert.title if alert else (investigation.title if investigation else "this item")
+
+        if severity in ("critical", "p1"):
+            steps.extend([
+                f"Triage '{label}' immediately and assign an on-call responder",
+                "Isolate affected endpoints from the network to contain spread",
+                "Preserve forensic evidence: memory, disk, and relevant logs",
+                "Rotate credentials for any involved user accounts",
+                "Notify security leadership and open an incident record",
+            ])
+        elif severity in ("high", "p2"):
+            steps.extend([
+                f"Assign '{label}' to a senior analyst for deep investigation",
+                "Correlate with other recent alerts from the same source",
+                "Check threat intel for related IOCs",
+                "Review endpoint telemetry for follow-on activity",
+            ])
+        elif severity in ("medium", "p3"):
+            steps.extend([
+                f"Assign '{label}' for standard investigation",
+                "Correlate with historical alerts from the same entities",
+                "Validate against baseline to rule out false positive",
+            ])
+        else:
+            steps.extend([
+                f"Review '{label}' during normal triage rotation",
+                "Tag and move on unless related alerts appear",
+            ])
+
+        # Personalize with real entities if available
+        if alert:
+            if alert.source_ip:
+                steps.append(f"Pivot on source IP {alert.source_ip} in SIEM/EDR")
+            if alert.hostname:
+                steps.append(f"Pull EDR timeline for host {alert.hostname}")
+            if alert.username:
+                steps.append(f"Review authentication logs for user {alert.username}")
+            if alert.file_hash:
+                steps.append(f"Submit file hash {alert.file_hash} for reputation lookup")
+
+        return steps
 
     async def generate_executive_summary(
         self,
@@ -1039,11 +1355,105 @@ class NaturalLanguageInterface:
         Returns:
             Executive summary
         """
-        return (
-            "Investigation Summary: Detected potential data exfiltration attempt. "
-            "Recommend immediate response: isolate affected systems, "
-            "review access logs, notify security leadership."
+        investigation = await self.db.get(Investigation, investigation_id)
+        if investigation is None:
+            return f"Investigation {investigation_id} not found."
+
+        step_count = len(investigation.reasoning_steps) if investigation.reasoning_steps else 0
+        action_count = len(investigation.actions) if investigation.actions else 0
+
+        # Count alerts/incidents associated with the same org for context
+        try:
+            alert_total_q = select(func.count(Alert.id)).where(
+                Alert.organization_id == investigation.organization_id
+            )
+            alert_total = (await self.db.execute(alert_total_q)).scalar() or 0
+        except Exception:
+            alert_total = 0
+
+        try:
+            incident_total_q = select(func.count(Incident.id)).where(
+                Incident.organization_id == investigation.organization_id
+            )
+            incident_total = (await self.db.execute(incident_total_q)).scalar() or 0
+        except Exception:
+            incident_total = 0
+
+        # Load the trigger alert if applicable
+        trigger_alert: Optional[Alert] = None
+        if investigation.trigger_source_id:
+            try:
+                trigger_alert = await self.db.get(Alert, investigation.trigger_source_id)
+            except Exception:
+                trigger_alert = None
+
+        # Prefer AI-generated executive summary if available
+        if AI_ANALYZER_AVAILABLE and AIAnalyzer is not None:
+            try:
+                analyzer = AIAnalyzer()
+                system_prompt = (
+                    "You are briefing a CISO. Write a concise (4-6 sentence) executive "
+                    "summary of this security investigation. Focus on business impact, "
+                    "what was found, confidence, and recommended actions. Avoid jargon."
+                )
+                user_prompt = (
+                    f"Investigation:\n"
+                    f"- Title: {investigation.title}\n"
+                    f"- Status: {investigation.status}\n"
+                    f"- Confidence: {investigation.confidence_score:.0f}%\n"
+                    f"- Resolution: {investigation.resolution_type}\n"
+                    f"- Hypothesis: {investigation.hypothesis or 'N/A'}\n"
+                    f"- Findings: {investigation.findings_summary or 'N/A'}\n"
+                    f"- Reasoning steps taken: {step_count}\n"
+                    f"- Actions proposed/taken: {action_count}\n"
+                    f"- Trigger alert: "
+                    f"{trigger_alert.title if trigger_alert else 'N/A'} "
+                    f"(severity={trigger_alert.severity if trigger_alert else 'N/A'})\n"
+                    f"- Organization context: {alert_total} total alerts, "
+                    f"{incident_total} total incidents.\n"
+                )
+                ai_response = analyzer._call_llm(
+                    system_prompt, user_prompt, structured_output=False
+                )
+                if isinstance(ai_response, str) and ai_response.strip():
+                    return ai_response.strip()
+            except Exception as e:
+                logger.debug(f"AI executive summary failed, falling back: {e}")
+
+        # Deterministic fallback summary from real fields
+        lines = [
+            f"Executive Summary - {investigation.title}",
+            f"Status: {investigation.status} | Confidence: {investigation.confidence_score:.0f}% "
+            f"| Resolution: {investigation.resolution_type or 'pending'}",
+        ]
+        if trigger_alert:
+            lines.append(
+                f"Triggered by alert '{trigger_alert.title}' "
+                f"(severity={trigger_alert.severity}, source={trigger_alert.source})."
+            )
+        if investigation.hypothesis:
+            lines.append(f"Working hypothesis: {investigation.hypothesis}")
+        if investigation.findings_summary:
+            lines.append(f"Findings: {investigation.findings_summary}")
+        lines.append(
+            f"The agent executed {step_count} reasoning step(s) and "
+            f"{action_count} action(s). Organization has {alert_total} total alerts "
+            f"and {incident_total} incidents on record."
         )
+        if investigation.confidence_score >= 80:
+            lines.append(
+                "Recommendation: treat as a confirmed finding - escalate to IR, "
+                "contain affected assets, and preserve evidence."
+            )
+        elif investigation.confidence_score >= 50:
+            lines.append(
+                "Recommendation: continue investigation with analyst review before action."
+            )
+        else:
+            lines.append(
+                "Recommendation: low confidence - monitor for additional signal before escalation."
+            )
+        return "\n".join(lines)
 
     async def translate_technical(
         self,

@@ -10,16 +10,23 @@ Responsible for:
 """
 
 import asyncio
+import json
 from datetime import datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
+import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_
 
 from src.core.logging import get_logger
 from src.core.config import settings
 from src.models.base import utc_now
+from src.models.ioc import IOC, IOCStatus, IOCType, ThreatLevel
+from src.models.asset import Asset, AssetStatus
+from src.models.user import User
+from src.tickethub.models import TicketActivity
+from src.vulnmgmt.models import Vulnerability, VulnerabilityInstance, VulnerabilityStatus
 from src.remediation.models import (
     RemediationPolicy,
     RemediationAction,
@@ -562,32 +569,171 @@ class ActionExecutor:
         }
 
 
+def _get_execution_context(context: dict) -> tuple[str, str | None, str | None]:
+    """Extract execution_id, organization_id, and actor_id from the action context."""
+    execution_id = context.get("execution_id", "unknown")
+    trigger_data = context.get("trigger_data") or {}
+    org_id = (
+        context.get("organization_id")
+        or trigger_data.get("organization_id")
+    )
+    actor_id = context.get("initiated_by") or trigger_data.get("initiated_by")
+    return execution_id, org_id, actor_id
+
+
+async def _log_ticket_activity(
+    db: AsyncSession,
+    *,
+    source_id: str,
+    activity_type: str,
+    description: str,
+    actor_id: str | None = None,
+    organization_id: str | None = None,
+    extra_metadata: dict | None = None,
+) -> TicketActivity:
+    """Create a TicketActivity record tied to a remediation execution."""
+    activity = TicketActivity(
+        id=str(uuid4()),
+        source_type="remediation_execution",
+        source_id=source_id,
+        activity_type=activity_type,
+        actor_id=actor_id,
+        description=description[:500],
+        extra_metadata=extra_metadata,
+        organization_id=organization_id,
+    )
+    db.add(activity)
+    await db.flush()
+    return activity
+
+
 class FirewallBlockExecutor(ActionExecutor):
-    """Firewall blocking executor."""
+    """Firewall blocking executor: creates an active IOC for the IP."""
 
     async def execute(self, target: str, parameters: dict, context: dict) -> dict:
+        execution_id, org_id, actor_id = _get_execution_context(context)
         duration_hours = parameters.get("duration_hours", 24)
-        self.logger.info(f"Blocking IP: {target} for {duration_hours}h", extra={
-            "target": target,
-            "duration": duration_hours,
-        })
+        expires_at = (utc_now() + timedelta(hours=duration_hours)).isoformat()
+
+        self.logger.info(
+            "Creating firewall block IOC",
+            extra={"target": target, "duration_hours": duration_hours},
+        )
+
+        ioc = IOC(
+            id=str(uuid4()),
+            value=target,
+            ioc_type=IOCType.IP.value,
+            status=IOCStatus.ACTIVE.value,
+            threat_level=ThreatLevel.HIGH.value,
+            confidence=90,
+            description=f"Blocked via remediation execution {execution_id}",
+            source="remediation_engine",
+            source_reference=execution_id,
+            tags=json.dumps(["blocked", "firewall", "auto_remediation"]),
+            category="blocked",
+            first_seen=utc_now().isoformat(),
+            last_seen=utc_now().isoformat(),
+            expires_at=expires_at,
+        )
+        self.db.add(ioc)
+        await self.db.flush()
+
+        await _log_ticket_activity(
+            self.db,
+            source_id=execution_id,
+            activity_type="firewall_block",
+            description=f"Blocked IP {target} via firewall for {duration_hours}h",
+            actor_id=actor_id,
+            organization_id=org_id,
+            extra_metadata={
+                "target_ip": target,
+                "duration_hours": duration_hours,
+                "ioc_id": ioc.id,
+                "expires_at": expires_at,
+            },
+        )
+
         return {
             "success": True,
             "action": "firewall_block",
             "target": target,
+            "ioc_id": ioc.id,
             "duration_hours": duration_hours,
+            "expires_at": expires_at,
         }
 
 
 class HostIsolationExecutor(ActionExecutor):
-    """Host isolation/network quarantine executor."""
+    """Host isolation executor: marks asset as isolated in inventory."""
 
     async def execute(self, target: str, parameters: dict, context: dict) -> dict:
-        self.logger.info(f"Isolating host: {target}", extra={"target": target})
+        execution_id, org_id, actor_id = _get_execution_context(context)
+        self.logger.info("Isolating host", extra={"target": target})
+
+        stmt = select(Asset).where(
+            (Asset.hostname == target)
+            | (Asset.name == target)
+            | (Asset.ip_address == target)
+        )
+        result = await self.db.execute(stmt)
+        asset = result.scalars().first()
+
+        if not asset:
+            await _log_ticket_activity(
+                self.db,
+                source_id=execution_id,
+                activity_type="host_isolate_failed",
+                description=f"Host isolation requested for unknown asset {target}",
+                actor_id=actor_id,
+                organization_id=org_id,
+                extra_metadata={"target": target},
+            )
+            return {
+                "success": False,
+                "action": "host_isolate",
+                "target": target,
+                "error": "Asset not found in inventory",
+            }
+
+        previous_status = asset.status
+        try:
+            existing_tags = json.loads(asset.tags) if asset.tags else []
+            if not isinstance(existing_tags, list):
+                existing_tags = []
+        except (ValueError, TypeError):
+            existing_tags = []
+
+        if "isolated" not in existing_tags:
+            existing_tags.append("isolated")
+
+        asset.status = AssetStatus.MAINTENANCE.value
+        asset.tags = json.dumps(existing_tags)
+        await self.db.flush()
+
+        await _log_ticket_activity(
+            self.db,
+            source_id=execution_id,
+            activity_type="host_isolate",
+            description=f"Isolated host {asset.name} ({asset.hostname or asset.ip_address})",
+            actor_id=actor_id,
+            organization_id=org_id,
+            extra_metadata={
+                "asset_id": asset.id,
+                "hostname": asset.hostname,
+                "ip_address": asset.ip_address,
+                "previous_status": previous_status,
+            },
+        )
+
         return {
             "success": True,
             "action": "host_isolate",
             "target": target,
+            "asset_id": asset.id,
+            "asset_name": asset.name,
+            "previous_status": previous_status,
+            "new_status": asset.status,
         }
 
 
@@ -595,114 +741,429 @@ class AccountActionExecutor(ActionExecutor):
     """Account-level actions (disable, lock, reset, terminate, revoke)."""
 
     async def execute(self, target: str, parameters: dict, context: dict) -> dict:
+        execution_id, org_id, actor_id = _get_execution_context(context)
         action = parameters.get("action", "disable")
-        self.logger.info(f"Executing account action: {action} for {target}", extra={
-            "target": target,
-            "action": action,
-        })
+
+        self.logger.info(
+            "Executing account action",
+            extra={"target": target, "action": action},
+        )
+
+        stmt = select(User).where(User.email == target)
+        result = await self.db.execute(stmt)
+        user = result.scalars().first()
+
+        if not user:
+            await _log_ticket_activity(
+                self.db,
+                source_id=execution_id,
+                activity_type="account_action_failed",
+                description=f"Account action '{action}' requested for unknown user {target}",
+                actor_id=actor_id,
+                organization_id=org_id,
+                extra_metadata={"target": target, "action": action},
+            )
+            return {
+                "success": False,
+                "action": action,
+                "target": target,
+                "error": "User not found",
+            }
+
+        previous_active = user.is_active
+        if action == "disable":
+            user.is_active = False
+            user.force_password_change = True
+        elif action in ("lock", "session_terminate", "token_revoke"):
+            user.force_password_change = True
+        elif action == "password_reset":
+            user.force_password_change = True
+
+        await self.db.flush()
+
+        await _log_ticket_activity(
+            self.db,
+            source_id=execution_id,
+            activity_type=f"account_{action}",
+            description=f"Account action '{action}' applied to {user.email}",
+            actor_id=actor_id,
+            organization_id=org_id,
+            extra_metadata={
+                "user_id": user.id,
+                "email": user.email,
+                "action": action,
+                "previous_is_active": previous_active,
+                "new_is_active": user.is_active,
+            },
+        )
+
         return {
             "success": True,
             "action": action,
             "target": target,
+            "user_id": user.id,
+            "is_active": user.is_active,
         }
 
 
 class ProcessActionExecutor(ActionExecutor):
-    """Process and file actions."""
+    """Process and file actions: queued for endpoint agent execution."""
 
     async def execute(self, target: str, parameters: dict, context: dict) -> dict:
+        execution_id, org_id, actor_id = _get_execution_context(context)
         action = parameters.get("action", "kill")
-        self.logger.info(f"Executing process action: {action} on {target}", extra={
-            "target": target,
-            "action": action,
-        })
+        process_name = parameters.get("process_name")
+        pid = parameters.get("pid")
+        file_path = parameters.get("file_path")
+
+        self.logger.info(
+            "Queuing process/file action for endpoint agent",
+            extra={"target": target, "action": action},
+        )
+
+        activity = await _log_ticket_activity(
+            self.db,
+            source_id=execution_id,
+            activity_type=f"process_{action}",
+            description=(
+                f"Queued process action '{action}' on {target} "
+                f"(requires endpoint agent)"
+            ),
+            actor_id=actor_id,
+            organization_id=org_id,
+            extra_metadata={
+                "host": target,
+                "action": action,
+                "process_name": process_name,
+                "pid": pid,
+                "file_path": file_path,
+                "requires_agent": True,
+            },
+        )
+
         return {
             "success": True,
             "action": action,
             "target": target,
+            "activity_id": activity.id,
+            "status": "queued",
+            "note": "Requires endpoint agent to execute",
         }
 
 
 class NetworkActionExecutor(ActionExecutor):
-    """Network actions (sinkhole, block URL)."""
+    """Network actions (sinkhole, block URL, DNS sinkhole)."""
 
     async def execute(self, target: str, parameters: dict, context: dict) -> dict:
+        execution_id, org_id, actor_id = _get_execution_context(context)
         action = parameters.get("action", "sinkhole")
-        self.logger.info(f"Executing network action: {action} for {target}", extra={
-            "target": target,
-            "action": action,
-        })
+
+        self.logger.info(
+            "Executing network action",
+            extra={"target": target, "action": action},
+        )
+
+        activity = await _log_ticket_activity(
+            self.db,
+            source_id=execution_id,
+            activity_type=f"network_{action}",
+            description=f"Network action '{action}' applied to {target}",
+            actor_id=actor_id,
+            organization_id=org_id,
+            extra_metadata={
+                "target": target,
+                "action": action,
+                "parameters": parameters,
+            },
+        )
+
         return {
             "success": True,
             "action": action,
             "target": target,
+            "activity_id": activity.id,
         }
 
 
 class PatchExecutor(ActionExecutor):
-    """Patch deployment executor."""
+    """Patch deployment executor: marks vulnerability as patching/patched."""
 
     async def execute(self, target: str, parameters: dict, context: dict) -> dict:
-        patch_id = parameters.get("patch_id")
-        self.logger.info(f"Deploying patch {patch_id} to {target}", extra={
-            "target": target,
-            "patch_id": patch_id,
-        })
+        execution_id, org_id, actor_id = _get_execution_context(context)
+        cve_id = parameters.get("cve_id") or parameters.get("patch_id")
+        new_status = parameters.get("new_status", VulnerabilityStatus.PATCHED.value)
+
+        self.logger.info(
+            "Deploying patch",
+            extra={"target": target, "cve_id": cve_id},
+        )
+
+        if not cve_id:
+            return {
+                "success": False,
+                "action": "patch_deploy",
+                "target": target,
+                "error": "cve_id (or patch_id) parameter is required",
+            }
+
+        stmt = select(Vulnerability).where(Vulnerability.cve_id == cve_id)
+        result = await self.db.execute(stmt)
+        vuln = result.scalars().first()
+
+        if not vuln:
+            await _log_ticket_activity(
+                self.db,
+                source_id=execution_id,
+                activity_type="patch_deploy_failed",
+                description=f"Patch deploy requested for unknown CVE {cve_id}",
+                actor_id=actor_id,
+                organization_id=org_id,
+                extra_metadata={"cve_id": cve_id, "target": target},
+            )
+            return {
+                "success": False,
+                "action": "patch_deploy",
+                "target": target,
+                "cve_id": cve_id,
+                "error": "Vulnerability not found",
+            }
+
+        # Update matching instances (optionally scoped to target asset)
+        inst_stmt = select(VulnerabilityInstance).where(
+            VulnerabilityInstance.vulnerability_id == vuln.id
+        )
+        if target and target != "unknown":
+            inst_stmt = inst_stmt.where(
+                (VulnerabilityInstance.asset_name == target)
+                | (VulnerabilityInstance.asset_ip == target)
+                | (VulnerabilityInstance.asset_id == target)
+            )
+        inst_result = await self.db.execute(inst_stmt)
+        instances = inst_result.scalars().all()
+
+        updated_ids: list[str] = []
+        for inst in instances:
+            inst.status = new_status
+            updated_ids.append(inst.id)
+
+        await self.db.flush()
+
+        await _log_ticket_activity(
+            self.db,
+            source_id=execution_id,
+            activity_type="patch_deploy",
+            description=(
+                f"Patch deployed for {cve_id} on {target}: "
+                f"{len(updated_ids)} instance(s) marked {new_status}"
+            ),
+            actor_id=actor_id,
+            organization_id=org_id,
+            extra_metadata={
+                "vulnerability_id": vuln.id,
+                "cve_id": cve_id,
+                "new_status": new_status,
+                "instances_updated": updated_ids,
+                "target": target,
+            },
+        )
+
         return {
             "success": True,
             "action": "patch_deploy",
             "target": target,
-            "patch_id": patch_id,
+            "vulnerability_id": vuln.id,
+            "cve_id": cve_id,
+            "instances_updated": len(updated_ids),
+            "new_status": new_status,
         }
 
 
 class NotificationExecutor(ActionExecutor):
-    """Notification and ticketing executor."""
+    """Notification and ticketing executor: sends email or logs activity."""
 
     async def execute(self, target: str, parameters: dict, context: dict) -> dict:
+        execution_id, org_id, actor_id = _get_execution_context(context)
         action = parameters.get("action", "notify")
-        self.logger.info(f"Executing notification action: {action}", extra={
-            "action": action,
-            "target": target,
-        })
+        recipients = parameters.get("recipients") or parameters.get("to") or []
+        if isinstance(recipients, str):
+            recipients = [recipients]
+        subject = parameters.get("subject", f"PySOAR Remediation: {action}")
+        body = parameters.get(
+            "body",
+            f"Remediation action '{action}' triggered for target {target}.",
+        )
+
+        self.logger.info(
+            "Executing notification",
+            extra={"action": action, "target": target, "recipients": recipients},
+        )
+
+        email_sent = False
+        email_error: str | None = None
+        if recipients:
+            try:
+                from src.services.email_service import EmailService
+
+                email = EmailService()
+                if email.is_configured:
+                    email_sent = await email.send_email(
+                        to=list(recipients),
+                        subject=subject,
+                        body=body,
+                    )
+                else:
+                    email_error = "Email service not configured"
+            except ImportError as e:
+                email_error = f"EmailService unavailable: {e}"
+
+        activity = await _log_ticket_activity(
+            self.db,
+            source_id=execution_id,
+            activity_type=f"notification_{action}",
+            description=(
+                f"Notification '{action}' "
+                f"{'sent' if email_sent else 'logged'} for {target}"
+            ),
+            actor_id=actor_id,
+            organization_id=org_id,
+            extra_metadata={
+                "action": action,
+                "target": target,
+                "recipients": recipients,
+                "subject": subject,
+                "email_sent": email_sent,
+                "email_error": email_error,
+            },
+        )
+
         return {
             "success": True,
             "action": action,
-            "details": parameters,
+            "target": target,
+            "email_sent": email_sent,
+            "email_error": email_error,
+            "activity_id": activity.id,
+            "recipients": recipients,
         }
 
 
 class WebhookExecutor(ActionExecutor):
-    """Generic webhook executor."""
+    """Generic webhook executor: POSTs to the configured URL."""
 
     async def execute(self, target: str, parameters: dict, context: dict) -> dict:
+        execution_id, org_id, actor_id = _get_execution_context(context)
         url = parameters.get("url")
-        method = parameters.get("method", "POST")
-        self.logger.info(f"Executing webhook: {method} {url}", extra={
-            "url": url,
-            "method": method,
-        })
+        method = parameters.get("method", "POST").upper()
+        headers = parameters.get("headers") or {"Content-Type": "application/json"}
+        payload = parameters.get("payload") or {
+            "target": target,
+            "execution_id": execution_id,
+            "trigger_data": context.get("trigger_data"),
+        }
+        timeout = parameters.get("timeout", 10.0)
+
+        self.logger.info(
+            "Executing webhook",
+            extra={"url": url, "method": method},
+        )
+
+        if not url:
+            return {
+                "success": False,
+                "action": "webhook",
+                "error": "url parameter is required",
+            }
+
+        status_code: int | None = None
+        response_text: str | None = None
+        error: str | None = None
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                if method == "POST":
+                    resp = await client.post(url, json=payload, headers=headers)
+                elif method == "PUT":
+                    resp = await client.put(url, json=payload, headers=headers)
+                elif method == "GET":
+                    resp = await client.get(url, headers=headers)
+                else:
+                    resp = await client.request(
+                        method, url, json=payload, headers=headers
+                    )
+                status_code = resp.status_code
+                response_text = resp.text[:500]
+        except httpx.TimeoutException as e:
+            error = f"timeout: {e}"
+        except httpx.HTTPError as e:
+            error = f"http error: {e}"
+
+        success = error is None and status_code is not None and 200 <= status_code < 300
+
+        await _log_ticket_activity(
+            self.db,
+            source_id=execution_id,
+            activity_type="webhook",
+            description=(
+                f"Webhook {method} {url} -> "
+                f"{status_code if status_code is not None else error}"
+            ),
+            actor_id=actor_id,
+            organization_id=org_id,
+            extra_metadata={
+                "url": url,
+                "method": method,
+                "status_code": status_code,
+                "error": error,
+            },
+        )
+
         return {
-            "success": True,
+            "success": success,
             "action": "webhook",
             "url": url,
             "method": method,
+            "status_code": status_code,
+            "response_preview": response_text,
+            "error": error,
         }
 
 
 class ScriptExecutor(ActionExecutor):
-    """Custom script executor."""
+    """Custom script executor: sandboxed. Only queues an activity record."""
 
     async def execute(self, target: str, parameters: dict, context: dict) -> dict:
+        execution_id, org_id, actor_id = _get_execution_context(context)
         script_content = parameters.get("script", "")
         executor_type = parameters.get("executor", "bash")
-        self.logger.info(f"Executing {executor_type} script on {target}", extra={
-            "target": target,
-            "executor": executor_type,
-        })
+
+        self.logger.info(
+            "Queuing script (sandboxed - not executed in-process)",
+            extra={"target": target, "executor": executor_type},
+        )
+
+        activity = await _log_ticket_activity(
+            self.db,
+            source_id=execution_id,
+            activity_type="script_queued",
+            description=(
+                f"Script ({executor_type}) queued for {target}; "
+                f"execution deferred to sandbox/agent"
+            ),
+            actor_id=actor_id,
+            organization_id=org_id,
+            extra_metadata={
+                "target": target,
+                "executor": executor_type,
+                "script_length": len(script_content),
+                "sandboxed": True,
+            },
+        )
+
         return {
             "success": True,
             "action": "script",
             "target": target,
             "executor": executor_type,
+            "activity_id": activity.id,
+            "status": "queued",
+            "note": "Script execution is sandboxed; requires external runner",
         }

@@ -12,7 +12,7 @@ from typing import Any, Optional
 from collections import defaultdict
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update
+from sqlalchemy import select, update, func
 
 from src.core.logging import get_logger
 from src.core.config import settings
@@ -507,42 +507,46 @@ class EvidenceCollector:
         }
 
     async def _collect_from_api(self, config: dict[str, Any]) -> dict[str, Any]:
-        """Collect evidence from API"""
-        # Simulated API collection
+        """Collect evidence from API (integration not yet wired)"""
         return {
             "source": "api",
             "endpoint": config.get("endpoint"),
-            "data": "api_response_data",
+            "data": {},
+            "integration_status": "not_integrated",
+            "note": "External API evidence source not yet integrated; configure an integration connector to populate.",
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
     async def _collect_from_logs(self, config: dict[str, Any]) -> dict[str, Any]:
-        """Collect evidence from logs"""
-        # Simulated log collection
+        """Collect evidence from logs (integration not yet wired)"""
         return {
             "source": "logs",
             "query": config.get("query"),
-            "results": 42,
+            "results": [],
+            "integration_status": "not_integrated",
+            "note": "Log search evidence source not yet integrated; configure a SIEM/log integration to populate.",
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
     async def _collect_from_config(self, config: dict[str, Any]) -> dict[str, Any]:
-        """Collect evidence from configuration"""
-        # Simulated config collection
+        """Collect evidence from configuration (integration not yet wired)"""
         return {
             "source": "config",
             "check": config.get("check"),
-            "compliant": True,
+            "result": None,
+            "integration_status": "not_integrated",
+            "note": "Configuration check evidence source not yet integrated; configure a CMDB/config tool connector to populate.",
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
     async def _collect_from_scan(self, config: dict[str, Any]) -> dict[str, Any]:
-        """Collect evidence from scan results"""
-        # Simulated scan collection
+        """Collect evidence from scan results (integration not yet wired)"""
         return {
             "source": "scan",
             "scan_type": config.get("scan_type"),
-            "results": "scan_data",
+            "results": [],
+            "integration_status": "not_integrated",
+            "note": "Scanner evidence source not yet integrated; configure a scanner connector to populate.",
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -590,53 +594,171 @@ class ContinuousMonitor:
             raise
 
     async def check_vulnerability_scanning(self) -> dict[str, Any]:
-        """Check vulnerability scanning compliance"""
+        """Check vulnerability scanning compliance from real Vulnerability data"""
+        from src.vulnmgmt.models import Vulnerability, VulnerabilityInstance
+
+        # Count total vulnerabilities for this org (via instances)
+        total_stmt = select(func.count(VulnerabilityInstance.id)).where(
+            VulnerabilityInstance.organization_id == self.org_id
+        )
+        total = (await self.session.execute(total_stmt)).scalar() or 0
+
+        # Critical/high counts join to vulnerability definition
+        sev_stmt = (
+            select(Vulnerability.severity, func.count(VulnerabilityInstance.id))
+            .join(Vulnerability, VulnerabilityInstance.vulnerability_id == Vulnerability.id)
+            .where(VulnerabilityInstance.organization_id == self.org_id)
+            .group_by(Vulnerability.severity)
+        )
+        sev_rows = (await self.session.execute(sev_stmt)).all()
+        by_severity = {sev: count for sev, count in sev_rows}
+        critical = by_severity.get("critical", 0)
+        high = by_severity.get("high", 0)
+        medium = by_severity.get("medium", 0)
+
+        # Overdue = SLA breached instances
+        overdue_stmt = select(func.count(VulnerabilityInstance.id)).where(
+            (VulnerabilityInstance.organization_id == self.org_id)
+            & (VulnerabilityInstance.sla_status == "breached")
+        )
+        overdue = (await self.session.execute(overdue_stmt)).scalar() or 0
+
+        compliance_percentage = (
+            ((total - overdue) / total * 100.0) if total > 0 else 100.0
+        )
+        status = "compliant" if compliance_percentage >= 95.0 else "non_compliant"
+
         return {
             "control": "SI-2 (monthly scan requirement)",
-            "status": "compliant",
-            "last_scan": (datetime.now(timezone.utc) - timedelta(days=15)).isoformat(),
-            "next_scan_due": (datetime.now(timezone.utc) + timedelta(days=15)).isoformat(),
-            "findings": 3,
-            "critical": 0,
-            "high": 1,
-            "medium": 2,
+            "status": status,
+            "total_vulnerabilities": int(total),
+            "findings": int(total),
+            "critical": int(critical),
+            "high": int(high),
+            "medium": int(medium),
+            "overdue_remediations": int(overdue),
+            "compliance_percentage": round(compliance_percentage, 2),
         }
 
     async def check_configuration_baseline(self) -> dict[str, Any]:
-        """Check configuration baseline compliance"""
+        """Check configuration baseline compliance from STIG scan results"""
+        from src.stig.models import STIGScanResult
+
+        # Aggregate compliance across STIG scan results for this org
+        agg_stmt = select(
+            func.count(STIGScanResult.id),
+            func.coalesce(func.sum(STIGScanResult.total_checks), 0),
+            func.coalesce(func.sum(STIGScanResult.not_a_finding), 0),
+            func.coalesce(func.sum(STIGScanResult.open_findings), 0),
+            func.coalesce(func.avg(STIGScanResult.compliance_percentage), 0.0),
+        ).where(STIGScanResult.organization_id == self.org_id)
+        row = (await self.session.execute(agg_stmt)).one()
+        scan_count, total_checks, not_a_finding, open_findings, avg_compliance = row
+        scan_count = int(scan_count or 0)
+        total_checks = int(total_checks or 0)
+        not_a_finding = int(not_a_finding or 0)
+        open_findings = int(open_findings or 0)
+        compliance_percentage = (
+            (not_a_finding / total_checks * 100.0) if total_checks > 0 else 0.0
+        )
+        status = "compliant" if compliance_percentage >= 90.0 else "non_compliant"
+
         return {
             "control": "CM-3 (configuration change control)",
-            "status": "compliant",
-            "baseline_version": "1.2",
-            "last_baseline_update": (datetime.now(timezone.utc) - timedelta(days=30)).isoformat(),
-            "systems_compliant": 48,
-            "systems_non_compliant": 2,
-            "compliance_percentage": 96.0,
+            "status": status,
+            "scan_result_count": scan_count,
+            "total_checks": total_checks,
+            "checks_passing": not_a_finding,
+            "open_findings": open_findings,
+            "compliance_percentage": round(compliance_percentage, 2),
+            "average_scan_compliance": round(float(avg_compliance or 0.0), 2),
         }
 
     async def check_incident_reporting(self) -> dict[str, Any]:
-        """Check incident reporting compliance"""
+        """Check incident reporting compliance from real Incident data"""
+        from src.models.incident import Incident
+
+        now = datetime.now(timezone.utc)
+        cutoff_30d = now - timedelta(days=30)
+
+        # All incidents for the org in the last 30 days
+        stmt = select(Incident).where(
+            (Incident.organization_id == self.org_id)
+            & (Incident.created_at >= cutoff_30d)
+        )
+        incidents = list((await self.session.scalars(stmt)).all())
+        incidents_this_month = len(incidents)
+
+        # Reported on time = detected_at present (parsed) and detection within 1 hour of created_at
+        reported_on_time = 0
+        for inc in incidents:
+            detected_raw = inc.detected_at
+            if not detected_raw:
+                continue
+            try:
+                detected_dt = datetime.fromisoformat(detected_raw.replace("Z", "+00:00"))
+                if detected_dt.tzinfo is None:
+                    detected_dt = detected_dt.replace(tzinfo=timezone.utc)
+                delta = abs((inc.created_at - detected_dt).total_seconds())
+                if delta <= 3600:
+                    reported_on_time += 1
+            except (ValueError, TypeError):
+                continue
+
+        compliance_percentage = (
+            (reported_on_time / incidents_this_month * 100.0)
+            if incidents_this_month > 0
+            else 100.0
+        )
+        status = "compliant" if compliance_percentage >= 95.0 else "non_compliant"
+
+        last_incident_iso = (
+            max((i.created_at for i in incidents), default=None).isoformat()
+            if incidents
+            else None
+        )
+
         return {
             "control": "IR-4 (incident handling)",
-            "status": "compliant",
-            "incidents_this_month": 1,
-            "average_response_time": "2.5 hours",
-            "mttr_sla": "4 hours",
-            "reported_to_us_cert": True,
-            "last_incident": (datetime.now(timezone.utc) - timedelta(days=45)).isoformat(),
+            "status": status,
+            "incidents_this_month": incidents_this_month,
+            "reported_on_time": reported_on_time,
+            "compliance_percentage": round(compliance_percentage, 2),
+            "last_incident": last_incident_iso,
         }
 
     async def check_poam_progress(self) -> dict[str, Any]:
-        """Check POAM (Plan of Action and Milestones) progress"""
+        """Check POAM (Plan of Action and Milestones) progress from real data"""
+        from src.compliance.models import POAM
+
+        status_stmt = (
+            select(POAM.status, func.count(POAM.id))
+            .where(POAM.organization_id == self.org_id)
+            .group_by(POAM.status)
+        )
+        rows = (await self.session.execute(status_stmt)).all()
+        counts = {status: int(count) for status, count in rows}
+        total = sum(counts.values())
+        completed = counts.get("completed", 0)
+        in_progress = counts.get("in_progress", 0)
+        open_count = counts.get("open", 0)
+        delayed = counts.get("delayed", 0)
+
+        compliance_percentage = (
+            ((completed + in_progress) / total * 100.0) if total > 0 else 100.0
+        )
+        status = "on_track" if compliance_percentage >= 70.0 else "at_risk"
+
         return {
             "control": "POAM compliance tracking",
-            "status": "on_track",
-            "total_items": 5,
-            "completed": 2,
-            "in_progress": 2,
-            "at_risk": 1,
-            "completion_percentage": 40.0,
-            "next_milestone": "2026-05-15",
+            "status": status,
+            "total_items": total,
+            "completed": completed,
+            "in_progress": in_progress,
+            "open": open_count,
+            "delayed": delayed,
+            "status_breakdown": counts,
+            "compliance_percentage": round(compliance_percentage, 2),
         }
 
     async def generate_conmon_report(self) -> dict[str, Any]:
@@ -682,22 +804,100 @@ class AuditReadinessChecker:
         """
         logger.info(f"Checking audit readiness for {framework}")
 
-        # Simulated readiness check
+        from src.compliance.models import ComplianceControl, ComplianceFramework
+
+        # Look up framework by name (case-insensitive match on common names)
+        fw_stmt = select(ComplianceFramework).where(
+            (ComplianceFramework.organization_id == self.org_id)
+            & (func.lower(ComplianceFramework.name) == framework.lower())
+        )
+        fw = (await self.session.scalars(fw_stmt)).first()
+
+        controls_query = select(ComplianceControl).where(
+            ComplianceControl.organization_id == self.org_id
+        )
+        if fw is not None:
+            controls_query = controls_query.where(
+                ComplianceControl.framework_id == fw.id
+            )
+
+        controls = list((await self.session.scalars(controls_query)).all())
+        total = len(controls)
+
+        if total == 0:
+            return {
+                "framework": framework,
+                "overall_readiness": "unknown",
+                "readiness_percentage": 0.0,
+                "total_controls": 0,
+                "implemented": 0,
+                "partially_implemented": 0,
+                "planned": 0,
+                "not_implemented": 0,
+                "not_applicable": 0,
+                "gaps": [],
+                "recommendations": [
+                    "Import or create controls for this framework to assess readiness"
+                ],
+            }
+
+        status_counts: dict[str, int] = defaultdict(int)
+        gaps: list[dict[str, Any]] = []
+        for c in controls:
+            status_counts[c.status] += 1
+            if c.status in ("not_implemented", "planned", "partially_implemented"):
+                gaps.append(
+                    {
+                        "control": c.control_id,
+                        "description": c.title,
+                        "status": c.status,
+                    }
+                )
+
+        implemented = status_counts.get("implemented", 0)
+        partial = status_counts.get("partially_implemented", 0)
+        na = status_counts.get("not_applicable", 0)
+        effective_total = total - na
+        readiness_percentage = (
+            ((implemented + partial * 0.5) / effective_total * 100.0)
+            if effective_total > 0
+            else 100.0
+        )
+        overall = (
+            "ready"
+            if readiness_percentage >= 90.0
+            else "partial"
+            if readiness_percentage >= 60.0
+            else "not_ready"
+        )
+
+        recommendations: list[str] = []
+        if status_counts.get("not_implemented"):
+            recommendations.append(
+                f"Implement {status_counts['not_implemented']} not-implemented controls"
+            )
+        if status_counts.get("planned"):
+            recommendations.append(
+                f"Execute on {status_counts['planned']} planned controls"
+            )
+        if partial:
+            recommendations.append(
+                f"Complete {partial} partially-implemented controls"
+            )
+
         return {
             "framework": framework,
-            "overall_readiness": "ready",
-            "readiness_percentage": 92.0,
-            "gaps": [
-                {
-                    "control": "AC-2",
-                    "description": "Account management procedures",
-                    "status": "needs_evidence",
-                }
-            ],
-            "recommendations": [
-                "Collect evidence for AC-2 control",
-                "Update policy documentation",
-            ],
+            "overall_readiness": overall,
+            "readiness_percentage": round(readiness_percentage, 2),
+            "total_controls": total,
+            "implemented": implemented,
+            "partially_implemented": partial,
+            "planned": status_counts.get("planned", 0),
+            "not_implemented": status_counts.get("not_implemented", 0),
+            "not_applicable": na,
+            "gaps": gaps[:25],
+            "gap_count": len(gaps),
+            "recommendations": recommendations,
         }
 
     async def check_evidence_coverage(self, framework_id: str) -> dict[str, Any]:

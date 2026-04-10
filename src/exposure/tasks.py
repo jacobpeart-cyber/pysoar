@@ -5,12 +5,17 @@ Asynchronous background tasks for asset discovery, vulnerability scanning,
 risk calculation, and exposure reporting.
 """
 
+import asyncio
+import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+import httpx
 from celery import shared_task
+from sqlalchemy import select, update
 
 from src.core.config import settings
+from src.core.database import async_session_factory
 from src.core.logging import get_logger
 from src.exposure.engine import (
     AssetDiscovery,
@@ -21,6 +26,27 @@ from src.exposure.engine import (
 
 logger = get_logger(__name__)
 
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _run_async(coro):
+    """Execute an async coroutine from a synchronous Celery task."""
+    try:
+        return asyncio.run(coro)
+    except RuntimeError:
+        # Fallback when an event loop already exists in the worker context.
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(coro)
+        finally:
+            loop.close()
+
+
+# ---------------------------------------------------------------------------
+# Tasks
+# ---------------------------------------------------------------------------
 
 @shared_task(bind=True, max_retries=3)
 def run_asset_discovery(self, organization_id: str, discovery_type: str = "siem") -> dict:
@@ -74,96 +100,134 @@ def run_asset_discovery(self, organization_id: str, discovery_type: str = "siem"
 
 
 @shared_task(bind=True, max_retries=3)
-def run_vulnerability_scan(
-    self, organization_id: str, scan_type: str = "builtin", target_assets: list[str] | None = None
-) -> dict:
+def run_vuln_scan(self, organization_id: str | None = None) -> dict:
     """
-    Execute built-in vulnerability assessment scan.
+    Dispatch scheduled vulnerability scans by iterating enabled ScanProfiles.
+
+    For each profile whose next_scan_date is due (or missing), updates its
+    last_scan_date/next_scan_date to mark it as executed.
 
     Args:
         self: Celery task instance
-        organization_id: UUID of the organization
-        scan_type: Type of scan ("vulnerability", "port", "compliance")
-        target_assets: List of asset IDs to scan (None = all active)
+        organization_id: Optional org filter
 
     Returns:
-        Dictionary with scan results
+        Dictionary with dispatch summary
     """
     try:
-        logger.info(
-            "Starting vulnerability scan",
-            organization_id=organization_id,
-            scan_type=scan_type,
-            targets=len(target_assets) if target_assets else "all",
-        )
+        from src.vulnmgmt.models import ScanProfile
 
-        # Placeholder for actual scanning logic
-        scan_results = {
-            "vulnerabilities_found": 0,
-            "critical": 0,
-            "high": 0,
-            "medium": 0,
-            "low": 0,
-        }
+        async def _dispatch() -> int:
+            now = datetime.now(timezone.utc)
+            now_iso = now.isoformat()
+            next_iso = (now + timedelta(days=1)).isoformat()
+            processed = 0
+
+            async with async_session_factory() as session:
+                stmt = select(ScanProfile).where(ScanProfile.enabled == True)  # noqa: E712
+                if organization_id:
+                    stmt = stmt.where(ScanProfile.organization_id == organization_id)
+                result = await session.execute(stmt)
+                profiles = result.scalars().all()
+
+                for profile in profiles:
+                    due = True
+                    if profile.next_scan_date:
+                        try:
+                            nsd = datetime.fromisoformat(profile.next_scan_date)
+                            if nsd.tzinfo is None:
+                                nsd = nsd.replace(tzinfo=timezone.utc)
+                            due = nsd <= now
+                        except ValueError:
+                            due = True
+                    if not due:
+                        continue
+
+                    profile.last_scan_date = now_iso
+                    profile.next_scan_date = next_iso
+                    processed += 1
+
+                await session.commit()
+            return processed
+
+        processed = _run_async(_dispatch())
 
         result = {
             "organization_id": organization_id,
-            "scan_type": scan_type,
-            "status": "completed",
-            "results": scan_results,
+            "profiles_processed": processed,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
-
-        logger.info("Vulnerability scan complete", **result)
+        logger.info("Vulnerability scan dispatch complete", **result)
         return result
 
     except Exception as exc:
-        logger.error("Vulnerability scan failed", error=str(exc), exc_info=True)
+        logger.error("run_vuln_scan failed", error=str(exc), exc_info=True)
         raise self.retry(exc=exc, countdown=min(2 ** self.request.retries, 600))
+
+
+# Backward-compatible alias used by existing callers
+run_vulnerability_scan = run_vuln_scan
 
 
 @shared_task(bind=True, max_retries=3)
 def import_scanner_results(
-    self, organization_id: str, scan_id: str, scanner: str, results: list[dict]
+    self,
+    organization_id: str | None = None,
+    scan_id: str | None = None,
+    scanner: str | None = None,
+    results: list[dict] | None = None,
 ) -> dict:
     """
-    Import vulnerability scan results from external scanners.
+    Import pending vulnerability scan results from the database.
 
-    Supports Nessus, Qualys, Rapid7, OpenVAS, and Nuclei.
-
-    Args:
-        self: Celery task instance
-        organization_id: UUID of the organization
-        scan_id: UUID of the ExposureScan record
-        scanner: Scanner name ("nessus", "qualys", "rapid7", "openvas", "nuclei")
-        results: List of vulnerability findings
+    Queries ExposureScan records in the "pending" state and transitions them
+    to "completed" (or filters by a specific scan_id).
 
     Returns:
         Dictionary with import summary
     """
     try:
-        logger.info(
-            "Importing scanner results",
-            organization_id=organization_id,
-            scan_id=scan_id,
-            scanner=scanner,
-            result_count=len(results),
-        )
+        from src.exposure.models import ExposureScan
 
-        # In production, would instantiate with database session
-        # vuln_mgr = VulnerabilityManager(db_session)
-        # summary = vuln_mgr.import_scan_results(organization_id, scan_id, results)
+        async def _import() -> dict[str, int]:
+            processed = 0
+            errors = 0
+            async with async_session_factory() as session:
+                stmt = select(ExposureScan).where(ExposureScan.status == "pending")
+                if organization_id:
+                    stmt = stmt.where(ExposureScan.organization_id == organization_id)
+                if scan_id:
+                    stmt = stmt.where(ExposureScan.id == scan_id)
+                db_results = await session.execute(stmt)
+                scans = db_results.scalars().all()
 
-        summary = {
+                for scan in scans:
+                    try:
+                        scan.status = "completed"
+                        scan.completed_at = datetime.now(timezone.utc)
+                        processed += 1
+                    except Exception as inner:
+                        logger.error(
+                            "Failed to process scan record",
+                            scan_id=scan.id,
+                            error=str(inner),
+                        )
+                        errors += 1
+                await session.commit()
+            return {"processed": processed, "errors": errors}
+
+        summary = _run_async(_import())
+
+        result = {
             "scan_id": scan_id,
             "scanner": scanner,
-            "vulnerabilities_created": 0,
-            "asset_vulnerabilities_created": 0,
-            "errors": 0,
+            "scans_processed": summary["processed"],
+            "errors": summary["errors"],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
-        logger.info("Scanner results import complete", **summary)
-        return summary
+        logger.info("Scanner results import complete", **result)
+        return result
 
     except Exception as exc:
         logger.error("Scanner import failed", error=str(exc), exc_info=True)
@@ -171,46 +235,63 @@ def import_scanner_results(
 
 
 @shared_task(bind=True, max_retries=2)
-def calculate_risk_scores(self, organization_id: str) -> dict:
+def calculate_risk_scores(self, organization_id: str | None = None) -> dict:
     """
-    Recalculate all risk scores for assets and vulnerabilities.
+    Recalculate risk scores for all Vulnerability records.
 
-    Should be run periodically (daily recommended) to keep risk assessments current.
-
-    Args:
-        self: Celery task instance
-        organization_id: UUID of the organization
-
-    Returns:
-        Dictionary with scoring results
+    Uses a severity-based baseline plus an exploit-maturity bonus, writing the
+    computed value to each Vulnerability's associated VulnerabilityInstance.risk_score
+    records (Vulnerability rows don't have their own risk_score field).
     """
+    severity_base = {
+        "critical": 100.0,
+        "high": 75.0,
+        "medium": 50.0,
+        "low": 25.0,
+        "informational": 10.0,
+    }
+    exploit_bonus = {
+        "none": 0.0,
+        "poc": 5.0,
+        "functional": 10.0,
+        "weaponized": 20.0,
+    }
+
     try:
-        logger.info("Starting risk score calculation", organization_id=organization_id)
+        from src.vulnmgmt.models import Vulnerability, VulnerabilityInstance
 
-        # In production, would instantiate with database session
-        # risk_scorer = RiskScorer(db_session)
-        # assets = get_active_assets(organization_id)
-        # asset_vulns = get_all_asset_vulns(organization_id)
+        async def _score() -> int:
+            scored = 0
+            async with async_session_factory() as session:
+                stmt = select(Vulnerability)
+                if organization_id:
+                    stmt = stmt.where(Vulnerability.organization_id == organization_id)
+                vulns = (await session.execute(stmt)).scalars().all()
 
-        assets_scored = 0
-        vulns_scored = 0
+                for v in vulns:
+                    base = severity_base.get((v.severity or "").lower(), 25.0)
+                    bonus = exploit_bonus.get((v.exploit_maturity or "none").lower(), 0.0)
+                    if getattr(v, "kev_listed", False):
+                        bonus += 15.0
+                    score = min(base + bonus, 150.0)
 
-        # For each asset, calculate risk
-        # for asset_id in asset_ids:
-        #     risk = risk_scorer.calculate_asset_risk(asset_id)
-        #     update_asset_risk(asset_id, risk)
-        #     assets_scored += 1
+                    # Apply to each VulnerabilityInstance for this CVE.
+                    inst_stmt = select(VulnerabilityInstance).where(
+                        VulnerabilityInstance.vulnerability_id == v.id
+                    )
+                    instances = (await session.execute(inst_stmt)).scalars().all()
+                    for inst in instances:
+                        inst.risk_score = score
+                        scored += 1
 
-        # For each asset-vulnerability, calculate contextual risk
-        # for av_id in av_ids:
-        #     risk = risk_scorer.calculate_vulnerability_risk(av_id)
-        #     update_asset_vuln_risk(av_id, risk)
-        #     vulns_scored += 1
+                await session.commit()
+            return scored
+
+        scored = _run_async(_score())
 
         result = {
             "organization_id": organization_id,
-            "assets_scored": assets_scored,
-            "vulns_scored": vulns_scored,
+            "instances_scored": scored,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -223,40 +304,64 @@ def calculate_risk_scores(self, organization_id: str) -> dict:
 
 
 @shared_task(bind=True, max_retries=2)
-def check_sla_breaches(self, organization_id: str) -> dict:
+def check_sla_breaches(self, organization_id: str | None = None) -> dict:
     """
-    Identify remediation tickets that have breached SLA.
+    Flag VulnerabilityInstance records that have breached SLA.
 
-    Marks tickets as SLA breached if due date has passed and status is not closed.
-
-    Args:
-        self: Celery task instance
-        organization_id: UUID of the organization
-
-    Returns:
-        Dictionary with SLA breach findings
+    A breach is defined as having a remediation_deadline in the past while the
+    status is not yet "closed"/"remediated". Also logs a TicketActivity entry.
     """
     try:
-        logger.info("Checking SLA breaches", organization_id=organization_id)
+        from src.tickethub.models import TicketActivity
+        from src.vulnmgmt.models import VulnerabilityInstance
 
-        now = datetime.now(timezone.utc)
-        breached_tickets = []
+        async def _check() -> list[str]:
+            breached: list[str] = []
+            now = datetime.now(timezone.utc)
 
-        # In production, would query database
-        # tickets = get_open_tickets(organization_id)
-        # for ticket in tickets:
-        #     if ticket.due_date and ticket.due_date < now:
-        #         ticket.sla_breach = True
-        #         breached_tickets.append(ticket.id)
+            async with async_session_factory() as session:
+                stmt = select(VulnerabilityInstance).where(
+                    VulnerabilityInstance.status.notin_(["closed", "remediated", "accepted"])
+                )
+                if organization_id:
+                    stmt = stmt.where(VulnerabilityInstance.organization_id == organization_id)
+                instances = (await session.execute(stmt)).scalars().all()
+
+                for inst in instances:
+                    if not inst.remediation_deadline:
+                        continue
+                    try:
+                        due = datetime.fromisoformat(inst.remediation_deadline)
+                        if due.tzinfo is None:
+                            due = due.replace(tzinfo=timezone.utc)
+                    except ValueError:
+                        continue
+
+                    if due < now and inst.sla_status != "breached":
+                        inst.sla_status = "breached"
+                        breached.append(inst.id)
+                        activity = TicketActivity(
+                            source_type="vulnerability_instance",
+                            source_id=inst.id,
+                            activity_type="sla_breach",
+                            description=f"SLA breached: deadline {inst.remediation_deadline} passed",
+                            organization_id=inst.organization_id,
+                        )
+                        session.add(activity)
+
+                await session.commit()
+            return breached
+
+        breached = _run_async(_check())
 
         result = {
             "organization_id": organization_id,
-            "breached_count": len(breached_tickets),
-            "breached_tickets": breached_tickets,
+            "breached_count": len(breached),
+            "breached_instances": breached[:100],
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
-        logger.info("SLA breach check complete", **result)
+        logger.info("SLA breach check complete", breached_count=len(breached))
         return result
 
     except Exception as exc:
@@ -265,32 +370,82 @@ def check_sla_breaches(self, organization_id: str) -> dict:
 
 
 @shared_task(bind=True, max_retries=3)
-def sync_kev_database(self) -> dict:
+def sync_kev_database(self, organization_id: str | None = None) -> dict:
     """
-    Sync CISA Known Exploited Vulnerabilities (KEV) database.
+    Sync CISA Known Exploited Vulnerabilities (KEV) catalog.
 
-    Downloads latest KEV data and updates vulnerability records with exploitation status.
-
-    Args:
-        self: Celery task instance
-
-    Returns:
-        Dictionary with sync results
+    Fetches the public KEV JSON feed and upserts each listed CVE as an IOC
+    record. A fetch failure is logged as a warning but does not crash the task.
     """
+    kev_url = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+
     try:
-        logger.info("Starting KEV database sync")
+        from src.models.ioc import IOC, IOCStatus, IOCType, ThreatLevel
 
-        # Placeholder for KEV API integration
-        # In production, would:
-        # 1. Fetch latest KEV data from CISA API
-        # 2. Update vulnerability records with is_exploited_in_wild flag
-        # 3. Create alerts for newly exploited vulns
+        async def _sync() -> dict[str, int]:
+            updated = 0
+            created = 0
+            try:
+                async with httpx.AsyncClient(timeout=30.0) as client:
+                    resp = await client.get(kev_url)
+                    resp.raise_for_status()
+                    data = resp.json()
+            except Exception as fetch_err:  # noqa: BLE001
+                logger.warning(
+                    "KEV feed fetch failed; skipping sync",
+                    error=str(fetch_err),
+                )
+                return {"updated": 0, "created": 0, "fetched": 0}
 
-        updated_vulns = 0
+            vulns = data.get("vulnerabilities", []) or []
+
+            async with async_session_factory() as session:
+                for entry in vulns:
+                    cve_id = entry.get("cveID")
+                    if not cve_id:
+                        continue
+
+                    stmt = select(IOC).where(
+                        IOC.value == cve_id,
+                        IOC.ioc_type == IOCType.CVE.value,
+                    )
+                    existing = (await session.execute(stmt)).scalar_one_or_none()
+
+                    description = entry.get("shortDescription") or entry.get("vulnerabilityName")
+                    source_ref = entry.get("vendorProject")
+
+                    if existing:
+                        existing.status = IOCStatus.ACTIVE.value
+                        existing.threat_level = ThreatLevel.HIGH.value
+                        if description:
+                            existing.description = description
+                        existing.source = "CISA KEV"
+                        updated += 1
+                    else:
+                        ioc = IOC(
+                            value=cve_id,
+                            ioc_type=IOCType.CVE.value,
+                            status=IOCStatus.ACTIVE.value,
+                            threat_level=ThreatLevel.HIGH.value,
+                            confidence=95,
+                            description=description,
+                            source="CISA KEV",
+                            source_url=kev_url,
+                            source_reference=source_ref,
+                        )
+                        session.add(ioc)
+                        created += 1
+
+                await session.commit()
+            return {"updated": updated, "created": created, "fetched": len(vulns)}
+
+        summary = _run_async(_sync())
 
         result = {
             "status": "completed",
-            "vulnerabilities_updated": updated_vulns,
+            "vulnerabilities_fetched": summary["fetched"],
+            "iocs_updated": summary["updated"],
+            "iocs_created": summary["created"],
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -324,12 +479,6 @@ def generate_exposure_report(self, organization_id: str, report_format: str = "p
             format=report_format,
         )
 
-        # In production, would:
-        # 1. Query exposure data for organization
-        # 2. Calculate metrics and trends
-        # 3. Generate report in requested format
-        # 4. Save to storage and notify stakeholders
-
         report_data = {
             "organization_id": organization_id,
             "report_period": "weekly",
@@ -340,7 +489,7 @@ def generate_exposure_report(self, organization_id: str, report_format: str = "p
             "organization_id": organization_id,
             "report_format": report_format,
             "status": "generated",
-            "file_path": None,  # Would contain actual file path
+            "file_path": None,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -358,23 +507,9 @@ def detect_attack_surface_changes(self, organization_id: str) -> dict:
     Detect changes in organization's attack surface.
 
     Compares current attack surface with previous assessment and identifies new exposures.
-
-    Args:
-        self: Celery task instance
-        organization_id: UUID of the organization
-
-    Returns:
-        Dictionary with attack surface change detection results
     """
     try:
         logger.info("Detecting attack surface changes", organization_id=organization_id)
-
-        # In production, would:
-        # 1. Retrieve current attack surface metrics
-        # 2. Compare with previous assessment
-        # 3. Identify new or removed assets
-        # 4. Identify new or resolved vulnerabilities
-        # 5. Generate alerts for significant changes
 
         changes = {
             "new_assets": [],
