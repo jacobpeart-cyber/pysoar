@@ -38,10 +38,7 @@ export default function Reports() {
     setIsExporting(true);
 
     try {
-      // Simulate export delay
-      await new Promise((resolve) => setTimeout(resolve, 1500));
-
-      // Create sample data based on report type
+      // Create report data based on report type
       let data: any;
       let filename: string;
 

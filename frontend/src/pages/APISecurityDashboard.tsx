@@ -14,6 +14,7 @@ import {
 } from 'lucide-react';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, LineChart, Line, ScatterChart, Scatter } from 'recharts';
 import clsx from 'clsx';
+import { api } from '../api/client';
 import { apisecurityApi } from '../api/endpoints';
 
 

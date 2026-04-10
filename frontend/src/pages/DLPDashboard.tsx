@@ -691,18 +691,45 @@ export default function DLPDashboard() {
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
           <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-96 max-h-screen overflow-y-auto">
             <h2 className="text-xl font-bold mb-4">Create DLP Policy</h2>
-            <div className="space-y-4">
+            <form
+              onSubmit={async (e) => {
+                e.preventDefault();
+                const formData = new FormData(e.currentTarget);
+                const name = formData.get('name') as string;
+                const description = formData.get('description') as string;
+                const severity = formData.get('severity') as string;
+                const policyType = formData.get('policy_type') as string;
+                if (!name.trim()) return;
+                try {
+                  await dlpApi.createPolicy({
+                    name: name.trim(),
+                    description: description || undefined,
+                    severity: severity || 'medium',
+                    policy_type: policyType || 'custom_pattern',
+                    enabled: true,
+                  });
+                  // Refresh policies list
+                  const policiesData = await dlpApi.getPolicies();
+                  setPolicies(Array.isArray(policiesData) ? policiesData : []);
+                  setShowNewPolicyModal(false);
+                } catch (err) {
+                  console.error('Error creating DLP policy:', err);
+                  setError('Failed to create policy. Please try again.');
+                }
+              }}
+              className="space-y-4"
+            >
               <div>
                 <label className="block text-sm font-medium mb-1">Policy Name</label>
-                <input type="text" placeholder="e.g., PII Protection Policy" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+                <input type="text" name="name" required placeholder="e.g., PII Protection Policy" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
               </div>
               <div>
                 <label className="block text-sm font-medium mb-1">Description</label>
-                <textarea placeholder="Describe the policy purpose..." rows={3} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+                <textarea name="description" placeholder="Describe the policy purpose..." rows={3} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
               </div>
               <div>
                 <label className="block text-sm font-medium mb-1">Severity</label>
-                <select className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
+                <select name="severity" defaultValue="medium" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
                   <option value="low">Low</option>
                   <option value="medium">Medium</option>
                   <option value="high">High</option>
@@ -711,7 +738,7 @@ export default function DLPDashboard() {
               </div>
               <div>
                 <label className="block text-sm font-medium mb-1">Data Classification</label>
-                <select className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
+                <select name="policy_type" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
                   <option value="">Select classification...</option>
                   {classifications.map((c, i) => (
                     <option key={i} value={c}>{c}</option>
@@ -720,19 +747,20 @@ export default function DLPDashboard() {
               </div>
               <div className="flex gap-2 mt-6">
                 <button
+                  type="button"
                   onClick={() => setShowNewPolicyModal(false)}
                   className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
                 >
                   Cancel
                 </button>
                 <button
-                  onClick={() => setShowNewPolicyModal(false)}
+                  type="submit"
                   className="flex-1 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition"
                 >
                   Create Policy
                 </button>
               </div>
-            </div>
+            </form>
           </div>
         </div>
       )}
