@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.deps import CurrentUser, DatabaseSession
 from src.core.logging import get_logger
 from src.services.automation import AutomationService
+from src.core.utils import safe_json_loads
 from src.schemas.zerotrust import (
     AccessDecisionResponse,
     AccessRequestSchema,
@@ -112,7 +113,7 @@ async def evaluate_access_request(
             id=decision.id,
             decision=decision.decision,
             risk_score=decision.risk_score,
-            risk_factors=json.loads(decision.risk_factors or "[]"),
+            risk_factors=safe_json_loads(decision.risk_factors or "[]", []),
             reason=decision.decision_reason,
             required_actions=required_actions,
             mfa_required=decision.decision in ["challenge", "step_up"],
@@ -167,7 +168,7 @@ async def continuous_session_evaluation(
             id=new_decision.id,
             decision=new_decision.decision,
             risk_score=new_decision.risk_score,
-            risk_factors=json.loads(new_decision.risk_factors or "[]"),
+            risk_factors=safe_json_loads(new_decision.risk_factors or "[]", []),
             reason=new_decision.decision_reason,
             required_actions=[],
             mfa_required=False,

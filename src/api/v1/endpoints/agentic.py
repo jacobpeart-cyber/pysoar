@@ -9,8 +9,10 @@ from typing import Optional
 from fastapi import APIRouter, Path, HTTPException, Query, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from src.api.deps import CurrentUser, DatabaseSession
+from src.core.utils import safe_json_loads
 from src.models.alert import Alert
 from src.models.incident import Incident
 
@@ -325,25 +327,25 @@ async def get_investigation(
 
     if investigation.reasoning_chain:
         try:
-            inv_data.reasoning_chain = json.loads(investigation.reasoning_chain)
+            inv_data.reasoning_chain = safe_json_loads(investigation.reasoning_chain, {})
         except:
             pass
 
     if investigation.evidence_collected:
         try:
-            inv_data.evidence_collected = json.loads(investigation.evidence_collected)
+            inv_data.evidence_collected = safe_json_loads(investigation.evidence_collected, {})
         except:
             pass
 
     if investigation.actions_taken:
         try:
-            inv_data.actions_taken = json.loads(investigation.actions_taken)
+            inv_data.actions_taken = safe_json_loads(investigation.actions_taken, {})
         except:
             pass
 
     if investigation.recommendations:
         try:
-            inv_data.recommendations = json.loads(investigation.recommendations)
+            inv_data.recommendations = safe_json_loads(investigation.recommendations, {})
         except:
             pass
 
@@ -436,7 +438,12 @@ async def get_reasoning_chain(
     investigation_id: str = Path(...),
 ):
     """Get detailed reasoning chain for investigation"""
-    investigation = await db.get(Investigation, investigation_id)
+    result = await db.execute(
+        select(Investigation)
+        .options(selectinload(Investigation.reasoning_steps))
+        .where(Investigation.id == investigation_id)
+    )
+    investigation = result.scalar_one_or_none()
 
     if not investigation or investigation.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(
@@ -450,7 +457,7 @@ async def get_reasoning_chain(
             "step_number": step.step_number,
             "step_type": step.step_type,
             "thought_process": step.thought_process,
-            "observation": json.loads(step.observation) if step.observation else None,
+            "observation": safe_json_loads(step.observation, {}) if step.observation else None,
             "confidence_delta": step.confidence_delta,
             "duration_ms": step.duration_ms,
         })

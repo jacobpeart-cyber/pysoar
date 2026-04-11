@@ -15,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.deps import CurrentUser, DatabaseSession
 from src.core.logging import get_logger
 from src.services.automation import AutomationService
+from src.core.utils import safe_json_loads
 from src.risk_quant.engine import (
     BIAEngine,
     ControlEffectivenessAnalyzer,
@@ -460,7 +461,7 @@ async def get_loss_exceedance_curve(
             detail="Simulation not completed",
         )
 
-    return json.loads(analysis.loss_exceedance_curve)
+    return safe_json_loads(analysis.loss_exceedance_curve, {})
 
 
 # Risk Register Endpoints

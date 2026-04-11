@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.deps import CurrentUser, DatabaseSession
 from src.core.database import async_session_factory
 from src.core.logging import get_logger
+from src.core.utils import safe_json_loads
 from src.services.automation import AutomationService
 
 logger = get_logger(__name__)
@@ -845,7 +846,7 @@ async def execute_notebook_cell(
     start_time = datetime.now(timezone.utc)
 
     # Parse notebook content and retrieve the target cell
-    cells = json.loads(notebook.content) if isinstance(notebook.content, str) else (notebook.content or [])
+    cells = safe_json_loads(notebook.content, {}) if isinstance(notebook.content, str) else (notebook.content or [])
     if cell_data.cell_index < 0 or cell_data.cell_index >= len(cells):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -912,8 +913,8 @@ async def export_notebook(
     """Export a notebook in the specified format"""
     notebook = await get_notebook_or_404(db, notebook_id)
 
-    cells = json.loads(notebook.content) if isinstance(notebook.content, str) else (notebook.content or [])
-    tags = json.loads(notebook.tags) if isinstance(notebook.tags, str) and notebook.tags else (notebook.tags or [])
+    cells = safe_json_loads(notebook.content, {}) if isinstance(notebook.content, str) else (notebook.content or [])
+    tags = safe_json_loads(notebook.tags, []) if isinstance(notebook.tags, str) and notebook.tags else (notebook.tags or [])
 
     return {
         "status": "success",

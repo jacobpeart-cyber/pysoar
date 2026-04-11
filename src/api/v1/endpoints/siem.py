@@ -35,6 +35,7 @@ from src.siem.models import (
     SIEMDataSource,
 )
 from src.services.automation import AutomationService
+from src.core.utils import safe_json_loads
 
 router = APIRouter(prefix="/siem", tags=["SIEM"])
 
@@ -953,7 +954,7 @@ async def export_rule_yaml(
         "description": rule.description or "",
         "level": rule.severity,
         "status": "active" if rule.enabled else "disabled",
-        "detection": json.loads(rule.detection_logic) if rule.detection_logic else {},
+        "detection": safe_json_loads(rule.detection_logic, {}) if rule.detection_logic else {},
     }
     return {"yaml": yaml.dump(rule_dict, default_flow_style=False), "title": rule.title}
 

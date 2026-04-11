@@ -26,6 +26,7 @@ from src.models.case import (
 )
 from src.models.incident import Incident
 from src.models.user import User
+from src.core.utils import safe_json_loads
 
 router = APIRouter()
 
@@ -865,7 +866,7 @@ async def get_timeline(
             description=event.description,
             old_value=event.old_value,
             new_value=event.new_value,
-            metadata=json.loads(event.metadata) if event.metadata else None,
+            metadata=safe_json_loads(event.metadata, {}) if event.metadata else None,
             incident_id=event.incident_id,
             actor_id=event.actor_id,
             actor_name=event.actor.full_name if event.actor else None,
@@ -908,7 +909,7 @@ async def create_timeline_event(
         description=event.description,
         old_value=event.old_value,
         new_value=event.new_value,
-        metadata=json.loads(event.metadata) if event.metadata else None,
+        metadata=safe_json_loads(event.metadata, {}) if event.metadata else None,
         incident_id=event.incident_id,
         actor_id=event.actor_id,
         actor_name=current_user.full_name,

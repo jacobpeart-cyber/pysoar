@@ -67,6 +67,7 @@ from src.schemas.dlp import (
 )
 
 from src.services.automation import AutomationService
+from src.core.utils import safe_json_loads
 
 router = APIRouter(prefix="/dlp", tags=["DLP"])
 
@@ -122,11 +123,11 @@ async def get_incident_or_404(db: AsyncSession, incident_id: str) -> DLPIncident
 def convert_json_fields(model_obj):
     """Convert JSON string fields to Python objects"""
     if hasattr(model_obj, "data_patterns") and model_obj.data_patterns:
-        model_obj.data_patterns = json.loads(model_obj.data_patterns) if isinstance(model_obj.data_patterns, str) else model_obj.data_patterns
+        model_obj.data_patterns = safe_json_loads(model_obj.data_patterns, {}) if isinstance(model_obj.data_patterns, str) else model_obj.data_patterns
     if hasattr(model_obj, "channels_monitored") and model_obj.channels_monitored:
-        model_obj.channels_monitored = json.loads(model_obj.channels_monitored) if isinstance(model_obj.channels_monitored, str) else model_obj.channels_monitored
+        model_obj.channels_monitored = safe_json_loads(model_obj.channels_monitored, {}) if isinstance(model_obj.channels_monitored, str) else model_obj.channels_monitored
     if hasattr(model_obj, "sensitive_data_types") and model_obj.sensitive_data_types:
-        model_obj.sensitive_data_types = json.loads(model_obj.sensitive_data_types) if isinstance(model_obj.sensitive_data_types, str) else model_obj.sensitive_data_types
+        model_obj.sensitive_data_types = safe_json_loads(model_obj.sensitive_data_types, {}) if isinstance(model_obj.sensitive_data_types, str) else model_obj.sensitive_data_types
     return model_obj
 
 

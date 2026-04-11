@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from src.api.deps import CurrentUser, DatabaseSession
+from src.core.utils import safe_json_loads
 from src.models.user import User
 from src.dfir.models import (
     ForensicCase,
@@ -427,7 +428,7 @@ async def update_chain_of_custody(
     # Parse existing log
     coc_log = evidence.chain_of_custody_log or {"entries": []}
     if isinstance(coc_log, str):
-        coc_log = json.loads(coc_log)
+        coc_log = safe_json_loads(coc_log, {})
 
     if "entries" not in coc_log:
         coc_log["entries"] = []
@@ -868,7 +869,7 @@ async def get_chain_of_custody_report(
 
     coc_log = evidence.chain_of_custody_log or {}
     if isinstance(coc_log, str):
-        coc_log = json.loads(coc_log)
+        coc_log = safe_json_loads(coc_log, {})
 
     entries = []
     if "entries" in coc_log:

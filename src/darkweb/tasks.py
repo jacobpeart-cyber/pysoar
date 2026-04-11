@@ -426,8 +426,7 @@ def threat_correlation(
                 # Load recent incidents (last 90 days) for this org
                 inc_cutoff = datetime.now(timezone.utc) - timedelta(days=90)
                 inc_stmt = select(Incident).where(
-                    (Incident.organization_id == organization_id)
-                    & (Incident.created_at >= inc_cutoff)
+                    Incident.created_at >= inc_cutoff
                 )
                 incidents = list((await session.scalars(inc_stmt)).all())
 

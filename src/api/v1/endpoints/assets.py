@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DatabaseSession
 from src.models.asset import Asset, AssetStatus
+from src.core.utils import safe_json_loads
 from src.schemas.asset import (
     AssetCreate,
     AssetListResponse,
@@ -34,7 +35,7 @@ async def get_asset_or_404(db: AsyncSession, asset_id: str) -> Asset:
 
 def asset_to_response(asset: Asset) -> AssetResponse:
     """Convert Asset model to response schema"""
-    tags = json.loads(asset.tags) if asset.tags else None
+    tags = safe_json_loads(asset.tags, []) if asset.tags else None
 
     return AssetResponse(
         id=asset.id,

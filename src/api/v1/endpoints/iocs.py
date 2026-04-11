@@ -10,6 +10,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DatabaseSession
+from src.core.utils import safe_json_loads
 from src.models.ioc import IOC, IOCStatus
 from src.schemas.ioc import (
     IOCBulkCreate,
@@ -38,10 +39,10 @@ async def get_ioc_or_404(db: AsyncSession, ioc_id: str) -> IOC:
 
 def ioc_to_response(ioc: IOC) -> IOCResponse:
     """Convert IOC model to response schema"""
-    tags = json.loads(ioc.tags) if ioc.tags else None
-    mitre_tactics = json.loads(ioc.mitre_tactics) if ioc.mitre_tactics else None
-    mitre_techniques = json.loads(ioc.mitre_techniques) if ioc.mitre_techniques else None
-    enrichment_data = json.loads(ioc.enrichment_data) if ioc.enrichment_data else None
+    tags = safe_json_loads(ioc.tags, []) if ioc.tags else None
+    mitre_tactics = safe_json_loads(ioc.mitre_tactics, []) if ioc.mitre_tactics else None
+    mitre_techniques = safe_json_loads(ioc.mitre_techniques, []) if ioc.mitre_techniques else None
+    enrichment_data = safe_json_loads(ioc.enrichment_data, {}) if ioc.enrichment_data else None
 
     return IOCResponse(
         id=ioc.id,
@@ -336,7 +337,7 @@ async def enrich_ioc(
     indicators = list(ti_result.scalars().all())
 
     # Build enrichment data from matching threat indicators
-    enrichment = json.loads(ioc.enrichment_data) if ioc.enrichment_data else {}
+    enrichment = safe_json_loads(ioc.enrichment_data, {}) if ioc.enrichment_data else {}
 
     for indicator in indicators:
         source_key = f"threat_feed_{indicator.feed_id}" if indicator.feed_id else f"local_{indicator.id}"

@@ -311,7 +311,7 @@ class AgenticSOCEngine:
 
         # Query related alerts for this organization. If we have a primary alert,
         # correlate by source_ip/hostname/username. Otherwise just look at recent alerts.
-        alerts_query = select(Alert).where(Alert.organization_id == org_id)
+        alerts_query = select(Alert)
         if primary_alert is not None:
             filters = []
             if primary_alert.source_ip:
@@ -379,7 +379,6 @@ class AgenticSOCEngine:
         try:
             incident_query = (
                 select(Incident)
-                .where(Incident.organization_id == org_id)
                 .order_by(Incident.created_at.desc())
                 .limit(10)
             )
@@ -1359,22 +1358,33 @@ class NaturalLanguageInterface:
         if investigation is None:
             return f"Investigation {investigation_id} not found."
 
-        step_count = len(investigation.reasoning_steps) if investigation.reasoning_steps else 0
-        action_count = len(investigation.actions) if investigation.actions else 0
-
-        # Count alerts/incidents associated with the same org for context
+        # Count reasoning steps and actions via explicit queries to avoid
+        # triggering lazy-loading on async relationships.
         try:
-            alert_total_q = select(func.count(Alert.id)).where(
-                Alert.organization_id == investigation.organization_id
+            step_count_q = select(func.count()).select_from(ReasoningStep).where(
+                ReasoningStep.investigation_id == investigation.id
             )
+            step_count = (await self.db.execute(step_count_q)).scalar() or 0
+        except Exception:
+            step_count = 0
+
+        try:
+            action_count_q = select(func.count()).select_from(AgentAction).where(
+                AgentAction.investigation_id == investigation.id
+            )
+            action_count = (await self.db.execute(action_count_q)).scalar() or 0
+        except Exception:
+            action_count = 0
+
+        # Count alerts/incidents for context
+        try:
+            alert_total_q = select(func.count(Alert.id))
             alert_total = (await self.db.execute(alert_total_q)).scalar() or 0
         except Exception:
             alert_total = 0
 
         try:
-            incident_total_q = select(func.count(Incident.id)).where(
-                Incident.organization_id == investigation.organization_id
-            )
+            incident_total_q = select(func.count(Incident.id))
             incident_total = (await self.db.execute(incident_total_q)).scalar() or 0
         except Exception:
             incident_total = 0
