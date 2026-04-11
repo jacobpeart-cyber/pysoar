@@ -2,11 +2,11 @@
 
 import json
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Path, HTTPException, Query, status
-from sqlalchemy import func, select
+from fastapi import APIRouter, Body, Path, HTTPException, Query, status
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DatabaseSession
@@ -706,6 +706,87 @@ async def estimate_query_cost(
 # ==================== DATA CATALOG ENDPOINTS ====================
 
 
+@router.get("/catalog")
+async def list_catalog(
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+):
+    """List all catalog datasets for this org (wraps DataSource + UnifiedDataModel)."""
+    org_id = getattr(current_user, "organization_id", None)
+
+    sources = (await db.execute(
+        select(DataSource).where(DataSource.organization_id == org_id)
+    )).scalars().all()
+    models = (await db.execute(
+        select(UnifiedDataModel).where(UnifiedDataModel.organization_id == org_id)
+    )).scalars().all()
+
+    entries = []
+    for s in sources:
+        entries.append({
+            "id": s.id,
+            "name": s.name,
+            "description": s.description,
+            "type": "source",
+            "source_type": s.source_type,
+            "status": s.status,
+            "format": getattr(s, "format", None),
+        })
+    for m in models:
+        entries.append({
+            "id": m.id,
+            "name": m.name,
+            "description": m.description,
+            "type": "unified_model",
+            "entity_type": m.entity_type,
+        })
+    return entries
+
+
+@router.post("/query")
+async def run_ad_hoc_query(
+    payload: dict = Body(...),
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+):
+    """Run an ad-hoc query against the data lake (alias for POST /queries)."""
+    query_str = payload.get("query") or payload.get("query_text") or ""
+    if not query_str:
+        raise HTTPException(status_code=400, detail="query required")
+
+    try:
+        engine = QueryEngine()
+        result = engine.execute_query(query_str) if hasattr(engine, "execute_query") else None
+    except Exception as exc:
+        logger.warning(f"QueryEngine execute failed: {exc}")
+        result = None
+
+    # Persist a QueryJob audit record for history
+    try:
+        job = QueryJob(
+            organization_id=getattr(current_user, "organization_id", None),
+            query_text=query_str,
+            query_language=payload.get("language", "sql"),
+            status="completed" if result is not None else "failed",
+            data_sources_queried=payload.get("data_sources", []),
+            submitted_by=str(getattr(current_user, "id", "")),
+        )
+        db.add(job)
+        await db.commit()
+        await db.refresh(job)
+    except Exception as exc:
+        logger.warning(f"QueryJob persist failed: {exc}")
+        await db.rollback()
+        job = None
+
+    return {
+        "query": query_str,
+        "result": result,
+        "job_id": getattr(job, "id", None),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 @router.get("/catalog/datasets")
 async def search_datasets(
     current_user: CurrentUser = None,
@@ -766,47 +847,89 @@ async def get_dashboard_metrics(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Get unified dashboard metrics"""
+    """Get unified dashboard metrics (real counts from DB, not hardcoded lies)."""
+    org_id = getattr(current_user, "organization_id", None)
+    now = datetime.now(timezone.utc)
+    window_24h = now - timedelta(hours=24)
+
+    # Sources
+    sources_total = (await db.execute(
+        select(func.count()).select_from(DataSource).where(DataSource.organization_id == org_id)
+    )).scalar() or 0
+    sources_active = (await db.execute(
+        select(func.count()).select_from(DataSource).where(
+            and_(DataSource.organization_id == org_id, DataSource.status == "active")
+        )
+    )).scalar() or 0
+
+    # Pipelines
+    pipelines_total = (await db.execute(
+        select(func.count()).select_from(DataPipeline).where(DataPipeline.organization_id == org_id)
+    )).scalar() or 0
+    pipelines_active = (await db.execute(
+        select(func.count()).select_from(DataPipeline).where(
+            and_(DataPipeline.organization_id == org_id, DataPipeline.status == "active")
+        )
+    )).scalar() or 0
+    pipelines_failed = (await db.execute(
+        select(func.count()).select_from(DataPipeline).where(
+            and_(DataPipeline.organization_id == org_id, DataPipeline.status == "failed")
+        )
+    )).scalar() or 0
+
+    # Storage (sum real partition sizes if the column exists)
+    total_bytes = 0
     try:
-        # Gather metrics from all sources
-        storage_mgr = StorageManager()
-        query_engine = QueryEngine()
+        total_bytes = (await db.execute(
+            select(func.coalesce(func.sum(DataPartition.size_bytes), 0)).where(
+                DataPartition.organization_id == org_id
+            )
+        )).scalar() or 0
+    except Exception:
+        total_bytes = 0
 
-        ingestion_metrics = {
-            "events_per_second": 12543,
-            "daily_ingestion_gb": 1234,
-            "success_rate": 99.98,
-        }
+    # Queries in last 24h
+    queries_24h = 0
+    avg_exec_ms = 0
+    try:
+        queries_24h = (await db.execute(
+            select(func.count()).select_from(QueryJob).where(
+                and_(QueryJob.organization_id == org_id, QueryJob.created_at >= window_24h)
+            )
+        )).scalar() or 0
+        avg_exec_ms = (await db.execute(
+            select(func.coalesce(func.avg(QueryJob.execution_time_ms), 0)).where(
+                and_(QueryJob.organization_id == org_id, QueryJob.created_at >= window_24h)
+            )
+        )).scalar() or 0
+    except Exception:
+        pass
 
-        storage_usage = {
-            "total_bytes": 5368709120000,  # 5TB
-            "hot_gb": 500,
-            "warm_gb": 1500,
-            "cold_gb": 2500,
-        }
-
-        query_performance = {
-            "avg_execution_time_ms": 1234,
-            "p95_execution_time_ms": 5678,
-            "total_queries_24h": 45000,
-        }
-
-        pipeline_health = {
-            "active_pipelines": 42,
-            "failed_pipelines": 1,
-            "avg_success_rate": 99.76,
-        }
-
-        return {
-            "ingestion_metrics": ingestion_metrics,
-            "storage_usage": storage_usage,
-            "query_performance": query_performance,
-            "pipeline_health": pipeline_health,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=400, detail="Operation failed. Please try again or contact support.")
+    return {
+        "ingestion_metrics": {
+            "active_sources": sources_active,
+            "total_sources": sources_total,
+            "success_rate": round(
+                (pipelines_active / pipelines_total * 100) if pipelines_total else 0.0, 2
+            ),
+        },
+        "storage_usage": {
+            "total_bytes": int(total_bytes),
+        },
+        "query_performance": {
+            "avg_execution_time_ms": int(avg_exec_ms or 0),
+            "total_queries_24h": int(queries_24h),
+        },
+        "pipeline_health": {
+            "active_pipelines": pipelines_active,
+            "total_pipelines": pipelines_total,
+            "failed_pipelines": pipelines_failed,
+            "avg_success_rate": round(
+                (pipelines_active / pipelines_total * 100) if pipelines_total else 0.0, 2
+            ),
+        },
+        "timestamp": now.isoformat(),
+    }
 
 
 @router.get("/dashboard/storage-breakdown")
@@ -814,24 +937,49 @@ async def get_storage_breakdown(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Get detailed storage usage breakdown"""
+    """Get detailed storage usage breakdown (real bytes by tier and source)."""
+    org_id = getattr(current_user, "organization_id", None)
+
+    # Total + by tier
+    total_bytes = 0
+    by_tier: dict = {}
     try:
-        storage_usage = {
-            "total_bytes": 5368709120000,
-            "by_tier": {
-                "hot": 536870912000,  # 500GB
-                "warm": 1610612736000,  # 1.5TB
-                "cold": 2684354560000,  # 2.5TB
-            },
-            "by_source": {
-                "siem": 2147483648000,  # 2TB
-                "edr": 1610612736000,  # 1.5TB
-                "cloud": 1074790400000,  # 1TB
-            },
-        }
-        return storage_usage
-    except Exception as e:
-        raise HTTPException(status_code=400, detail="Operation failed. Please try again or contact support.")
+        total_bytes = (await db.execute(
+            select(func.coalesce(func.sum(DataPartition.size_bytes), 0)).where(
+                DataPartition.organization_id == org_id
+            )
+        )).scalar() or 0
+
+        tier_result = await db.execute(
+            select(DataPartition.storage_tier, func.coalesce(func.sum(DataPartition.size_bytes), 0))
+            .where(DataPartition.organization_id == org_id)
+            .group_by(DataPartition.storage_tier)
+        )
+        for tier, bytes_ in tier_result.all():
+            by_tier[tier or "unknown"] = int(bytes_ or 0)
+    except Exception:
+        by_tier = {}
+
+    # By source name (join through DataSource)
+    by_source: dict = {}
+    try:
+        src_result = await db.execute(
+            select(DataSource.name, func.coalesce(func.sum(DataPartition.size_bytes), 0))
+            .select_from(DataPartition)
+            .join(DataSource, DataSource.id == DataPartition.source_id)
+            .where(DataSource.organization_id == org_id)
+            .group_by(DataSource.name)
+        )
+        for name, bytes_ in src_result.all():
+            by_source[name or "unknown"] = int(bytes_ or 0)
+    except Exception:
+        by_source = {}
+
+    return {
+        "total_bytes": int(total_bytes),
+        "by_tier": by_tier,
+        "by_source": by_source,
+    }
 
 
 @router.get("/dashboard/pipeline-status")
