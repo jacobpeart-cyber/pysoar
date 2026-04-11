@@ -215,6 +215,29 @@ async def list_commands(
     return [CommandSummary.model_validate(r) for r in rows]
 
 
+@router.get("/commands/pending-approval", response_model=list[CommandSummary])
+async def pending_approval_queue(
+    current_user: CurrentUser = None,
+    session: DatabaseSession = None,
+    limit: int = Query(100, ge=1, le=500),
+) -> list[CommandSummary]:
+    """Approval queue for high-blast Live Response actions.
+
+    Rendered in the UI as a single pane of "things a second analyst
+    needs to sign off on before they hit an endpoint." Ordered oldest
+    first so long-waiting approvals rise to the top. Scoped to the
+    caller's organization so one tenant's approvers never see another
+    tenant's pending commands.
+    """
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(AgentCommand).where(AgentCommand.status == "awaiting_approval")
+    if org_id is not None:
+        stmt = stmt.where(AgentCommand.organization_id == org_id)
+    stmt = stmt.order_by(AgentCommand.created_at.asc()).limit(limit)
+    rows = list((await session.execute(stmt)).scalars().all())
+    return [CommandSummary.model_validate(r) for r in rows]
+
+
 @router.post("/commands/{command_id}/approve", response_model=CommandSummary)
 async def approve_command(
     command_id: str,
@@ -237,6 +260,43 @@ async def approve_command(
         )
     except AgentServiceError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    return CommandSummary.model_validate(cmd)
+
+
+@router.post("/commands/{command_id}/reject", response_model=CommandSummary)
+async def reject_command(
+    command_id: str,
+    request: ApprovalRequest,
+    current_user: CurrentUser = None,
+    session: DatabaseSession = None,
+) -> CommandSummary:
+    """Deny a pending-approval high-blast command.
+
+    Rejection is terminal — the rejected row stays in the audit chain
+    so the rejection itself is a signed record. Rejecter must be a
+    different user from the issuer."""
+    cmd = (
+        await session.execute(select(AgentCommand).where(AgentCommand.id == command_id))
+    ).scalar_one_or_none()
+    if cmd is None:
+        raise HTTPException(status_code=404, detail="Command not found")
+    if cmd.status != "awaiting_approval":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Command status is {cmd.status}; cannot reject",
+        )
+    if cmd.issued_by and cmd.issued_by == str(current_user.id):
+        raise HTTPException(
+            status_code=400,
+            detail="Rejecter cannot be the same user who issued the command",
+        )
+    cmd.status = "rejected"
+    cmd.approved_by = str(current_user.id)  # audit: who performed the rejection
+    from datetime import datetime, timezone
+    cmd.approved_at = datetime.now(timezone.utc)
+    cmd.approval_reason = f"REJECTED: {request.reason or ''}"
+    await session.flush()
+    await session.refresh(cmd)
     return CommandSummary.model_validate(cmd)
 
 
