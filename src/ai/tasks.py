@@ -312,7 +312,7 @@ def generate_daily_threat_briefing():
             from src.core.database import async_session_factory
             from src.models.alert import Alert
             from src.models.incident import Incident
-            from src.models.ioc import IOC
+            from src.intel.models import ThreatIndicator as IOC
 
             async with async_session_factory() as session:
                 cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
@@ -351,7 +351,7 @@ def generate_daily_threat_briefing():
 
                 # IOC counts
                 ioc_result = await session.execute(
-                    select(func.count(IOC.id)).where(IOC.status == "active")
+                    select(func.count(IOC.id)).where(IOC.is_active == True)  # noqa: E712
                 )
                 active_iocs = ioc_result.scalar() or 0
 

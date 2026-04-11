@@ -31,7 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.alert import Alert
 from src.models.incident import Incident
-from src.models.ioc import IOC
+from src.intel.models import ThreatIndicator as IOC
 from src.collaboration.models import WarRoom, ActionItem
 from src.tickethub.models import TicketActivity
 
@@ -671,9 +671,9 @@ class AutomationService:
     # =========================================================================
 
     async def _check_ioc_matches(self, alert: Alert) -> list[dict]:
-        """Check alert indicators against IOC database."""
+        """Check alert indicators against unified threat_indicators table."""
         indicators = []
-        for field in ("source_ip", "destination_ip"):
+        for field in ("source_ip", "destination_ip", "hostname", "domain", "url", "file_hash"):
             val = getattr(alert, field, None)
             if val:
                 indicators.append(val)
@@ -684,7 +684,8 @@ class AutomationService:
         result = await self.db.execute(
             select(IOC).where(
                 IOC.value.in_(indicators),
-                IOC.status == "active",
+                IOC.is_active == True,  # noqa: E712
+                IOC.is_whitelisted == False,  # noqa: E712
             )
         )
         matches = result.scalars().all()
@@ -692,11 +693,26 @@ class AutomationService:
         if matches:
             alert.severity = "critical"
             desc = getattr(alert, "description", "") or ""
-            match_info = ", ".join(f"{m.ioc_type}:{m.value}" for m in matches)
+            match_info = ", ".join(f"{m.indicator_type}:{m.value}" for m in matches)
             alert.description = f"{desc}\n[AUTO] IOC Match: {match_info}"
+            # Bump sighting counters
+            now = datetime.now(timezone.utc)
+            for m in matches:
+                m.sighting_count = (m.sighting_count or 0) + 1
+                m.last_sighting_at = now
+                m.last_seen = now
             await self.db.flush()
 
-        return [{"ioc_id": m.id, "value": m.value, "type": m.ioc_type} for m in matches]
+        return [
+            {
+                "ioc_id": m.id,
+                "value": m.value,
+                "type": m.indicator_type,
+                "severity": m.severity,
+                "source": m.source,
+            }
+            for m in matches
+        ]
 
     async def _auto_create_incident(
         self, alert: Alert, org_id: Optional[str], created_by: Optional[str]

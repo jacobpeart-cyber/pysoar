@@ -344,14 +344,14 @@ class AgentToolRegistry:
         return [{"id": i.id, "title": i.title, "severity": i.severity, "status": i.status, "created_at": i.created_at.isoformat() if i.created_at else None} for i in incidents]
 
     async def _list_iocs(self, ioc_type=None, limit=20):
-        from src.models.ioc import IOC
-        q = select(IOC).order_by(IOC.created_at.desc())
+        from src.intel.models import ThreatIndicator
+        q = select(ThreatIndicator).where(ThreatIndicator.is_active == True).order_by(ThreatIndicator.created_at.desc())  # noqa: E712
         if ioc_type:
-            q = q.where(IOC.ioc_type == ioc_type)
+            q = q.where(ThreatIndicator.indicator_type == ioc_type)
         q = q.limit(int(limit))
         result = await self.db.execute(q)
         iocs = result.scalars().all()
-        return [{"id": i.id, "value": i.value, "type": i.ioc_type, "threat_level": getattr(i, "threat_level", None)} for i in iocs]
+        return [{"id": i.id, "value": i.value, "type": i.indicator_type, "threat_level": i.severity, "source": i.source} for i in iocs]
 
     async def _get_alert(self, alert_id):
         from src.models.alert import Alert
@@ -485,9 +485,18 @@ class AgentToolRegistry:
 
     async def _block_ip(self, ip, reason):
         from src.tickethub.models import TicketActivity
-        from src.models.ioc import IOC
-        # Add to IOC list as blocked
-        ioc = IOC(value=ip, ioc_type="ip", threat_level="high", status="active")
+        from src.intel.models import ThreatIndicator
+        # Add to threat indicator list as blocked
+        ioc = ThreatIndicator(
+            value=ip,
+            indicator_type="ipv4",
+            severity="high",
+            is_active=True,
+            is_whitelisted=False,
+            source="agent_block",
+            confidence=80,
+            context={"reason": reason, "action": "block_ip"},
+        )
         self.db.add(ioc)
         # Log action
         activity = TicketActivity(
@@ -519,8 +528,16 @@ class AgentToolRegistry:
         return {"user_email": user_email, "status": "disabled", "reason": reason}
 
     async def _create_ioc(self, value, ioc_type, threat_level="medium"):
-        from src.models.ioc import IOC
-        ioc = IOC(value=value, ioc_type=ioc_type, threat_level=threat_level, status="active")
+        from src.intel.models import ThreatIndicator
+        ioc = ThreatIndicator(
+            value=value,
+            indicator_type=ioc_type,
+            severity=threat_level,
+            is_active=True,
+            is_whitelisted=False,
+            source="agent_manual",
+            confidence=70,
+        )
         self.db.add(ioc)
         await self.db.flush()
         return {"id": ioc.id, "value": value, "type": ioc_type}
@@ -563,19 +580,32 @@ class AgentToolRegistry:
         }
 
     async def _enrich_ioc(self, value, ioc_type):
-        from src.models.ioc import IOC
+        from src.intel.models import ThreatIndicator
         result = await self.db.execute(
-            select(IOC).where(IOC.value == value, IOC.ioc_type == ioc_type)
+            select(ThreatIndicator).where(
+                ThreatIndicator.value == value,
+                ThreatIndicator.indicator_type == ioc_type,
+            )
         )
-        ioc = result.scalar_one_or_none()
-        if ioc:
-            return {
-                "value": value, "type": ioc_type, "known": True,
-                "threat_level": getattr(ioc, "threat_level", None),
-                "source": getattr(ioc, "source", None),
-                "first_seen": ioc.created_at.isoformat() if ioc.created_at else None,
-            }
-        return {"value": value, "type": ioc_type, "known": False, "message": "No threat intel match"}
+        matches = result.scalars().all()
+        if not matches:
+            return {"value": value, "type": ioc_type, "known": False, "message": "No threat intel match"}
+        # Aggregate across feeds/rows that share the same value
+        sources = [m.source for m in matches if m.source]
+        confidences = [m.confidence for m in matches if m.confidence is not None]
+        severities = [m.severity for m in matches if m.severity]
+        severity_rank = {"critical": 4, "high": 3, "medium": 2, "low": 1, "informational": 0}
+        worst = max(severities, key=lambda s: severity_rank.get(s, 0)) if severities else None
+        return {
+            "value": value,
+            "type": ioc_type,
+            "known": True,
+            "match_count": len(matches),
+            "threat_level": worst,
+            "confidence": int(sum(confidences) / len(confidences)) if confidences else None,
+            "sources": sources,
+            "first_seen": matches[0].first_seen.isoformat() if matches[0].first_seen else (matches[0].created_at.isoformat() if matches[0].created_at else None),
+        }
 
     async def _correlate_alerts(self, alert_id):
         from src.models.alert import Alert
@@ -605,7 +635,7 @@ class AgentToolRegistry:
 
     async def _check_ioc_matches(self, alert_id):
         from src.models.alert import Alert
-        from src.models.ioc import IOC
+        from src.intel.models import ThreatIndicator
         result = await self.db.execute(select(Alert).where(Alert.id == alert_id))
         alert = result.scalar_one_or_none()
         if not alert:
@@ -614,11 +644,15 @@ class AgentToolRegistry:
         if not indicators:
             return {"matches": [], "message": "No indicators to check"}
         ioc_result = await self.db.execute(
-            select(IOC).where(IOC.value.in_(indicators), IOC.status == "active")
+            select(ThreatIndicator).where(
+                ThreatIndicator.value.in_(indicators),
+                ThreatIndicator.is_active == True,  # noqa: E712
+                ThreatIndicator.is_whitelisted == False,  # noqa: E712
+            )
         )
         matches = ioc_result.scalars().all()
         return {
-            "matches": [{"value": m.value, "type": m.ioc_type, "threat_level": getattr(m, "threat_level", None)} for m in matches],
+            "matches": [{"value": m.value, "type": m.indicator_type, "threat_level": m.severity, "source": m.source} for m in matches],
             "match_count": len(matches),
         }
 

@@ -354,17 +354,10 @@ class PlaybookAction:
         enrichment_results = {}
         try:
             from src.core.database import async_session_factory
-            from src.models.ioc import IOC
+            from src.intel.models import ThreatIndicator
 
             async with async_session_factory() as session:
-                # Look up IOC in the database
-                result = await session.execute(
-                    select(IOC).where(IOC.value == ioc_value)
-                )
-                ioc = result.scalar_one_or_none()
-
-                # Also check threat indicators for existing intel
-                from src.intel.models import ThreatIndicator
+                # Query the unified threat_indicators table
                 ti_result = await session.execute(
                     select(ThreatIndicator).where(
                         ThreatIndicator.value == ioc_value,
@@ -374,21 +367,25 @@ class PlaybookAction:
                 indicators = list(ti_result.scalars().all())
 
                 for indicator in indicators:
-                    enrichment_results[f"threat_intel_{indicator.feed_id or 'local'}"] = {
+                    enrichment_results[f"threat_intel_{indicator.feed_id or indicator.id[:8]}"] = {
                         "confidence": indicator.confidence,
                         "severity": indicator.severity,
                         "tags": indicator.tags,
                         "context": indicator.context,
+                        "source": indicator.source,
                         "first_seen": indicator.first_seen.isoformat() if indicator.first_seen else None,
                         "last_seen": indicator.last_seen.isoformat() if indicator.last_seen else None,
                     }
 
-                # Update the IOC enrichment_data if it exists in the IOC table
-                if ioc:
-                    existing_data = json.loads(ioc.enrichment_data) if ioc.enrichment_data else {}
-                    existing_data.update(enrichment_results)
-                    ioc.enrichment_data = json.dumps(existing_data)
-                    ioc.last_enriched = datetime.now(timezone.utc).isoformat()
+                # Stash aggregated enrichment into the first match's context
+                if indicators:
+                    primary = indicators[0]
+                    ctx = dict(primary.context) if isinstance(primary.context, dict) else {}
+                    existing_enr = dict(ctx.get("enrichment_data") or {})
+                    existing_enr.update(enrichment_results)
+                    ctx["enrichment_data"] = existing_enr
+                    ctx["last_enriched"] = datetime.now(timezone.utc).isoformat()
+                    primary.context = ctx
                     await session.commit()
 
         except Exception as e:
