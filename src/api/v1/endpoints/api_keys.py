@@ -141,6 +141,37 @@ async def create_api_key(
     return response
 
 
+@router.get("/permissions/available", response_model=list[str])
+async def list_available_permissions_v2(
+    current_user: CurrentUser = None,
+):
+    """List all available permissions (declared early to avoid /{key_id} catchall)"""
+    return APIKeyPermission.all_permissions()
+
+
+@router.get("/admin/all", response_model=list[APIKeyResponse])
+async def list_all_api_keys(
+    db: DatabaseSession = None,
+    admin_user: User = Depends(get_current_admin_user),
+):
+    """List all API keys across every user (platform superuser only).
+
+    Route is declared BEFORE /{key_id} so GET /api-keys/admin/all is matched
+    literally instead of landing on the dynamic get_api_key handler with
+    key_id="admin".
+    """
+    if not getattr(admin_user, "is_superuser", False):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Platform superuser required",
+        )
+    result = await db.execute(
+        select(APIKey).order_by(APIKey.created_at.desc())
+    )
+    keys = result.scalars().all()
+    return [_format_api_key(key) for key in keys]
+
+
 @router.get("/{key_id}", response_model=APIKeyResponse)
 async def get_api_key(
     key_id: str,
@@ -220,34 +251,17 @@ async def regenerate_api_key(
     return response
 
 
-@router.get("/permissions/available", response_model=list[str])
-async def list_available_permissions(
-    current_user: CurrentUser = None,
-):
-    """List all available permissions"""
-    return APIKeyPermission.all_permissions()
-
-
-# Admin endpoints
-@router.get("/admin/all", response_model=list[APIKeyResponse])
-async def list_all_api_keys(
-    db: DatabaseSession = None,
-    admin_user: User = Depends(get_current_admin_user),
-):
-    """List all API keys (admin only)"""
-    result = await db.execute(
-        select(APIKey).order_by(APIKey.created_at.desc())
-    )
-    keys = result.scalars().all()
-    return [_format_api_key(key) for key in keys]
-
-
 async def _get_user_api_key(
+    db: AsyncSession,
     key_id: str,
     user: User,
-    db: AsyncSession,
 ) -> APIKey:
-    """Get an API key, ensuring it belongs to the user (or user is admin)"""
+    """Get an API key, ensuring it belongs to the caller.
+
+    Platform superusers can access any key. Per-tenant admin role does NOT
+    grant cross-user access — users only see their own keys unless they
+    are a platform superuser.
+    """
     result = await db.execute(select(APIKey).where(APIKey.id == key_id))
     api_key = result.scalar_one_or_none()
 
@@ -257,10 +271,10 @@ async def _get_user_api_key(
             detail="API key not found",
         )
 
-    if api_key.owner_id != user.id and not user.is_admin:
+    if api_key.owner_id != user.id and not getattr(user, "is_superuser", False):
         raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorized to access this API key",
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="API key not found",
         )
 
     return api_key
