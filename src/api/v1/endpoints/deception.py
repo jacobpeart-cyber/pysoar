@@ -174,14 +174,20 @@ async def deploy_decoy(
 @router.get("/decoys", response_model=list[DecoyResponse])
 async def list_decoys(
     db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     decoy_type: str | None = Query(None),
     decoy_status: str | None = Query(None, alias="status"),
     category: str | None = Query(None),
-    organization_id: str | None = Query(None),
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
 ):
-    """List all decoys with optional filtering."""
+    """List all decoys with optional filtering.
+
+    **Auth + tenancy**: caller must be authenticated. Results are
+    scoped to the caller's organization — there is deliberately no
+    ``organization_id`` query parameter (previous versions accepted
+    one, which let anonymous callers dump any tenant's decoys).
+    """
     try:
         query = select(Decoy)
 
@@ -192,8 +198,10 @@ async def list_decoys(
             filters.append(Decoy.status == decoy_status)
         if category:
             filters.append(Decoy.category == category)
-        if organization_id:
-            filters.append(Decoy.organization_id == organization_id)
+
+        org_id = getattr(current_user, "organization_id", None)
+        if org_id:
+            filters.append(Decoy.organization_id == org_id)
 
         if filters:
             query = query.where(and_(*filters))
@@ -229,6 +237,7 @@ async def list_decoys(
 async def get_decoy_detail(
     decoy_id: UUID,
     db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Get detailed information about a specific decoy."""
     try:
@@ -467,13 +476,17 @@ async def generate_token(
 @router.get("/tokens", response_model=list[HoneyTokenResponse])
 async def list_tokens(
     db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     token_type: str | None = Query(None),
     token_status: str | None = Query(None, alias="status"),
-    organization_id: str | None = Query(None),
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
 ):
-    """List all honeytokens with optional filtering."""
+    """List all honeytokens with optional filtering.
+
+    Authenticated and org-scoped. Results are limited to the caller's
+    organization; there is no client-supplied ``organization_id``.
+    """
     try:
         query = select(HoneyToken)
 
@@ -482,8 +495,9 @@ async def list_tokens(
             filters.append(HoneyToken.token_type == token_type)
         if token_status:
             filters.append(HoneyToken.status == token_status)
-        if organization_id:
-            filters.append(HoneyToken.organization_id == organization_id)
+        org_id = getattr(current_user, "organization_id", None)
+        if org_id:
+            filters.append(HoneyToken.organization_id == org_id)
 
         if filters:
             query = query.where(and_(*filters))
@@ -515,6 +529,7 @@ async def list_tokens(
 async def get_token(
     token_id: UUID,
     db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Get details about a specific honeytoken."""
     try:
@@ -538,6 +553,7 @@ async def get_token(
 async def check_token(
     token_id: UUID,
     db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Check if a honeytoken has been used/triggered."""
     try:
@@ -601,10 +617,15 @@ async def delete_token(
 async def rotate_tokens(
     db: DatabaseSession = None,
     token_type: str = Query(...),
-    organization_id: str | None = Query(None),
     current_user: CurrentUser = None,
 ):
-    """Rotate all tokens of a specific type."""
+    """Rotate all tokens of a specific type.
+
+    Org-scoped: only rotates tokens belonging to the caller's
+    organization. Previous version accepted an ``organization_id``
+    query parameter which would let an authenticated caller rotate
+    another tenant's tokens and break their active honeypot bait.
+    """
     try:
         import hashlib
         import secrets
@@ -615,6 +636,7 @@ async def rotate_tokens(
                 HoneyToken.status == "active",
             )
         )
+        organization_id = getattr(current_user, "organization_id", None)
         if organization_id:
             query = query.where(HoneyToken.organization_id == organization_id)
 
@@ -656,14 +678,18 @@ async def rotate_tokens(
 @router.get("/interactions", response_model=list[DecoyInteractionResponse])
 async def list_interactions(
     db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     decoy_id: UUID | None = Query(None),
     source_ip: str | None = Query(None),
     threat_level: str | None = Query(None),
-    organization_id: str | None = Query(None),
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
 ):
-    """List all decoy interactions with optional filtering."""
+    """List all decoy interactions with optional filtering.
+
+    Authenticated and org-scoped. Interactions from other tenants are
+    never returned, and there is no client-supplied organization_id.
+    """
     try:
         query = select(DecoyInteraction)
 
@@ -674,10 +700,9 @@ async def list_interactions(
             filters.append(DecoyInteraction.source_ip == source_ip)
         if threat_level:
             filters.append(DecoyInteraction.threat_assessment == threat_level)
-        if organization_id:
-            filters.append(
-                DecoyInteraction.organization_id == organization_id
-            )
+        org_id = getattr(current_user, "organization_id", None)
+        if org_id:
+            filters.append(DecoyInteraction.organization_id == org_id)
 
         if filters:
             query = query.where(and_(*filters))
@@ -720,6 +745,7 @@ async def list_interactions(
 )
 async def get_interaction_timeline(
     db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     decoy_id: UUID = Query(...),
     hours: int = Query(24, ge=1, le=720),
 ):
@@ -791,6 +817,7 @@ async def get_interaction_timeline(
 async def get_interaction(
     interaction_id: UUID,
     db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Get details about a specific interaction."""
     try:
@@ -956,13 +983,16 @@ async def create_campaign(
 @router.get("/campaigns", response_model=list[DeceptionCampaignResponse])
 async def list_campaigns(
     db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     objective: str | None = Query(None),
     campaign_status: str | None = Query(None, alias="status"),
-    organization_id: str | None = Query(None),
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
 ):
-    """List all deception campaigns with optional filtering."""
+    """List all deception campaigns with optional filtering.
+
+    Authenticated and org-scoped. No client-supplied organization_id.
+    """
     try:
         query = select(DeceptionCampaign)
 
@@ -971,10 +1001,9 @@ async def list_campaigns(
             filters.append(DeceptionCampaign.objective == objective)
         if campaign_status:
             filters.append(DeceptionCampaign.status == campaign_status)
-        if organization_id:
-            filters.append(
-                DeceptionCampaign.organization_id == organization_id
-            )
+        org_id = getattr(current_user, "organization_id", None)
+        if org_id:
+            filters.append(DeceptionCampaign.organization_id == org_id)
 
         if filters:
             query = query.where(and_(*filters))
@@ -1015,6 +1044,7 @@ async def list_campaigns(
 async def get_campaign_detail(
     campaign_id: UUID,
     db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Get detailed information about a campaign."""
     try:
@@ -1099,6 +1129,7 @@ async def update_campaign_status(
 async def get_campaign_effectiveness(
     campaign_id: UUID,
     db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Get effectiveness assessment of a campaign."""
     try:
@@ -1170,10 +1201,16 @@ async def get_campaign_effectiveness(
 @router.get("/dashboard", response_model=DeceptionDashboardResponse)
 async def get_dashboard(
     db: DatabaseSession = None,
-    organization_id: str | None = Query(None),
+    current_user: CurrentUser = None,
 ):
-    """Get deception module dashboard statistics."""
+    """Get deception module dashboard statistics.
+
+    Authenticated and org-scoped to the caller's organization. No
+    client-supplied ``organization_id`` — that was a cross-tenant leak
+    vector that let anonymous callers dump any tenant's stats.
+    """
     try:
+        organization_id = getattr(current_user, "organization_id", None)
         now = datetime.now(timezone.utc)
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         week_start = today_start - timedelta(days=today_start.weekday())
@@ -1359,10 +1396,14 @@ async def get_dashboard(
 @router.get("/coverage", response_model=CoverageMapResponse)
 async def get_coverage_map(
     db: DatabaseSession = None,
-    organization_id: str | None = Query(None),
+    current_user: CurrentUser = None,
 ):
-    """Get network coverage map for deception infrastructure."""
+    """Get network coverage map for deception infrastructure.
+
+    Authenticated and org-scoped. No client-supplied organization_id.
+    """
     try:
+        organization_id = getattr(current_user, "organization_id", None)
         query = select(Decoy).where(Decoy.status == "active")
         if organization_id:
             query = query.where(Decoy.organization_id == organization_id)
@@ -1419,10 +1460,14 @@ async def get_coverage_map(
 @router.get("/recommendations", response_model=RecommendationsResponse)
 async def get_recommendations(
     db: DatabaseSession = None,
-    organization_id: str | None = Query(None),
+    current_user: CurrentUser = None,
 ):
-    """Get recommendations for improving deception coverage."""
+    """Get recommendations for improving deception coverage.
+
+    Authenticated and org-scoped. No client-supplied organization_id.
+    """
     try:
+        organization_id = getattr(current_user, "organization_id", None)
         # Count decoys by category to find gaps
         query = (
             select(Decoy.category, func.count(Decoy.id))
