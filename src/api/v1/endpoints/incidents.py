@@ -82,7 +82,14 @@ async def list_incidents(
     count_result = await db.execute(count_query)
     total = count_result.scalar() or 0
 
-    # Apply sorting
+    # Apply sorting — whitelist sortable columns so clients can't order by
+    # arbitrary attributes via the query string.
+    _ALLOWED_INCIDENT_SORTS = {
+        "created_at", "updated_at", "severity", "status", "incident_type",
+        "title", "priority", "assigned_to",
+    }
+    if sort_by not in _ALLOWED_INCIDENT_SORTS:
+        sort_by = "created_at"
     sort_column = getattr(Incident, sort_by, Incident.created_at)
     if sort_order == "desc":
         query = query.order_by(sort_column.desc())
@@ -158,34 +165,65 @@ async def get_incident_stats(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Get incident statistics"""
+    """Get incident statistics including a real MTTR calculation.
+
+    MTTR = average(resolved_at - created_at) over all closed incidents
+    that have a resolved_at timestamp.
+    """
     # Total count
     total_result = await db.execute(select(func.count(Incident.id)))
     total = total_result.scalar() or 0
 
-    # By severity
+    # By severity / status / type (single-pass group-bys)
     severity_result = await db.execute(
-        select(Incident.severity, func.count(Incident.id))
-        .group_by(Incident.severity)
+        select(Incident.severity, func.count(Incident.id)).group_by(Incident.severity)
     )
-    by_severity = dict(severity_result.all())
+    by_severity = {k: v for k, v in severity_result.all() if k is not None}
 
-    # By status
     status_result = await db.execute(
-        select(Incident.status, func.count(Incident.id))
-        .group_by(Incident.status)
+        select(Incident.status, func.count(Incident.id)).group_by(Incident.status)
     )
-    by_status = dict(status_result.all())
+    by_status = {k: v for k, v in status_result.all() if k is not None}
 
-    # By type
     type_result = await db.execute(
-        select(Incident.incident_type, func.count(Incident.id))
-        .group_by(Incident.incident_type)
+        select(Incident.incident_type, func.count(Incident.id)).group_by(Incident.incident_type)
     )
-    by_type = dict(type_result.all())
+    by_type = {k: v for k, v in type_result.all() if k is not None}
 
-    # Open count
-    open_count = by_status.get(IncidentStatus.OPEN.value, 0)
+    # Every non-closed status counts as "open" for dashboard purposes.
+    _ACTIVE_STATUSES = {
+        IncidentStatus.OPEN.value,
+        IncidentStatus.INVESTIGATING.value,
+        IncidentStatus.CONTAINMENT.value,
+        IncidentStatus.ERADICATION.value,
+        IncidentStatus.RECOVERY.value,
+    }
+    open_count = sum(v for k, v in by_status.items() if k in _ACTIVE_STATUSES)
+
+    # Real MTTR: average resolution time across closed incidents that have
+    # both created_at and resolved_at set. resolved_at is stored as an ISO
+    # string, so parse it in Python.
+    closed_result = await db.execute(
+        select(Incident.created_at, Incident.resolved_at)
+        .where(Incident.status == IncidentStatus.CLOSED.value)
+        .where(Incident.resolved_at.is_not(None))
+    )
+    durations_seconds: list[float] = []
+    for created_at, resolved_at_str in closed_result.all():
+        if not created_at or not resolved_at_str:
+            continue
+        try:
+            resolved_at = datetime.fromisoformat(str(resolved_at_str).replace("Z", "+00:00"))
+            if resolved_at.tzinfo is None:
+                resolved_at = resolved_at.replace(tzinfo=timezone.utc)
+            created_utc = created_at if created_at.tzinfo else created_at.replace(tzinfo=timezone.utc)
+            delta_s = (resolved_at - created_utc).total_seconds()
+            if delta_s > 0:
+                durations_seconds.append(delta_s)
+        except (ValueError, TypeError):
+            continue
+
+    mttr_hours = round(sum(durations_seconds) / len(durations_seconds) / 3600.0, 2) if durations_seconds else None
 
     return IncidentStats(
         total=total,
@@ -193,7 +231,7 @@ async def get_incident_stats(
         by_status=by_status,
         by_type=by_type,
         open_count=open_count,
-        mttr_hours=None,  # Would require more complex calculation
+        mttr_hours=mttr_hours,
     )
 
 

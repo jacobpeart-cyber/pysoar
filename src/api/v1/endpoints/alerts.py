@@ -2,7 +2,7 @@
 
 import json
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, status
@@ -100,7 +100,15 @@ async def list_alerts(
     )
     total = count_result.scalar() or 0
 
-    # Apply sorting
+    # Apply sorting — whitelist sortable columns to prevent clients from
+    # ordering by arbitrary (potentially sensitive) attributes via the query
+    # string. Anything outside this set falls back to created_at DESC.
+    _ALLOWED_ALERT_SORTS = {
+        "created_at", "updated_at", "severity", "status", "source",
+        "title", "assigned_to",
+    }
+    if sort_by not in _ALLOWED_ALERT_SORTS:
+        sort_by = "created_at"
     sort_column = getattr(Alert, sort_by, Alert.created_at)
     if sort_order == "desc":
         query = query.order_by(sort_column.desc())
@@ -180,34 +188,55 @@ async def get_alert_stats(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Get alert statistics"""
+    """Get alert statistics with real date-filtered counts."""
+    now = datetime.now(timezone.utc)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_start = now - timedelta(days=7)
+
     # Total count
     total_result = await db.execute(select(func.count(Alert.id)))
     total = total_result.scalar() or 0
 
     # By severity
     severity_result = await db.execute(
-        select(Alert.severity, func.count(Alert.id))
-        .group_by(Alert.severity)
+        select(Alert.severity, func.count(Alert.id)).group_by(Alert.severity)
     )
-    by_severity = dict(severity_result.all())
+    by_severity = {k: v for k, v in severity_result.all() if k is not None}
 
     # By status
     status_result = await db.execute(
-        select(Alert.status, func.count(Alert.id))
-        .group_by(Alert.status)
+        select(Alert.status, func.count(Alert.id)).group_by(Alert.status)
     )
-    by_status = dict(status_result.all())
+    by_status = {k: v for k, v in status_result.all() if k is not None}
 
     # By source
     source_result = await db.execute(
-        select(Alert.source, func.count(Alert.id))
-        .group_by(Alert.source)
+        select(Alert.source, func.count(Alert.id)).group_by(Alert.source)
     )
-    by_source = dict(source_result.all())
+    by_source = {k: v for k, v in source_result.all() if k is not None}
 
-    # New today (simplified - in production use proper date filtering)
-    new_today = by_status.get(AlertStatus.NEW.value, 0)
+    # Real "new today" and "new this week" counts, filtered by created_at
+    today_result = await db.execute(
+        select(func.count(Alert.id)).where(Alert.created_at >= today_start)
+    )
+    new_today = today_result.scalar() or 0
+
+    week_result = await db.execute(
+        select(func.count(Alert.id)).where(Alert.created_at >= week_start)
+    )
+    new_this_week = week_result.scalar() or 0
+
+    # Resolved today: alerts whose resolved_at (ISO string) falls on today.
+    # ISO 8601 strings compare lexicographically in the same order as time,
+    # so string comparison works against today_start.isoformat().
+    today_iso_prefix = today_start.isoformat()
+    resolved_result = await db.execute(
+        select(func.count(Alert.id)).where(
+            Alert.resolved_at.is_not(None),
+            Alert.resolved_at >= today_iso_prefix,
+        )
+    )
+    resolved_today = resolved_result.scalar() or 0
 
     return AlertStats(
         total=total,
@@ -215,7 +244,8 @@ async def get_alert_stats(
         by_status=by_status,
         by_source=by_source,
         new_today=new_today,
-        new_this_week=total,  # Simplified
+        new_this_week=new_this_week,
+        resolved_today=resolved_today,
     )
 
 
