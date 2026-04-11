@@ -20,6 +20,8 @@ import {
   Clock,
   Search,
   Shield,
+  Play,
+  Zap,
 } from 'lucide-react';
 import { api } from '../lib/api';
 import clsx from 'clsx';
