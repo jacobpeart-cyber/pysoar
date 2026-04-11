@@ -616,52 +616,57 @@ async def seed_all_compliance_frameworks() -> dict:
     total_controls_added = 0
     details: list[dict] = []
 
-    async with async_session_factory() as db:
-        try:
-            org_result = await db.execute(select(Organization))
-            organizations = list(org_result.scalars().all())
+    # Fetch all orgs in a read-only session first so the seeding loop gets
+    # a fresh transaction per framework (one IntegrityError doesn't poison
+    # the whole seed run).
+    async with async_session_factory() as read_db:
+        org_result = await read_db.execute(select(Organization))
+        organizations = list(read_db.scalars(select(Organization)).all() if False else org_result.scalars().all())
 
-            if not organizations:
-                logger.info("seed_all_compliance_frameworks: no organizations yet")
-                return {"organizations": 0, "frameworks_created": 0, "controls_added": 0}
+    if not organizations:
+        logger.info("seed_all_compliance_frameworks: no organizations yet")
+        return {"organizations": 0, "frameworks_created": 0, "controls_added": 0}
 
-            for org in organizations:
-                for framework_def in FRAMEWORK_DEFINITIONS:
-                    try:
-                        status, added = await seed_framework_for_org(
-                            db, org.id, framework_def
-                        )
-                        if status == "created":
-                            total_created += 1
-                        total_controls_added += added
-                        details.append({
-                            "org_id": org.id,
-                            "framework": framework_def["short_name"],
-                            "status": status,
-                            "controls_added": added,
-                        })
-                    except Exception as e:
-                        logger.warning(
-                            f"Failed to seed {framework_def['short_name']} "
-                            f"for org {org.id}: {e}"
-                        )
+    for org in organizations:
+        for framework_def in FRAMEWORK_DEFINITIONS:
+            async with async_session_factory() as db:
+                try:
+                    status, added = await seed_framework_for_org(
+                        db, org.id, framework_def
+                    )
+                    await db.commit()
+                    if status == "created":
+                        total_created += 1
+                    total_controls_added += added
+                    details.append({
+                        "org_id": org.id,
+                        "framework": framework_def["short_name"],
+                        "status": status,
+                        "controls_added": added,
+                    })
+                except Exception as e:
+                    await db.rollback()
+                    logger.warning(
+                        f"Failed to seed {framework_def['short_name']} "
+                        f"for org {org.id}: {e}"
+                    )
+                    details.append({
+                        "org_id": org.id,
+                        "framework": framework_def["short_name"],
+                        "status": "failed",
+                        "error": str(e)[:200],
+                    })
 
-            await db.commit()
+    logger.info(
+        f"Compliance seeding complete: "
+        f"{len(organizations)} orgs, "
+        f"{total_created} new frameworks, "
+        f"{total_controls_added} new controls"
+    )
 
-            logger.info(
-                f"Compliance seeding complete: "
-                f"{len(organizations)} orgs, "
-                f"{total_created} new frameworks, "
-                f"{total_controls_added} new controls"
-            )
-
-            return {
-                "organizations": len(organizations),
-                "frameworks_created": total_created,
-                "controls_added": total_controls_added,
-                "details": details,
-            }
-        except Exception as e:
-            logger.error(f"seed_all_compliance_frameworks failed: {e}", exc_info=True)
-            await db.rollback()
-            return {"error": str(e)}
+    return {
+        "organizations": len(organizations),
+        "frameworks_created": total_created,
+        "controls_added": total_controls_added,
+        "details": details,
+    }
