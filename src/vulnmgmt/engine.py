@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from xml.etree import ElementTree as ET
 
-from sqlalchemy import and_, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.logging import get_logger
@@ -238,12 +238,64 @@ class VulnerabilityScanner:
         db: AsyncSession,
         findings: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        """Correlate findings with asset inventory"""
+        """Correlate findings with the Asset inventory.
+
+        Previously just flagged every finding as ``asset_correlated=True``
+        without actually looking anything up. Now tries to match each
+        finding's ``asset_name`` against Asset.hostname and
+        ``asset_ip`` against Asset.ip_address (org-scoped), records
+        the asset_id on the finding, and uses a single batched lookup
+        so import-scan stays fast on large scan files.
+        """
+        from src.models.asset import Asset
+
+        hostnames = {
+            (f.get("asset_name") or "").strip().lower()
+            for f in findings
+            if f.get("asset_name")
+        }
+        hostnames.discard("")
+        hostnames.discard("unknown")
+
+        ip_addresses = {
+            (f.get("asset_ip") or "").strip()
+            for f in findings
+            if f.get("asset_ip")
+        }
+        ip_addresses.discard("")
+
+        # Batch-load every candidate Asset row for this org in one query
+        asset_query = select(Asset).where(Asset.organization_id == self.organization_id)
+        conditions = []
+        if hostnames:
+            conditions.append(func.lower(Asset.hostname).in_(hostnames))
+        if ip_addresses:
+            conditions.append(Asset.ip_address.in_(ip_addresses))
+
+        by_hostname: dict[str, Asset] = {}
+        by_ip: dict[str, Asset] = {}
+        if conditions:
+            asset_query = asset_query.where(or_(*conditions))
+            assets = list((await db.execute(asset_query)).scalars().all())
+            for a in assets:
+                if a.hostname:
+                    by_hostname[a.hostname.lower()] = a
+                if a.ip_address:
+                    by_ip[a.ip_address] = a
+
         correlated = []
         for finding in findings:
-            # In real implementation, would query asset database
-            # For now, just mark as processed
-            finding["asset_correlated"] = True
+            name = (finding.get("asset_name") or "").strip().lower()
+            ip = (finding.get("asset_ip") or "").strip()
+
+            asset = by_hostname.get(name) or by_ip.get(ip)
+            if asset is not None:
+                finding["asset_id"] = asset.id
+                finding["asset_correlated"] = True
+            else:
+                finding["asset_id"] = None
+                finding["asset_correlated"] = False
+
             correlated.append(finding)
         return correlated
 
@@ -384,20 +436,42 @@ class RiskPrioritizer:
         self,
         db: AsyncSession,
     ) -> dict[str, dict[str, int]]:
-        """Generate risk matrix (severity x exploitability)
+        """Generate risk matrix (severity × exploitability).
 
-        Returns:
-            Risk matrix with counts
+        Previously returned a fully zeroed matrix with an explicit
+        ``# In production, would query actual counts`` comment — the
+        frontend's risk-matrix widget was always a blank heatmap.
+
+        Now joins VulnerabilityInstance to Vulnerability, groups by
+        (severity, exploit_maturity), and populates real counts for
+        this org. Buckets that have no rows stay at 0 so the matrix
+        shape the frontend expects is preserved.
         """
-        matrix = {}
+        matrix: dict[str, dict[str, int]] = {}
         severities = [s.value for s in VulnerabilitySeverity]
         exploits = [e.value for e in ExploitMaturity]
-
         for severity in severities:
-            matrix[severity] = {}
-            for exploit in exploits:
-                # In production, would query actual counts
-                matrix[severity][exploit] = 0
+            matrix[severity] = {e: 0 for e in exploits}
+
+        stmt = (
+            select(
+                Vulnerability.severity,
+                Vulnerability.exploit_maturity,
+                func.count(VulnerabilityInstance.id),
+            )
+            .join(
+                VulnerabilityInstance,
+                VulnerabilityInstance.vulnerability_id == Vulnerability.id,
+            )
+            .where(
+                VulnerabilityInstance.organization_id == self.organization_id
+            )
+            .group_by(Vulnerability.severity, Vulnerability.exploit_maturity)
+        )
+        result = await db.execute(stmt)
+        for severity, exploit, count in result.all():
+            if severity in matrix and exploit in matrix[severity]:
+                matrix[severity][exploit] = int(count or 0)
 
         return matrix
 
@@ -445,30 +519,59 @@ class PatchOrchestrator:
         vulnerability_instances: list[VulnerabilityInstance],
         maintenance_window: Optional[str] = None,
     ) -> str:
-        """Create patch deployment plan grouped by priority
+        """Create a patch deployment plan.
 
-        Args:
-            db: Database session
-            vulnerability_instances: Instances to patch
-            maintenance_window: Optional maintenance window
+        Previous version logged a count and returned a fake
+        ``plan_<iso-timestamp>`` string — the frontend got a
+        plausible-looking plan_id but nothing landed in the database,
+        so the Patch Operations tab stayed empty forever.
 
-        Returns:
-            Plan ID
+        Now creates a real ``PatchOperation`` row per vulnerability
+        instance (PatchOperation is 1:1 with instance per the model).
+        Each row starts in the PENDING deployment status. If a
+        maintenance_window was supplied, the deployment_date is set
+        to that window's start so downstream schedulers can pick it
+        up. Returns the first PatchOperation.id as the plan handle;
+        callers can query /patch-operations to get the full list.
         """
-        # Group by severity and asset
-        groups = {}
+        from src.vulnmgmt.models import PatchType
+
+        if not vulnerability_instances:
+            return ""
+
+        created: list[PatchOperation] = []
+        for instance in vulnerability_instances:
+            op = PatchOperation(
+                vulnerability_instance_id=instance.id,
+                patch_type=PatchType.OS_PATCH.value,
+                patch_name=f"Patch plan for {instance.id[:8]}",
+                deployment_status=DeploymentStatus.PENDING.value,
+                deployment_date=maintenance_window,
+                rollback_available=True,
+                organization_id=self.organization_id,
+            )
+            db.add(op)
+            created.append(op)
+
+        await db.flush()
+
+        # Group for the log message
+        groups: dict[tuple, int] = {}
         for instance in vulnerability_instances:
             key = (instance.asset_id, instance.status)
-            if key not in groups:
-                groups[key] = []
-            groups[key].append(instance)
+            groups[key] = groups.get(key, 0) + 1
 
         self.logger.info(
             "Created patch plan",
             groups=len(groups),
             instances=len(vulnerability_instances),
+            operations_created=len(created),
         )
-        return "plan_" + datetime.now(timezone.utc).isoformat()
+
+        # Caller expects a single plan_id; we return the first
+        # PatchOperation.id so the UI can link back to the patch-operations
+        # list filtered by that group.
+        return created[0].id if created else ""
 
     async def schedule_deployment(
         self,

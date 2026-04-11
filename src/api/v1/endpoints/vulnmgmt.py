@@ -689,7 +689,15 @@ async def get_dashboard(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Get vulnerability management dashboard metrics"""
+    """Get vulnerability management dashboard metrics.
+
+    Previously shipped three hardcoded fake fields:
+      - risk_matrix.severity_x_exploitability = {} (empty dict)
+      - patch_compliance.compliance_percentage = 0.0
+      - kev_compliance.total_kev_tracked / kev_patched = 0
+
+    All three are now computed from real data.
+    """
     org_id = getattr(current_user, "organization_id", None)
 
     prioritizer = RiskPrioritizer(org_id)
@@ -703,6 +711,8 @@ async def get_dashboard(
     trends = await lifecycle.trend_analysis(db, days=30)
     aging = await lifecycle.aging_analysis(db)
     kev_compliance = await kev_monitor.check_kev_compliance(db)
+    # Real severity × exploit counts (was hardcoded {})
+    risk_matrix_counts = await prioritizer.generate_risk_matrix(db)
 
     # Get top vulnerabilities
     result = await db.execute(
@@ -712,8 +722,22 @@ async def get_dashboard(
     )
     top_vulns = result.scalars().all()
 
+    # --- Real patch_compliance_percentage ---
+    total_ops = patch_report.get("total_operations", 0) or 0
+    patched_ops = (patch_report.get("verified", 0) or 0) + (patch_report.get("deployed", 0) or 0)
+    patch_pct = round((patched_ops / total_ops) * 100.0, 1) if total_ops > 0 else 0.0
+
+    # --- Real KEV tracked/patched totals ---
+    # check_kev_compliance returns compliant/non_compliant; total is
+    # their sum, and kev_patched is the compliant count (BOD 22-01
+    # defines compliant as "patched within the due date").
+    kev_total = int(kev_compliance.get("compliant", 0) or 0) + int(
+        kev_compliance.get("non_compliant", 0) or 0
+    )
+    kev_patched = int(kev_compliance.get("compliant", 0) or 0)
+
     return DashboardMetrics(
-        risk_matrix=RiskMatrix(severity_x_exploitability={}),
+        risk_matrix=RiskMatrix(severity_x_exploitability=risk_matrix_counts),
         sla_compliance=SLAComplianceMetrics(
             total=sla_compliance["total"],
             within_sla=sla_compliance["within_sla"],
@@ -722,17 +746,17 @@ async def get_dashboard(
             compliance_percentage=sla_compliance["compliance_percentage"],
         ),
         patch_compliance={
-            "total_vulnerabilities": patch_report.get("total_operations", 0),
-            "patched": patch_report.get("verified", 0),
-            "compliance_percentage": 0.0,
+            "total_vulnerabilities": total_ops,
+            "patched": patched_ops,
+            "compliance_percentage": patch_pct,
         },
         trends_30_days=trends,
         aging=aging,
         top_vulnerabilities=[VulnerabilityInstanceResponse.model_validate(v) for v in top_vulns],
         kev_compliance=KEVComplianceReport(
             report_date=datetime.now(timezone.utc).isoformat(),
-            total_kev_tracked=0,
-            kev_patched=0,
+            total_kev_tracked=kev_total,
+            kev_patched=kev_patched,
             kev_compliant=kev_compliance["compliant"],
             kev_non_compliant=kev_compliance["non_compliant"],
             compliance_percentage=kev_compliance["compliance_percentage"],
