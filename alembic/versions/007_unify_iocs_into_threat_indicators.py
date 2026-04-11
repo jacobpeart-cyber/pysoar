@@ -45,6 +45,7 @@ Deduplication: if a threat_indicators row already exists with the same
 summed, context extras overlaid — rather than duplicated.
 """
 
+import json
 from datetime import datetime, timezone
 
 import sqlalchemy as sa
@@ -169,14 +170,14 @@ def upgrade() -> None:
             bind.execute(
                 sa.text(
                     "UPDATE threat_indicators "
-                    "SET context = :ctx, "
+                    "SET context = CAST(:ctx AS jsonb), "
                     "    sighting_count = :cnt, "
                     "    last_sighting_at = COALESCE(:lsa, last_sighting_at), "
                     "    last_seen = COALESCE(:ls, last_seen) "
                     "WHERE id = :id"
                 ),
                 {
-                    "ctx": merged_ctx,
+                    "ctx": json.dumps(merged_ctx),
                     "cnt": merged_count,
                     "lsa": last_sighting_at,
                     "ls": last_seen,
@@ -186,7 +187,8 @@ def upgrade() -> None:
             merged += 1
             continue
 
-        # Insert fresh row in threat_indicators
+        # Insert fresh row in threat_indicators — JSON columns need to be
+        # cast explicitly for asyncpg, so we pass strings and CAST.
         bind.execute(
             sa.text(
                 "INSERT INTO threat_indicators ("
@@ -198,7 +200,8 @@ def upgrade() -> None:
                 ") VALUES ("
                 ":id, :itype, :value, :source, :confidence, :severity, "
                 ":is_active, :is_whitelisted, :first_seen, :last_seen, :expires_at, "
-                ":mtact, :mtech, :tags, :ctx, :related, "
+                "CAST(:mtact AS jsonb), CAST(:mtech AS jsonb), CAST(:tags AS jsonb), "
+                "CAST(:ctx AS jsonb), CAST(:related AS jsonb), "
                 ":sc, :lsa, 0, "
                 ":created_at, :updated_at)"
             ),
@@ -214,11 +217,11 @@ def upgrade() -> None:
                 "first_seen": first_seen,
                 "last_seen": last_seen,
                 "expires_at": expires_at,
-                "mtact": mitre_tactics,
-                "mtech": mitre_techniques,
-                "tags": tags,
-                "ctx": ctx,
-                "related": [],
+                "mtact": json.dumps(mitre_tactics),
+                "mtech": json.dumps(mitre_techniques),
+                "tags": json.dumps(tags),
+                "ctx": json.dumps(ctx),
+                "related": json.dumps([]),
                 "sc": legacy.get("sighting_count") or 0,
                 "lsa": last_sighting_at,
                 "created_at": legacy.get("created_at") or datetime.now(timezone.utc),
