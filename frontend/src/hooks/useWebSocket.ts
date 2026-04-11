@@ -32,6 +32,26 @@ function getWebSocketUrl(): string {
 
 const RECONNECT_DELAYS = [1000, 2000, 4000, 8000, 16000, 30000]; // max 30s
 
+// If the WebSocket fails this many times in a row, assume the deployment is
+// behind a reverse proxy that strips the Upgrade header (APISIX, some CDNs,
+// some ALBs) and fall back to HTTP polling instead of spamming the console.
+const MAX_WS_ATTEMPTS_BEFORE_POLLING_FALLBACK = 3;
+
+// Polling interval when running in fallback mode. 15s is a reasonable
+// latency for SOC dashboards — alerts/incidents are not sub-second events.
+const POLLING_FALLBACK_INTERVAL_MS = 15000;
+
+// Query keys that get invalidated on a "simulated tick" in polling mode.
+// Must match the invalidation list inside the ws.onmessage handler below.
+const POLLING_INVALIDATION_KEYS = [
+  ['alerts'],
+  ['incidents'],
+  ['playbooks'],
+  ['threats'],
+  ['iocs'],
+  ['compliance'],
+] as const;
+
 export function useWebSocket(): UseWebSocketReturn {
   const { token } = useAuth();
   const queryClient = useQueryClient();
@@ -43,6 +63,34 @@ export function useWebSocket(): UseWebSocketReturn {
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const heartbeatTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const mountedRef = useRef(true);
+  const pollingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pollingFallbackActiveRef = useRef(false);
+
+  const startPollingFallback = useCallback(() => {
+    if (pollingFallbackActiveRef.current) return;
+    pollingFallbackActiveRef.current = true;
+    // Quiet single info line so developers know what's happening without
+    // a wall of red errors.
+    console.info(
+      '[PySOAR] Real-time WebSocket unavailable (reverse proxy strips Upgrade headers); ' +
+      `falling back to HTTP polling every ${POLLING_FALLBACK_INTERVAL_MS / 1000}s.`
+    );
+    setIsConnected(false);
+    pollingIntervalRef.current = setInterval(() => {
+      if (!mountedRef.current) return;
+      for (const key of POLLING_INVALIDATION_KEYS) {
+        queryClient.invalidateQueries({ queryKey: key });
+      }
+    }, POLLING_FALLBACK_INTERVAL_MS);
+  }, [queryClient]);
+
+  const stopPollingFallback = useCallback(() => {
+    if (pollingIntervalRef.current) {
+      clearInterval(pollingIntervalRef.current);
+      pollingIntervalRef.current = null;
+    }
+    pollingFallbackActiveRef.current = false;
+  }, []);
 
   // Exponential backoff reconnect delay
   const getReconnectDelay = useCallback(() => {
@@ -90,6 +138,8 @@ export function useWebSocket(): UseWebSocketReturn {
           console.log('WebSocket connected');
           setIsConnected(true);
           reconnectAttemptRef.current = 0;
+          // If we had fallen back to polling, stop that — WS is back.
+          stopPollingFallback();
           startHeartbeat();
         }
       };
@@ -148,16 +198,21 @@ export function useWebSocket(): UseWebSocketReturn {
       ws.onclose = () => {
         if (!mountedRef.current) return;
 
-        console.log('WebSocket disconnected');
         stopHeartbeat();
         setIsConnected(false);
         wsRef.current = null;
 
-        // Attempt to reconnect with exponential backoff
+        // If we've hit the threshold, give up on WebSocket and switch
+        // to polling. Don't spam the console or keep hammering the proxy.
+        if (reconnectAttemptRef.current >= MAX_WS_ATTEMPTS_BEFORE_POLLING_FALLBACK) {
+          startPollingFallback();
+          return;
+        }
+
+        // Otherwise, silent retry with backoff.
         if (token && mountedRef.current) {
           const delay = getReconnectDelay();
           reconnectAttemptRef.current += 1;
-          console.log(`Reconnecting in ${delay}ms (attempt ${reconnectAttemptRef.current})`);
 
           reconnectTimeoutRef.current = setTimeout(() => {
             if (mountedRef.current) {
@@ -167,15 +222,20 @@ export function useWebSocket(): UseWebSocketReturn {
         }
       };
 
-      ws.onerror = (error) => {
-        console.error('WebSocket error:', error);
+      // Swallow error events silently — onclose will run next and handle
+      // the retry / fallback logic. Logging the raw error Event object
+      // creates noise without any actionable information.
+      ws.onerror = () => {
+        /* handled by onclose */
       };
 
       wsRef.current = ws;
-    } catch (e) {
-      console.error('Failed to create WebSocket connection:', e);
+    } catch {
+      // If the WebSocket constructor itself throws (rare — usually a
+      // malformed URL), skip straight to the polling fallback.
+      startPollingFallback();
     }
-  }, [token, getReconnectDelay, startHeartbeat, stopHeartbeat, queryClient]);
+  }, [token, getReconnectDelay, startHeartbeat, stopHeartbeat, queryClient, startPollingFallback, stopPollingFallback]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -193,13 +253,14 @@ export function useWebSocket(): UseWebSocketReturn {
       }
 
       stopHeartbeat();
+      stopPollingFallback();
 
       if (wsRef.current) {
         wsRef.current.close();
         wsRef.current = null;
       }
     };
-  }, [connect, token, stopHeartbeat]);
+  }, [connect, token, stopHeartbeat, stopPollingFallback]);
 
   const subscribe = useCallback((channel: string) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
