@@ -122,6 +122,101 @@ async def enroll_agent(
     )
 
 
+@router.get("/dashboard")
+async def agents_dashboard(
+    current_user: CurrentUser = None,
+    session: DatabaseSession = None,
+) -> dict:
+    """Stats feed for the AgentManagement UI tile row.
+
+    Returns aggregate counts and a recent-activity window. Scoped to
+    the caller's organization. Lazy-refreshes stale-offline flips on
+    every call so the numbers stay fresh without a separate cron.
+    """
+    from sqlalchemy import func as _func
+
+    try:
+        await AgentService(session).mark_stale_agents_offline()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"mark_stale_agents_offline failed: {e}")
+
+    org_id = getattr(current_user, "organization_id", None)
+
+    def _scope(q):
+        if org_id is None:
+            return q
+        return q.where(EndpointAgent.organization_id == org_id)
+
+    def _scope_cmd(q):
+        if org_id is None:
+            return q
+        return q.where(AgentCommand.organization_id == org_id)
+
+    total = (await session.execute(_scope(select(_func.count(EndpointAgent.id))))).scalar() or 0
+    active = (await session.execute(
+        _scope(select(_func.count(EndpointAgent.id))).where(EndpointAgent.status == "active")
+    )).scalar() or 0
+    offline = (await session.execute(
+        _scope(select(_func.count(EndpointAgent.id))).where(EndpointAgent.status == "offline")
+    )).scalar() or 0
+    pending_enroll = (await session.execute(
+        _scope(select(_func.count(EndpointAgent.id))).where(EndpointAgent.status == "pending")
+    )).scalar() or 0
+
+    # Commands in flight
+    in_flight_statuses = ("queued", "dispatched", "running")
+    in_flight = (await session.execute(
+        _scope_cmd(select(_func.count(AgentCommand.id))).where(
+            AgentCommand.status.in_(in_flight_statuses)
+        )
+    )).scalar() or 0
+    awaiting = (await session.execute(
+        _scope_cmd(select(_func.count(AgentCommand.id))).where(
+            AgentCommand.status == "awaiting_approval"
+        )
+    )).scalar() or 0
+
+    # Capability breakdown (in-Python count since JSON array filtering
+    # is dialect-specific)
+    all_agents = list(
+        (await session.execute(_scope(select(EndpointAgent)))).scalars().all()
+    )
+    cap_counts: dict[str, int] = {"bas": 0, "ir": 0, "purple": 0}
+    for a in all_agents:
+        for c in a.capabilities or []:
+            if c in cap_counts:
+                cap_counts[c] += 1
+
+    # Recent commands (last 20)
+    recent_stmt = _scope_cmd(select(AgentCommand)).order_by(
+        desc(AgentCommand.created_at)
+    ).limit(20)
+    recent_cmds = list((await session.execute(recent_stmt)).scalars().all())
+
+    return {
+        "total_agents": total,
+        "active_agents": active,
+        "offline_agents": offline,
+        "pending_enroll": pending_enroll,
+        "capability_counts": cap_counts,
+        "commands_in_flight": in_flight,
+        "commands_awaiting_approval": awaiting,
+        "recent_commands": [
+            {
+                "id": c.id,
+                "action": c.action,
+                "status": c.status,
+                "agent_id": c.agent_id,
+                "created_at": c.created_at.isoformat() if c.created_at else None,
+                "completed_at": c.completed_at.isoformat() if c.completed_at else None,
+                "incident_id": c.incident_id,
+                "simulation_id": c.simulation_id,
+            }
+            for c in recent_cmds
+        ],
+    }
+
+
 @router.get("", response_model=AgentListResponse)
 async def list_agents(
     current_user: CurrentUser = None,

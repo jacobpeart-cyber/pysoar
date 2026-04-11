@@ -51,6 +51,9 @@ import WarRoom from './pages/WarRoom'
 import PhishingSimulation from './pages/PhishingSimulation'
 import TicketHub from './pages/TicketHub'
 import FedRAMP from './pages/FedRAMP'
+import AgentManagement from './pages/AgentManagement'
+import LiveResponse from './pages/LiveResponse'
+import PurpleTeam from './pages/PurpleTeam'
 import NotFound from './pages/NotFound'
 
 import React from 'react'
@@ -192,6 +195,9 @@ function AppRoutes() {
         <Route path="phishing" element={<PhishingSimulation />} />
         <Route path="ticket-hub" element={<TicketHub />} />
         <Route path="fedramp" element={<FedRAMP />} />
+        <Route path="agents" element={<AgentManagement />} />
+        <Route path="live-response" element={<LiveResponse />} />
+        <Route path="purple-team" element={<PurpleTeam />} />
       </Route>
       <Route path="*" element={<NotFound />} />
     </Routes>

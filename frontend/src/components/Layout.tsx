@@ -53,6 +53,9 @@ import {
   MessageSquare,
   Mail,
   Ticket,
+  Cpu,
+  Terminal,
+  Swords,
 } from 'lucide-react';
 import { useState, useEffect } from 'react';
 import clsx from 'clsx';
@@ -94,6 +97,9 @@ const navigation = [
   { name: 'War Room', href: '/warroom', icon: MessageSquare },
   { name: 'Ticket Hub', href: '/ticket-hub', icon: Ticket },
   { name: 'FedRAMP', href: '/fedramp', icon: Shield },
+  { name: 'Endpoint Agents', href: '/agents', icon: Cpu },
+  { name: 'Live Response', href: '/live-response', icon: Terminal },
+  { name: 'Purple Team', href: '/purple-team', icon: Swords },
   { name: 'Phishing Sim', href: '/phishing', icon: Mail },
   { name: 'Playbooks', href: '/playbooks', icon: Zap },
   { name: 'Assets', href: '/assets', icon: Server },

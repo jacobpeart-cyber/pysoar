@@ -33,6 +33,21 @@ from src.core.logging import get_logger
 logger = get_logger(__name__)
 
 
+async def _broadcast(channel: str, message: dict[str, Any]) -> None:
+    """Best-effort WebSocket publish — never blocks or raises.
+
+    Used to push real-time agent-command events into the PySOAR
+    frontend (the AgentManagement live table, the LiveResponse result
+    stream, the PurpleTeam correlation view). Any failure is logged
+    and swallowed so the HTTP path stays on the happy path.
+    """
+    try:
+        from src.services.websocket_manager import manager as _ws_manager
+        await _ws_manager.broadcast_channel(channel, message)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"ws broadcast {channel} failed: {exc}")
+
+
 # Agents are considered offline if they haven't checked in for this long
 HEARTBEAT_LIVENESS_SECONDS = 120
 
@@ -258,6 +273,23 @@ class AgentService:
             f"Queued command id={cmd.id} action={action} agent={agent.id} "
             f"status={status}"
         )
+
+        # Real-time broadcast so AgentManagement, LiveResponse, and
+        # Purple Team views update without a poll.
+        event = {
+            "type": "agent_command_queued",
+            "command_id": cmd.id,
+            "agent_id": agent.id,
+            "hostname": agent.hostname,
+            "action": action,
+            "status": status,
+            "approval_required": needs_approval,
+            "simulation_id": simulation_id,
+            "incident_id": incident_id,
+        }
+        await _broadcast("agents", event)
+        if simulation_id:
+            await _broadcast(f"purple:{simulation_id}", event)
         return cmd
 
     async def approve_command(
@@ -321,6 +353,17 @@ class AgentService:
             c.dispatched_at = now
         if commands:
             await self.session.flush()
+            for c in commands:
+                event = {
+                    "type": "agent_command_dispatched",
+                    "command_id": c.id,
+                    "agent_id": agent.id,
+                    "hostname": agent.hostname,
+                    "action": c.action,
+                }
+                await _broadcast("agents", event)
+                if c.simulation_id:
+                    await _broadcast(f"purple:{c.simulation_id}", event)
         return commands
 
     async def ingest_result(
@@ -374,6 +417,22 @@ class AgentService:
 
         await self.session.flush()
         await self.session.refresh(result)
+
+        event = {
+            "type": "agent_command_result",
+            "command_id": command_id,
+            "agent_id": agent.id,
+            "hostname": agent.hostname,
+            "action": cmd.action,
+            "status": cmd.status,
+            "exit_code": exit_code,
+            "duration_seconds": duration_seconds,
+            "stdout_preview": (stdout or "")[:512],
+            "stderr_preview": (stderr or "")[:512],
+        }
+        await _broadcast("agents", event)
+        if cmd.simulation_id:
+            await _broadcast(f"purple:{cmd.simulation_id}", event)
         return result
 
     # ------------------------------------------------------------------
