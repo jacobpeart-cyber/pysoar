@@ -508,25 +508,18 @@ class FeedManager:
 
         # Built-in feeds — all keyless, all free, all publicly accessible.
         # The "plain" feed_type uses PlainListFeedParser which auto-detects
-        # indicator_type from each line (IPv4/domain/URL/hash).
+        # indicator_type from each line (IPv4/CIDR/URL/domain/hash).
         self.builtin_feeds = [
             {
-                "name": "Abuse.ch Feodo Tracker",
+                "name": "Abuse.ch Feodo Tracker (Aggressive)",
                 "feed_type": "plain",
-                "url": "https://feodotracker.abuse.ch/downloads/ipblocklist.csv",
+                # The "aggressive" list includes historical C2 infrastructure
+                # (~8000 IPs) — operators reuse infra, so historical is the
+                # signal, not noise. The "recommended" list only has ~5
+                # currently-online IPs which is useless for detection.
+                "url": "https://feodotracker.abuse.ch/downloads/ipblocklist_aggressive.csv",
                 "provider": "Abuse.ch",
-                "description": "Botnet C&C IPs (Emotet, Dridex, QakBot, TrickBot, BazarLoader)",
-                "is_builtin": True,
-                "is_enabled": True,
-                "poll_interval_minutes": 60,
-                "confidence_weight": 0.95,
-            },
-            {
-                "name": "Abuse.ch SSL Blacklist",
-                "feed_type": "plain",
-                "url": "https://sslbl.abuse.ch/blacklist/sslipblacklist.csv",
-                "provider": "Abuse.ch",
-                "description": "IPs hosting malicious SSL certificates (botnet C2)",
+                "description": "Historical + active botnet C&C IPs (Emotet, Dridex, QakBot, TrickBot, BazarLoader)",
                 "is_builtin": True,
                 "is_enabled": True,
                 "poll_interval_minutes": 60,
@@ -564,6 +557,39 @@ class FeedManager:
                 "is_enabled": True,
                 "poll_interval_minutes": 360,
                 "confidence_weight": 1.0,
+            },
+            {
+                "name": "CINS Army List",
+                "feed_type": "plain",
+                "url": "http://cinsscore.com/list/ci-badguys.txt",
+                "provider": "Sentinel IPS",
+                "description": "Top ~15,000 highest-scoring attacker IPs seen by Sentinel IPS sensor network",
+                "is_builtin": True,
+                "is_enabled": True,
+                "poll_interval_minutes": 180,
+                "confidence_weight": 0.85,
+            },
+            {
+                "name": "Blocklist.de All",
+                "feed_type": "plain",
+                "url": "https://lists.blocklist.de/lists/all.txt",
+                "provider": "blocklist.de",
+                "description": "Attackers seen by >700 fail2ban / log analyzer sensors (SSH brute force, web attacks, IMAP, mail)",
+                "is_builtin": True,
+                "is_enabled": True,
+                "poll_interval_minutes": 120,
+                "confidence_weight": 0.85,
+            },
+            {
+                "name": "Binary Defense Banlist",
+                "feed_type": "plain",
+                "url": "https://www.binarydefense.com/banlist.txt",
+                "provider": "Binary Defense",
+                "description": "Artillery Threat Intelligence Feed — curated attacker IPs",
+                "is_builtin": True,
+                "is_enabled": True,
+                "poll_interval_minutes": 360,
+                "confidence_weight": 0.9,
             },
         ]
 
@@ -830,19 +856,45 @@ class FeedManager:
             "success_rate": 0.0,
         }
 
+    # Feeds that used to be built-in but are deprecated/upstream-dead.
+    # Rows with these names (is_builtin=True) are removed on startup.
+    _DEPRECATED_FEED_NAMES = (
+        "Abuse.ch SSL Blacklist",  # abuse.ch deprecated it 2025-01-03
+        "Abuse.ch Feodo Tracker",  # replaced by "Abuse.ch Feodo Tracker (Aggressive)"
+        "Abuse.ch MalwareBazaar",  # old stub, no parser
+        "AlienVault OTX",  # old stub, needs API key
+        "PhishTank",  # old stub, needs API key
+        "EmergingThreats",  # old stub, wrong URL
+    )
+
     async def register_builtin_feeds(self) -> int:
         """Register built-in threat feeds in the database.
 
         Idempotent — existing builtin feeds (matched by name) are updated
-        in place, not duplicated. Returns the number of NEW feeds created.
+        in place, not duplicated. Deprecated built-ins are removed.
+        Returns the number of NEW feeds created this call.
         """
         from src.core.database import async_session_factory
-        from sqlalchemy import select
+        from sqlalchemy import select, delete
 
         self.logger.info("Registering built-in feeds", count=len(self.builtin_feeds))
 
         created = 0
         async with async_session_factory() as session:
+            # 1. Purge any deprecated built-in feeds (and their indicators
+            #    cascade-delete via the ThreatFeed.indicators relationship).
+            for dead_name in self._DEPRECATED_FEED_NAMES:
+                result = await session.execute(
+                    select(ThreatFeed).where(
+                        ThreatFeed.name == dead_name,
+                        ThreatFeed.is_builtin == True,  # noqa: E712
+                    )
+                )
+                dead = result.scalar_one_or_none()
+                if dead:
+                    self.logger.info("Removing deprecated builtin feed", name=dead_name)
+                    await session.delete(dead)
+            await session.flush()
             for feed_def in self.builtin_feeds:
                 existing = await session.execute(
                     select(ThreatFeed).where(ThreatFeed.name == feed_def["name"])
