@@ -258,13 +258,23 @@ class SimulationOrchestrator:
             test.executor = test_cmd.get("executor", "powershell")
             test.command_executed = command
 
-            # Simulate command execution (in production, would actually execute)
-            output = f"[SIMULATED] Executed: {command}\nTest output simulated"
-            test.output = output
+            # This is a simulation engine — we never actually execute the
+            # technique's command on a target. The value of the engine comes
+            # from measuring whether the organization's deployed detection
+            # rules COVER the technique. Coverage is deterministic and based
+            # on the detection_rules table (MITRE technique mapping).
+            test.output = (
+                f"[SIMULATED] Technique {technique.mitre_id} test plan:\n"
+                f"  executor: {test_cmd.get('executor', 'powershell')}\n"
+                f"  command: {command}\n"
+                f"  description: {technique.description or ''}\n"
+                f"  (Real execution requires agent deployment — "
+                f"this run scored coverage against detection rules only.)"
+            )
             test.status = "passed"
 
-            # Check for detection (with timeout)
-            detected = await self._check_detection(test, wait_seconds=300)
+            # Deterministic detection lookup against active detection rules
+            detected = await self._check_detection(test, technique)
             test.was_detected = detected
 
             # Run cleanup if test passed and cleanup command exists
@@ -289,42 +299,68 @@ class SimulationOrchestrator:
             "detection_time": test.detection_time_seconds
         }
 
-    async def _check_detection(self, test: SimulationTest, wait_seconds: int = 300) -> bool:
+    async def _check_detection(
+        self,
+        test: SimulationTest,
+        technique: "AttackTechnique",
+    ) -> bool:
         """
-        Check if SIEM detected the simulation activity.
+        Determine whether this technique is covered by the org's detection rules.
 
-        Polls for detection results within the specified timeout period.
+        This is the scoring heart of the BAS engine. It is **deterministic**
+        (the same technique always scores the same way for a given ruleset)
+        and it reflects the *real* coverage of the platform's DetectionRule
+        table. That way the security posture score actually measures
+        something — "do you have a rule that claims to detect this MITRE
+        technique?" — instead of random noise.
 
-        Args:
-            test: SimulationTest to check
-            wait_seconds: Maximum seconds to wait for detection
-
-        Returns:
-            True if activity was detected, False if timeout or not detected
+        Detection is granted if ANY active detection rule lists this
+        technique's mitre_id in its ``mitre_techniques`` JSON array.
         """
-        start_time = time.time()
-        poll_interval = 5  # seconds
+        from src.siem.models import DetectionRule, RuleStatus
 
-        while time.time() - start_time < wait_seconds:
-            # In production, would query actual SIEM/EDR
-            # For simulation: randomly determine detection based on test setup
-            import random
-            detected = random.random() > 0.3  # 70% detection rate
+        mitre_id = technique.mitre_id
+        if not mitre_id:
+            return False
 
-            if detected:
-                elapsed = int(time.time() - start_time)
-                test.detection_time_seconds = elapsed
-                test.detection_source = "simulated_siem"
-                test.detection_details = {
-                    "rule_id": "SIM_TEST_001",
-                    "alert_severity": "medium",
-                    "detected_at": datetime.utcnow().isoformat()
-                }
-                return True
+        # Active detection rules whose mitre_techniques contains this id.
+        # ``mitre_techniques`` is a Text column holding a JSON array, so we
+        # use SQL LIKE to pre-filter and then confirm in Python against a
+        # parsed list to avoid false positives (e.g. "T1059" matching "T10591").
+        stmt = select(DetectionRule).where(
+            and_(
+                DetectionRule.status == RuleStatus.ACTIVE.value,
+                DetectionRule.mitre_techniques.is_not(None),
+                DetectionRule.mitre_techniques.like(f"%{mitre_id}%"),
+            )
+        )
+        result = await self.session.execute(stmt)
+        candidates = list(result.scalars().all())
 
-            await asyncio.sleep(poll_interval)
+        matching_rule = None
+        for rule in candidates:
+            try:
+                rule_techniques = json.loads(rule.mitre_techniques or "[]")
+            except (ValueError, TypeError):
+                continue
+            if isinstance(rule_techniques, list) and mitre_id in rule_techniques:
+                matching_rule = rule
+                break
 
-        return False
+        if matching_rule is None:
+            return False
+
+        test.detection_time_seconds = 0  # instantaneous: we're scoring coverage, not latency
+        test.detection_source = f"detection_rule:{matching_rule.name}"
+        test.detection_details = {
+            "rule_id": matching_rule.id,
+            "rule_name": matching_rule.name,
+            "rule_title": matching_rule.title,
+            "alert_severity": matching_rule.severity,
+            "matched_at": utc_now().isoformat(),
+            "match_type": "mitre_technique_mapping",
+        }
+        return True
 
     async def _run_cleanup(self, test: SimulationTest, cleanup_command: str) -> bool:
         """
@@ -1027,7 +1063,7 @@ class AdversaryEmulator:
                 target_sectors=profile_data.get("target_sectors", []),
                 tools_used=profile_data.get("tools_used", []),
                 is_builtin=profile_data.get("is_builtin", True),
-                organization_id="builtin",  # System-wide profiles
+                organization_id=None,  # Built-in profiles are global reference data
                 created_at=utc_now(),
                 updated_at=utc_now(),
             )
@@ -1038,8 +1074,18 @@ class AdversaryEmulator:
         logger.info(f"Loaded {count} built-in adversary profiles")
         return count
 
-    async def create_emulation_plan(self, adversary_id: str, organization_id: str) -> AttackSimulation:
-        """Create an attack simulation based on an adversary profile."""
+    async def create_emulation_plan(
+        self,
+        adversary_id: str,
+        organization_id: Optional[str],
+        created_by: str,
+    ) -> AttackSimulation:
+        """Create an attack simulation based on an adversary profile.
+
+        ``created_by`` must be a real user id — attack_simulations.created_by
+        is an FK into the users table. Previously this method hardcoded
+        "system" which violated the FK and blew up every emulation.
+        """
         stmt = select(AdversaryProfile).where(AdversaryProfile.id == adversary_id)
         result = await self.session.execute(stmt)
         profile = result.scalar_one_or_none()
@@ -1054,7 +1100,7 @@ class AdversaryEmulator:
             techniques=profile.ttps,
             scope={"target": "lab_environment"},
             target_environment="lab",
-            created_by="system",
+            created_by=created_by,
             organization_id=organization_id,
             description=f"Emulation of {profile.name} attack patterns: {', '.join(profile.objectives)}"
         )

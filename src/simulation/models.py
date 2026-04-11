@@ -46,9 +46,9 @@ class AttackSimulation(BaseModel):
     mitre_tactics: Mapped[list] = mapped_column(JSON, default=[], nullable=False)
     mitre_techniques: Mapped[list] = mapped_column(JSON, default=[], nullable=False)
 
-    scheduled_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
-    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
-    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    scheduled_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     duration_seconds: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
 
     total_tests: Mapped[int] = mapped_column(Integer, default=0)
@@ -179,8 +179,8 @@ class SimulationTest(BaseModel):
     output: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     error_output: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
-    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
-    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     was_detected: Mapped[Optional[bool]] = mapped_column(Boolean, nullable=True)
     detection_time_seconds: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
@@ -237,7 +237,12 @@ class AdversaryProfile(BaseModel):
     tools_used: Mapped[list] = mapped_column(JSON, default=[], nullable=False)
 
     is_builtin: Mapped[bool] = mapped_column(Boolean, default=False)
-    organization_id: Mapped[str] = mapped_column(String(36), ForeignKey("organizations.id"), nullable=False)
+    # Nullable so built-in reference profiles (APT29, FIN7, etc.) can exist
+    # globally without being tied to a specific org. Tenant-authored
+    # profiles still set this to their owning org.
+    organization_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("organizations.id"), nullable=True
+    )
 
     def __repr__(self) -> str:
         return f"<AdversaryProfile(id={self.id}, name={self.name})>"
