@@ -525,6 +525,11 @@ async def run_threat_scan(
 
     scanned = len(identities)
     created = 0
+    # Collect (identity, threat_type, severity) tuples so we can fire
+    # automation.on_itdr_threat for each one AFTER the flush — that
+    # keeps the event fan-out outside the tight loop and ensures the
+    # threat row is committed before downstream handlers read it.
+    fired_threats: list[tuple[str, str, str, str]] = []
     for identity in identities:
         # role_assignments is a JSON list on the model, not a scalar role.
         role_list = getattr(identity, "role_assignments", None) or []
@@ -557,6 +562,10 @@ async def run_threat_scan(
                 },
             ):
                 created += 1
+                fired_threats.append(
+                    ("dormant_admin", identity.username, "high",
+                     "Dormant privileged account retains admin privileges")
+                )
 
         # 2) mfa_missing_privileged
         if is_privileged and not getattr(identity, "mfa_enabled", False):
@@ -571,6 +580,10 @@ async def run_threat_scan(
                 },
             ):
                 created += 1
+                fired_threats.append(
+                    ("mfa_missing_privileged", identity.username, "critical",
+                     "Privileged identity has no MFA enrolled")
+                )
 
         # 3) stale_credential (password > 180 days old)
         last_pw = _parse_iso(getattr(identity, "last_password_change", None))
@@ -587,8 +600,38 @@ async def run_threat_scan(
                 },
             ):
                 created += 1
+                fired_threats.append(
+                    ("stale_credential", identity.username, "medium",
+                     f"Password last rotated {age_days} days ago")
+                )
 
     await db.flush()
+
+    # Fan out to the cross-module automation pipeline. Each threat
+    # that was actually created (not deduped) fires on_itdr_threat,
+    # which creates an Alert and runs the full on_alert_created chain
+    # (IOC match -> auto-incident -> war room -> remediation policy
+    # eval -> agent containment if affected_systems is set). Failures
+    # are logged but don't roll back the scan — we'd rather have the
+    # threat rows persisted than lose the whole scan on an
+    # automation hiccup.
+    try:
+        automation = AutomationService(db)
+        for threat_type, username, severity, details in fired_threats:
+            try:
+                await automation.on_itdr_threat(
+                    threat_type=threat_type,
+                    identity=username,
+                    risk_level=severity,
+                    details=details,
+                    organization_id=org_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    f"on_itdr_threat failed for {username}/{threat_type}: {exc}"
+                )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"AutomationService setup failed during threat scan: {exc}")
 
     logger.info(
         f"Identity threat scan complete: scanned={scanned} created={created}"
@@ -764,6 +807,30 @@ async def check_credential_exposure(
         f"Credential exposure check for {identity_id}: "
         f"{len(leak_rows)} leaks matched, {len(new_exposures)} new exposures created"
     )
+
+    # Cross-module loop: NEW credential exposures are high-severity
+    # events that should kick the full automation chain. Use the
+    # darkweb handler because that's where the evidence lives — it
+    # creates an Alert with source=darkweb and fires on_alert_created
+    # (IOC match / auto-incident / remediation policy eval).
+    if new_exposures:
+        try:
+            automation = AutomationService(db)
+            sources = sorted({e.breach_name or "unknown" for e in new_exposures})
+            await automation.on_darkweb_finding(
+                finding_type="exposed_credentials",
+                description=(
+                    f"{len(new_exposures)} new credential exposure(s) found for "
+                    f"{identity.email or identity.username} in breaches: "
+                    f"{', '.join(sources)}"
+                ),
+                severity="high",
+                organization_id=org_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"on_darkweb_finding failed for new credential exposures: {exc}"
+            )
 
     return {
         "status": "completed",

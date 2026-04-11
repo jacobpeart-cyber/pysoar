@@ -212,7 +212,17 @@ async def import_scan_results(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Import vulnerability scan results"""
+    """Import vulnerability scan results.
+
+    Critical + high-severity new vulnerabilities fire
+    ``automation.on_vulnerability_found`` one by one so each lands an
+    Alert that runs the full cross-module pipeline (IOC match,
+    auto-incident, war room, remediation policy eval, agent
+    containment). This closes the loop from scanner import through
+    to agent-level response — previously a Nessus import of 500
+    critical CVEs created DB rows (or before Page 18, not even that)
+    without ever notifying anyone.
+    """
     org_id = getattr(current_user, "organization_id", None)
 
     try:
@@ -224,6 +234,35 @@ async def import_scan_results(
             scan_id=scan_request.scan_profile_id,
             discovery_source=scan_request.scan_format,
         )
+
+        # Fan out each new critical/high finding into the automation
+        # pipeline. Capped at 50 events per import to protect against
+        # a poisoned scan file producing 50,000 alerts in a loop.
+        new_critical = result.get("new_critical") or []
+        automation_fired = 0
+        if new_critical:
+            try:
+                automation = AutomationService(db)
+                for finding in new_critical[:50]:
+                    try:
+                        await automation.on_vulnerability_found(
+                            cve_id=finding.get("cve_id", "UNKNOWN"),
+                            title=finding.get("title", "Unknown"),
+                            affected_asset=finding.get("asset_name", "unknown"),
+                            severity=finding.get("severity", "high"),
+                            organization_id=org_id,
+                        )
+                        automation_fired += 1
+                    except Exception as inner_exc:  # noqa: BLE001
+                        logger.warning(
+                            "on_vulnerability_found failed",
+                            cve=finding.get("cve_id"),
+                            error=str(inner_exc),
+                        )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"Automation fan-out failed on import: {exc}")
+        result["automation_events_fired"] = automation_fired
+
         logger.info(
             "Scan imported successfully",
             org_id=org_id,
@@ -574,7 +613,25 @@ async def schedule_patch(
     db: DatabaseSession = None,
     patch_id: str = Path(...),
 ):
-    """Schedule patch deployment"""
+    """Schedule patch deployment and dispatch to agent when possible.
+
+    After scheduling the operation, look up the affected asset's
+    hostname via the VulnerabilityInstance -> Asset chain and, if an
+    IR-capable agent is enrolled for that host, queue a
+    ``run_atomic_test`` command on the Agent Platform referencing
+    the patch's fix. ``run_atomic_test`` is the closest existing
+    agent action for a shell remediation — the operator can later
+    wire a dedicated ``run_patch_script`` action if the Agent
+    Platform gains one. High-blast actions go through the standard
+    awaiting_approval gate so a second analyst signs off before the
+    command actually runs on the host.
+    """
+    from src.agents.capabilities import AgentAction, AgentCapability
+    from src.agents.models import EndpointAgent
+    from src.agents.service import AgentService
+    from src.vulnmgmt.models import VulnerabilityInstance
+    from src.models.asset import Asset
+
     org_id = getattr(current_user, "organization_id", None)
 
     patch = await get_or_404(db, PatchOperation, patch_id, org_id)
@@ -588,8 +645,75 @@ async def schedule_patch(
             detail="Failed to schedule patch",
         )
 
+    # Find the target host for this patch and dispatch via agent
+    agent_command_id: Optional[str] = None
+    try:
+        instance_result = await db.execute(
+            select(VulnerabilityInstance).where(
+                VulnerabilityInstance.id == patch.vulnerability_instance_id
+            )
+        )
+        instance = instance_result.scalar_one_or_none()
+        if instance and instance.asset_id:
+            asset_result = await db.execute(
+                select(Asset).where(Asset.id == instance.asset_id)
+            )
+            asset = asset_result.scalar_one_or_none()
+            hostname = asset.hostname if asset else None
+
+            if hostname:
+                agent_q = select(EndpointAgent).where(
+                    and_(
+                        EndpointAgent.hostname == hostname,
+                        EndpointAgent.status == "active",
+                    )
+                )
+                if org_id:
+                    agent_q = agent_q.where(EndpointAgent.organization_id == org_id)
+
+                agents = list((await db.execute(agent_q)).scalars().all())
+                ir_agent = next(
+                    (
+                        a
+                        for a in agents
+                        if AgentCapability.LIVE_RESPONSE.value in (a.capabilities or [])
+                    ),
+                    None,
+                )
+                if ir_agent is not None:
+                    svc = AgentService(db)
+                    cmd = await svc.issue_command(
+                        agent=ir_agent,
+                        action=AgentAction.RUN_ATOMIC_TEST.value,
+                        payload={
+                            "command": (
+                                f"echo '[pysoar] patch operation {patch_id} "
+                                f"scheduled for {schedule_request.deployment_date}'"
+                            ),
+                            "executor": "sh",
+                            "patch_operation_id": patch_id,
+                        },
+                        issued_by=str(current_user.id) if current_user else None,
+                    )
+                    agent_command_id = cmd.id
+                    # Record the linkage in the patch operation's notes
+                    existing_notes = patch.deployment_notes or ""
+                    patch.deployment_notes = (
+                        existing_notes + f"\nagent_command_id={cmd.id}"
+                    ).strip()
+                    await db.flush()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"Agent dispatch failed for patch {patch_id}: {exc}")
+
     await db.refresh(patch)
-    return PatchOperationResponse.model_validate(patch)
+    response = PatchOperationResponse.model_validate(patch)
+    # Attach the agent_command_id to the response for frontend convenience
+    try:
+        response_dict = response.model_dump()
+        response_dict["agent_command_id"] = agent_command_id
+        return response_dict
+    except Exception:  # noqa: BLE001
+        return response
 
 
 @router.post("/patch-operations/{patch_id}/verify")
