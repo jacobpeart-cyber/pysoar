@@ -4,6 +4,7 @@ from fastapi import APIRouter
 
 from src.api.v1.endpoints import (
     agentic,
+    agents,
     ai,
     alerts,
     api_keys,
@@ -125,3 +126,6 @@ api_router.include_router(fedramp.router, tags=["fedramp"])
 # --- Monitoring ---
 api_router.include_router(monitoring.router, tags=["monitoring"])
 api_router.include_router(websocket.router, tags=["websocket"])
+
+# --- Agent Platform (unified BAS execution + Live Response + Purple Team) ---
+api_router.include_router(agents.router, tags=["agents"])

@@ -82,6 +82,7 @@ _try_import("src.api_security.models", ["APIEndpoint", "APIVulnerability", "APIS
 _try_import("src.data_lake.models", ["DataSource", "DataPipeline", "UnifiedDataModel", "DataPartition", "QueryJob"])
 _try_import("src.collaboration.models", ["WarRoom", "WarRoomMessage", "ActionItem", "SharedArtifact", "IncidentTimeline"])
 _try_import("src.phishing_sim.models", ["PhishingCampaign", "PhishingTemplate", "CampaignEvent", "TargetGroup", "SecurityAwarenessScore"])
+_try_import("src.agents.models", ["EndpointAgent", "AgentCommand", "AgentResult", "AgentHeartbeat"])
 
 # Alembic Config object
 config = context.config

@@ -258,20 +258,36 @@ class SimulationOrchestrator:
             test.executor = test_cmd.get("executor", "powershell")
             test.command_executed = command
 
-            # This is a simulation engine — we never actually execute the
-            # technique's command on a target. The value of the engine comes
-            # from measuring whether the organization's deployed detection
-            # rules COVER the technique. Coverage is deterministic and based
-            # on the detection_rules table (MITRE technique mapping).
-            test.output = (
-                f"[SIMULATED] Technique {technique.mitre_id} test plan:\n"
-                f"  executor: {test_cmd.get('executor', 'powershell')}\n"
-                f"  command: {command}\n"
-                f"  description: {technique.description or ''}\n"
-                f"  (Real execution requires agent deployment — "
-                f"this run scored coverage against detection rules only.)"
+            # Try to execute the atomic test on a real endpoint agent if
+            # one is available in scope. Fall back to coverage-only
+            # scoring if no agent matches or the agent doesn't respond
+            # within the dispatch window. Either way the detection score
+            # is still computed from the DetectionRule table, so the
+            # security posture number remains well-defined regardless of
+            # whether a physical host was involved.
+            agent_result = await self._try_dispatch_to_agent(
+                test=test,
+                technique=technique,
+                command=command,
+                executor=test_cmd.get("executor", "sh"),
             )
-            test.status = "passed"
+
+            if agent_result is not None:
+                test.output = agent_result.stdout or ""
+                if agent_result.stderr:
+                    test.error_output = agent_result.stderr
+                test.status = "passed" if agent_result.status == "success" else "error"
+            else:
+                # No live agent — score against detection rule coverage only
+                test.output = (
+                    f"[COVERAGE-ONLY] Technique {technique.mitre_id} plan:\n"
+                    f"  executor: {test_cmd.get('executor', 'powershell')}\n"
+                    f"  command: {command}\n"
+                    f"  description: {technique.description or ''}\n"
+                    f"  (No BAS-capable agent enrolled in scope — "
+                    f"scored against detection rule coverage only.)"
+                )
+                test.status = "passed"
 
             # Deterministic detection lookup against active detection rules
             detected = await self._check_detection(test, technique)
@@ -298,6 +314,104 @@ class SimulationOrchestrator:
             "detected": test.was_detected,
             "detection_time": test.detection_time_seconds
         }
+
+    async def _try_dispatch_to_agent(
+        self,
+        test: SimulationTest,
+        technique: "AttackTechnique",
+        command: str,
+        executor: str,
+        max_wait_seconds: int = 30,
+    ):
+        """Dispatch this atomic test to a live BAS-capable endpoint agent.
+
+        The simulation's ``scope`` may contain a ``target_host`` hint. We
+        look for an ACTIVE agent whose hostname matches the hint AND has
+        the ``bas`` capability. If one exists, we issue a
+        ``run_atomic_test`` command via AgentService (which chains the
+        audit hash) and poll the agent_results table until a row lands
+        or we time out. Returns the AgentResult row, or None if no agent
+        matched or the agent didn't report back in time.
+
+        Any exception here is non-fatal — the test simply degrades to
+        coverage-only scoring rather than failing the whole simulation.
+        """
+        try:
+            from src.agents.capabilities import AgentAction, AgentCapability
+            from src.agents.models import AgentCommand, AgentResult, EndpointAgent
+            from src.agents.service import AgentService
+
+            simulation = await self._get_simulation(test.simulation_id)
+            if simulation is None:
+                return None
+
+            scope = simulation.scope or {}
+            target_host = scope.get("target_host") if isinstance(scope, dict) else None
+            org_id = simulation.organization_id
+
+            agent_query = select(EndpointAgent).where(
+                EndpointAgent.status == "active"
+            )
+            if org_id:
+                agent_query = agent_query.where(EndpointAgent.organization_id == org_id)
+            if target_host:
+                agent_query = agent_query.where(EndpointAgent.hostname == target_host)
+
+            result = await self.session.execute(agent_query)
+            candidates = list(result.scalars().all())
+
+            agent = None
+            for candidate in candidates:
+                caps = candidate.capabilities or []
+                if AgentCapability.BAS.value in caps:
+                    agent = candidate
+                    break
+
+            if agent is None:
+                return None
+
+            svc = AgentService(self.session)
+            payload = {
+                "command": command,
+                "executor": executor,
+                "mitre_id": technique.mitre_id,
+            }
+            cmd = await svc.issue_command(
+                agent=agent,
+                action=AgentAction.RUN_ATOMIC_TEST.value,
+                payload=payload,
+                simulation_id=test.simulation_id,
+            )
+            await self.session.commit()
+
+            # Poll for the result. The agent polls on its own ~30s cycle
+            # so we wait up to max_wait_seconds before bailing out.
+            deadline = time.time() + max_wait_seconds
+            poll_interval = 2
+            while time.time() < deadline:
+                await asyncio.sleep(poll_interval)
+                result_row = (
+                    await self.session.execute(
+                        select(AgentResult).where(AgentResult.command_id == cmd.id)
+                    )
+                ).scalar_one_or_none()
+                if result_row is not None:
+                    return result_row
+                # Refresh command to see if it expired / rejected
+                cmd_row = (
+                    await self.session.execute(
+                        select(AgentCommand).where(AgentCommand.id == cmd.id)
+                    )
+                ).scalar_one_or_none()
+                if cmd_row and cmd_row.status in ("rejected", "expired", "failed"):
+                    break
+            return None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"Agent dispatch failed for test {test.id}: {exc} — "
+                f"falling back to coverage-only scoring"
+            )
+            return None
 
     async def _check_detection(
         self,
