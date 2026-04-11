@@ -152,6 +152,152 @@ async def create_playbook(
     return _playbook_to_response(playbook)
 
 
+# ---------------------------------------------------------------------------
+# Literal-path routes declared BEFORE /{playbook_id}.
+#
+# FastAPI matches routes in declaration order. The dynamic catch-all
+# ``/{playbook_id}`` (GET) ate /templates and /dashboard before they
+# could fire — the frontend's template browser and Playbook Builder
+# dashboard have been returning ``"Playbook not found"`` ever since
+# the module shipped. These routes must stay physically above the
+# dynamic path handler below.
+# ---------------------------------------------------------------------------
+
+
+@router.get("/templates", response_model=PlaybookTemplateListResponse)
+async def list_templates_early(
+    current_user: CurrentUser = None,
+    page: int = Query(1, ge=1),
+    size: int = Query(20, ge=1, le=100),
+):
+    """List available playbook templates.
+
+    Previously positioned after the ``/{playbook_id}`` catch-all so
+    every call matched the dynamic route first and returned
+    "Playbook not found". Also had a dict(list).items() bug that
+    would have crashed it once the routing was fixed. Both are
+    corrected here.
+    """
+    templates = TemplateLibrary.get_templates()
+
+    # templates is dict[template_id, template_dict]. Slice by keys
+    # rather than values so we can keep the id alongside the payload.
+    all_ids = list(templates.keys())
+    offset = (page - 1) * size
+    paginated_ids = all_ids[offset : offset + size]
+
+    total = len(all_ids)
+    pages = math.ceil(total / size) if size > 0 else 0
+
+    items = [
+        PlaybookTemplateResponse(
+            id=tid,
+            name=templates[tid].get("name"),
+            description=templates[tid].get("description"),
+            category=templates[tid].get("category"),
+            nodes=templates[tid].get("nodes", []),
+            edges=templates[tid].get("edges", []),
+            created_at=None,
+            updated_at=None,
+        )
+        for tid in paginated_ids
+    ]
+
+    return PlaybookTemplateListResponse(
+        items=items,
+        total=total,
+        page=page,
+        size=size,
+        pages=pages,
+    )
+
+
+@router.get("/dashboard", response_model=PlaybookDashboardResponse)
+async def get_dashboard_early(
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+):
+    """Playbook builder dashboard with real execution aggregates.
+
+    Previously unreachable due to the same ``/{playbook_id}`` route
+    collision. Also hardcoded ``successful_executions=0``,
+    ``failed_executions=0``, ``avg_execution_time_ms=0.0``,
+    ``success_rate=0.0`` regardless of the real execution history.
+    Now computes all four from VisualPlaybookExecution rows.
+    """
+    org_id = getattr(current_user, "organization_id", None)
+
+    # Count playbooks (org-scoped)
+    total_result = await db.execute(
+        select(func.count(VisualPlaybook.id)).where(
+            VisualPlaybook.organization_id == org_id
+        )
+    )
+    total_playbooks = total_result.scalar() or 0
+
+    active_result = await db.execute(
+        select(func.count(VisualPlaybook.id)).where(
+            VisualPlaybook.organization_id == org_id,
+            VisualPlaybook.status == "active",
+        )
+    )
+    active_playbooks = active_result.scalar() or 0
+
+    draft_result = await db.execute(
+        select(func.count(VisualPlaybook.id)).where(
+            VisualPlaybook.organization_id == org_id,
+            VisualPlaybook.status == "draft",
+        )
+    )
+    draft_playbooks = draft_result.scalar() or 0
+
+    total_templates = len(TemplateLibrary.get_templates())
+
+    # Real execution aggregates
+    exec_result = await db.execute(
+        select(VisualPlaybookExecution).where(
+            VisualPlaybookExecution.organization_id == org_id
+        )
+    )
+    executions = list(exec_result.scalars().all())
+    total_executions = len(executions)
+    successful = sum(1 for e in executions if e.status == "completed")
+    failed = sum(1 for e in executions if e.status in ("failed", "error"))
+
+    # Pull duration from started_at/completed_at timestamps
+    durations_ms: list[float] = []
+    for e in executions:
+        if e.started_at and e.completed_at:
+            try:
+                delta = (e.completed_at - e.started_at).total_seconds() * 1000.0
+                if delta > 0:
+                    durations_ms.append(delta)
+            except Exception:  # noqa: BLE001
+                continue
+    avg_execution_time_ms = (
+        round(sum(durations_ms) / len(durations_ms), 1) if durations_ms else 0.0
+    )
+    success_rate = (
+        round((successful / total_executions) * 100.0, 1)
+        if total_executions > 0
+        else 0.0
+    )
+
+    return PlaybookDashboardResponse(
+        total_playbooks=total_playbooks,
+        active_playbooks=active_playbooks,
+        draft_playbooks=draft_playbooks,
+        total_templates=total_templates,
+        execution_stats={
+            "total_executions": total_executions,
+            "successful_executions": successful,
+            "failed_executions": failed,
+            "avg_execution_time_ms": avg_execution_time_ms,
+            "success_rate": success_rate,
+        },
+    )
+
+
 @router.get("/{playbook_id}", response_model=PlaybookResponse)
 async def get_playbook(
     playbook_id: str,
@@ -577,42 +723,9 @@ async def get_execution_status(
     )
 
 
-# Template endpoints
-@router.get("/templates", response_model=PlaybookTemplateListResponse)
-async def list_templates(
-    current_user: CurrentUser = None,
-    page: int = Query(1, ge=1),
-    size: int = Query(20, ge=1, le=100),
-):
-    """List available templates"""
-    templates = TemplateLibrary.get_templates()
-    items = list(templates.values())
-
-    offset = (page - 1) * size
-    paginated = items[offset : offset + size]
-
-    total = len(items)
-    pages = math.ceil(total / size) if size > 0 else 0
-
-    return PlaybookTemplateListResponse(
-        items=[
-            PlaybookTemplateResponse(
-                id=k,
-                name=v.get("name"),
-                description=v.get("description"),
-                category=v.get("category"),
-                nodes=v.get("nodes", []),
-                edges=v.get("edges", []),
-                created_at=None,
-                updated_at=None,
-            )
-            for k, v in dict(paginated).items()
-        ],
-        total=total,
-        page=page,
-        size=size,
-        pages=pages,
-    )
+# /templates moved above the /{playbook_id} catch-all (earlier in
+# this file) to fix a P0 route-ordering collision. This shim is a
+# placeholder so the import structure stays intact.
 
 
 @router.post("/templates/{template_id}/create", response_model=PlaybookResponse)
@@ -647,60 +760,8 @@ async def create_from_template(
 
 
 # Dashboard endpoint
-@router.get("/dashboard", response_model=PlaybookDashboardResponse)
-async def get_dashboard(
-    current_user: CurrentUser = None,
-    db: DatabaseSession = None,
-):
-    """Get playbook builder dashboard"""
-    # Count playbooks
-    result = await db.execute(
-        select(func.count(VisualPlaybook.id)).where(
-            VisualPlaybook.organization_id == getattr(current_user, "organization_id", None)
-        )
-    )
-    total_playbooks = result.scalar() or 0
-
-    result = await db.execute(
-        select(func.count(VisualPlaybook.id)).where(
-            VisualPlaybook.organization_id == getattr(current_user, "organization_id", None),
-            VisualPlaybook.status == "active",
-        )
-    )
-    active_playbooks = result.scalar() or 0
-
-    result = await db.execute(
-        select(func.count(VisualPlaybook.id)).where(
-            VisualPlaybook.organization_id == getattr(current_user, "organization_id", None),
-            VisualPlaybook.status == "draft",
-        )
-    )
-    draft_playbooks = result.scalar() or 0
-
-    templates = TemplateLibrary.get_templates()
-    total_templates = len(templates)
-
-    # Count executions
-    result = await db.execute(
-        select(func.count(VisualPlaybookExecution.id)).where(
-            VisualPlaybookExecution.organization_id == getattr(current_user, "organization_id", None)
-        )
-    )
-    total_executions = result.scalar() or 0
-
-    return PlaybookDashboardResponse(
-        total_playbooks=total_playbooks,
-        active_playbooks=active_playbooks,
-        draft_playbooks=draft_playbooks,
-        total_templates=total_templates,
-        execution_stats={
-            "total_executions": total_executions,
-            "successful_executions": 0,
-            "failed_executions": 0,
-            "avg_execution_time_ms": 0.0,
-            "success_rate": 0.0,
-        },
-    )
+# /dashboard moved above the /{playbook_id} catch-all (earlier in
+# this file) to fix a P0 route-ordering collision.
 
 
 # Helper functions
