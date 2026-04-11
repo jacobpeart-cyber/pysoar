@@ -71,6 +71,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     # Create first admin user if needed
     await create_first_admin()
 
+    # Register built-in threat feeds (idempotent — safe to run every boot)
+    try:
+        from src.intel.feeds import FeedManager
+        created = await FeedManager().register_builtin_feeds()
+        if created:
+            logger.info("Registered built-in threat feeds", count=created)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Built-in feed registration failed", error=str(e))
+
     yield
 
     # Shutdown

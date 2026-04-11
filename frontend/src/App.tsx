@@ -9,7 +9,6 @@ import Alerts from './pages/Alerts'
 import AlertDetail from './pages/AlertDetail'
 import Incidents from './pages/Incidents'
 import IncidentDetail from './pages/IncidentDetail'
-import IOCs from './pages/IOCs'
 import Users from './pages/Users'
 import Playbooks from './pages/Playbooks'
 import Assets from './pages/Assets'
@@ -150,7 +149,7 @@ function AppRoutes() {
         <Route path="alerts/:id" element={<AlertDetail />} />
         <Route path="incidents" element={<Incidents />} />
         <Route path="incidents/:id" element={<IncidentDetail />} />
-        <Route path="iocs" element={<IOCs />} />
+        <Route path="iocs" element={<Navigate to="/threat-intel" replace />} />
         <Route path="playbooks" element={<Playbooks />} />
         <Route path="assets" element={<Assets />} />
         <Route path="users" element={<Users />} />

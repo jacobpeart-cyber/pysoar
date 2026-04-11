@@ -182,6 +182,107 @@ class STIXFeedParser(FeedParser):
         return techniques
 
 
+class PlainListFeedParser(FeedParser):
+    """Parser for plain-text threat feeds (one indicator per line).
+
+    Handles the common abuse.ch / emerging threats / blocklist format:
+    comment lines starting with ``#`` are ignored, and each remaining
+    line is one indicator. The indicator type is auto-detected from the
+    value (ipv4, ipv6, cidr, url, domain, md5, sha1, sha256).
+
+    For CSVs like feodotracker's ipblocklist (with multiple columns),
+    the first column is assumed to be the indicator value.
+    """
+
+    IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+    IPV6_RE = re.compile(r"^[0-9a-fA-F:]+$")
+    CIDR_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}/\d{1,2}$")
+    MD5_RE = re.compile(r"^[a-fA-F0-9]{32}$")
+    SHA1_RE = re.compile(r"^[a-fA-F0-9]{40}$")
+    SHA256_RE = re.compile(r"^[a-fA-F0-9]{64}$")
+    DOMAIN_RE = re.compile(r"^(?=.{1,253}$)(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$")
+
+    def __init__(self, default_severity: str = "medium", default_confidence: int = 70):
+        self.default_severity = default_severity
+        self.default_confidence = default_confidence
+
+    def _detect_type(self, value: str) -> Optional[str]:
+        v = value.strip()
+        if not v:
+            return None
+        if self.CIDR_RE.match(v):
+            return "cidr"
+        if self.IPV4_RE.match(v):
+            try:
+                ipaddress.IPv4Address(v)
+                return "ipv4"
+            except ValueError:
+                return None
+        if ":" in v and self.IPV6_RE.match(v):
+            try:
+                ipaddress.IPv6Address(v)
+                return "ipv6"
+            except ValueError:
+                pass
+        if v.startswith(("http://", "https://", "ftp://")):
+            return "url"
+        if self.SHA256_RE.match(v):
+            return "sha256"
+        if self.SHA1_RE.match(v):
+            return "sha1"
+        if self.MD5_RE.match(v):
+            return "md5"
+        if self.DOMAIN_RE.match(v):
+            return "domain"
+        return None
+
+    def parse(self, raw_data: bytes) -> list[dict[str, Any]]:
+        try:
+            text = raw_data.decode("utf-8", errors="replace")
+        except Exception as e:
+            logger.error("Failed to decode plain feed", error=str(e))
+            return []
+
+        indicators: list[dict[str, Any]] = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            # Strip Spamhaus-style trailing "; comment" from data lines
+            if ";" in line and not line.startswith(";"):
+                line = line.split(";", 1)[0].strip()
+            if not line:
+                continue
+            if line.startswith(("#", "//", ";")):
+                continue
+
+            # Try each comma-separated field in order. This handles:
+            #   * single-value lines (urlhaus text_online, spamhaus)
+            #   * multi-column CSVs where the indicator is not column 0
+            #     (feodotracker ipblocklist.csv puts IP in col 1 after
+            #     the timestamp column)
+            fields = [f.strip().strip('"') for f in line.split(",")]
+            chosen_value = None
+            chosen_type = None
+            for field in fields:
+                ind_type = self._detect_type(field)
+                if ind_type:
+                    chosen_value = field
+                    chosen_type = ind_type
+                    break
+
+            if not chosen_value or not chosen_type:
+                continue
+
+            indicators.append({
+                "value": chosen_value,
+                "indicator_type": chosen_type,
+                "confidence": self.default_confidence,
+                "severity": self.default_severity,
+            })
+
+        logger.info("Parsed plain-list feed", indicator_count=len(indicators))
+        return indicators
+
+
 class CSVFeedParser(FeedParser):
     """Parser for CSV threat feeds with configurable column mapping"""
 
@@ -402,54 +503,67 @@ class FeedManager:
             "json": STIXFeedParser(),  # Default to STIX for JSON
             "taxii": STIXFeedParser(),  # TAXII returns STIX
             "openioc": STIXFeedParser(),  # Will parse as STIX
+            "plain": PlainListFeedParser(),  # abuse.ch style plain-text lists
         }
 
-        # Built-in feeds configuration
+        # Built-in feeds — all keyless, all free, all publicly accessible.
+        # The "plain" feed_type uses PlainListFeedParser which auto-detects
+        # indicator_type from each line (IPv4/domain/URL/hash).
         self.builtin_feeds = [
             {
-                "name": "AlienVault OTX",
-                "feed_type": "csv",
-                "url": "https://otx.alienvault.com/api/v1/pulses/subscribed",
-                "provider": "AT&T Cybersecurity",
-                "description": "AlienVault Open Threat Exchange - community-sourced threat intelligence",
+                "name": "Abuse.ch Feodo Tracker",
+                "feed_type": "plain",
+                "url": "https://feodotracker.abuse.ch/downloads/ipblocklist.csv",
+                "provider": "Abuse.ch",
+                "description": "Botnet C&C IPs (Emotet, Dridex, QakBot, TrickBot, BazarLoader)",
                 "is_builtin": True,
+                "is_enabled": True,
                 "poll_interval_minutes": 60,
+                "confidence_weight": 0.95,
+            },
+            {
+                "name": "Abuse.ch SSL Blacklist",
+                "feed_type": "plain",
+                "url": "https://sslbl.abuse.ch/blacklist/sslipblacklist.csv",
+                "provider": "Abuse.ch",
+                "description": "IPs hosting malicious SSL certificates (botnet C2)",
+                "is_builtin": True,
+                "is_enabled": True,
+                "poll_interval_minutes": 60,
+                "confidence_weight": 0.9,
             },
             {
                 "name": "Abuse.ch URLhaus",
-                "feed_type": "csv",
-                "url": "https://urlhaus-api.abuse.ch/v1/urls/recent/",
+                "feed_type": "plain",
+                "url": "https://urlhaus.abuse.ch/downloads/text_online/",
                 "provider": "Abuse.ch",
-                "description": "Malicious URLs database",
+                "description": "Active malware distribution URLs",
                 "is_builtin": True,
-                "poll_interval_minutes": 60,
+                "is_enabled": True,
+                "poll_interval_minutes": 30,
+                "confidence_weight": 0.95,
             },
             {
-                "name": "Abuse.ch MalwareBazaar",
-                "feed_type": "json",
-                "url": "https://mb-api.abuse.ch/api/v1/",
-                "provider": "Abuse.ch",
-                "description": "Malware samples and hashes",
+                "name": "Emerging Threats Compromised IPs",
+                "feed_type": "plain",
+                "url": "https://rules.emergingthreats.net/blockrules/compromised-ips.txt",
+                "provider": "Proofpoint ET",
+                "description": "Known compromised hosts (open proxies, malware infected)",
                 "is_builtin": True,
+                "is_enabled": True,
                 "poll_interval_minutes": 120,
+                "confidence_weight": 0.8,
             },
             {
-                "name": "EmergingThreats",
-                "feed_type": "csv",
-                "url": "https://rules.emergingthreats.net/blocklist/",
-                "provider": "Proofpoint",
-                "description": "Emerging threats IOC feed",
+                "name": "Spamhaus DROP",
+                "feed_type": "plain",
+                "url": "https://www.spamhaus.org/drop/drop.txt",
+                "provider": "Spamhaus",
+                "description": "Don't Route Or Peer netblocks (hijacked or known criminal)",
                 "is_builtin": True,
-                "poll_interval_minutes": 60,
-            },
-            {
-                "name": "PhishTank",
-                "feed_type": "json",
-                "url": "https://phishtank.com/api_info.php",
-                "provider": "OpenDNS",
-                "description": "Phishing URLs database",
-                "is_builtin": True,
-                "poll_interval_minutes": 240,
+                "is_enabled": True,
+                "poll_interval_minutes": 360,
+                "confidence_weight": 1.0,
             },
         ]
 
@@ -717,11 +831,56 @@ class FeedManager:
         }
 
     async def register_builtin_feeds(self) -> int:
-        """Register built-in threat feeds in database
+        """Register built-in threat feeds in the database.
 
-        Returns:
-            Number of feeds registered
+        Idempotent — existing builtin feeds (matched by name) are updated
+        in place, not duplicated. Returns the number of NEW feeds created.
         """
+        from src.core.database import async_session_factory
+        from sqlalchemy import select
+
         self.logger.info("Registering built-in feeds", count=len(self.builtin_feeds))
-        # This would create ThreatFeed entries in database for each builtin feed
-        return len(self.builtin_feeds)
+
+        created = 0
+        async with async_session_factory() as session:
+            for feed_def in self.builtin_feeds:
+                existing = await session.execute(
+                    select(ThreatFeed).where(ThreatFeed.name == feed_def["name"])
+                )
+                row = existing.scalar_one_or_none()
+
+                if row:
+                    # Update mutable config on every call so URL/description
+                    # changes in code propagate without a migration.
+                    row.feed_type = feed_def["feed_type"]
+                    row.url = feed_def.get("url")
+                    row.provider = feed_def.get("provider")
+                    row.description = feed_def.get("description")
+                    row.is_builtin = True
+                    row.poll_interval_minutes = feed_def.get("poll_interval_minutes", 60)
+                    if "confidence_weight" in feed_def:
+                        row.confidence_weight = feed_def["confidence_weight"]
+                    # Don't clobber is_enabled if an operator disabled it
+                    continue
+
+                new_feed = ThreatFeed(
+                    name=feed_def["name"],
+                    feed_type=feed_def["feed_type"],
+                    url=feed_def.get("url"),
+                    provider=feed_def.get("provider"),
+                    description=feed_def.get("description"),
+                    is_enabled=feed_def.get("is_enabled", True),
+                    is_builtin=True,
+                    poll_interval_minutes=feed_def.get("poll_interval_minutes", 60),
+                    confidence_weight=feed_def.get("confidence_weight", 1.0),
+                    total_indicators=0,
+                    tags=[],
+                )
+                session.add(new_feed)
+                created += 1
+                self.logger.info("Registered builtin feed", name=feed_def["name"])
+
+            await session.commit()
+
+        self.logger.info("Built-in feeds registration complete", created=created)
+        return created
