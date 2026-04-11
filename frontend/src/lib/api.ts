@@ -142,7 +142,16 @@ export const authApi = {
 
 // Alerts API
 export const alertsApi = {
-  list: async (params?: { page?: number; size?: number; status?: string; severity?: string }) => {
+  list: async (params?: {
+    page?: number;
+    size?: number;
+    status?: string;
+    severity?: string;
+    source?: string;
+    search?: string;
+    sort_by?: string;
+    sort_order?: 'asc' | 'desc';
+  }) => {
     const response = await api.get('/alerts', { params });
     return response.data;
   },
@@ -160,6 +169,10 @@ export const alertsApi = {
   },
   delete: async (id: string) => {
     await api.delete(`/alerts/${id}`);
+  },
+  bulkAction: async (data: { alert_ids: string[]; action: string; value?: string }) => {
+    const response = await api.post('/alerts/bulk', data);
+    return response.data;
   },
   getStats: async () => {
     const response = await api.get('/alerts/stats');

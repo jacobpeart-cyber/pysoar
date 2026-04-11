@@ -301,15 +301,44 @@ async def delete_alert(
     await db.flush()
 
 
+_VALID_BULK_ACTIONS = {"acknowledge", "close", "assign", "resolve", "delete", "in_progress"}
+
+
 @router.post("/bulk", response_model=None)
 async def bulk_action(
     action_data: AlertBulkAction,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Perform bulk action on alerts"""
+    """Perform bulk action on alerts.
+
+    Supported actions: acknowledge, in_progress, resolve, close, assign, delete.
+    `assign` requires `value` to be set to a user ID.
+    """
+    if action_data.action not in _VALID_BULK_ACTIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid action. Supported: {sorted(_VALID_BULK_ACTIONS)}",
+        )
+    if action_data.action == "assign" and not action_data.value:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The 'assign' action requires a non-empty value (user ID).",
+        )
+    if not action_data.alert_ids:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="alert_ids must contain at least one alert ID.",
+        )
+    if len(action_data.alert_ids) > 500:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="A single bulk request may target at most 500 alerts.",
+        )
+
     success_count = 0
-    failures = []
+    failures: list[dict] = []
+    now_iso = datetime.now(timezone.utc).isoformat()
 
     for alert_id in action_data.alert_ids:
         try:
@@ -322,18 +351,24 @@ async def bulk_action(
 
             if action_data.action == "acknowledge":
                 alert.status = AlertStatus.ACKNOWLEDGED.value
+            elif action_data.action == "in_progress":
+                alert.status = AlertStatus.IN_PROGRESS.value
             elif action_data.action == "close":
                 alert.status = AlertStatus.CLOSED.value
+                if not alert.resolved_at:
+                    alert.resolved_at = now_iso
             elif action_data.action == "assign":
                 alert.assigned_to = action_data.value
             elif action_data.action == "resolve":
                 alert.status = AlertStatus.RESOLVED.value
-                alert.resolved_at = datetime.now(timezone.utc).isoformat()
+                alert.resolved_at = now_iso
+            elif action_data.action == "delete":
+                await db.delete(alert)
 
             success_count += 1
 
         except Exception as e:
-            failures.append({"id": alert_id, "error": str(e)})
+            failures.append({"id": alert_id, "error": str(e)[:200]})
 
     await db.flush()
 
