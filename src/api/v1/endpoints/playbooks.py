@@ -278,10 +278,25 @@ async def list_playbook_executions(
     size: int = Query(20, ge=1, le=100),
     execution_status: Optional[str] = Query(None, alias="status"),
 ):
-    """List executions for a playbook"""
+    """List executions for a playbook.
+
+    Playbook and PlaybookExecution models have no organization_id column
+    (SOAR playbooks are system-level admin resources). To prevent cross-tenant
+    visibility of execution history we scope by joining to the users table
+    and filtering triggered_by to users in the caller's organization. Manual
+    executions with no user context are filtered out conservatively.
+    """
     await get_playbook_or_404(db, playbook_id)
 
-    query = select(PlaybookExecution).where(PlaybookExecution.playbook_id == playbook_id)
+    from src.models.user import User as _User
+    org_id = getattr(current_user, "organization_id", None)
+
+    query = select(PlaybookExecution).where(
+        PlaybookExecution.playbook_id == playbook_id
+    )
+    if org_id is not None:
+        org_user_ids = select(_User.id).where(_User.organization_id == org_id)
+        query = query.where(PlaybookExecution.triggered_by.in_(org_user_ids))
 
     if execution_status:
         query = query.where(PlaybookExecution.status == execution_status)
