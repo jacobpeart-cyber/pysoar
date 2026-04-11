@@ -1175,5 +1175,6 @@ async def get_dashboard_stats(
         violation_count=violations,
         maturity_score=maturity["overall_score"],
         maturity_level=maturity["maturity_level"],
+        pillars=maturity["pillars"],
         last_updated=datetime.now(timezone.utc),
     )
