@@ -53,6 +53,7 @@ from src.api.v1.endpoints import (
     backup,
     fedramp,
     monitoring,
+    websocket,
 )
 
 api_router = APIRouter()
@@ -123,3 +124,4 @@ api_router.include_router(fedramp.router, tags=["fedramp"])
 
 # --- Monitoring ---
 api_router.include_router(monitoring.router, tags=["monitoring"])
+api_router.include_router(websocket.router, tags=["websocket"])
