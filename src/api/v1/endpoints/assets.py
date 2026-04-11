@@ -5,7 +5,7 @@ import math
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, status
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DatabaseSession
@@ -21,9 +21,12 @@ from src.schemas.asset import (
 router = APIRouter(prefix="/assets", tags=["Assets"])
 
 
-async def get_asset_or_404(db: AsyncSession, asset_id: str) -> Asset:
-    """Get Asset by ID or raise 404"""
-    result = await db.execute(select(Asset).where(Asset.id == asset_id))
+async def get_asset_or_404(db: AsyncSession, asset_id: str, org_id: Optional[str] = None) -> Asset:
+    """Get Asset by ID or raise 404 (tenant-scoped)"""
+    stmt = select(Asset).where(Asset.id == asset_id)
+    if org_id is not None:
+        stmt = stmt.where(Asset.organization_id == org_id)
+    result = await db.execute(stmt)
     asset = result.scalar_one_or_none()
     if not asset:
         raise HTTPException(
@@ -80,7 +83,8 @@ async def list_assets(
     criticality: Optional[str] = None,
 ):
     """List assets with filtering and pagination"""
-    query = select(Asset)
+    org_id = getattr(current_user, "organization_id", None)
+    query = select(Asset).where(Asset.organization_id == org_id)
 
     # Apply filters
     if search:
@@ -131,6 +135,7 @@ async def create_asset(
 ):
     """Create a new asset"""
     asset = Asset(
+        organization_id=getattr(current_user, "organization_id", None),
         name=asset_data.name,
         hostname=asset_data.hostname,
         asset_type=asset_data.asset_type,
@@ -168,7 +173,7 @@ async def get_asset(
     db: DatabaseSession = None,
 ):
     """Get an asset by ID"""
-    asset = await get_asset_or_404(db, asset_id)
+    asset = await get_asset_or_404(db, asset_id, getattr(current_user, "organization_id", None))
     return asset_to_response(asset)
 
 
@@ -180,7 +185,7 @@ async def update_asset(
     db: DatabaseSession = None,
 ):
     """Update an asset"""
-    asset = await get_asset_or_404(db, asset_id)
+    asset = await get_asset_or_404(db, asset_id, getattr(current_user, "organization_id", None))
 
     update_data = asset_data.model_dump(exclude_unset=True, exclude_none=True)
 
@@ -204,6 +209,6 @@ async def delete_asset(
     db: DatabaseSession = None,
 ):
     """Delete an asset"""
-    asset = await get_asset_or_404(db, asset_id)
+    asset = await get_asset_or_404(db, asset_id, getattr(current_user, "organization_id", None))
     await db.delete(asset)
     await db.flush()

@@ -3,7 +3,7 @@
 from enum import Enum
 from typing import Optional
 
-from sqlalchemy import Boolean, Integer, String, Text
+from sqlalchemy import Boolean, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from src.models.base import BaseModel
@@ -48,6 +48,13 @@ class Asset(BaseModel):
     """Asset model for inventory management"""
 
     __tablename__ = "assets"
+
+    organization_id: Mapped[Optional[str]] = mapped_column(
+        String(36),
+        ForeignKey("organizations.id"),
+        nullable=True,
+        index=True,
+    )
 
     # Core identification
     name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
