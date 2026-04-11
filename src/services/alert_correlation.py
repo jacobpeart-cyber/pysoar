@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.core.logging import get_logger
 from src.models.alert import Alert, AlertSeverity, AlertStatus
 from src.models.incident import Incident, IncidentSeverity, IncidentStatus, IncidentType
-from src.models.ioc import IOC, IOCStatus
+from src.intel.models import ThreatIndicator as IOC
 from src.models.playbook import ExecutionStatus, Playbook, PlaybookExecution, PlaybookStatus, PlaybookTrigger
 
 logger = get_logger(__name__)
@@ -288,8 +288,8 @@ class AlertCorrelationService:
         # Query active IOCs whose value matches any of the alert indicators
         result = await self.db.execute(
             select(IOC).where(
-                IOC.status == IOCStatus.ACTIVE.value,
-                IOC.is_whitelisted == False,
+                IOC.is_active == True,  # noqa: E712
+                IOC.is_whitelisted == False,  # noqa: E712
                 IOC.value.in_(indicator_values),
             )
         )
@@ -300,15 +300,17 @@ class AlertCorrelationService:
 
         # Build a human-readable summary of the matches
         match_details = []
+        now = datetime.now(timezone.utc)
         for ioc in matched_iocs:
             match_details.append(
-                f"  - IOC match: {ioc.ioc_type} = {ioc.value} "
-                f"(threat_level={ioc.threat_level}, source={ioc.source or 'N/A'})"
+                f"  - IOC match: {ioc.indicator_type} = {ioc.value} "
+                f"(severity={ioc.severity}, source={ioc.source or 'N/A'})"
             )
 
             # Bump sighting count on the IOC
             ioc.sighting_count = (ioc.sighting_count or 0) + 1
-            ioc.last_sighting = datetime.now(timezone.utc).isoformat()
+            ioc.last_sighting_at = now
+            ioc.last_seen = now
 
         note = (
             "\n\n--- Threat Intel IOC Match ---\n"

@@ -323,9 +323,9 @@ async def get_iocs_by_type(
 ):
     """Get IOC counts grouped by type"""
     result = await db.execute(
-        select(IOC.ioc_type, func.count(IOC.id))
-        .where(IOC.is_active == True)
-        .group_by(IOC.ioc_type)
+        select(IOC.indicator_type, func.count(IOC.id))
+        .where(IOC.is_active == True)  # noqa: E712
+        .group_by(IOC.indicator_type)
         .order_by(func.count(IOC.id).desc())
     )
 
@@ -341,9 +341,9 @@ async def get_iocs_by_threat_level(
 ):
     """Get IOC counts grouped by threat level"""
     result = await db.execute(
-        select(IOC.threat_level, func.count(IOC.id))
-        .where(IOC.is_active == True)
-        .group_by(IOC.threat_level)
+        select(IOC.severity, func.count(IOC.id))
+        .where(IOC.is_active == True)  # noqa: E712
+        .group_by(IOC.severity)
     )
 
     return {

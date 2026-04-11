@@ -9,36 +9,34 @@ from src.core.logging import get_logger
 logger = get_logger(__name__)
 
 
-@shared_task(bind=True, max_retries=3)
+@shared_task(bind=True, max_retries=3, name="intel.poll_threat_feeds")
 def poll_threat_feeds(self) -> dict[str, Any]:
-    """Poll all enabled threat feeds for new indicators
+    """Poll all enabled threat feeds for new indicators.
 
-    This task:
-    1. Queries all enabled threat feeds from database
-    2. Fetches fresh data from each feed source
-    3. Parses data using appropriate feed parser
-    4. Ingests new indicators and updates existing ones
-    5. Records statistics and last poll time
-
-    Returns:
-        Dictionary with polling results per feed
+    Actually calls FeedManager.poll_all_feeds() (which for each enabled
+    feed: fetches, parses, dedupes, and writes ThreatIndicator rows).
     """
+    import asyncio
+
     try:
         logger.info("Starting threat feed polling task")
 
         from src.intel.feeds import FeedManager
 
-        feed_manager = FeedManager()
+        async def _run() -> dict[str, int]:
+            manager = FeedManager()
+            return await manager.poll_all_feeds()
 
-        # This would be async in reality
+        per_feed = asyncio.run(_run())
+        total = sum(int(v or 0) for v in per_feed.values())
+
         results = {
             "task": "poll_threat_feeds",
-            "feeds_polled": 0,
-            "total_indicators_ingested": 0,
-            "errors": [],
+            "feeds_polled": len(per_feed),
+            "total_indicators_ingested": total,
+            "per_feed": per_feed,
         }
-
-        logger.info("Threat feed polling complete", results=results)
+        logger.info("Threat feed polling complete", **results)
         return results
 
     except Exception as e:
