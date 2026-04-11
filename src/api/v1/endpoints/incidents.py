@@ -124,7 +124,15 @@ async def create_incident(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Create a new incident"""
+    """Create a new incident and fire cross-module automation.
+
+    Automation fires on every incident create (manual, agentic, or
+    alert-correlation-driven): for critical/high severity it auto-creates
+    a War Room and seeds it with 4 standard response action items
+    (triage, containment, evidence, comms).
+    """
+    from src.services.automation import AutomationService
+
     incident = Incident(
         title=incident_data.title,
         description=incident_data.description,
@@ -144,19 +152,38 @@ async def create_incident(
     db.add(incident)
     await db.flush()
 
-    # Link alerts if provided
+    # Link alerts if provided. Track which ones actually existed so we
+    # can report back and avoid silently skipping bad IDs.
+    linked_alerts = 0
     if incident_data.alert_ids:
         for alert_id in incident_data.alert_ids:
             result = await db.execute(select(Alert).where(Alert.id == alert_id))
             alert = result.scalar_one_or_none()
             if alert:
                 alert.incident_id = incident.id
+                linked_alerts += 1
 
     await db.flush()
     await db.refresh(incident)
 
+    # Fire cross-module automation (best-effort — never fail the request
+    # if the war-room creation hits a snag)
+    try:
+        automation = AutomationService(db)
+        await automation.on_incident_created(
+            incident,
+            organization_id=getattr(current_user, "organization_id", None) if current_user else None,
+            created_by=str(current_user.id) if current_user else None,
+        )
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(
+            f"AutomationService.on_incident_created failed for {incident.id}: {e}",
+            exc_info=True,
+        )
+
     response = IncidentResponse.model_validate(incident)
-    response.alert_count = len(incident_data.alert_ids) if incident_data.alert_ids else 0
+    response.alert_count = linked_alerts
     return response
 
 
@@ -289,13 +316,31 @@ async def delete_incident(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Delete an incident"""
+    """Delete an incident and detach all FK references.
+
+    Cleans up everything that points at this incident so the DELETE
+    doesn't hit a foreign-key violation:
+      - alerts.incident_id -> NULL
+      - war_rooms.incident_id -> NULL (war rooms are NOT deleted — they
+        retain their action items and chat history as standalone records
+        operators can still review after incident closure)
+      - case_notes, case_tasks, case_attachments, case_timeline cascade
+        on the incident_id FK (already defined as CASCADE in the models)
+    """
+    from src.collaboration.models import WarRoom
+
     incident = await get_incident_or_404(db, incident_id)
 
     # Unlink alerts
     for alert in incident.alerts:
         alert.incident_id = None
 
+    # Detach any war rooms pointing at this incident
+    wr_result = await db.execute(select(WarRoom).where(WarRoom.incident_id == incident_id))
+    for war_room in wr_result.scalars().all():
+        war_room.incident_id = None
+
+    await db.flush()
     await db.delete(incident)
     await db.flush()
 

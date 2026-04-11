@@ -182,7 +182,14 @@ export const alertsApi = {
 
 // Incidents API
 export const incidentsApi = {
-  list: async (params?: { page?: number; size?: number; status?: string; severity?: string }) => {
+  list: async (params?: {
+    page?: number;
+    size?: number;
+    status?: string;
+    severity?: string;
+    incident_type?: string;
+    search?: string;
+  }) => {
     const response = await api.get('/incidents', { params });
     return response.data;
   },
@@ -203,6 +210,62 @@ export const incidentsApi = {
   },
   getStats: async () => {
     const response = await api.get('/incidents/stats');
+    return response.data;
+  },
+  linkAlert: async (incidentId: string, alertId: string) => {
+    const response = await api.post(`/incidents/${incidentId}/alerts/${alertId}`);
+    return response.data;
+  },
+  unlinkAlert: async (incidentId: string, alertId: string) => {
+    await api.delete(`/incidents/${incidentId}/alerts/${alertId}`);
+  },
+  // --- Case management (notes / tasks / attachments / timeline) ---
+  listNotes: async (incidentId: string) => {
+    const response = await api.get(`/incidents/${incidentId}/notes`);
+    return response.data;
+  },
+  createNote: async (incidentId: string, content: string, note_type: string = 'general') => {
+    const response = await api.post(`/incidents/${incidentId}/notes`, { content, note_type });
+    return response.data;
+  },
+  deleteNote: async (incidentId: string, noteId: string) => {
+    await api.delete(`/incidents/${incidentId}/notes/${noteId}`);
+  },
+  listTasks: async (incidentId: string) => {
+    const response = await api.get(`/incidents/${incidentId}/tasks`);
+    return response.data;
+  },
+  createTask: async (
+    incidentId: string,
+    data: { title: string; description?: string; priority?: number; due_date?: string; assigned_to?: string },
+  ) => {
+    const response = await api.post(`/incidents/${incidentId}/tasks`, data);
+    return response.data;
+  },
+  updateTask: async (incidentId: string, taskId: string, data: any) => {
+    const response = await api.patch(`/incidents/${incidentId}/tasks/${taskId}`, data);
+    return response.data;
+  },
+  deleteTask: async (incidentId: string, taskId: string) => {
+    await api.delete(`/incidents/${incidentId}/tasks/${taskId}`);
+  },
+  listAttachments: async (incidentId: string) => {
+    const response = await api.get(`/incidents/${incidentId}/attachments`);
+    return response.data;
+  },
+  uploadAttachment: async (incidentId: string, file: File) => {
+    const formData = new FormData();
+    formData.append('file', file);
+    const response = await api.post(`/incidents/${incidentId}/attachments`, formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    });
+    return response.data;
+  },
+  deleteAttachment: async (incidentId: string, attachmentId: string) => {
+    await api.delete(`/incidents/${incidentId}/attachments/${attachmentId}`);
+  },
+  listTimeline: async (incidentId: string) => {
+    const response = await api.get(`/incidents/${incidentId}/timeline`);
     return response.data;
   },
 };

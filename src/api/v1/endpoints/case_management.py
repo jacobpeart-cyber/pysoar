@@ -71,8 +71,8 @@ class NoteResponse(BaseModel):
     incident_id: str
     author_id: str
     author_name: Optional[str] = None
-    created_at: str
-    updated_at: str
+    created_at: datetime
+    updated_at: datetime
 
     class Config:
         from_attributes = True
@@ -107,15 +107,15 @@ class TaskResponse(BaseModel):
     description: Optional[str]
     status: str
     priority: int
-    due_date: Optional[str]
-    completed_at: Optional[str]
+    due_date: Optional[str]  # stored as ISO string on the Task model
+    completed_at: Optional[str]  # stored as ISO string on the Task model
     incident_id: str
     assigned_to: Optional[str]
     assignee_name: Optional[str] = None
     created_by: str
     creator_name: Optional[str] = None
-    created_at: str
-    updated_at: str
+    created_at: datetime
+    updated_at: datetime
 
     class Config:
         from_attributes = True
@@ -137,7 +137,7 @@ class AttachmentResponse(BaseModel):
     incident_id: str
     uploaded_by: str
     uploader_name: Optional[str] = None
-    created_at: str
+    created_at: datetime
 
     class Config:
         from_attributes = True
@@ -156,7 +156,7 @@ class TimelineResponse(BaseModel):
     incident_id: str
     actor_id: Optional[str]
     actor_name: Optional[str] = None
-    created_at: str
+    created_at: datetime
 
     class Config:
         from_attributes = True
