@@ -26,6 +26,37 @@ import clsx from 'clsx';
 
 type TabType = 'dashboard' | 'audit-trail' | 'evidence' | 'packages' | 'conmon';
 
+// ---- Module-scope helpers (shared by all tab sub-components) ----
+// These used to live inside the main AuditEvidence component which meant
+// the sub-component functions (EvidenceTab, AuditTrailTab, etc.) tried to
+// reference them from a closure they never captured → ReferenceError at
+// render time. Lifting them to module scope fixes that.
+
+const statusColorMap: Record<string, string> = {
+  success: 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400',
+  failure: 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400',
+  pending: 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-400',
+  reviewed: 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400',
+  approved: 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400',
+  draft: 'bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-400',
+  'in-review': 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400',
+  submitted: 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-400',
+};
+
+const riskColorMap: Record<string, string> = {
+  low: 'text-green-600 dark:text-green-400',
+  medium: 'text-yellow-600 dark:text-yellow-400',
+  high: 'text-red-600 dark:text-red-400',
+};
+
+function getStatusColor(status: string): string {
+  return statusColorMap[status] || 'bg-gray-100 text-gray-800';
+}
+
+function getRiskColor(risk: string): string {
+  return riskColorMap[risk] || 'text-gray-600';
+}
+
 interface DashboardData {
   auditEventsCount: number;
   evidenceItemsCount: number;
@@ -52,12 +83,13 @@ interface AuditEvent {
 interface EvidenceItem {
   id: string;
   title: string;
-  type: 'document' | 'screenshot' | 'log' | 'config' | 'scan';
+  type: 'document' | 'screenshot' | 'log' | 'config' | 'scan' | string;
   control: string;
   source: string;
-  collected: string;
-  status: 'pending' | 'reviewed' | 'approved';
-  contentUrl?: string;
+  collected?: string;
+  status: 'pending' | 'reviewed' | 'approved' | string;
+  contentUrl?: string | null;
+  created_at?: string;
 }
 
 interface Package {
@@ -75,6 +107,9 @@ interface ConMonStatus {
   name: string;
   active: boolean;
   lastRun: string;
+  status?: string;
+  compliance_percentage?: number;
+  last_run?: string; // back-compat alias
 }
 
 export default function AuditEvidence() {
@@ -143,13 +178,15 @@ export default function AuditEvidence() {
   const { data: evidenceItems, isLoading: evidenceLoading } = useQuery<EvidenceItem[]>({
     queryKey: ['evidence-items', evidenceStatusFilter, evidenceTypeFilter],
     queryFn: async () => {
-      const params = new URLSearchParams();
-      if (evidenceStatusFilter !== 'all') params.append('status', evidenceStatusFilter);
-      if (evidenceTypeFilter !== 'all') params.append('type', evidenceTypeFilter);
       try {
-      const response = await api.get('/audit-evidence/evidence/list');
-      const d = response.data;
-      return Array.isArray(d) ? d : (d?.items || []);
+        const params: Record<string, string> = {};
+        if (evidenceStatusFilter !== 'all') params.status = evidenceStatusFilter;
+        if (evidenceTypeFilter !== 'all') params.evidence_type = evidenceTypeFilter;
+        const response = await api.get('/audit-evidence/evidence/list', { params });
+        const d = response.data;
+        if (Array.isArray(d)) return d;
+        if (d && Array.isArray(d.items)) return d.items;
+        return [];
       } catch { return []; }
     },
   });
@@ -168,9 +205,21 @@ export default function AuditEvidence() {
     queryKey: ['conmon-status'],
     queryFn: async () => {
       try {
-      const response = await api.get('/audit-evidence/conmon/status');
-      return response.data;
-      } catch { return null; }
+        const response = await api.get('/audit-evidence/conmon/status');
+        const d = response.data;
+        if (Array.isArray(d)) return d;
+        // Back-compat: older /conmon/status returned an object {status, checks, last_run}
+        if (d && typeof d === 'object' && d.checks && typeof d.checks === 'object') {
+          const now = d.last_run || new Date().toISOString();
+          return Object.entries(d.checks).map(([key, val]: [string, any]) => ({
+            id: key,
+            name: key.replace(/_/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
+            active: val?.status === 'compliant' || val?.status === 'on_track',
+            lastRun: now,
+          }));
+        }
+        return [];
+      } catch { return []; }
     },
   });
 
@@ -213,38 +262,7 @@ export default function AuditEvidence() {
     },
   });
 
-  const getEventTypeIcon = (type: string) => {
-    const icons: Record<string, React.ComponentType> = {
-      login: Shield,
-      access: FileText,
-      change: AlertCircle,
-      delete: Trash2,
-    };
-    return icons[type] || FileText;
-  };
-
-  const getStatusColor = (status: string) => {
-    const colors: Record<string, string> = {
-      success: 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400',
-      failure: 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400',
-      pending: 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-400',
-      reviewed: 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400',
-      approved: 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400',
-      draft: 'bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-400',
-      'in-review': 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400',
-      submitted: 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-400',
-    };
-    return colors[status] || 'bg-gray-100 text-gray-800';
-  };
-
-  const getRiskColor = (risk: string) => {
-    const colors: Record<string, string> = {
-      low: 'text-green-600 dark:text-green-400',
-      medium: 'text-yellow-600 dark:text-yellow-400',
-      high: 'text-red-600 dark:text-red-400',
-    };
-    return colors[risk] || 'text-gray-600';
-  };
+  // Helpers now live at module scope (statusColorMap/riskColorMap + getStatusColor/getRiskColor)
 
   return (
     <div className="space-y-6">
@@ -821,7 +839,12 @@ function EvidenceTab({
                     {item.source}
                   </td>
                   <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                    {new Date(item.collected || item.created_at || "").toLocaleDateString()}
+                    {(() => {
+                      const ts = item.collected || item.created_at;
+                      if (!ts) return '—';
+                      const d = new Date(ts);
+                      return isNaN(d.getTime()) ? '—' : d.toLocaleDateString();
+                    })()}
                   </td>
                   <td className="px-6 py-4 text-sm">
                     <span
@@ -1026,13 +1049,25 @@ function ConMonTab({
 
             <div className="space-y-2 text-sm text-gray-600 dark:text-gray-400">
               <div>
-                Status: <span className="font-medium text-gray-900 dark:text-white">
-                  {status.active ? 'Active' : 'Inactive'}
+                Status: <span className="font-medium text-gray-900 dark:text-white capitalize">
+                  {status.status || (status.active ? 'Active' : 'Inactive')}
                 </span>
               </div>
+              {status.compliance_percentage != null && (
+                <div>
+                  Compliance: <span className="font-medium text-gray-900 dark:text-white">
+                    {status.compliance_percentage.toFixed(1)}%
+                  </span>
+                </div>
+              )}
               <div>
                 Last Run: <span className="font-medium text-gray-900 dark:text-white">
-                  {new Date(status.lastRun || status.last_run || "").toLocaleString()}
+                  {(() => {
+                    const ts = status.lastRun || status.last_run;
+                    if (!ts) return '—';
+                    const d = new Date(ts);
+                    return isNaN(d.getTime()) ? '—' : d.toLocaleString();
+                  })()}
                 </span>
               </div>
             </div>
