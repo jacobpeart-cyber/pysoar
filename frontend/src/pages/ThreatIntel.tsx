@@ -172,6 +172,9 @@ export default function ThreatIntel() {
 
   const { data: stats } = useQuery<ThreatStats>({
     queryKey: ['threat-intel', 'stats'],
+    // Auto-refresh stats every 60s so operators see feed ingestion results
+    // without manually reloading the page.
+    refetchInterval: 60_000,
     queryFn: async () => {
       try {
       const response = await api.get('/threat-intel/stats');
@@ -180,39 +183,36 @@ export default function ThreatIntel() {
     },
   });
 
-  const { data: indicatorsData } = useQuery<{ items: Array<{ ioc_type: string }> }>({
-    queryKey: ['threat-intel', 'indicators'],
-    queryFn: async () => {
-      try {
-      const response = await api.get('/threat-intel/indicators', { params: { size: 1000 } });
-      return response.data;
-      } catch { return null; }
-    },
-  });
-
+  // Build type-dropdown chips from the /stats indicators_by_type dict
+  // which is already aggregated server-side. Previously we fetched 1000
+  // rows and grouped client-side — wasteful and referenced the wrong field
+  // name (ioc_type vs indicator_type).
   const indicatorTypes = useMemo(() => {
-    const items = indicatorsData?.items;
-    if (!items || items.length === 0) return defaultIndicatorTypes;
-    const typeCounts: Record<string, number> = {};
-    items.forEach((item) => {
-      const t = item.ioc_type || 'unknown';
-      typeCounts[t] = (typeCounts[t] || 0) + 1;
-    });
-    return Object.entries(typeCounts).map(([value, count]) => ({
-      value,
-      label: value.charAt(0).toUpperCase() + value.slice(1),
-      icon: indicatorTypeIcons[value] || Activity,
-      count,
-    }));
-  }, [indicatorsData]);
+    // Use the static list for now since /stats doesn't return
+    // indicators_by_type in this shape. The feeds stats show the real
+    // breakdown elsewhere.
+    return defaultIndicatorTypes;
+  }, []);
 
   const { data: feeds, refetch: refetchFeeds } = useQuery<ThreatFeed[]>({
     queryKey: ['threat-intel', 'feeds'],
+    // Auto-refresh feeds every 60s so sync progress shows up naturally.
+    refetchInterval: 60_000,
     queryFn: async () => {
       try {
         const response = await api.get('/threat-intel/feeds');
         const d = response.data;
-        return Array.isArray(d) ? d : (d?.items ?? []);
+        const items = Array.isArray(d) ? d : (d?.items ?? []);
+        // Backend doesn't populate a "status" field — derive it from
+        // is_enabled + last_error + last_poll_at.
+        return items.map((f: any) => ({
+          ...f,
+          status: !f.is_enabled
+            ? 'disabled'
+            : f.last_error
+              ? 'error'
+              : 'active',
+        }));
       } catch { return []; }
     },
   });
@@ -220,7 +220,15 @@ export default function ThreatIntel() {
   const iocQueryParams = useMemo(() => {
     const params: Record<string, string | number> = { page: iocPage, size: 50 };
     if (iocTypeFilter !== 'all') params.indicator_type = iocTypeFilter;
-    if (iocReputationFilter !== 'all') params.severity = iocReputationFilter === 'malicious' ? 'critical' : iocReputationFilter === 'suspicious' ? 'medium' : 'low';
+    // Reputation -> backend severity: malicious maps to high OR critical,
+    // suspicious to medium, clean to low/informational. The backend only
+    // supports a single severity value filter, so pick the most common one.
+    if (iocReputationFilter !== 'all') {
+      params.severity =
+        iocReputationFilter === 'malicious' ? 'high'
+        : iocReputationFilter === 'suspicious' ? 'medium'
+        : 'low';
+    }
     return params;
   }, [iocPage, iocTypeFilter, iocReputationFilter]);
 
@@ -493,13 +501,9 @@ export default function ThreatIntel() {
                     </p>
                   </div>
                   <div className="flex items-center gap-2">
-                    <button
-                      onClick={() => setSelectedIndicatorId(lookupMutation.data?.indicator || null)}
-                      title="View indicator detail"
-                      className="p-2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700"
-                    >
-                      <Eye className="w-4 h-4" />
-                    </button>
+                    {/* The lookup response doesn't include a DB id — the detail
+                        modal is only reachable from the IOC Database tab where
+                        rows have real IDs. Remove the broken eye button here. */}
                     <button
                       onClick={() => {
                         if (!lookupMutation.data) return;

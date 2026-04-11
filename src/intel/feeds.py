@@ -509,6 +509,11 @@ class FeedManager:
         # Built-in feeds — all keyless, all free, all publicly accessible.
         # The "plain" feed_type uses PlainListFeedParser which auto-detects
         # indicator_type from each line (IPv4/CIDR/URL/domain/hash).
+        #
+        # default_severity: severity assigned to every indicator ingested
+        # from this feed. Pick the level that matches the feed's signal
+        # quality — known C2 infrastructure is HIGH, curated attacker
+        # blocklists are MEDIUM.
         self.builtin_feeds = [
             {
                 "name": "Abuse.ch Feodo Tracker (Aggressive)",
@@ -524,6 +529,7 @@ class FeedManager:
                 "is_enabled": True,
                 "poll_interval_minutes": 60,
                 "confidence_weight": 0.9,
+                "default_severity": "high",  # live C2 infrastructure
             },
             {
                 "name": "Abuse.ch URLhaus",
@@ -535,6 +541,7 @@ class FeedManager:
                 "is_enabled": True,
                 "poll_interval_minutes": 30,
                 "confidence_weight": 0.95,
+                "default_severity": "high",  # live malware distribution
             },
             {
                 "name": "Emerging Threats Compromised IPs",
@@ -546,6 +553,7 @@ class FeedManager:
                 "is_enabled": True,
                 "poll_interval_minutes": 120,
                 "confidence_weight": 0.8,
+                "default_severity": "high",
             },
             {
                 "name": "Spamhaus DROP",
@@ -557,6 +565,7 @@ class FeedManager:
                 "is_enabled": True,
                 "poll_interval_minutes": 360,
                 "confidence_weight": 1.0,
+                "default_severity": "critical",  # hijacked or criminal netblocks
             },
             {
                 "name": "CINS Army List",
@@ -568,6 +577,7 @@ class FeedManager:
                 "is_enabled": True,
                 "poll_interval_minutes": 180,
                 "confidence_weight": 0.85,
+                "default_severity": "medium",
             },
             {
                 "name": "Blocklist.de All",
@@ -579,6 +589,7 @@ class FeedManager:
                 "is_enabled": True,
                 "poll_interval_minutes": 120,
                 "confidence_weight": 0.85,
+                "default_severity": "medium",
             },
             {
                 "name": "Binary Defense Banlist",
@@ -590,8 +601,20 @@ class FeedManager:
                 "is_enabled": True,
                 "poll_interval_minutes": 360,
                 "confidence_weight": 0.9,
+                "default_severity": "medium",
             },
         ]
+
+    def _feed_default_severity(self, feed_name: str) -> str:
+        """Look up the configured default severity for a named built-in feed.
+
+        Falls back to 'medium' for any feed that isn't in the builtin
+        config (e.g. user-added custom feeds).
+        """
+        for f in self.builtin_feeds:
+            if f["name"] == feed_name:
+                return f.get("default_severity", "medium")
+        return "medium"
 
     async def poll_feed(self, feed_id: str) -> int:
         """Poll a single threat feed and ingest indicators
@@ -629,8 +652,16 @@ class FeedManager:
                 await session.commit()
                 return 0
 
-            # Parse using the appropriate parser
-            parser = self.parsers.get(feed.feed_type)
+            # Parse using the appropriate parser. For plain-list feeds we
+            # instantiate a per-feed parser with the default severity
+            # configured in builtin_feeds[] — known-C2 feeds get HIGH,
+            # hijacked-netblock feeds get CRITICAL, generic attacker
+            # blocklists stay MEDIUM.
+            feed_default_severity = self._feed_default_severity(feed.name)
+            if feed.feed_type == "plain":
+                parser = PlainListFeedParser(default_severity=feed_default_severity)
+            else:
+                parser = self.parsers.get(feed.feed_type)
             if not parser:
                 self.logger.error("No parser for feed type", feed_type=feed.feed_type)
                 feed.last_error = f"No parser for feed type: {feed.feed_type}"
@@ -932,6 +963,32 @@ class FeedManager:
                 created += 1
                 self.logger.info("Registered builtin feed", name=feed_def["name"])
 
+            await session.commit()
+
+            # Backfill: upgrade severity on existing rows whose feed's
+            # default_severity has changed (e.g. the first ingestion
+            # defaulted to 'medium' and the feed has since been reclassified
+            # as 'high' or 'critical'). Idempotent — only touches rows whose
+            # current severity doesn't match the target.
+            from sqlalchemy import update
+            for feed_def in self.builtin_feeds:
+                target_severity = feed_def.get("default_severity")
+                if not target_severity:
+                    continue
+                feed_row_result = await session.execute(
+                    select(ThreatFeed).where(ThreatFeed.name == feed_def["name"])
+                )
+                feed_row = feed_row_result.scalar_one_or_none()
+                if not feed_row:
+                    continue
+                await session.execute(
+                    update(ThreatIndicator)
+                    .where(
+                        ThreatIndicator.feed_id == feed_row.id,
+                        ThreatIndicator.severity != target_severity,
+                    )
+                    .values(severity=target_severity)
+                )
             await session.commit()
 
         self.logger.info("Built-in feeds registration complete", created=created)
