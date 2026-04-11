@@ -669,9 +669,29 @@ async def execute_agent_tool(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Execute an agent tool directly."""
+    """Execute an agent tool directly. Every invocation is audit-logged."""
     from src.services.agent_tools import AgentToolRegistry
+    from src.tickethub.models import TicketActivity
+
     registry = AgentToolRegistry(db)
+    org_id = getattr(current_user, "organization_id", None)
+
+    # AU-2: Audit log the direct invocation
+    try:
+        db.add(TicketActivity(
+            source_type="agent_decision",
+            source_id="direct_api",
+            activity_type="tool_direct_invocation",
+            description=(
+                f"tool={tool_name} user={getattr(current_user, 'email', 'system')} "
+                f"params={json.dumps(params, default=str)[:500]}"
+            ),
+            organization_id=org_id,
+        ))
+        await db.flush()
+    except Exception as e:
+        logger.warning(f"Direct tool audit log failed: {e}")
+
     result = await registry.execute(tool_name, params)
     await db.commit()
     return result
@@ -700,6 +720,15 @@ async def chat_with_agent(
     tool_registry = AgentToolRegistry(db)
     tool_declarations = tool_registry.gemini_function_declarations()
     analyzer = AIAnalyzer()
+
+    # NIST AC-3: Destructive action tools require explicit caller authorization.
+    # Without `authorize_actions=True`, the agent is read-only.
+    DESTRUCTIVE_TOOLS = {
+        "block_ip", "isolate_host", "disable_user", "execute_playbook",
+        "create_incident", "create_alert", "create_ioc", "create_war_room",
+        "create_remediation_ticket", "update_alert_status", "assign_alert",
+        "create_action_item",
+    }
 
     system_prompt = (
         "You are an autonomous SOC agent for PySOAR. You have direct access to the security platform "
@@ -742,8 +771,67 @@ async def chat_with_agent(
         if llm_result.get("type") == "tool_call":
             tool_name = llm_result.get("name", "")
             tool_args = llm_result.get("args", {}) or {}
+            is_fallback = bool(llm_result.get("fallback"))
 
-            logger.info(f"Agent step {step+1}: calling tool {tool_name} with {tool_args}")
+            # AC-3 enforcement: block destructive tools unless explicitly authorized
+            if tool_name in DESTRUCTIVE_TOOLS and not query_data.authorize_actions:
+                blocked_msg = (
+                    f"The agent wants to call `{tool_name}` with args {json.dumps(tool_args, default=str)[:200]}, "
+                    f"which is a state-changing action. Re-send the request with `authorize_actions: true` "
+                    f"to approve and execute this action."
+                )
+                tool_log.append({
+                    "step": step + 1,
+                    "tool": tool_name,
+                    "args": tool_args,
+                    "result": {"blocked": True, "reason": "authorize_actions=false"},
+                    "blocked": True,
+                })
+                # Audit the blocked attempt
+                try:
+                    from src.tickethub.models import TicketActivity
+                    db.add(TicketActivity(
+                        source_type="agent_decision",
+                        source_id=str(query_data.agent_id or "auto"),
+                        activity_type="tool_blocked",
+                        description=(
+                            f"BLOCKED tool={tool_name} reason=authorize_actions=false "
+                            f"user={getattr(current_user, 'email', 'system')} "
+                            f"args={json.dumps(tool_args, default=str)[:400]}"
+                        ),
+                        organization_id=org_id,
+                    ))
+                    await db.flush()
+                except Exception:
+                    pass
+                final_text = blocked_msg
+                break
+
+            logger.info(
+                f"Agent step {step+1}: calling tool {tool_name} with {tool_args}"
+                f"{' [heuristic-fallback]' if is_fallback else ''}"
+            )
+
+            # AU-2: Persist every agent tool invocation BEFORE execution so
+            # there is a tamper-evident record even if the action crashes.
+            try:
+                from src.tickethub.models import TicketActivity
+                audit = TicketActivity(
+                    source_type="agent_decision",
+                    source_id=str(query_data.agent_id or "auto"),
+                    activity_type="tool_invocation",
+                    description=(
+                        f"step={step+1} tool={tool_name} "
+                        f"mode={'fallback' if is_fallback else 'llm'} "
+                        f"user={getattr(current_user, 'email', 'system')} "
+                        f"args={json.dumps(tool_args, default=str)[:500]}"
+                    ),
+                    organization_id=org_id,
+                )
+                db.add(audit)
+                await db.flush()
+            except Exception as audit_err:
+                logger.warning(f"Agent audit log write failed: {audit_err}")
 
             exec_result = await tool_registry.execute(tool_name, tool_args)
             tool_log.append({
@@ -751,6 +839,7 @@ async def chat_with_agent(
                 "tool": tool_name,
                 "args": tool_args,
                 "result": exec_result,
+                "fallback": is_fallback,
             })
 
             # Feed the result back to Gemini for a natural-language answer

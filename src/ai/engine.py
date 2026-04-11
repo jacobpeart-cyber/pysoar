@@ -800,7 +800,8 @@ class AIAnalyzer:
 
         try:
             response = httpx.post(
-                f"{self.GEMINI_URL}?key={self.GEMINI_API_KEY}",
+                self.GEMINI_URL,
+                headers={"x-goog-api-key": self.GEMINI_API_KEY, "Content-Type": "application/json"},
                 json={
                     "contents": [{"parts": [{"text": full_prompt}]}],
                     "generationConfig": {
@@ -889,7 +890,8 @@ class AIAnalyzer:
 
         try:
             response = httpx.post(
-                f"{self.GEMINI_URL}?key={self.GEMINI_API_KEY}",
+                self.GEMINI_URL,
+                headers={"x-goog-api-key": self.GEMINI_API_KEY, "Content-Type": "application/json"},
                 json={
                     "contents": [
                         {"role": "user", "parts": [{"text": f"{system_prompt}\n\n{user_prompt}"}]}
@@ -924,7 +926,47 @@ class AIAnalyzer:
 
         except Exception as e:
             self.logger.error(f"Gemini tool call failed: {e}")
+            # Deterministic fallback: pick a tool via keyword heuristic so the
+            # agent still does something useful when the LLM is unavailable.
+            fallback_tool = self._heuristic_tool_pick(user_prompt, tools)
+            if fallback_tool:
+                return {
+                    "type": "tool_call",
+                    "name": fallback_tool["name"],
+                    "args": fallback_tool["args"],
+                    "fallback": True,
+                }
             return {"type": "error", "error": str(e)[:200]}
+
+    def _heuristic_tool_pick(self, user_prompt: str, tools: list[dict]) -> dict | None:
+        """Keyword-based tool picker for LLM-unavailable fallback."""
+        if not tools:
+            return None
+        text = (user_prompt or "").lower()
+        tool_names = {t.get("name", ""): t for t in tools}
+
+        # Priority-ordered keyword rules → tool name + arg extractor
+        import re
+        ip_match = re.search(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b", text)
+        rules: list[tuple[list[str], str, dict]] = [
+            (["block", "blacklist"], "block_ip", {"ip": ip_match.group(1) if ip_match else ""}),
+            (["isolate", "quarantine host"], "isolate_host", {}),
+            (["disable user", "lock account"], "disable_user", {}),
+            (["list alert", "show alert", "recent alert"], "list_alerts", {"limit": 10}),
+            (["list incident", "show incident"], "list_incidents", {"limit": 10}),
+            (["list ioc", "show ioc", "indicator"], "list_iocs", {"limit": 10}),
+            (["stat", "status", "overview", "summary", "dashboard", "how many"], "platform_stats", {}),
+            (["search", "find"], "search_alerts", {"query": user_prompt[:200]}),
+            (["hunt"], "run_threat_hunt", {}),
+            (["triage"], "triage_alert", {}),
+        ]
+        for keywords, name, args in rules:
+            if name in tool_names and any(k in text for k in keywords):
+                return {"name": name, "args": args}
+
+        if "platform_stats" in tool_names:
+            return {"name": "platform_stats", "args": {}}
+        return None
 
     def call_llm_followup(
         self,
@@ -942,7 +984,8 @@ class AIAnalyzer:
 
         try:
             response = httpx.post(
-                f"{self.GEMINI_URL}?key={self.GEMINI_API_KEY}",
+                self.GEMINI_URL,
+                headers={"x-goog-api-key": self.GEMINI_API_KEY, "Content-Type": "application/json"},
                 json={
                     "contents": [
                         {"role": "user", "parts": [{"text": f"{system_prompt}\n\n{user_prompt}"}]},

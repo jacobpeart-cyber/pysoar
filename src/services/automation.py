@@ -71,6 +71,8 @@ class AutomationService:
         }
         org_id = organization_id or getattr(alert, "organization_id", None)
 
+        failures: list[dict] = []
+
         # Step 1: IOC matching
         try:
             ioc_matches = await self._check_ioc_matches(alert)
@@ -79,6 +81,7 @@ class AutomationService:
                 logger.info(f"Alert {alert.id} matched {len(ioc_matches)} IOCs - escalated to critical")
         except Exception as e:
             logger.error(f"IOC matching failed for alert {alert.id}: {e}")
+            failures.append({"step": "ioc_matching", "error": str(e)[:300]})
 
         # Step 2: Auto-create incident for critical/high severity or repeated patterns
         try:
@@ -95,6 +98,7 @@ class AutomationService:
                         logger.info(f"Auto-created war room {war_room.id} for critical incident {incident.id}")
         except Exception as e:
             logger.error(f"Auto-incident creation failed for alert {alert.id}: {e}")
+            failures.append({"step": "auto_incident", "error": str(e)[:300]})
 
         # Step 4: Auto-trigger playbooks
         try:
@@ -102,6 +106,23 @@ class AutomationService:
             results["playbooks_triggered"] = triggered
         except Exception as e:
             logger.error(f"Playbook auto-trigger failed for alert {alert.id}: {e}")
+            failures.append({"step": "playbook_trigger", "error": str(e)[:300]})
+
+        # Dead-letter trail: record any pipeline failures as an activity so
+        # operators can retry them later. (scheduled retry task can query this.)
+        if failures:
+            results["failures"] = failures
+            try:
+                dlq = TicketActivity(
+                    source_type="alert",
+                    source_id=str(alert.id),
+                    activity_type="automation_pipeline_failure",
+                    description=f"DLQ: {json.dumps(failures)[:800]}",
+                    organization_id=org_id,
+                )
+                self.db.add(dlq)
+            except Exception:
+                pass
 
         # Log activity
         try:

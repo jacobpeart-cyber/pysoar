@@ -304,6 +304,10 @@ class NaturalLanguageQuery(BaseModel):
 
     query: str = Field(..., min_length=1)
     agent_id: Optional[str] = None  # Specific agent or auto-select
+    # If False, destructive action tools (block_ip, isolate_host, disable_user,
+    # execute_playbook, create_incident, etc.) are blocked — the agent can only
+    # query and analyze. Caller must explicitly authorize actions.
+    authorize_actions: bool = False
 
 
 class NaturalLanguageResponse(BaseModel):
