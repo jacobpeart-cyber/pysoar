@@ -124,9 +124,11 @@ class HuntSessionResponse(DBModel):
     query_count: int = 0
     events_analyzed: int = 0
     findings_count: int = 0
-    queries_executed: Optional[int] = 0
+    # queries_executed is a JSON column on the model that stores the
+    # per-run hunt telemetry dict (logs_scanned, iocs_checked, findings_created_this_run)
+    queries_executed: Optional[Any] = None
     error_message: Optional[str] = None
-    created_by: str = ""
+    created_by: Optional[str] = ""
     created_at: Optional[datetime] = None
 
     class Config:
@@ -175,10 +177,21 @@ class HuntFindingResponse(DBModel):
     """Schema for hunt finding response"""
 
     id: str = ""
+    session_id: Optional[str] = None
+    title: str = ""
+    description: Optional[str] = None
+    severity: str = "medium"
     classification: Optional[str] = None
+    evidence: Optional[Any] = None
+    affected_assets: Optional[Any] = None
+    iocs_found: Optional[Any] = None
+    mitre_techniques: Optional[Any] = None
+    analyst_notes: Optional[str] = None
     escalated_to_case: bool = False
     case_id: Optional[str] = None
+    created_by: Optional[str] = None
     created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -247,7 +260,7 @@ class HuntNotebookResponse(DBModel):
     id: str = ""
     session_id: str = ""
     title: str = ""
-    content: list[HuntNotebookCell]
+    content: list[HuntNotebookCell] = Field(default_factory=list)
     version: int = 1
     is_published: bool = False
     published_at: Optional[datetime] = None
