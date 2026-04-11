@@ -1266,7 +1266,7 @@ export const phishingApi = {
     page?: number;
     size?: number;
   }): Promise<PaginatedResponse<PhishingResult>> => {
-    const response = await api.get(`/phishing/campaigns/${campaignId}/results`, { params });
+    const response = await api.get(`/phishing_sim/campaigns/${campaignId}/results`, { params });
     return extractData(response.data);
   },
 
@@ -1285,8 +1285,8 @@ export const phishingApi = {
     return extractData(response.data);
   },
 
-  launchCampaign: async (groupId: string): Promise<any> => {
-    const response = await api.post(`/phishing/campaigns/launch`, { target_group_id: groupId });
+  launchCampaign: async (campaignId: string): Promise<any> => {
+    const response = await api.post(`/phishing_sim/campaigns/${campaignId}/launch`);
     return response.data;
   },
 };
