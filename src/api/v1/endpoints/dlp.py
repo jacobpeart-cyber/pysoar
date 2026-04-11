@@ -10,7 +10,7 @@ import math
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, status
-from sqlalchemy import func, select
+from sqlalchemy import and_, case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DatabaseSession
@@ -925,59 +925,176 @@ async def get_dlp_dashboard(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Get DLP dashboard summary"""
+    """Get DLP dashboard summary.
+
+    Five fields were hardcoded theater — worst of them the
+    compliance_status dict that claimed
+    ``{"gdpr": "compliant", "hipaa": "compliant", "pci_dss": "pending_review"}``
+    regardless of whether any framework was even loaded for the
+    tenant. An auditor clicking through the DLP page would have seen
+    GDPR "compliant" on a fresh tenant with zero evidence.
+    """
+    from datetime import datetime, timedelta, timezone
+    from src.compliance.models import ComplianceFramework
+
+    org_id = getattr(current_user, "organization_id", None)
+    now = datetime.now(timezone.utc)
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+
     # Count violations
-    violations_query = select(func.count()).select_from(DLPViolation).where(
-        DLPViolation.organization_id == getattr(current_user, "organization_id", None)
+    total_violations_result = await db.execute(
+        select(func.count(DLPViolation.id)).where(
+            DLPViolation.organization_id == org_id
+        )
     )
-    total_violations_result = await db.execute(violations_query)
     total_violations = total_violations_result.scalar() or 0
 
-    # Count critical violations
-    critical_query = select(func.count()).select_from(DLPViolation).where(
-        (DLPViolation.organization_id == getattr(current_user, "organization_id", None))
-        & (DLPViolation.severity == "critical")
+    # This month
+    month_result = await db.execute(
+        select(func.count(DLPViolation.id)).where(
+            and_(
+                DLPViolation.organization_id == org_id,
+                DLPViolation.created_at >= month_start,
+            )
+        )
     )
-    critical_result = await db.execute(critical_query)
+    violations_this_month = month_result.scalar() or 0
+
+    # Count critical
+    critical_result = await db.execute(
+        select(func.count(DLPViolation.id)).where(
+            and_(
+                DLPViolation.organization_id == org_id,
+                DLPViolation.severity == "critical",
+            )
+        )
+    )
     critical_violations = critical_result.scalar() or 0
 
-    # Get top policies
-    policy_query = select(DLPPolicy.name, func.count(DLPViolation.id).label("trigger_count")).join(
-        DLPViolation,
-        DLPPolicy.id == DLPViolation.policy_id,
-    ).where(
-        DLPPolicy.organization_id == getattr(current_user, "organization_id", None)
-    ).group_by(
-        DLPPolicy.name
-    ).order_by(
-        func.count(DLPViolation.id).desc()
-    ).limit(5)
-
+    # Top policies by trigger count
+    policy_query = (
+        select(DLPPolicy.name, func.count(DLPViolation.id))
+        .join(DLPViolation, DLPPolicy.id == DLPViolation.policy_id)
+        .where(DLPPolicy.organization_id == org_id)
+        .group_by(DLPPolicy.name)
+        .order_by(func.count(DLPViolation.id).desc())
+        .limit(5)
+    )
     policy_result = await db.execute(policy_query)
     top_policies = [
-        {"policy": row[0], "triggers": row[1]}
-        for row in policy_result.all()
+        {"policy": row[0], "triggers": row[1]} for row in policy_result.all()
     ]
 
+    # Top violations (newest 5 by severity rank)
+    sev_rank = case(
+        (DLPViolation.severity == "critical", 4),
+        (DLPViolation.severity == "high", 3),
+        (DLPViolation.severity == "medium", 2),
+        (DLPViolation.severity == "low", 1),
+        else_=0,
+    )
+    top_vio_result = await db.execute(
+        select(DLPViolation)
+        .where(DLPViolation.organization_id == org_id)
+        .order_by(sev_rank.desc(), DLPViolation.created_at.desc())
+        .limit(5)
+    )
+    top_violations_raw = list(top_vio_result.scalars().all())
+    top_violations = [
+        {
+            "id": v.id,
+            "severity": v.severity,
+            "violation_type": v.violation_type,
+            "status": v.status,
+            "created_at": v.created_at.isoformat() if v.created_at else None,
+        }
+        for v in top_violations_raw
+    ]
+
+    # Data risk map — real counts from SensitiveDataDiscovery scans
+    try:
+        scan_rows = await db.execute(
+            select(SensitiveDataDiscovery).where(
+                SensitiveDataDiscovery.organization_id == org_id
+            )
+        )
+        scans = list(scan_rows.scalars().all())
+        high_risk_locations = sum(
+            1 for s in scans if (getattr(s, "risk_level", "") or "") == "high"
+        )
+        medium_risk_locations = sum(
+            1 for s in scans if (getattr(s, "risk_level", "") or "") == "medium"
+        )
+        monitored_locations = len(scans)
+    except Exception:  # noqa: BLE001
+        high_risk_locations = medium_risk_locations = monitored_locations = 0
+
+    data_risk_map = {
+        "high_risk_locations": high_risk_locations,
+        "medium_risk_locations": medium_risk_locations,
+        "monitored_locations": monitored_locations,
+    }
+
+    # Real compliance_status — query ComplianceFramework like ITDR
+    compliance_status: dict[str, str] = {}
+    try:
+        fw_rows = await db.execute(
+            select(ComplianceFramework).where(
+                ComplianceFramework.organization_id == org_id
+            )
+        )
+        for fw in fw_rows.scalars().all():
+            if fw.short_name:
+                compliance_status[fw.short_name] = fw.status or "unknown"
+    except Exception:  # noqa: BLE001
+        pass
+
+    # Real remediation rate = resolved / total
+    resolved_result = await db.execute(
+        select(func.count(DLPViolation.id)).where(
+            and_(
+                DLPViolation.organization_id == org_id,
+                DLPViolation.status == "resolved",
+            )
+        )
+    )
+    resolved = resolved_result.scalar() or 0
+    remediation_rate = (resolved / total_violations) if total_violations > 0 else 0.0
+
+    # Real average response time from resolved violations
+    resolved_rows = await db.execute(
+        select(DLPViolation).where(
+            and_(
+                DLPViolation.organization_id == org_id,
+                DLPViolation.status == "resolved",
+            )
+        )
+    )
+    resolved_list = list(resolved_rows.scalars().all())
+    durations_hours: list[float] = []
+    for v in resolved_list:
+        # Use created_at → updated_at as the response window proxy
+        if v.created_at and v.updated_at and v.updated_at > v.created_at:
+            dur = (v.updated_at - v.created_at).total_seconds() / 3600.0
+            if dur >= 0:
+                durations_hours.append(dur)
+    avg_response_time = (
+        round(sum(durations_hours) / len(durations_hours), 2)
+        if durations_hours
+        else 0.0
+    )
+
     return DLPDashboardResponse(
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         total_violations=total_violations,
-        violations_this_month=0,
+        violations_this_month=violations_this_month,
         critical_violations=critical_violations,
-        top_violations=[],
+        top_violations=top_violations,
         top_policies_triggered=top_policies,
-        data_risk_map={
-            "high_risk_locations": 3,
-            "medium_risk_locations": 12,
-            "monitored_locations": 250,
-        },
-        compliance_status={
-            "gdpr": "compliant",
-            "hipaa": "compliant",
-            "pci_dss": "pending_review",
-        },
-        remediation_rate=0.82,
-        average_response_time_hours=4.5,
+        data_risk_map=data_risk_map,
+        compliance_status=compliance_status,
+        remediation_rate=round(remediation_rate, 3),
+        average_response_time_hours=avg_response_time,
     )
 
 
@@ -987,25 +1104,82 @@ async def get_violation_trends(
     db: DatabaseSession = None,
     period: str = Query("month", pattern="^(day|week|month|year)$"),
 ):
-    """Get violation trends"""
+    """Get violation trends over a period.
+
+    Previously returned hardcoded zeros and a fake "stable" trend.
+    Now runs real aggregates over the requested window.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    org_id = getattr(current_user, "organization_id", None)
+    now = datetime.now(timezone.utc)
+
+    if period == "day":
+        cutoff = now - timedelta(days=1)
+        prior = now - timedelta(days=2)
+    elif period == "week":
+        cutoff = now - timedelta(days=7)
+        prior = now - timedelta(days=14)
+    elif period == "year":
+        cutoff = now - timedelta(days=365)
+        prior = now - timedelta(days=730)
+    else:  # month
+        cutoff = now - timedelta(days=30)
+        prior = now - timedelta(days=60)
+
+    recent_rows = await db.execute(
+        select(DLPViolation).where(
+            and_(
+                DLPViolation.organization_id == org_id,
+                DLPViolation.created_at >= cutoff,
+            )
+        )
+    )
+    recent = list(recent_rows.scalars().all())
+
+    prior_count_result = await db.execute(
+        select(func.count(DLPViolation.id)).where(
+            and_(
+                DLPViolation.organization_id == org_id,
+                DLPViolation.created_at >= prior,
+                DLPViolation.created_at < cutoff,
+            )
+        )
+    )
+    prior_count = prior_count_result.scalar() or 0
+
+    by_type: dict[str, int] = {}
+    by_severity: dict[str, int] = {}
+    by_status: dict[str, int] = {}
+    for v in recent:
+        t = v.violation_type or "unknown"
+        s = v.severity or "unknown"
+        st = v.status or "unknown"
+        by_type[t] = by_type.get(t, 0) + 1
+        by_severity[s] = by_severity.get(s, 0) + 1
+        by_status[st] = by_status.get(st, 0) + 1
+
+    recent_count = len(recent)
+    if prior_count == 0 and recent_count == 0:
+        trend_direction = "stable"
+    elif prior_count == 0:
+        trend_direction = "rising"
+    else:
+        delta = (recent_count - prior_count) / prior_count
+        if delta > 0.1:
+            trend_direction = "rising"
+        elif delta < -0.1:
+            trend_direction = "declining"
+        else:
+            trend_direction = "stable"
+
     return ViolationTrendResponse(
         period=period,
-        total_violations=0,
-        by_type={
-            "pii_exposure": 0,
-            "unauthorized_transfer": 0,
-        },
-        by_severity={
-            "critical": 0,
-            "high": 0,
-            "medium": 0,
-        },
-        by_status={
-            "new": 0,
-            "investigating": 0,
-            "resolved": 0,
-        },
-        trend_direction="stable",
+        total_violations=recent_count,
+        by_type=by_type,
+        by_severity=by_severity,
+        by_status=by_status,
+        trend_direction=trend_direction,
     )
 
 
@@ -1014,16 +1188,70 @@ async def get_compliance_status(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Get regulatory compliance status"""
+    """Get regulatory compliance status.
+
+    Previously returned a hardcoded lie:
+      {"GDPR": {"compliant": True}, "HIPAA": {"compliant": True},
+       "PCI-DSS": {"compliant": True}, "CCPA": {"compliant": True}}
+    regardless of actual framework data. A compliance officer
+    viewing a fresh tenant would see "everything compliant" —
+    the first fail in any real audit.
+
+    Now queries ComplianceFramework rows and pairs them with
+    open DLPIncident counts to produce the actual compliance_status
+    + open_incidents dict.
+    """
+    from src.compliance.models import ComplianceFramework
+
+    org_id = getattr(current_user, "organization_id", None)
+
+    # Real compliance frameworks
+    fw_rows = await db.execute(
+        select(ComplianceFramework).where(
+            ComplianceFramework.organization_id == org_id
+        )
+    )
+    frameworks = list(fw_rows.scalars().all())
+
+    # Open DLP incident count for each framework that might care
+    open_incidents_q = await db.execute(
+        select(func.count(DLPIncident.id)).where(
+            and_(
+                DLPIncident.organization_id == org_id,
+                DLPIncident.status.in_(["new", "investigating", "open"]),
+            )
+        )
+    )
+    total_open_incidents = open_incidents_q.scalar() or 0
+
+    regulations: dict[str, dict] = {}
+    for fw in frameworks:
+        key = (fw.short_name or fw.name).upper().replace("_", "-")
+        compliant = (fw.status or "").lower() in ("compliant", "certified")
+        regulations[key] = {
+            "compliant": compliant,
+            "open_incidents": total_open_incidents if not compliant else 0,
+            "compliance_score": fw.compliance_score or 0.0,
+        }
+
+    # Overall compliance_score = average across frameworks
+    if frameworks:
+        overall = sum(f.compliance_score or 0.0 for f in frameworks) / len(frameworks)
+        compliance_score = round(overall / 100.0, 2)
+    else:
+        compliance_score = 0.0
+
+    # Recommendations: any framework < 80% gets an entry
+    recommendations = [
+        f"{fw.name} is at {fw.compliance_score or 0:.0f}% — assess controls and close gaps"
+        for fw in frameworks
+        if (fw.compliance_score or 0.0) < 80.0
+    ]
+
     return ComplianceStatusResponse(
-        regulations={
-            "GDPR": {"compliant": True, "open_incidents": 0},
-            "HIPAA": {"compliant": True, "open_incidents": 0},
-            "PCI-DSS": {"compliant": True, "open_incidents": 0},
-            "CCPA": {"compliant": True, "open_incidents": 0},
-        },
-        open_incidents=0,
+        regulations=regulations,
+        open_incidents=total_open_incidents,
         overdue_notifications=0,
-        compliance_score=0.95,
-        recommendations=[],
+        compliance_score=compliance_score,
+        recommendations=recommendations,
     )
