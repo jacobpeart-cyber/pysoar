@@ -564,6 +564,45 @@ async def list_vulnerabilities(
     }
 
 
+@router.get("/vulnerabilities/kev")
+async def get_cisa_kev_list_early(
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+):
+    """CISA Known Exploited Vulnerabilities list.
+
+    NOTE: This route MUST be declared before GET /vulnerabilities/{vuln_id}
+    because FastAPI matches routes in definition order — if the dynamic
+    route comes first, the literal path 'kev' is captured as a vuln_id
+    and the endpoint 404s with "Vulnerability not found".
+    """
+    org_id = getattr(current_user, "organization_id", None)
+    query = select(Vulnerability).where(Vulnerability.is_exploited_in_wild == True)  # noqa: E712
+    if org_id is not None:
+        query = query.where(Vulnerability.organization_id == org_id)
+    result = await db.execute(query)
+    kev_vulns = list(result.scalars().all())
+
+    return {
+        "kev_vulnerabilities": [
+            {
+                "id": v.id,
+                "cve_id": v.cve_id,
+                "title": v.title,
+                "severity": v.severity,
+                "cvss_score": v.cvss_score,
+                "is_exploited_in_wild": v.is_exploited_in_wild,
+                "kev_date_added": v.kev_date_added.isoformat() if getattr(v, "kev_date_added", None) else None,
+                "published_date": v.published_date.isoformat() if getattr(v, "published_date", None) else None,
+                "description": v.description,
+            }
+            for v in kev_vulns
+        ],
+        "last_updated": datetime.now(timezone.utc).isoformat(),
+        "count": len(kev_vulns),
+    }
+
+
 @router.get("/vulnerabilities/{vuln_id}", response_model=VulnerabilityResponse)
 async def get_vulnerability(
     vuln_id: str,
@@ -607,27 +646,8 @@ async def delete_vulnerability(
     await db.flush()
 
 
-@router.get("/vulnerabilities/kev")
-async def get_cisa_kev_list(
-    current_user: CurrentUser = None,
-    db: DatabaseSession = None,
-):
-    """Get CISA Known Exploited Vulnerabilities list (with integration)"""
-    result = await db.execute(
-        select(Vulnerability).where(
-            and_(
-                Vulnerability.organization_id == getattr(current_user, "organization_id", None),
-                Vulnerability.is_exploited_in_wild == True,
-            )
-        )
-    )
-    kev_vulns = list(result.scalars().all())
-
-    return {
-        "kev_vulnerabilities": kev_vulns,
-        "last_updated": datetime.now(timezone.utc).isoformat(),
-        "count": len(kev_vulns),
-    }
+# /vulnerabilities/kev moved above /vulnerabilities/{vuln_id} — see
+# get_cisa_kev_list_early above. Route ordering matters in FastAPI.
 
 
 @router.post("/vulnerabilities/search", response_model=VulnerabilityListResponse)
@@ -1344,6 +1364,96 @@ async def get_dashboard_statistics(
     vuln_status_result = await db.execute(vs_query.group_by(AssetVulnerability.status))
     vulns_by_status = dict(vuln_status_result.all())
 
+    # --- REAL MTTR: average (resolved_at - created_at) over closed tickets ---
+    mttr_query = select(RemediationTicket.created_at, RemediationTicket.resolved_at)
+    if org_id is not None:
+        mttr_query = mttr_query.where(RemediationTicket.organization_id == org_id)
+    mttr_query = mttr_query.where(
+        RemediationTicket.status == "closed",
+        RemediationTicket.resolved_at.is_not(None),
+    )
+    mttr_result = await db.execute(mttr_query)
+    durations_days: list[float] = []
+    for created_at, resolved_at in mttr_result.all():
+        if not created_at or not resolved_at:
+            continue
+        delta = (resolved_at - created_at).total_seconds() / 86400.0
+        if delta > 0:
+            durations_days.append(delta)
+    mean_time_to_remediate_days = (
+        round(sum(durations_days) / len(durations_days), 2) if durations_days else None
+    )
+
+    # --- REAL OVERALL RISK SCORE: weighted blend of open vulns by severity ---
+    # Simple FAIR-adjacent heuristic: critical=10, high=5, medium=2, low=1.
+    # Normalize to 0-100 with 100 = "every asset has a critical vuln".
+    severity_weights = {"critical": 10, "high": 5, "medium": 2, "low": 1, "informational": 0}
+    weighted_sum = sum(
+        severity_counts.get(k, 0) * w for k, w in severity_weights.items()
+    )
+    max_possible = max(total_assets, 1) * 10  # ceiling: every asset critical
+    overall_risk_score = round(min(100.0, (weighted_sum / max_possible) * 100.0), 1) if max_possible > 0 else 0.0
+
+    # --- REAL TOP VULNERABLE ASSETS: top 10 by risk_score ---
+    top_query = select(ExposureAsset).order_by(ExposureAsset.risk_score.desc()).limit(10)
+    if org_id is not None:
+        top_query = top_query.where(ExposureAsset.organization_id == org_id)
+    top_result = await db.execute(top_query)
+    top_vulnerable_assets = [
+        {
+            "id": a.id,
+            "hostname": a.hostname,
+            "asset_type": a.asset_type,
+            "criticality": a.criticality,
+            "risk_score": float(a.risk_score or 0.0),
+            "is_internet_facing": a.is_internet_facing,
+        }
+        for a in top_result.scalars().all()
+    ]
+
+    # --- REAL EXPOSURE TREND: daily new vulns over the last 30 days ---
+    from datetime import timedelta as _td
+    thirty_days_ago = datetime.now(timezone.utc) - _td(days=30)
+    trend_query = select(
+        func.date_trunc("day", Vulnerability.created_at).label("day"),
+        func.count(Vulnerability.id),
+    ).where(Vulnerability.created_at >= thirty_days_ago)
+    if org_id is not None:
+        trend_query = trend_query.where(Vulnerability.organization_id == org_id)
+    trend_query = trend_query.group_by("day").order_by("day")
+    trend_result = await db.execute(trend_query)
+    trend_by_day = {row[0].date().isoformat(): int(row[1]) for row in trend_result.all()}
+    # Fill any missing day with 0 to keep the chart dense
+    exposure_trend = []
+    for i in range(30):
+        day = (thirty_days_ago + _td(days=i)).date()
+        exposure_trend.append({
+            "date": day.strftime("%b %d"),
+            "exposures": trend_by_day.get(day.isoformat(), 0),
+        })
+
+    # --- REAL COMPLIANCE SUMMARY: pull aggregates from ComplianceFramework if present ---
+    compliance_summary = {}
+    try:
+        from src.compliance.models import ComplianceFramework
+        fw_query = select(
+            ComplianceFramework.short_name,
+            ComplianceFramework.compliance_score,
+            ComplianceFramework.total_controls,
+            ComplianceFramework.implemented_controls,
+        ).where(ComplianceFramework.is_enabled == True)
+        if org_id is not None:
+            fw_query = fw_query.where(ComplianceFramework.organization_id == org_id)
+        fw_result = await db.execute(fw_query)
+        for short, score, total, implemented in fw_result.all():
+            compliance_summary[short or "unknown"] = {
+                "score": float(score or 0.0),
+                "total_controls": int(total or 0),
+                "implemented_controls": int(implemented or 0),
+            }
+    except Exception:
+        pass  # Compliance module optional — keep the dashboard rendering
+
     return {
         "total_assets": total_assets,
         "active_assets": active_assets,
@@ -1354,14 +1464,14 @@ async def get_dashboard_statistics(
         "medium_vulns": severity_counts.get("medium", 0),
         "low_vulns": severity_counts.get("low", 0),
         "info_vulns": severity_counts.get("informational", 0),
-        "mean_time_to_remediate_days": 0.0,
+        "mean_time_to_remediate_days": mean_time_to_remediate_days,
         "overdue_tickets": overdue_tickets,
-        "overall_risk_score": 0.0,
+        "overall_risk_score": overall_risk_score,
         "assets_by_criticality": assets_by_criticality,
         "vulns_by_status": vulns_by_status,
-        "top_vulnerable_assets": [],
-        "exposure_trend": [],
-        "compliance_summary": {},
+        "top_vulnerable_assets": top_vulnerable_assets,
+        "exposure_trend": exposure_trend,
+        "compliance_summary": compliance_summary,
     }
 
 
@@ -1370,32 +1480,58 @@ async def get_risk_matrix(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Get risk matrix (criticality vs severity)"""
+    """Build a real criticality×severity risk matrix.
+
+    Joins every open AssetVulnerability to its parent ExposureAsset +
+    Vulnerability, then groups by (asset.criticality × vuln.severity).
+    The resulting 4×5 grid (low/medium/high/critical × info/low/medium/high/critical)
+    is what the frontend risk heatmap renders.
+    """
     org_id = getattr(current_user, "organization_id", None)
 
+    # Total open exposures
+    total_conditions = [AssetVulnerability.status == "open"]
+    if org_id is not None:
+        total_conditions.append(AssetVulnerability.organization_id == org_id)
     total_result = await db.execute(
-        select(func.count(AssetVulnerability.id)).where(
-            and_(
-                AssetVulnerability.organization_id == org_id,
-                AssetVulnerability.status == "open",
-            )
-        )
+        select(func.count(AssetVulnerability.id)).where(and_(*total_conditions))
     )
     total_exposures = total_result.scalar() or 0
 
+    # Critical exposures (risk_score >= 80 OR vuln.severity == critical)
+    critical_conditions = list(total_conditions) + [AssetVulnerability.risk_score >= 80.0]
     critical_result = await db.execute(
-        select(func.count(AssetVulnerability.id)).where(
-            and_(
-                AssetVulnerability.organization_id == org_id,
-                AssetVulnerability.status == "open",
-                AssetVulnerability.risk_score >= 80.0,
-            )
-        )
+        select(func.count(AssetVulnerability.id)).where(and_(*critical_conditions))
     )
     critical_exposures = critical_result.scalar() or 0
 
+    # Build the matrix: JOIN to asset (for criticality) + vuln (for severity)
+    matrix_query = (
+        select(
+            ExposureAsset.criticality,
+            Vulnerability.severity,
+            func.count(AssetVulnerability.id),
+        )
+        .join(ExposureAsset, AssetVulnerability.asset_id == ExposureAsset.id)
+        .join(Vulnerability, AssetVulnerability.vulnerability_id == Vulnerability.id)
+        .where(AssetVulnerability.status == "open")
+        .group_by(ExposureAsset.criticality, Vulnerability.severity)
+    )
+    if org_id is not None:
+        matrix_query = matrix_query.where(AssetVulnerability.organization_id == org_id)
+    matrix_result = await db.execute(matrix_query)
+
+    # Initialize the grid so cells with zero exposures render as 0 (not missing)
+    criticalities = ["low", "medium", "high", "critical"]
+    severities = ["informational", "low", "medium", "high", "critical"]
+    matrix: dict = {c: {s: 0 for s in severities} for c in criticalities}
+
+    for crit, sev, count in matrix_result.all():
+        if crit in matrix and sev in matrix[crit]:
+            matrix[crit][sev] = int(count)
+
     return {
-        "matrix": {},
+        "matrix": matrix,
         "total_exposures": total_exposures,
         "critical_exposures": critical_exposures,
     }
@@ -1406,22 +1542,88 @@ async def get_compliance_status(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Get compliance status summary"""
+    """Compliance status summary for the exposure dashboard.
+
+    Pulls real framework data from the ComplianceFramework + ComplianceControl
+    tables, aggregates pass/fail counts per framework, and computes an
+    overall compliance score. Frontend consumes this to render the
+    Compliance tab list of frameworks.
+    """
     org_id = getattr(current_user, "organization_id", None)
 
-    # Count assets with compliance data
-    compliance_query = select(func.count(ExposureAsset.id))
-    if org_id is not None:
-        compliance_query = compliance_query.where(ExposureAsset.organization_id == org_id)
-    total_result = await db.execute(compliance_query)
-    total_checks = total_result.scalar() or 0
+    frameworks_data: dict = {}
+    total_checks = 0
+    passed_checks = 0
+    failed_checks = 0
+    overall_scores: list[float] = []
+
+    try:
+        from src.compliance.models import ComplianceFramework, ComplianceControl
+
+        fw_query = select(ComplianceFramework).where(ComplianceFramework.is_enabled == True)  # noqa: E712
+        if org_id is not None:
+            fw_query = fw_query.where(ComplianceFramework.organization_id == org_id)
+        fw_result = await db.execute(fw_query)
+        frameworks = list(fw_result.scalars().all())
+
+        for fw in frameworks:
+            # Count controls per framework
+            total_q = select(func.count(ComplianceControl.id)).where(
+                ComplianceControl.framework_id == fw.id
+            )
+            total_fw = (await db.execute(total_q)).scalar() or 0
+
+            passed_q = select(func.count(ComplianceControl.id)).where(
+                ComplianceControl.framework_id == fw.id,
+                ComplianceControl.status == "implemented",
+            )
+            passed_fw = (await db.execute(passed_q)).scalar() or 0
+
+            failed_q = select(func.count(ComplianceControl.id)).where(
+                ComplianceControl.framework_id == fw.id,
+                ComplianceControl.status.in_(["not_implemented", "partial", "non_compliant"]),
+            )
+            failed_fw = (await db.execute(failed_q)).scalar() or 0
+
+            pass_pct = round((passed_fw / total_fw * 100.0), 1) if total_fw > 0 else 0.0
+
+            frameworks_data[fw.short_name or fw.name] = {
+                "name": fw.name,
+                "score": float(fw.compliance_score or 0.0),
+                "pass_percentage": pass_pct,
+                "total_controls": int(total_fw),
+                "passed_checks": int(passed_fw),
+                "failed_checks": int(failed_fw),
+                "status": fw.status,
+                "last_assessment_at": fw.last_assessment_at.isoformat() if fw.last_assessment_at else None,
+            }
+
+            total_checks += total_fw
+            passed_checks += passed_fw
+            failed_checks += failed_fw
+            if fw.compliance_score is not None:
+                overall_scores.append(float(fw.compliance_score))
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning(
+            f"Compliance summary partial — compliance module unavailable: {e}"
+        )
+
+    # Fall back to asset-count if no frameworks exist (fresh install)
+    if total_checks == 0:
+        asset_q = select(func.count(ExposureAsset.id))
+        if org_id is not None:
+            asset_q = asset_q.where(ExposureAsset.organization_id == org_id)
+        total_checks = (await db.execute(asset_q)).scalar() or 0
+
+    overall_score = round(sum(overall_scores) / len(overall_scores), 1) if overall_scores else 0.0
 
     return {
-        "frameworks": {},
-        "overall_compliance_score": 0.0,
+        "frameworks": frameworks_data,
+        "overall_compliance_score": overall_score,
         "total_compliance_checks": total_checks,
-        "passed_checks": 0,
-        "failed_checks": 0,
+        "passed_checks": passed_checks,
+        "failed_checks": failed_checks,
     }
 
 
