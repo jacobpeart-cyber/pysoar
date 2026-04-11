@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { api } from '../lib/api';
+import { useAuth } from '../contexts/AuthContext';
 import {
   Swords,
   Play,
@@ -8,6 +9,8 @@ import {
   Eye,
   CheckCircle,
   XCircle,
+  ShieldCheck,
+  RadioTower,
 } from 'lucide-react';
 import clsx from 'clsx';
 
@@ -38,6 +41,13 @@ interface StreamEvent {
   status?: string;
   stdout_preview?: string;
   stderr_preview?: string;
+  // siem_match fields
+  rule_id?: string;
+  rule_title?: string;
+  severity?: string;
+  mitre_techniques?: string[];
+  alert_id?: string;
+  correlates_with_fired?: boolean;
   raw?: Record<string, any>;
 }
 
@@ -45,14 +55,29 @@ const eventColor: Record<string, string> = {
   agent_command_queued: 'border-blue-500 bg-blue-50 dark:bg-blue-900/20',
   agent_command_dispatched: 'border-cyan-500 bg-cyan-50 dark:bg-cyan-900/20',
   agent_command_result: 'border-green-500 bg-green-50 dark:bg-green-900/20',
+  siem_match: 'border-fuchsia-500 bg-fuchsia-50 dark:bg-fuchsia-900/20',
+};
+
+const severityColors: Record<string, string> = {
+  critical: 'text-red-700 dark:text-red-300',
+  high: 'text-orange-700 dark:text-orange-300',
+  medium: 'text-yellow-700 dark:text-yellow-300',
+  low: 'text-blue-700 dark:text-blue-300',
 };
 
 export default function PurpleTeam() {
+  const { user } = useAuth();
+  const orgChannel = `agents:${user?.organization_id ?? 'global'}`;
   const [selectedAgent, setSelectedAgent] = useState('');
   const [selectedTechnique, setSelectedTechnique] = useState('');
   const [events, setEvents] = useState<StreamEvent[]>([]);
   const [isFiring, setIsFiring] = useState(false);
   const [lastResult, setLastResult] = useState<{ detected: boolean; hostname: string; technique: string } | null>(null);
+  // Techniques that have been fired in this session — used to correlate
+  // incoming siem_match events against red-team activity. The Set is
+  // refilled every time the user fires a new technique and persists
+  // until page reload.
+  const firedTechniquesRef = useRef<Set<string>>(new Set());
   const wsRef = useRef<WebSocket | null>(null);
 
   const { data: agents } = useQuery({
@@ -83,7 +108,14 @@ export default function PurpleTeam() {
     },
   });
 
-  // Open a long-lived WebSocket and subscribe to the purple team channel
+  // Open a long-lived WebSocket and subscribe to the per-org purple
+  // team / agents channel. Three event types feed the timeline:
+  //   agent_command_queued / dispatched / result  — red team activity
+  //   siem_match                                  — blue team detection
+  // We correlate by MITRE technique id: if a SIEM match's
+  // mitre_techniques list overlaps with anything we've fired in this
+  // session, we flag it with correlates_with_fired so the UI can
+  // render it as a successful purple-team catch.
   useEffect(() => {
     const token = localStorage.getItem('access_token');
     if (!token) return;
@@ -91,23 +123,28 @@ export default function PurpleTeam() {
     const ws = new WebSocket(`${proto}//${window.location.host}/api/v1/ws?token=${token}`);
     wsRef.current = ws;
     ws.onopen = () => {
-      // Subscribe to both the global 'agents' stream and a purple-team
-      // wildcard. The server only broadcasts purple:<sim_id> if a
-      // simulation_id was attached to the command, so we still rely on
-      // the 'agents' channel to catch ad-hoc fires.
-      ws.send(JSON.stringify({ action: 'subscribe', channel: 'agents' }));
+      ws.send(JSON.stringify({ action: 'subscribe', channel: orgChannel }));
     };
     ws.onmessage = (msg) => {
       try {
         const raw = JSON.parse(msg.data);
         if (!raw || typeof raw !== 'object') return;
-        if (!raw.type || !String(raw.type).startsWith('agent_command')) return;
+        const t = String(raw.type || '');
+        if (!t.startsWith('agent_command') && t !== 'siem_match') return;
+
+        const correlates =
+          t === 'siem_match' &&
+          Array.isArray(raw.mitre_techniques) &&
+          raw.mitre_techniques.some((tid: string) =>
+            firedTechniquesRef.current.has(tid),
+          );
+
         setEvents((prev) =>
           [
             {
               id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
               timestamp: raw.timestamp ?? new Date().toISOString(),
-              type: raw.type,
+              type: t,
               action: raw.action,
               command_id: raw.command_id,
               agent_id: raw.agent_id,
@@ -115,10 +152,16 @@ export default function PurpleTeam() {
               status: raw.status,
               stdout_preview: raw.stdout_preview,
               stderr_preview: raw.stderr_preview,
+              rule_id: raw.rule_id,
+              rule_title: raw.rule_title,
+              severity: raw.severity,
+              mitre_techniques: raw.mitre_techniques,
+              alert_id: raw.alert_id,
+              correlates_with_fired: correlates,
               raw,
             },
             ...prev,
-          ].slice(0, 50),
+          ].slice(0, 100),
         );
       } catch {
         /* noop */
@@ -126,16 +169,20 @@ export default function PurpleTeam() {
     };
     return () => {
       try {
+        ws.send(JSON.stringify({ action: 'unsubscribe', channel: orgChannel }));
         ws.close();
       } catch {
         /* noop */
       }
     };
-  }, []);
+  }, [orgChannel]);
 
   const fireTechnique = async () => {
     if (!selectedAgent || !selectedTechnique) return;
     setIsFiring(true);
+    // Remember which technique we just fired so subsequent siem_match
+    // events can be flagged as correlated red->blue hits.
+    firedTechniquesRef.current.add(selectedTechnique);
     try {
       // Issue a run_atomic_test command via the agents API so it
       // streams through the WebSocket channel. We pull the command
@@ -298,42 +345,88 @@ export default function PurpleTeam() {
               with an affected system that has an enrolled agent.
             </div>
           )}
-          {events.map((ev) => (
-            <div
-              key={ev.id}
-              className={clsx(
-                'px-6 py-3 border-l-4 border-b border-gray-100 dark:border-gray-700',
-                eventColor[ev.type] ?? 'border-gray-400',
-              )}
-            >
-              <div className="flex items-center gap-3 text-sm">
-                <Zap className="w-4 h-4 text-indigo-500 flex-shrink-0" />
-                <span className="font-mono font-semibold text-gray-900 dark:text-white">
-                  {ev.type.replace('agent_command_', '')}
-                </span>
-                <span className="font-mono text-xs text-gray-600 dark:text-gray-400">
-                  {ev.action}
-                </span>
-                {ev.hostname && (
-                  <span className="text-xs text-gray-500">on {ev.hostname}</span>
+          {events.map((ev) => {
+            const isSiem = ev.type === 'siem_match';
+            return (
+              <div
+                key={ev.id}
+                className={clsx(
+                  'px-6 py-3 border-l-4 border-b border-gray-100 dark:border-gray-700',
+                  eventColor[ev.type] ?? 'border-gray-400',
+                  ev.correlates_with_fired && 'ring-2 ring-green-500 ring-inset',
                 )}
-                {ev.status && (
-                  <span className="ml-auto text-xs font-semibold text-gray-700 dark:text-gray-300">
-                    {ev.status}
+              >
+                <div className="flex items-center gap-3 text-sm">
+                  {isSiem ? (
+                    <RadioTower className="w-4 h-4 text-fuchsia-600 flex-shrink-0" />
+                  ) : (
+                    <Zap className="w-4 h-4 text-indigo-500 flex-shrink-0" />
+                  )}
+                  <span className="font-mono font-semibold text-gray-900 dark:text-white">
+                    {isSiem ? 'siem_match' : ev.type.replace('agent_command_', '')}
                   </span>
+
+                  {isSiem ? (
+                    <>
+                      <span className="font-mono text-xs text-gray-700 dark:text-gray-300">
+                        {ev.rule_title}
+                      </span>
+                      {ev.severity && (
+                        <span
+                          className={clsx(
+                            'text-xs font-semibold',
+                            severityColors[ev.severity] ?? 'text-gray-600',
+                          )}
+                        >
+                          {ev.severity}
+                        </span>
+                      )}
+                      {ev.mitre_techniques && ev.mitre_techniques.length > 0 && (
+                        <span className="text-xs text-gray-500 font-mono">
+                          [{ev.mitre_techniques.join(', ')}]
+                        </span>
+                      )}
+                    </>
+                  ) : (
+                    <>
+                      <span className="font-mono text-xs text-gray-600 dark:text-gray-400">
+                        {ev.action}
+                      </span>
+                      {ev.status && (
+                        <span className="text-xs font-semibold text-gray-700 dark:text-gray-300">
+                          {ev.status}
+                        </span>
+                      )}
+                    </>
+                  )}
+
+                  {ev.hostname && (
+                    <span className="text-xs text-gray-500">on {ev.hostname}</span>
+                  )}
+                  {ev.correlates_with_fired && (
+                    <span className="ml-auto flex items-center gap-1 text-xs font-bold text-green-700 dark:text-green-400">
+                      <ShieldCheck className="w-3 h-3" />
+                      PURPLE HIT
+                    </span>
+                  )}
+                  <span
+                    className={clsx(
+                      'text-xs text-gray-400',
+                      !ev.correlates_with_fired && 'ml-auto',
+                    )}
+                  >
+                    {new Date(ev.timestamp).toLocaleTimeString()}
+                  </span>
+                </div>
+                {(ev.stdout_preview || ev.stderr_preview) && (
+                  <pre className="mt-2 bg-gray-900 text-green-200 p-2 rounded text-xs overflow-x-auto font-mono">
+                    {ev.stdout_preview}
+                    {ev.stderr_preview ? `\n[stderr] ${ev.stderr_preview}` : ''}
+                  </pre>
                 )}
-                <span className="text-xs text-gray-400">
-                  {new Date(ev.timestamp).toLocaleTimeString()}
-                </span>
               </div>
-              {(ev.stdout_preview || ev.stderr_preview) && (
-                <pre className="mt-2 bg-gray-900 text-green-200 p-2 rounded text-xs overflow-x-auto font-mono">
-                  {ev.stdout_preview}
-                  {ev.stderr_preview ? `\n[stderr] ${ev.stderr_preview}` : ''}
-                </pre>
-              )}
-            </div>
-          ))}
+            );
+          })}
         </div>
       </div>
     </div>

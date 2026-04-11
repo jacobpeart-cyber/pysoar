@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../lib/api';
+import { useAuth } from '../contexts/AuthContext';
 import {
   ShieldAlert,
   Check,
@@ -74,6 +75,8 @@ function ageText(iso: string | null | undefined): string {
 
 export default function LiveResponse() {
   const qc = useQueryClient();
+  const { user } = useAuth();
+  const orgChannel = `agents:${user?.organization_id ?? 'global'}`;
   const [selectedAgent, setSelectedAgent] = useState<string>('');
   const [selectedAction, setSelectedAction] = useState<string>(IR_ACTIONS[0].action);
   const [payloadText, setPayloadText] = useState('{}');
@@ -125,13 +128,13 @@ export default function LiveResponse() {
     refetchInterval: 3000,
   });
 
-  // WebSocket push — invalidate on every agent event
+  // WebSocket push — subscribe to per-org agents channel
   useEffect(() => {
     const token = localStorage.getItem('access_token');
     if (!token) return;
     const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const ws = new WebSocket(`${proto}//${window.location.host}/api/v1/ws?token=${token}`);
-    ws.onopen = () => ws.send(JSON.stringify({ action: 'subscribe', channel: 'agents' }));
+    ws.onopen = () => ws.send(JSON.stringify({ action: 'subscribe', channel: orgChannel }));
     ws.onmessage = () => {
       qc.invalidateQueries({ queryKey: ['lr-pending'] });
       qc.invalidateQueries({ queryKey: ['lr-recent', selectedAgent] });
@@ -143,7 +146,7 @@ export default function LiveResponse() {
         /* noop */
       }
     };
-  }, [qc, selectedAgent]);
+  }, [qc, selectedAgent, orgChannel]);
 
   const issueCommand = async () => {
     if (!selectedAgent || !selectedAction) return;
