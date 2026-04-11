@@ -187,7 +187,129 @@ class AutomationService:
             except Exception as e:
                 logger.error(f"War room creation failed for incident {incident.id}: {e}")
 
+        # ------------------------------------------------------------------
+        # Agent-driven containment proposals
+        # ------------------------------------------------------------------
+        # If a Live Response agent is enrolled for any of the incident's
+        # affected systems, queue a triage bundle automatically:
+        #   - collect_process_list and collect_network_connections run
+        #     immediately (read-only, no approval gate)
+        #   - isolate_host is queued as awaiting_approval so the human
+        #     signs off before the host actually goes dark
+        # This is the "agentic" part of the SOC story — PySOAR proposes
+        # the containment actions but never pulls the trigger on high-
+        # blast ones without a second-analyst approval.
+        try:
+            results["agent_commands_queued"] = await self._queue_incident_containment(
+                incident=incident,
+                organization_id=org_id,
+                created_by=created_by,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Agent containment proposals failed for incident {incident.id}: {e}")
+            results["agent_commands_queued"] = 0
+
         return results
+
+    async def _queue_incident_containment(
+        self,
+        *,
+        incident: Incident,
+        organization_id: Optional[str],
+        created_by: Optional[str],
+    ) -> int:
+        """For each affected system that has an active IR-capable agent,
+        dispatch a triage + proposed containment command bundle."""
+        import json as _json
+
+        from sqlalchemy import and_, select
+
+        from src.agents.capabilities import AgentAction, AgentCapability
+        from src.agents.models import EndpointAgent
+        from src.agents.service import AgentService
+
+        # Parse affected_systems (stored as JSON string in Incident model)
+        raw = getattr(incident, "affected_systems", None)
+        if not raw:
+            return 0
+        try:
+            hosts = _json.loads(raw) if isinstance(raw, str) else list(raw)
+        except Exception:  # noqa: BLE001
+            return 0
+        if not isinstance(hosts, list) or not hosts:
+            return 0
+
+        svc = AgentService(self.db)
+        queued = 0
+        severity = (getattr(incident, "severity", "medium") or "medium").lower()
+
+        for host in hosts:
+            if not host:
+                continue
+            agent_q = select(EndpointAgent).where(
+                and_(
+                    EndpointAgent.hostname == str(host),
+                    EndpointAgent.status == "active",
+                )
+            )
+            if organization_id:
+                agent_q = agent_q.where(EndpointAgent.organization_id == organization_id)
+
+            agents = list((await self.db.execute(agent_q)).scalars().all())
+            if not agents:
+                continue
+
+            # Prefer an IR-capable agent; fall back to BAS for the
+            # read-only collects if no IR agent is present.
+            ir_agent = next(
+                (a for a in agents if AgentCapability.LIVE_RESPONSE.value in (a.capabilities or [])),
+                None,
+            )
+            triage_agent = ir_agent or next(
+                (a for a in agents if AgentCapability.BAS.value in (a.capabilities or [])),
+                None,
+            )
+            if triage_agent is None:
+                continue
+
+            # Read-only triage: queue immediately, no approval needed
+            for action in (
+                AgentAction.COLLECT_PROCESS_LIST.value,
+                AgentAction.COLLECT_NETWORK_CONNECTIONS.value,
+            ):
+                try:
+                    await svc.issue_command(
+                        agent=triage_agent,
+                        action=action,
+                        payload={},
+                        issued_by=created_by,
+                        incident_id=incident.id,
+                    )
+                    queued += 1
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        f"Failed to queue {action} for host={host} incident={incident.id}: {e}"
+                    )
+
+            # Proposed containment: isolate_host -> awaiting_approval.
+            # Only propose on high/critical incidents so automation
+            # doesn't spam the approval queue with low-severity noise.
+            if ir_agent is not None and severity in ("critical", "high"):
+                try:
+                    await svc.issue_command(
+                        agent=ir_agent,
+                        action=AgentAction.ISOLATE_HOST.value,
+                        payload={"reason": f"proposed by incident {incident.id} ({severity})"},
+                        issued_by=created_by,
+                        incident_id=incident.id,
+                    )
+                    queued += 1
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        f"Failed to propose isolate_host for host={host} incident={incident.id}: {e}"
+                    )
+
+        return queued
 
     # =========================================================================
     # MODULE EVENT HANDLERS - Each module calls these to trigger automation
