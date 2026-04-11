@@ -60,7 +60,9 @@ async def list_fedramp_controls(
     status from the database when available.
     """
     try:
-        controls = _generator.get_control_implementation_status(db)
+        controls = await _generator.get_control_implementation_status(
+            db, organization_id=getattr(current_user, "organization_id", None)
+        )
 
         # Apply filters
         if family:
@@ -113,7 +115,9 @@ async def fedramp_readiness(
     achieving FedRAMP Moderate authorization.
     """
     try:
-        controls = _generator.get_control_implementation_status(db)
+        controls = await _generator.get_control_implementation_status(
+            db, organization_id=getattr(current_user, "organization_id", None)
+        )
         report = _generator.generate_readiness_report(controls)
         return report
     except Exception as exc:
@@ -142,7 +146,9 @@ async def generate_ssp(
     and includes all control family sections with implementation narratives.
     """
     try:
-        controls = _generator.get_control_implementation_status(db)
+        controls = await _generator.get_control_implementation_status(
+            db, organization_id=getattr(current_user, "organization_id", None)
+        )
         ssp = _generator.generate_ssp(org_name, system_name, controls)
         return ssp
     except Exception as exc:
@@ -167,7 +173,9 @@ async def export_ssp(
     ``download_url`` placeholder and the full SSP payload.
     """
     try:
-        controls = _generator.get_control_implementation_status(db)
+        controls = await _generator.get_control_implementation_status(
+            db, organization_id=getattr(current_user, "organization_id", None)
+        )
         ssp = _generator.generate_ssp(org_name, system_name, controls)
 
         timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
@@ -219,7 +227,10 @@ async def poam_report(
             if db and hasattr(db, "execute"):
                 from sqlalchemy import select as sa_select
 
+                org_id = getattr(current_user, "organization_id", None)
                 stmt = sa_select(POAM)
+                if hasattr(POAM, "organization_id"):
+                    stmt = stmt.where(POAM.organization_id == org_id)
                 if severity:
                     stmt = stmt.where(POAM.severity == severity)
                 if status_filter:
@@ -282,7 +293,9 @@ async def evidence_status(
     an overall evidence-collection percentage.
     """
     try:
-        controls = _generator.get_control_implementation_status(db)
+        controls = await _generator.get_control_implementation_status(
+            db, organization_id=getattr(current_user, "organization_id", None)
+        )
 
         family_evidence: Dict[str, Dict[str, Any]] = {}
         for ctrl in controls:
@@ -380,12 +393,17 @@ async def update_control_status(
             from src.compliance.models import ComplianceControl
 
             if db and hasattr(db, "execute"):
-                from sqlalchemy import select as sa_select, update as sa_update
+                from sqlalchemy import select as sa_select
 
+                org_id = getattr(current_user, "organization_id", None)
                 stmt = sa_select(ComplianceControl).where(
                     ComplianceControl.control_id == control_id,
                     ComplianceControl.framework == "FedRAMP",
                 )
+                if hasattr(ComplianceControl, "organization_id"):
+                    stmt = stmt.where(
+                        ComplianceControl.organization_id == org_id
+                    )
                 result = await db.scalars(stmt)
                 existing = result.first()
 
@@ -405,6 +423,8 @@ async def update_control_status(
                         description=baseline_ctrl["description"],
                         family=baseline_ctrl["family"],
                     )
+                    if hasattr(ComplianceControl, "organization_id"):
+                        new_ctrl.organization_id = org_id
                     if implementation_narrative is not None:
                         new_ctrl.implementation_narrative = implementation_narrative
                     if assessor_notes is not None:
