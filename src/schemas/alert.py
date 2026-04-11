@@ -103,3 +103,4 @@ class AlertStats(BaseModel):
     by_source: dict[str, int]
     new_today: int = 0
     new_this_week: int = 0
+    resolved_today: int = 0
