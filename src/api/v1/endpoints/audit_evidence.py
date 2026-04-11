@@ -233,20 +233,64 @@ async def list_evidence_items(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
     evidence_type: Optional[str] = None,
+    status_filter: Optional[str] = Query(None, alias="status"),
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=500),
 ):
-    """List evidence items"""
+    """List evidence items from the ComplianceEvidence repository.
+
+    Returns data in the shape the frontend expects: id, title, type,
+    control, source, collected, status, contentUrl.
+    """
     try:
-        query = select(AutomatedEvidenceRule).where(
-            AutomatedEvidenceRule.organization_id == getattr(current_user, "organization_id", None)
+        from src.compliance.models import ComplianceEvidence, ComplianceControl
+
+        org_id = getattr(current_user, "organization_id", None)
+        query = select(ComplianceEvidence).where(
+            ComplianceEvidence.organization_id == org_id
         )
-        if evidence_type:
-            query = query.where(AutomatedEvidenceRule.rule_type == evidence_type)
-        query = query.offset(skip).limit(limit)
+        if evidence_type and evidence_type != "all":
+            query = query.where(ComplianceEvidence.evidence_type == evidence_type)
+        if status_filter and status_filter != "all":
+            query = query.where(ComplianceEvidence.review_status == status_filter)
+        query = query.order_by(ComplianceEvidence.collected_at.desc()).offset(skip).limit(limit)
+
         result = await db.execute(query)
-        items = result.scalars().all()
-        return list(items)
+        evidence_rows = list(result.scalars().all())
+
+        # Resolve control_id labels in one batch lookup
+        control_ids = {e.control_id_ref for e in evidence_rows if e.control_id_ref}
+        control_map: dict[str, str] = {}
+        if control_ids:
+            ctrl_result = await db.execute(
+                select(ComplianceControl).where(ComplianceControl.id.in_(control_ids))
+            )
+            control_map = {c.id: c.control_id for c in ctrl_result.scalars().all()}
+
+        type_alias = {
+            "configuration": "config",
+            "scan_result": "scan",
+            "automated_test": "scan",
+            "policy": "document",
+            "procedure": "document",
+            "interview_notes": "document",
+            "training_record": "document",
+        }
+
+        items: list[dict] = []
+        for e in evidence_rows:
+            items.append({
+                "id": e.id,
+                "title": e.title,
+                "type": type_alias.get(e.evidence_type, e.evidence_type or "document"),
+                "control": control_map.get(e.control_id_ref, e.control_id_ref or "—"),
+                "source": e.source_system or "manual",
+                "collected": e.collected_at.isoformat() if e.collected_at else None,
+                "status": e.review_status or "pending",
+                "contentUrl": e.file_path,
+                "created_at": e.created_at.isoformat() if e.created_at else None,
+            })
+        return items
     except Exception as e:
         logger.error(f"Error listing evidence: {str(e)}")
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
@@ -412,6 +456,21 @@ async def run_conmon_cycle(
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
 
 
+@router.post("/conmon/run", response_model=None)
+async def run_conmon_alias(
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
+):
+    """Alias for /conmon/run-cycle used by the frontend ConMon button."""
+    try:
+        monitor = ContinuousMonitor(db, getattr(current_user, "organization_id", None))
+        report = await monitor.generate_conmon_report()
+        return {"ok": True, "report": report}
+    except Exception as e:
+        logger.error(f"Error running ConMon cycle (alias): {str(e)}")
+        raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
+
+
 @router.get("/conmon/report", response_model=ConMonReportResponse)
 async def get_conmon_report(
     db: DatabaseSession = None,
@@ -432,15 +491,39 @@ async def get_conmon_status(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
 ):
-    """Get ConMon status"""
+    """Get ConMon status per control check.
+
+    Returns an ARRAY of ConMonStatus rows (one per control check) so the
+    frontend can render them in a grid. Each row has {id, name, active,
+    lastRun, status, compliance_percentage, details}.
+    """
     try:
         monitor = ContinuousMonitor(db, getattr(current_user, "organization_id", None))
-        cycle_results = await monitor.run_conmon_cycle()
-        return {
-            "status": "compliant",
-            "checks": cycle_results,
-            "last_run": datetime.now(timezone.utc).isoformat(),
+        cycle = await monitor.run_conmon_cycle()
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        label_map = {
+            "vulnerability_scanning": "Vulnerability Scanning (SI-2)",
+            "configuration_baseline": "Configuration Baseline (CM-3)",
+            "incident_reporting": "Incident Reporting (IR-4)",
+            "poam_progress": "POA&M Progress",
         }
+
+        rows: list[dict] = []
+        for key, label in label_map.items():
+            check = cycle.get(key) or {}
+            check_status = check.get("status", "unknown")
+            is_active = check_status in ("compliant", "on_track")
+            rows.append({
+                "id": key,
+                "name": label,
+                "active": is_active,
+                "status": check_status,
+                "lastRun": now_iso,
+                "compliance_percentage": check.get("compliance_percentage", 0),
+                "details": check,
+            })
+        return rows
     except Exception as e:
         logger.error(f"Error getting ConMon status: {str(e)}")
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
