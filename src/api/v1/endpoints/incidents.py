@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, status
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -24,13 +24,16 @@ from src.schemas.incident import (
 router = APIRouter(prefix="/incidents", tags=["Incidents"])
 
 
-async def get_incident_or_404(db: AsyncSession, incident_id: str) -> Incident:
-    """Get incident by ID or raise 404"""
-    result = await db.execute(
+async def get_incident_or_404(db: AsyncSession, incident_id: str, org_id: Optional[str] = None) -> Incident:
+    """Get incident by ID or raise 404 (tenant-scoped)"""
+    stmt = (
         select(Incident)
         .options(selectinload(Incident.alerts))
         .where(Incident.id == incident_id)
     )
+    if org_id is not None:
+        stmt = stmt.where(Incident.organization_id == org_id)
+    result = await db.execute(stmt)
     incident = result.scalar_one_or_none()
     if not incident:
         raise HTTPException(
@@ -55,7 +58,12 @@ async def list_incidents(
     sort_order: str = "desc",
 ):
     """List incidents with filtering and pagination"""
-    query = select(Incident).options(selectinload(Incident.alerts))
+    org_id = getattr(current_user, "organization_id", None)
+    query = (
+        select(Incident)
+        .options(selectinload(Incident.alerts))
+        .where(Incident.organization_id == org_id)
+    )
 
     # Apply filters
     if search:
@@ -134,6 +142,7 @@ async def create_incident(
     from src.services.automation import AutomationService
 
     incident = Incident(
+        organization_id=getattr(current_user, "organization_id", None) if current_user else None,
         title=incident_data.title,
         description=incident_data.description,
         severity=incident_data.severity,
@@ -152,12 +161,17 @@ async def create_incident(
     db.add(incident)
     await db.flush()
 
-    # Link alerts if provided. Track which ones actually existed so we
-    # can report back and avoid silently skipping bad IDs.
+    # Link alerts if provided (tenant-scoped so a tenant can't pull alerts
+    # from another tenant into their own incident).
     linked_alerts = 0
+    _org = getattr(current_user, "organization_id", None) if current_user else None
     if incident_data.alert_ids:
         for alert_id in incident_data.alert_ids:
-            result = await db.execute(select(Alert).where(Alert.id == alert_id))
+            result = await db.execute(
+                select(Alert).where(
+                    and_(Alert.id == alert_id, Alert.organization_id == _org)
+                )
+            )
             alert = result.scalar_one_or_none()
             if alert:
                 alert.incident_id = incident.id
@@ -192,28 +206,39 @@ async def get_incident_stats(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Get incident statistics including a real MTTR calculation.
+    """Get incident statistics including a real MTTR calculation (tenant-scoped).
 
     MTTR = average(resolved_at - created_at) over all closed incidents
     that have a resolved_at timestamp.
     """
+    org_id = getattr(current_user, "organization_id", None)
+    org_filter = Incident.organization_id == org_id
+
     # Total count
-    total_result = await db.execute(select(func.count(Incident.id)))
+    total_result = await db.execute(
+        select(func.count(Incident.id)).where(org_filter)
+    )
     total = total_result.scalar() or 0
 
-    # By severity / status / type (single-pass group-bys)
+    # By severity / status / type
     severity_result = await db.execute(
-        select(Incident.severity, func.count(Incident.id)).group_by(Incident.severity)
+        select(Incident.severity, func.count(Incident.id))
+        .where(org_filter)
+        .group_by(Incident.severity)
     )
     by_severity = {k: v for k, v in severity_result.all() if k is not None}
 
     status_result = await db.execute(
-        select(Incident.status, func.count(Incident.id)).group_by(Incident.status)
+        select(Incident.status, func.count(Incident.id))
+        .where(org_filter)
+        .group_by(Incident.status)
     )
     by_status = {k: v for k, v in status_result.all() if k is not None}
 
     type_result = await db.execute(
-        select(Incident.incident_type, func.count(Incident.id)).group_by(Incident.incident_type)
+        select(Incident.incident_type, func.count(Incident.id))
+        .where(org_filter)
+        .group_by(Incident.incident_type)
     )
     by_type = {k: v for k, v in type_result.all() if k is not None}
 
@@ -227,11 +252,10 @@ async def get_incident_stats(
     }
     open_count = sum(v for k, v in by_status.items() if k in _ACTIVE_STATUSES)
 
-    # Real MTTR: average resolution time across closed incidents that have
-    # both created_at and resolved_at set. resolved_at is stored as an ISO
-    # string, so parse it in Python.
+    # Real MTTR: average resolution time across closed incidents (tenant-scoped)
     closed_result = await db.execute(
         select(Incident.created_at, Incident.resolved_at)
+        .where(org_filter)
         .where(Incident.status == IncidentStatus.CLOSED.value)
         .where(Incident.resolved_at.is_not(None))
     )
@@ -269,7 +293,7 @@ async def get_incident(
     db: DatabaseSession = None,
 ):
     """Get an incident by ID"""
-    incident = await get_incident_or_404(db, incident_id)
+    incident = await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
     response = IncidentResponse.model_validate(incident)
     response.alert_count = len(incident.alerts)
     return response
@@ -283,7 +307,7 @@ async def update_incident(
     db: DatabaseSession = None,
 ):
     """Update an incident"""
-    incident = await get_incident_or_404(db, incident_id)
+    incident = await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
 
     update_data = incident_data.model_dump(exclude_unset=True, exclude_none=True)
 
@@ -329,7 +353,7 @@ async def delete_incident(
     """
     from src.collaboration.models import WarRoom
 
-    incident = await get_incident_or_404(db, incident_id)
+    incident = await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
 
     # Unlink alerts
     for alert in incident.alerts:
@@ -352,10 +376,15 @@ async def link_alert_to_incident(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Link an alert to an incident"""
-    incident = await get_incident_or_404(db, incident_id)
+    """Link an alert to an incident (both must belong to the same tenant)"""
+    _org = getattr(current_user, "organization_id", None)
+    incident = await get_incident_or_404(db, incident_id, _org)
 
-    result = await db.execute(select(Alert).where(Alert.id == alert_id))
+    result = await db.execute(
+        select(Alert).where(
+            and_(Alert.id == alert_id, Alert.organization_id == _org)
+        )
+    )
     alert = result.scalar_one_or_none()
 
     if not alert:
@@ -377,12 +406,17 @@ async def unlink_alert_from_incident(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Unlink an alert from an incident"""
-    await get_incident_or_404(db, incident_id)
+    """Unlink an alert from an incident (tenant-scoped)"""
+    _org = getattr(current_user, "organization_id", None)
+    await get_incident_or_404(db, incident_id, _org)
 
     result = await db.execute(
         select(Alert).where(
-            (Alert.id == alert_id) & (Alert.incident_id == incident_id)
+            and_(
+                Alert.id == alert_id,
+                Alert.incident_id == incident_id,
+                Alert.organization_id == _org,
+            )
         )
     )
     alert = result.scalar_one_or_none()

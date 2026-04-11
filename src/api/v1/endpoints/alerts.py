@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, status
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DatabaseSession
@@ -41,9 +41,12 @@ async def process_alert_correlation(alert_id: str):
             await db.rollback()
 
 
-async def get_alert_or_404(db: AsyncSession, alert_id: str) -> Alert:
-    """Get alert by ID or raise 404"""
-    result = await db.execute(select(Alert).where(Alert.id == alert_id))
+async def get_alert_or_404(db: AsyncSession, alert_id: str, org_id: Optional[str] = None) -> Alert:
+    """Get alert by ID or raise 404 (tenant-scoped)"""
+    stmt = select(Alert).where(Alert.id == alert_id)
+    if org_id is not None:
+        stmt = stmt.where(Alert.organization_id == org_id)
+    result = await db.execute(stmt)
     alert = result.scalar_one_or_none()
     if not alert:
         raise HTTPException(
@@ -70,7 +73,8 @@ async def list_alerts(
     sort_order: str = "desc",
 ):
     """List alerts with filtering and pagination"""
-    query = select(Alert)
+    org_id = getattr(current_user, "organization_id", None)
+    query = select(Alert).where(Alert.organization_id == org_id)
 
     # Apply filters
     if search:
@@ -134,6 +138,7 @@ async def list_alerts(
 async def create_alert(alert_data: AlertCreate, current_user: CurrentUser = None, db: DatabaseSession = None, background_tasks: BackgroundTasks = None):
     """Create a new alert"""
     alert = Alert(
+        organization_id=getattr(current_user, "organization_id", None) if current_user else None,
         title=alert_data.title,
         description=alert_data.description,
         severity=alert_data.severity,
@@ -188,52 +193,67 @@ async def get_alert_stats(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Get alert statistics with real date-filtered counts."""
+    """Get alert statistics with real date-filtered counts (tenant-scoped)."""
+    org_id = getattr(current_user, "organization_id", None)
     now = datetime.now(timezone.utc)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     week_start = now - timedelta(days=7)
 
+    org_filter = Alert.organization_id == org_id
+
     # Total count
-    total_result = await db.execute(select(func.count(Alert.id)))
+    total_result = await db.execute(
+        select(func.count(Alert.id)).where(org_filter)
+    )
     total = total_result.scalar() or 0
 
     # By severity
     severity_result = await db.execute(
-        select(Alert.severity, func.count(Alert.id)).group_by(Alert.severity)
+        select(Alert.severity, func.count(Alert.id))
+        .where(org_filter)
+        .group_by(Alert.severity)
     )
     by_severity = {k: v for k, v in severity_result.all() if k is not None}
 
     # By status
     status_result = await db.execute(
-        select(Alert.status, func.count(Alert.id)).group_by(Alert.status)
+        select(Alert.status, func.count(Alert.id))
+        .where(org_filter)
+        .group_by(Alert.status)
     )
     by_status = {k: v for k, v in status_result.all() if k is not None}
 
     # By source
     source_result = await db.execute(
-        select(Alert.source, func.count(Alert.id)).group_by(Alert.source)
+        select(Alert.source, func.count(Alert.id))
+        .where(org_filter)
+        .group_by(Alert.source)
     )
     by_source = {k: v for k, v in source_result.all() if k is not None}
 
-    # Real "new today" and "new this week" counts, filtered by created_at
+    # Real "new today" and "new this week" counts
     today_result = await db.execute(
-        select(func.count(Alert.id)).where(Alert.created_at >= today_start)
+        select(func.count(Alert.id)).where(
+            and_(org_filter, Alert.created_at >= today_start)
+        )
     )
     new_today = today_result.scalar() or 0
 
     week_result = await db.execute(
-        select(func.count(Alert.id)).where(Alert.created_at >= week_start)
+        select(func.count(Alert.id)).where(
+            and_(org_filter, Alert.created_at >= week_start)
+        )
     )
     new_this_week = week_result.scalar() or 0
 
-    # Resolved today: alerts whose resolved_at (ISO string) falls on today.
-    # ISO 8601 strings compare lexicographically in the same order as time,
-    # so string comparison works against today_start.isoformat().
     today_iso_prefix = today_start.isoformat()
     resolved_result = await db.execute(
         select(func.count(Alert.id)).where(
-            Alert.resolved_at.is_not(None),
-            Alert.resolved_at >= today_iso_prefix,
+            and_(
+                org_filter,
+                Alert.resolved_at.is_not(None),
+                Alert.resolved_at >= today_iso_prefix,
+            )
         )
     )
     resolved_today = resolved_result.scalar() or 0
@@ -256,7 +276,7 @@ async def get_alert(
     db: DatabaseSession = None,
 ):
     """Get an alert by ID"""
-    alert = await get_alert_or_404(db, alert_id)
+    alert = await get_alert_or_404(db, alert_id, getattr(current_user, "organization_id", None))
     return AlertResponse.model_validate(alert)
 
 
@@ -268,7 +288,7 @@ async def update_alert(
     db: DatabaseSession = None,
 ):
     """Update an alert"""
-    alert = await get_alert_or_404(db, alert_id)
+    alert = await get_alert_or_404(db, alert_id, getattr(current_user, "organization_id", None))
 
     update_data = alert_data.model_dump(exclude_unset=True, exclude_none=True)
 
@@ -296,7 +316,7 @@ async def delete_alert(
     db: DatabaseSession = None,
 ):
     """Delete an alert"""
-    alert = await get_alert_or_404(db, alert_id)
+    alert = await get_alert_or_404(db, alert_id, getattr(current_user, "organization_id", None))
     await db.delete(alert)
     await db.flush()
 
@@ -340,9 +360,14 @@ async def bulk_action(
     failures: list[dict] = []
     now_iso = datetime.now(timezone.utc).isoformat()
 
+    org_id = getattr(current_user, "organization_id", None)
     for alert_id in action_data.alert_ids:
         try:
-            result = await db.execute(select(Alert).where(Alert.id == alert_id))
+            result = await db.execute(
+                select(Alert).where(
+                    and_(Alert.id == alert_id, Alert.organization_id == org_id)
+                )
+            )
             alert = result.scalar_one_or_none()
 
             if not alert:
