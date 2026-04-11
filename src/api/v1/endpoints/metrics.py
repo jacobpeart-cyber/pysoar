@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.deps import CurrentUser, DatabaseSession
 from src.models.alert import Alert
 from src.models.incident import Incident
-from src.models.ioc import IOC
+from src.intel.models import ThreatIndicator as IOC
 from src.models.playbook import PlaybookExecution
 
 router = APIRouter()

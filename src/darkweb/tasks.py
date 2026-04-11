@@ -22,7 +22,7 @@ from src.darkweb.engine import (
 )
 from src.darkweb.models import DarkWebFinding, DarkWebMonitor
 from src.models.incident import Incident
-from src.models.ioc import IOC
+from src.intel.models import ThreatIndicator as IOC
 
 logger = get_logger(__name__)
 
@@ -415,9 +415,9 @@ def threat_correlation(
                     {
                         "id": i.id,
                         "value": i.value,
-                        "type": i.ioc_type,
+                        "type": i.indicator_type,
                         "source": i.source,
-                        "threat_level": i.threat_level,
+                        "threat_level": i.severity,
                         "confidence": i.confidence,
                     }
                     for i in iocs

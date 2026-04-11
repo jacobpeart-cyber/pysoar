@@ -17,7 +17,7 @@ from sqlalchemy import select, func
 
 from src.models.alert import Alert
 from src.models.incident import Incident
-from src.models.ioc import IOC
+from src.intel.models import ThreatIndicator as IOC
 from src.agentic.models import (
     SOCAgent,
     Investigation,
@@ -347,16 +347,9 @@ class AgenticSOCEngine:
             if a.source_ip:
                 source_ips.add(a.source_ip)
 
-        # Query IOCs for this organization
-        try:
-            ioc_query = select(IOC).where(IOC.organization_id == org_id).limit(100)
-            ioc_result = await self.db.execute(ioc_query)
-            iocs = list(ioc_result.scalars().all())
-        except Exception as e:
-            logger.warning(f"Failed to query IOCs: {e}")
-            iocs = []
-
-        ioc_matches = []
+        # Query active threat indicators for this organization (scoped by value
+        # for efficiency — only pull rows matching the alert's own indicators)
+        ioc_matches: list[dict] = []
         if primary_alert is not None:
             alert_indicators = {
                 primary_alert.source_ip,
@@ -367,12 +360,30 @@ class AgenticSOCEngine:
                 primary_alert.url,
             }
             alert_indicators.discard(None)
-            for ioc in iocs:
-                if getattr(ioc, "value", None) and ioc.value in alert_indicators:
+            if alert_indicators:
+                try:
+                    ioc_query = (
+                        select(IOC)
+                        .where(
+                            IOC.value.in_(list(alert_indicators)),
+                            IOC.is_active == True,  # noqa: E712
+                            IOC.is_whitelisted == False,  # noqa: E712
+                        )
+                        .limit(100)
+                    )
+                    ioc_result = await self.db.execute(ioc_query)
+                    iocs = list(ioc_result.scalars().all())
+                except Exception as e:
+                    logger.warning(f"Failed to query IOCs: {e}")
+                    iocs = []
+                for ioc in iocs:
+                    ctx = ioc.context if isinstance(ioc.context, dict) else {}
                     ioc_matches.append({
                         "value": ioc.value,
-                        "type": getattr(ioc, "ioc_type", None) or getattr(ioc, "type", None),
-                        "category": getattr(ioc, "category", None),
+                        "type": ioc.indicator_type,
+                        "severity": ioc.severity,
+                        "source": ioc.source,
+                        "category": ctx.get("category"),
                     })
 
         # Query recent incidents for context
