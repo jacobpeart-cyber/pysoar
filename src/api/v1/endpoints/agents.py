@@ -257,9 +257,11 @@ async def get_agent(
     current_user: CurrentUser = None,
     session: DatabaseSession = None,
 ) -> AgentSummary:
-    agent = (
-        await session.execute(select(EndpointAgent).where(EndpointAgent.id == agent_id))
-    ).scalar_one_or_none()
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(EndpointAgent).where(EndpointAgent.id == agent_id)
+    if org_id is not None:
+        stmt = stmt.where(EndpointAgent.organization_id == org_id)
+    agent = (await session.execute(stmt)).scalar_one_or_none()
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
     return AgentSummary.model_validate(agent)
@@ -272,9 +274,11 @@ async def issue_command(
     current_user: CurrentUser = None,
     session: DatabaseSession = None,
 ) -> CommandSummary:
-    agent = (
-        await session.execute(select(EndpointAgent).where(EndpointAgent.id == agent_id))
-    ).scalar_one_or_none()
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(EndpointAgent).where(EndpointAgent.id == agent_id)
+    if org_id is not None:
+        stmt = stmt.where(EndpointAgent.organization_id == org_id)
+    agent = (await session.execute(stmt)).scalar_one_or_none()
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
 
@@ -300,12 +304,11 @@ async def list_commands(
     session: DatabaseSession = None,
     limit: int = Query(50, ge=1, le=500),
 ) -> list[CommandSummary]:
-    stmt = (
-        select(AgentCommand)
-        .where(AgentCommand.agent_id == agent_id)
-        .order_by(desc(AgentCommand.created_at))
-        .limit(limit)
-    )
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(AgentCommand).where(AgentCommand.agent_id == agent_id)
+    if org_id is not None:
+        stmt = stmt.where(AgentCommand.organization_id == org_id)
+    stmt = stmt.order_by(desc(AgentCommand.created_at)).limit(limit)
     rows = list((await session.execute(stmt)).scalars().all())
     return [CommandSummary.model_validate(r) for r in rows]
 
@@ -340,9 +343,11 @@ async def approve_command(
     current_user: CurrentUser = None,
     session: DatabaseSession = None,
 ) -> CommandSummary:
-    cmd = (
-        await session.execute(select(AgentCommand).where(AgentCommand.id == command_id))
-    ).scalar_one_or_none()
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(AgentCommand).where(AgentCommand.id == command_id)
+    if org_id is not None:
+        stmt = stmt.where(AgentCommand.organization_id == org_id)
+    cmd = (await session.execute(stmt)).scalar_one_or_none()
     if cmd is None:
         raise HTTPException(status_code=404, detail="Command not found")
 
@@ -370,9 +375,11 @@ async def reject_command(
     Rejection is terminal — the rejected row stays in the audit chain
     so the rejection itself is a signed record. Rejecter must be a
     different user from the issuer."""
-    cmd = (
-        await session.execute(select(AgentCommand).where(AgentCommand.id == command_id))
-    ).scalar_one_or_none()
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(AgentCommand).where(AgentCommand.id == command_id)
+    if org_id is not None:
+        stmt = stmt.where(AgentCommand.organization_id == org_id)
+    cmd = (await session.execute(stmt)).scalar_one_or_none()
     if cmd is None:
         raise HTTPException(status_code=404, detail="Command not found")
     if cmd.status != "awaiting_approval":
@@ -401,9 +408,11 @@ async def verify_chain(
     current_user: CurrentUser = None,
     session: DatabaseSession = None,
 ) -> ChainVerificationResponse:
-    agent = (
-        await session.execute(select(EndpointAgent).where(EndpointAgent.id == agent_id))
-    ).scalar_one_or_none()
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(EndpointAgent).where(EndpointAgent.id == agent_id)
+    if org_id is not None:
+        stmt = stmt.where(EndpointAgent.organization_id == org_id)
+    agent = (await session.execute(stmt)).scalar_one_or_none()
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
     svc = AgentService(session)
