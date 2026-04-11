@@ -108,6 +108,23 @@ class AutomationService:
             logger.error(f"Playbook auto-trigger failed for alert {alert.id}: {e}")
             failures.append({"step": "playbook_trigger", "error": str(e)[:300]})
 
+        # Step 5: Evaluate remediation policies against this alert.
+        # Any enabled RemediationPolicy whose trigger_type matches and
+        # whose severity threshold is met will fire its configured
+        # action — firewall_block on source_ip, isolate_host on the
+        # hostname, disable_account on the user, etc. Each fired
+        # policy creates a RemediationExecution row the operator can
+        # track in the Remediation page. Policies marked
+        # requires_approval=True land in awaiting_approval rather than
+        # executing immediately, matching the second-analyst sign-off
+        # contract the audit team expects.
+        try:
+            remediations = await self._evaluate_remediation_policies(alert, org_id)
+            results["remediations_triggered"] = remediations
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Remediation policy evaluation failed for alert {alert.id}: {e}")
+            failures.append({"step": "remediation_eval", "error": str(e)[:300]})
+
         # Dead-letter trail: record any pipeline failures as an activity so
         # operators can retry them later. (scheduled retry task can query this.)
         if failures:
@@ -951,3 +968,123 @@ class AutomationService:
                 elif actual != required:
                     return False
         return True
+
+    async def _evaluate_remediation_policies(
+        self,
+        alert: Alert,
+        organization_id: Optional[str],
+    ) -> list[str]:
+        """Find enabled RemediationPolicy rows that match this alert and
+        fire them. Returns a list of execution IDs created.
+
+        Matching rules:
+          * ``trigger_type`` == "alert" or "alert_severity"
+          * ``trigger_conditions.severity`` (list or string) must match
+            alert.severity if set
+          * Policy's cooldown is respected (don't fire the same policy
+            twice inside its cooldown_minutes window)
+
+        For each matching policy we write a RemediationExecution row
+        with ``status=awaiting_approval`` if the policy requires
+        approval, otherwise ``status=pending`` (the worker task or UI
+        button picks it up from there).
+        """
+        from datetime import datetime, timezone, timedelta
+
+        from src.remediation.models import (
+            RemediationExecution,
+            RemediationPolicy,
+        )
+
+        created_ids: list[str] = []
+
+        stmt = select(RemediationPolicy).where(
+            and_(
+                RemediationPolicy.is_enabled == True,  # noqa: E712
+                RemediationPolicy.trigger_type.in_(["alert", "alert_severity"]),
+            )
+        )
+        if organization_id:
+            stmt = stmt.where(
+                RemediationPolicy.organization_id == organization_id
+            )
+
+        result = await self.db.execute(stmt)
+        policies = list(result.scalars().all())
+        if not policies:
+            return []
+
+        alert_severity = (getattr(alert, "severity", None) or "").lower()
+        now = datetime.now(timezone.utc)
+
+        for policy in policies:
+            # Cooldown enforcement
+            if policy.last_executed_at and policy.cooldown_minutes:
+                last = policy.last_executed_at
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=timezone.utc)
+                if now - last < timedelta(minutes=policy.cooldown_minutes):
+                    continue
+
+            # Severity match
+            conds = policy.trigger_conditions or {}
+            required_sev = conds.get("severity")
+            if required_sev:
+                if isinstance(required_sev, list):
+                    if alert_severity not in [s.lower() for s in required_sev]:
+                        continue
+                elif alert_severity != str(required_sev).lower():
+                    continue
+
+            # Resolve target from the alert
+            target_entity = (
+                getattr(alert, "source_ip", None)
+                or getattr(alert, "hostname", None)
+                or str(alert.id)
+            )
+            target_type = "ip" if getattr(alert, "source_ip", None) else "host"
+
+            # Decide initial status based on policy's approval gate
+            initial_status = (
+                "awaiting_approval" if policy.requires_approval else "pending"
+            )
+
+            execution = RemediationExecution(
+                policy_id=policy.id,
+                trigger_source="alert",
+                trigger_id=str(alert.id),
+                trigger_details={
+                    "alert_id": str(alert.id),
+                    "alert_severity": alert_severity,
+                    "alert_source": getattr(alert, "source", None),
+                    "alert_title": getattr(alert, "title", None),
+                },
+                status=initial_status,
+                target_entity=target_entity,
+                target_type=target_type,
+                actions_planned=policy.actions or [],
+                actions_completed=[],
+                organization_id=organization_id or "",
+                created_by=None,  # auto-triggered, no human actor
+            )
+            self.db.add(execution)
+            try:
+                await self.db.flush()
+                await self.db.refresh(execution)
+                created_ids.append(execution.id)
+
+                policy.last_executed_at = now
+                policy.execution_count = (policy.execution_count or 0) + 1
+                await self.db.flush()
+
+                logger.info(
+                    f"Remediation policy '{policy.name}' triggered by alert "
+                    f"{alert.id} (execution={execution.id}, status={initial_status})"
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    f"Failed to create remediation execution for policy "
+                    f"{policy.id}: {exc}"
+                )
+
+        return created_ids
