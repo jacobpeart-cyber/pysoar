@@ -5,7 +5,9 @@ from src.models.user import User
 from src.models.alert import Alert
 from src.models.incident import Incident
 from src.models.playbook import Playbook, PlaybookExecution
-from src.models.ioc import IOC
+# IOC is a lazy re-export alias for ThreatIndicator (src.intel.models);
+# not imported here to avoid a circular: src.intel.models -> src.models.base
+# -> src.models.__init__. Callers use `from src.models.ioc import IOC` directly.
 from src.models.asset import Asset
 from src.models.audit import AuditLog
 from src.models.case import CaseNote, CaseAttachment, CaseTimeline, Task
@@ -19,7 +21,6 @@ __all__ = [
     "Incident",
     "Playbook",
     "PlaybookExecution",
-    "IOC",
     "Asset",
     "AuditLog",
     "CaseNote",

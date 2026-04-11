@@ -194,7 +194,7 @@ export default function Dashboard() {
           icon={Crosshair}
           color="bg-blue-500"
           subtitle="Active indicators"
-          href="/iocs"
+          href="/threat-intel"
         />
         <StatCard
           title="Playbooks"
