@@ -155,8 +155,29 @@ async def trigger_assessment(
     run_compliance_assessment.delay(framework_id, getattr(current_user, "organization_id", None))
 
     # Run assessment synchronously for immediate response
-    engine = ComplianceEngine(db, getattr(current_user, "organization_id", None))
+    org_id = getattr(current_user, "organization_id", None)
+    engine = ComplianceEngine(db, org_id)
     assessment = await engine.assess_framework(framework_id)
+
+    # Cross-module loop: if the framework's assessment came back
+    # with less than 80% compliance, fire on_compliance_failure so
+    # the framework drops into the automation pipeline — Alert,
+    # POAM creation, and remediation policy evaluation all get
+    # their shot at the finding. 80% is the standard FedRAMP
+    # Moderate "partially compliant" threshold.
+    try:
+        score = (assessment.get("compliance_score") if isinstance(assessment, dict) else None) or 0
+        if score < 80.0:
+            from src.services.automation import AutomationService
+            automation = AutomationService(db)
+            await automation.on_compliance_failure(
+                control_id=framework.short_name or framework_id,
+                control_title=f"{framework.name}: {score:.1f}% compliant",
+                framework=framework.name,
+                organization_id=org_id,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"on_compliance_failure fan-out failed: {exc}")
 
     return assessment
 

@@ -667,10 +667,64 @@ async def check_evidence_coverage(
     framework_id: str = Query(...),
     current_user: CurrentUser = None,
 ):
-    """Check evidence coverage for framework"""
+    """Check evidence coverage for framework.
+
+    Each control that came back without sufficient evidence fires
+    ``automation.on_fedramp_evidence_gap``, which creates a POAM and
+    runs the full compliance automation chain. Previously the
+    coverage check returned a gap list to the UI but those gaps
+    never produced any POAMs or alerts, so an assessor preparing a
+    FedRAMP package would see "covered: no" on a control and nothing
+    actionable would happen downstream.
+
+    Capped at 25 gap events per call so a completely uncovered
+    framework (191 controls for FedRAMP Moderate) can't fan out 191
+    alerts in one API hit.
+    """
+    org_id = getattr(current_user, "organization_id", None)
     try:
-        checker = AuditReadinessChecker(db, getattr(current_user, "organization_id", None))
+        checker = AuditReadinessChecker(db, org_id)
         result = await checker.check_evidence_coverage(framework_id)
+
+        # Fan out the gaps to the compliance automation pipeline
+        try:
+            gaps = []
+            if isinstance(result, dict):
+                gaps = result.get("uncovered_controls") or result.get("gaps") or []
+            elif hasattr(result, "uncovered_controls"):
+                gaps = result.uncovered_controls or []
+            elif hasattr(result, "gaps"):
+                gaps = result.gaps or []
+
+            if gaps:
+                from src.services.automation import AutomationService
+                automation = AutomationService(db)
+                fired = 0
+                for gap in gaps[:25]:
+                    # gap may be a dict or a scalar control_id string
+                    if isinstance(gap, dict):
+                        control_id = gap.get("control_id") or gap.get("id") or "unknown"
+                        control_title = gap.get("title") or gap.get("control_title") or f"Uncovered control {control_id}"
+                    else:
+                        control_id = str(gap)
+                        control_title = f"Uncovered control {control_id}"
+                    try:
+                        await automation.on_fedramp_evidence_gap(
+                            control_id=control_id,
+                            control_title=control_title,
+                            organization_id=org_id,
+                        )
+                        fired += 1
+                    except Exception as inner_exc:  # noqa: BLE001
+                        logger.warning(
+                            f"on_fedramp_evidence_gap failed for {control_id}: {inner_exc}"
+                        )
+                logger.info(
+                    f"Fired {fired} evidence-gap events for framework={framework_id}"
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Evidence gap fan-out failed: {exc}")
+
         return result
     except Exception as e:
         logger.error(f"Error checking evidence coverage: {str(e)}")

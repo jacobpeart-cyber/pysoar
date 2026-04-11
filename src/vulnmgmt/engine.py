@@ -44,17 +44,21 @@ class VulnerabilityScanner:
         scan_id: str,
         discovery_source: str,
     ) -> dict[str, Any]:
-        """Import scan results from various formats (Nessus, Qualys, OpenVAS, etc.)
+        """Import scan results from various formats (Nessus, Qualys, OpenVAS, etc.).
 
-        Args:
-            db: Database session
-            scan_format: Format of scan data (nessus, qualys, openvas, tenable)
-            scan_data: Raw scan data content
-            scan_id: Unique scan identifier
-            discovery_source: Source scanner (nessus, qualys, etc.)
+        Previously parsed, normalized, deduped, correlated — and then
+        returned. Nothing was ever persisted to the database because
+        ``update_vulnerability_database`` was never called from this
+        method. Every "successful" scan import produced zero rows in
+        ``vulnerabilities`` and zero in ``vulnerability_instances``,
+        while the response payload claimed N imported. Pre-existing
+        silent theater.
 
-        Returns:
-            Import statistics with counts
+        Now:
+          - calls update_vulnerability_database to persist new vulns
+          - returns the list of NEWLY-CREATED critical/high findings
+            as ``new_critical`` so the endpoint can fan them out into
+            the automation pipeline via on_vulnerability_found
         """
         self.logger.info(
             "Importing scan results",
@@ -77,12 +81,29 @@ class VulnerabilityScanner:
             deduplicated = await self.deduplicate_findings(db, normalized)
             correlated = await self.correlate_with_assets(db, deduplicated)
 
+            # Persist the findings — this was silently missing
+            persisted = await self.update_vulnerability_database(db, correlated)
+
+            new_critical = [
+                {
+                    "cve_id": f.get("cve_id", "UNKNOWN"),
+                    "title": f.get("title", "Unknown"),
+                    "severity": f.get("severity", "medium"),
+                    "asset_name": f.get("asset_name", "unknown"),
+                }
+                for f in correlated
+                if f.get("is_new")
+                and str(f.get("severity", "")).lower() in ("critical", "high")
+            ]
+
             return {
                 "scan_id": scan_id,
                 "imported": len(findings),
                 "normalized": len(normalized),
+                "persisted": persisted,
                 "new": len([f for f in correlated if f.get("is_new")]),
                 "existing": len([f for f in correlated if not f.get("is_new")]),
+                "new_critical": new_critical,
             }
         except Exception as e:
             self.logger.error("Scan import failed", scan_id=scan_id, error=str(e))
