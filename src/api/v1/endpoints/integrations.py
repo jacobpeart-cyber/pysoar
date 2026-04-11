@@ -2,7 +2,8 @@
 
 import json
 import math
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Any, Optional
 
 from fastapi import APIRouter, Path, HTTPException, Query, status
 from sqlalchemy import and_, func, or_, select
@@ -875,30 +876,132 @@ async def delete_webhook(
 
 
 # Dashboard endpoints
+# ---------------------------------------------------------------------------
+# Dashboard helpers — shared between the three dashboard endpoints
+# ---------------------------------------------------------------------------
+
+
+async def _compute_integration_health(
+    db: AsyncSession, org_id: Optional[str]
+) -> tuple[list[InstalledIntegration], dict[str, int]]:
+    query = select(InstalledIntegration).where(
+        InstalledIntegration.organization_id == org_id
+    )
+    result = await db.execute(query)
+    integrations = list(result.scalars().all())
+
+    health_counts = {"healthy": 0, "degraded": 0, "unhealthy": 0, "unknown": 0}
+    for integration in integrations:
+        h = integration.health_status or "unknown"
+        if h in health_counts:
+            health_counts[h] += 1
+        else:
+            health_counts["unknown"] += 1
+    return integrations, health_counts
+
+
+async def _compute_execution_stats(
+    db: AsyncSession,
+    org_id: Optional[str],
+    period: str,
+) -> dict[str, Any]:
+    """Real IntegrationExecution aggregates over the requested window."""
+    from datetime import timedelta
+    from src.integrations.models import IntegrationExecution, IntegrationAction
+
+    now = datetime.now(timezone.utc)
+    if period == "hour":
+        cutoff = now - timedelta(hours=1)
+    elif period == "week":
+        cutoff = now - timedelta(days=7)
+    elif period == "month":
+        cutoff = now - timedelta(days=30)
+    else:  # day
+        cutoff = now - timedelta(days=1)
+
+    base = select(IntegrationExecution).where(
+        and_(
+            IntegrationExecution.organization_id == org_id,
+            IntegrationExecution.created_at >= cutoff,
+        )
+    )
+    result = await db.execute(base)
+    executions = list(result.scalars().all())
+
+    total = len(executions)
+    successful = sum(1 for e in executions if e.status == "success")
+    failed = sum(1 for e in executions if e.status in ("failed", "error"))
+
+    # by_connector via installed_integration → connector_name
+    by_connector: dict[str, int] = {}
+    installed_ids = list({e.installed_id for e in executions if e.installed_id})
+    connector_map: dict[str, str] = {}
+    if installed_ids:
+        inst_rows = await db.execute(
+            select(InstalledIntegration).where(InstalledIntegration.id.in_(installed_ids))
+        )
+        for inst in inst_rows.scalars().all():
+            connector_map[inst.id] = inst.connector_name or "unknown"
+    for e in executions:
+        name = connector_map.get(e.installed_id, "unknown")
+        by_connector[name] = by_connector.get(name, 0) + 1
+
+    # by_action_type via action_id → IntegrationAction.action_type
+    by_action_type: dict[str, int] = {}
+    action_ids = list({e.action_id for e in executions if e.action_id})
+    action_map: dict[str, str] = {}
+    if action_ids:
+        act_rows = await db.execute(
+            select(IntegrationAction).where(IntegrationAction.id.in_(action_ids))
+        )
+        for a in act_rows.scalars().all():
+            action_map[a.id] = getattr(a, "action_type", None) or a.name or "unknown"
+    for e in executions:
+        atype = action_map.get(e.action_id, "unknown")
+        by_action_type[atype] = by_action_type.get(atype, 0) + 1
+
+    # Average duration
+    durations = [e.duration_ms for e in executions if e.duration_ms is not None]
+    avg_duration = (sum(durations) / len(durations)) if durations else None
+
+    return {
+        "total": total,
+        "successful": successful,
+        "failed": failed,
+        "by_connector": by_connector,
+        "by_action_type": by_action_type,
+        "avg_duration_ms": avg_duration,
+        "executions": executions,
+        "connector_map": connector_map,
+    }
+
+
 @router.get("/dashboard/health", response_model=DashboardIntegrationHealthResponse)
 async def get_health_dashboard(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Get integration health overview dashboard"""
-    query = select(InstalledIntegration).where(
-        InstalledIntegration.organization_id == getattr(current_user, "organization_id", None),
-    )
+    """Get integration health overview dashboard.
 
-    result = await db.execute(query)
-    integrations = list(result.scalars().all())
+    Previously returned real counts but hardcoded ``integrations=[]``
+    so the per-integration table on the frontend had no rows. Now
+    serializes the actual installed integrations into the list.
+    """
+    org_id = getattr(current_user, "organization_id", None)
+    integrations, health_counts = await _compute_integration_health(db, org_id)
 
-    health_counts = {
-        "healthy": 0,
-        "degraded": 0,
-        "unhealthy": 0,
-        "unknown": 0,
-    }
-
-    for integration in integrations:
-        status = integration.health_status or "unknown"
-        if status in health_counts:
-            health_counts[status] += 1
+    integration_dicts = [
+        {
+            "id": i.id,
+            "name": i.name,
+            "connector_name": i.connector_name,
+            "status": i.status,
+            "health_status": i.health_status or "unknown",
+            "last_health_check": i.last_health_check,
+            "error_message": i.error_message,
+        }
+        for i in integrations
+    ]
 
     return DashboardIntegrationHealthResponse(
         total_installed=len(integrations),
@@ -906,8 +1009,8 @@ async def get_health_dashboard(
         degraded=health_counts["degraded"],
         unhealthy=health_counts["unhealthy"],
         unknown=health_counts["unknown"],
-        integrations=[],
-        last_updated="",
+        integrations=integration_dicts,
+        last_updated=datetime.now(timezone.utc).isoformat(),
     )
 
 
@@ -917,15 +1020,23 @@ async def get_execution_stats(
     db: DatabaseSession = None,
     period: str = Query("day", pattern="^(hour|day|week|month)$"),
 ):
-    """Get execution statistics dashboard"""
+    """Get execution statistics dashboard.
+
+    Previously returned hardcoded zeros / empty dicts for every
+    tenant regardless of how many IntegrationExecution rows existed.
+    Now runs real aggregates over the requested window.
+    """
+    org_id = getattr(current_user, "organization_id", None)
+    stats = await _compute_execution_stats(db, org_id, period)
+
     return DashboardExecutionStatsResponse(
         period=period,
-        total_executions=0,
-        successful=0,
-        failed=0,
-        by_connector={},
-        by_action_type={},
-        last_updated="",
+        total_executions=stats["total"],
+        successful=stats["successful"],
+        failed=stats["failed"],
+        by_connector=stats["by_connector"],
+        by_action_type=stats["by_action_type"],
+        last_updated=datetime.now(timezone.utc).isoformat(),
     )
 
 
@@ -934,50 +1045,96 @@ async def get_dashboard_summary(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Get complete dashboard summary"""
-    query = select(InstalledIntegration).where(
-        InstalledIntegration.organization_id == getattr(current_user, "organization_id", None),
-    )
+    """Get complete dashboard summary with real top_connectors + high_error_rate.
 
-    result = await db.execute(query)
-    integrations = list(result.scalars().all())
+    Previously hardcoded ``top_connectors=[]``, ``high_error_rate=[]``,
+    ``total_executions=0``, ``success_rate=0.0``, and delegated to the
+    broken execution stats path. Now computes all of them from the
+    last 24 hours of IntegrationExecution rows:
+      - top_connectors: top 5 by execution count
+      - high_error_rate: any connector with > 50% failure rate and
+        ≥ 3 executions (so a single failing call doesn't trigger)
+      - success_rate and avg_execution_time_ms come from the same
+        window.
+    """
+    org_id = getattr(current_user, "organization_id", None)
+    integrations, health_counts = await _compute_integration_health(db, org_id)
+    stats = await _compute_execution_stats(db, org_id, period="day")
 
-    health_counts = {
-        "healthy": 0,
-        "degraded": 0,
-        "unhealthy": 0,
-        "unknown": 0,
-    }
+    total = stats["total"]
+    successful = stats["successful"]
+    success_rate = (successful / total * 100.0) if total > 0 else 0.0
 
-    for integration in integrations:
-        status = integration.health_status or "unknown"
-        if status in health_counts:
-            health_counts[status] += 1
+    # Top 5 connectors by execution count
+    top_connectors = [
+        {"connector_name": name, "executions": count}
+        for name, count in sorted(
+            stats["by_connector"].items(), key=lambda kv: -kv[1]
+        )[:5]
+    ]
+
+    # Per-connector failure rates for high_error_rate detection
+    per_connector_counts: dict[str, dict[str, int]] = {}
+    for e in stats["executions"]:
+        name = stats["connector_map"].get(e.installed_id, "unknown")
+        bucket = per_connector_counts.setdefault(name, {"total": 0, "failed": 0})
+        bucket["total"] += 1
+        if e.status in ("failed", "error"):
+            bucket["failed"] += 1
+
+    high_error_rate = []
+    for name, bucket in per_connector_counts.items():
+        if bucket["total"] >= 3:
+            fr = bucket["failed"] / bucket["total"]
+            if fr > 0.5:
+                high_error_rate.append(
+                    {
+                        "connector_name": name,
+                        "total": bucket["total"],
+                        "failed": bucket["failed"],
+                        "failure_rate": round(fr * 100, 1),
+                    }
+                )
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    integration_dicts = [
+        {
+            "id": i.id,
+            "name": i.name,
+            "connector_name": i.connector_name,
+            "status": i.status,
+            "health_status": i.health_status or "unknown",
+            "last_health_check": i.last_health_check,
+            "error_message": i.error_message,
+        }
+        for i in integrations
+    ]
 
     return DashboardSummaryResponse(
         total_installed=len(integrations),
-        total_executions=0,
-        success_rate=0.0,
-        avg_execution_time_ms=None,
+        total_executions=total,
+        success_rate=round(success_rate, 1),
+        avg_execution_time_ms=stats["avg_duration_ms"],
         health_overview=DashboardIntegrationHealthResponse(
             total_installed=len(integrations),
             healthy=health_counts["healthy"],
             degraded=health_counts["degraded"],
             unhealthy=health_counts["unhealthy"],
             unknown=health_counts["unknown"],
-            integrations=[],
-            last_updated="",
+            integrations=integration_dicts,
+            last_updated=now_iso,
         ),
-        top_connectors=[],
-        high_error_rate=[],
+        top_connectors=top_connectors,
+        high_error_rate=high_error_rate,
         period_stats=DashboardExecutionStatsResponse(
             period="day",
-            total_executions=0,
-            successful=0,
-            failed=0,
-            by_connector={},
-            by_action_type={},
-            last_updated="",
+            total_executions=total,
+            successful=successful,
+            failed=stats["failed"],
+            by_connector=stats["by_connector"],
+            by_action_type=stats["by_action_type"],
+            last_updated=now_iso,
         ),
-        last_updated="",
+        last_updated=now_iso,
     )
