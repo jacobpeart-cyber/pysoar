@@ -233,9 +233,12 @@ async def scan_image(
         db=db,
     )
 
-    # Persist new vulnerabilities that aren't already in the DB
+    # Persist new vulnerabilities that aren't already in the DB (defense in depth)
     existing_stmt = select(ImageVulnerability.cve_id).where(
-        ImageVulnerability.image_id == image_id
+        and_(
+            ImageVulnerability.image_id == image_id,
+            ImageVulnerability.organization_id == org_id,
+        )
     )
     existing_result = await db.execute(existing_stmt)
     existing_cves = {r[0] for r in existing_result.all()}
