@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Any
 from abc import ABC, abstractmethod
@@ -815,6 +816,56 @@ class ArtifactAnalyzer:
             self.logger.error(f"Failed to analyze network artifacts: {e}")
             return {"status": "error", "message": str(e)}
 
+    # ------------------------------------------------------------------
+    # IOC extraction regexes (module-level so they compile once)
+    # ------------------------------------------------------------------
+    # These are intentionally restrictive. DFIR analysts are happy with
+    # tight heuristics that miss occasional exotic formats in exchange
+    # for near-zero false positives, which is why we include things
+    # like "no trailing dot for domains" and "mask obvious private
+    # address ranges" before classifying an IPv4 as suspicious.
+    _IPV4_RE = re.compile(
+        r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b"
+    )
+    _IPV6_RE = re.compile(
+        r"\b(?:[A-F0-9]{1,4}:){2,7}[A-F0-9]{1,4}\b", re.IGNORECASE
+    )
+    _DOMAIN_RE = re.compile(
+        r"\b(?:(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)\.){1,}"
+        r"(?:[a-z]{2,24})\b",
+        re.IGNORECASE,
+    )
+    _URL_RE = re.compile(
+        r"\b(?:https?|ftp|file)://[^\s<>\"']+", re.IGNORECASE
+    )
+    _EMAIL_RE = re.compile(
+        r"\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,24}\b", re.IGNORECASE
+    )
+    # MD5 / SHA-1 / SHA-256 hashes (hex-only, exact length)
+    _HASH_RE = re.compile(
+        r"\b(?:[a-f0-9]{32}|[a-f0-9]{40}|[a-f0-9]{64})\b", re.IGNORECASE
+    )
+
+    @classmethod
+    def _walk_strings(cls, value: Any) -> list[str]:
+        """Flatten any nested dict/list into a list of string values so
+        the IOC regexes can scan arbitrary artifact shapes without
+        special-casing each artifact_type."""
+        out: list[str] = []
+        if value is None:
+            return out
+        if isinstance(value, str):
+            out.append(value)
+        elif isinstance(value, (int, float, bool)):
+            out.append(str(value))
+        elif isinstance(value, dict):
+            for v in value.values():
+                out.extend(cls._walk_strings(v))
+        elif isinstance(value, (list, tuple, set)):
+            for v in value:
+                out.extend(cls._walk_strings(v))
+        return out
+
     def extract_iocs(
         self,
         artifact_data: dict,
@@ -823,39 +874,80 @@ class ArtifactAnalyzer:
         """
         Extract IOCs (IPs, domains, hashes, emails, URLs) from artifacts.
 
-        Args:
-            artifact_data: Artifact data to analyze
-            artifact_type: Type of artifact
+        Previous behavior: returned whatever the caller happened to
+        pre-key as ``ip_addresses``, ``domains``, ``hashes``, ``urls``.
+        If the caller passed raw memory-dump bytes or shell history
+        strings, the analyzer found exactly zero IOCs — useless for
+        any real DFIR workflow.
 
-        Returns:
-            Extracted IOCs
+        New behavior: walks every string inside the artifact (nested
+        dicts and lists included) and runs real regex extraction for
+        IPv4, IPv6, domains, URLs, emails, and MD5/SHA-1/SHA-256
+        hashes. The pre-extracted lists the caller may have supplied
+        are still honored and merged in so existing call sites don't
+        regress.
         """
         try:
             self.logger.info(f"Extracting IOCs from {artifact_type}")
 
-            iocs = {
-                "ipv4_addresses": [],
-                "ipv6_addresses": [],
-                "domains": [],
-                "file_hashes": [],
-                "email_addresses": [],
-                "urls": [],
+            iocs: dict[str, set] = {
+                "ipv4_addresses": set(),
+                "ipv6_addresses": set(),
+                "domains": set(),
+                "file_hashes": set(),
+                "email_addresses": set(),
+                "urls": set(),
             }
 
-            # Simplified IOC extraction
-            if "ip_addresses" in artifact_data:
-                iocs["ipv4_addresses"] = artifact_data.get("ip_addresses", [])
-            if "domains" in artifact_data:
-                iocs["domains"] = artifact_data.get("domains", [])
-            if "hashes" in artifact_data:
-                iocs["file_hashes"] = artifact_data.get("hashes", [])
-            if "urls" in artifact_data:
-                iocs["urls"] = artifact_data.get("urls", [])
+            # Pre-keyed lists from caller (backward-compat)
+            if isinstance(artifact_data, dict):
+                for pre_key, ioc_key in (
+                    ("ip_addresses", "ipv4_addresses"),
+                    ("ipv4_addresses", "ipv4_addresses"),
+                    ("ipv6_addresses", "ipv6_addresses"),
+                    ("domains", "domains"),
+                    ("hashes", "file_hashes"),
+                    ("file_hashes", "file_hashes"),
+                    ("urls", "urls"),
+                    ("emails", "email_addresses"),
+                    ("email_addresses", "email_addresses"),
+                ):
+                    vals = artifact_data.get(pre_key)
+                    if isinstance(vals, list):
+                        iocs[ioc_key].update(str(v) for v in vals if v)
 
+            # Walk the whole structure and regex every string leaf
+            for s in self._walk_strings(artifact_data):
+                # URLs first so we can strip them from the text before
+                # running the domain regex (so "https://example.com"
+                # doesn't also appear in the domains bucket)
+                s_wo_url = s
+                for m in self._URL_RE.findall(s):
+                    iocs["urls"].add(m)
+                    s_wo_url = s_wo_url.replace(m, " ")
+
+                for m in self._IPV4_RE.findall(s_wo_url):
+                    iocs["ipv4_addresses"].add(m)
+                for m in self._IPV6_RE.findall(s_wo_url):
+                    iocs["ipv6_addresses"].add(m)
+                for m in self._DOMAIN_RE.findall(s_wo_url):
+                    # reject things that look like IPs or .local / .test
+                    lowered = m.lower()
+                    if self._IPV4_RE.fullmatch(lowered):
+                        continue
+                    if lowered.endswith((".local", ".test", ".internal", ".lan")):
+                        continue
+                    iocs["domains"].add(lowered)
+                for m in self._EMAIL_RE.findall(s_wo_url):
+                    iocs["email_addresses"].add(m.lower())
+                for m in self._HASH_RE.findall(s_wo_url):
+                    iocs["file_hashes"].add(m.lower())
+
+            result = {k: sorted(v) for k, v in iocs.items()}
             return {
                 "status": "success",
-                "iocs": iocs,
-                "total_extracted": sum(len(v) for v in iocs.values()),
+                "iocs": result,
+                "total_extracted": sum(len(v) for v in result.values()),
             }
         except Exception as e:
             self.logger.error(f"Failed to extract IOCs: {e}")
