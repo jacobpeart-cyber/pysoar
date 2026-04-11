@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../lib/api';
+import { useAuth } from '../contexts/AuthContext';
 import {
   Cpu,
   CheckCircle,
@@ -98,6 +99,8 @@ function formatAge(iso: string | null | undefined): string {
 
 export default function AgentManagement() {
   const qc = useQueryClient();
+  const { user } = useAuth();
+  const orgChannel = `agents:${user?.organization_id ?? 'global'}`;
   const [showEnroll, setShowEnroll] = useState(false);
   const [enrollResult, setEnrollResult] = useState<EnrollResult | null>(null);
   const [enrollForm, setEnrollForm] = useState({
@@ -134,14 +137,16 @@ export default function AgentManagement() {
     refetchInterval: 5000,
   });
 
-  // Live WebSocket — subscribe to the 'agents' channel so events push
-  // into the React Query cache without us needing to poll every second.
+  // Live WebSocket — subscribe to the per-org agents channel so events
+  // push into the React Query cache without polling. Channel is
+  // `agents:<org_id>` (or `agents:global` in single-tenant mode) so
+  // events never leak between tenants.
   useEffect(() => {
     const token = localStorage.getItem('access_token');
     if (!token) return;
     const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const ws = new WebSocket(`${proto}//${window.location.host}/api/v1/ws?token=${token}`);
-    ws.onopen = () => ws.send(JSON.stringify({ action: 'subscribe', channel: 'agents' }));
+    ws.onopen = () => ws.send(JSON.stringify({ action: 'subscribe', channel: orgChannel }));
     ws.onmessage = () => {
       // Any inbound event invalidates both queries so the UI re-renders
       qc.invalidateQueries({ queryKey: ['agents-dashboard'] });
@@ -149,13 +154,13 @@ export default function AgentManagement() {
     };
     return () => {
       try {
-        ws.send(JSON.stringify({ action: 'unsubscribe', channel: 'agents' }));
+        ws.send(JSON.stringify({ action: 'unsubscribe', channel: orgChannel }));
         ws.close();
       } catch {
         /* noop */
       }
     };
-  }, [qc]);
+  }, [qc, orgChannel]);
 
   const submitEnroll = async () => {
     const capabilities = Object.entries(enrollForm.capabilities)

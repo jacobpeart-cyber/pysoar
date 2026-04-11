@@ -33,6 +33,22 @@ from src.core.logging import get_logger
 logger = get_logger(__name__)
 
 
+def _agents_channel(org_id: Optional[str]) -> str:
+    """Canonical per-tenant agent events channel.
+
+    Single-tenant deployments (no org_id) fall back to ``agents:global``
+    so the frontend always has a deterministic channel name to
+    subscribe to. Never emits to a bare ``agents`` channel anymore —
+    the old global broadcast leaked events across tenants.
+    """
+    return f"agents:{org_id or 'global'}"
+
+
+def _purple_channel(org_id: Optional[str], simulation_id: str) -> str:
+    """Per-tenant + per-simulation purple team stream channel."""
+    return f"purple:{org_id or 'global'}:{simulation_id}"
+
+
 async def _broadcast(channel: str, message: dict[str, Any]) -> None:
     """Best-effort WebSocket publish — never blocks or raises.
 
@@ -275,7 +291,8 @@ class AgentService:
         )
 
         # Real-time broadcast so AgentManagement, LiveResponse, and
-        # Purple Team views update without a poll.
+        # Purple Team views update without a poll. Scoped per-org so
+        # one tenant's events never leak into another tenant's stream.
         event = {
             "type": "agent_command_queued",
             "command_id": cmd.id,
@@ -287,9 +304,9 @@ class AgentService:
             "simulation_id": simulation_id,
             "incident_id": incident_id,
         }
-        await _broadcast("agents", event)
+        await _broadcast(_agents_channel(agent.organization_id), event)
         if simulation_id:
-            await _broadcast(f"purple:{simulation_id}", event)
+            await _broadcast(_purple_channel(agent.organization_id, simulation_id), event)
         return cmd
 
     async def approve_command(
@@ -361,9 +378,12 @@ class AgentService:
                     "hostname": agent.hostname,
                     "action": c.action,
                 }
-                await _broadcast("agents", event)
+                await _broadcast(_agents_channel(agent.organization_id), event)
                 if c.simulation_id:
-                    await _broadcast(f"purple:{c.simulation_id}", event)
+                    await _broadcast(
+                        _purple_channel(agent.organization_id, c.simulation_id),
+                        event,
+                    )
         return commands
 
     async def ingest_result(
@@ -430,9 +450,12 @@ class AgentService:
             "stdout_preview": (stdout or "")[:512],
             "stderr_preview": (stderr or "")[:512],
         }
-        await _broadcast("agents", event)
+        await _broadcast(_agents_channel(agent.organization_id), event)
         if cmd.simulation_id:
-            await _broadcast(f"purple:{cmd.simulation_id}", event)
+            await _broadcast(
+                _purple_channel(agent.organization_id, cmd.simulation_id),
+                event,
+            )
         return result
 
     # ------------------------------------------------------------------

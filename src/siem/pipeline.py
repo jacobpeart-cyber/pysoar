@@ -200,6 +200,32 @@ async def process_log(
                     except Exception:
                         pass  # Non-critical
 
+                # Purple Team correlation: broadcast a siem_match event
+                # over the per-org agent WebSocket channel. The Purple
+                # Team view listens for these and overlays them next to
+                # the BAS fire events it already renders, so an analyst
+                # watching a live technique execution sees detection
+                # rule hits land on the same timeline in real time.
+                try:
+                    from src.agents.service import _agents_channel, _broadcast
+                    await _broadcast(
+                        _agents_channel(organization_id),
+                        {
+                            "type": "siem_match",
+                            "rule_id": match.rule_id,
+                            "rule_title": match.rule_title,
+                            "severity": match.severity,
+                            "mitre_techniques": match.mitre_techniques or [],
+                            "source_name": source_name,
+                            "source_ip": source_ip,
+                            "alert_id": alert.id,
+                            "log_id": log_entry.id,
+                            "hostname": norm_dict.get("hostname"),
+                        },
+                    )
+                except Exception as ws_exc:  # noqa: BLE001
+                    logger.debug(f"purple team siem_match broadcast failed: {ws_exc}")
+
     except Exception as e:
         logger.error(f"Rule evaluation failed: {e}")
 
