@@ -85,12 +85,23 @@ def execute_simulation(self, simulation_id: str, organization_id: str) -> dict:
                 result = await session.execute(stmt)
                 all_tests = result.scalars().all()
 
+                # Count outcomes. In this engine's terminology:
+                #   passed_tests  = technique was detected by a rule (defender win)
+                #   failed_tests  = technique went undetected (defender miss)
+                #   blocked_tests = test errored out / could not run
                 simulation.passed_tests = sum(1 for t in all_tests if t.was_detected)
-                simulation.failed_tests = sum(1 for t in all_tests if not t.was_detected and t.status == "passed")
-                simulation.blocked_tests = sum(1 for t in all_tests if t.status == "blocked")
+                simulation.failed_tests = sum(
+                    1 for t in all_tests if not t.was_detected and t.status != "error"
+                )
+                simulation.blocked_tests = sum(1 for t in all_tests if t.status == "error")
 
                 if simulation.total_tests > 0:
-                    simulation.detection_rate = (simulation.blocked_tests / simulation.total_tests) * 100
+                    # detection_rate = fraction of techniques covered by a rule.
+                    # Previously this used blocked_tests / total, which was
+                    # both inverted and counted errors as detections.
+                    simulation.detection_rate = (
+                        simulation.passed_tests / simulation.total_tests
+                    ) * 100
                     simulation.overall_score = simulation.detection_rate
 
                 await session.commit()
