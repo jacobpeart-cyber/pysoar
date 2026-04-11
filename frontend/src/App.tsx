@@ -24,7 +24,6 @@ import ThreatIntel from './pages/ThreatIntel'
 import SIEMDashboard from './pages/SIEMDashboard'
 import ThreatHunting from './pages/ThreatHunting'
 import ExposureManagement from './pages/ExposureManagement'
-import AIEngine from './pages/AIEngine'
 import UEBADashboard from './pages/UEBADashboard'
 import AttackSimulation from './pages/AttackSimulation'
 import DeceptionTech from './pages/DeceptionTech'
@@ -166,7 +165,6 @@ function AppRoutes() {
         <Route path="siem" element={<SIEMDashboard />} />
         <Route path="hunting" element={<ThreatHunting />} />
         <Route path="exposure" element={<ExposureManagement />} />
-        <Route path="ai" element={<AIEngine />} />
         <Route path="ueba" element={<UEBADashboard />} />
         <Route path="simulation" element={<AttackSimulation />} />
         <Route path="deception" element={<DeceptionTech />} />

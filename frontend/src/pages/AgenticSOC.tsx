@@ -12,6 +12,9 @@ import {
   AlertCircle,
   Send,
   X,
+  CheckCircle,
+  XCircle,
+  RefreshCw,
 } from 'lucide-react';
 import {
   LineChart,
@@ -25,10 +28,24 @@ import {
 import clsx from 'clsx';
 import { api } from '../api/client';
 
+type TabId = 'agents' | 'investigations' | 'reasoning' | 'approvals' | 'triage' | 'anomalies' | 'predictions' | 'models';
+
+const priorityColors: Record<string, string> = {
+  critical: 'text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20',
+  high: 'text-orange-600 dark:text-orange-400 bg-orange-50 dark:bg-orange-900/20',
+  medium: 'text-yellow-600 dark:text-yellow-400 bg-yellow-50 dark:bg-yellow-900/20',
+  low: 'text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-900/20',
+};
+
+const severityColors: Record<string, string> = {
+  critical: 'text-red-600 dark:text-red-400',
+  high: 'text-orange-600 dark:text-orange-400',
+  medium: 'text-yellow-600 dark:text-yellow-400',
+  low: 'text-blue-600 dark:text-blue-400',
+};
+
 const AgenticSOC: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<'agents' | 'investigations' | 'reasoning' | 'approvals'>(
-    'agents'
-  );
+  const [activeTab, setActiveTab] = useState<TabId>('agents');
   const [selectedAgent, setSelectedAgent] = useState<string | null>(null);
   const [selectedInvestigation, setSelectedInvestigation] = useState<string | null>(null);
   const [chatMessages, setChatMessages] = useState<Array<{ role: string; text: string }>>([
@@ -39,6 +56,7 @@ const AgenticSOC: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [chatLoading, setChatLoading] = useState(false);
+  const [statusToast, setStatusToast] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   // State for API data
   const [agents, setAgents] = useState<any[]>([]);
@@ -52,6 +70,23 @@ const AgenticSOC: React.FC = () => {
     avgConfidenceScore: 0,
     actionsPendingApproval: 0,
   });
+
+  // AI Engine absorbed state
+  const [aiDashboard, setAiDashboard] = useState<any>(null);
+  const [triagedAlerts, setTriagedAlerts] = useState<any[]>([]);
+  const [anomalies, setAnomalies] = useState<any[]>([]);
+  const [anomalyFilter, setAnomalyFilter] = useState<'all' | 'active' | 'confirmed' | 'dismissed'>('all');
+  const [predictions, setPredictions] = useState<any[]>([]);
+  const [predictionFilter, setPredictionFilter] = useState<'all' | 'critical' | 'high' | 'medium' | 'low'>('all');
+  const [entityTypeFilter, setEntityTypeFilter] = useState('all');
+  const [models, setModels] = useState<any[]>([]);
+  const [triageLoading, setTriageLoading] = useState(false);
+  const [trainLoading, setTrainLoading] = useState(false);
+
+  const showStatus = (type: 'success' | 'error', text: string) => {
+    setStatusToast({ type, text });
+    setTimeout(() => setStatusToast(null), 4000);
+  };
 
   useEffect(() => {
     const loadData = async () => {
@@ -142,6 +177,106 @@ const AgenticSOC: React.FC = () => {
     };
     loadData();
   }, []);
+
+  // Load AI Engine data (dashboard, triage, models) once on mount
+  useEffect(() => {
+    const loadAi = async () => {
+      try {
+        const [dash, triaged, mdls] = await Promise.all([
+          api.get('/ai/dashboard').catch(() => ({ data: null })),
+          api.get('/ai/alerts/triaged').catch(() => ({ data: [] })),
+          api.get('/ai/models').catch(() => ({ data: [] })),
+        ]);
+        setAiDashboard(dash?.data || null);
+        setTriagedAlerts(Array.isArray(triaged?.data) ? triaged.data : []);
+        setModels(Array.isArray(mdls?.data) ? mdls.data : []);
+      } catch {
+        /* graceful: tabs will show empty states */
+      }
+    };
+    loadAi();
+  }, []);
+
+  // Refetch anomalies when filter changes
+  useEffect(() => {
+    const loadAnomalies = async () => {
+      try {
+        const res = await api.get('/ai/anomalies', {
+          params: anomalyFilter !== 'all' ? { status: anomalyFilter } : {},
+        });
+        setAnomalies(res.data?.anomalies ?? []);
+      } catch {
+        setAnomalies([]);
+      }
+    };
+    loadAnomalies();
+  }, [anomalyFilter]);
+
+  // Refetch predictions when filters change
+  useEffect(() => {
+    const loadPredictions = async () => {
+      try {
+        const res = await api.get('/ai/predictions', {
+          params: {
+            ...(predictionFilter !== 'all' ? { risk_level: predictionFilter } : {}),
+            ...(entityTypeFilter !== 'all' ? { entity_type: entityTypeFilter } : {}),
+          },
+        });
+        setPredictions(Array.isArray(res.data) ? res.data : []);
+      } catch {
+        setPredictions([]);
+      }
+    };
+    loadPredictions();
+  }, [predictionFilter, entityTypeFilter]);
+
+  const handleTriage = async () => {
+    setTriageLoading(true);
+    try {
+      const alertIds = triagedAlerts.map((a) => a.id);
+      const res = await api.post('/ai/triage/batch', { alert_ids: alertIds, limit: 10 });
+      const count = res.data?.results?.length || res.data?.triaged_count || 0;
+      const refresh = await api.get('/ai/alerts/triaged');
+      setTriagedAlerts(Array.isArray(refresh?.data) ? refresh.data : []);
+      showStatus('success', `Triaged ${count} alerts successfully`);
+    } catch {
+      showStatus('error', 'Alert triage failed — check API connection');
+    } finally {
+      setTriageLoading(false);
+    }
+  };
+
+  const handleAnomalyAction = async (anomalyId: string, action: 'confirm' | 'dismiss') => {
+    try {
+      const body = action === 'confirm' ? { is_confirmed: true } : { is_false_positive: true };
+      await api.post(`/ai/anomalies/${anomalyId}/feedback`, body);
+      const res = await api.get('/ai/anomalies', {
+        params: anomalyFilter !== 'all' ? { status: anomalyFilter } : {},
+      });
+      setAnomalies(res.data?.anomalies ?? []);
+      showStatus('success', `Anomaly ${action === 'confirm' ? 'confirmed' : 'dismissed'}`);
+    } catch {
+      showStatus('error', `Failed to ${action} anomaly`);
+    }
+  };
+
+  const handleTrainModel = async () => {
+    setTrainLoading(true);
+    try {
+      await api.post('/ai/models/train', {
+        model_type: 'anomaly_detection',
+        algorithm: 'isolation_forest',
+        description: 'Auto-trained anomaly detection model',
+      });
+      const refresh = await api.get('/ai/models');
+      setModels(Array.isArray(refresh?.data) ? refresh.data : []);
+      showStatus('success', 'Model training initiated successfully');
+    } catch {
+      showStatus('error', 'Model training failed — check API connection');
+    } finally {
+      setTrainLoading(false);
+    }
+  };
 
   const handleChatSend = async () => {
     if (!chatInput.trim() || chatLoading) return;
@@ -270,20 +405,40 @@ const AgenticSOC: React.FC = () => {
           </div>
         </div>
 
+        {/* Status Toast */}
+        {statusToast && (
+          <div className={clsx('mb-4 p-4 rounded-lg flex items-center gap-3 text-sm font-medium border',
+            statusToast.type === 'success'
+              ? 'bg-green-50 dark:bg-green-900/20 text-green-700 dark:text-green-400 border-green-200 dark:border-green-800'
+              : 'bg-red-50 dark:bg-red-900/20 text-red-700 dark:text-red-400 border-red-200 dark:border-red-800')}>
+            {statusToast.type === 'success' ? <CheckCircle className="w-5 h-5" /> : <AlertCircle className="w-5 h-5" />}
+            {statusToast.text}
+          </div>
+        )}
+
         {/* Tabs */}
-        <div className="mb-6 flex gap-2 border-b border-gray-200 dark:border-gray-700">
-          {(['agents', 'investigations', 'reasoning', 'approvals'] as const).map((tab) => (
+        <div className="mb-6 flex gap-2 border-b border-gray-200 dark:border-gray-700 overflow-x-auto">
+          {([
+            { id: 'agents', label: 'Agents' },
+            { id: 'investigations', label: 'Investigations' },
+            { id: 'reasoning', label: 'Reasoning' },
+            { id: 'approvals', label: 'Approvals' },
+            { id: 'triage', label: 'Alert Triage' },
+            { id: 'anomalies', label: 'Anomalies' },
+            { id: 'predictions', label: 'Predictions' },
+            { id: 'models', label: 'ML Models' },
+          ] as const).map((tab) => (
             <button
-              key={tab}
-              onClick={() => setActiveTab(tab)}
+              key={tab.id}
+              onClick={() => setActiveTab(tab.id)}
               className={clsx(
-                'px-4 py-3 font-medium text-sm border-b-2 transition',
-                activeTab === tab
+                'px-4 py-3 font-medium text-sm border-b-2 transition whitespace-nowrap',
+                activeTab === tab.id
                   ? 'border-blue-600 text-blue-600 dark:text-blue-400'
                   : 'border-transparent text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-300'
               )}
             >
-              {tab.charAt(0).toUpperCase() + tab.slice(1)}
+              {tab.label}
             </button>
           ))}
         </div>
@@ -460,6 +615,331 @@ const AgenticSOC: React.FC = () => {
                     </div>
                   </div>
                 ))}
+              </div>
+            </div>
+          )}
+
+          {/* Alert Triage Tab */}
+          {activeTab === 'triage' && (
+            <div className="space-y-6">
+              <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                <div className="bg-gray-50 dark:bg-gray-900 rounded-lg border border-gray-200 dark:border-gray-700 p-5">
+                  <p className="text-gray-600 dark:text-gray-400 text-sm">Total Analyses</p>
+                  <p className="text-3xl font-bold text-gray-900 dark:text-white mt-2">{aiDashboard?.total_analyses ?? 0}</p>
+                </div>
+                <div className="bg-gray-50 dark:bg-gray-900 rounded-lg border border-gray-200 dark:border-gray-700 p-5">
+                  <p className="text-gray-600 dark:text-gray-400 text-sm">Accuracy Rate</p>
+                  <p className="text-3xl font-bold text-green-600 dark:text-green-400 mt-2">{((aiDashboard?.accuracy_rate ?? 0) * 100).toFixed(1)}%</p>
+                </div>
+                <div className="bg-gray-50 dark:bg-gray-900 rounded-lg border border-gray-200 dark:border-gray-700 p-5">
+                  <p className="text-gray-600 dark:text-gray-400 text-sm">False Positive Rate</p>
+                  <p className="text-3xl font-bold text-orange-600 dark:text-orange-400 mt-2">{((aiDashboard?.false_positive_rate ?? 0) * 100).toFixed(1)}%</p>
+                </div>
+                <div className="bg-gray-50 dark:bg-gray-900 rounded-lg border border-gray-200 dark:border-gray-700 p-5">
+                  <p className="text-gray-600 dark:text-gray-400 text-sm">Avg Confidence</p>
+                  <p className="text-3xl font-bold text-blue-600 dark:text-blue-400 mt-2">{((aiDashboard?.average_confidence ?? 0) * 100).toFixed(1)}%</p>
+                </div>
+              </div>
+
+              <div className="overflow-x-auto rounded-lg border border-gray-200 dark:border-gray-700">
+                <table className="w-full text-sm">
+                  <thead className="bg-gray-50 dark:bg-gray-900">
+                    <tr>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-gray-900 dark:text-white uppercase">Alert</th>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-gray-900 dark:text-white uppercase">AI Priority</th>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-gray-900 dark:text-white uppercase">Confidence</th>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-gray-900 dark:text-white uppercase">Reasoning</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
+                    {triagedAlerts.slice(0, 10).map((alert) => (
+                      <tr key={alert.id} className="hover:bg-gray-50 dark:hover:bg-gray-700">
+                        <td className="px-4 py-3 text-gray-900 dark:text-white font-medium">{alert.title}</td>
+                        <td className="px-4 py-3">
+                          <span className={clsx('px-3 py-1 rounded-full text-xs font-medium', priorityColors[alert.ai_priority ?? 'medium'])}>
+                            {(alert.ai_priority ?? 'medium').charAt(0).toUpperCase() + (alert.ai_priority ?? 'medium').slice(1)}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3">
+                          <div className="flex items-center gap-2">
+                            <div className="w-16 bg-gray-200 dark:bg-gray-700 rounded-full h-2">
+                              <div className="bg-blue-600 dark:bg-blue-400 h-2 rounded-full" style={{ width: `${(alert.confidence ?? 0) * 100}%` }} />
+                            </div>
+                            <span className="text-xs text-gray-600 dark:text-gray-400">{((alert.confidence ?? 0) * 100).toFixed(0)}%</span>
+                          </div>
+                        </td>
+                        <td className="px-4 py-3 text-sm text-gray-600 dark:text-gray-400 truncate max-w-md">{alert.reasoning}</td>
+                      </tr>
+                    ))}
+                    {triagedAlerts.length === 0 && (
+                      <tr><td colSpan={4} className="px-4 py-8 text-center text-sm text-gray-500 dark:text-gray-400">No triaged alerts. Click "Triage Pending Alerts" to run AI triage.</td></tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+
+              <button
+                onClick={handleTriage}
+                disabled={triageLoading}
+                className="px-4 py-2 rounded-lg bg-blue-600 dark:bg-blue-700 text-white hover:bg-blue-700 dark:hover:bg-blue-600 font-medium transition disabled:opacity-50 flex items-center gap-2"
+              >
+                {triageLoading ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Zap className="w-4 h-4" />}
+                {triageLoading ? 'Triaging...' : 'Triage Pending Alerts'}
+              </button>
+            </div>
+          )}
+
+          {/* Anomalies Tab */}
+          {activeTab === 'anomalies' && (
+            <div className="space-y-6">
+              <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
+                <div className="bg-gray-50 dark:bg-gray-900 rounded-lg border border-gray-200 dark:border-gray-700 p-5">
+                  <p className="text-gray-600 dark:text-gray-400 text-sm">Anomalies Detected</p>
+                  <p className="text-3xl font-bold text-gray-900 dark:text-white mt-2">{aiDashboard?.total_anomalies_detected ?? 0}</p>
+                </div>
+                <div className="bg-gray-50 dark:bg-gray-900 rounded-lg border border-gray-200 dark:border-gray-700 p-5">
+                  <p className="text-gray-600 dark:text-gray-400 text-sm">Models Deployed</p>
+                  <p className="text-3xl font-bold text-blue-600 dark:text-blue-400 mt-2">{aiDashboard?.models_deployed ?? 0}</p>
+                </div>
+                <div className="bg-gray-50 dark:bg-gray-900 rounded-lg border border-gray-200 dark:border-gray-700 p-5">
+                  <p className="text-gray-600 dark:text-gray-400 text-sm">Avg Model Drift</p>
+                  <p className="text-3xl font-bold text-green-600 dark:text-green-400 mt-2">{((aiDashboard?.avg_model_drift ?? 0) * 100).toFixed(1)}%</p>
+                </div>
+                <div className="bg-gray-50 dark:bg-gray-900 rounded-lg border border-gray-200 dark:border-gray-700 p-5">
+                  <p className="text-gray-600 dark:text-gray-400 text-sm">False Positive Rate</p>
+                  <p className="text-3xl font-bold text-orange-600 dark:text-orange-400 mt-2">{((aiDashboard?.false_positive_rate ?? 0) * 100).toFixed(1)}%</p>
+                </div>
+              </div>
+
+              <div className="flex gap-2">
+                {(['all', 'active', 'confirmed', 'dismissed'] as const).map((s) => (
+                  <button
+                    key={s}
+                    onClick={() => setAnomalyFilter(s)}
+                    className={clsx(
+                      'px-4 py-2 rounded-lg font-medium text-sm transition',
+                      anomalyFilter === s
+                        ? 'bg-blue-600 dark:bg-blue-700 text-white'
+                        : 'bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-white hover:bg-gray-300 dark:hover:bg-gray-600'
+                    )}
+                  >
+                    {s.charAt(0).toUpperCase() + s.slice(1)}
+                  </button>
+                ))}
+              </div>
+
+              <div className="overflow-x-auto rounded-lg border border-gray-200 dark:border-gray-700">
+                <table className="w-full text-sm">
+                  <thead className="bg-gray-50 dark:bg-gray-900">
+                    <tr>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-gray-900 dark:text-white uppercase">Time</th>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-gray-900 dark:text-white uppercase">Entity</th>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-gray-900 dark:text-white uppercase">Type</th>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-gray-900 dark:text-white uppercase">Score</th>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-gray-900 dark:text-white uppercase">Severity</th>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-gray-900 dark:text-white uppercase">Description</th>
+                      <th className="px-4 py-3 text-left text-xs font-medium text-gray-900 dark:text-white uppercase">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
+                    {anomalies.slice(0, 10).map((a) => (
+                      <tr key={a.id} className="hover:bg-gray-50 dark:hover:bg-gray-700">
+                        <td className="px-4 py-3 text-xs text-gray-600 dark:text-gray-400">{a.created_at ? new Date(a.created_at).toLocaleString() : 'N/A'}</td>
+                        <td className="px-4 py-3 text-sm font-medium text-gray-900 dark:text-white">{a.entity_id}</td>
+                        <td className="px-4 py-3 text-xs text-gray-600 dark:text-gray-400">{a.entity_type}</td>
+                        <td className="px-4 py-3">
+                          <div className="w-16 bg-gray-200 dark:bg-gray-700 rounded-full h-2">
+                            <div
+                              className={clsx('h-2 rounded-full', a.anomaly_score > 0.7 ? 'bg-red-500' : a.anomaly_score > 0.5 ? 'bg-yellow-500' : 'bg-blue-500')}
+                              style={{ width: `${(a.anomaly_score ?? 0) * 100}%` }}
+                            />
+                          </div>
+                        </td>
+                        <td className="px-4 py-3">
+                          <span className={clsx('text-sm font-medium', severityColors[a.severity ?? 'medium'])}>
+                            {(a.severity ?? 'medium').charAt(0).toUpperCase() + (a.severity ?? 'medium').slice(1)}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3 text-xs text-gray-600 dark:text-gray-400 truncate max-w-xs">{a.description}</td>
+                        <td className="px-4 py-3 space-x-2 whitespace-nowrap">
+                          <button onClick={() => handleAnomalyAction(a.id, 'confirm')} className="inline-flex items-center gap-1 px-2 py-1 rounded text-xs bg-green-50 dark:bg-green-900/20 text-green-600 dark:text-green-400 hover:bg-green-100 dark:hover:bg-green-900/40">
+                            <CheckCircle className="w-3 h-3" /> Confirm
+                          </button>
+                          <button onClick={() => handleAnomalyAction(a.id, 'dismiss')} className="inline-flex items-center gap-1 px-2 py-1 rounded text-xs bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-400 hover:bg-gray-200 dark:hover:bg-gray-600">
+                            <XCircle className="w-3 h-3" /> Dismiss
+                          </button>
+                        </td>
+                      </tr>
+                    ))}
+                    {anomalies.length === 0 && (
+                      <tr><td colSpan={7} className="px-4 py-8 text-center text-sm text-gray-500 dark:text-gray-400">No anomalies in this category.</td></tr>
+                    )}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* Predictions Tab */}
+          {activeTab === 'predictions' && (
+            <div className="space-y-6">
+              <div className="flex flex-wrap gap-4">
+                <div>
+                  <label className="block text-sm font-medium text-gray-900 dark:text-white mb-2">Entity Type</label>
+                  <select
+                    value={entityTypeFilter}
+                    onChange={(e) => setEntityTypeFilter(e.target.value)}
+                    className="px-4 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white"
+                  >
+                    <option value="all">All Types</option>
+                    <option value="user">User</option>
+                    <option value="host">Host</option>
+                    <option value="service">Service</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-900 dark:text-white mb-2">Risk Level</label>
+                  <select
+                    value={predictionFilter}
+                    onChange={(e) => setPredictionFilter(e.target.value as any)}
+                    className="px-4 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white"
+                  >
+                    <option value="all">All Levels</option>
+                    <option value="critical">Critical</option>
+                    <option value="high">High</option>
+                    <option value="medium">Medium</option>
+                    <option value="low">Low</option>
+                  </select>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                {predictions.slice(0, 9).map((p) => (
+                  <div key={p.id ?? p.entity_id} className="bg-gray-50 dark:bg-gray-900 rounded-lg border border-gray-200 dark:border-gray-700 p-5 space-y-4">
+                    <div>
+                      <p className="text-xs text-gray-600 dark:text-gray-400">Entity</p>
+                      <p className="font-semibold text-gray-900 dark:text-white mt-1">{p.entity_id}</p>
+                      <p className="text-xs text-gray-500 mt-1">{p.entity_type}</p>
+                    </div>
+                    <div>
+                      <p className="text-xs text-gray-600 dark:text-gray-400 mb-2">Risk Score</p>
+                      <div className="flex items-center gap-3">
+                        <div className="flex-1 h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
+                          <div
+                            className={clsx('h-full', (p.risk_score ?? 0) > 70 ? 'bg-red-500' : (p.risk_score ?? 0) > 50 ? 'bg-orange-500' : 'bg-green-500')}
+                            style={{ width: `${Math.min(p.risk_score ?? 0, 100)}%` }}
+                          />
+                        </div>
+                        <span className="text-lg font-bold text-gray-900 dark:text-white">{(p.risk_score ?? 0).toFixed(0)}</span>
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="p-3 rounded-lg bg-white dark:bg-gray-800">
+                        <p className="text-xs text-gray-600 dark:text-gray-400">Probability</p>
+                        <p className="text-base font-bold text-gray-900 dark:text-white mt-1">{((p.probability ?? 0) * 100).toFixed(0)}%</p>
+                      </div>
+                      <div className="p-3 rounded-lg bg-white dark:bg-gray-800">
+                        <p className="text-xs text-gray-600 dark:text-gray-400">Horizon</p>
+                        <p className="text-base font-bold text-gray-900 dark:text-white mt-1">{p.time_horizon_hours ?? 0}h</p>
+                      </div>
+                    </div>
+                    {(p.contributing_factors ?? []).length > 0 && (
+                      <div>
+                        <p className="text-xs font-semibold text-gray-900 dark:text-white mb-1">Factors</p>
+                        <ul className="space-y-1">
+                          {(p.contributing_factors ?? []).slice(0, 2).map((f: string, idx: number) => (
+                            <li key={idx} className="text-xs text-gray-600 dark:text-gray-400 flex items-start gap-2">
+                              <span className="text-blue-600 dark:text-blue-400">•</span>
+                              <span>{f}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                    {(p.recommended_actions ?? []).length > 0 && (
+                      <div>
+                        <p className="text-xs font-semibold text-gray-900 dark:text-white mb-1">Actions</p>
+                        <ul className="space-y-1">
+                          {(p.recommended_actions ?? []).slice(0, 2).map((a: string, idx: number) => (
+                            <li key={idx} className="text-xs text-gray-600 dark:text-gray-400 flex items-start gap-2">
+                              <span className="text-green-600 dark:text-green-400">→</span>
+                              <span>{a}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+                  </div>
+                ))}
+                {predictions.length === 0 && (
+                  <div className="col-span-full text-center py-8 text-sm text-gray-500 dark:text-gray-400">No threat predictions for the selected filters.</div>
+                )}
+              </div>
+            </div>
+          )}
+
+          {/* ML Models Tab */}
+          {activeTab === 'models' && (
+            <div className="space-y-6">
+              <button
+                onClick={handleTrainModel}
+                disabled={trainLoading}
+                className="px-4 py-2 rounded-lg bg-blue-600 dark:bg-blue-700 text-white hover:bg-blue-700 dark:hover:bg-blue-600 font-medium transition disabled:opacity-50 flex items-center gap-2"
+              >
+                {trainLoading ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Brain className="w-4 h-4" />}
+                {trainLoading ? 'Training...' : 'Train New Model'}
+              </button>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                {models.map((m) => {
+                  const statusColor: Record<string, string> = {
+                    training: 'bg-yellow-50 dark:bg-yellow-900/20 text-yellow-600 dark:text-yellow-400',
+                    ready: 'bg-green-50 dark:bg-green-900/20 text-green-600 dark:text-green-400',
+                    deployed: 'bg-blue-50 dark:bg-blue-900/20 text-blue-600 dark:text-blue-400',
+                    retired: 'bg-gray-100 dark:bg-gray-700 text-gray-600 dark:text-gray-400',
+                  };
+                  return (
+                    <div key={m.id} className="bg-gray-50 dark:bg-gray-900 rounded-lg border border-gray-200 dark:border-gray-700 p-5 space-y-3">
+                      <div>
+                        <h3 className="font-semibold text-gray-900 dark:text-white">{m.name}</h3>
+                        <p className="text-xs text-gray-600 dark:text-gray-400 mt-1">{m.algorithm}</p>
+                      </div>
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm text-gray-600 dark:text-gray-400">{m.model_type}</span>
+                        <span className={clsx('px-3 py-1 rounded-full text-xs font-medium', statusColor[m.status ?? 'ready'])}>
+                          {(m.status ?? 'ready').charAt(0).toUpperCase() + (m.status ?? 'ready').slice(1)}
+                        </span>
+                      </div>
+                      <div className="grid grid-cols-2 gap-3">
+                        <div className="p-3 rounded-lg bg-white dark:bg-gray-800">
+                          <p className="text-xs text-gray-600 dark:text-gray-400">Accuracy</p>
+                          <p className="text-base font-bold text-gray-900 dark:text-white mt-1">{((m.training_metrics?.accuracy ?? 0) * 100).toFixed(1)}%</p>
+                        </div>
+                        <div className="p-3 rounded-lg bg-white dark:bg-gray-800">
+                          <p className="text-xs text-gray-600 dark:text-gray-400">F1 Score</p>
+                          <p className="text-base font-bold text-gray-900 dark:text-white mt-1">{((m.training_metrics?.f1 ?? 0) * 100).toFixed(1)}%</p>
+                        </div>
+                      </div>
+                      <div className="space-y-1 text-sm">
+                        <div className="flex justify-between">
+                          <span className="text-gray-600 dark:text-gray-400">Last Trained</span>
+                          <span className="text-gray-900 dark:text-white font-medium text-xs">{m.last_trained_at ? new Date(m.last_trained_at).toLocaleDateString() : 'N/A'}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-gray-600 dark:text-gray-400">Predictions</span>
+                          <span className="text-gray-900 dark:text-white font-medium text-xs">{m.prediction_count ?? 0}</span>
+                        </div>
+                        <div className="flex justify-between">
+                          <span className="text-gray-600 dark:text-gray-400">Drift Score</span>
+                          <span className="text-gray-900 dark:text-white font-medium text-xs">{((m.drift_score ?? 0) * 100).toFixed(1)}%</span>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+                {models.length === 0 && (
+                  <div className="col-span-full text-center py-8 text-sm text-gray-500 dark:text-gray-400">No ML models. Click "Train New Model" to create one.</div>
+                )}
               </div>
             </div>
           )}
