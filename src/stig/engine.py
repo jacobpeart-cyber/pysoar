@@ -409,34 +409,99 @@ class STIGRemediator:
         self, findings: dict[str, Any], platform: str
     ) -> str:
         """
-        Generate platform-specific remediation script
+        Generate platform-specific remediation script.
 
-        Args:
-            findings: Dictionary of findings to remediate
-            platform: Target platform (windows, linux, etc.)
+        Previously produced a dummy template that just wrote
+        ``# Add platform-specific remediation commands`` under each
+        rule ID — useless when a SOC analyst copy-pastes it.
 
-        Returns:
-            Generated remediation script
+        Now looks up each finding's STIGRule in the database and
+        interpolates its real ``fix_text`` from the DISA benchmark. The
+        output is a shellable / runnable script with real commands the
+        operator can either execute directly or feed to the
+        Agent Platform. If a rule has no fix_text defined, the script
+        emits a TODO block so the analyst sees which rules still need
+        manual work rather than a silent skip.
         """
-        script_lines = []
+        is_windows = platform.lower() in ("windows", "win32")
 
-        if platform.lower() in ["windows", "win32"]:
-            script_lines.append("# PowerShell Remediation Script")
-            script_lines.append("# Generated for Windows remediation")
-            script_lines.append("")
+        script_lines: list[str] = []
+        if is_windows:
+            script_lines += [
+                "# PySOAR STIG Remediation Script — PowerShell",
+                "# Generated: " + datetime.now(timezone.utc).isoformat(),
+                f"# Platform: {platform}",
+                f"# Total rules: {len(findings)}",
+                "",
+                "$ErrorActionPreference = 'Continue'",
+                "",
+            ]
         else:
-            script_lines.append("#!/bin/bash")
-            script_lines.append("# Bash Remediation Script")
-            script_lines.append("# Generated for Linux/Unix remediation")
-            script_lines.append("")
+            script_lines += [
+                "#!/usr/bin/env bash",
+                "# PySOAR STIG Remediation Script — Bash",
+                "# Generated: " + datetime.now(timezone.utc).isoformat(),
+                f"# Platform: {platform}",
+                f"# Total rules: {len(findings)}",
+                "",
+                "set -u",
+                "",
+            ]
 
-        script_lines.append(f"# Remediation Script - Generated {datetime.now(timezone.utc).isoformat()}")
-        script_lines.append(f"# Total findings: {len(findings)}")
-        script_lines.append("")
+        rule_ids = list(findings.keys())[:50]  # Safety cap
 
-        for rule_id, finding in list(findings.items())[:50]:  # Limit to 50
-            script_lines.append(f"# Remediate {rule_id}")
-            script_lines.append("# Add platform-specific remediation commands")
+        # Load all rules in one query rather than N individual lookups
+        rules_by_id: dict[str, STIGRule] = {}
+        if rule_ids:
+            stmt = select(STIGRule).where(STIGRule.rule_id.in_(rule_ids))
+            result = await self.session.scalars(stmt)
+            for r in result:
+                rules_by_id[r.rule_id] = r
+
+        for rule_id in rule_ids:
+            finding = findings.get(rule_id, {})
+            rule = rules_by_id.get(rule_id)
+            title = getattr(rule, "title", None) or finding.get("title", "unknown")
+            severity = getattr(rule, "severity", None) or finding.get("severity", "medium")
+            fix_text = getattr(rule, "fix_text", None)
+
+            script_lines.append(f"# --- {rule_id} ({severity}) ---")
+            script_lines.append(f"# {title}")
+
+            if fix_text:
+                # fix_text often contains multiple shell lines separated
+                # by newlines and DISA-style bullets. We comment-out any
+                # line that looks like prose so the script still runs
+                # cleanly as a shell / ps1 file.
+                for raw_line in fix_text.splitlines():
+                    stripped = raw_line.strip()
+                    if not stripped:
+                        script_lines.append("")
+                        continue
+                    looks_like_command = (
+                        stripped.startswith("$")
+                        or stripped.startswith("sudo ")
+                        or stripped.startswith("chmod ")
+                        or stripped.startswith("chown ")
+                        or stripped.startswith("systemctl ")
+                        or stripped.startswith("sed ")
+                        or stripped.startswith("echo ")
+                        or stripped.startswith("setfacl ")
+                        or stripped.startswith("yum ")
+                        or stripped.startswith("apt ")
+                        or stripped.startswith("Set-")
+                        or stripped.startswith("Get-")
+                        or stripped.startswith("Register-")
+                    )
+                    if looks_like_command:
+                        script_lines.append(raw_line)
+                    else:
+                        script_lines.append("# " + raw_line)
+            else:
+                script_lines.append(
+                    "# TODO: no fix_text in benchmark for this rule — requires manual remediation"
+                )
+
             script_lines.append("")
 
         return "\n".join(script_lines)

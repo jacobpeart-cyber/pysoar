@@ -24,14 +24,24 @@ type TabType = 'dashboard' | 'benchmarks' | 'results' | 'remediation';
 type Severity = 'CAT I' | 'CAT II' | 'CAT III';
 type RuleStatus = 'Open' | 'Not a Finding' | 'N/A' | 'Not Reviewed';
 
+// Field names match the backend snake_case STIGDashboardStats schema.
+// Historical note: the interface used camelCase (benchmarksLoaded, etc.)
+// and the dashboard silently showed zeros forever because none of the
+// fields existed on the backend response.
 interface DashboardData {
-  benchmarksLoaded: number;
-  totalScans: number;
-  avgCompliance: number;
-  catIFindings: number;
-  complianceByBenchmark: Array<{ name: string; percentage: number }>;
-  findingsBySeverity: { [key: string]: number };
-  recentScans: Scan[];
+  total_benchmarks: number;
+  total_scans: number;
+  average_compliance: number;
+  critical_findings: number;
+  high_findings: number;
+  medium_findings: number;
+  low_findings: number;
+  compliance_by_benchmark: Array<{ name: string; percentage: number }>;
+  findings_by_severity: { [key: string]: number };
+  recent_scans: Scan[];
+  top_failing_rules: Array<{ rule_id: string; title: string; failures: number }>;
+  last_scan_date: string | null;
+  compliance_trend: string;
 }
 
 interface Benchmark {
@@ -259,7 +269,7 @@ export default function STIGCompliance() {
           severityFilter={severityFilter}
           setSeverityFilter={setSeverityFilter}
           onAutoRemediate={() => autoRemediateMutation.mutate()}
-          catIFindings={dashboardData?.catIFindings || 0}
+          catIFindings={dashboardData?.critical_findings || 0}
         />
       )}
     </div>
@@ -287,25 +297,25 @@ function DashboardTab({
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
         <KPICard
           label="Benchmarks Loaded"
-          value={data?.benchmarksLoaded || 0}
+          value={data?.total_benchmarks || 0}
           icon={CheckCircle}
           color="blue"
         />
         <KPICard
           label="Total Scans"
-          value={data?.totalScans || 0}
+          value={data?.total_scans || 0}
           icon={Zap}
           color="green"
         />
         <KPICard
           label="Avg Compliance"
-          value={`${data?.avgCompliance || 0}%`}
+          value={`${Math.round(data?.average_compliance || 0)}%`}
           icon={AlertTriangle}
           color="yellow"
         />
         <KPICard
           label="CAT I Findings"
-          value={data?.catIFindings || 0}
+          value={data?.critical_findings || 0}
           icon={AlertCircle}
           color="red"
         />
@@ -317,7 +327,7 @@ function DashboardTab({
           Compliance by Benchmark
         </h2>
         <div className="space-y-4">
-          {(data?.complianceByBenchmark || []).map((item) => (
+          {(data?.compliance_by_benchmark || []).map((item: { name: string; percentage: number }) => (
             <div key={item.name}>
               <div className="flex items-center justify-between mb-1">
                 <span className="text-sm font-medium text-gray-700 dark:text-gray-300">
@@ -351,7 +361,7 @@ function DashboardTab({
           Findings by Severity
         </h2>
         <div className="grid grid-cols-3 gap-4">
-          {Object.entries(data?.findingsBySeverity || {}).map(([severity, count]) => (
+          {Object.entries(data?.findings_by_severity || {}).map(([severity, count]) => (
             <div
               key={severity}
               className={clsx(
@@ -408,7 +418,7 @@ function DashboardTab({
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
-              {(data?.recentScans || []).slice(0, 5).map((scan) => (
+              {(data?.recent_scans || []).slice(0, 5).map((scan: Scan) => (
                 <tr key={scan.id} className="hover:bg-gray-50 dark:hover:bg-gray-700/50">
                   <td className="px-4 py-3 text-gray-900 dark:text-white font-mono">
                     {scan.host}
