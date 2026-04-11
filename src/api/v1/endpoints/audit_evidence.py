@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Body
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, and_, func
 
 from src.api.deps import CurrentUser, DatabaseSession, get_current_active_user
 from src.core.database import get_db
@@ -226,6 +226,117 @@ async def verify_evidence_integrity(
     except Exception as e:
         logger.error(f"Error verifying evidence: {str(e)}")
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
+
+
+@router.delete("/evidence/{evidence_id}", status_code=204)
+async def delete_evidence_item(
+    evidence_id: str,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
+):
+    """Delete a ComplianceEvidence row.
+
+    The frontend's "Delete" button hit this route and silently 404'd
+    because it wasn't declared. Now validates ownership (org-scoped),
+    soft-deletes by setting ``is_valid=False``, and writes an audit
+    trail entry so an assessor can see the removal.
+    """
+    from src.compliance.models import ComplianceEvidence
+
+    org_id = getattr(current_user, "organization_id", None)
+    result = await db.execute(
+        select(ComplianceEvidence).where(
+            and_(
+                ComplianceEvidence.id == evidence_id,
+                ComplianceEvidence.organization_id == org_id,
+            )
+        )
+    )
+    evidence = result.scalar_one_or_none()
+    if evidence is None:
+        raise HTTPException(status_code=404, detail="Evidence not found")
+
+    evidence.is_valid = False
+    evidence.review_status = "rejected"
+    evidence.reviewed_by = str(getattr(current_user, "id", ""))
+    evidence.reviewed_at = datetime.now(timezone.utc)
+    await db.flush()
+
+    # Record the deletion in the audit trail
+    try:
+        audit_logger = AuditLogger(db, org_id)
+        await audit_logger.log_event(
+            event_type="change",
+            action="evidence.soft_delete",
+            actor_type="user",
+            actor_id=str(getattr(current_user, "id", "")),
+            resource_type="ComplianceEvidence",
+            resource_id=evidence_id,
+            description=f"Evidence {evidence_id} soft-deleted",
+            result="success",
+            risk_level="medium",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"Audit trail for evidence delete failed: {exc}")
+
+    return None
+
+
+@router.post("/evidence/{evidence_id}/approve", status_code=200)
+async def approve_evidence_item(
+    evidence_id: str,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
+):
+    """Mark a ComplianceEvidence row as approved.
+
+    Frontend "Approve" button hit this route and 404'd the same way
+    the delete button did. Now sets review_status=approved, records
+    the approver + timestamp, and writes an audit trail entry.
+    """
+    from src.compliance.models import ComplianceEvidence
+
+    org_id = getattr(current_user, "organization_id", None)
+    result = await db.execute(
+        select(ComplianceEvidence).where(
+            and_(
+                ComplianceEvidence.id == evidence_id,
+                ComplianceEvidence.organization_id == org_id,
+            )
+        )
+    )
+    evidence = result.scalar_one_or_none()
+    if evidence is None:
+        raise HTTPException(status_code=404, detail="Evidence not found")
+
+    evidence.review_status = "approved"
+    evidence.reviewed_by = str(getattr(current_user, "id", ""))
+    evidence.reviewed_at = datetime.now(timezone.utc)
+    await db.flush()
+    await db.refresh(evidence)
+
+    try:
+        audit_logger = AuditLogger(db, org_id)
+        await audit_logger.log_event(
+            event_type="policy",
+            action="evidence.approve",
+            actor_type="user",
+            actor_id=str(getattr(current_user, "id", "")),
+            resource_type="ComplianceEvidence",
+            resource_id=evidence_id,
+            description=f"Evidence {evidence_id} approved",
+            result="success",
+            risk_level="low",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"Audit trail for evidence approve failed: {exc}")
+
+    return {
+        "id": evidence.id,
+        "status": evidence.review_status,
+        "reviewed_by": evidence.reviewed_by,
+        "reviewed_at": evidence.reviewed_at.isoformat() if evidence.reviewed_at else None,
+    }
 
 
 @router.get("/evidence/list", response_model=list[dict])
@@ -661,41 +772,110 @@ async def get_audit_dashboard_stats(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
 ):
-    """Get audit and evidence dashboard statistics"""
+    """Get audit and evidence dashboard statistics.
+
+    Four fields used to be hardcoded (event_types_breakdown = {},
+    risk_distribution = {}, avg_evidence_package_compliance = 92.0,
+    suspicious_activities_detected = 0). Now they are computed from
+    real AuditTrail + ComplianceEvidence data.
+    """
+    from src.compliance.models import ComplianceEvidence
+
+    org_id = getattr(current_user, "organization_id", None)
+
     try:
         # Count audit entries
         audit_query = select(AuditTrail).where(
-            AuditTrail.organization_id == getattr(current_user, "organization_id", None)
+            AuditTrail.organization_id == org_id
         )
         audits = await db.scalars(audit_query)
         audit_list = list(audits)
 
         # Count packages
         pkg_query = select(EvidencePackage).where(
-            EvidencePackage.organization_id == getattr(current_user, "organization_id", None)
+            EvidencePackage.organization_id == org_id
         )
         packages = await db.scalars(pkg_query)
         pkg_list = list(packages)
 
-        # Calculate stats
-        this_month = datetime.now(timezone.utc).replace(day=1)
+        this_month = datetime.now(timezone.utc).replace(
+            day=1, hour=0, minute=0, second=0, microsecond=0
+        )
         month_audits = len(
-            [a for a in audit_list if a.created_at >= this_month]
+            [a for a in audit_list if a.created_at and a.created_at >= this_month]
         )
         pkg_in_progress = len([p for p in pkg_list if p.status == "collecting"])
         pkg_submitted = len([p for p in pkg_list if p.status == "submitted"])
 
+        # --- Real event_types_breakdown ---
+        event_types_breakdown: dict[str, int] = {}
+        for a in audit_list:
+            key = a.event_type or "unknown"
+            event_types_breakdown[key] = event_types_breakdown.get(key, 0) + 1
+
+        # --- Real risk_distribution ---
+        risk_distribution: dict[str, int] = {}
+        for a in audit_list:
+            key = (a.risk_level or "unknown").lower()
+            risk_distribution[key] = risk_distribution.get(key, 0) + 1
+
+        # --- Real avg_evidence_package_compliance ---
+        # For each package, compute the share of its referenced evidence
+        # items that are in approved status. Average across packages.
+        avg_pkg_compliance = 0.0
+        if pkg_list:
+            pkg_scores: list[float] = []
+            for p in pkg_list:
+                items = p.evidence_items or []
+                if not items:
+                    continue
+                evidence_ids = [str(i) for i in items if i]
+                if not evidence_ids:
+                    continue
+                ev_result = await db.execute(
+                    select(ComplianceEvidence).where(
+                        and_(
+                            ComplianceEvidence.id.in_(evidence_ids),
+                            ComplianceEvidence.organization_id == org_id,
+                        )
+                    )
+                )
+                ev_rows = list(ev_result.scalars().all())
+                if not ev_rows:
+                    continue
+                approved = sum(1 for e in ev_rows if e.review_status == "approved")
+                pkg_scores.append((approved / len(ev_rows)) * 100.0)
+            if pkg_scores:
+                avg_pkg_compliance = round(sum(pkg_scores) / len(pkg_scores), 1)
+
+        # --- Real suspicious_activities_detected ---
+        # Count distinct actors who had the AuditLogger flag them in the
+        # last 30 days. We reuse the engine's detection rather than
+        # inventing a new heuristic here.
+        suspicious_count = 0
+        try:
+            audit_logger = AuditLogger(db, org_id)
+            # Take distinct actors who have written audit events and
+            # check each one. Cap at 25 actors to bound the work.
+            actor_ids = list({a.actor_id for a in audit_list if a.actor_id})[:25]
+            for actor_id in actor_ids:
+                activities = await audit_logger.detect_suspicious_activity(actor_id)
+                if activities:
+                    suspicious_count += 1
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"suspicious activity detection failed: {exc}")
+
         return AuditDashboardStats(
-            organization_id=getattr(current_user, "organization_id", None),
+            organization_id=org_id or "",
             total_audit_entries=len(audit_list),
             audit_entries_this_month=month_audits,
-            event_types_breakdown={},
-            risk_distribution={},
+            event_types_breakdown=event_types_breakdown,
+            risk_distribution=risk_distribution,
             total_evidence_packages=len(pkg_list),
             evidence_packages_in_progress=pkg_in_progress,
             evidence_packages_submitted=pkg_submitted,
-            avg_evidence_package_compliance=92.0,
-            suspicious_activities_detected=0,
+            avg_evidence_package_compliance=avg_pkg_compliance,
+            suspicious_activities_detected=suspicious_count,
             critical_audit_events=len([a for a in audit_list if a.risk_level == "critical"]),
         )
     except Exception as e:
