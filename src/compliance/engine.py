@@ -616,15 +616,22 @@ class FedRAMPManager:
     async def _run_automated_control_check(
         self, control: ComplianceControl
     ) -> Dict[str, Any]:
-        """Internal: Run automated check for a control"""
+        """Internal: Run automated check for a control.
+
+        Evidence query is org-scoped so a tenant can't inherit
+        another tenant's evidence if control UUIDs happen to collide
+        — an auditor would reject any control that couldn't prove
+        its own evidence.
+        """
         now = datetime.utcnow()
         evidence_cutoff = now - timedelta(days=90)
 
-        # Query recent evidence for this control
+        # Query recent evidence for this control, scoped to this tenant
         stmt = select(ComplianceEvidence).where(
             and_(
                 ComplianceEvidence.control_id_ref == str(control.id),
                 ComplianceEvidence.collected_at >= evidence_cutoff,
+                ComplianceEvidence.organization_id == self.org_id,
             )
         )
         result = await self.db.execute(stmt)
@@ -762,94 +769,359 @@ class NISTManager:
             "check_timestamp": datetime.utcnow().isoformat(),
         }
 
+    # ------------------------------------------------------------------
+    # Real automated NIST 800-53 / 800-171 control checks.
+    #
+    # Previously every method here returned ``{"check_passed": True}``
+    # unconditionally, which turned compliance reporting into theater —
+    # an auditor would run a single check and walk away from the sale.
+    # These now query the actual PySOAR data model and return real
+    # findings with failure counts and remediation guidance.
+    # ------------------------------------------------------------------
+
     async def _check_account_management(self) -> Dict[str, Any]:
-        """AC-2: Account management verification"""
+        """AC-2: Account management — inactive accounts, orphaned users."""
+        from sqlalchemy import func as _func
+        from src.models.user import User
+
+        findings: list[str] = []
+        total_q = await self.db.execute(select(_func.count(User.id)))
+        total = total_q.scalar() or 0
+        inactive_q = await self.db.execute(
+            select(_func.count(User.id)).where(User.is_active == False)  # noqa: E712
+        )
+        inactive = inactive_q.scalar() or 0
+
+        if total == 0:
+            findings.append("No user accounts found — AC-2 cannot be assessed.")
+        # AC-2 expects inactive/dormant accounts to be disabled, not deleted.
+        # Having some is fine; having zero means no dormant-account discipline.
+        # A red flag is a large proportion of inactive accounts relative to total.
+        if total > 0 and inactive / max(total, 1) > 0.5:
+            findings.append(
+                f"{inactive}/{total} users are inactive ({(inactive/total)*100:.0f}%). "
+                "Review for accounts that should be disabled or deleted."
+            )
+
         return {
             "control_id": "AC-2",
             "check_name": "Account Management",
-            "check_passed": True,
-            "findings": [],
+            "check_passed": len(findings) == 0,
+            "findings": findings,
+            "evidence": {"total_users": total, "inactive_users": inactive},
+            "check_timestamp": datetime.utcnow().isoformat(),
         }
 
     async def _check_failed_login_attempts(self) -> Dict[str, Any]:
-        """AC-7: Failed login attempt checks"""
+        """AC-7: Unsuccessful login attempts — look at recent failed auth in audit trail."""
+        from sqlalchemy import func as _func
+        try:
+            from src.models.audit_log import AuditLog as _AuditLog
+        except Exception:  # noqa: BLE001
+            _AuditLog = None
+
+        findings: list[str] = []
+        failed_logins_7d = 0
+        if _AuditLog is not None:
+            cutoff = datetime.utcnow() - timedelta(days=7)
+            try:
+                q = await self.db.execute(
+                    select(_func.count(_AuditLog.id)).where(
+                        and_(
+                            _AuditLog.action == "login_failed",
+                            _AuditLog.created_at >= cutoff,
+                        )
+                    )
+                )
+                failed_logins_7d = q.scalar() or 0
+            except Exception:  # noqa: BLE001
+                failed_logins_7d = -1  # table exists but column mismatch — record unknown
+
+        if failed_logins_7d == -1:
+            findings.append(
+                "Audit log schema did not expose a ``login_failed`` action; "
+                "AC-7 cannot be assessed automatically. Verify audit middleware records login failures."
+            )
+        elif failed_logins_7d > 100:
+            findings.append(
+                f"{failed_logins_7d} failed login attempts in last 7 days — "
+                "possible brute-force attempts; verify lockout policy is enforced."
+            )
+
         return {
             "control_id": "AC-7",
             "check_name": "Unsuccessful Login Attempts",
-            "check_passed": True,
-            "findings": [],
+            "check_passed": len(findings) == 0,
+            "findings": findings,
+            "evidence": {"failed_logins_last_7d": failed_logins_7d},
+            "check_timestamp": datetime.utcnow().isoformat(),
         }
 
     async def _check_audit_events(self) -> Dict[str, Any]:
-        """AU-2: Audit event checks"""
+        """AU-2: Audit events — audit log is populated and actively recording."""
+        from sqlalchemy import func as _func
+        try:
+            from src.models.audit_log import AuditLog as _AuditLog
+        except Exception:  # noqa: BLE001
+            _AuditLog = None
+
+        findings: list[str] = []
+        count_24h = 0
+        if _AuditLog is not None:
+            cutoff = datetime.utcnow() - timedelta(hours=24)
+            try:
+                q = await self.db.execute(
+                    select(_func.count(_AuditLog.id)).where(
+                        _AuditLog.created_at >= cutoff
+                    )
+                )
+                count_24h = q.scalar() or 0
+            except Exception:  # noqa: BLE001
+                pass
+
+        if _AuditLog is None:
+            findings.append("No audit_log model found — AU-2 cannot be satisfied.")
+        elif count_24h == 0:
+            findings.append(
+                "Zero audit events recorded in last 24h. Audit middleware may be disabled."
+            )
+
         return {
             "control_id": "AU-2",
             "check_name": "Audit Events",
-            "check_passed": True,
-            "findings": [],
+            "check_passed": len(findings) == 0,
+            "findings": findings,
+            "evidence": {"audit_events_last_24h": count_24h},
+            "check_timestamp": datetime.utcnow().isoformat(),
         }
 
     async def _check_mfa(self) -> Dict[str, Any]:
-        """IA-2: MFA verification"""
+        """IA-2: MFA — every active user should have mfa_enabled=True."""
+        from sqlalchemy import func as _func
+        from src.models.user import User
+
+        findings: list[str] = []
+        active_q = await self.db.execute(
+            select(_func.count(User.id)).where(User.is_active == True)  # noqa: E712
+        )
+        active_total = active_q.scalar() or 0
+
+        mfa_q = await self.db.execute(
+            select(_func.count(User.id)).where(
+                and_(User.is_active == True, User.mfa_enabled == True)  # noqa: E712
+            )
+        )
+        mfa_enrolled = mfa_q.scalar() or 0
+
+        if active_total == 0:
+            findings.append("No active users — IA-2 cannot be assessed.")
+        elif mfa_enrolled < active_total:
+            missing = active_total - mfa_enrolled
+            findings.append(
+                f"{missing}/{active_total} active users do not have MFA enabled. "
+                "FedRAMP Moderate and NIST 800-171 both require MFA for all privileged "
+                "and non-local access."
+            )
+
         return {
             "control_id": "IA-2",
             "check_name": "Identification and Authentication (MFA)",
-            "check_passed": True,
-            "findings": [],
+            "check_passed": len(findings) == 0,
+            "findings": findings,
+            "evidence": {
+                "active_users": active_total,
+                "mfa_enrolled": mfa_enrolled,
+                "mfa_percentage": round((mfa_enrolled / active_total) * 100, 1) if active_total else 0.0,
+            },
+            "check_timestamp": datetime.utcnow().isoformat(),
         }
 
     async def _check_password_policy(self) -> Dict[str, Any]:
-        """IA-5: Password policy checks"""
+        """IA-5: Authenticator management — password policy strength."""
+        from src.core.config import settings as _settings
+
+        findings: list[str] = []
+        min_length = getattr(_settings, "password_min_length", 0)
+        # NIST SP 800-63B minimum for memorized secrets is 8; FedRAMP
+        # Moderate typically requires 12 for privileged accounts. We use 12.
+        if min_length < 12:
+            findings.append(
+                f"password_min_length is {min_length}; FedRAMP Moderate expects ≥12 characters."
+            )
+
         return {
             "control_id": "IA-5",
             "check_name": "Authenticator Management",
-            "check_passed": True,
-            "findings": [],
+            "check_passed": len(findings) == 0,
+            "findings": findings,
+            "evidence": {"password_min_length": min_length},
+            "check_timestamp": datetime.utcnow().isoformat(),
         }
 
     async def _check_vulnerability_scanning(self) -> Dict[str, Any]:
-        """RA-5: Vulnerability scanning"""
+        """RA-5: Vulnerability scanning — scan frequency and open vulns."""
+        from sqlalchemy import func as _func
+
+        findings: list[str] = []
+        scans_30d = 0
+        open_vulns = 0
+        try:
+            from src.vulnmgmt.models import VulnScan, Vulnerability
+            cutoff = datetime.utcnow() - timedelta(days=30)
+            scans_q = await self.db.execute(
+                select(_func.count(VulnScan.id)).where(VulnScan.created_at >= cutoff)
+            )
+            scans_30d = scans_q.scalar() or 0
+            vulns_q = await self.db.execute(
+                select(_func.count(Vulnerability.id))
+            )
+            open_vulns = vulns_q.scalar() or 0
+        except Exception:  # noqa: BLE001
+            findings.append("Vulnerability management module not reachable — RA-5 cannot be verified.")
+
+        if scans_30d == 0:
+            findings.append(
+                "No vulnerability scans recorded in last 30 days. RA-5 requires at least monthly scanning."
+            )
+
         return {
             "control_id": "RA-5",
             "check_name": "Vulnerability Scanning",
-            "check_passed": True,
-            "findings": [],
+            "check_passed": len(findings) == 0,
+            "findings": findings,
+            "evidence": {"scans_last_30d": scans_30d, "total_vulnerabilities": open_vulns},
+            "check_timestamp": datetime.utcnow().isoformat(),
         }
 
     async def _check_boundary_protection(self) -> Dict[str, Any]:
-        """SC-7: Boundary protection"""
+        """SC-7: Boundary protection — zero trust policies, segmentation coverage."""
+        from sqlalchemy import func as _func
+
+        findings: list[str] = []
+        zt_policy_count = 0
+        try:
+            from src.zerotrust.models import ZeroTrustPolicy
+            q = await self.db.execute(select(_func.count(ZeroTrustPolicy.id)))
+            zt_policy_count = q.scalar() or 0
+        except Exception:  # noqa: BLE001
+            pass
+
+        if zt_policy_count == 0:
+            findings.append(
+                "No zero-trust policies defined. SC-7 requires managed interfaces and "
+                "boundary enforcement between security zones."
+            )
+
         return {
             "control_id": "SC-7",
             "check_name": "Boundary Protection",
-            "check_passed": True,
-            "findings": [],
+            "check_passed": len(findings) == 0,
+            "findings": findings,
+            "evidence": {"zero_trust_policies": zt_policy_count},
+            "check_timestamp": datetime.utcnow().isoformat(),
         }
 
     async def _check_data_encryption(self) -> Dict[str, Any]:
-        """SC-28: Data encryption at rest"""
+        """SC-28: Data at rest encryption — encryption service initialized."""
+        findings: list[str] = []
+        encryption_initialized = False
+        try:
+            from src.core.encryption import get_encryption_service
+            svc = get_encryption_service()
+            encryption_initialized = svc is not None
+        except Exception:  # noqa: BLE001
+            encryption_initialized = False
+
+        if not encryption_initialized:
+            findings.append(
+                "Encryption service not initialized. SC-28 requires AES-256 (or equivalent) "
+                "encryption at rest for CUI and PII."
+            )
+
         return {
             "control_id": "SC-28",
             "check_name": "Protection of Information at Rest",
-            "check_passed": True,
-            "findings": [],
+            "check_passed": len(findings) == 0,
+            "findings": findings,
+            "evidence": {"encryption_initialized": encryption_initialized},
+            "check_timestamp": datetime.utcnow().isoformat(),
         }
 
     async def _check_patch_management(self) -> Dict[str, Any]:
-        """SI-2: Patch management"""
+        """SI-2: Flaw remediation — recent patch operations."""
+        from sqlalchemy import func as _func
+
+        findings: list[str] = []
+        patches_30d = 0
+        try:
+            from src.vulnmgmt.models import PatchOperation
+            cutoff = datetime.utcnow() - timedelta(days=30)
+            q = await self.db.execute(
+                select(_func.count(PatchOperation.id)).where(
+                    PatchOperation.created_at >= cutoff
+                )
+            )
+            patches_30d = q.scalar() or 0
+        except Exception:  # noqa: BLE001
+            pass
+
+        if patches_30d == 0:
+            findings.append(
+                "No patch operations recorded in last 30 days. SI-2 expects flaws to be "
+                "identified, reported, and corrected per a documented timeline."
+            )
+
         return {
             "control_id": "SI-2",
             "check_name": "Flaw Remediation",
-            "check_passed": True,
-            "findings": [],
+            "check_passed": len(findings) == 0,
+            "findings": findings,
+            "evidence": {"patches_last_30d": patches_30d},
+            "check_timestamp": datetime.utcnow().isoformat(),
         }
 
     async def _check_system_monitoring(self) -> Dict[str, Any]:
-        """SI-4: System monitoring"""
+        """SI-4: System monitoring — SIEM rules + log ingestion activity."""
+        from sqlalchemy import func as _func
+
+        findings: list[str] = []
+        active_rules = 0
+        logs_24h = 0
+        try:
+            from src.siem.models import DetectionRule, LogEntry, RuleStatus
+            rules_q = await self.db.execute(
+                select(_func.count(DetectionRule.id)).where(
+                    DetectionRule.status == RuleStatus.ACTIVE.value
+                )
+            )
+            active_rules = rules_q.scalar() or 0
+            cutoff = datetime.utcnow() - timedelta(hours=24)
+            logs_q = await self.db.execute(
+                select(_func.count(LogEntry.id)).where(LogEntry.created_at >= cutoff)
+            )
+            logs_24h = logs_q.scalar() or 0
+        except Exception:  # noqa: BLE001
+            pass
+
+        if active_rules == 0:
+            findings.append(
+                "No active SIEM detection rules. SI-4 requires monitoring for unauthorized activity."
+            )
+        if logs_24h == 0:
+            findings.append(
+                "Zero log entries ingested in last 24h — log pipeline may be broken."
+            )
+
         return {
             "control_id": "SI-4",
             "check_name": "System Monitoring",
-            "check_passed": True,
-            "findings": [],
+            "check_passed": len(findings) == 0,
+            "findings": findings,
+            "evidence": {
+                "active_detection_rules": active_rules,
+                "log_entries_last_24h": logs_24h,
+            },
+            "check_timestamp": datetime.utcnow().isoformat(),
         }
 
 
