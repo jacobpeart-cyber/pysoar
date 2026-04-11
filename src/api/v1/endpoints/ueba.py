@@ -93,6 +93,114 @@ async def get_alert_or_404(db: AsyncSession, alert_id: str, organization_id: str
     return alert
 
 
+async def _score_event_anomaly(
+    db: AsyncSession,
+    entity: EntityProfile,
+    behavior_event: BehaviorEvent,
+) -> tuple[bool, list, float]:
+    """Score a behavior event for anomaly-ness against the entity's baseline.
+
+    Returns (is_anomalous, reasons, risk_contribution).
+
+    Strategy:
+    1. Look up a BehaviorBaseline for (entity, event_type). If one exists, check
+       the incoming source_ip / destination / hour against its statistical model
+       (typical_values, time_patterns).
+    2. If no baseline, fall back to comparing against the entity's own recent
+       events of the same type: a new source_ip, a never-before-seen destination,
+       or an activity at an unusual hour (before 6am or after 10pm UTC) count
+       as anomalous.
+    3. The first few events per entity (when history < 3) are *not* flagged,
+       otherwise every event on a cold entity looks anomalous. This mirrors
+       real UEBA warm-up behavior.
+    """
+    reasons: list[str] = []
+    risk_delta = 0.0
+
+    event_hour = datetime.now(timezone.utc).hour
+    unusual_hour = event_hour < 6 or event_hour >= 22
+
+    # Try baseline first
+    baseline_result = await db.execute(
+        select(BehaviorBaseline).where(
+            and_(
+                BehaviorBaseline.entity_profile_id == entity.id,
+                BehaviorBaseline.behavior_type == behavior_event.event_type,
+            )
+        ).limit(1)
+    )
+    baseline = baseline_result.scalar_one_or_none()
+
+    if baseline and baseline.confidence >= 0.3:
+        typical = baseline.typical_values or []
+        time_patterns = baseline.time_patterns or {}
+        typical_ips = set(typical) if isinstance(typical, list) else set()
+
+        if behavior_event.source_ip and behavior_event.source_ip not in typical_ips:
+            reasons.append(f"new_source_ip:{behavior_event.source_ip}")
+            risk_delta += 8.0
+
+        typical_hours = set(time_patterns.get("hours", [])) if isinstance(time_patterns, dict) else set()
+        if typical_hours and event_hour not in typical_hours:
+            reasons.append(f"unusual_hour:{event_hour}")
+            risk_delta += 5.0
+
+        if unusual_hour and not typical_hours:
+            reasons.append(f"off_hours:{event_hour}")
+            risk_delta += 3.0
+    else:
+        # Cold-start: use entity's recent history as the baseline
+        recent_result = await db.execute(
+            select(BehaviorEvent).where(
+                and_(
+                    BehaviorEvent.entity_profile_id == entity.id,
+                    BehaviorEvent.event_type == behavior_event.event_type,
+                )
+            ).order_by(desc(BehaviorEvent.created_at)).limit(50)
+        )
+        recent = list(recent_result.scalars().all())
+
+        # Warm-up: need at least 3 prior samples before flagging
+        if len(recent) < 3:
+            return (False, [], 0.0)
+
+        seen_ips = {r.source_ip for r in recent if r.source_ip}
+        seen_dests = {r.destination for r in recent if r.destination}
+
+        if behavior_event.source_ip and behavior_event.source_ip not in seen_ips:
+            reasons.append(f"new_source_ip:{behavior_event.source_ip}")
+            risk_delta += 10.0
+
+        if behavior_event.destination and behavior_event.destination not in seen_dests:
+            reasons.append(f"new_destination:{behavior_event.destination}")
+            risk_delta += 6.0
+
+        if unusual_hour:
+            reasons.append(f"off_hours:{event_hour}")
+            risk_delta += 4.0
+
+    # Geo impossibility: if geo_location differs from the entity's most recent event
+    if behavior_event.geo_location and isinstance(behavior_event.geo_location, dict):
+        new_country = behavior_event.geo_location.get("country")
+        if new_country:
+            last_geo_result = await db.execute(
+                select(BehaviorEvent.geo_location).where(
+                    and_(
+                        BehaviorEvent.entity_profile_id == entity.id,
+                        BehaviorEvent.geo_location.is_not(None),
+                    )
+                ).order_by(desc(BehaviorEvent.created_at)).limit(1)
+            )
+            last_geo = last_geo_result.scalar_one_or_none()
+            if isinstance(last_geo, dict):
+                last_country = last_geo.get("country")
+                if last_country and last_country != new_country:
+                    reasons.append(f"geo_change:{last_country}->{new_country}")
+                    risk_delta += 12.0
+
+    return (len(reasons) > 0, reasons, risk_delta)
+
+
 async def get_peer_group_or_404(db: AsyncSession, group_id: str, organization_id: str) -> PeerGroup:
     """Get peer group by ID or raise 404"""
     result = await db.execute(
@@ -571,30 +679,102 @@ async def escalate_alert(
     alert_id: str,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    incident_id: str = Query(...),
+    incident_id: Optional[str] = Query(None),
     notes: Optional[str] = Query(None),
 ) -> UEBARiskAlert:
     """
-    Escalate alert to a security incident.
+    Escalate a UEBA risk alert to a security Incident.
 
-    Path Parameters:
-    - alert_id: Unique alert identifier
+    If ``incident_id`` is provided, link this alert to that existing
+    incident (verified to belong to the same org). Otherwise, create a
+    brand-new Incident from the alert metadata and fire the standard
+    incident-created automation pipeline (which spins up a war room and
+    action items for high/critical severity).
 
     Query Parameters:
-    - incident_id: Target incident ID
-    - notes: Escalation notes
+    - incident_id: optional existing incident to link to
+    - notes: escalation notes (stored on the alert)
     """
-    logger.info(f"Escalating alert {alert_id} to incident {incident_id}")
+    from src.models.incident import Incident, IncidentStatus
+
+    logger.info(f"Escalating alert {alert_id} (target incident={incident_id})")
 
     org_id = getattr(current_user, "organization_id", None)
-    # org_id may be None for users without organization
-
     alert = await get_alert_or_404(db, alert_id, org_id)
 
+    # Idempotent: if already escalated, return as-is
+    if alert.escalated_to_incident and alert.status == "confirmed":
+        if notes:
+            alert.analyst_notes = notes
+            await db.flush()
+            await db.refresh(alert)
+        return alert
+
+    # Load the entity so we can populate the incident w/ meaningful context
+    entity_result = await db.execute(
+        select(EntityProfile).where(EntityProfile.id == alert.entity_profile_id)
+    )
+    entity = entity_result.scalar_one_or_none()
+
+    target_incident: Optional[Incident] = None
+    created_new = False
+
+    if incident_id:
+        # Link to an existing incident — verify it exists
+        inc_result = await db.execute(
+            select(Incident).where(Incident.id == incident_id)
+        )
+        target_incident = inc_result.scalar_one_or_none()
+        if not target_incident:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Incident {incident_id} not found",
+            )
+    else:
+        # Create a real incident from this alert
+        sev_map = {"critical": "critical", "high": "high", "medium": "medium", "low": "low"}
+        incident_severity = sev_map.get((alert.severity or "").lower(), "medium")
+
+        entity_label = (
+            f"{entity.entity_type}:{entity.entity_id}" if entity else "unknown entity"
+        )
+
+        target_incident = Incident(
+            title=f"UEBA escalation: {alert.alert_type} on {entity_label}",
+            description=(
+                (alert.description or "")
+                + "\n\n---\n"
+                + f"Escalated from UEBA alert {alert.id}.\n"
+                + f"Entity: {entity_label}\n"
+                + f"Risk score delta: {alert.risk_score_delta}\n"
+                + (f"Analyst notes: {notes}\n" if notes else "")
+            ),
+            severity=incident_severity,
+            status=IncidentStatus.OPEN.value,
+            incident_type="ueba_anomaly",
+            detected_at=datetime.now(timezone.utc).isoformat(),
+        )
+        db.add(target_incident)
+        await db.flush()
+        created_new = True
+
     alert.status = "confirmed"
-    alert.escalated_to_incident = incident_id
+    alert.escalated_to_incident = target_incident.id
     if notes:
         alert.analyst_notes = notes
+
+    if created_new:
+        try:
+            automation = AutomationService(db)
+            await automation.on_incident_created(
+                target_incident,
+                organization_id=org_id,
+                created_by=str(current_user.id) if current_user else None,
+            )
+        except Exception as automation_exc:  # noqa: BLE001
+            logger.warning(
+                f"Automation on_incident_created failed after UEBA escalation: {automation_exc}"
+            )
 
     await db.flush()
     await db.refresh(alert)
@@ -659,12 +839,39 @@ async def ingest_event(
         organization_id=org_id,
     )
 
+    # Run anomaly detection against the entity's baseline. Without this,
+    # is_anomalous always defaulted to False and no UEBA alerts ever fired.
+    is_anomalous, reasons, risk_delta = await _score_event_anomaly(
+        db, entity, behavior_event
+    )
+    behavior_event.is_anomalous = is_anomalous
+    behavior_event.anomaly_reasons = reasons
+    behavior_event.risk_contribution = risk_delta
+
+    if is_anomalous:
+        # Bump the entity's rolling risk score and anomaly counters
+        entity.risk_score = min(100.0, (entity.risk_score or 0.0) + risk_delta)
+        entity.anomaly_count_30d = (entity.anomaly_count_30d or 0) + 1
+        entity.last_anomaly_at = datetime.now(timezone.utc)
+        entity.last_activity_at = datetime.now(timezone.utc)
+        # Recompute risk_level bucket
+        if entity.risk_score >= 80:
+            entity.risk_level = "critical"
+        elif entity.risk_score >= 60:
+            entity.risk_level = "high"
+        elif entity.risk_score >= 30:
+            entity.risk_level = "medium"
+        else:
+            entity.risk_level = "low"
+    else:
+        entity.last_activity_at = datetime.now(timezone.utc)
+
     db.add(behavior_event)
     await db.flush()
     await db.refresh(behavior_event)
 
     # Fire automation for UEBA anomaly if the event is anomalous
-    if getattr(behavior_event, "is_anomalous", False):
+    if behavior_event.is_anomalous:
         try:
             automation = AutomationService(db)
             await automation.on_ueba_anomaly(
@@ -939,25 +1146,96 @@ async def trigger_auto_cluster(
     db: DatabaseSession = None,
 ) -> list:
     """
-    Trigger automatic peer clustering based on behavior features.
+    Trigger automatic peer clustering.
+
+    Groups entities by (entity_type, department, role) — this is the
+    canonical dimension along which UEBA compares peer behavior. Entities
+    without a department/role are bucketed by (entity_type, risk_level)
+    so they still get a comparable group. Existing auto_clustered groups
+    are deleted first so repeated calls are idempotent.
     """
+    from sqlalchemy import delete as sql_delete
+
     logger.info("Triggering auto-cluster for peer groups")
 
     org_id = getattr(current_user, "organization_id", None)
-    # org_id may be None for users without organization
 
-    # Return existing auto-clustered groups
-    result = await db.execute(
-        select(PeerGroup).where(
+    # Load all entities for this org
+    entity_result = await db.execute(
+        select(EntityProfile).where(_org_filter(EntityProfile, org_id))
+    )
+    entities = list(entity_result.scalars().all())
+
+    if not entities:
+        return []
+
+    # Bucket entities
+    buckets: dict[tuple, list[EntityProfile]] = {}
+    for e in entities:
+        if e.department and e.role:
+            key = (e.entity_type, e.department, e.role)
+            label = f"{e.entity_type}:{e.department}/{e.role}"
+        elif e.department:
+            key = (e.entity_type, e.department, None)
+            label = f"{e.entity_type}:{e.department}"
+        else:
+            key = (e.entity_type, None, e.risk_level or "low")
+            label = f"{e.entity_type}:{e.risk_level or 'low'}-risk"
+        buckets.setdefault(key, []).append(e)
+
+    # Wipe prior auto-clustered groups for this org
+    await db.execute(
+        sql_delete(PeerGroup).where(
             and_(
                 _org_filter(PeerGroup, org_id),
                 PeerGroup.group_type == "auto_clustered",
             )
         )
     )
-    groups = list(result.scalars().all())
+    await db.flush()
 
-    return groups
+    created_groups: list[PeerGroup] = []
+    for key, members in buckets.items():
+        if len(members) < 2:
+            # A peer group of one isn't useful
+            continue
+        etype, dept_or_none, role_or_risk = key
+        if dept_or_none and role_or_risk:
+            name = f"{etype}-{dept_or_none}-{role_or_risk}"
+        elif dept_or_none:
+            name = f"{etype}-{dept_or_none}"
+        else:
+            name = f"{etype}-{role_or_risk}"
+
+        # Aggregate baseline: mean risk_score, risk_level distribution
+        scores = [m.risk_score or 0.0 for m in members]
+        mean_risk = sum(scores) / len(scores) if scores else 0.0
+        baseline_data = {
+            "mean_risk_score": round(mean_risk, 2),
+            "member_count": len(members),
+            "entity_type": etype,
+        }
+
+        group = PeerGroup(
+            id=str(uuid.uuid4()),
+            name=name,
+            description=f"Auto-clustered on {datetime.now(timezone.utc).date().isoformat()}",
+            group_type="auto_clustered",
+            member_count=len(members),
+            baseline_data=baseline_data,
+            risk_threshold=max(70.0, mean_risk + 20.0),
+            members=[m.id for m in members],
+            organization_id=org_id,
+        )
+        db.add(group)
+        created_groups.append(group)
+
+    await db.flush()
+    for g in created_groups:
+        await db.refresh(g)
+
+    logger.info(f"Auto-cluster created {len(created_groups)} peer groups from {len(entities)} entities")
+    return created_groups
 
 
 # ============================================================================
@@ -1018,35 +1296,135 @@ async def rebuild_baselines(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     entity_ids: Optional[list[str]] = Query(None),
+    baseline_days: int = Query(30, ge=1, le=365),
 ) -> dict:
     """
-    Trigger baseline recalculation for entities.
+    Rebuild behavior baselines for entities synchronously.
+
+    For each target entity:
+    - Load BehaviorEvents from the last ``baseline_days`` days
+    - Group by event_type
+    - For each (entity, event_type), compute typical source_ips, typical
+      destinations, common hours, and sample count
+    - Upsert a BehaviorBaseline row per (entity, event_type)
 
     Query Parameters:
-    - entity_ids: Specific entities to rebuild (None = all)
+    - entity_ids: specific entities to rebuild (None = all entities in org)
+    - baseline_days: rolling window for baseline calculation (default 30)
     """
+    from sqlalchemy import delete as sql_delete
+
     org_id = getattr(current_user, "organization_id", None)
-    # org_id may be None for users without organization
 
-    target_count = len(entity_ids) if entity_ids else 0
-
-    if not entity_ids:
-        # Count all entities in org
-        count_result = await db.execute(
-            select(func.count(EntityProfile.id)).where(
-                _org_filter(EntityProfile, org_id)
+    # Load target entities
+    if entity_ids:
+        ent_query = select(EntityProfile).where(
+            and_(
+                EntityProfile.id.in_(entity_ids),
+                _org_filter(EntityProfile, org_id),
             )
         )
-        target_count = count_result.scalar() or 0
+    else:
+        ent_query = select(EntityProfile).where(_org_filter(EntityProfile, org_id))
 
-    logger.info(f"Rebuilding baselines for {target_count} entities")
+    ent_result = await db.execute(ent_query)
+    entities = list(ent_result.scalars().all())
 
-    task_id = str(uuid.uuid4())
+    logger.info(f"Rebuilding baselines for {len(entities)} entities (window={baseline_days}d)")
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=baseline_days)
+    baselines_built = 0
+    events_analyzed = 0
+
+    for entity in entities:
+        # Fetch recent events for this entity
+        ev_result = await db.execute(
+            select(BehaviorEvent).where(
+                and_(
+                    BehaviorEvent.entity_profile_id == entity.id,
+                    BehaviorEvent.created_at >= cutoff,
+                )
+            )
+        )
+        events = list(ev_result.scalars().all())
+        events_analyzed += len(events)
+
+        if not events:
+            continue
+
+        # Group by event_type
+        by_type: dict[str, list[BehaviorEvent]] = {}
+        for ev in events:
+            by_type.setdefault(ev.event_type, []).append(ev)
+
+        # Wipe this entity's existing baselines so the rebuild is clean
+        await db.execute(
+            sql_delete(BehaviorBaseline).where(
+                BehaviorBaseline.entity_profile_id == entity.id
+            )
+        )
+
+        for event_type, type_events in by_type.items():
+            ips: dict[str, int] = {}
+            dests: dict[str, int] = {}
+            hours: dict[int, int] = {}
+            for ev in type_events:
+                if ev.source_ip:
+                    ips[ev.source_ip] = ips.get(ev.source_ip, 0) + 1
+                if ev.destination:
+                    dests[ev.destination] = dests.get(ev.destination, 0) + 1
+                if ev.created_at:
+                    h = ev.created_at.hour
+                    hours[h] = hours.get(h, 0) + 1
+
+            typical_ips = sorted(ips.keys(), key=lambda k: -ips[k])[:20]
+            typical_dests = sorted(dests.keys(), key=lambda k: -dests[k])[:20]
+            top_hours = sorted(hours.keys(), key=lambda k: -hours[k])[:8]
+
+            sample_count = len(type_events)
+            # Confidence grows with sample size, saturates at 100 samples
+            confidence = min(1.0, sample_count / 100.0)
+
+            baseline = BehaviorBaseline(
+                id=str(uuid.uuid4()),
+                entity_profile_id=entity.id,
+                behavior_type=event_type,
+                baseline_period_days=baseline_days,
+                statistical_model={
+                    "unique_source_ips": len(ips),
+                    "unique_destinations": len(dests),
+                    "sample_count": sample_count,
+                },
+                typical_values=typical_ips,
+                time_patterns={
+                    "hours": top_hours,
+                    "hour_counts": hours,
+                    "destinations": typical_dests,
+                },
+                peer_comparison={},
+                confidence=round(confidence, 3),
+                sample_count=sample_count,
+                last_updated_at=datetime.now(timezone.utc),
+            )
+            db.add(baseline)
+            baselines_built += 1
+
+        # Update entity baseline_data summary
+        entity.baseline_data = {
+            "baseline_days": baseline_days,
+            "event_types": list(by_type.keys()),
+            "total_events": len(events),
+            "last_rebuild": datetime.now(timezone.utc).isoformat(),
+        }
+
+    await db.flush()
 
     return {
-        "status": "scheduled",
-        "task_id": task_id,
-        "entities_targeted": target_count,
+        "status": "completed",
+        "entities_targeted": len(entities),
+        "baselines_built": baselines_built,
+        "events_analyzed": events_analyzed,
+        "baseline_days": baseline_days,
     }
 
 
