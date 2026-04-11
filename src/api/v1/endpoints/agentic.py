@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Path, HTTPException, Query, status
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -1157,34 +1157,194 @@ async def start_threat_hunt(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Start threat hunt with specified profile"""
-    # Select agent if not specified
+    """Run a threat hunt against real platform data.
+
+    Previously returned a fake ``hunt_id=hunt_<timestamp>`` with every
+    count set to 0 and ``status=initiated`` — the button claimed a
+    hunt started, nothing ran, no Investigation rows were created,
+    and the dashboard stayed empty forever.
+
+    Now performs a real, synchronous multi-source hunt:
+      1. Resolve the agent (specified or first in org)
+      2. Query Alerts (status != resolved, severity high/critical)
+      3. Query open IdentityThreats
+      4. Query open CredentialLeaks
+      5. Query unresolved HuntFindings from the SIEM module
+      6. Create a real Investigation row that consolidates the count
+         with a reasoning_chain entry per source, confidence scored
+         from the cross-source overlap
+      7. Return real counts from the aggregation
+
+    Hunt profiles ("credential_theft", "lateral_movement", "exfil",
+    "apt", "ransomware", "default") filter which sources are queried.
+    """
+    import time
+    from src.models.alert import Alert
+    from src.itdr.models import IdentityThreat
+    from src.darkweb.models import CredentialLeak
+    try:
+        from src.hunting.models import HuntFinding
+    except Exception:  # noqa: BLE001
+        HuntFinding = None
+
+    org_id = getattr(current_user, "organization_id", None)
+    start_t = time.time()
+
+    # Resolve the agent
     agent_id = hunt_request.agent_id
-
     if not agent_id:
-        query = select(SOCAgent).where(
-            SOCAgent.organization_id == getattr(current_user, "organization_id", None)
+        result = await db.execute(
+            select(SOCAgent).where(SOCAgent.organization_id == org_id)
         )
-        result = await db.execute(query)
         agent = result.scalars().first()
-
         if not agent:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="No agents available",
             )
-
         agent_id = agent.id
 
-    return ThreatHuntResult(
-        hunt_id=f"hunt_{datetime.now().timestamp()}",
+    profile = (hunt_request.hunt_profile or "default").lower()
+
+    # Source filters by profile
+    want_alerts = True
+    want_identity = profile in ("credential_theft", "apt", "default")
+    want_credentials = profile in ("credential_theft", "exfil", "default")
+    want_hunt_findings = profile in ("lateral_movement", "apt", "ransomware", "default")
+
+    reasoning_chain: list[dict] = []
+    affected_assets: list[str] = []
+    indicators_found = 0
+    high_confidence_findings = 0
+
+    # 1. Alerts
+    if want_alerts:
+        alert_query = select(Alert).where(
+            Alert.severity.in_(["critical", "high"]),
+            Alert.status.in_(["new", "investigating"]),
+        )
+        alerts = list((await db.execute(alert_query)).scalars().all())
+        reasoning_chain.append({
+            "source": "alerts",
+            "query": "severity in (critical, high), status unresolved",
+            "count": len(alerts),
+        })
+        indicators_found += len(alerts)
+        high_confidence_findings += sum(1 for a in alerts if a.severity == "critical")
+        for a in alerts[:10]:
+            if a.source_ip:
+                affected_assets.append(f"ip:{a.source_ip}")
+            if getattr(a, "hostname", None):
+                affected_assets.append(f"host:{a.hostname}")
+
+    # 2. IdentityThreats
+    if want_identity:
+        id_query = select(IdentityThreat).where(
+            and_(
+                IdentityThreat.organization_id == org_id,
+                IdentityThreat.status.in_(["detected", "investigating"]),
+            )
+        )
+        threats = list((await db.execute(id_query)).scalars().all())
+        reasoning_chain.append({
+            "source": "identity_threats",
+            "query": "status in (detected, investigating)",
+            "count": len(threats),
+        })
+        indicators_found += len(threats)
+        high_confidence_findings += sum(1 for t in threats if t.severity == "critical")
+
+    # 3. CredentialLeaks
+    if want_credentials:
+        cred_query = select(CredentialLeak).where(
+            and_(
+                CredentialLeak.organization_id == org_id,
+                CredentialLeak.is_remediated == False,  # noqa: E712
+            )
+        )
+        creds = list((await db.execute(cred_query)).scalars().all())
+        reasoning_chain.append({
+            "source": "credential_leaks",
+            "query": "is_remediated=false",
+            "count": len(creds),
+        })
+        indicators_found += len(creds)
+
+    # 4. Hunt findings (SIEM hunting module)
+    if want_hunt_findings and HuntFinding is not None:
+        try:
+            hf_query = select(HuntFinding).where(
+                HuntFinding.severity.in_(["critical", "high"])
+            )
+            hfs = list((await db.execute(hf_query)).scalars().all())
+            reasoning_chain.append({
+                "source": "hunt_findings",
+                "query": "severity in (critical, high)",
+                "count": len(hfs),
+            })
+            indicators_found += len(hfs)
+            high_confidence_findings += sum(1 for h in hfs if h.severity == "critical")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"HuntFinding scan failed: {exc}")
+
+    # Confidence: scale by how many sources returned hits
+    sources_with_hits = sum(1 for r in reasoning_chain if r["count"] > 0)
+    confidence = min(100.0, sources_with_hits * 25.0 + min(indicators_found * 2, 20))
+
+    # Create a real Investigation row documenting the hunt
+    from src.agentic.models import InvestigationStatus
+    investigation = Investigation(
         agent_id=agent_id,
-        profile=hunt_request.hunt_profile,
-        status="initiated",
-        indicators_found=0,
-        investigations_created=0,
-        high_confidence_findings=0,
-        execution_time_minutes=0.0,
+        organization_id=org_id or "",
+        trigger_type="threat_hunt",
+        trigger_source_id=None,
+        title=f"Threat hunt: {profile}",
+        hypothesis=(
+            f"Hunt profile '{profile}' looking for active indicators "
+            f"across alerts, identity threats, credential leaks, "
+            f"and hunt findings."
+        ),
+        status=(
+            InvestigationStatus.COMPLETED.value
+            if indicators_found > 0
+            else InvestigationStatus.INITIATED.value
+        ),
+        priority=1 if high_confidence_findings > 0 else 3,
+        confidence_score=confidence,
+        reasoning_chain=reasoning_chain,
+        evidence_collected={
+            "sources_scanned": [r["source"] for r in reasoning_chain],
+            "total_indicators": indicators_found,
+        },
+        affected_assets=affected_assets[:20] if affected_assets else None,
+        findings_summary=(
+            f"Hunt '{profile}' found {indicators_found} indicator(s) "
+            f"across {sources_with_hits} source(s), "
+            f"{high_confidence_findings} of which are high-confidence."
+        ),
+    )
+    db.add(investigation)
+    await db.flush()
+    await db.refresh(investigation)
+
+    hunt_id = investigation.id
+    elapsed = (time.time() - start_t) / 60.0
+
+    logger.info(
+        f"Threat hunt completed: profile={profile} agent={agent_id} "
+        f"indicators={indicators_found} high_conf={high_confidence_findings} "
+        f"elapsed_min={elapsed:.2f}"
+    )
+
+    return ThreatHuntResult(
+        hunt_id=hunt_id,
+        agent_id=agent_id,
+        profile=profile,
+        status="completed",
+        indicators_found=indicators_found,
+        investigations_created=1,
+        high_confidence_findings=high_confidence_findings,
+        execution_time_minutes=round(elapsed, 2),
         timestamp=datetime.now(timezone.utc),
     )
 
