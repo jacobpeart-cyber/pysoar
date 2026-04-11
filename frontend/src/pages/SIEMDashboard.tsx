@@ -183,10 +183,12 @@ export default function SIEMDashboard() {
   // Toggle rule mutation
   const toggleRuleMutation = useMutation({
     mutationFn: async ({ ruleId, enabled }: { ruleId: string; enabled: boolean }) => {
-      try {
       const response = await api.put(`/siem/rules/${ruleId}`, { enabled });
       return response.data;
-      } catch { return null; }
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['siem-rules'] });
+      queryClient.invalidateQueries({ queryKey: ['siem-stats'] });
     },
   });
 
@@ -296,13 +298,18 @@ export default function SIEMDashboard() {
     },
   });
 
-  // Live Tail polling
+  // Live Tail polling — /siem/logs/search is a POST endpoint with a JSON
+  // body, so the previous GET call was always 405 Method Not Allowed and
+  // the Live Tail tab was completely broken.
   const fetchLiveLogs = useCallback(async () => {
     try {
-      const response = await api.get('/siem/logs/search', {
-        params: { sort_order: 'desc', size: 20 },
+      const response = await api.post('/siem/logs/search', {
+        sort_by: 'timestamp',
+        sort_order: 'desc',
+        page: 1,
+        size: 20,
       });
-      const items = response.data?.items || response.data || [];
+      const items = response.data?.items || [];
       setLiveLogs(items);
     } catch {
       // silently ignore polling errors

@@ -201,13 +201,27 @@ async def batch_ingest_logs(
     }
 
 
+# Whitelist of LogEntry columns clients can sort or aggregate by. Anything
+# outside this set is rejected so the search/aggregate endpoints can't be
+# used to enumerate or order by arbitrary (potentially sensitive) columns.
+_LOG_SEARCHABLE_FIELDS = {
+    "timestamp", "received_at", "source_type", "source_name", "source_ip",
+    "log_type", "severity", "source_address", "destination_address",
+    "source_port", "destination_port", "protocol", "username", "hostname",
+    "process_name", "action", "outcome", "created_at",
+}
+
+
 @router.post("/logs/search", response_model=LogSearchResponse)
 async def search_logs(
     search_data: LogSearchRequest,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Search logs with complex filtering"""
+    """Search logs with complex filtering."""
+    import time as _time
+    started = _time.monotonic()
+
     query = select(LogEntry)
 
     # Apply filters
@@ -252,8 +266,10 @@ async def search_logs(
     )
     total = count_result.scalar() or 0
 
-    # Apply sorting
-    sort_column = getattr(LogEntry, search_data.sort_by, LogEntry.timestamp)
+    # Apply sorting — whitelist sortable columns to prevent arbitrary
+    # ORDER BY injection via the request body.
+    sort_by = search_data.sort_by if search_data.sort_by in _LOG_SEARCHABLE_FIELDS else "timestamp"
+    sort_column = getattr(LogEntry, sort_by, LogEntry.timestamp)
     if search_data.sort_order == "desc":
         query = query.order_by(sort_column.desc())
     else:
@@ -265,13 +281,15 @@ async def search_logs(
     result = await db.execute(query)
     log_entries = list(result.scalars().all())
 
+    query_time_ms = int((_time.monotonic() - started) * 1000)
+
     return LogSearchResponse(
         items=[LogEntryResponse.model_validate(le) for le in log_entries],
         total=total,
         page=search_data.page,
         size=search_data.size,
         pages=math.ceil(total / search_data.size) if total > 0 else 0,
-        query_time_ms=0,
+        query_time_ms=query_time_ms,
     )
 
 
@@ -281,8 +299,23 @@ async def aggregate_logs(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Run aggregation query on logs"""
-    query = select(getattr(LogEntry, agg_data.field), func.count(LogEntry.id))
+    """Run aggregation query on logs.
+
+    The `field` parameter is whitelisted against
+    `_LOG_SEARCHABLE_FIELDS` so clients can't GROUP BY arbitrary
+    columns (would otherwise allow leaking JSON blob columns or hashes).
+    """
+    if agg_data.field not in _LOG_SEARCHABLE_FIELDS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Invalid aggregation field. Allowed fields: "
+                + ", ".join(sorted(_LOG_SEARCHABLE_FIELDS))
+            ),
+        )
+
+    field_column = getattr(LogEntry, agg_data.field)
+    query = select(field_column, func.count(LogEntry.id))
 
     if agg_data.time_start:
         query = query.where(LogEntry.timestamp >= agg_data.time_start.isoformat())
@@ -290,12 +323,10 @@ async def aggregate_logs(
     if agg_data.time_end:
         query = query.where(LogEntry.timestamp <= agg_data.time_end.isoformat())
 
-    query = query.group_by(getattr(LogEntry, agg_data.field)).order_by(
-        func.count(LogEntry.id).desc()
-    )
+    query = query.group_by(field_column).order_by(func.count(LogEntry.id).desc())
 
     if agg_data.top_n:
-        query = query.limit(agg_data.top_n)
+        query = query.limit(min(agg_data.top_n, 1000))
 
     result = await db.execute(query)
     rows = result.all()
@@ -586,36 +617,91 @@ async def test_rule(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Test a detection rule against sample logs"""
+    """Dry-run a detection rule against sample logs.
+
+    Uses the real Sigma-style rule engine — same one that runs in prod
+    on every ingested log — so the test result is identical to what
+    would happen at runtime. Does NOT fire AutomationService (this is a
+    dry-run; firing real alerts on synthetic test data was the previous
+    behaviour and would create phantom incidents).
+
+    Sample logs may be passed as either:
+      * a list of strings (free-form text — wrapped as { "raw_log": str })
+      * a list of dicts with parsed fields (recommended for testing
+        field-aware Sigma rules)
+    """
+    from src.siem.rules.engine import RuleEngine
+    from src.siem.engine_manager import _build_yaml_from_logic
+    from src.core.utils import safe_json_loads
+
     rule = await get_rule_or_404(db, rule_id)
-    sample_logs = test_data.get("sample_logs", [])
+    sample_logs = test_data.get("sample_logs", []) or []
 
-    # Simplified test: count how many logs would match
-    matches = 0
-    for log in sample_logs:
-        if rule.name.lower() in log.lower():
-            matches += 1
+    # Build a one-rule engine instance loaded with this specific rule.
+    # Prefer rule_yaml; fall back to detection_logic JSON (same path
+    # used by load_rules_from_db at runtime).
+    yaml_content = getattr(rule, "rule_yaml", None)
+    if not yaml_content:
+        detection_logic = getattr(rule, "detection_logic", None)
+        if detection_logic:
+            try:
+                logic = (
+                    json.loads(detection_logic)
+                    if isinstance(detection_logic, str)
+                    else detection_logic
+                )
+                yaml_content = _build_yaml_from_logic(rule, logic)
+            except Exception:
+                yaml_content = None
 
-    # Fire automation when rule matches
-    if matches > 0:
-        try:
-            org_id = getattr(current_user, "organization_id", None)
-            automation = AutomationService(db)
-            await automation.on_siem_rule_match(
-                rule_name=rule.name,
-                rule_severity=rule.severity,
-                matched_events=[],
-                organization_id=org_id,
-            )
-        except Exception as e:
-            import logging
-            logging.getLogger(__name__).error(f"Automation failed for SIEM rule match: {e}")
+    if not yaml_content:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Rule has no YAML or detection_logic to evaluate",
+        )
+
+    test_engine = RuleEngine()
+    rule_instance = test_engine.load_rule_from_yaml(yaml_content)
+    if not rule_instance:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Rule YAML is invalid or unparseable",
+        )
+    test_engine.add_rule(rule_instance)
+
+    matches: list[dict] = []
+    for sample in sample_logs:
+        # Normalize the sample into a log_fields dict
+        if isinstance(sample, dict):
+            log_fields = sample
+        elif isinstance(sample, str):
+            # Try to parse as JSON; otherwise treat as raw_log/message
+            parsed = safe_json_loads(sample, None)
+            log_fields = parsed if isinstance(parsed, dict) else {
+                "raw_log": sample,
+                "message": sample,
+            }
+        else:
+            continue
+
+        rule_matches = test_engine.evaluate_log(log_fields)
+        if rule_matches:
+            matches.append({
+                "log": log_fields,
+                "matched_rules": [
+                    {"rule_id": m.rule_id, "title": m.rule_title, "severity": m.severity}
+                    for m in rule_matches
+                ],
+            })
 
     return {
         "rule_id": rule_id,
+        "rule_name": rule.name,
         "sample_count": len(sample_logs),
-        "match_count": matches,
-        "match_rate": matches / len(sample_logs) if sample_logs else 0,
+        "match_count": len(matches),
+        "match_rate": len(matches) / len(sample_logs) if sample_logs else 0,
+        "matches": matches[:50],  # Cap detail output to first 50 matches
+        "dry_run": True,
     }
 
 
