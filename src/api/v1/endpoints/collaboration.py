@@ -62,6 +62,7 @@ from src.schemas.collaboration import (
     BulkParticipantUpdate,
 )
 from src.core.logging import get_logger
+from src.core.utils import safe_json_loads
 
 logger = get_logger(__name__)
 
@@ -848,7 +849,7 @@ async def get_collaboration_dashboard(
     return CollaborationDashboard(
         active_rooms=len(active_rooms),
         total_participants=sum(
-            len(json.loads(r.participants or "[]")) for r in active_rooms
+            len(safe_json_loads(r.participants or "[]", [])) for r in active_rooms
         ),
         pending_actions=pending_actions,
         overdue_actions=overdue_actions,

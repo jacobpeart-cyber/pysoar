@@ -620,12 +620,12 @@ async def get_campaign(
         )
 
     # Calculate metrics from campaign data
-    sent = max(campaign.emails_sent, 1)
-    open_rate = (campaign.emails_opened / sent) * 100
-    click_rate = (campaign.links_clicked / sent) * 100
-    submission_rate = (campaign.credentials_submitted / sent) * 100
-    report_rate = (campaign.reported_count / sent) * 100
-    attachment_rate = (campaign.attachments_opened / sent) * 100
+    sent = max(campaign.emails_sent or 0, 1)
+    open_rate = ((campaign.emails_opened or 0) / sent) * 100
+    click_rate = ((campaign.links_clicked or 0) / sent) * 100
+    submission_rate = ((campaign.credentials_submitted or 0) / sent) * 100
+    report_rate = ((campaign.reported_count or 0) / sent) * 100
+    attachment_rate = ((campaign.attachments_opened or 0) / sent) * 100
     vulnerability_index = (click_rate + submission_rate * 2) / 3
     security_score = max(0, 100 - vulnerability_index)
 
@@ -1005,7 +1005,7 @@ async def get_campaign_results(
             detail="Campaign not found",
         )
 
-    sent = max(campaign.emails_sent, 1)
+    sent = max(campaign.emails_sent or 0, 1)
     return {
         "campaign_id": str(campaign_id),
         "status": campaign.status,
@@ -1016,12 +1016,12 @@ async def get_campaign_results(
         "credentials_submitted": campaign.credentials_submitted,
         "attachments_opened": campaign.attachments_opened,
         "reported_count": campaign.reported_count,
-        "open_rate": round((campaign.emails_opened / sent) * 100, 2),
-        "click_rate": round((campaign.links_clicked / sent) * 100, 2),
+        "open_rate": round(((campaign.emails_opened or 0) / sent) * 100, 2),
+        "click_rate": round(((campaign.links_clicked or 0) / sent) * 100, 2),
         "submission_rate": round(
-            (campaign.credentials_submitted / sent) * 100, 2
+            ((campaign.credentials_submitted or 0) / sent) * 100, 2
         ),
-        "report_rate": round((campaign.reported_count / sent) * 100, 2),
+        "report_rate": round(((campaign.reported_count or 0) / sent) * 100, 2),
     }
 
 

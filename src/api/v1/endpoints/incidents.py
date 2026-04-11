@@ -78,10 +78,7 @@ async def list_incidents(
         query = query.where(Incident.assigned_to == assigned_to)
 
     # Get total count
-    count_query = select(func.count()).select_from(
-        select(Incident.id)
-        .where(query.whereclause) if query.whereclause is not None else select(Incident.id)
-    )
+    count_query = select(func.count()).select_from(query.subquery())
     count_result = await db.execute(count_query)
     total = count_result.scalar() or 0
 

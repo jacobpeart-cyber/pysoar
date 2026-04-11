@@ -10,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import AdminUser, CurrentUser, DatabaseSession
 from src.core.database import async_session_factory
+from src.core.utils import safe_json_loads
 from src.models.playbook import (
     ExecutionStatus,
     Playbook,
@@ -58,10 +59,10 @@ async def get_playbook_or_404(db: AsyncSession, playbook_id: str) -> Playbook:
 
 def playbook_to_response(playbook: Playbook) -> PlaybookResponse:
     """Convert playbook model to response schema"""
-    steps = json.loads(playbook.steps) if playbook.steps else []
-    trigger_conditions = json.loads(playbook.trigger_conditions) if playbook.trigger_conditions else None
-    variables = json.loads(playbook.variables) if playbook.variables else None
-    tags = json.loads(playbook.tags) if playbook.tags else None
+    steps = safe_json_loads(playbook.steps, [])
+    trigger_conditions = safe_json_loads(playbook.trigger_conditions, None)
+    variables = safe_json_loads(playbook.variables, None)
+    tags = safe_json_loads(playbook.tags, None)
 
     return PlaybookResponse(
         id=playbook.id,
@@ -228,7 +229,7 @@ async def execute_playbook(playbook_id: str, execute_data: PlaybookExecuteReques
             detail="Playbook is not active",
         )
 
-    steps = json.loads(playbook.steps) if playbook.steps else []
+    steps = safe_json_loads(playbook.steps, [])
 
     execution = PlaybookExecution(
         playbook_id=playbook.id,
@@ -256,7 +257,7 @@ async def execute_playbook(playbook_id: str, execute_data: PlaybookExecuteReques
         total_steps=execution.total_steps,
         started_at=execution.started_at,
         completed_at=execution.completed_at,
-        input_data=json.loads(execution.input_data) if execution.input_data else None,
+        input_data=safe_json_loads(execution.input_data, None),
         output_data=None,
         step_results=None,
         error_message=execution.error_message,
@@ -309,9 +310,9 @@ async def list_playbook_executions(
             total_steps=execution.total_steps,
             started_at=execution.started_at,
             completed_at=execution.completed_at,
-            input_data=json.loads(execution.input_data) if execution.input_data else None,
-            output_data=json.loads(execution.output_data) if execution.output_data else None,
-            step_results=json.loads(execution.step_results) if execution.step_results else None,
+            input_data=safe_json_loads(execution.input_data, None),
+            output_data=safe_json_loads(execution.output_data, None),
+            step_results=safe_json_loads(execution.step_results, None),
             error_message=execution.error_message,
             error_step=execution.error_step,
             triggered_by=execution.triggered_by,

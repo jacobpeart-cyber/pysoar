@@ -17,6 +17,7 @@ from src.api.deps import CurrentUser, DatabaseSession
 from src.core.logging import get_logger
 from src.models.organization import Organization
 from src.services.automation import AutomationService
+from src.core.utils import safe_json_loads
 
 logger = get_logger(__name__)
 from src.schemas.supplychain import (
@@ -508,7 +509,9 @@ async def get_component_vulnerabilities(
     cves = []
     for risk in risks:
         if risk.cve_ids:
-            cves.extend(json.loads(risk.cve_ids) if isinstance(risk.cve_ids, str) else risk.cve_ids)
+            cve_list = safe_json_loads(risk.cve_ids, [])
+            if isinstance(cve_list, list):
+                cves.extend(cve_list)
 
     return ComponentVulnerabilityLookup(
         component=component,
