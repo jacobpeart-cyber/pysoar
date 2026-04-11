@@ -80,6 +80,22 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     except Exception as e:  # noqa: BLE001
         logger.warning("Built-in feed registration failed", error=str(e))
 
+    # Seed compliance frameworks (idempotent). Populates FedRAMP Moderate
+    # w/ 191 NIST 800-53 Rev 5 controls, plus NIST 800-171, CMMC 2 L2,
+    # PCI DSS v4, HIPAA, SOC 2, and ISO 27001:2022 for every organization.
+    try:
+        from src.compliance.seeder import seed_all_compliance_frameworks
+        result = await seed_all_compliance_frameworks()
+        if result.get("frameworks_created", 0) or result.get("controls_added", 0):
+            logger.info(
+                "Seeded compliance frameworks",
+                orgs=result.get("organizations", 0),
+                frameworks_created=result.get("frameworks_created", 0),
+                controls_added=result.get("controls_added", 0),
+            )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Compliance framework seeding failed", error=str(e))
+
     yield
 
     # Shutdown
