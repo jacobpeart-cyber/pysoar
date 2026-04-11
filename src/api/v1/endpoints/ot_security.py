@@ -7,11 +7,11 @@ incident coordination, and compliance reporting.
 
 import json
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, status
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DatabaseSession
@@ -923,6 +923,8 @@ async def get_policy_violation_history(
 async def get_ot_dashboard(current_user: CurrentUser = None, db: DatabaseSession = None):
     """Get OT security dashboard"""
     org_id = getattr(current_user, "organization_id", None)
+    now = datetime.now(timezone.utc)
+    window_24h = now - timedelta(hours=24)
 
     # Get asset counts
     asset_result = await db.execute(
@@ -932,30 +934,66 @@ async def get_ot_dashboard(current_user: CurrentUser = None, db: DatabaseSession
 
     online_result = await db.execute(
         select(func.count()).select_from(OTAsset).where(
-            (OTAsset.organization_id == org_id) & (OTAsset.is_online == True)
+            and_(OTAsset.organization_id == org_id, OTAsset.is_online == True)
         )
     )
     online_count = online_result.scalar() or 0
 
-    # Get alert counts
+    # Get alert counts (real 24h windows, not //3 / //4)
     alert_result = await db.execute(
         select(func.count()).select_from(OTAlert).where(OTAlert.organization_id == org_id)
     )
     total_alerts = alert_result.scalar() or 0
 
+    new_24h_result = await db.execute(
+        select(func.count()).select_from(OTAlert).where(
+            and_(
+                OTAlert.organization_id == org_id,
+                OTAlert.created_at >= window_24h,
+            )
+        )
+    )
+    new_alerts_24h = new_24h_result.scalar() or 0
+
+    resolved_24h_result = await db.execute(
+        select(func.count()).select_from(OTAlert).where(
+            and_(
+                OTAlert.organization_id == org_id,
+                OTAlert.status.in_(["resolved", "contained", "false_positive"]),
+                OTAlert.updated_at >= window_24h,
+            )
+        )
+    )
+    resolved_24h = resolved_24h_result.scalar() or 0
+
     # Get zone counts by level
     zones_result = await db.execute(
         select(OTZone).where(OTZone.organization_id == org_id)
     )
-    zones = zones_result.scalars().all()
+    zones = list(zones_result.scalars().all())
 
-    zones_by_level = {}
+    zones_by_level: dict = {}
     for zone in zones:
         level = zone.purdue_level
         zones_by_level[level] = zones_by_level.get(level, 0) + 1
 
+    # Real compliance score: share of zones with compliance_status == "compliant"
+    compliant_zones = sum(1 for z in zones if z.compliance_status == "compliant")
+    zone_compliance = (compliant_zones / len(zones)) if zones else 0.0
+
+    # Firmware currency rate across assets
+    firmware_current_result = await db.execute(
+        select(func.count()).select_from(OTAsset).where(
+            and_(OTAsset.organization_id == org_id, OTAsset.firmware_current == True)
+        )
+    )
+    firmware_current_count = firmware_current_result.scalar() or 0
+    firmware_score = (firmware_current_count / total_assets) if total_assets else 0.0
+
+    overall_compliance = round((zone_compliance + firmware_score) / 2, 3) if (zones or total_assets) else 0.0
+
     return OTDashboardResponse(
-        timestamp=datetime.now(timezone.utc),
+        timestamp=now,
         asset_inventory=AssetInventoryStats(
             total_assets=total_assets,
             online_count=online_count,
@@ -963,18 +1001,79 @@ async def get_ot_dashboard(current_user: CurrentUser = None, db: DatabaseSession
         ),
         alert_summary=AlertStats(
             total_alerts=total_alerts,
-            new_alerts_24h=total_alerts // 3,
-            resolved_24h=total_alerts // 4,
+            new_alerts_24h=new_alerts_24h,
+            resolved_24h=resolved_24h,
         ),
         zones_by_level=zones_by_level,
         compliance_scores=ComplianceScores(
-            overall=0.75,
+            overall=overall_compliance,
         ),
         purdue_model_visualization={
             "levels": zones_by_level,
             "segmentation_complete": len(zones_by_level) >= 4,
+            "zone_compliance": round(zone_compliance, 3),
+            "firmware_score": round(firmware_score, 3),
         },
     )
+
+
+# Map Purdue string enum to numeric level
+_PURDUE_LEVEL_NUMERIC = {
+    "level0_process": 0,
+    "level1_control": 1,
+    "level2_supervisory": 2,
+    "level3_operations": 3,
+    "level3_5_dmz": 3,  # collapsed with ops for visualization
+    "level4_enterprise": 4,
+    "level5_internet": 5,
+}
+
+
+@router.get("/purdue-map")
+async def get_purdue_map(current_user: CurrentUser = None, db: DatabaseSession = None):
+    """Return asset devices grouped by numeric Purdue level for the visualization tab."""
+    org_id = getattr(current_user, "organization_id", None)
+
+    result = await db.execute(
+        select(OTAsset).where(OTAsset.organization_id == org_id)
+    )
+    assets = list(result.scalars().all())
+
+    buckets: dict = {lvl: [] for lvl in range(6)}
+    for a in assets:
+        lvl = _PURDUE_LEVEL_NUMERIC.get(a.purdue_level, 3)
+        buckets[lvl].append(
+            {
+                "id": a.id,
+                "name": a.name,
+                "asset_type": a.asset_type,
+                "type": a.asset_type,
+                "ip_address": a.ip_address,
+                "ipAddress": a.ip_address,
+                "ip": a.ip_address,
+                "vendor": a.vendor,
+                "protocol": a.protocol,
+                "zone": a.zone,
+                "criticality": a.criticality,
+                "is_online": a.is_online,
+                "status": "online" if a.is_online else "offline",
+                "last_seen": a.last_seen.isoformat() if a.last_seen else None,
+            }
+        )
+
+    levels = [
+        {"level": lvl, "devices": buckets[lvl], "device_count": len(buckets[lvl])}
+        for lvl in sorted(buckets.keys())
+    ]
+    total_devices = sum(len(v) for v in buckets.values())
+    segmented = sum(1 for lvl, devs in buckets.items() if devs) >= 4
+
+    return {
+        "levels": levels,
+        "total_devices": total_devices,
+        "segmentation_complete": segmented,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 # ===== OT COMPLIANCE =====
