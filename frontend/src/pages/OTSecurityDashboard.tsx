@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import { useState, useEffect } from 'react';
 import {
   Shield,
   Activity,
@@ -96,9 +96,10 @@ export default function OTSecurityDashboard() {
           otsecurityApi.getZones(),
           otsecurityApi.getPurdueMap(),
         ]);
-        setAssets(Array.isArray(assetsData) ? assetsData : (assetsData?.items || assetsData?.data || []));
-        setAlerts(Array.isArray(alertsData) ? alertsData : (alertsData?.items || alertsData?.data || []));
-        setZones(Array.isArray(zonesData) ? zonesData : zonesData.data || []);
+        const toItems = (d: any) => Array.isArray(d) ? d : (d?.items || []);
+        setAssets(toItems(assetsData));
+        setAlerts(toItems(alertsData));
+        setZones(toItems(zonesData));
         setPurdueMap(purdueData || null);
       } catch (error) {
         console.error('Error loading OT security data:', error);
@@ -110,8 +111,8 @@ export default function OTSecurityDashboard() {
   }, []);
 
   const totalAssets = assets.length;
-  const onlineAssets = assets.filter((a) => a.status === 'online').length;
-  const activeAlerts = alerts.filter((a) => a.status === 'active' || a.status === 'critical').length;
+  const onlineAssets = assets.filter((a) => a.is_online === true || a.status === 'online').length;
+  const activeAlerts = alerts.filter((a) => !['resolved', 'contained', 'false_positive'].includes(a.status)).length;
   const securityZones = zones.length;
 
   const tabs = [
@@ -124,14 +125,15 @@ export default function OTSecurityDashboard() {
   const filteredAssets = assets.filter(
     (a) =>
       (a.name || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
-      (a.type || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
+      (a.asset_type || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
       (a.vendor || '').toLowerCase().includes(searchQuery.toLowerCase())
   );
 
   const filteredAlerts = alerts.filter(
     (a) =>
-      (a.title || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
-      (a.source || '').toLowerCase().includes(searchQuery.toLowerCase())
+      (a.description || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
+      (a.source_ip || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
+      (a.alert_type || '').toLowerCase().includes(searchQuery.toLowerCase())
   );
 
   const purdueDevices = purdueMap?.levels || [];
@@ -221,19 +223,19 @@ export default function OTSecurityDashboard() {
                     <div className="space-y-2 text-sm">
                       <div className="flex justify-between">
                         <span>PLCs / RTUs</span>
-                        <span className="font-semibold">{assets.filter((a) => a.type === 'plc' || a.type === 'rtu').length}</span>
+                        <span className="font-semibold">{assets.filter((a) => a.asset_type === 'plc' || a.asset_type === 'rtu').length}</span>
                       </div>
                       <div className="flex justify-between">
                         <span>HMIs / SCADA</span>
-                        <span className="font-semibold">{assets.filter((a) => a.type === 'hmi' || a.type === 'scada').length}</span>
+                        <span className="font-semibold">{assets.filter((a) => a.asset_type === 'hmi' || a.asset_type === 'scada_server').length}</span>
                       </div>
                       <div className="flex justify-between">
                         <span>Engineering Workstations</span>
-                        <span className="font-semibold">{assets.filter((a) => a.type === 'workstation').length}</span>
+                        <span className="font-semibold">{assets.filter((a) => a.asset_type === 'engineering_workstation').length}</span>
                       </div>
                       <div className="flex justify-between">
                         <span>Network Devices</span>
-                        <span className="font-semibold">{assets.filter((a) => a.type === 'network').length}</span>
+                        <span className="font-semibold">{assets.filter((a) => a.asset_type === 'network_switch' || a.asset_type === 'firewall').length}</span>
                       </div>
                     </div>
                   </div>
@@ -242,11 +244,11 @@ export default function OTSecurityDashboard() {
                     <div className="space-y-2 text-sm">
                       <div className="flex justify-between">
                         <span>Modbus TCP</span>
-                        <span className="font-semibold">{assets.filter((a) => a.protocol === 'modbus').length}</span>
+                        <span className="font-semibold">{assets.filter((a) => a.protocol === 'modbus_tcp').length}</span>
                       </div>
                       <div className="flex justify-between">
                         <span>EtherNet/IP</span>
-                        <span className="font-semibold">{assets.filter((a) => a.protocol === 'ethernet-ip').length}</span>
+                        <span className="font-semibold">{assets.filter((a) => a.protocol === 'ethernetip').length}</span>
                       </div>
                       <div className="flex justify-between">
                         <span>DNP3</span>
@@ -254,7 +256,7 @@ export default function OTSecurityDashboard() {
                       </div>
                       <div className="flex justify-between">
                         <span>OPC UA</span>
-                        <span className="font-semibold">{assets.filter((a) => a.protocol === 'opc-ua').length}</span>
+                        <span className="font-semibold">{assets.filter((a) => a.protocol === 'opc_ua').length}</span>
                       </div>
                     </div>
                   </div>
@@ -263,15 +265,15 @@ export default function OTSecurityDashboard() {
                     <div className="space-y-2 text-sm">
                       <div className="flex justify-between">
                         <span>Up to Date</span>
-                        <span className="font-semibold text-green-600">{assets.filter((a) => a.firmwareStatus === 'current').length}</span>
+                        <span className="font-semibold text-green-600">{assets.filter((a) => a.firmware_current === true).length}</span>
                       </div>
                       <div className="flex justify-between">
-                        <span>Update Available</span>
-                        <span className="font-semibold text-yellow-600">{assets.filter((a) => a.firmwareStatus === 'outdated').length}</span>
+                        <span>Update Needed</span>
+                        <span className="font-semibold text-yellow-600">{assets.filter((a) => a.firmware_current === false).length}</span>
                       </div>
                       <div className="flex justify-between">
-                        <span>End of Life</span>
-                        <span className="font-semibold text-red-600">{assets.filter((a) => a.firmwareStatus === 'eol').length}</span>
+                        <span>Known Vulnerabilities</span>
+                        <span className="font-semibold text-red-600">{assets.filter((a) => (a.known_vulnerabilities_count || 0) > 0).length}</span>
                       </div>
                     </div>
                   </div>
@@ -319,28 +321,30 @@ export default function OTSecurityDashboard() {
                           </td>
                         </tr>
                       ) : (
-                        filteredAssets.map((asset) => (
+                        filteredAssets.map((asset) => {
+                          const online = asset.is_online === true || asset.status === 'online';
+                          return (
                           <tr key={asset.id} className="border-b border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700 transition">
                             <td className="px-6 py-4 text-sm font-medium flex items-center gap-2">
-                              {asset.status === 'online' ? (
+                              {online ? (
                                 <Wifi className="w-4 h-4 text-green-500 flex-shrink-0" />
                               ) : (
                                 <WifiOff className="w-4 h-4 text-gray-400 flex-shrink-0" />
                               )}
                               {asset.name}
                             </td>
-                            <td className="px-6 py-4 text-sm uppercase">{asset.type}</td>
+                            <td className="px-6 py-4 text-sm uppercase">{asset.asset_type}</td>
                             <td className="px-6 py-4 text-sm">{asset.vendor}</td>
-                            <td className="px-6 py-4 text-sm font-mono">{asset.ipAddress}</td>
+                            <td className="px-6 py-4 text-sm font-mono">{asset.ip_address}</td>
                             <td className="px-6 py-4 text-sm">{asset.protocol}</td>
                             <td className="px-6 py-4 text-sm">{asset.zone}</td>
                             <td className="px-6 py-4">
-                              <span className={`px-3 py-1 rounded-full text-xs font-medium ${getStatusColor(asset.status)}`}>
-                                {asset.status}
+                              <span className={`px-3 py-1 rounded-full text-xs font-medium ${getStatusColor(online ? 'online' : 'offline')}`}>
+                                {online ? 'online' : 'offline'}
                               </span>
                             </td>
                             <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                              {asset.lastSeen ? new Date(asset.lastSeen || "").toLocaleString() : '\u2014'}
+                              {asset.last_seen ? new Date(asset.last_seen).toLocaleString() : '\u2014'}
                             </td>
                             <td className="px-6 py-4 text-sm">
                               <button className="text-blue-600 dark:text-blue-400 hover:underline">
@@ -348,7 +352,8 @@ export default function OTSecurityDashboard() {
                               </button>
                             </td>
                           </tr>
-                        ))
+                          );
+                        })
                       )}
                     </tbody>
                   </table>
@@ -416,9 +421,9 @@ export default function OTSecurityDashboard() {
                       <tr className="border-b border-gray-200 dark:border-gray-700">
                         <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Alert</th>
                         <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Severity</th>
-                        <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Source</th>
-                        <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Category</th>
-                        <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Zone</th>
+                        <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Source IP</th>
+                        <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Type</th>
+                        <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">MITRE ICS</th>
                         <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Status</th>
                         <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Timestamp</th>
                         <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Actions</th>
@@ -434,22 +439,22 @@ export default function OTSecurityDashboard() {
                       ) : (
                         filteredAlerts.map((alert) => (
                           <tr key={alert.id} className="border-b border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700 transition">
-                            <td className="px-6 py-4 text-sm font-medium">{alert.title}</td>
+                            <td className="px-6 py-4 text-sm font-medium">{alert.description}</td>
                             <td className="px-6 py-4">
                               <span className={`px-3 py-1 rounded-full text-xs font-medium ${getSeverityColor(alert.severity)}`}>
                                 {(alert.severity || '').toUpperCase()}
                               </span>
                             </td>
-                            <td className="px-6 py-4 text-sm font-mono">{alert.source}</td>
-                            <td className="px-6 py-4 text-sm">{alert.category}</td>
-                            <td className="px-6 py-4 text-sm">{alert.zone}</td>
+                            <td className="px-6 py-4 text-sm font-mono">{alert.source_ip || '\u2014'}</td>
+                            <td className="px-6 py-4 text-sm">{alert.alert_type}</td>
+                            <td className="px-6 py-4 text-sm">{alert.mitre_ics_technique || '\u2014'}</td>
                             <td className="px-6 py-4">
                               <span className={`px-3 py-1 rounded-full text-xs font-medium ${getStatusColor(alert.status)}`}>
                                 {alert.status}
                               </span>
                             </td>
                             <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                              {alert.timestamp ? new Date(alert.timestamp || "").toLocaleString() : '\u2014'}
+                              {alert.created_at ? new Date(alert.created_at).toLocaleString() : '\u2014'}
                             </td>
                             <td className="px-6 py-4 text-sm flex gap-2">
                               <button className="text-blue-600 dark:text-blue-400 hover:underline">
@@ -485,15 +490,17 @@ export default function OTSecurityDashboard() {
                   </div>
                 ) : (
                   <div className="grid grid-cols-1 gap-4">
-                    {zones.map((zone) => (
+                    {zones.map((zone) => {
+                      const compliant = zone.compliance_status === 'compliant';
+                      return (
                       <div key={zone.id} className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-6 hover:shadow-lg transition">
                         <div className="flex justify-between items-start mb-4">
                           <div className="flex items-center gap-3">
                             <div className={clsx(
                               'w-10 h-10 rounded-lg flex items-center justify-center',
-                              zone.status === 'secure' ? 'bg-green-100 dark:bg-green-900' : 'bg-red-100 dark:bg-red-900'
+                              compliant ? 'bg-green-100 dark:bg-green-900' : 'bg-red-100 dark:bg-red-900'
                             )}>
-                              {zone.status === 'secure' ? (
+                              {compliant ? (
                                 <Lock className="w-5 h-5 text-green-600 dark:text-green-300" />
                               ) : (
                                 <AlertTriangle className="w-5 h-5 text-red-600 dark:text-red-300" />
@@ -504,33 +511,33 @@ export default function OTSecurityDashboard() {
                               <p className="text-sm text-gray-600 dark:text-gray-400">{zone.description}</p>
                             </div>
                           </div>
-                          <span className={`px-3 py-1 rounded-full text-xs font-medium ${getStatusColor(zone.status)}`}>
-                            {zone.status}
+                          <span className={`px-3 py-1 rounded-full text-xs font-medium ${getStatusColor(compliant ? 'secure' : 'warning')}`}>
+                            {zone.compliance_status || 'unknown'}
                           </span>
                         </div>
                         <div className="grid grid-cols-4 gap-4 text-sm">
                           <div>
                             <p className="text-gray-600 dark:text-gray-400">Assets</p>
-                            <p className="font-semibold">{zone.assetCount ?? '\u2014'}</p>
+                            <p className="font-semibold">{zone.assets_count ?? '\u2014'}</p>
                           </div>
                           <div>
-                            <p className="text-gray-600 dark:text-gray-400">Trust Level</p>
-                            <p className="font-semibold capitalize">{zone.trustLevel ?? '\u2014'}</p>
+                            <p className="text-gray-600 dark:text-gray-400">Purdue Level</p>
+                            <p className="font-semibold capitalize">{(zone.purdue_level || '').replace(/_/g, ' ')}</p>
                           </div>
                           <div>
-                            <p className="text-gray-600 dark:text-gray-400">Firewall Rules</p>
-                            <p className="font-semibold">{zone.firewallRules ?? '\u2014'}</p>
+                            <p className="text-gray-600 dark:text-gray-400">Network CIDR</p>
+                            <p className="font-semibold font-mono text-xs">{zone.network_cidr || '\u2014'}</p>
                           </div>
                           <div>
-                            <p className="text-gray-600 dark:text-gray-400">Active Connections</p>
-                            <p className="font-semibold">{zone.activeConnections ?? '\u2014'}</p>
+                            <p className="text-gray-600 dark:text-gray-400">Segmentation</p>
+                            <p className="font-semibold">{zone.segmentation_verified ? 'Verified' : 'Unverified'}</p>
                           </div>
                         </div>
-                        {zone.allowedProtocols && zone.allowedProtocols.length > 0 && (
+                        {zone.allowed_protocols && zone.allowed_protocols.length > 0 && (
                           <div className="mt-4 pt-4 border-t border-gray-200 dark:border-gray-700">
                             <p className="text-sm text-gray-600 dark:text-gray-400 mb-2">Allowed Protocols</p>
                             <div className="flex flex-wrap gap-2">
-                              {zone.allowedProtocols.map((proto: string, idx: number) => (
+                              {zone.allowed_protocols.map((proto: string, idx: number) => (
                                 <span
                                   key={idx}
                                   className="px-2 py-1 bg-gray-100 dark:bg-gray-700 rounded text-xs font-medium"
@@ -542,7 +549,8 @@ export default function OTSecurityDashboard() {
                           </div>
                         )}
                       </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 )}
               </div>
@@ -573,8 +581,7 @@ export default function OTSecurityDashboard() {
                       const info = getPurdueLevel(level);
                       const levelData = purdueDevices.find((l: any) => l.level === level);
                       const deviceCount = levelData?.devices?.length || 0;
-                      const levelAssets = assets.filter((a) => a.purdueLevel === level);
-                      const displayAssets = levelData?.devices || levelAssets;
+                      const displayAssets = levelData?.devices || [];
 
                       return (
                         <div key={level} className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden">
