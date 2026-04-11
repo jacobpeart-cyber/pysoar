@@ -36,6 +36,7 @@ __all__ = [
     "PodQuarantineRequest",
     "DashboardOverviewResponse",
     "ComplianceMatrixResponse",
+    "ClusterComplianceResponse",
     "PaginationParams",
 ]
 
@@ -452,6 +453,11 @@ class DashboardOverviewResponse(BaseModel):
     runtime_alerts_new: int = 0
     high_risk_images: int = Field(default=0)
     non_compliant_clusters: int = Field(default=0)
+    # Flattened aliases for the frontend ContainerSecurity summary cards
+    open_findings: int = 0
+    active_alerts: int = 0
+    critical_vulnerabilities: int = 0
+    high_vulnerabilities: int = 0
     top_vulnerabilities: List[Dict[str, Any]] = Field(default_factory=list)
     cluster_compliance: List[ClusterComplianceResponse] = Field(default_factory=list)
     runtime_alert_trends: List[Dict[str, Any]] = Field(default_factory=list)
