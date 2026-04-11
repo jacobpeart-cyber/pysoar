@@ -94,7 +94,15 @@ class ReviewStatus(str, Enum):
 
 # Base Response Models
 class ComplianceFrameworkResponse(DBModel):
-    """Compliance Framework Response"""
+    """Compliance Framework Response.
+
+    NOTE: the model column is ``extra_metadata``, not ``metadata``.
+    ``metadata`` is reserved by SQLAlchemy's declarative base and
+    resolves to the Table MetaData object, which is not a dict and
+    fails Pydantic validation. Exposing the column under its real
+    name here; the previous schema returned 500 on every
+    /compliance/frameworks call.
+    """
 
     id: str = ""
     name: str = ""
@@ -110,7 +118,7 @@ class ComplianceFrameworkResponse(DBModel):
     next_assessment_due: Optional[datetime] = None
     certification_level: Optional[str] = None
     is_enabled: bool = False
-    metadata: Dict[str, Any] = {}
+    extra_metadata: Dict[str, Any] = {}
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 

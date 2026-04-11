@@ -448,10 +448,32 @@ async def cross_map_controls(
     target_framework_id: str = Query(...),
     current_user: CurrentUser = None,
 ):
-    """Get cross-framework control mapping."""
-    engine = ComplianceEngine(db, getattr(current_user, "organization_id", None))
-    mapping = await engine.cross_map_controls(source_framework_id, target_framework_id)
+    """Get cross-framework control mapping.
 
+    Verifies both frameworks belong to the caller's org before running
+    the mapping. Without this check, an authenticated user could pass
+    any framework UUID (e.g. another tenant's FedRAMP instance) and
+    read its control relationships.
+    """
+    org_id = getattr(current_user, "organization_id", None)
+
+    for fw_id in (source_framework_id, target_framework_id):
+        check = await db.execute(
+            select(ComplianceFramework).where(
+                and_(
+                    ComplianceFramework.id == fw_id,
+                    ComplianceFramework.organization_id == org_id,
+                )
+            )
+        )
+        if check.scalar_one_or_none() is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Framework {fw_id} not found in your organization",
+            )
+
+    engine = ComplianceEngine(db, org_id)
+    mapping = await engine.cross_map_controls(source_framework_id, target_framework_id)
     return mapping
 
 
