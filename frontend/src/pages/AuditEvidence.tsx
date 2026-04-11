@@ -92,17 +92,31 @@ export default function AuditEvidence() {
     queryKey: ['audit-evidence-dashboard'],
     queryFn: async () => {
       try {
-      // Dashboard endpoint doesn't exist — derive from packages
-      const pkgRes = await api.get('/audit-evidence/packages');
-      const pkgs = Array.isArray(pkgRes.data) ? pkgRes.data : (pkgRes.data?.items || []);
-      return {
-        total_evidence: pkgs.length,
-        total_packages: pkgs.length,
-        compliance_score: pkgs.length > 0 ? 85 : 0,
-        pending_reviews: pkgs.filter((p: any) => p.status === 'pending' || p.status === 'draft').length,
-        recentAuditEvents: [],
-      };
-      } catch { return null; }
+        const pkgRes = await api.get('/audit-evidence/packages');
+        const pkgs = Array.isArray(pkgRes.data) ? pkgRes.data : (pkgRes.data?.items || []);
+        const active = pkgs.filter((p: any) => p.status !== 'approved' && p.status !== 'archived').length;
+        const withEv = pkgs.filter((p: any) => (p.evidenceCount ?? p.evidence_count ?? 0) > 0).length;
+        return {
+          auditEventsCount: 0,
+          evidenceItemsCount: pkgs.reduce((s: number, p: any) => s + (p.evidenceCount ?? p.evidence_count ?? 0), 0),
+          activePackagesCount: active,
+          readinessScore: pkgs.length > 0 ? Math.round((withEv / pkgs.length) * 100) : 0,
+          evidenceCoverage: {
+            withEvidence: withEv,
+            withoutEvidence: pkgs.length - withEv,
+          },
+          recentAuditEvents: [],
+        } as DashboardData;
+      } catch {
+        return {
+          auditEventsCount: 0,
+          evidenceItemsCount: 0,
+          activePackagesCount: 0,
+          readinessScore: 0,
+          evidenceCoverage: { withEvidence: 0, withoutEvidence: 0 },
+          recentAuditEvents: [],
+        } as DashboardData;
+      }
     },
   });
 
@@ -402,7 +416,7 @@ function DashboardTab({
                 stroke="currentColor"
                 strokeWidth="8"
                 strokeDasharray={`${
-                  (data?.evidenceCoverage.withEvidence || 0) * 3.4
+                  (data?.evidenceCoverage?.withEvidence || 0) * 3.4
                 } 340`}
                 className="text-green-500 transition-all duration-500"
               />
@@ -410,7 +424,7 @@ function DashboardTab({
             <div className="absolute inset-0 flex items-center justify-center">
               <div className="text-center">
                 <div className="text-2xl font-bold text-gray-900 dark:text-white">
-                  {data?.evidenceCoverage.withEvidence || 0}
+                  {data?.evidenceCoverage?.withEvidence || 0}
                 </div>
                 <div className="text-xs text-gray-500 dark:text-gray-400">
                   with evidence
@@ -426,7 +440,7 @@ function DashboardTab({
                     Controls with Evidence
                   </span>
                   <span className="text-sm font-semibold text-gray-900 dark:text-white">
-                    {data?.evidenceCoverage.withEvidence || 0}
+                    {data?.evidenceCoverage?.withEvidence || 0}
                   </span>
                 </div>
                 <div className="h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
@@ -439,7 +453,7 @@ function DashboardTab({
                     Controls without Evidence
                   </span>
                   <span className="text-sm font-semibold text-gray-900 dark:text-white">
-                    {data?.evidenceCoverage.withoutEvidence || 0}
+                    {data?.evidenceCoverage?.withoutEvidence || 0}
                   </span>
                 </div>
                 <div className="h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
