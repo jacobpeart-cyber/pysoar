@@ -8,7 +8,6 @@ import {
   Network,
   Eye,
   Search,
-  Filter,
   Layers,
   Wifi,
   WifiOff,
@@ -17,6 +16,7 @@ import {
 } from 'lucide-react';
 import clsx from 'clsx';
 import { otsecurityApi } from '../api/endpoints';
+import DetailDrawer, { DetailSection } from '../components/DetailDrawer';
 
 const getSeverityColor = (severity: string) => {
   switch (severity?.toLowerCase()) {
@@ -85,6 +85,8 @@ export default function OTSecurityDashboard() {
   const [purdueMap, setPurdueMap] = useState<any>(null);
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
+  const [detailAsset, setDetailAsset] = useState<any | null>(null);
+  const [detailAlert, setDetailAlert] = useState<any | null>(null);
 
   useEffect(() => {
     const loadData = async () => {
@@ -291,14 +293,6 @@ export default function OTSecurityDashboard() {
                       className="w-full pl-10 pr-4 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
                     />
                   </div>
-                  <button
-                    onClick={() => setSearchQuery('')}
-                    className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
-                    title="Clear search"
-                  >
-                    <Filter className="w-4 h-4" />
-                    Clear
-                  </button>
                 </div>
 
                 {/* Assets Table */}
@@ -352,7 +346,7 @@ export default function OTSecurityDashboard() {
                             </td>
                             <td className="px-6 py-4 text-sm">
                               <button
-                                onClick={() => alert(JSON.stringify(asset, null, 2))}
+                                onClick={() => setDetailAsset(asset)}
                                 className="text-blue-600 dark:text-blue-400 hover:underline"
                                 title="View asset details"
                               >
@@ -416,14 +410,6 @@ export default function OTSecurityDashboard() {
                       className="w-full pl-10 pr-4 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
                     />
                   </div>
-                  <button
-                    onClick={() => setSearchQuery('')}
-                    className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
-                    title="Clear search"
-                  >
-                    <Filter className="w-4 h-4" />
-                    Clear
-                  </button>
                 </div>
 
                 {/* Alerts Table */}
@@ -470,7 +456,7 @@ export default function OTSecurityDashboard() {
                             </td>
                             <td className="px-6 py-4 text-sm flex gap-2">
                               <button
-                                onClick={() => window.alert(JSON.stringify(otAlert, null, 2))}
+                                onClick={() => setDetailAlert(otAlert)}
                                 className="text-blue-600 dark:text-blue-400 hover:underline"
                                 title="View alert details"
                               >
@@ -652,6 +638,97 @@ export default function OTSecurityDashboard() {
           </>
         )}
       </div>
+
+      {/* Asset detail drawer */}
+      <DetailDrawer
+        open={!!detailAsset}
+        onClose={() => setDetailAsset(null)}
+        title={detailAsset?.name || 'OT Asset'}
+        subtitle={detailAsset ? `${(detailAsset.asset_type || '').toUpperCase()} · ${detailAsset.vendor || 'Unknown vendor'}` : undefined}
+        sections={
+          detailAsset
+            ? ([
+                {
+                  title: 'Identity',
+                  fields: [
+                    { label: 'Asset ID', value: detailAsset.id, mono: true, full: true },
+                    { label: 'Name', value: detailAsset.name },
+                    { label: 'Type', value: (detailAsset.asset_type || '').toUpperCase() },
+                    { label: 'Vendor', value: detailAsset.vendor },
+                    { label: 'Model', value: detailAsset.model },
+                    { label: 'Serial', value: detailAsset.serial_number, mono: true },
+                    { label: 'Firmware', value: detailAsset.firmware_version, mono: true },
+                  ],
+                },
+                {
+                  title: 'Network',
+                  fields: [
+                    { label: 'IP Address', value: detailAsset.ip_address, mono: true },
+                    { label: 'MAC Address', value: detailAsset.mac_address, mono: true },
+                    { label: 'Protocol', value: detailAsset.protocol },
+                    { label: 'Zone', value: detailAsset.zone },
+                    { label: 'Cell/Area', value: detailAsset.cell_area },
+                    { label: 'Purdue Level', value: (detailAsset.purdue_level || '').replace(/_/g, ' ') },
+                  ],
+                },
+                {
+                  title: 'Security Posture',
+                  fields: [
+                    { label: 'Criticality', value: detailAsset.criticality },
+                    { label: 'Online', value: detailAsset.is_online ? 'Yes' : 'No' },
+                    { label: 'Firmware Current', value: detailAsset.firmware_current ? 'Yes' : 'No' },
+                    { label: 'Known Vulnerabilities', value: detailAsset.known_vulnerabilities_count ?? 0 },
+                    { label: 'Risk Score', value: detailAsset.risk_score ?? 0 },
+                    { label: 'Last Seen', value: detailAsset.last_seen ? new Date(detailAsset.last_seen).toLocaleString() : null },
+                  ],
+                },
+              ] as DetailSection[])
+            : undefined
+        }
+      />
+
+      {/* Alert detail drawer */}
+      <DetailDrawer
+        open={!!detailAlert}
+        onClose={() => setDetailAlert(null)}
+        title={detailAlert?.description || 'OT Alert'}
+        subtitle={detailAlert ? `${(detailAlert.severity || '').toUpperCase()} · ${detailAlert.alert_type || ''}` : undefined}
+        sections={
+          detailAlert
+            ? ([
+                {
+                  title: 'Alert',
+                  fields: [
+                    { label: 'Alert ID', value: detailAlert.id, mono: true, full: true },
+                    { label: 'Type', value: detailAlert.alert_type },
+                    { label: 'Severity', value: (detailAlert.severity || '').toUpperCase() },
+                    { label: 'Status', value: detailAlert.status },
+                    { label: 'MITRE ICS', value: detailAlert.mitre_ics_technique, mono: true },
+                    { label: 'Description', value: detailAlert.description, full: true },
+                  ],
+                },
+                {
+                  title: 'Network Context',
+                  fields: [
+                    { label: 'Source IP', value: detailAlert.source_ip, mono: true },
+                    { label: 'Destination IP', value: detailAlert.destination_ip, mono: true },
+                    { label: 'Protocol', value: detailAlert.protocol_used },
+                    { label: 'Command / Function', value: detailAlert.command_function_code, mono: true },
+                    { label: 'Asset ID', value: detailAlert.asset_id, mono: true, full: true },
+                  ],
+                },
+                {
+                  title: 'Response',
+                  fields: [
+                    { label: 'Response Action', value: detailAlert.response_action, full: true },
+                    { label: 'Created', value: detailAlert.created_at ? new Date(detailAlert.created_at).toLocaleString() : null },
+                    { label: 'Updated', value: detailAlert.updated_at ? new Date(detailAlert.updated_at).toLocaleString() : null },
+                  ],
+                },
+              ] as DetailSection[])
+            : undefined
+        }
+      />
     </div>
   );
 }

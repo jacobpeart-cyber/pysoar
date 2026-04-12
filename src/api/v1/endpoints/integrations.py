@@ -840,6 +840,67 @@ async def list_webhooks(
     )
 
 
+@router.post(
+    "/installed/{integration_id}/webhooks/{webhook_id}/test",
+)
+async def test_webhook(
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+    integration_id: str = Path(...),
+    webhook_id: str = Path(...),
+):
+    """Fire a synthetic test event through the webhook processing pipeline.
+
+    Looks up the webhook, verifies tenant ownership, constructs a
+    ``pysoar.webhook.test`` payload, and records the test in the webhook's
+    ``last_received`` / ``received_count`` counters. Returns the synthetic
+    payload so the UI can display what was fired.
+    """
+    integration = await get_installed_integration_or_404(db, integration_id)
+    if integration.organization_id != getattr(current_user, "organization_id", None):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied",
+        )
+
+    result = await db.execute(
+        select(WebhookEndpoint).where(
+            WebhookEndpoint.id == webhook_id,
+            WebhookEndpoint.installed_id == integration_id,
+        )
+    )
+    webhook = result.scalar_one_or_none()
+    if not webhook:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Webhook not found",
+        )
+
+    test_payload = {
+        "event": "pysoar.webhook.test",
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "webhook_id": webhook_id,
+        "integration_id": integration_id,
+        "source": "ui_test_button",
+        "actor_id": getattr(current_user, "id", None),
+    }
+
+    # Record the synthetic test in the webhook's counters so operators see it
+    # reflected in the UI immediately.
+    webhook.last_received = datetime.utcnow()
+    webhook.received_count = (webhook.received_count or 0) + 1
+    await db.commit()
+    await db.refresh(webhook)
+
+    return {
+        "status": "test_fired",
+        "webhook_id": webhook_id,
+        "endpoint_path": webhook.endpoint_path,
+        "payload": test_payload,
+        "received_count": webhook.received_count,
+    }
+
+
 @router.delete(
     "/installed/{integration_id}/webhooks/{webhook_id}",
     status_code=status.HTTP_204_NO_CONTENT,
