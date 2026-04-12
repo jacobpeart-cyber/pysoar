@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Path, HTTPException, Query, status
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DatabaseSession
@@ -585,12 +585,16 @@ async def get_component_vulnerabilities(
                 cves.extend(cve_list)
     unique_cves = sorted(set(cves))
 
-    # Resolve highest real severity from the Vulnerability table
+    # Resolve highest real severity from the Vulnerability table (tenant-scoped)
     highest: Optional[str] = None
     if unique_cves:
+        org_id = getattr(current_user, "organization_id", None)
         sev_result = await db.execute(
             select(Vulnerability.severity).where(
-                Vulnerability.cve_id.in_(unique_cves)
+                and_(
+                    Vulnerability.cve_id.in_(unique_cves),
+                    Vulnerability.organization_id == org_id,
+                )
             )
         )
         severities = [row[0] for row in sev_result.all() if row[0]]

@@ -1217,11 +1217,14 @@ async def start_threat_hunt(
     indicators_found = 0
     high_confidence_findings = 0
 
-    # 1. Alerts
+    # 1. Alerts (tenant-scoped)
     if want_alerts:
         alert_query = select(Alert).where(
-            Alert.severity.in_(["critical", "high"]),
-            Alert.status.in_(["new", "investigating"]),
+            and_(
+                Alert.organization_id == org_id,
+                Alert.severity.in_(["critical", "high"]),
+                Alert.status.in_(["new", "investigating"]),
+            )
         )
         alerts = list((await db.execute(alert_query)).scalars().all())
         reasoning_chain.append({
@@ -1271,15 +1274,30 @@ async def start_threat_hunt(
         indicators_found += len(creds)
 
     # 4. Hunt findings (SIEM hunting module)
+    # NOTE: HuntFinding/HuntSession/HuntHypothesis don't carry organization_id
+    # directly — they're scoped via the users.created_by chain. To keep this
+    # tenant-safe we scope HuntFindings via HuntSession.created_by being a
+    # member of the caller's org.
     if want_hunt_findings and HuntFinding is not None:
         try:
-            hf_query = select(HuntFinding).where(
-                HuntFinding.severity.in_(["critical", "high"])
+            from src.hunting.models import HuntSession
+            from src.models.user import User as _User
+
+            org_user_subq = select(_User.id).where(_User.organization_id == org_id)
+            hf_query = (
+                select(HuntFinding)
+                .join(HuntSession, HuntSession.id == HuntFinding.session_id)
+                .where(
+                    and_(
+                        HuntFinding.severity.in_(["critical", "high"]),
+                        HuntSession.created_by.in_(org_user_subq),
+                    )
+                )
             )
             hfs = list((await db.execute(hf_query)).scalars().all())
             reasoning_chain.append({
                 "source": "hunt_findings",
-                "query": "severity in (critical, high)",
+                "query": "severity in (critical, high), tenant-scoped via session.created_by",
                 "count": len(hfs),
             })
             indicators_found += len(hfs)

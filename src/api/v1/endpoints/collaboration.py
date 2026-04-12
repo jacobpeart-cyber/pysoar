@@ -941,10 +941,22 @@ async def get_room_activity_metrics(
     )
     overdue_actions = overdue_result.scalar() or 0
 
+    # Real distinct-participant count in the last hour: count unique sender_ids
+    # on messages posted in the window.
+    participants_result = await db.execute(
+        select(func.count(func.distinct(WarRoomMessage.sender_id))).where(
+            and_(
+                WarRoomMessage.room_id == room_id,
+                WarRoomMessage.created_at >= hour_ago,
+            )
+        )
+    )
+    active_participants = participants_result.scalar() or 0
+
     return RoomActivityMetrics(
         messages_last_hour=messages_last_hour,
         messages_last_24h=messages_last_24h,
-        active_participants_last_hour=1,  # Simplified
+        active_participants_last_hour=active_participants,
         pending_actions=pending_actions,
         overdue_actions=overdue_actions,
     )

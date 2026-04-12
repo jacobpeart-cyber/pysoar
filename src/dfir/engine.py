@@ -559,21 +559,45 @@ class TimelineReconstructor:
             timeline_result = self.build_timeline(case_id)
             events = timeline_result.get("events", [])
 
+            # Real gap detection: compute the real time delta between
+            # chronologically-ordered timeline events. Only include gaps
+            # longer than a threshold (default 1 hour) as "significant".
+            from datetime import datetime as _dt
+            SIGNIFICANT_GAP_SECONDS = 3600
+
+            parsed_events = []
+            for e in events:
+                ts_raw = e.get("timestamp") or e.get("event_time") or e.get("occurred_at")
+                if not ts_raw:
+                    continue
+                try:
+                    ts = _dt.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
+                    parsed_events.append((ts, e))
+                except (ValueError, TypeError):
+                    continue
+            parsed_events.sort(key=lambda p: p[0])
+
             gaps = []
-            if len(events) >= 2:
-                for i in range(len(events) - 1):
-                    # Simplified gap detection
-                    gap = {
-                        "from_event": events[i]["event_type"],
-                        "to_event": events[i + 1]["event_type"],
-                        "gap_duration": "TBD",
-                    }
-                    gaps.append(gap)
+            for i in range(len(parsed_events) - 1):
+                ts_a, ev_a = parsed_events[i]
+                ts_b, ev_b = parsed_events[i + 1]
+                delta_seconds = (ts_b - ts_a).total_seconds()
+                if delta_seconds >= SIGNIFICANT_GAP_SECONDS:
+                    gaps.append({
+                        "from_event": ev_a.get("event_type"),
+                        "from_timestamp": ts_a.isoformat(),
+                        "to_event": ev_b.get("event_type"),
+                        "to_timestamp": ts_b.isoformat(),
+                        "gap_seconds": int(delta_seconds),
+                        "gap_minutes": round(delta_seconds / 60.0, 1),
+                        "gap_hours": round(delta_seconds / 3600.0, 2),
+                    })
 
             return {
                 "status": "success",
                 "case_id": case_id,
                 "gap_count": len(gaps),
+                "significant_gap_threshold_seconds": SIGNIFICANT_GAP_SECONDS,
                 "gaps": gaps,
             }
         except Exception as e:

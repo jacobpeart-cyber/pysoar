@@ -780,15 +780,22 @@ class NISTManager:
     # ------------------------------------------------------------------
 
     async def _check_account_management(self) -> Dict[str, Any]:
-        """AC-2: Account management — inactive accounts, orphaned users."""
+        """AC-2: Account management — inactive accounts, orphaned users (tenant-scoped)."""
         from sqlalchemy import func as _func
         from src.models.user import User
 
         findings: list[str] = []
-        total_q = await self.db.execute(select(_func.count(User.id)))
+        total_q = await self.db.execute(
+            select(_func.count(User.id)).where(User.organization_id == self.org_id)
+        )
         total = total_q.scalar() or 0
         inactive_q = await self.db.execute(
-            select(_func.count(User.id)).where(User.is_active == False)  # noqa: E712
+            select(_func.count(User.id)).where(
+                and_(
+                    User.organization_id == self.org_id,
+                    User.is_active == False,  # noqa: E712
+                )
+            )
         )
         inactive = inactive_q.scalar() or 0
 
@@ -824,12 +831,18 @@ class NISTManager:
         failed_logins_7d = 0
         if _AuditLog is not None:
             cutoff = datetime.utcnow() - timedelta(days=7)
+            # AuditLog is typically scoped via users.organization_id through
+            # the user_id FK. Scope by subquery to avoid leaking login
+            # failures across tenants.
+            from src.models.user import User as _User
             try:
+                org_user_ids = select(_User.id).where(_User.organization_id == self.org_id)
                 q = await self.db.execute(
                     select(_func.count(_AuditLog.id)).where(
                         and_(
                             _AuditLog.action == "login_failed",
                             _AuditLog.created_at >= cutoff,
+                            _AuditLog.user_id.in_(org_user_ids),
                         )
                     )
                 )
@@ -868,11 +881,16 @@ class NISTManager:
         findings: list[str] = []
         count_24h = 0
         if _AuditLog is not None:
+            from src.models.user import User as _User
             cutoff = datetime.utcnow() - timedelta(hours=24)
             try:
+                org_user_ids = select(_User.id).where(_User.organization_id == self.org_id)
                 q = await self.db.execute(
                     select(_func.count(_AuditLog.id)).where(
-                        _AuditLog.created_at >= cutoff
+                        and_(
+                            _AuditLog.created_at >= cutoff,
+                            _AuditLog.user_id.in_(org_user_ids),
+                        )
                     )
                 )
                 count_24h = q.scalar() or 0
@@ -902,13 +920,22 @@ class NISTManager:
 
         findings: list[str] = []
         active_q = await self.db.execute(
-            select(_func.count(User.id)).where(User.is_active == True)  # noqa: E712
+            select(_func.count(User.id)).where(
+                and_(
+                    User.organization_id == self.org_id,
+                    User.is_active == True,  # noqa: E712
+                )
+            )
         )
         active_total = active_q.scalar() or 0
 
         mfa_q = await self.db.execute(
             select(_func.count(User.id)).where(
-                and_(User.is_active == True, User.mfa_enabled == True)  # noqa: E712
+                and_(
+                    User.organization_id == self.org_id,
+                    User.is_active == True,  # noqa: E712
+                    User.mfa_enabled == True,  # noqa: E712
+                )
             )
         )
         mfa_enrolled = mfa_q.scalar() or 0
@@ -969,11 +996,18 @@ class NISTManager:
             from src.vulnmgmt.models import VulnScan, Vulnerability
             cutoff = datetime.utcnow() - timedelta(days=30)
             scans_q = await self.db.execute(
-                select(_func.count(VulnScan.id)).where(VulnScan.created_at >= cutoff)
+                select(_func.count(VulnScan.id)).where(
+                    and_(
+                        VulnScan.organization_id == self.org_id,
+                        VulnScan.created_at >= cutoff,
+                    )
+                )
             )
             scans_30d = scans_q.scalar() or 0
             vulns_q = await self.db.execute(
-                select(_func.count(Vulnerability.id))
+                select(_func.count(Vulnerability.id)).where(
+                    Vulnerability.organization_id == self.org_id
+                )
             )
             open_vulns = vulns_q.scalar() or 0
         except Exception:  # noqa: BLE001
@@ -1001,7 +1035,11 @@ class NISTManager:
         zt_policy_count = 0
         try:
             from src.zerotrust.models import ZeroTrustPolicy
-            q = await self.db.execute(select(_func.count(ZeroTrustPolicy.id)))
+            q = await self.db.execute(
+                select(_func.count(ZeroTrustPolicy.id)).where(
+                    ZeroTrustPolicy.organization_id == self.org_id
+                )
+            )
             zt_policy_count = q.scalar() or 0
         except Exception:  # noqa: BLE001
             pass
@@ -1058,7 +1096,10 @@ class NISTManager:
             cutoff = datetime.utcnow() - timedelta(days=30)
             q = await self.db.execute(
                 select(_func.count(PatchOperation.id)).where(
-                    PatchOperation.created_at >= cutoff
+                    and_(
+                        PatchOperation.organization_id == self.org_id,
+                        PatchOperation.created_at >= cutoff,
+                    )
                 )
             )
             patches_30d = q.scalar() or 0
@@ -1091,13 +1132,21 @@ class NISTManager:
             from src.siem.models import DetectionRule, LogEntry, RuleStatus
             rules_q = await self.db.execute(
                 select(_func.count(DetectionRule.id)).where(
-                    DetectionRule.status == RuleStatus.ACTIVE.value
+                    and_(
+                        DetectionRule.organization_id == self.org_id,
+                        DetectionRule.status == RuleStatus.ACTIVE.value,
+                    )
                 )
             )
             active_rules = rules_q.scalar() or 0
             cutoff = datetime.utcnow() - timedelta(hours=24)
             logs_q = await self.db.execute(
-                select(_func.count(LogEntry.id)).where(LogEntry.created_at >= cutoff)
+                select(_func.count(LogEntry.id)).where(
+                    and_(
+                        LogEntry.organization_id == self.org_id,
+                        LogEntry.created_at >= cutoff,
+                    )
+                )
             )
             logs_24h = logs_q.scalar() or 0
         except Exception:  # noqa: BLE001
