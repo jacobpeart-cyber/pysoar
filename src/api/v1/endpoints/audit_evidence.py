@@ -8,7 +8,7 @@ continuous monitoring, and audit readiness checking.
 from typing import Optional
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Body
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Body, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, func
 
@@ -167,6 +167,191 @@ async def detect_suspicious_activity(
 # ============================================================================
 # Evidence Collection Endpoints
 # ============================================================================
+
+
+@router.post("/evidence/upload", response_model=None)
+async def upload_evidence_file(
+    file: UploadFile = File(...),
+    control_id: str = Form(...),
+    title: str = Form(...),
+    evidence_type: str = Form("document"),
+    description: str = Form(""),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
+):
+    """Upload a real evidence artifact for a specific compliance control.
+
+    Stores the file under ``uploads/evidence/<org>/<control_id>/<uuid>_<filename>``,
+    computes a SHA-512 hash, and creates a ``ComplianceEvidence`` row tied to
+    the referenced ``ComplianceControl``. Raises 404 if the control doesn't
+    exist for the caller's org so users can't upload evidence into a
+    non-existent or cross-tenant control.
+    """
+    import hashlib
+    import os
+    import uuid as _uuid
+
+    from src.compliance.models import ComplianceControl, ComplianceEvidence
+
+    org_id = getattr(current_user, "organization_id", None)
+
+    # Verify control exists and belongs to the caller's org
+    ctrl_result = await db.execute(
+        select(ComplianceControl).where(
+            and_(
+                ComplianceControl.id == control_id,
+                ComplianceControl.organization_id == org_id,
+            )
+        )
+    )
+    control = ctrl_result.scalar_one_or_none()
+    if not control:
+        raise HTTPException(
+            status_code=404,
+            detail="Compliance control not found for this organization",
+        )
+
+    # Persist file to disk under an org + control namespaced directory
+    upload_root = os.getenv("EVIDENCE_UPLOAD_DIR", "uploads/evidence")
+    target_dir = os.path.join(upload_root, str(org_id or "unknown"), control_id)
+    os.makedirs(target_dir, exist_ok=True)
+
+    safe_name = (file.filename or "evidence").replace("/", "_").replace("\\", "_")
+    unique = f"{_uuid.uuid4().hex}_{safe_name}"
+    dest_path = os.path.join(target_dir, unique)
+
+    hasher = hashlib.sha512()
+    total_bytes = 0
+    with open(dest_path, "wb") as f:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            total_bytes += len(chunk)
+            hasher.update(chunk)
+            f.write(chunk)
+
+    evidence = ComplianceEvidence(
+        control_id_ref=control_id,
+        evidence_type=evidence_type,
+        title=title,
+        description=description or None,
+        file_path=dest_path,
+        file_hash=hasher.hexdigest(),
+        collected_at=datetime.now(timezone.utc),
+        collected_by=getattr(current_user, "full_name", None) or getattr(current_user, "email", "unknown"),
+        is_automated=False,
+        is_valid=True,
+        review_status="pending",
+        tags=[],
+        organization_id=org_id,
+    )
+    db.add(evidence)
+    await db.flush()
+    await db.refresh(evidence)
+
+    return {
+        "status": "uploaded",
+        "evidence_id": evidence.id,
+        "control_id": control_id,
+        "file_path": dest_path,
+        "file_hash": evidence.file_hash,
+        "file_size_bytes": total_bytes,
+        "title": title,
+        "uploaded_at": evidence.collected_at.isoformat(),
+    }
+
+
+@router.get("/evidence/{evidence_id}/download")
+async def download_evidence_file(
+    evidence_id: str,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
+):
+    """Stream a previously uploaded evidence artifact back to the caller.
+
+    Tenant-scoped via organization_id — a user in org A cannot download
+    evidence from org B even by ID.
+    """
+    import os
+    from fastapi.responses import FileResponse
+    from src.compliance.models import ComplianceEvidence
+
+    org_id = getattr(current_user, "organization_id", None)
+    result = await db.execute(
+        select(ComplianceEvidence).where(
+            and_(
+                ComplianceEvidence.id == evidence_id,
+                ComplianceEvidence.organization_id == org_id,
+            )
+        )
+    )
+    evidence = result.scalar_one_or_none()
+    if not evidence:
+        raise HTTPException(status_code=404, detail="Evidence not found")
+    if not evidence.file_path or not os.path.exists(evidence.file_path):
+        raise HTTPException(
+            status_code=404,
+            detail="Evidence file missing on disk",
+        )
+    original_name = os.path.basename(evidence.file_path).split("_", 1)[-1] or "evidence"
+    return FileResponse(
+        path=evidence.file_path,
+        media_type="application/octet-stream",
+        filename=original_name,
+    )
+
+
+@router.get("/reports/monthly")
+async def download_monthly_report(
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
+):
+    """Generate and stream a monthly FedRAMP ConMon report as a JSON download.
+
+    Runs the real ``ContinuousMonitor.generate_conmon_report()`` and wraps
+    it in a FedRAMP-shaped monthly report envelope: report metadata, the
+    30-day window, the real control check summary, and POA&M progress.
+    Returns the document as a StreamingResponse so the browser saves it
+    as a dated filename instead of rendering JSON in a tab.
+    """
+    import io
+    import json as _json
+    from fastapi.responses import StreamingResponse
+
+    try:
+        monitor = ContinuousMonitor(db, getattr(current_user, "organization_id", None))
+        conmon = await monitor.generate_conmon_report()
+    except Exception as exc:
+        logger.error(f"Monthly report generation failed: {exc}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to generate monthly report",
+        )
+
+    now = datetime.now(timezone.utc)
+    window_start = now - timedelta(days=30)
+
+    document = {
+        "report_type": "FedRAMP Continuous Monitoring Monthly Report",
+        "generated_at": now.isoformat(),
+        "reporting_period": {
+            "start": window_start.isoformat(),
+            "end": now.isoformat(),
+            "days": 30,
+        },
+        "organization_id": getattr(current_user, "organization_id", None),
+        "conmon_report": conmon.model_dump() if hasattr(conmon, "model_dump") else conmon,
+    }
+
+    content = _json.dumps(document, indent=2, default=str)
+    filename = f"pysoar_conmon_monthly_{now.strftime('%Y-%m')}.json"
+
+    return StreamingResponse(
+        io.BytesIO(content.encode("utf-8")),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.post("/evidence/collect", response_model=None)

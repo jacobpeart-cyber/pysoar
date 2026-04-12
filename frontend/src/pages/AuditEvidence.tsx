@@ -25,6 +25,7 @@ import {
 } from 'lucide-react';
 import { api } from '../lib/api';
 import clsx from 'clsx';
+import FormModal from '../components/FormModal';
 
 type TabType = 'dashboard' | 'audit-trail' | 'evidence' | 'packages' | 'conmon';
 
@@ -752,6 +753,31 @@ function EvidenceTab({
   onApproveEvidence: (id: string) => void;
 }) {
   const queryClient = useQueryClient();
+  const [showUploadModal, setShowUploadModal] = useState(false);
+  const [uploadFile, setUploadFile] = useState<File | null>(null);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [uploading, setUploading] = useState(false);
+
+  // Load compliance controls so the upload form can attach evidence to a real control
+  const { data: controlsData } = useQuery<{ items?: any[] } | any[]>({
+    queryKey: ['compliance-controls-for-evidence'],
+    queryFn: async () => {
+      try {
+        const res = await api.get('/compliance/controls', { params: { limit: 500 } });
+        return res.data;
+      } catch {
+        return { items: [] };
+      }
+    },
+  });
+  const controlOptions: Array<{ value: string; label: string }> = (() => {
+    const list = Array.isArray(controlsData) ? controlsData : (controlsData as any)?.items || [];
+    return list.map((c: any) => ({
+      value: c.id,
+      label: `${c.control_id || c.code || c.id} — ${c.title || ''}`.slice(0, 120),
+    }));
+  })();
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
@@ -921,24 +947,15 @@ function EvidenceTab({
       {/* Upload and Actions */}
       <div className="flex gap-4">
         <button
-          onClick={async () => {
-            // "Upload" in this context kicks off the automated evidence
-            // collection sweep across every enabled automated rule. For
-            // file-based attachments users have the incident attachment
-            // upload. This button gives ConMon operators a one-click way
-            // to refresh all automated evidence items.
-            try {
-              await api.post('/audit-evidence/evidence/collect-all');
-              queryClient.invalidateQueries({ queryKey: ['evidence-items'] });
-              queryClient.invalidateQueries({ queryKey: ['audit-evidence-dashboard'] });
-            } catch (err) {
-              console.error('Evidence collect-all failed:', err);
-            }
+          onClick={() => {
+            setUploadFile(null);
+            setUploadError(null);
+            setShowUploadModal(true);
           }}
           className="inline-flex items-center gap-2 px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium"
         >
           <Upload className="w-5 h-5" />
-          Collect All Evidence
+          Upload Evidence
         </button>
         <button
           onClick={async () => {
@@ -962,6 +979,166 @@ function EvidenceTab({
           Verify Integrity
         </button>
       </div>
+
+      {/* Upload Evidence modal — real multipart POST /audit-evidence/evidence/upload */}
+      {showUploadModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" role="dialog" aria-modal="true">
+          <div
+            className="absolute inset-0 bg-black/50 backdrop-blur-sm"
+            onClick={() => !uploading && setShowUploadModal(false)}
+          />
+          <div className="relative w-full max-w-lg bg-white dark:bg-gray-900 rounded-lg shadow-2xl border border-gray-200 dark:border-gray-700">
+            <div className="flex items-start justify-between px-6 py-4 border-b border-gray-200 dark:border-gray-700">
+              <div>
+                <h2 className="text-lg font-semibold text-gray-900 dark:text-white">Upload Evidence</h2>
+                <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
+                  Attach an evidence artifact to a specific compliance control. File is hashed (SHA-512) and stored for audit traceability.
+                </p>
+              </div>
+            </div>
+            <form
+              onSubmit={async (e) => {
+                e.preventDefault();
+                const formEl = e.currentTarget;
+                const control_id = (formEl.elements.namedItem('control_id') as HTMLSelectElement)?.value;
+                const title = (formEl.elements.namedItem('title') as HTMLInputElement)?.value.trim();
+                const evidence_type = (formEl.elements.namedItem('evidence_type') as HTMLSelectElement)?.value;
+                const description = (formEl.elements.namedItem('description') as HTMLTextAreaElement)?.value;
+                if (!uploadFile) {
+                  setUploadError('Please choose a file to upload');
+                  return;
+                }
+                if (!control_id) {
+                  setUploadError('Please select a compliance control');
+                  return;
+                }
+                if (!title) {
+                  setUploadError('Title is required');
+                  return;
+                }
+                setUploading(true);
+                setUploadError(null);
+                try {
+                  const form = new FormData();
+                  form.append('file', uploadFile);
+                  form.append('control_id', control_id);
+                  form.append('title', title);
+                  form.append('evidence_type', evidence_type || 'document');
+                  form.append('description', description || '');
+                  await api.post('/audit-evidence/evidence/upload', form, {
+                    headers: { 'Content-Type': 'multipart/form-data' },
+                  });
+                  queryClient.invalidateQueries({ queryKey: ['evidence-items'] });
+                  queryClient.invalidateQueries({ queryKey: ['audit-evidence-dashboard'] });
+                  setShowUploadModal(false);
+                  setUploadFile(null);
+                } catch (err: any) {
+                  setUploadError(err?.response?.data?.detail || err?.message || 'Upload failed');
+                } finally {
+                  setUploading(false);
+                }
+              }}
+            >
+              <div className="px-6 py-5 space-y-4 max-h-[60vh] overflow-y-auto">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                    File <span className="text-red-500">*</span>
+                  </label>
+                  <input
+                    type="file"
+                    onChange={(e) => setUploadFile(e.target.files?.[0] || null)}
+                    className="w-full text-sm text-gray-900 dark:text-gray-100 file:mr-3 file:py-2 file:px-4 file:border file:border-gray-300 file:rounded file:text-sm file:bg-white file:text-gray-700 hover:file:bg-gray-50"
+                  />
+                  {uploadFile && (
+                    <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                      {uploadFile.name} · {(uploadFile.size / 1024).toFixed(1)} KB
+                    </p>
+                  )}
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                    Compliance Control <span className="text-red-500">*</span>
+                  </label>
+                  <select
+                    name="control_id"
+                    className="w-full px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100"
+                    defaultValue=""
+                  >
+                    <option value="">— Select a control —</option>
+                    {controlOptions.map((o) => (
+                      <option key={o.value} value={o.value}>{o.label}</option>
+                    ))}
+                  </select>
+                  {controlOptions.length === 0 && (
+                    <p className="mt-1 text-xs text-yellow-700 dark:text-yellow-500">
+                      No compliance controls loaded. Create controls in the Compliance module first.
+                    </p>
+                  )}
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                    Title <span className="text-red-500">*</span>
+                  </label>
+                  <input
+                    name="title"
+                    type="text"
+                    className="w-full px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100"
+                    placeholder="Q1 2026 Access Review Screenshot"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Evidence Type</label>
+                  <select
+                    name="evidence_type"
+                    defaultValue="document"
+                    className="w-full px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100"
+                  >
+                    <option value="document">Document</option>
+                    <option value="screenshot">Screenshot</option>
+                    <option value="log">Log</option>
+                    <option value="configuration">Configuration</option>
+                    <option value="scan_result">Scan Result</option>
+                    <option value="policy">Policy</option>
+                    <option value="procedure">Procedure</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Description</label>
+                  <textarea
+                    name="description"
+                    rows={3}
+                    className="w-full px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100"
+                    placeholder="Context, source system, scope..."
+                  />
+                </div>
+                {uploadError && (
+                  <div className="px-3 py-2 rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 text-sm text-red-700 dark:text-red-300">
+                    {uploadError}
+                  </div>
+                )}
+              </div>
+              <div className="border-t border-gray-200 dark:border-gray-700 px-6 py-4 flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowUploadModal(false)}
+                  disabled={uploading}
+                  className="px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700 disabled:opacity-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={uploading}
+                  className="px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 disabled:opacity-50 flex items-center gap-2"
+                >
+                  {uploading && <Loader2 className="w-4 h-4 animate-spin" />}
+                  Upload
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1176,31 +1353,30 @@ function ConMonTab({
         Run ConMon Cycle
       </button>
 
-      {/* Generate Monthly Report — pulls /audit-evidence/continuous-monitoring for last 30 days */}
+      {/* Generate Monthly Report — streams real FedRAMP ConMon monthly JSON report from backend */}
       <button
         onClick={async () => {
           try {
-            const response = await api.get('/audit-evidence/dashboard');
-            const snapshot = response.data || {};
-            const report = {
-              report_type: 'PySOAR Continuous Monitoring Monthly Report',
-              generated_at: new Date().toISOString(),
-              period_days: 30,
-              snapshot,
-            };
-            const blob = new Blob([JSON.stringify(report, null, 2)], {
-              type: 'application/json',
+            const response = await api.get('/audit-evidence/reports/monthly', {
+              responseType: 'blob',
             });
+            const blob = response.data as Blob;
+            const cd = response.headers?.['content-disposition'];
+            let filename = `pysoar_conmon_monthly_${new Date().toISOString().slice(0, 7)}.json`;
+            if (cd && typeof cd === 'string') {
+              const m = cd.match(/filename="?([^"]+)"?/);
+              if (m) filename = m[1];
+            }
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
-            a.download = `conmon-monthly-${new Date().toISOString().slice(0, 10)}.json`;
+            a.download = filename;
             document.body.appendChild(a);
             a.click();
             document.body.removeChild(a);
             URL.revokeObjectURL(url);
           } catch (err) {
-            console.error('ConMon report generation failed:', err);
+            console.error('Monthly report download failed:', err);
           }
         }}
         className="inline-flex items-center gap-2 px-6 py-3 bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-white rounded-lg hover:bg-gray-300 dark:hover:bg-gray-600 font-medium"

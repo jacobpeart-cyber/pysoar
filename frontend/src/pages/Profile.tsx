@@ -8,7 +8,6 @@ import {
   Shield,
   Key,
   Save,
-  Camera,
   Loader2,
   CheckCircle,
   AlertCircle,
@@ -120,15 +119,6 @@ export default function Profile() {
             <div className="w-24 h-24 rounded-full bg-blue-600 flex items-center justify-center text-white text-3xl font-bold">
               {user?.full_name?.[0] || user?.email?.[0]?.toUpperCase() || 'U'}
             </div>
-            <button
-              onClick={() =>
-                alert('Avatar upload is not yet enabled. Use PATCH /users/{id} with avatar_url to set an avatar programmatically.')
-              }
-              className="absolute bottom-0 right-0 p-2 bg-white rounded-full border border-gray-200 shadow-sm hover:bg-gray-50"
-              title="Avatar upload coming soon"
-            >
-              <Camera className="w-4 h-4 text-gray-600" />
-            </button>
           </div>
           <div>
             <h1 className="text-2xl font-bold text-gray-900">
