@@ -11,6 +11,7 @@ import {
   Calendar,
   Search,
   Loader2,
+  Download,
 } from 'lucide-react';
 import { api } from '../lib/api';
 import clsx from 'clsx';
@@ -116,18 +117,58 @@ export default function AuditLogs() {
           <h1 className="text-2xl font-bold text-gray-900">Audit Logs</h1>
           <p className="text-gray-500">Track all system activity and user actions</p>
         </div>
-        <button
-          onClick={() => setShowFilters(!showFilters)}
-          className={clsx(
-            'flex items-center gap-2 px-4 py-2 rounded-lg border transition-colors',
-            showFilters
-              ? 'bg-blue-50 border-blue-200 text-blue-700'
-              : 'bg-white border-gray-200 text-gray-700 hover:bg-gray-50'
-          )}
-        >
-          <Filter className="w-4 h-4" />
-          Filters
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={async () => {
+              // Hit the real backend /audit/export which streams a CSV with
+              // proper Content-Disposition. Required for FedRAMP AU-6 audit
+              // evidence export.
+              const params = new URLSearchParams();
+              params.append('format', 'csv');
+              params.append('days', '90');
+              if (filters.action) params.append('action', filters.action);
+              if (filters.resource_type) params.append('resource_type', filters.resource_type);
+              try {
+                const response = await api.get(`/audit/export?${params.toString()}`, {
+                  responseType: 'blob',
+                });
+                const blob = response.data as Blob;
+                const cd = response.headers?.['content-disposition'];
+                let filename = `pysoar_audit_${new Date().toISOString().slice(0, 10)}.csv`;
+                if (cd && typeof cd === 'string') {
+                  const m = cd.match(/filename="?([^"]+)"?/);
+                  if (m) filename = m[1];
+                }
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = filename;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+              } catch (err) {
+                console.error('Audit export failed:', err);
+              }
+            }}
+            className="flex items-center gap-2 px-4 py-2 rounded-lg border border-gray-200 bg-white text-gray-700 hover:bg-gray-50 transition-colors"
+          >
+            <Download className="w-4 h-4" />
+            Export CSV
+          </button>
+          <button
+            onClick={() => setShowFilters(!showFilters)}
+            className={clsx(
+              'flex items-center gap-2 px-4 py-2 rounded-lg border transition-colors',
+              showFilters
+                ? 'bg-blue-50 border-blue-200 text-blue-700'
+                : 'bg-white border-gray-200 text-gray-700 hover:bg-gray-50'
+            )}
+          >
+            <Filter className="w-4 h-4" />
+            Filters
+          </button>
+        </div>
       </div>
 
       {/* Filters */}

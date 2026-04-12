@@ -666,9 +666,28 @@ export const supplychainApi = {
     return response.data;
   },
 
-  downloadSBOM: async (sbomId: string): Promise<any> => {
-    const response = await api.get(`/supplychain/sboms/${sbomId}/export`);
-    return response.data;
+  /**
+   * Download a real spec-compliant SPDX or CycloneDX SBOM file. Backend streams
+   * the document with a proper Content-Disposition attachment header; we grab
+   * the blob and trigger a browser download so the user sees the file.
+   */
+  downloadSBOM: async (
+    sbomId: string,
+    format: 'spdx_json' | 'cyclonedx_json' = 'cyclonedx_json'
+  ): Promise<{ blob: Blob; filename: string }> => {
+    const response = await api.post(
+      `/supplychain/sboms/${sbomId}/export`,
+      { export_format: format },
+      { responseType: 'blob' }
+    );
+    // Extract filename from Content-Disposition if present
+    let filename = `sbom-${sbomId}.${format === 'spdx_json' ? 'spdx' : 'cdx'}.json`;
+    const cd = response.headers?.['content-disposition'];
+    if (cd && typeof cd === 'string') {
+      const m = cd.match(/filename="?([^"]+)"?/);
+      if (m) filename = m[1];
+    }
+    return { blob: response.data as Blob, filename };
   },
 };
 

@@ -786,6 +786,52 @@ async def upload_attachment(
     )
 
 
+@router.get(
+    "/incidents/{incident_id}/attachments/{attachment_id}/download",
+)
+async def download_attachment(
+    incident_id: str,
+    attachment_id: str,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
+):
+    """Stream an incident attachment back to the caller as a real file download.
+
+    Enforces the same tenant boundary as the rest of the incidents API: the
+    attachment must belong to an incident the caller can see. File is streamed
+    with the original filename in Content-Disposition.
+    """
+    from fastapi.responses import FileResponse
+
+    await get_incident_or_404(db, incident_id)
+
+    result = await db.execute(
+        select(CaseAttachment).where(
+            CaseAttachment.id == attachment_id,
+            CaseAttachment.incident_id == incident_id,
+        )
+    )
+    attachment = result.scalar_one_or_none()
+
+    if not attachment:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Attachment not found",
+        )
+
+    if not attachment.file_path or not os.path.exists(attachment.file_path):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Attachment file missing on disk",
+        )
+
+    return FileResponse(
+        path=attachment.file_path,
+        media_type=attachment.mime_type or "application/octet-stream",
+        filename=attachment.original_filename or "attachment",
+    )
+
+
 @router.delete(
     "/incidents/{incident_id}/attachments/{attachment_id}",
     status_code=status.HTTP_204_NO_CONTENT,

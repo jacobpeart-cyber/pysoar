@@ -24,7 +24,7 @@ import {
   Download,
   User as UserIcon,
 } from 'lucide-react';
-import { incidentsApi, alertsApi, playbooksApi } from '../lib/api';
+import { incidentsApi, alertsApi, playbooksApi, api } from '../lib/api';
 import type { Incident, Alert, Playbook } from '../lib/types';
 import clsx from 'clsx';
 
@@ -660,7 +660,32 @@ export default function IncidentDetail() {
                               {att.uploader_name || 'Unknown'} · {formatDate(att.created_at)}
                             </p>
                           </div>
-                          <Download className="w-4 h-4 text-gray-400" />
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              try {
+                                const response = await api.get(
+                                  `/incidents/${id}/attachments/${att.id}/download`,
+                                  { responseType: 'blob' }
+                                );
+                                const blob = response.data as Blob;
+                                const url = URL.createObjectURL(blob);
+                                const a = document.createElement('a');
+                                a.href = url;
+                                a.download = att.original_filename || 'attachment';
+                                document.body.appendChild(a);
+                                a.click();
+                                document.body.removeChild(a);
+                                URL.revokeObjectURL(url);
+                              } catch (err) {
+                                console.error('Attachment download failed:', err);
+                              }
+                            }}
+                            className="p-1.5 text-gray-400 hover:text-blue-600 hover:bg-blue-50 dark:hover:bg-blue-900/20 rounded transition"
+                            title="Download attachment"
+                          >
+                            <Download className="w-4 h-4" />
+                          </button>
                         </div>
                       ))}
                     </div>
