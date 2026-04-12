@@ -201,11 +201,61 @@ async def export_sbom(
     db: DatabaseSession = None,
     sbom_id: str = Path(...),
 ):
-    """Export SBOM in specified format"""
+    """Export SBOM as a real, spec-compliant SPDX or CycloneDX document.
+
+    Loads every SBOMComponent + joined SoftwareComponent row for this SBOM
+    and passes them to the generator so the output contains real packages,
+    versions, licenses, purls, and SHA-256 checksums — not an empty envelope.
+
+    Returns a ``StreamingResponse`` with the proper ``Content-Disposition``
+    header so the browser downloads it as a file instead of rendering JSON.
+    """
+    from fastapi.responses import StreamingResponse
+    import io
+
     sbom = await get_sbom_or_404(db, sbom_id)
 
     if sbom.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+
+    # Load the real component list (tenant-scoped via SBOM ownership check above)
+    comp_result = await db.execute(
+        select(SoftwareComponent, SBOMComponent.relationship_type)
+        .join(SBOMComponent, SBOMComponent.component_id == SoftwareComponent.id)
+        .where(SBOMComponent.sbom_id == sbom_id)
+    )
+    rows = comp_result.all()
+
+    components = []
+    relationships = []
+    for sw, rel_type in rows:
+        components.append({
+            "id": sw.id,
+            "SPDXID": f"SPDXRef-Package-{sw.id}",
+            "bom-ref": sw.id,
+            "name": sw.name,
+            "version": sw.version,
+            "type": sw.package_type or "library",
+            "supplier": f"Organization: {sw.vendor}" if sw.vendor else "NOASSERTION",
+            "licenseConcluded": sw.license_spdx_id or sw.license_type or "NOASSERTION",
+            "licenseDeclared": sw.license_spdx_id or sw.license_type or "NOASSERTION",
+            "purl": sw.purl,
+            "cpe": sw.cpe,
+            "hashes": (
+                [{"alg": "SHA-256", "content": sw.checksum_sha256}]
+                if sw.checksum_sha256
+                else []
+            ),
+            "externalRefs": (
+                [{"referenceType": "purl", "referenceLocator": sw.purl}] if sw.purl else []
+            ),
+        })
+        if sw.parent_component_id:
+            relationships.append({
+                "spdxElementId": f"SPDXRef-Package-{sw.parent_component_id}",
+                "relatedSpdxElement": f"SPDXRef-Package-{sw.id}",
+                "relationshipType": (rel_type or "DEPENDS_ON").upper(),
+            })
 
     generator = SBOMGenerator()
 
@@ -213,24 +263,31 @@ async def export_sbom(
         "id": sbom.id,
         "name": sbom.application_name,
         "version": sbom.application_version,
-        "created_by_tool": sbom.created_by_tool,
+        "created_by_tool": sbom.created_by_tool or "PySOAR",
+        "components": components,
+        "relationships": relationships,
     }
 
-    if export_request.export_format == "spdx_json":
+    fmt = export_request.export_format
+    if fmt == "spdx_json":
         content = generator.generate_spdx_output(sbom_data)
-    elif export_request.export_format == "cyclonedx_json":
+        media_type = "application/spdx+json"
+        filename = f"{sbom.application_name or 'sbom'}-{sbom.application_version or 'v1'}.spdx.json"
+    elif fmt == "cyclonedx_json":
         content = generator.generate_cyclonedx_output(sbom_data)
+        media_type = "application/vnd.cyclonedx+json"
+        filename = f"{sbom.application_name or 'sbom'}-{sbom.application_version or 'v1'}.cdx.json"
     else:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Unsupported export format",
+            detail="Unsupported export format (use spdx_json or cyclonedx_json)",
         )
 
-    return {
-        "format": export_request.export_format,
-        "content": content,
-        "generated_at": datetime.utcnow().isoformat(),
-    }
+    return StreamingResponse(
+        io.BytesIO(content.encode("utf-8")),
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.get("/sboms", response_model=SBOMListResponse)

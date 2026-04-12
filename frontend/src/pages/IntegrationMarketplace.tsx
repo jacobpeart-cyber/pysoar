@@ -324,7 +324,18 @@ export default function IntegrationMarketplace() {
                           <td className="px-6 py-4 text-sm">{exec.recordsProcessed.toLocaleString()}</td>
                           <td className="px-6 py-4 text-sm">{exec.duration}s</td>
                           <td className="px-6 py-4 text-sm">
-                            <button className="text-blue-600 dark:text-blue-400 hover:underline">
+                            <button
+                              onClick={() => {
+                                // Show the full execution result in a modal-less
+                                // prompt-style popup. Good enough for a history
+                                // drill-down; the execution rows have all fields.
+                                alert(
+                                  JSON.stringify(exec, null, 2)
+                                );
+                              }}
+                              className="text-blue-600 dark:text-blue-400 hover:underline"
+                              title="View execution details"
+                            >
                               <Eye className="w-4 h-4" />
                             </button>
                           </td>
@@ -370,13 +381,62 @@ export default function IntegrationMarketplace() {
                         </div>
                       </div>
                       <div className="flex gap-2">
-                        <button className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                        <button
+                          onClick={async () => {
+                            // Frontend-side smoke test: POST a dummy event to the
+                            // webhook URL so the user sees their pipeline fire.
+                            // Backend doesn't currently proxy these so we do it
+                            // directly; failures are reported back.
+                            try {
+                              const res = await fetch(webhook.url, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify({
+                                  event: 'pysoar.webhook.test',
+                                  timestamp: new Date().toISOString(),
+                                  webhook_id: webhook.id,
+                                }),
+                              });
+                              alert(`Webhook test returned ${res.status}`);
+                            } catch (err: any) {
+                              alert(`Webhook test failed: ${err?.message || err}`);
+                            }
+                          }}
+                          className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                          title="Send a test payload"
+                        >
                           Test
                         </button>
-                        <button className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                        <button
+                          onClick={() => {
+                            alert(
+                              'Webhook editing via the UI is not yet supported. Use the Installed integration page to re-register with a new URL.'
+                            );
+                          }}
+                          className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                        >
                           Edit
                         </button>
-                        <button className="px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                        <button
+                          onClick={async () => {
+                            if (!window.confirm(`Delete webhook ${webhook.name}?`)) return;
+                            try {
+                              // Webhook delete is scoped under the installed integration
+                              const integrationId = (webhook as any).installation_id;
+                              if (!integrationId) {
+                                alert('Cannot delete — installation_id missing on this webhook record.');
+                                return;
+                              }
+                              await api.delete(
+                                `/integrations/installed/${integrationId}/webhooks/${webhook.id}`
+                              );
+                              loadData();
+                            } catch (err) {
+                              console.error('Webhook delete failed:', err);
+                            }
+                          }}
+                          className="px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                        >
                           <Trash2 className="w-4 h-4" />
                         </button>
                       </div>

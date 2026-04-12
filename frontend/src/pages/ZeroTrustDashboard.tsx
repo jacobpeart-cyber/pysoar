@@ -851,10 +851,30 @@ function DeviceTrustTab({
             {/* Expanded Details */}
             {expandedDevice === device.id && (
               <div className="mt-4 pt-4 border-t border-gray-200 dark:border-gray-700 space-y-2">
-                <button className="w-full px-3 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-xs font-medium">
+                <button
+                  onClick={async () => {
+                    try {
+                      const res = await api.get(`/zerotrust/devices/${device.id}`);
+                      alert(JSON.stringify(res.data, null, 2));
+                    } catch (err) {
+                      console.error('Device detail fetch failed:', err);
+                    }
+                  }}
+                  className="w-full px-3 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-xs font-medium"
+                >
                   View Details
                 </button>
-                <button className="w-full px-3 py-2 bg-gray-100 dark:bg-gray-700 text-gray-900 dark:text-white rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600 text-xs font-medium">
+                <button
+                  onClick={async () => {
+                    try {
+                      await api.post('/zerotrust/assess-devices', { device_ids: [device.id] });
+                      alert('Device re-assessment triggered.');
+                    } catch (err) {
+                      console.error('Re-assess failed:', err);
+                    }
+                  }}
+                  className="w-full px-3 py-2 bg-gray-100 dark:bg-gray-700 text-gray-900 dark:text-white rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600 text-xs font-medium"
+                >
                   Re-assess
                 </button>
               </div>

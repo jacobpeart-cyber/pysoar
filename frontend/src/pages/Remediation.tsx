@@ -658,7 +658,20 @@ export default function Remediation() {
                       {policy.trigger_type}
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap">
-                      <button className="flex items-center gap-2 px-3 py-1 rounded-lg transition">
+                      <button
+                        onClick={async () => {
+                          try {
+                            await api.put(`/remediation/policies/${policy.id}`, {
+                              is_enabled: !policy.is_enabled,
+                            });
+                            queryClient.invalidateQueries({ queryKey: ['remediation-policies'] });
+                          } catch (err) {
+                            console.error('Toggle policy failed:', err);
+                          }
+                        }}
+                        className="flex items-center gap-2 px-3 py-1 rounded-lg transition"
+                        title={policy.is_enabled ? 'Disable policy' : 'Enable policy'}
+                      >
                         {policy.is_enabled ? (
                           <>
                             <ToggleRight className="w-5 h-5 text-green-600" />
@@ -749,10 +762,39 @@ export default function Remediation() {
                     </p>
                   </div>
                   <div className="flex gap-2">
-                    <button className="px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg font-medium transition">
+                    <button
+                      onClick={async () => {
+                        try {
+                          await api.post(
+                            `/remediation/executions/${approval.id || approval.execution_id}/approve`,
+                            { approver_id: '' }
+                          );
+                          queryClient.invalidateQueries({ queryKey: ['remediation-pending-approvals'] });
+                          queryClient.invalidateQueries({ queryKey: ['remediation-executions'] });
+                        } catch (err) {
+                          console.error('Approve execution failed:', err);
+                        }
+                      }}
+                      className="px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg font-medium transition"
+                    >
                       Approve
                     </button>
-                    <button className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg font-medium transition">
+                    <button
+                      onClick={async () => {
+                        const reason = window.prompt('Rejection reason:') || 'Rejected via UI';
+                        try {
+                          await api.post(
+                            `/remediation/executions/${approval.id || approval.execution_id}/reject`,
+                            { approver_id: '', reason }
+                          );
+                          queryClient.invalidateQueries({ queryKey: ['remediation-pending-approvals'] });
+                          queryClient.invalidateQueries({ queryKey: ['remediation-executions'] });
+                        } catch (err) {
+                          console.error('Reject execution failed:', err);
+                        }
+                      }}
+                      className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg font-medium transition"
+                    >
                       Reject
                     </button>
                   </div>
@@ -1237,7 +1279,24 @@ export default function Remediation() {
                 </p>
               </div>
 
-              <button className="w-full px-3 py-2 bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 text-gray-900 dark:text-white rounded-lg font-medium transition text-sm">
+              <button
+                onClick={async () => {
+                  try {
+                    const res = await api.post(
+                      `/integrations/installed/${integration.id}/test`,
+                      {}
+                    );
+                    alert(
+                      `Connection test: ${res.data?.status || 'completed'}`
+                    );
+                  } catch (err: any) {
+                    alert(
+                      `Connection test failed: ${err?.response?.data?.detail || err?.message || err}`
+                    );
+                  }
+                }}
+                className="w-full px-3 py-2 bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 text-gray-900 dark:text-white rounded-lg font-medium transition text-sm"
+              >
                 Test Connection
               </button>
             </div>

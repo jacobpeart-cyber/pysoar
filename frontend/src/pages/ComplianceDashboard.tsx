@@ -762,6 +762,7 @@ function POAMsTab({
   onDeletePOAM: (id: string) => void;
   overduePOAMs: number;
 }) {
+  const queryClient = useQueryClient();
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
@@ -970,7 +971,27 @@ function POAMsTab({
       </div>
 
       {/* Create POA&M Button */}
-      <button className="inline-flex items-center gap-2 px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium">
+      <button
+        onClick={async () => {
+          const title = window.prompt('POA&M title (weakness description):');
+          if (!title) return;
+          const control_id = window.prompt('Control ID (e.g. AC-2, SI-4):') || 'UNASSIGNED';
+          const severity = (window.prompt('Severity (low/medium/high/critical):') || 'medium').toLowerCase();
+          try {
+            await api.post('/compliance/poams', {
+              title,
+              weakness_description: title,
+              control_id,
+              severity,
+              status: 'open',
+            });
+            queryClient.invalidateQueries({ queryKey: ['compliance-poams'] });
+          } catch (err) {
+            console.error('Create POA&M failed:', err);
+          }
+        }}
+        className="inline-flex items-center gap-2 px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium"
+      >
         <Plus className="w-5 h-5" />
         Create POA&M
       </button>

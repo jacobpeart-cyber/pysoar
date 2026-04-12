@@ -291,9 +291,13 @@ export default function OTSecurityDashboard() {
                       className="w-full pl-10 pr-4 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
                     />
                   </div>
-                  <button className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                  <button
+                    onClick={() => setSearchQuery('')}
+                    className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                    title="Clear search"
+                  >
                     <Filter className="w-4 h-4" />
-                    Filter
+                    Clear
                   </button>
                 </div>
 
@@ -347,7 +351,11 @@ export default function OTSecurityDashboard() {
                               {asset.last_seen ? new Date(asset.last_seen).toLocaleString() : '\u2014'}
                             </td>
                             <td className="px-6 py-4 text-sm">
-                              <button className="text-blue-600 dark:text-blue-400 hover:underline">
+                              <button
+                                onClick={() => alert(JSON.stringify(asset, null, 2))}
+                                className="text-blue-600 dark:text-blue-400 hover:underline"
+                                title="View asset details"
+                              >
                                 <Eye className="w-4 h-4" />
                               </button>
                             </td>
@@ -408,9 +416,13 @@ export default function OTSecurityDashboard() {
                       className="w-full pl-10 pr-4 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
                     />
                   </div>
-                  <button className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                  <button
+                    onClick={() => setSearchQuery('')}
+                    className="flex items-center gap-2 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                    title="Clear search"
+                  >
                     <Filter className="w-4 h-4" />
-                    Filter
+                    Clear
                   </button>
                 </div>
 
@@ -437,27 +449,31 @@ export default function OTSecurityDashboard() {
                           </td>
                         </tr>
                       ) : (
-                        filteredAlerts.map((alert) => (
-                          <tr key={alert.id} className="border-b border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700 transition">
-                            <td className="px-6 py-4 text-sm font-medium">{alert.description}</td>
+                        filteredAlerts.map((otAlert) => (
+                          <tr key={otAlert.id} className="border-b border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700 transition">
+                            <td className="px-6 py-4 text-sm font-medium">{otAlert.description}</td>
                             <td className="px-6 py-4">
-                              <span className={`px-3 py-1 rounded-full text-xs font-medium ${getSeverityColor(alert.severity)}`}>
-                                {(alert.severity || '').toUpperCase()}
+                              <span className={`px-3 py-1 rounded-full text-xs font-medium ${getSeverityColor(otAlert.severity)}`}>
+                                {(otAlert.severity || '').toUpperCase()}
                               </span>
                             </td>
-                            <td className="px-6 py-4 text-sm font-mono">{alert.source_ip || '\u2014'}</td>
-                            <td className="px-6 py-4 text-sm">{alert.alert_type}</td>
-                            <td className="px-6 py-4 text-sm">{alert.mitre_ics_technique || '\u2014'}</td>
+                            <td className="px-6 py-4 text-sm font-mono">{otAlert.source_ip || '\u2014'}</td>
+                            <td className="px-6 py-4 text-sm">{otAlert.alert_type}</td>
+                            <td className="px-6 py-4 text-sm">{otAlert.mitre_ics_technique || '\u2014'}</td>
                             <td className="px-6 py-4">
-                              <span className={`px-3 py-1 rounded-full text-xs font-medium ${getStatusColor(alert.status)}`}>
-                                {alert.status}
+                              <span className={`px-3 py-1 rounded-full text-xs font-medium ${getStatusColor(otAlert.status)}`}>
+                                {otAlert.status}
                               </span>
                             </td>
                             <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                              {alert.created_at ? new Date(alert.created_at).toLocaleString() : '\u2014'}
+                              {otAlert.created_at ? new Date(otAlert.created_at).toLocaleString() : '\u2014'}
                             </td>
                             <td className="px-6 py-4 text-sm flex gap-2">
-                              <button className="text-blue-600 dark:text-blue-400 hover:underline">
+                              <button
+                                onClick={() => window.alert(JSON.stringify(otAlert, null, 2))}
+                                className="text-blue-600 dark:text-blue-400 hover:underline"
+                                title="View alert details"
+                              >
                                 <Eye className="w-4 h-4" />
                               </button>
                             </td>

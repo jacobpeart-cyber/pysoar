@@ -237,14 +237,17 @@ export default function SupplyChainDashboard() {
                         <button
                           onClick={async () => {
                             try {
-                              const res = await supplychainApi.getSBOMs();
-                              const items = Array.isArray(res) ? res : (res as any)?.items || [];
-                              const blob = new Blob([JSON.stringify(items.find((s: any) => s.id === sbom.id) || sbom, null, 2)], { type: 'application/json' });
+                              const { blob, filename } = await supplychainApi.downloadSBOM(
+                                sbom.id,
+                                'cyclonedx_json'
+                              );
                               const url = URL.createObjectURL(blob);
                               const a = document.createElement('a');
                               a.href = url;
-                              a.download = `${sbom.name}-sbom.json`;
+                              a.download = filename;
+                              document.body.appendChild(a);
                               a.click();
+                              document.body.removeChild(a);
                               URL.revokeObjectURL(url);
                             } catch (err) {
                               console.error('Error downloading SBOM:', err);

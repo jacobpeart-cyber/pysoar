@@ -344,6 +344,63 @@ async def get_evidence(
     return ForensicEvidenceResponse.model_validate(evidence)
 
 
+@router.get("/evidence/{evidence_id}/download")
+async def download_evidence(
+    evidence_id: str,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+):
+    """Download forensic evidence, appending a chain-of-custody entry.
+
+    Supports local filesystem ``storage_location`` paths (streams the file)
+    and HTTP(S) URLs (returns a 307 redirect to the signed URL). Every
+    download is appended to ``chain_of_custody_log`` as an immutable record
+    for NIST SP 800-86 compliance — who accessed what, when, and the SHA-256
+    at access time.
+    """
+    import os
+    from fastapi.responses import FileResponse, RedirectResponse
+
+    evidence = await get_evidence_or_404(db, evidence_id)
+
+    if not evidence.storage_location:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No storage_location set for this evidence item",
+        )
+
+    # Append chain-of-custody entry for this access
+    chain = dict(evidence.chain_of_custody_log or {})
+    entries = list(chain.get("entries", []))
+    entries.append({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "actor": getattr(current_user, "full_name", None) or current_user.email,
+        "action": "accessed_download",
+        "hash": evidence.original_hash_sha256,
+    })
+    chain["entries"] = entries
+    evidence.chain_of_custody_log = chain
+    await db.flush()
+
+    loc = evidence.storage_location
+    # Remote URL — redirect
+    if loc.startswith("http://") or loc.startswith("https://") or loc.startswith("s3://"):
+        return RedirectResponse(url=loc)
+
+    # Local path — stream
+    if not os.path.exists(loc):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Evidence file missing at storage_location",
+        )
+    filename = os.path.basename(loc) or f"evidence-{evidence_id}"
+    return FileResponse(
+        path=loc,
+        media_type="application/octet-stream",
+        filename=filename,
+    )
+
+
 @router.post("/evidence", response_model=ForensicEvidenceResponse, status_code=status.HTTP_201_CREATED)
 async def collect_evidence(
     evidence_data: ForensicEvidenceCreate,
