@@ -1023,19 +1023,42 @@ async def get_dashboard_overview(
         for v in top_vulns_result.scalars().all()
     ]
 
-    # Cluster compliance summary
+    # Cluster compliance summary with REAL findings counts per cluster
+    org_id = getattr(current_user, "organization_id", None)
     cluster_list_stmt = select(KubernetesCluster).where(
-        KubernetesCluster.organization_id == getattr(current_user, "organization_id", None)
+        KubernetesCluster.organization_id == org_id
     )
     cluster_list_result = await db.execute(cluster_list_stmt)
+    clusters = list(cluster_list_result.scalars().all())
+
+    # Fetch findings counts for all clusters in a single grouped query
+    findings_by_cluster: dict = {}
+    if clusters:
+        findings_count_result = await db.execute(
+            select(
+                K8sSecurityFinding.cluster_id,
+                func.count(K8sSecurityFinding.id),
+            )
+            .where(
+                and_(
+                    K8sSecurityFinding.organization_id == org_id,
+                    K8sSecurityFinding.cluster_id.in_([c.id for c in clusters]),
+                    K8sSecurityFinding.status == "open",
+                )
+            )
+            .group_by(K8sSecurityFinding.cluster_id)
+        )
+        for cluster_id, count in findings_count_result.all():
+            findings_by_cluster[cluster_id] = count
+
     cluster_compliance = []
-    for c in cluster_list_result.scalars().all():
+    for c in clusters:
         score = getattr(c, "compliance_score", 0) or 0
         cluster_compliance.append(
             ClusterComplianceResponse(
                 cluster_name=c.name,
                 compliance_score=int(score),
-                findings_count=0,
+                findings_count=findings_by_cluster.get(c.id, 0),
                 status="compliant" if score >= 80 else ("non_compliant" if score < 60 else "partial"),
             )
         )

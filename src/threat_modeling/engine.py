@@ -527,20 +527,83 @@ class AttackTreeGenerator:
         self, tree: dict[str, Any]
     ) -> dict[str, Any]:
         """
-        Calculate metrics for attack paths (cost, skill, probability)
+        Calculate real metrics for attack paths (cost, skill, probability)
+        derived from the threats actually present in the tree. Previous
+        version returned hardcoded fake values (average_cost=5000,
+        average_skill="medium", highest_probability=0.75) regardless of
+        the input — useless for any real assessment.
 
-        Args:
-            tree: Attack tree
-
-        Returns:
-            Path metrics
+        New behavior: walks the tree and computes metrics from each
+        threat's risk_score / likelihood / impact fields using standard
+        CAPEC-style heuristics.
         """
+        threats = self._flatten_tree(tree)
+        if not threats:
+            return {
+                "total_paths": 0,
+                "average_cost": 0,
+                "average_skill": "unknown",
+                "highest_probability": 0.0,
+            }
+
+        # Cost heuristic: lower-effort attacks (high-likelihood, low-risk-score)
+        # cost attackers less. Scale around 2k-50k USD based on inverse of
+        # risk_score + likelihood.
+        LIKELIHOOD_WEIGHTS = {"low": 0.25, "medium": 0.5, "high": 0.75, "critical": 1.0}
+        IMPACT_WEIGHTS = {"low": 0.25, "medium": 0.5, "high": 0.75, "critical": 1.0}
+
+        costs = []
+        probabilities = []
+        skill_levels = []
+
+        for t in threats:
+            lw = LIKELIHOOD_WEIGHTS.get((t.get("likelihood") or "medium").lower(), 0.5)
+            iw = IMPACT_WEIGHTS.get((t.get("impact") or "medium").lower(), 0.5)
+
+            # High-likelihood × low-impact = cheap attacks; inverse for costly
+            estimated_cost = int(50_000 * (1.0 - lw) + 2000)
+            costs.append(estimated_cost)
+
+            # Probability as the product of likelihood weight and a
+            # risk_score-normalized confidence (risk_score is 1..25 from the
+            # 5x5 matrix).
+            rs = float(t.get("risk_score") or 0)
+            probability = lw * min(1.0, rs / 25.0) if rs > 0 else lw * 0.5
+            probabilities.append(round(probability, 3))
+
+            # Skill inferred from impact: higher impact threats generally
+            # require more sophisticated attackers.
+            if iw >= 0.75:
+                skill_levels.append("high")
+            elif iw >= 0.5:
+                skill_levels.append("medium")
+            else:
+                skill_levels.append("low")
+
+        # Most common skill level wins
+        skill_counts = {"low": 0, "medium": 0, "high": 0}
+        for s in skill_levels:
+            skill_counts[s] = skill_counts.get(s, 0) + 1
+        dominant_skill = max(skill_counts.items(), key=lambda kv: kv[1])[0]
+
         return {
             "total_paths": self._count_paths(tree),
-            "average_cost": 5000,
-            "average_skill": "medium",
-            "highest_probability": 0.75,
+            "average_cost": int(sum(costs) / len(costs)),
+            "average_skill": dominant_skill,
+            "highest_probability": max(probabilities) if probabilities else 0.0,
+            "threat_count": len(threats),
         }
+
+    def _flatten_tree(self, tree: dict[str, Any]) -> list[dict[str, Any]]:
+        """Recursively flatten an attack tree into a list of threat dicts."""
+        out: list[dict[str, Any]] = []
+        if not tree or not isinstance(tree, dict):
+            return out
+        if tree.get("goal") or tree.get("risk_score") is not None:
+            out.append(tree)
+        for child in tree.get("children", []) or []:
+            out.extend(self._flatten_tree(child))
+        return out
 
     def _count_paths(self, node: dict[str, Any]) -> int:
         """Count total attack paths in tree"""

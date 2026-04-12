@@ -344,10 +344,14 @@ class VulnerabilityScanner:
                 db.add(vuln)
                 count += 1
             else:
-                # Update existing
+                # Update existing (tenant-scoped — without this every tenant
+                # with the same CVE would overwrite each other's row)
                 result = await db.execute(
                     select(Vulnerability).where(
-                        Vulnerability.cve_id == finding["cve_id"]
+                        and_(
+                            Vulnerability.cve_id == finding["cve_id"],
+                            Vulnerability.organization_id == self.organization_id,
+                        )
                     )
                 )
                 vuln = result.scalar_one_or_none()
@@ -600,18 +604,14 @@ class PatchOrchestrator:
         patch_operation_id: str,
         deployment_date: str,
     ) -> bool:
-        """Schedule patch deployment
-
-        Args:
-            db: Database session
-            patch_operation_id: Patch operation ID
-            deployment_date: Scheduled deployment date
-
-        Returns:
-            Success status
-        """
+        """Schedule patch deployment (tenant-scoped)."""
         result = await db.execute(
-            select(PatchOperation).where(PatchOperation.id == patch_operation_id)
+            select(PatchOperation).where(
+                and_(
+                    PatchOperation.id == patch_operation_id,
+                    PatchOperation.organization_id == self.organization_id,
+                )
+            )
         )
         patch_op = result.scalar_one_or_none()
         if not patch_op:
@@ -628,18 +628,14 @@ class PatchOrchestrator:
         patch_operation_id: str,
         verification_results: dict[str, Any],
     ) -> bool:
-        """Verify patch deployment
-
-        Args:
-            db: Database session
-            patch_operation_id: Patch operation ID
-            verification_results: Verification test results
-
-        Returns:
-            Verification success status
-        """
+        """Verify patch deployment (tenant-scoped)."""
         result = await db.execute(
-            select(PatchOperation).where(PatchOperation.id == patch_operation_id)
+            select(PatchOperation).where(
+                and_(
+                    PatchOperation.id == patch_operation_id,
+                    PatchOperation.organization_id == self.organization_id,
+                )
+            )
         )
         patch_op = result.scalar_one_or_none()
         if not patch_op:
@@ -662,18 +658,14 @@ class PatchOrchestrator:
         patch_operation_id: str,
         reason: str,
     ) -> bool:
-        """Rollback patch deployment
-
-        Args:
-            db: Database session
-            patch_operation_id: Patch operation ID
-            reason: Rollback reason
-
-        Returns:
-            Rollback success status
-        """
+        """Rollback patch deployment (tenant-scoped)."""
         result = await db.execute(
-            select(PatchOperation).where(PatchOperation.id == patch_operation_id)
+            select(PatchOperation).where(
+                and_(
+                    PatchOperation.id == patch_operation_id,
+                    PatchOperation.organization_id == self.organization_id,
+                )
+            )
         )
         patch_op = result.scalar_one_or_none()
         if not patch_op or not patch_op.rollback_available:
