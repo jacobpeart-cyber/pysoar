@@ -380,7 +380,7 @@ def sync_kev_database(self, organization_id: str | None = None) -> dict:
     kev_url = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
 
     try:
-        from src.models.ioc import IOC, IOCStatus, IOCType, ThreatLevel
+        from src.intel.models import ThreatIndicator
 
         async def _sync() -> dict[str, int]:
             updated = 0
@@ -405,9 +405,9 @@ def sync_kev_database(self, organization_id: str | None = None) -> dict:
                     if not cve_id:
                         continue
 
-                    stmt = select(IOC).where(
-                        IOC.value == cve_id,
-                        IOC.ioc_type == IOCType.CVE.value,
+                    stmt = select(ThreatIndicator).where(
+                        ThreatIndicator.value == cve_id,
+                        ThreatIndicator.indicator_type == "cve",
                     )
                     existing = (await session.execute(stmt)).scalar_one_or_none()
 
@@ -415,23 +415,31 @@ def sync_kev_database(self, organization_id: str | None = None) -> dict:
                     source_ref = entry.get("vendorProject")
 
                     if existing:
-                        existing.status = IOCStatus.ACTIVE.value
-                        existing.threat_level = ThreatLevel.HIGH.value
-                        if description:
-                            existing.description = description
+                        existing.is_active = True
+                        existing.severity = "high"
                         existing.source = "CISA KEV"
+                        ctx = dict(existing.context) if isinstance(existing.context, dict) else {}
+                        if description:
+                            ctx["description"] = description
+                        if source_ref:
+                            ctx["source_reference"] = source_ref
+                        ctx["source_url"] = kev_url
+                        existing.context = ctx
                         updated += 1
                     else:
-                        ioc = IOC(
+                        ioc = ThreatIndicator(
                             value=cve_id,
-                            ioc_type=IOCType.CVE.value,
-                            status=IOCStatus.ACTIVE.value,
-                            threat_level=ThreatLevel.HIGH.value,
+                            indicator_type="cve",
+                            is_active=True,
+                            is_whitelisted=False,
+                            severity="high",
                             confidence=95,
-                            description=description,
                             source="CISA KEV",
-                            source_url=kev_url,
-                            source_reference=source_ref,
+                            context={
+                                "description": description,
+                                "source_url": kev_url,
+                                "source_reference": source_ref,
+                            },
                         )
                         session.add(ioc)
                         created += 1

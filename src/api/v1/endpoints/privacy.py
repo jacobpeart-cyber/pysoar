@@ -967,10 +967,11 @@ async def get_privacy_stats(
         )
         incidents_this_month = (await db.execute(month_inc_stmt)).scalar() or 0
 
-        # Average incident resolution days (from created_at to updated_at for closed/remediated)
+        # Average incident resolution days (PostgreSQL-compatible, not SQLite julianday)
         resolution_stmt = select(
             func.avg(
-                func.julianday(PrivacyIncident.updated_at) - func.julianday(PrivacyIncident.created_at)
+                func.extract("epoch", PrivacyIncident.updated_at - PrivacyIncident.created_at)
+                / 86400.0
             )
         ).where(
             and_(
@@ -985,7 +986,6 @@ async def get_privacy_stats(
             avg_resolution = (await db.execute(resolution_stmt)).scalar()
             avg_incident_resolution_days = round(float(avg_resolution), 1) if avg_resolution else 0.0
         except Exception:
-            # julianday may not be available on all DB backends; fall back to 0
             avg_incident_resolution_days = 0.0
 
         stats = PrivacyDashboardStats(

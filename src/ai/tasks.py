@@ -312,7 +312,7 @@ def generate_daily_threat_briefing():
             from src.core.database import async_session_factory
             from src.models.alert import Alert
             from src.models.incident import Incident
-            from src.models.ioc import IOC
+            from src.intel.models import ThreatIndicator as IOC
 
             async with async_session_factory() as session:
                 cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
@@ -351,7 +351,7 @@ def generate_daily_threat_briefing():
 
                 # IOC counts
                 ioc_result = await session.execute(
-                    select(func.count(IOC.id)).where(IOC.status == "active")
+                    select(func.count(IOC.id)).where(IOC.is_active == True)  # noqa: E712
                 )
                 active_iocs = ioc_result.scalar() or 0
 
@@ -476,8 +476,25 @@ def check_model_drift():
 
         detector = AnomalyDetector()
 
-        # Simulate checking multiple models
-        models_to_check = ["isolation_forest_v1", "statistical_detector_v2", "lstm_timeseries_v1"]
+        # Query deployed models from the database
+        from src.core.database import async_session_factory
+        from src.ai.models import MLModel
+
+        async def _get_deployed_models():
+            async with async_session_factory() as db:
+                query = select(MLModel.name).where(MLModel.status == "deployed")
+                result = await db.execute(query)
+                return [row[0] for row in result.all()]
+
+        models_to_check = _run_async(_get_deployed_models())
+        if not models_to_check:
+            # Fallback: check all models in the registry
+            async def _get_all_models():
+                async with async_session_factory() as db:
+                    query = select(MLModel.name)
+                    result = await db.execute(query)
+                    return [row[0] for row in result.all()]
+            models_to_check = _run_async(_get_all_models())
 
         drift_results = {}
         models_needing_retrain = []

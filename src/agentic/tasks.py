@@ -300,12 +300,56 @@ def autonomous_triage(
                         "alerts_processed": 0,
                     }
 
-                # Simulate alert triage
+                # Query untriaged alerts for this organization
+                from src.models.alert import Alert, AlertStatus
+                alert_query = select(Alert).where(
+                    Alert.organization_id == organization_id,
+                    Alert.status == AlertStatus.NEW.value,
+                ).order_by(Alert.severity.desc()).limit(alert_batch_size)
+                alert_result = await db.execute(alert_query)
+                alerts = list(alert_result.scalars().all())
+
+                if not alerts:
+                    return {
+                        "status": "success",
+                        "alerts_processed": 0,
+                        "agents_used": 0,
+                        "investigations_created": 0,
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    }
+
+                # Triage each alert: assign severity-based priority and create investigations
+                investigations_created = 0
+                severity_priority = {"critical": 1, "high": 2, "medium": 3, "low": 4, "info": 5}
+                agent_idx = 0
+
+                for alert in alerts:
+                    alert.status = "triaged"
+                    priority = severity_priority.get(alert.severity, 3)
+
+                    # Create investigation for high-priority alerts
+                    if priority <= 2 and agent_idx < len(agents):
+                        agent = agents[agent_idx]
+                        investigation = Investigation(
+                            organization_id=organization_id,
+                            alert_id=alert.id,
+                            agent_id=agent.id,
+                            status=InvestigationStatus.IN_PROGRESS.value,
+                            priority=priority,
+                            hypothesis=f"Auto-triage investigation for {alert.severity} alert: {alert.title}",
+                        )
+                        db.add(investigation)
+                        agent.status = AgentStatus.INVESTIGATING.value
+                        investigations_created += 1
+                        agent_idx = (agent_idx + 1) % len(agents)
+
+                await db.commit()
+
                 return {
                     "status": "success",
-                    "alerts_processed": min(alert_batch_size, 5),
-                    "agents_used": len(agents),
-                    "investigations_created": 3,
+                    "alerts_processed": len(alerts),
+                    "agents_used": min(agent_idx + 1, len(agents)) if alerts else 0,
+                    "investigations_created": investigations_created,
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
 

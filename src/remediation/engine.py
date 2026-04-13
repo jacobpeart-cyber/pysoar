@@ -22,7 +22,7 @@ from sqlalchemy import select, and_
 from src.core.logging import get_logger
 from src.core.config import settings
 from src.models.base import utc_now
-from src.models.ioc import IOC, IOCStatus, IOCType, ThreatLevel
+from src.intel.models import ThreatIndicator
 from src.models.asset import Asset, AssetStatus
 from src.models.user import User
 from src.tickethub.models import TicketActivity
@@ -613,27 +613,31 @@ class FirewallBlockExecutor(ActionExecutor):
     async def execute(self, target: str, parameters: dict, context: dict) -> dict:
         execution_id, org_id, actor_id = _get_execution_context(context)
         duration_hours = parameters.get("duration_hours", 24)
-        expires_at = (utc_now() + timedelta(hours=duration_hours)).isoformat()
+        now = utc_now()
+        expires_at = now + timedelta(hours=duration_hours)
 
         self.logger.info(
             "Creating firewall block IOC",
             extra={"target": target, "duration_hours": duration_hours},
         )
 
-        ioc = IOC(
+        ioc = ThreatIndicator(
             id=str(uuid4()),
             value=target,
-            ioc_type=IOCType.IP.value,
-            status=IOCStatus.ACTIVE.value,
-            threat_level=ThreatLevel.HIGH.value,
+            indicator_type="ipv4",
+            is_active=True,
+            is_whitelisted=False,
+            severity="high",
             confidence=90,
-            description=f"Blocked via remediation execution {execution_id}",
             source="remediation_engine",
-            source_reference=execution_id,
-            tags=json.dumps(["blocked", "firewall", "auto_remediation"]),
-            category="blocked",
-            first_seen=utc_now().isoformat(),
-            last_seen=utc_now().isoformat(),
+            tags=["blocked", "firewall", "auto_remediation"],
+            context={
+                "description": f"Blocked via remediation execution {execution_id}",
+                "source_reference": execution_id,
+                "category": "blocked",
+            },
+            first_seen=now,
+            last_seen=now,
             expires_at=expires_at,
         )
         self.db.add(ioc)

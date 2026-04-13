@@ -22,7 +22,7 @@ from src.darkweb.engine import (
 )
 from src.darkweb.models import DarkWebFinding, DarkWebMonitor
 from src.models.incident import Incident
-from src.models.ioc import IOC
+from src.intel.models import ThreatIndicator as IOC
 
 logger = get_logger(__name__)
 
@@ -326,8 +326,32 @@ def takedown_status_check(
 
         brand_protection = BrandProtection()
 
-        # Simulate status check
-        status = await_sync_wrapper(brand_protection.track_takedown_status(takedown_id))
+        # Query the DarkWebMonitor/DarkWebFinding for real takedown status
+        import asyncio
+        from src.core.database import async_session_factory
+
+        async def _check_status():
+            async with async_session_factory() as db:
+                # Look up the finding associated with this takedown
+                finding_query = select(DarkWebFinding).where(
+                    DarkWebFinding.id == threat_id
+                )
+                result = await db.execute(finding_query)
+                finding = result.scalar_one_or_none()
+
+                if finding:
+                    return {
+                        "takedown_id": takedown_id,
+                        "status": finding.status if hasattr(finding, 'status') else "in_progress",
+                        "last_updated": finding.updated_at.isoformat() if hasattr(finding, 'updated_at') and finding.updated_at else datetime.now(timezone.utc).isoformat(),
+                        "finding_type": finding.finding_type,
+                        "source_platform": finding.source_platform,
+                    }
+                else:
+                    # Fall back to the brand_protection engine
+                    return await brand_protection.track_takedown_status(takedown_id)
+
+        status = asyncio.run(_check_status())
 
         logger.info(f"Takedown {takedown_id} status: {status.get('status')}")
 
@@ -415,9 +439,9 @@ def threat_correlation(
                     {
                         "id": i.id,
                         "value": i.value,
-                        "type": i.ioc_type,
+                        "type": i.indicator_type,
                         "source": i.source,
-                        "threat_level": i.threat_level,
+                        "threat_level": i.severity,
                         "confidence": i.confidence,
                     }
                     for i in iocs

@@ -5,7 +5,7 @@ Real cloud API integration for AWS, Azure, and GCP compliance assessments.
 Implements live checks against cloud infrastructure for NIST 800-53 controls.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass, asdict
 import logging
@@ -82,7 +82,7 @@ class AWSComplianceChecker:
         control_id = "AC-2"
         findings = []
         evidence = {}
-        checked_at = datetime.utcnow()
+        checked_at = datetime.now(timezone.utc)
 
         if not self.session:
             return CloudCheckResult(
@@ -142,7 +142,7 @@ class AWSComplianceChecker:
                     })
 
             # Check inactive accounts
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
             ninety_days_ago = now - timedelta(days=90)
             inactive_users = []
 
@@ -197,7 +197,7 @@ class AWSComplianceChecker:
         control_id = "IA-2"
         findings = []
         evidence = {}
-        checked_at = datetime.utcnow()
+        checked_at = datetime.now(timezone.utc)
 
         if not self.session:
             return CloudCheckResult(
@@ -271,7 +271,7 @@ class AWSComplianceChecker:
         control_id = "SC-7"
         findings = []
         evidence = {}
-        checked_at = datetime.utcnow()
+        checked_at = datetime.now(timezone.utc)
         resource_count = 0
         compliant_count = 0
 
@@ -373,7 +373,7 @@ class AWSComplianceChecker:
         control_id = "SC-28"
         findings = []
         evidence = {}
-        checked_at = datetime.utcnow()
+        checked_at = datetime.now(timezone.utc)
         resource_count = 0
         compliant_count = 0
 
@@ -489,7 +489,7 @@ class AWSComplianceChecker:
         control_id = "SI-2"
         findings = []
         evidence = {}
-        checked_at = datetime.utcnow()
+        checked_at = datetime.now(timezone.utc)
 
         if not self.session:
             return CloudCheckResult(
@@ -563,7 +563,7 @@ class AWSComplianceChecker:
         control_id = "AU-2"
         findings = []
         evidence = {}
-        checked_at = datetime.utcnow()
+        checked_at = datetime.now(timezone.utc)
 
         if not self.session:
             return CloudCheckResult(
@@ -653,7 +653,7 @@ class AWSComplianceChecker:
         control_id = "CM-6"
         findings = []
         evidence = {}
-        checked_at = datetime.utcnow()
+        checked_at = datetime.now(timezone.utc)
 
         if not self.session:
             return CloudCheckResult(
@@ -746,7 +746,7 @@ class AWSComplianceChecker:
         control_id = "SC-8"
         findings = []
         evidence = {}
-        checked_at = datetime.utcnow()
+        checked_at = datetime.now(timezone.utc)
 
         if not self.session:
             return CloudCheckResult(
@@ -790,7 +790,7 @@ class AWSComplianceChecker:
                 certificates = certs_response.get("CertificateSummaryList", [])
 
                 expiring_soon = []
-                now = datetime.utcnow()
+                now = datetime.now(timezone.utc)
                 for cert in certificates:
                     if cert.get("DomainName"):
                         expiring_soon.append(cert["DomainName"])
@@ -841,7 +841,7 @@ class AWSComplianceChecker:
         control_id = "RA-5"
         findings = []
         evidence = {}
-        checked_at = datetime.utcnow()
+        checked_at = datetime.now(timezone.utc)
 
         if not self.session:
             return CloudCheckResult(
@@ -915,7 +915,7 @@ class AWSComplianceChecker:
         control_id = "CP-9"
         findings = []
         evidence = {}
-        checked_at = datetime.utcnow()
+        checked_at = datetime.now(timezone.utc)
 
         if not self.session:
             return CloudCheckResult(
@@ -1015,7 +1015,7 @@ class AzureComplianceChecker:
         control_id = "AC-2"
         findings = []
         evidence = {"provider": "azure"}
-        checked_at = datetime.utcnow()
+        checked_at = datetime.now(timezone.utc)
 
         if not self.credential:
             return CloudCheckResult(
@@ -1060,7 +1060,7 @@ class AzureComplianceChecker:
         control_id = "SC-7"
         findings = []
         evidence = {"provider": "azure"}
-        checked_at = datetime.utcnow()
+        checked_at = datetime.now(timezone.utc)
 
         if not self.credential:
             return CloudCheckResult(
@@ -1105,7 +1105,7 @@ class AzureComplianceChecker:
         control_id = "SC-28"
         findings = []
         evidence = {"provider": "azure"}
-        checked_at = datetime.utcnow()
+        checked_at = datetime.now(timezone.utc)
 
         if not self.credential:
             return CloudCheckResult(
@@ -1150,7 +1150,7 @@ class AzureComplianceChecker:
         control_id = "AU-2"
         findings = []
         evidence = {"provider": "azure"}
-        checked_at = datetime.utcnow()
+        checked_at = datetime.now(timezone.utc)
 
         if not self.credential:
             return CloudCheckResult(
@@ -1215,7 +1215,7 @@ class GCPComplianceChecker:
         control_id = "AC-2"
         findings = []
         evidence = {"provider": "gcp"}
-        checked_at = datetime.utcnow()
+        checked_at = datetime.now(timezone.utc)
 
         if not self.iam_client:
             return CloudCheckResult(
@@ -1260,7 +1260,7 @@ class GCPComplianceChecker:
         control_id = "SC-7"
         findings = []
         evidence = {"provider": "gcp"}
-        checked_at = datetime.utcnow()
+        checked_at = datetime.now(timezone.utc)
 
         if not self.iam_client:
             return CloudCheckResult(
@@ -1304,7 +1304,7 @@ class GCPComplianceChecker:
         control_id = "SC-28"
         findings = []
         evidence = {"provider": "gcp"}
-        checked_at = datetime.utcnow()
+        checked_at = datetime.now(timezone.utc)
 
         if not self.iam_client:
             return CloudCheckResult(
@@ -1549,7 +1549,7 @@ class CloudComplianceOrchestrator:
         Returns:
             Comprehensive evidence package with timestamps and details
         """
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
 
         return {
             "generated_at": now.isoformat(),

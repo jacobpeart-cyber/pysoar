@@ -170,11 +170,11 @@ class RemediationExecution(BaseModel):
     approved_by: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("users.id"), nullable=True
     )
-    approved_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Execution timeline
-    started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
-    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Target and actions
     target_entity: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -195,7 +195,7 @@ class RemediationExecution(BaseModel):
         String(50), nullable=True,
         comment="pending, in_progress, completed, failed"
     )
-    rolled_back_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    rolled_back_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Metrics
     metrics: Mapped[dict] = mapped_column(JSON, nullable=False, default={})

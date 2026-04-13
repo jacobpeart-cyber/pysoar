@@ -6,7 +6,7 @@ Supports continuous monitoring, POA&M tracking, and automated evidence collectio
 """
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List
 from celery import shared_task
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
@@ -114,7 +114,7 @@ def check_poam_deadlines(self, org_id: str):
             async with AsyncSessionLocal() as db:
                 from sqlalchemy import select, and_
 
-                now = datetime.utcnow()
+                now = datetime.now(timezone.utc)
                 warning_threshold = now + timedelta(days=7)
 
                 # Check overdue
@@ -172,7 +172,7 @@ def collect_automated_evidence(self, org_id: str):
             async with AsyncSessionLocal() as db:
                 from sqlalchemy import select, and_, func
 
-                now = datetime.utcnow()
+                now = datetime.now(timezone.utc)
                 evidence_cutoff = now - timedelta(days=90)
 
                 # Get all controls for the organization
@@ -298,7 +298,7 @@ def check_cisa_directives(self, org_id: str):
                 result = await db.execute(stmt)
                 active_directives = result.scalars().all()
 
-                now = datetime.utcnow()
+                now = datetime.now(timezone.utc)
                 approaching_deadline = [
                     d
                     for d in active_directives
@@ -353,7 +353,7 @@ def generate_compliance_reports(self, org_id: str, report_type: str = "weekly"):
 
                 report_data = {
                     "report_type": report_type,
-                    "generated_at": datetime.utcnow().isoformat(),
+                    "generated_at": datetime.now(timezone.utc).isoformat(),
                     "org_id": org_id,
                     "frameworks": [],
                 }
@@ -451,7 +451,7 @@ def validate_cui_markings(self, org_id: str):
                 result = await db.execute(stmt)
                 cui_markings = result.scalars().all()
 
-                now = datetime.utcnow()
+                now = datetime.now(timezone.utc)
                 expired_count = 0
                 active_count = 0
 

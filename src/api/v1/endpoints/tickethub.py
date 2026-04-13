@@ -71,10 +71,14 @@ async def get_ticket_detail(
     if not ticket:
         raise HTTPException(status_code=404, detail="Ticket not found")
 
-    # Get comments
+    # Get comments (tenant-scoped)
     comments_result = await db.execute(
         select(TicketComment)
-        .where(TicketComment.source_type == source_type, TicketComment.source_id == source_id)
+        .where(
+            TicketComment.source_type == source_type,
+            TicketComment.source_id == source_id,
+            TicketComment.organization_id == org_id,
+        )
         .order_by(TicketComment.created_at.asc())
     )
     comments = [
@@ -89,10 +93,14 @@ async def get_ticket_detail(
         for c in comments_result.scalars().all()
     ]
 
-    # Get activity
+    # Get activity (tenant-scoped)
     activity_result = await db.execute(
         select(TicketActivity)
-        .where(TicketActivity.source_type == source_type, TicketActivity.source_id == source_id)
+        .where(
+            TicketActivity.source_type == source_type,
+            TicketActivity.source_id == source_id,
+            TicketActivity.organization_id == org_id,
+        )
         .order_by(TicketActivity.created_at.desc())
         .limit(50)
     )
@@ -109,11 +117,12 @@ async def get_ticket_detail(
         for a in activity_result.scalars().all()
     ]
 
-    # Get links
+    # Get links (tenant-scoped)
     links_result = await db.execute(
         select(TicketLink).where(
+            TicketLink.organization_id == org_id,
             (TicketLink.source_type_a == source_type) & (TicketLink.source_id_a == source_id)
-            | (TicketLink.source_type_b == source_type) & (TicketLink.source_id_b == source_id)
+            | (TicketLink.source_type_b == source_type) & (TicketLink.source_id_b == source_id),
         )
     )
     links = [
@@ -147,12 +156,16 @@ async def update_ticket_status(
     if not new_status:
         raise HTTPException(status_code=400, detail="status is required")
 
-    # Get source model and update
+    # Get source model and update (tenant-scoped)
     model = _get_source_model(source_type)
     if not model:
         raise HTTPException(status_code=400, detail=f"Unknown source type: {source_type}")
 
-    result = await db.execute(select(model).where(model.id == source_id))
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(model).where(model.id == source_id)
+    if hasattr(model, "organization_id"):
+        stmt = stmt.where(model.organization_id == org_id)
+    result = await db.execute(stmt)
     record = result.scalars().first()
     if not record:
         raise HTTPException(status_code=404, detail="Ticket not found")
@@ -218,12 +231,16 @@ async def move_kanban_card(
 
     new_status = target_statuses[0]  # Use first valid status
 
-    # Update source record
+    # Update source record (tenant-scoped)
     model = _get_source_model(source_type)
     if not model:
         raise HTTPException(status_code=400, detail=f"Unknown source type: {source_type}")
 
-    result = await db.execute(select(model).where(model.id == source_id))
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(model).where(model.id == source_id)
+    if hasattr(model, "organization_id"):
+        stmt = stmt.where(model.organization_id == org_id)
+    result = await db.execute(stmt)
     record = result.scalars().first()
     if not record:
         raise HTTPException(status_code=404, detail="Ticket not found")
@@ -263,9 +280,14 @@ async def list_comments(
     db: DatabaseSession = None,
 ):
     """List comments on a ticket."""
+    org_id = getattr(current_user, "organization_id", None)
     result = await db.execute(
         select(TicketComment)
-        .where(TicketComment.source_type == source_type, TicketComment.source_id == source_id)
+        .where(
+            TicketComment.source_type == source_type,
+            TicketComment.source_id == source_id,
+            TicketComment.organization_id == org_id,
+        )
         .order_by(TicketComment.created_at.asc())
     )
     return list(result.scalars().all())
@@ -315,8 +337,14 @@ async def delete_comment(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Delete a comment."""
-    result = await db.execute(select(TicketComment).where(TicketComment.id == comment_id))
+    """Delete a comment (tenant-scoped)."""
+    org_id = getattr(current_user, "organization_id", None)
+    result = await db.execute(
+        select(TicketComment).where(
+            TicketComment.id == comment_id,
+            TicketComment.organization_id == org_id,
+        )
+    )
     comment = result.scalars().first()
     if not comment:
         raise HTTPException(status_code=404, detail="Comment not found")
@@ -336,10 +364,15 @@ async def get_activity_log(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Get activity timeline for a ticket."""
+    """Get activity timeline for a ticket (tenant-scoped)."""
+    org_id = getattr(current_user, "organization_id", None)
     result = await db.execute(
         select(TicketActivity)
-        .where(TicketActivity.source_type == source_type, TicketActivity.source_id == source_id)
+        .where(
+            TicketActivity.source_type == source_type,
+            TicketActivity.source_id == source_id,
+            TicketActivity.organization_id == org_id,
+        )
         .order_by(TicketActivity.created_at.desc())
         .limit(100)
     )
@@ -399,8 +432,14 @@ async def update_automation_rule(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Update an automation rule."""
-    result = await db.execute(select(AutomationRule).where(AutomationRule.id == rule_id))
+    """Update an automation rule (tenant-scoped)."""
+    org_id = getattr(current_user, "organization_id", None)
+    result = await db.execute(
+        select(AutomationRule).where(
+            AutomationRule.id == rule_id,
+            AutomationRule.organization_id == org_id,
+        )
+    )
     rule = result.scalars().first()
     if not rule:
         raise HTTPException(status_code=404, detail="Rule not found")
@@ -424,8 +463,14 @@ async def delete_automation_rule(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Delete an automation rule."""
-    result = await db.execute(select(AutomationRule).where(AutomationRule.id == rule_id))
+    """Delete an automation rule (tenant-scoped)."""
+    org_id = getattr(current_user, "organization_id", None)
+    result = await db.execute(
+        select(AutomationRule).where(
+            AutomationRule.id == rule_id,
+            AutomationRule.organization_id == org_id,
+        )
+    )
     rule = result.scalars().first()
     if not rule:
         raise HTTPException(status_code=404, detail="Rule not found")
@@ -470,11 +515,13 @@ async def get_ticket_links(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Get linked tickets."""
+    """Get linked tickets (tenant-scoped)."""
+    org_id = getattr(current_user, "organization_id", None)
     result = await db.execute(
         select(TicketLink).where(
+            TicketLink.organization_id == org_id,
             (TicketLink.source_type_a == source_type) & (TicketLink.source_id_a == source_id)
-            | (TicketLink.source_type_b == source_type) & (TicketLink.source_id_b == source_id)
+            | (TicketLink.source_type_b == source_type) & (TicketLink.source_id_b == source_id),
         )
     )
     return list(result.scalars().all())

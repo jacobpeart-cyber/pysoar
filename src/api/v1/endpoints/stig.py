@@ -10,7 +10,7 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Body
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, desc
 
 from src.api.deps import CurrentUser, DatabaseSession, get_current_active_user
 from src.core.database import get_db
@@ -464,21 +464,33 @@ async def get_stig_stats(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
 ):
-    """Get STIG compliance dashboard statistics"""
+    """Get STIG compliance dashboard statistics.
+
+    Returns real benchmark and scan aggregates plus the three fields
+    the frontend actually renders on the dashboard tab
+    (``compliance_by_benchmark``, ``findings_by_severity``,
+    ``recent_scans``). These three were silently missing from the
+    schema historically, so the UI always showed zeros even when real
+    scans existed.
+    """
+    org_id = getattr(current_user, "organization_id", None)
+
     try:
         # Count benchmarks
         bench_query = select(STIGBenchmark).where(
-            STIGBenchmark.organization_id == getattr(current_user, "organization_id", None)
+            STIGBenchmark.organization_id == org_id
         )
-        benchmarks = await db.scalars(bench_query)
-        total_benchmarks = len(list(benchmarks))
+        benchmarks = list(await db.scalars(bench_query))
+        benchmarks_by_id = {b.id: b for b in benchmarks}
+        total_benchmarks = len(benchmarks)
 
         # Count scans
-        scan_query = select(STIGScanResult).where(
-            STIGScanResult.organization_id == getattr(current_user, "organization_id", None)
+        scan_query = (
+            select(STIGScanResult)
+            .where(STIGScanResult.organization_id == org_id)
+            .order_by(desc(STIGScanResult.created_at))
         )
-        scans = await db.scalars(scan_query)
-        scan_list = list(scans)
+        scan_list = list(await db.scalars(scan_query))
         total_scans = len(scan_list)
 
         # Calculate averages and totals
@@ -487,6 +499,7 @@ async def get_stig_stats(
             if total_scans > 0
             else 0.0
         )
+        # STIG CAT I = High, CAT II = Medium, CAT III = Low
         critical_findings = sum(s.cat1_open for s in scan_list)
         high_findings = sum(s.cat2_open for s in scan_list)
         medium_findings = sum(s.cat3_open for s in scan_list)
@@ -497,20 +510,85 @@ async def get_stig_stats(
             else None
         )
 
+        # --- compliance_by_benchmark (real aggregate) ---
+        compliance_by_benchmark: list[dict] = []
+        benchmark_scan_buckets: dict[str, list[float]] = {}
+        for s in scan_list:
+            if s.benchmark_id_ref:
+                benchmark_scan_buckets.setdefault(s.benchmark_id_ref, []).append(
+                    float(s.compliance_percentage or 0)
+                )
+        for bench_id, pcts in benchmark_scan_buckets.items():
+            bench = benchmarks_by_id.get(bench_id)
+            if bench is None or not pcts:
+                continue
+            compliance_by_benchmark.append({
+                "name": bench.title or bench.benchmark_id,
+                "percentage": round(sum(pcts) / len(pcts), 1),
+            })
+
+        # --- findings_by_severity (matches frontend bar chart) ---
+        findings_by_severity = {
+            "CAT I": critical_findings,
+            "CAT II": high_findings,
+            "CAT III": medium_findings,
+        }
+
+        # --- recent_scans (last 5 completed, serialized for table) ---
+        recent_scans = [
+            {
+                "id": s.id,
+                "host": s.target_host,
+                "benchmark": (
+                    benchmarks_by_id.get(s.benchmark_id_ref).title
+                    if s.benchmark_id_ref and benchmarks_by_id.get(s.benchmark_id_ref)
+                    else "unknown"
+                ),
+                "status": s.status,
+                "compliance": float(s.compliance_percentage or 0),
+                "findings": {
+                    "open": (s.cat1_open or 0) + (s.cat2_open or 0) + (s.cat3_open or 0),
+                    "naf": 0,
+                    "na": 0,
+                    "nr": 0,
+                },
+                "date": s.completed_at.isoformat() if s.completed_at else (s.created_at.isoformat() if s.created_at else None),
+            }
+            for s in scan_list[:5]
+        ]
+
+        # --- real compliance_trend (improving/declining/stable) ---
+        compliance_trend = "stable"
+        if total_scans >= 2:
+            # Compare the most recent 5 scans' average to the prior 5.
+            recent_window = scan_list[:5]
+            prior_window = scan_list[5:10] if total_scans >= 6 else []
+            if prior_window:
+                recent_avg = sum(s.compliance_percentage or 0 for s in recent_window) / len(recent_window)
+                prior_avg = sum(s.compliance_percentage or 0 for s in prior_window) / len(prior_window)
+                delta = recent_avg - prior_avg
+                if delta >= 2.0:
+                    compliance_trend = "improving"
+                elif delta <= -2.0:
+                    compliance_trend = "declining"
+
         return STIGDashboardStats(
-            organization_id=getattr(current_user, "organization_id", None),
+            organization_id=org_id or "",
             total_benchmarks=total_benchmarks,
             total_scans=total_scans,
-            average_compliance=avg_compliance,
+            average_compliance=round(avg_compliance, 1),
             critical_findings=critical_findings,
             high_findings=high_findings,
             medium_findings=medium_findings,
             low_findings=0,
             last_scan_date=last_scan_date,
             scans_this_month=len(
-                [s for s in scan_list if s.created_at.month == datetime.utcnow().month]
+                [s for s in scan_list if s.created_at and s.created_at.month == datetime.utcnow().month]
             ),
-            compliance_trend="stable",
+            compliance_trend=compliance_trend,
+            compliance_by_benchmark=compliance_by_benchmark,
+            findings_by_severity=findings_by_severity,
+            recent_scans=recent_scans,
         )
     except Exception as e:
         logger.error(f"Error getting dashboard stats: {str(e)}")

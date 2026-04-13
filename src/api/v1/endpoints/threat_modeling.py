@@ -5,7 +5,7 @@ import math
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Path, HTTPException, Query, status
+from fastapi import APIRouter, Body, Path, HTTPException, Query, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -624,10 +624,10 @@ async def update_mitigation(
 
 @router.post("/{model_id}/analyze/stride", response_model=STRIDEAnalysisResponse)
 async def run_stride_analysis(
-    request: STRIDEAnalysisRequest,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     model_id: str = Path(...),
+    request: STRIDEAnalysisRequest = Body(default_factory=STRIDEAnalysisRequest),
 ):
     """Run STRIDE analysis on threat model"""
     model = await get_threat_model_or_404(model_id, getattr(current_user, "organization_id", None), db)
@@ -682,10 +682,10 @@ async def run_stride_analysis(
 
 @router.post("/{model_id}/analyze/pasta", response_model=PASTAAnalysisResponse)
 async def run_pasta_analysis(
-    request: PASTAAnalysisRequest,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     model_id: str = Path(...),
+    request: PASTAAnalysisRequest = Body(default_factory=PASTAAnalysisRequest),
 ):
     """Run PASTA analysis on threat model"""
     model = await get_threat_model_or_404(model_id, getattr(current_user, "organization_id", None), db)
@@ -723,10 +723,10 @@ async def run_pasta_analysis(
 
 @router.post("/{model_id}/validate", response_model=ValidationResponse)
 async def validate_model(
-    request: ValidationRequest,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     model_id: str = Path(...),
+    request: ValidationRequest = Body(default_factory=ValidationRequest),
 ):
     """Validate threat model completeness"""
     model = await get_threat_model_or_404(model_id, getattr(current_user, "organization_id", None), db)

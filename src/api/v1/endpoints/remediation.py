@@ -560,19 +560,149 @@ async def execute_manual_remediation(
     }
 
 
+# ============================================================================
+# Quick Actions
+# ============================================================================
+#
+# Each of the four quick actions below used to ``return {"status":
+# "queued"}`` without touching the database, the integration layer, or
+# an endpoint agent — analysts clicked "Block IP" and nothing happened.
+# They now:
+#
+#   1. Write a RemediationExecution row so the Executions tab and
+#      dashboard stats reflect the action.
+#   2. If a matching IR-capable endpoint agent is enrolled, dispatch
+#      the action through AgentService.issue_command — high-blast
+#      actions (isolate, disable, quarantine) auto-queue as
+#      awaiting_approval so a second analyst has to sign off before
+#      the host is actually touched.
+#   3. If no matching agent is enrolled, the execution still lands
+#      with a clear awaiting_manual status so an operator can pick
+#      it up manually.
+#   4. block-ip is special — it writes a ThreatIndicator IOC marked
+#      active so the downstream firewall integration (if configured)
+#      will pick it up, AND it creates the RemediationExecution row.
+
+async def _find_ir_agent(db, hostname: Optional[str], org_id: Optional[str]):
+    """Find an active IR-capable agent for ``hostname`` (or any IR agent
+    in the org if no hostname is provided). Returns None if nothing
+    matches so callers can fall back to a manual execution path."""
+    from src.agents.models import EndpointAgent
+    from src.agents.capabilities import AgentCapability
+
+    q = select(EndpointAgent).where(EndpointAgent.status == "active")
+    if hostname:
+        q = q.where(EndpointAgent.hostname == hostname)
+    if org_id:
+        q = q.where(EndpointAgent.organization_id == org_id)
+
+    rows = list((await db.execute(q)).scalars().all())
+    for a in rows:
+        if AgentCapability.LIVE_RESPONSE.value in (a.capabilities or []):
+            return a
+    return None
+
+
+async def _write_execution(
+    *,
+    db,
+    current_user,
+    target_entity: str,
+    target_type: str,
+    action_type: str,
+    trigger_details: dict,
+    agent_command_id: Optional[str] = None,
+    status_value: str = "running",
+) -> RemediationExecution:
+    """Create a RemediationExecution row for a quick action."""
+    execution = RemediationExecution(
+        policy_id=None,
+        trigger_source="manual_quick_action",
+        trigger_details=trigger_details,
+        status=status_value,
+        target_entity=target_entity,
+        target_type=target_type,
+        actions_planned=[{"action_type": action_type, "target": target_entity}],
+        actions_completed=[],
+        started_at=utc_now() if status_value == "running" else None,
+        created_by=str(current_user.id) if current_user else None,
+        organization_id=getattr(current_user, "organization_id", None) or "",
+        metrics={"agent_command_id": agent_command_id} if agent_command_id else {},
+    )
+    db.add(execution)
+    await db.flush()
+    await db.refresh(execution)
+    return execution
+
+
 @router.post("/block-ip")
 async def quick_block_ip(
     request: QuickBlockIPRequest,
     db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
-    """Quick action: block an IP."""
-    logger.info("Quick block IP", extra={"ip": request.ip})
+    """Quick action: block an attacker IP.
+
+    Writes a ThreatIndicator IOC with type=ip, value=<ip>, severity=high
+    and marks it active. Any downstream firewall or SIEM integration
+    that watches active IOCs will pick this up. A RemediationExecution
+    row is created so the action shows up in the Executions tab and
+    dashboard effectiveness stats.
+    """
+    org_id = getattr(current_user, "organization_id", None)
+    logger.info("Quick block IP", extra={"ip": request.ip, "duration_hours": request.duration_hours})
+
+    # Write ThreatIndicator IOC — that's what a firewall block really is
+    try:
+        from src.intel.models import ThreatIndicator
+        ioc = ThreatIndicator(
+            indicator_type="ip",
+            value=request.ip,
+            severity="high",
+            confidence=95,
+            source="remediation_quick_action",
+            tags=["auto_block", f"ttl_hours_{request.duration_hours}"],
+            is_active=True,
+            organization_id=org_id or "",
+        )
+        db.add(ioc)
+        await db.flush()
+        ioc_id = ioc.id
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"Failed to create ThreatIndicator for block-ip: {exc}")
+        ioc_id = None
+
+    execution = await _write_execution(
+        db=db,
+        current_user=current_user,
+        target_entity=request.ip,
+        target_type="ip",
+        action_type="firewall_block",
+        trigger_details={
+            "ip": request.ip,
+            "duration_hours": request.duration_hours,
+            "ioc_id": ioc_id,
+            "reason": request.reason or "quick action",
+        },
+        status_value="completed",  # IOC created = action complete
+    )
+    execution.actions_completed = [{
+        "action_type": "firewall_block",
+        "target": request.ip,
+        "result": "ioc_created",
+        "ioc_id": ioc_id,
+    }]
+    execution.overall_result = "success" if ioc_id else "partial_success"
+    execution.completed_at = utc_now()
+    await db.flush()
+
     return {
+        "execution_id": execution.id,
         "action": "block_ip",
         "target": request.ip,
         "duration_hours": request.duration_hours,
-        "status": "queued",
+        "status": execution.status,
+        "ioc_id": ioc_id,
     }
 
 
@@ -582,12 +712,61 @@ async def quick_isolate_host(
     db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
-    """Quick action: isolate a host."""
+    """Quick action: isolate a host via its endpoint agent.
+
+    If an IR-capable agent is enrolled for this hostname, dispatches
+    ``isolate_host`` through AgentService.issue_command — which auto-
+    queues as ``awaiting_approval`` because isolate_host is a
+    high-blast action. A second analyst approves from /live-response
+    and the agent then runs iptables / Windows Firewall rules to
+    quarantine the host.
+    """
+    from src.agents.capabilities import AgentAction
+    from src.agents.service import AgentService
+
+    org_id = getattr(current_user, "organization_id", None)
     logger.info("Quick isolate host", extra={"hostname": request.hostname})
+
+    agent = await _find_ir_agent(db, request.hostname, org_id)
+    agent_command_id: Optional[str] = None
+    status_value = "awaiting_manual"
+
+    if agent is not None:
+        try:
+            svc = AgentService(db)
+            cmd = await svc.issue_command(
+                agent=agent,
+                action=AgentAction.ISOLATE_HOST.value,
+                payload={"reason": request.reason or "manual quick action"},
+                issued_by=str(current_user.id),
+            )
+            agent_command_id = cmd.id
+            status_value = "awaiting_approval"  # approval gate in agent platform
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"AgentService.issue_command failed for isolate_host: {exc}")
+
+    execution = await _write_execution(
+        db=db,
+        current_user=current_user,
+        target_entity=request.hostname,
+        target_type="host",
+        action_type="host_isolate",
+        trigger_details={
+            "hostname": request.hostname,
+            "agent_id": agent.id if agent else None,
+            "reason": request.reason,
+        },
+        agent_command_id=agent_command_id,
+        status_value=status_value,
+    )
+
     return {
+        "execution_id": execution.id,
         "action": "isolate_host",
         "target": request.hostname,
-        "status": "queued",
+        "status": status_value,
+        "agent_command_id": agent_command_id,
+        "agent_available": agent is not None,
     }
 
 
@@ -597,12 +776,58 @@ async def quick_disable_account(
     db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
-    """Quick action: disable an account."""
+    """Quick action: disable a user account.
+
+    Dispatches via AgentService if an IR agent is enrolled on the
+    host where the account lives (or any IR agent, if no hostname
+    provided). High-blast → awaiting_approval.
+    """
+    from src.agents.capabilities import AgentAction
+    from src.agents.service import AgentService
+
+    org_id = getattr(current_user, "organization_id", None)
     logger.info("Quick disable account", extra={"username": request.username})
+
+    agent = await _find_ir_agent(db, getattr(request, "hostname", None), org_id)
+    agent_command_id: Optional[str] = None
+    status_value = "awaiting_manual"
+
+    if agent is not None:
+        try:
+            svc = AgentService(db)
+            cmd = await svc.issue_command(
+                agent=agent,
+                action=AgentAction.DISABLE_ACCOUNT.value,
+                payload={"username": request.username, "reason": request.reason or "manual quick action"},
+                issued_by=str(current_user.id),
+            )
+            agent_command_id = cmd.id
+            status_value = "awaiting_approval"
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"AgentService.issue_command failed for disable_account: {exc}")
+
+    execution = await _write_execution(
+        db=db,
+        current_user=current_user,
+        target_entity=request.username,
+        target_type="user",
+        action_type="account_disable",
+        trigger_details={
+            "username": request.username,
+            "agent_id": agent.id if agent else None,
+            "reason": getattr(request, "reason", None),
+        },
+        agent_command_id=agent_command_id,
+        status_value=status_value,
+    )
+
     return {
+        "execution_id": execution.id,
         "action": "disable_account",
         "target": request.username,
-        "status": "queued",
+        "status": status_value,
+        "agent_command_id": agent_command_id,
+        "agent_available": agent is not None,
     }
 
 
@@ -612,16 +837,61 @@ async def quick_quarantine_file(
     db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
-    """Quick action: quarantine a file."""
+    """Quick action: quarantine a file on a specific host.
+
+    Requires a hostname so we can route the action to the right IR
+    agent. Quarantine is a high-blast action → awaiting_approval.
+    """
+    from src.agents.capabilities import AgentAction
+    from src.agents.service import AgentService
+
+    org_id = getattr(current_user, "organization_id", None)
     logger.info("Quick quarantine file", extra={
         "file_path": request.file_path,
         "hostname": request.hostname,
     })
+
+    agent = await _find_ir_agent(db, request.hostname, org_id)
+    agent_command_id: Optional[str] = None
+    status_value = "awaiting_manual"
+
+    if agent is not None:
+        try:
+            svc = AgentService(db)
+            cmd = await svc.issue_command(
+                agent=agent,
+                action=AgentAction.QUARANTINE_FILE.value,
+                payload={"path": request.file_path},
+                issued_by=str(current_user.id),
+            )
+            agent_command_id = cmd.id
+            status_value = "awaiting_approval"
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"AgentService.issue_command failed for quarantine_file: {exc}")
+
+    execution = await _write_execution(
+        db=db,
+        current_user=current_user,
+        target_entity=request.file_path,
+        target_type="file",
+        action_type="file_quarantine",
+        trigger_details={
+            "file_path": request.file_path,
+            "hostname": request.hostname,
+            "agent_id": agent.id if agent else None,
+        },
+        agent_command_id=agent_command_id,
+        status_value=status_value,
+    )
+
     return {
+        "execution_id": execution.id,
         "action": "quarantine_file",
         "target": request.file_path,
         "hostname": request.hostname,
-        "status": "queued",
+        "status": status_value,
+        "agent_command_id": agent_command_id,
+        "agent_available": agent is not None,
     }
 
 
@@ -867,6 +1137,113 @@ async def get_dashboard_stats(
     failed = sum(1 for e in executions if e.overall_result == "failure")
     pending = sum(1 for e in executions if e.status in ["pending", "awaiting_approval"])
 
+    # --- Real aggregates (previously hardcoded []) ---
+
+    # Action type histogram — walk actions_completed and actions_planned
+    # per execution. Planned captures the "what would run" picture even
+    # when the execution hasn't completed yet; completed captures the
+    # success/failure breakdown.
+    from src.schemas.remediation import ActionTypeStats, PolicyStats
+    action_type_counts: dict[str, dict[str, int]] = {}
+    for e in executions:
+        planned = e.actions_planned or []
+        completed = e.actions_completed or []
+        for a in planned:
+            at = (a or {}).get("action_type") or (a or {}).get("type") or "unknown"
+            bucket = action_type_counts.setdefault(
+                at, {"count": 0, "success": 0, "failure": 0}
+            )
+            bucket["count"] += 1
+        for a in completed:
+            at = (a or {}).get("action_type") or (a or {}).get("type") or "unknown"
+            bucket = action_type_counts.setdefault(
+                at, {"count": 0, "success": 0, "failure": 0}
+            )
+            result = (a or {}).get("result", "").lower()
+            if result in ("success", "ioc_created"):
+                bucket["success"] += 1
+            elif result in ("failure", "failed", "error"):
+                bucket["failure"] += 1
+    actions_by_type = [
+        ActionTypeStats(
+            action_type=k,
+            count=v["count"],
+            success_count=v["success"],
+            failure_count=v["failure"],
+        )
+        for k, v in action_type_counts.items()
+    ]
+
+    # Top policies — group executions by policy_id, find the top 5
+    # by execution count, resolve names from the RemediationPolicy table.
+    policy_counts: dict[str, dict[str, int]] = {}
+    for e in executions:
+        if not e.policy_id:
+            continue
+        bucket = policy_counts.setdefault(
+            e.policy_id, {"count": 0, "success": 0, "failure": 0}
+        )
+        bucket["count"] += 1
+        if e.overall_result == "success":
+            bucket["success"] += 1
+        elif e.overall_result == "failure":
+            bucket["failure"] += 1
+
+    top_policies: list[PolicyStats] = []
+    if policy_counts:
+        top_policy_ids = sorted(
+            policy_counts.keys(), key=lambda pid: -policy_counts[pid]["count"]
+        )[:5]
+        name_stmt = select(RemediationPolicy).where(
+            RemediationPolicy.id.in_(top_policy_ids)
+        )
+        if org_id:
+            name_stmt = name_stmt.where(
+                RemediationPolicy.organization_id == org_id
+            )
+        name_map = {
+            p.id: p.name
+            for p in (await db.execute(name_stmt)).scalars().all()
+        }
+        top_policies = [
+            PolicyStats(
+                policy_id=pid,
+                name=name_map.get(pid, "(deleted policy)"),
+                execution_count=policy_counts[pid]["count"],
+                success_count=policy_counts[pid]["success"],
+                failure_count=policy_counts[pid]["failure"],
+            )
+            for pid in top_policy_ids
+        ]
+
+    # Top targets — which hosts/IPs/users are getting remediated
+    # most often. Useful for spotting a noisy asset.
+    target_counts: dict[str, int] = {}
+    for e in executions:
+        key = f"{e.target_type}:{e.target_entity}"
+        target_counts[key] = target_counts.get(key, 0) + 1
+    top_targets = [
+        {"target": k, "count": v}
+        for k, v in sorted(target_counts.items(), key=lambda x: -x[1])[:10]
+    ]
+
+    # Execution hour histogram (24-bucket UTC)
+    hour_counts: dict[int, int] = {h: 0 for h in range(24)}
+    for e in executions:
+        if e.created_at:
+            hour_counts[e.created_at.hour] = hour_counts.get(e.created_at.hour, 0) + 1
+    execution_by_hour = [
+        {"hour": h, "count": c} for h, c in sorted(hour_counts.items())
+    ]
+
+    # Average execution wall clock in minutes, using started_at/completed_at
+    durations = [
+        (e.completed_at - e.started_at).total_seconds() / 60.0
+        for e in executions
+        if e.started_at and e.completed_at and e.completed_at > e.started_at
+    ]
+    avg_exec_minutes = round(sum(durations) / len(durations), 2) if durations else 0.0
+
     return RemediationDashboardStats(
         period_start=cutoff,
         period_end=utc_now(),
@@ -875,13 +1252,13 @@ async def get_dashboard_stats(
         successful_executions=successful,
         failed_executions=failed,
         overall_success_rate=(successful / total * 100) if total else 0,
-        avg_execution_minutes=0.0,
+        avg_execution_minutes=avg_exec_minutes,
         pending_approvals=sum(1 for e in executions if e.approval_status == "pending"),
         in_progress=sum(1 for e in executions if e.status == "running"),
-        actions_by_type=[],
-        top_policies=[],
-        top_targets=[],
-        execution_by_hour=[],
+        actions_by_type=actions_by_type,
+        top_policies=top_policies,
+        top_targets=top_targets,
+        execution_by_hour=execution_by_hour,
     )
 
 

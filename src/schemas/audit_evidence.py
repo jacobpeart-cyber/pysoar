@@ -92,7 +92,7 @@ class EvidencePackageBase(BaseModel):
     status: str = "collecting"
     assessor: Optional[str] = None
     due_date: Optional[datetime] = None
-    metadata: Optional[dict[str, Any]] = None
+    extra_metadata: Optional[dict[str, Any]] = None
 
 
 class EvidencePackageResponse(EvidencePackageBase):

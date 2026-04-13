@@ -429,55 +429,53 @@ class FedRAMPGenerator:
         }
 
     # ------------------------------------------------ Control Status Query
-    def get_control_implementation_status(
+    async def get_control_implementation_status(
         self,
         db: Any,
+        organization_id: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Query the compliance controls table and map results to the
-        FedRAMP Moderate baseline.
+        FedRAMP Moderate baseline (tenant-scoped).
 
         Args:
-            db: A database session (sync or async).  This method performs
-                a lightweight query against the ``compliance_controls``
-                table and joins results with the static baseline.
+            db: An async SQLAlchemy session.
+            organization_id: Tenant id. Queries filter by this when provided.
 
         Returns:
             List of control dicts enriched with their persisted
             implementation status and evidence references.
         """
-        # Build a mapping from any persisted control records
         persisted: Dict[str, Dict[str, Any]] = {}
         try:
-            # Attempt to query using SQLAlchemy-style access
             from src.compliance.models import ComplianceControl  # noqa: F811
+            from sqlalchemy import select as sa_select
 
-            if hasattr(db, "execute"):
-                from sqlalchemy import select as sa_select
-
-                stmt = sa_select(ComplianceControl).where(
-                    ComplianceControl.framework == "FedRAMP"
+            stmt = sa_select(ComplianceControl).where(
+                ComplianceControl.framework == "FedRAMP"
+            )
+            if organization_id is not None and hasattr(
+                ComplianceControl, "organization_id"
+            ):
+                stmt = stmt.where(
+                    ComplianceControl.organization_id == organization_id
                 )
-                # Support both sync and async sessions
-                if hasattr(db, "scalars"):
-                    result = db.scalars(stmt).all()
-                else:
-                    result = db.execute(stmt).scalars().all()
 
-                for row in result:
-                    persisted[row.control_id] = {
-                        "implementation_status": getattr(
-                            row, "status", "planned"
-                        ),
-                        "evidence_artifacts": getattr(
-                            row, "evidence_artifacts", []
-                        ),
-                        "last_assessed": str(
-                            getattr(row, "last_assessed", "")
-                        ),
-                        "assessor_notes": getattr(row, "assessor_notes", ""),
-                    }
-        except Exception:
-            # If the table/model is unavailable fall back to empty mapping
+            result = await db.scalars(stmt)
+            rows = result.all()
+
+            for row in rows:
+                persisted[row.control_id] = {
+                    "implementation_status": getattr(row, "status", "planned"),
+                    "evidence_artifacts": getattr(row, "evidence_artifacts", []),
+                    "last_assessed": str(getattr(row, "last_assessed", "")),
+                    "assessor_notes": getattr(row, "assessor_notes", ""),
+                }
+        except Exception as exc:
+            # Fall back to empty mapping — log so the failure isn't silent
+            import logging
+            logging.getLogger(__name__).warning(
+                f"FedRAMP generator DB query failed: {exc}"
+            )
             persisted = {}
 
         enriched: List[Dict[str, Any]] = []

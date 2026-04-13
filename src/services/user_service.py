@@ -36,6 +36,7 @@ class UserService:
         full_name: Optional[str] = None,
         role: str = UserRole.ANALYST.value,
         is_superuser: bool = False,
+        organization_id: Optional[str] = None,
     ) -> User:
         """Create a new user"""
         # Check if email already exists
@@ -50,6 +51,7 @@ class UserService:
             role=role,
             is_superuser=is_superuser,
             is_active=True,
+            organization_id=organization_id,
         )
 
         self.db.add(user)
@@ -124,9 +126,13 @@ class UserService:
         search: Optional[str] = None,
         role: Optional[str] = None,
         is_active: Optional[bool] = None,
+        organization_id: Optional[str] = None,
     ) -> tuple[list[User], int]:
-        """List users with pagination and filtering"""
+        """List users with pagination and filtering (tenant-scoped when org given)"""
         query = select(User)
+
+        if organization_id is not None:
+            query = query.where(User.organization_id == organization_id)
 
         # Apply filters
         if search:

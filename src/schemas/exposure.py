@@ -413,7 +413,7 @@ class ExposureDashboardStats(BaseModel):
     medium_vulns: int = 0
     low_vulns: int = 0
     info_vulns: int = 0
-    mean_time_to_remediate_days: float = 0.0
+    mean_time_to_remediate_days: Optional[float] = 0.0
     overdue_tickets: int = 0
     overall_risk_score: float = 0.0
     assets_by_criticality: dict = Field(default_factory=dict, description="Distribution of assets by criticality")

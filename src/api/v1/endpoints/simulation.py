@@ -509,20 +509,21 @@ async def get_technique(
 async def test_technique(
     mitre_id: str,
     current_user: CurrentUser = None,
-    target_host: str = Body(...),
+    payload: Optional[dict] = Body(default=None),
     session: DatabaseSession = None,
 ) -> dict:
     """
-    Execute a single technique test.
+    Run a single-technique simulation end-to-end synchronously.
 
-    Args:
-        mitre_id: MITRE technique ID
-        target_host: Target host for test
-        session: Database session
-        current_user: Current user ID
+    The frontend "Run Test" button posts with no body, so ``payload`` is
+    optional. A target host may be provided in ``payload["target_host"]``
+    (defaults to "lab-target"). This endpoint creates a one-technique
+    simulation, starts it, executes the coverage check in-process, and
+    returns the real pass/fail result — not a fake "executing" status.
 
-    Returns:
-        Test execution result
+    If the technique is NOT covered by any detection rule, we fire
+    on_simulation_result so the agentic SOC pipeline can generate a
+    mitigation recommendation or a hunt task.
     """
     try:
         library = AtomicTestLibrary(session)
@@ -531,7 +532,10 @@ async def test_technique(
         if not technique:
             raise HTTPException(status_code=404, detail="Technique not found")
 
-        # Create ad-hoc simulation with single technique
+        target_host = "lab-target"
+        if isinstance(payload, dict) and payload.get("target_host"):
+            target_host = str(payload["target_host"])
+
         org_id = getattr(current_user, "organization_id", None)
         orchestrator = SimulationOrchestrator(session)
         simulation = await orchestrator.create_simulation(
@@ -546,33 +550,52 @@ async def test_technique(
 
         await orchestrator.start_simulation(simulation.id)
 
-        # Trigger automation if technique test indicates defense bypass
-        try:
-            # For single technique tests, check result after execution starts
-            # The orchestrator returns results; if not blocked/detected, flag it
-            result = "not_blocked"  # Default for newly started tests
-            if result not in ("blocked", "detected"):
+        # Execute the tests synchronously (single technique, fast) so the
+        # caller gets a real result instead of "executing".
+        from src.simulation.models import SimulationTest
+        from sqlalchemy import select as _sel
+        tests_q = _sel(SimulationTest).where(
+            SimulationTest.simulation_id == simulation.id
+        )
+        tests = list((await session.execute(tests_q)).scalars().all())
+        detected_any = False
+        for t in tests:
+            try:
+                await orchestrator._execute_test(t)
+                if t.was_detected:
+                    detected_any = True
+            except Exception as test_exc:  # noqa: BLE001
+                logger.error(f"Failed to execute test {t.id}: {test_exc}")
+
+        # Fire automation ONLY on real defender miss — i.e. not a single
+        # detection rule claims to cover this technique.
+        if not detected_any:
+            try:
                 automation = AutomationService(session)
                 await automation.on_simulation_result(
                     technique_id=technique.mitre_id,
                     technique_name=technique.name,
-                    result=result,
+                    result="undetected",
                     organization_id=org_id,
                 )
-        except Exception as e:
-            logger.error(f"Automation on_simulation_result failed: {e}", exc_info=True)
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"Automation on_simulation_result failed: {e}")
+
+        await session.flush()
 
         return {
             "simulation_id": simulation.id,
-            "status": "executing",
+            "status": "completed",
             "technique": mitre_id,
             "target_host": target_host,
+            "detected": detected_any,
+            "tests_executed": len(tests),
         }
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Error testing technique: {str(e)}")
+        logger.error(f"Error testing technique: {str(e)}", exc_info=True)
         raise HTTPException(status_code=400, detail="Operation failed. Please try again or contact support.")
 
 
@@ -676,17 +699,65 @@ async def create_emulation_plan(
         emulator = AdversaryEmulator(session)
         simulation = await emulator.create_emulation_plan(
             adversary_id,
-            org_id
+            org_id,
+            created_by=str(current_user.id),
         )
+
+        # Actually run the plan — previously the button just created a
+        # draft record and pretended the simulation was underway.
+        orchestrator = SimulationOrchestrator(session)
+        try:
+            await orchestrator.start_simulation(simulation.id)
+        except Exception as start_exc:  # noqa: BLE001
+            logger.warning(f"start_simulation failed for {simulation.id}: {start_exc}")
+
+        # Execute all of the plan's tests in-process so the user sees real
+        # pass/fail numbers immediately. Adversary chains are 8-11 techniques
+        # and the scoring is a cheap DB lookup, so this is fast.
+        from src.simulation.models import SimulationTest
+        from sqlalchemy import select as _sel
+        tests = list((await session.execute(
+            _sel(SimulationTest).where(SimulationTest.simulation_id == simulation.id)
+        )).scalars().all())
+
+        for t in tests:
+            try:
+                await orchestrator._execute_test(t)
+            except Exception as test_exc:  # noqa: BLE001
+                logger.error(f"Failed to execute emulation test {t.id}: {test_exc}")
+
+        # Finalize simulation stats
+        simulation.passed_tests = sum(1 for t in tests if t.was_detected)
+        simulation.failed_tests = sum(1 for t in tests if not t.was_detected and t.status != "error")
+        simulation.blocked_tests = sum(1 for t in tests if t.status == "error")
+        if tests:
+            simulation.detection_rate = (simulation.passed_tests / len(tests)) * 100
+            simulation.overall_score = simulation.detection_rate
+        simulation.status = "completed"
+        simulation.completed_at = __import__("src.models.base", fromlist=["utc_now"]).utc_now()
+        if simulation.started_at:
+            simulation.duration_seconds = int(
+                (simulation.completed_at - simulation.started_at).total_seconds()
+            )
+
+        await session.flush()
+        await session.refresh(simulation)
 
         return SimulationDetailResponse(
             simulation=AttackSimulationSchema.model_validate(simulation),
-            tests=[],
-            execution_summary={"status": "created"},
+            tests=[SimulationTestSchema.model_validate(t) for t in tests],
+            execution_summary={
+                "status": "completed",
+                "total_tests": len(tests),
+                "passed_tests": simulation.passed_tests,
+                "failed_tests": simulation.failed_tests,
+                "blocked_tests": simulation.blocked_tests,
+                "detection_rate": simulation.detection_rate,
+            },
         )
 
     except Exception as e:
-        logger.error(f"Error creating emulation plan: {str(e)}")
+        logger.error(f"Error creating emulation plan: {str(e)}", exc_info=True)
         raise HTTPException(status_code=400, detail="Operation failed. Please try again or contact support.")
 
 
@@ -805,44 +876,120 @@ async def get_dashboard_stats(
         Dashboard statistics
     """
     try:
-        from sqlalchemy import select, func
+        from sqlalchemy import select, func, desc, and_
+        from src.simulation.models import SimulationTest
 
-        # Count simulations by status
-        total_result = await session.execute(select(func.count()).select_from(AttackSimulation))
-        total_sims = total_result.scalar() or 0
+        org_id = getattr(current_user, "organization_id", None)
 
-        completed_result = await session.execute(
-            select(func.count()).select_from(AttackSimulation).where(AttackSimulation.status == "completed")
-        )
-        completed = completed_result.scalar() or 0
+        # Make sure the built-in technique catalog AND adversary profiles
+        # are loaded so the dashboard counts aren't 0 on a cold database.
+        # Both loaders are idempotent (skip rows that already exist).
+        try:
+            await AtomicTestLibrary(session).load_builtin_techniques()
+            await AdversaryEmulator(session).load_builtin_profiles()
+        except Exception as load_exc:  # noqa: BLE001
+            logger.warning(f"Builtin BAS loader failed on dashboard: {load_exc}")
 
-        running_result = await session.execute(
-            select(func.count()).select_from(AttackSimulation).where(AttackSimulation.status == "running")
-        )
-        running = running_result.scalar() or 0
+        def _org(q):
+            if org_id is None:
+                return q
+            return q.where(AttackSimulation.organization_id == org_id)
 
-        # Get technique count
-        technique_result = await session.execute(select(func.count()).select_from(AttackTechnique))
-        technique_count = technique_result.scalar() or 0
+        # Count simulations by status (scoped to org)
+        total_sims = (await session.execute(_org(select(func.count(AttackSimulation.id))))).scalar() or 0
+        completed = (await session.execute(
+            _org(select(func.count(AttackSimulation.id))).where(AttackSimulation.status == "completed")
+        )).scalar() or 0
+        running = (await session.execute(
+            _org(select(func.count(AttackSimulation.id))).where(AttackSimulation.status == "running")
+        )).scalar() or 0
 
-        # Get adversary profiles count
-        adversary_result = await session.execute(select(func.count()).select_from(AdversaryProfile))
-        adversary_count = adversary_result.scalar() or 0
+        # Library-level counts (techniques and adversary profiles are global)
+        technique_count = (await session.execute(select(func.count(AttackTechnique.id)))).scalar() or 0
+        adversary_count = (await session.execute(select(func.count(AdversaryProfile.id)))).scalar() or 0
 
-        # Calculate average detection rate from completed simulations
-        detection_result = await session.execute(
-            select(func.avg(AttackSimulation.detection_rate)).where(
+        # Averages over completed simulations for this org
+        avg_detection = (await session.execute(
+            _org(select(func.avg(AttackSimulation.detection_rate))).where(
                 AttackSimulation.status == "completed"
             )
-        )
-        avg_detection = detection_result.scalar() or 0.0
-
-        posture_result = await session.execute(
-            select(func.avg(AttackSimulation.overall_score)).where(
+        )).scalar() or 0.0
+        avg_posture = (await session.execute(
+            _org(select(func.avg(AttackSimulation.overall_score))).where(
                 AttackSimulation.status == "completed"
             )
+        )).scalar() or 0.0
+
+        # --- Real top_tactics (detection rate per MITRE tactic) ---
+        # Join SimulationTest -> AttackTechnique -> group by tactic, compute
+        # detection rate = was_detected_count / total_count per tactic.
+        # Using count(...).filter(...) avoids dialect-specific boolean casts.
+        tactic_stmt = (
+            select(
+                AttackTechnique.tactic,
+                func.count(SimulationTest.id).label("total"),
+                func.count(SimulationTest.id).filter(
+                    SimulationTest.was_detected == True  # noqa: E712
+                ).label("detected"),
+            )
+            .select_from(SimulationTest)
+            .join(AttackTechnique, SimulationTest.technique_id == AttackTechnique.id)
+            .join(AttackSimulation, SimulationTest.simulation_id == AttackSimulation.id)
+            .where(AttackSimulation.status == "completed")
+            .group_by(AttackTechnique.tactic)
         )
-        avg_posture = posture_result.scalar() or 0.0
+        if org_id is not None:
+            tactic_stmt = tactic_stmt.where(AttackSimulation.organization_id == org_id)
+
+        top_tactics: list[dict] = []
+        tactic_result = await session.execute(tactic_stmt)
+        for tactic, total, detected in tactic_result.all():
+            total = int(total or 0)
+            detected = int(detected or 0)
+            if total > 0:
+                top_tactics.append({
+                    "tactic": tactic or "unknown",
+                    "total": total,
+                    "detection_rate": round((detected / total) * 100.0, 1),
+                })
+        top_tactics.sort(key=lambda x: x["detection_rate"], reverse=True)
+        top_tactics = top_tactics[:10]
+
+        # --- Real recent_simulations (last 10) ---
+        # Postgres requires NULLS LAST to follow the direction, not wrap it.
+        recent_stmt = _org(select(AttackSimulation)).order_by(
+            AttackSimulation.completed_at.desc().nullslast(),
+            AttackSimulation.created_at.desc(),
+        ).limit(10)
+        recent_rows = (await session.execute(recent_stmt)).scalars().all()
+        recent_simulations = [AttackSimulationSchema.model_validate(s) for s in recent_rows]
+
+        # --- Real security_trends from SecurityPostureScore history ---
+        trends_stmt = (
+            select(SecurityPostureScore.score)
+            .order_by(desc(SecurityPostureScore.assessed_at))
+            .limit(12)
+        )
+        if org_id is not None:
+            # Posture scores belong to simulations; join through to filter by org
+            trends_stmt = (
+                select(SecurityPostureScore.score)
+                .join(AttackSimulation, SecurityPostureScore.simulation_id == AttackSimulation.id)
+                .where(AttackSimulation.organization_id == org_id)
+                .order_by(desc(SecurityPostureScore.assessed_at))
+                .limit(12)
+            )
+        trend_scores = [float(s) for s in (await session.execute(trends_stmt)).scalars().all()]
+        trend_scores.reverse()  # oldest -> newest for chart consumption
+
+        detection_trend_stmt = _org(
+            select(AttackSimulation.detection_rate).where(AttackSimulation.status == "completed")
+        ).order_by(desc(AttackSimulation.completed_at)).limit(12)
+        detection_rates = [
+            float(r or 0.0)
+            for r in (await session.execute(detection_trend_stmt)).scalars().all()
+        ]
+        detection_rates.reverse()
 
         return DashboardStatsResponse(
             total_simulations=total_sims,
@@ -852,14 +999,14 @@ async def get_dashboard_stats(
             average_posture_score=round(float(avg_posture), 1),
             techniques_in_library=technique_count,
             adversary_profiles=adversary_count,
-            top_tactics=[],
-            recent_simulations=[],
+            top_tactics=top_tactics,
+            recent_simulations=recent_simulations,
             security_trends={
-                "scores": [60.0, 65.0, 70.0, 72.5],
-                "detection_rates": [50.0, 60.0, 70.0, 75.0],
+                "scores": trend_scores,
+                "detection_rates": detection_rates,
             }
         )
 
     except Exception as e:
-        logger.error(f"Error getting dashboard stats: {str(e)}")
+        logger.error(f"Error getting dashboard stats: {str(e)}", exc_info=True)
         raise HTTPException(status_code=400, detail="Operation failed. Please try again or contact support.")

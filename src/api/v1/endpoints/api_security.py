@@ -67,10 +67,15 @@ router = APIRouter(prefix="/api-security", tags=["API Security"])
 # ============================================================================
 
 
-async def get_endpoint_or_404(db: AsyncSession, endpoint_id: str) -> APIEndpointInventory:
-    """Get endpoint by ID or raise 404"""
+async def get_endpoint_or_404(db: AsyncSession, endpoint_id: str, org_id: Optional[str]) -> APIEndpointInventory:
+    """Get endpoint by ID or raise 404 (tenant-scoped)"""
     result = await db.execute(
-        select(APIEndpointInventory).where(APIEndpointInventory.id == endpoint_id)
+        select(APIEndpointInventory).where(
+            and_(
+                APIEndpointInventory.id == endpoint_id,
+                APIEndpointInventory.organization_id == org_id,
+            )
+        )
     )
     endpoint = result.scalar_one_or_none()
     if not endpoint:
@@ -98,7 +103,8 @@ async def list_endpoints(
     sort_order: str = "desc",
 ):
     """List API endpoints with filtering and pagination"""
-    query = select(APIEndpointInventory)
+    org_id = getattr(current_user, "organization_id", None)
+    query = select(APIEndpointInventory).where(APIEndpointInventory.organization_id == org_id)
 
     # Apply filters
     filters = []
@@ -172,7 +178,7 @@ async def get_endpoint(
     db: DatabaseSession = None,
 ):
     """Get endpoint by ID"""
-    endpoint = await get_endpoint_or_404(db, endpoint_id)
+    endpoint = await get_endpoint_or_404(db, endpoint_id, getattr(current_user, "organization_id", None))
     return APIEndpointInventoryResponse.model_validate(endpoint)
 
 
@@ -184,7 +190,7 @@ async def update_endpoint(
     db: DatabaseSession = None,
 ):
     """Update an API endpoint"""
-    endpoint = await get_endpoint_or_404(db, endpoint_id)
+    endpoint = await get_endpoint_or_404(db, endpoint_id, getattr(current_user, "organization_id", None))
 
     update_data = endpoint_data.model_dump(exclude_unset=True)
     for field, value in update_data.items():
@@ -202,7 +208,7 @@ async def delete_endpoint(
     db: DatabaseSession = None,
 ):
     """Delete an API endpoint"""
-    endpoint = await get_endpoint_or_404(db, endpoint_id)
+    endpoint = await get_endpoint_or_404(db, endpoint_id, getattr(current_user, "organization_id", None))
     await db.delete(endpoint)
     await db.commit()
 
@@ -212,10 +218,12 @@ async def delete_endpoint(
 # ============================================================================
 
 
-async def get_vulnerability_or_404(db: AsyncSession, vuln_id: str) -> APIVulnerability:
-    """Get vulnerability by ID or raise 404"""
+async def get_vulnerability_or_404(db: AsyncSession, vuln_id: str, org_id: Optional[str]) -> APIVulnerability:
+    """Get vulnerability by ID or raise 404 (tenant-scoped)"""
     result = await db.execute(
-        select(APIVulnerability).where(APIVulnerability.id == vuln_id)
+        select(APIVulnerability).where(
+            and_(APIVulnerability.id == vuln_id, APIVulnerability.organization_id == org_id)
+        )
     )
     vuln = result.scalar_one_or_none()
     if not vuln:
@@ -240,7 +248,8 @@ async def list_vulnerabilities(
     sort_order: str = "desc",
 ):
     """List API vulnerabilities with filtering and pagination"""
-    query = select(APIVulnerability)
+    org_id = getattr(current_user, "organization_id", None)
+    query = select(APIVulnerability).where(APIVulnerability.organization_id == org_id)
 
     # Apply filters
     filters = []
@@ -321,7 +330,7 @@ async def get_vulnerability(
     db: DatabaseSession = None,
 ):
     """Get vulnerability by ID"""
-    vuln = await get_vulnerability_or_404(db, vuln_id)
+    vuln = await get_vulnerability_or_404(db, vuln_id, getattr(current_user, "organization_id", None))
     return APIVulnerabilityResponse.model_validate(vuln)
 
 
@@ -333,7 +342,7 @@ async def update_vulnerability(
     db: DatabaseSession = None,
 ):
     """Update a vulnerability"""
-    vuln = await get_vulnerability_or_404(db, vuln_id)
+    vuln = await get_vulnerability_or_404(db, vuln_id, getattr(current_user, "organization_id", None))
 
     update_data = vuln_data.model_dump(exclude_unset=True)
     for field, value in update_data.items():
@@ -371,10 +380,12 @@ async def bulk_update_vulnerabilities(
 # ============================================================================
 
 
-async def get_policy_or_404(db: AsyncSession, policy_id: str) -> APISecurityPolicy:
-    """Get policy by ID or raise 404"""
+async def get_policy_or_404(db: AsyncSession, policy_id: str, org_id: Optional[str]) -> APISecurityPolicy:
+    """Get policy by ID or raise 404 (tenant-scoped)"""
     result = await db.execute(
-        select(APISecurityPolicy).where(APISecurityPolicy.id == policy_id)
+        select(APISecurityPolicy).where(
+            and_(APISecurityPolicy.id == policy_id, APISecurityPolicy.organization_id == org_id)
+        )
     )
     policy = result.scalar_one_or_none()
     if not policy:
@@ -397,7 +408,8 @@ async def list_policies(
     sort_order: str = "desc",
 ):
     """List API security policies"""
-    query = select(APISecurityPolicy)
+    org_id = getattr(current_user, "organization_id", None)
+    query = select(APISecurityPolicy).where(APISecurityPolicy.organization_id == org_id)
 
     # Apply filters
     filters = []
@@ -461,7 +473,7 @@ async def get_policy(
     db: DatabaseSession = None,
 ):
     """Get policy by ID"""
-    policy = await get_policy_or_404(db, policy_id)
+    policy = await get_policy_or_404(db, policy_id, getattr(current_user, "organization_id", None))
     return APISecurityPolicyResponse.model_validate(policy)
 
 
@@ -473,7 +485,7 @@ async def update_policy(
     db: DatabaseSession = None,
 ):
     """Update a security policy"""
-    policy = await get_policy_or_404(db, policy_id)
+    policy = await get_policy_or_404(db, policy_id, getattr(current_user, "organization_id", None))
 
     update_data = policy_data.model_dump(exclude_unset=True)
     for field, value in update_data.items():
@@ -491,7 +503,7 @@ async def delete_policy(
     db: DatabaseSession = None,
 ):
     """Delete a security policy"""
-    policy = await get_policy_or_404(db, policy_id)
+    policy = await get_policy_or_404(db, policy_id, getattr(current_user, "organization_id", None))
     await db.delete(policy)
     await db.commit()
 
@@ -501,10 +513,12 @@ async def delete_policy(
 # ============================================================================
 
 
-async def get_anomaly_or_404(db: AsyncSession, anomaly_id: str) -> APIAnomalyDetection:
-    """Get anomaly by ID or raise 404"""
+async def get_anomaly_or_404(db: AsyncSession, anomaly_id: str, org_id: Optional[str]) -> APIAnomalyDetection:
+    """Get anomaly by ID or raise 404 (tenant-scoped)"""
     result = await db.execute(
-        select(APIAnomalyDetection).where(APIAnomalyDetection.id == anomaly_id)
+        select(APIAnomalyDetection).where(
+            and_(APIAnomalyDetection.id == anomaly_id, APIAnomalyDetection.organization_id == org_id)
+        )
     )
     anomaly = result.scalar_one_or_none()
     if not anomaly:
@@ -529,7 +543,8 @@ async def list_anomalies(
     sort_order: str = "desc",
 ):
     """List anomalies with filtering and pagination"""
-    query = select(APIAnomalyDetection)
+    org_id = getattr(current_user, "organization_id", None)
+    query = select(APIAnomalyDetection).where(APIAnomalyDetection.organization_id == org_id)
 
     # Apply filters
     filters = []
@@ -597,7 +612,7 @@ async def get_anomaly(
     db: DatabaseSession = None,
 ):
     """Get anomaly by ID"""
-    anomaly = await get_anomaly_or_404(db, anomaly_id)
+    anomaly = await get_anomaly_or_404(db, anomaly_id, getattr(current_user, "organization_id", None))
     return APIAnomalyDetectionResponse.model_validate(anomaly)
 
 
@@ -609,7 +624,7 @@ async def update_anomaly(
     db: DatabaseSession = None,
 ):
     """Update an anomaly detection record"""
-    anomaly = await get_anomaly_or_404(db, anomaly_id)
+    anomaly = await get_anomaly_or_404(db, anomaly_id, getattr(current_user, "organization_id", None))
 
     update_data = anomaly_data.model_dump(exclude_unset=True)
     for field, value in update_data.items():
@@ -625,10 +640,12 @@ async def update_anomaly(
 # ============================================================================
 
 
-async def get_compliance_check_or_404(db: AsyncSession, check_id: str) -> APIComplianceCheck:
-    """Get compliance check by ID or raise 404"""
+async def get_compliance_check_or_404(db: AsyncSession, check_id: str, org_id: Optional[str]) -> APIComplianceCheck:
+    """Get compliance check by ID or raise 404 (tenant-scoped)"""
     result = await db.execute(
-        select(APIComplianceCheck).where(APIComplianceCheck.id == check_id)
+        select(APIComplianceCheck).where(
+            and_(APIComplianceCheck.id == check_id, APIComplianceCheck.organization_id == org_id)
+        )
     )
     check = result.scalar_one_or_none()
     if not check:
@@ -652,7 +669,8 @@ async def list_compliance_checks(
     sort_order: str = "desc",
 ):
     """List compliance checks with filtering and pagination"""
-    query = select(APIComplianceCheck)
+    org_id = getattr(current_user, "organization_id", None)
+    query = select(APIComplianceCheck).where(APIComplianceCheck.organization_id == org_id)
 
     # Apply filters
     filters = []
@@ -718,7 +736,7 @@ async def get_compliance_check(
     db: DatabaseSession = None,
 ):
     """Get compliance check by ID"""
-    check = await get_compliance_check_or_404(db, check_id)
+    check = await get_compliance_check_or_404(db, check_id, getattr(current_user, "organization_id", None))
     return APIComplianceCheckResponse.model_validate(check)
 
 
@@ -730,7 +748,7 @@ async def update_compliance_check(
     db: DatabaseSession = None,
 ):
     """Update a compliance check"""
-    check = await get_compliance_check_or_404(db, check_id)
+    check = await get_compliance_check_or_404(db, check_id, getattr(current_user, "organization_id", None))
 
     update_data = check_data.model_dump(exclude_unset=True)
     for field, value in update_data.items():
@@ -752,33 +770,45 @@ async def get_dashboard(
     db: DatabaseSession = None,
 ):
     """Get API security dashboard"""
+    from datetime import timedelta as _timedelta
+    org_id = getattr(current_user, "organization_id", None)
+
     # Total endpoints
     endpoints_result = await db.execute(
-        select(func.count()).select_from(APIEndpointInventory)
+        select(func.count()).select_from(APIEndpointInventory).where(
+            APIEndpointInventory.organization_id == org_id
+        )
     )
     total_endpoints = endpoints_result.scalar() or 0
 
     # Documented vs shadow
     doc_result = await db.execute(
         select(func.count()).select_from(APIEndpointInventory).where(
-            APIEndpointInventory.is_documented == True
+            and_(
+                APIEndpointInventory.organization_id == org_id,
+                APIEndpointInventory.is_documented == True,
+            )
         )
     )
     documented = doc_result.scalar() or 0
 
     shadow_result = await db.execute(
         select(func.count()).select_from(APIEndpointInventory).where(
-            APIEndpointInventory.is_shadow == True
+            and_(
+                APIEndpointInventory.organization_id == org_id,
+                APIEndpointInventory.is_shadow == True,
+            )
         )
     )
     shadow = shadow_result.scalar() or 0
 
-    # Zombie APIs
+    # Zombie APIs (documented but not seen for 30+ days)
     zombie_result = await db.execute(
         select(func.count()).select_from(APIEndpointInventory).where(
             and_(
+                APIEndpointInventory.organization_id == org_id,
                 APIEndpointInventory.is_documented == True,
-                APIEndpointInventory.last_seen < datetime.now(timezone.utc) - __import__('datetime').timedelta(days=30)
+                APIEndpointInventory.last_seen < datetime.now(timezone.utc) - _timedelta(days=30),
             )
         )
     )
@@ -787,33 +817,46 @@ async def get_dashboard(
     # Vulnerabilities
     crit_vuln = await db.execute(
         select(func.count()).select_from(APIVulnerability).where(
-            APIVulnerability.severity == "critical"
+            and_(
+                APIVulnerability.organization_id == org_id,
+                APIVulnerability.severity == "critical",
+            )
         )
     )
     critical_count = crit_vuln.scalar() or 0
 
     high_vuln = await db.execute(
         select(func.count()).select_from(APIVulnerability).where(
-            APIVulnerability.severity == "high"
+            and_(
+                APIVulnerability.organization_id == org_id,
+                APIVulnerability.severity == "high",
+            )
         )
     )
     high_count = high_vuln.scalar() or 0
 
     # Policy violations
     violations_result = await db.execute(
-        select(func.count()).select_from(APISecurityPolicy)
+        select(func.count()).select_from(APISecurityPolicy).where(
+            APISecurityPolicy.organization_id == org_id
+        )
     )
     violations = violations_result.scalar() or 0
 
     # Compliance pass rate
     compliance_total = await db.execute(
-        select(func.count()).select_from(APIComplianceCheck)
+        select(func.count()).select_from(APIComplianceCheck).where(
+            APIComplianceCheck.organization_id == org_id
+        )
     )
-    total_checks = compliance_total.scalar() or 1
+    total_checks = compliance_total.scalar() or 0
 
     compliance_passed = await db.execute(
         select(func.count()).select_from(APIComplianceCheck).where(
-            APIComplianceCheck.passed == True
+            and_(
+                APIComplianceCheck.organization_id == org_id,
+                APIComplianceCheck.passed == True,
+            )
         )
     )
     passed_checks = compliance_passed.scalar() or 0
@@ -821,14 +864,22 @@ async def get_dashboard(
 
     # Recent vulnerabilities
     recent_vulns = await db.execute(
-        select(APIVulnerability).order_by(APIVulnerability.created_at.desc()).limit(5)
+        select(APIVulnerability)
+        .where(APIVulnerability.organization_id == org_id)
+        .order_by(APIVulnerability.created_at.desc())
+        .limit(5)
     )
     recent_vuln_list = list(recent_vulns.scalars().all())
 
     # Critical anomalies
     anomalies = await db.execute(
         select(APIAnomalyDetection)
-        .where(APIAnomalyDetection.severity == "critical")
+        .where(
+            and_(
+                APIAnomalyDetection.organization_id == org_id,
+                APIAnomalyDetection.severity == "critical",
+            )
+        )
         .order_by(APIAnomalyDetection.created_at.desc())
         .limit(5)
     )
@@ -837,15 +888,21 @@ async def get_dashboard(
     # Failed compliance
     failed_checks = await db.execute(
         select(APIComplianceCheck)
-        .where(APIComplianceCheck.passed == False)
+        .where(
+            and_(
+                APIComplianceCheck.organization_id == org_id,
+                APIComplianceCheck.passed == False,
+            )
+        )
         .order_by(APIComplianceCheck.created_at.desc())
         .limit(5)
     )
     failed_check_list = list(failed_checks.scalars().all())
 
-    # Top vulnerable endpoints
+    # Top endpoints by 24h traffic (tenant-scoped)
     vuln_endpoints = await db.execute(
         select(APIEndpointInventory)
+        .where(APIEndpointInventory.organization_id == org_id)
         .order_by(APIEndpointInventory.request_count_24h.desc())
         .limit(5)
     )

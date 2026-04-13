@@ -681,11 +681,8 @@ class ContinuousMonitor:
         now = datetime.now(timezone.utc)
         cutoff_30d = now - timedelta(days=30)
 
-        # All incidents for the org in the last 30 days
-        stmt = select(Incident).where(
-            (Incident.organization_id == self.org_id)
-            & (Incident.created_at >= cutoff_30d)
-        )
+        # Incident does not have organization_id — scope only by time window.
+        stmt = select(Incident).where(Incident.created_at >= cutoff_30d)
         incidents = list((await self.session.scalars(stmt)).all())
         incidents_this_month = len(incidents)
 

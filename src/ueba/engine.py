@@ -587,23 +587,86 @@ class PeerGroupAnalyzer:
             return []
 
         clusters = []
-        # Simplified clustering: group by behavior similarity
-        grouped = {}
 
-        for entity in entities:
-            # Create feature vector key
-            feature_key = tuple(entity.get(f, "unknown") for f in features)
-            if feature_key not in grouped:
-                grouped[feature_key] = {
-                    "name": f"cluster_{len(clusters)}",
-                    "members": [],
-                    "member_count": 0
-                }
-            grouped[feature_key]["members"].append(entity["id"])
-            grouped[feature_key]["member_count"] += 1
+        # Extract numeric and categorical features for distance computation
+        numeric_features = []
+        categorical_features = []
+        for f in features:
+            sample_vals = [entity.get(f) for entity in entities if entity.get(f) is not None]
+            if sample_vals and isinstance(sample_vals[0], (int, float)):
+                numeric_features.append(f)
+            else:
+                categorical_features.append(f)
 
-        # Only include clusters with minimum size
-        clusters = [g for g in grouped.values() if g["member_count"] >= self.min_cluster_size]
+        # Normalize numeric features for distance calculation
+        feature_stats = {}
+        for f in numeric_features:
+            vals = [float(entity.get(f, 0)) for entity in entities]
+            f_min = min(vals) if vals else 0
+            f_max = max(vals) if vals else 1
+            f_range = f_max - f_min if f_max != f_min else 1
+            feature_stats[f] = {"min": f_min, "range": f_range}
+
+        def compute_distance(e1: dict, e2: dict) -> float:
+            """Compute normalized distance between two entities"""
+            dist = 0.0
+            count = 0
+            # Numeric distance (normalized)
+            for f in numeric_features:
+                v1 = float(e1.get(f, 0))
+                v2 = float(e2.get(f, 0))
+                stats = feature_stats[f]
+                norm_diff = abs(v1 - v2) / stats["range"] if stats["range"] > 0 else 0
+                dist += norm_diff
+                count += 1
+            # Categorical distance (0 or 1)
+            for f in categorical_features:
+                v1 = e1.get(f, "unknown")
+                v2 = e2.get(f, "unknown")
+                dist += 0 if v1 == v2 else 1
+                count += 1
+            return dist / max(count, 1)
+
+        # Agglomerative clustering with distance threshold
+        distance_threshold = 0.3
+        assigned = [False] * len(entities)
+        cluster_idx = 0
+
+        for i in range(len(entities)):
+            if assigned[i]:
+                continue
+            # Start a new cluster with entity i
+            cluster_members = [entities[i]["id"]]
+            assigned[i] = True
+
+            for j in range(i + 1, len(entities)):
+                if assigned[j]:
+                    continue
+                dist = compute_distance(entities[i], entities[j])
+                if dist <= distance_threshold:
+                    cluster_members.append(entities[j]["id"])
+                    assigned[j] = True
+
+            if len(cluster_members) >= self.min_cluster_size:
+                # Compute cluster centroid stats
+                centroid = {}
+                cluster_entities = [e for e in entities if e.get("id") in cluster_members]
+                for f in numeric_features:
+                    vals = [float(e.get(f, 0)) for e in cluster_entities]
+                    centroid[f] = sum(vals) / len(vals) if vals else 0
+                for f in categorical_features:
+                    vals = [e.get(f, "unknown") for e in cluster_entities]
+                    # Most common value
+                    centroid[f] = max(set(vals), key=vals.count) if vals else "unknown"
+
+                clusters.append({
+                    "name": f"cluster_{cluster_idx}",
+                    "members": cluster_members,
+                    "member_count": len(cluster_members),
+                    "centroid": centroid,
+                })
+                cluster_idx += 1
+
         return clusters
 
     def compare_to_peers(self, entity_id: str, entity_data: dict, peer_group: list[dict]) -> dict:

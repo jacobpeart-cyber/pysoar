@@ -182,6 +182,107 @@ class STIXFeedParser(FeedParser):
         return techniques
 
 
+class PlainListFeedParser(FeedParser):
+    """Parser for plain-text threat feeds (one indicator per line).
+
+    Handles the common abuse.ch / emerging threats / blocklist format:
+    comment lines starting with ``#`` are ignored, and each remaining
+    line is one indicator. The indicator type is auto-detected from the
+    value (ipv4, ipv6, cidr, url, domain, md5, sha1, sha256).
+
+    For CSVs like feodotracker's ipblocklist (with multiple columns),
+    the first column is assumed to be the indicator value.
+    """
+
+    IPV4_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+    IPV6_RE = re.compile(r"^[0-9a-fA-F:]+$")
+    CIDR_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}/\d{1,2}$")
+    MD5_RE = re.compile(r"^[a-fA-F0-9]{32}$")
+    SHA1_RE = re.compile(r"^[a-fA-F0-9]{40}$")
+    SHA256_RE = re.compile(r"^[a-fA-F0-9]{64}$")
+    DOMAIN_RE = re.compile(r"^(?=.{1,253}$)(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$")
+
+    def __init__(self, default_severity: str = "medium", default_confidence: int = 70):
+        self.default_severity = default_severity
+        self.default_confidence = default_confidence
+
+    def _detect_type(self, value: str) -> Optional[str]:
+        v = value.strip()
+        if not v:
+            return None
+        if self.CIDR_RE.match(v):
+            return "cidr"
+        if self.IPV4_RE.match(v):
+            try:
+                ipaddress.IPv4Address(v)
+                return "ipv4"
+            except ValueError:
+                return None
+        if ":" in v and self.IPV6_RE.match(v):
+            try:
+                ipaddress.IPv6Address(v)
+                return "ipv6"
+            except ValueError:
+                pass
+        if v.startswith(("http://", "https://", "ftp://")):
+            return "url"
+        if self.SHA256_RE.match(v):
+            return "sha256"
+        if self.SHA1_RE.match(v):
+            return "sha1"
+        if self.MD5_RE.match(v):
+            return "md5"
+        if self.DOMAIN_RE.match(v):
+            return "domain"
+        return None
+
+    def parse(self, raw_data: bytes) -> list[dict[str, Any]]:
+        try:
+            text = raw_data.decode("utf-8", errors="replace")
+        except Exception as e:
+            logger.error("Failed to decode plain feed", error=str(e))
+            return []
+
+        indicators: list[dict[str, Any]] = []
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            # Strip Spamhaus-style trailing "; comment" from data lines
+            if ";" in line and not line.startswith(";"):
+                line = line.split(";", 1)[0].strip()
+            if not line:
+                continue
+            if line.startswith(("#", "//", ";")):
+                continue
+
+            # Try each comma-separated field in order. This handles:
+            #   * single-value lines (urlhaus text_online, spamhaus)
+            #   * multi-column CSVs where the indicator is not column 0
+            #     (feodotracker ipblocklist.csv puts IP in col 1 after
+            #     the timestamp column)
+            fields = [f.strip().strip('"') for f in line.split(",")]
+            chosen_value = None
+            chosen_type = None
+            for field in fields:
+                ind_type = self._detect_type(field)
+                if ind_type:
+                    chosen_value = field
+                    chosen_type = ind_type
+                    break
+
+            if not chosen_value or not chosen_type:
+                continue
+
+            indicators.append({
+                "value": chosen_value,
+                "indicator_type": chosen_type,
+                "confidence": self.default_confidence,
+                "severity": self.default_severity,
+            })
+
+        logger.info("Parsed plain-list feed", indicator_count=len(indicators))
+        return indicators
+
+
 class CSVFeedParser(FeedParser):
     """Parser for CSV threat feeds with configurable column mapping"""
 
@@ -402,56 +503,118 @@ class FeedManager:
             "json": STIXFeedParser(),  # Default to STIX for JSON
             "taxii": STIXFeedParser(),  # TAXII returns STIX
             "openioc": STIXFeedParser(),  # Will parse as STIX
+            "plain": PlainListFeedParser(),  # abuse.ch style plain-text lists
         }
 
-        # Built-in feeds configuration
+        # Built-in feeds — all keyless, all free, all publicly accessible.
+        # The "plain" feed_type uses PlainListFeedParser which auto-detects
+        # indicator_type from each line (IPv4/CIDR/URL/domain/hash).
+        #
+        # default_severity: severity assigned to every indicator ingested
+        # from this feed. Pick the level that matches the feed's signal
+        # quality — known C2 infrastructure is HIGH, curated attacker
+        # blocklists are MEDIUM.
         self.builtin_feeds = [
             {
-                "name": "AlienVault OTX",
-                "feed_type": "csv",
-                "url": "https://otx.alienvault.com/api/v1/pulses/subscribed",
-                "provider": "AT&T Cybersecurity",
-                "description": "AlienVault Open Threat Exchange - community-sourced threat intelligence",
+                "name": "Abuse.ch Feodo Tracker (Aggressive)",
+                "feed_type": "plain",
+                # The "aggressive" list includes historical C2 infrastructure
+                # (~8000 IPs) — operators reuse infra, so historical is the
+                # signal, not noise. The "recommended" list only has ~5
+                # currently-online IPs which is useless for detection.
+                "url": "https://feodotracker.abuse.ch/downloads/ipblocklist_aggressive.csv",
+                "provider": "Abuse.ch",
+                "description": "Historical + active botnet C&C IPs (Emotet, Dridex, QakBot, TrickBot, BazarLoader)",
                 "is_builtin": True,
+                "is_enabled": True,
                 "poll_interval_minutes": 60,
+                "confidence_weight": 0.9,
+                "default_severity": "high",  # live C2 infrastructure
             },
             {
                 "name": "Abuse.ch URLhaus",
-                "feed_type": "csv",
-                "url": "https://urlhaus-api.abuse.ch/v1/urls/recent/",
+                "feed_type": "plain",
+                "url": "https://urlhaus.abuse.ch/downloads/text_online/",
                 "provider": "Abuse.ch",
-                "description": "Malicious URLs database",
+                "description": "Active malware distribution URLs",
                 "is_builtin": True,
-                "poll_interval_minutes": 60,
+                "is_enabled": True,
+                "poll_interval_minutes": 30,
+                "confidence_weight": 0.95,
+                "default_severity": "high",  # live malware distribution
             },
             {
-                "name": "Abuse.ch MalwareBazaar",
-                "feed_type": "json",
-                "url": "https://mb-api.abuse.ch/api/v1/",
-                "provider": "Abuse.ch",
-                "description": "Malware samples and hashes",
+                "name": "Emerging Threats Compromised IPs",
+                "feed_type": "plain",
+                "url": "https://rules.emergingthreats.net/blockrules/compromised-ips.txt",
+                "provider": "Proofpoint ET",
+                "description": "Known compromised hosts (open proxies, malware infected)",
                 "is_builtin": True,
+                "is_enabled": True,
                 "poll_interval_minutes": 120,
+                "confidence_weight": 0.8,
+                "default_severity": "high",
             },
             {
-                "name": "EmergingThreats",
-                "feed_type": "csv",
-                "url": "https://rules.emergingthreats.net/blocklist/",
-                "provider": "Proofpoint",
-                "description": "Emerging threats IOC feed",
+                "name": "Spamhaus DROP",
+                "feed_type": "plain",
+                "url": "https://www.spamhaus.org/drop/drop.txt",
+                "provider": "Spamhaus",
+                "description": "Don't Route Or Peer netblocks (hijacked or known criminal)",
                 "is_builtin": True,
-                "poll_interval_minutes": 60,
+                "is_enabled": True,
+                "poll_interval_minutes": 360,
+                "confidence_weight": 1.0,
+                "default_severity": "critical",  # hijacked or criminal netblocks
             },
             {
-                "name": "PhishTank",
-                "feed_type": "json",
-                "url": "https://phishtank.com/api_info.php",
-                "provider": "OpenDNS",
-                "description": "Phishing URLs database",
+                "name": "CINS Army List",
+                "feed_type": "plain",
+                "url": "http://cinsscore.com/list/ci-badguys.txt",
+                "provider": "Sentinel IPS",
+                "description": "Top ~15,000 highest-scoring attacker IPs seen by Sentinel IPS sensor network",
                 "is_builtin": True,
-                "poll_interval_minutes": 240,
+                "is_enabled": True,
+                "poll_interval_minutes": 180,
+                "confidence_weight": 0.85,
+                "default_severity": "medium",
+            },
+            {
+                "name": "Blocklist.de All",
+                "feed_type": "plain",
+                "url": "https://lists.blocklist.de/lists/all.txt",
+                "provider": "blocklist.de",
+                "description": "Attackers seen by >700 fail2ban / log analyzer sensors (SSH brute force, web attacks, IMAP, mail)",
+                "is_builtin": True,
+                "is_enabled": True,
+                "poll_interval_minutes": 120,
+                "confidence_weight": 0.85,
+                "default_severity": "medium",
+            },
+            {
+                "name": "Binary Defense Banlist",
+                "feed_type": "plain",
+                "url": "https://www.binarydefense.com/banlist.txt",
+                "provider": "Binary Defense",
+                "description": "Artillery Threat Intelligence Feed — curated attacker IPs",
+                "is_builtin": True,
+                "is_enabled": True,
+                "poll_interval_minutes": 360,
+                "confidence_weight": 0.9,
+                "default_severity": "medium",
             },
         ]
+
+    def _feed_default_severity(self, feed_name: str) -> str:
+        """Look up the configured default severity for a named built-in feed.
+
+        Falls back to 'medium' for any feed that isn't in the builtin
+        config (e.g. user-added custom feeds).
+        """
+        for f in self.builtin_feeds:
+            if f["name"] == feed_name:
+                return f.get("default_severity", "medium")
+        return "medium"
 
     async def poll_feed(self, feed_id: str) -> int:
         """Poll a single threat feed and ingest indicators
@@ -489,8 +652,16 @@ class FeedManager:
                 await session.commit()
                 return 0
 
-            # Parse using the appropriate parser
-            parser = self.parsers.get(feed.feed_type)
+            # Parse using the appropriate parser. For plain-list feeds we
+            # instantiate a per-feed parser with the default severity
+            # configured in builtin_feeds[] — known-C2 feeds get HIGH,
+            # hijacked-netblock feeds get CRITICAL, generic attacker
+            # blocklists stay MEDIUM.
+            feed_default_severity = self._feed_default_severity(feed.name)
+            if feed.feed_type == "plain":
+                parser = PlainListFeedParser(default_severity=feed_default_severity)
+            else:
+                parser = self.parsers.get(feed.feed_type)
             if not parser:
                 self.logger.error("No parser for feed type", feed_type=feed.feed_type)
                 feed.last_error = f"No parser for feed type: {feed.feed_type}"
@@ -679,18 +850,50 @@ class FeedManager:
     ) -> Optional[ThreatIndicator]:
         """Check for existing indicator or create new one
 
+        Queries the database for an existing indicator with the same type and
+        value. If found, updates its last_seen timestamp. If not found, creates
+        a new ThreatIndicator record.
+
         Args:
             indicator_type: Type of indicator
             value: Indicator value
             feed_id: Source feed ID
 
         Returns:
-            ThreatIndicator instance (existing or new)
+            ThreatIndicator instance if new, None if already exists
         """
-        # This would query the database for existing indicator
-        # and either return it or create a new one
-        # Placeholder implementation
-        return None
+        from src.core.database import async_session_factory
+        from sqlalchemy import select
+
+        async with async_session_factory() as db:
+            # Check if indicator already exists
+            query = select(ThreatIndicator).where(
+                ThreatIndicator.indicator_type == indicator_type,
+                ThreatIndicator.value == value,
+            )
+            result = await db.execute(query)
+            existing = result.scalar_one_or_none()
+
+            if existing:
+                # Update last_seen on existing indicator
+                existing.last_seen = datetime.now(timezone.utc)
+                await db.commit()
+                return None  # Not new, return None
+
+            # Create new indicator
+            new_indicator = ThreatIndicator(
+                indicator_type=indicator_type,
+                value=value,
+                feed_id=feed_id,
+                source=f"feed:{feed_id}",
+                is_active=True,
+                first_seen=datetime.now(timezone.utc),
+                last_seen=datetime.now(timezone.utc),
+            )
+            db.add(new_indicator)
+            await db.commit()
+            await db.refresh(new_indicator)
+            return new_indicator
 
     async def enable_feed(self, feed_id: str) -> bool:
         """Enable a threat feed"""
@@ -716,12 +919,109 @@ class FeedManager:
             "success_rate": 0.0,
         }
 
-    async def register_builtin_feeds(self) -> int:
-        """Register built-in threat feeds in database
+    # Feeds that used to be built-in but are deprecated/upstream-dead.
+    # Rows with these names (is_builtin=True) are removed on startup.
+    _DEPRECATED_FEED_NAMES = (
+        "Abuse.ch SSL Blacklist",  # abuse.ch deprecated it 2025-01-03
+        "Abuse.ch Feodo Tracker",  # replaced by "Abuse.ch Feodo Tracker (Aggressive)"
+        "Abuse.ch MalwareBazaar",  # old stub, no parser
+        "AlienVault OTX",  # old stub, needs API key
+        "PhishTank",  # old stub, needs API key
+        "EmergingThreats",  # old stub, wrong URL
+    )
 
-        Returns:
-            Number of feeds registered
+    async def register_builtin_feeds(self) -> int:
+        """Register built-in threat feeds in the database.
+
+        Idempotent — existing builtin feeds (matched by name) are updated
+        in place, not duplicated. Deprecated built-ins are removed.
+        Returns the number of NEW feeds created this call.
         """
+        from src.core.database import async_session_factory
+        from sqlalchemy import select, delete
+
         self.logger.info("Registering built-in feeds", count=len(self.builtin_feeds))
-        # This would create ThreatFeed entries in database for each builtin feed
-        return len(self.builtin_feeds)
+
+        created = 0
+        async with async_session_factory() as session:
+            # 1. Purge any deprecated built-in feeds (and their indicators
+            #    cascade-delete via the ThreatFeed.indicators relationship).
+            for dead_name in self._DEPRECATED_FEED_NAMES:
+                result = await session.execute(
+                    select(ThreatFeed).where(
+                        ThreatFeed.name == dead_name,
+                        ThreatFeed.is_builtin == True,  # noqa: E712
+                    )
+                )
+                dead = result.scalar_one_or_none()
+                if dead:
+                    self.logger.info("Removing deprecated builtin feed", name=dead_name)
+                    await session.delete(dead)
+            await session.flush()
+            for feed_def in self.builtin_feeds:
+                existing = await session.execute(
+                    select(ThreatFeed).where(ThreatFeed.name == feed_def["name"])
+                )
+                row = existing.scalar_one_or_none()
+
+                if row:
+                    # Update mutable config on every call so URL/description
+                    # changes in code propagate without a migration.
+                    row.feed_type = feed_def["feed_type"]
+                    row.url = feed_def.get("url")
+                    row.provider = feed_def.get("provider")
+                    row.description = feed_def.get("description")
+                    row.is_builtin = True
+                    row.poll_interval_minutes = feed_def.get("poll_interval_minutes", 60)
+                    if "confidence_weight" in feed_def:
+                        row.confidence_weight = feed_def["confidence_weight"]
+                    # Don't clobber is_enabled if an operator disabled it
+                    continue
+
+                new_feed = ThreatFeed(
+                    name=feed_def["name"],
+                    feed_type=feed_def["feed_type"],
+                    url=feed_def.get("url"),
+                    provider=feed_def.get("provider"),
+                    description=feed_def.get("description"),
+                    is_enabled=feed_def.get("is_enabled", True),
+                    is_builtin=True,
+                    poll_interval_minutes=feed_def.get("poll_interval_minutes", 60),
+                    confidence_weight=feed_def.get("confidence_weight", 1.0),
+                    total_indicators=0,
+                    tags=[],
+                )
+                session.add(new_feed)
+                created += 1
+                self.logger.info("Registered builtin feed", name=feed_def["name"])
+
+            await session.commit()
+
+            # Backfill: upgrade severity on existing rows whose feed's
+            # default_severity has changed (e.g. the first ingestion
+            # defaulted to 'medium' and the feed has since been reclassified
+            # as 'high' or 'critical'). Idempotent — only touches rows whose
+            # current severity doesn't match the target.
+            from sqlalchemy import update
+            for feed_def in self.builtin_feeds:
+                target_severity = feed_def.get("default_severity")
+                if not target_severity:
+                    continue
+                feed_row_result = await session.execute(
+                    select(ThreatFeed).where(ThreatFeed.name == feed_def["name"])
+                )
+                feed_row = feed_row_result.scalar_one_or_none()
+                if not feed_row:
+                    continue
+                await session.execute(
+                    update(ThreatIndicator)
+                    .where(
+                        ThreatIndicator.feed_id == feed_row.id,
+                        ThreatIndicator.severity != target_severity,
+                    )
+                    .values(severity=target_severity)
+                )
+            await session.commit()
+
+        self.logger.info("Built-in feeds registration complete", created=created)
+        return created

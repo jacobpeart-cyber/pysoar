@@ -26,7 +26,7 @@ class EntityProfileBase(BaseModel):
     is_watched: bool = False
     watch_reason: Optional[str] = None
     tags: list = Field(default_factory=list)
-    metadata: dict = Field(default_factory=dict)
+    extra_metadata: dict = Field(default_factory=dict)
 
 
 class EntityProfileCreate(EntityProfileBase):
@@ -47,7 +47,7 @@ class EntityProfileUpdate(BaseModel):
     is_watched: Optional[bool] = None
     watch_reason: Optional[str] = None
     tags: Optional[list] = None
-    metadata: Optional[dict] = None
+    extra_metadata: Optional[dict] = None
 
 
 class EntityProfileResponse(EntityProfileBase, DBModel):

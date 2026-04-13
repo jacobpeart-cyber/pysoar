@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Path, HTTPException, Query, status
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DatabaseSession
@@ -201,11 +201,61 @@ async def export_sbom(
     db: DatabaseSession = None,
     sbom_id: str = Path(...),
 ):
-    """Export SBOM in specified format"""
+    """Export SBOM as a real, spec-compliant SPDX or CycloneDX document.
+
+    Loads every SBOMComponent + joined SoftwareComponent row for this SBOM
+    and passes them to the generator so the output contains real packages,
+    versions, licenses, purls, and SHA-256 checksums — not an empty envelope.
+
+    Returns a ``StreamingResponse`` with the proper ``Content-Disposition``
+    header so the browser downloads it as a file instead of rendering JSON.
+    """
+    from fastapi.responses import StreamingResponse
+    import io
+
     sbom = await get_sbom_or_404(db, sbom_id)
 
     if sbom.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+
+    # Load the real component list (tenant-scoped via SBOM ownership check above)
+    comp_result = await db.execute(
+        select(SoftwareComponent, SBOMComponent.relationship_type)
+        .join(SBOMComponent, SBOMComponent.component_id == SoftwareComponent.id)
+        .where(SBOMComponent.sbom_id == sbom_id)
+    )
+    rows = comp_result.all()
+
+    components = []
+    relationships = []
+    for sw, rel_type in rows:
+        components.append({
+            "id": sw.id,
+            "SPDXID": f"SPDXRef-Package-{sw.id}",
+            "bom-ref": sw.id,
+            "name": sw.name,
+            "version": sw.version,
+            "type": sw.package_type or "library",
+            "supplier": f"Organization: {sw.vendor}" if sw.vendor else "NOASSERTION",
+            "licenseConcluded": sw.license_spdx_id or sw.license_type or "NOASSERTION",
+            "licenseDeclared": sw.license_spdx_id or sw.license_type or "NOASSERTION",
+            "purl": sw.purl,
+            "cpe": sw.cpe,
+            "hashes": (
+                [{"alg": "SHA-256", "content": sw.checksum_sha256}]
+                if sw.checksum_sha256
+                else []
+            ),
+            "externalRefs": (
+                [{"referenceType": "purl", "referenceLocator": sw.purl}] if sw.purl else []
+            ),
+        })
+        if sw.parent_component_id:
+            relationships.append({
+                "spdxElementId": f"SPDXRef-Package-{sw.parent_component_id}",
+                "relatedSpdxElement": f"SPDXRef-Package-{sw.id}",
+                "relationshipType": (rel_type or "DEPENDS_ON").upper(),
+            })
 
     generator = SBOMGenerator()
 
@@ -213,24 +263,31 @@ async def export_sbom(
         "id": sbom.id,
         "name": sbom.application_name,
         "version": sbom.application_version,
-        "created_by_tool": sbom.created_by_tool,
+        "created_by_tool": sbom.created_by_tool or "PySOAR",
+        "components": components,
+        "relationships": relationships,
     }
 
-    if export_request.export_format == "spdx_json":
+    fmt = export_request.export_format
+    if fmt == "spdx_json":
         content = generator.generate_spdx_output(sbom_data)
-    elif export_request.export_format == "cyclonedx_json":
+        media_type = "application/spdx+json"
+        filename = f"{sbom.application_name or 'sbom'}-{sbom.application_version or 'v1'}.spdx.json"
+    elif fmt == "cyclonedx_json":
         content = generator.generate_cyclonedx_output(sbom_data)
+        media_type = "application/vnd.cyclonedx+json"
+        filename = f"{sbom.application_name or 'sbom'}-{sbom.application_version or 'v1'}.cdx.json"
     else:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Unsupported export format",
+            detail="Unsupported export format (use spdx_json or cyclonedx_json)",
         )
 
-    return {
-        "format": export_request.export_format,
-        "content": content,
-        "generated_at": datetime.utcnow().isoformat(),
-    }
+    return StreamingResponse(
+        io.BytesIO(content.encode("utf-8")),
+        media_type=media_type,
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @router.get("/sboms", response_model=SBOMListResponse)
@@ -492,7 +549,21 @@ async def get_component_vulnerabilities(
     db: DatabaseSession = None,
     component_id: str = Path(...),
 ):
-    """Look up known vulnerabilities for component"""
+    """Look up known vulnerabilities for a component.
+
+    Previously hardcoded ``highest_severity = "critical"`` whenever
+    the component had any CVE at all, regardless of actual CVSS
+    scores. An informational CVE looked critical on the dashboard;
+    a component with 12 high-severity CVEs looked the same as one
+    with 1 medium. Now:
+      - pulls SupplyChainRisk rows linked to this component
+      - joins the collected CVE IDs back to the Vulnerability table
+        to get the real severity
+      - returns the highest actual severity in the standard
+        critical > high > medium > low > informational ordering
+    """
+    from src.vulnmgmt.models import Vulnerability, VulnerabilitySeverity
+
     component = await get_component_or_404(db, component_id)
 
     if component.organization_id != getattr(current_user, "organization_id", None):
@@ -506,18 +577,43 @@ async def get_component_vulnerabilities(
     )
     risks = result.scalars().all()
 
-    cves = []
+    cves: list[str] = []
     for risk in risks:
         if risk.cve_ids:
             cve_list = safe_json_loads(risk.cve_ids, [])
             if isinstance(cve_list, list):
                 cves.extend(cve_list)
+    unique_cves = sorted(set(cves))
+
+    # Resolve highest real severity from the Vulnerability table (tenant-scoped)
+    highest: Optional[str] = None
+    if unique_cves:
+        org_id = getattr(current_user, "organization_id", None)
+        sev_result = await db.execute(
+            select(Vulnerability.severity).where(
+                and_(
+                    Vulnerability.cve_id.in_(unique_cves),
+                    Vulnerability.organization_id == org_id,
+                )
+            )
+        )
+        severities = [row[0] for row in sev_result.all() if row[0]]
+        if severities:
+            # Rank by the canonical enum ordering — critical > low
+            rank = {
+                VulnerabilitySeverity.CRITICAL.value: 5,
+                VulnerabilitySeverity.HIGH.value: 4,
+                VulnerabilitySeverity.MEDIUM.value: 3,
+                VulnerabilitySeverity.LOW.value: 2,
+                VulnerabilitySeverity.INFORMATIONAL.value: 1,
+            }
+            highest = max(severities, key=lambda s: rank.get(s, 0))
 
     return ComponentVulnerabilityLookup(
         component=component,
-        cves=list(set(cves)),
-        vulnerability_count=len(cves),
-        highest_severity="critical" if len(cves) > 0 else None,
+        cves=unique_cves,
+        vulnerability_count=len(unique_cves),
+        highest_severity=highest,
     )
 
 
@@ -755,7 +851,24 @@ async def license_audit(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Audit license compliance across organization"""
+    """Audit license compliance across organization.
+
+    Fixed logic bugs in the previous version:
+      - ``conflicts = []`` was always empty, so the UI never showed
+        which components were in conflict
+      - compliance_status was ``"compliant" if proprietary_count == 0
+        OR gpl_count == 0 else "conflict"``, meaning the endpoint
+        reported "compliant" whenever EITHER count was zero. A tenant
+        with 50 proprietary + 0 GPL got "compliant" (the real concern
+        is the mix, not the individual count).
+
+    Now calls the engine's ``SupplyChainRiskAnalyzer.assess_license_
+    compliance`` on the unique license set for real GPL↔proprietary
+    conflict detection, and populates ``conflicts`` with the
+    specific components that carry conflicting licenses.
+    """
+    from src.supplychain.engine import SupplyChainRiskAnalyzer
+
     result = await db.execute(
         select(SoftwareComponent).where(
             SoftwareComponent.organization_id == getattr(current_user, "organization_id", None)
@@ -763,21 +876,45 @@ async def license_audit(
     )
     components = result.scalars().all()
 
-    licenses = {}
+    licenses: dict[str, int] = {}
     gpl_count = 0
     proprietary_count = 0
     permissive_count = 0
 
-    for component in components:
-        if component.license_spdx_id:
-            licenses[component.license_spdx_id] = licenses.get(component.license_spdx_id, 0) + 1
+    gpl_license_set = {"GPL-2.0", "GPL-3.0", "AGPL-3.0", "LGPL-2.1", "LGPL-3.0"}
+    proprietary_license_set = {"Proprietary", "Commercial"}
+    permissive_license_set = {"MIT", "Apache-2.0", "BSD-3-Clause", "ISC"}
 
-            if "GPL" in component.license_spdx_id:
-                gpl_count += 1
-            elif component.license_spdx_id in ["Proprietary", "Commercial"]:
-                proprietary_count += 1
-            elif component.license_spdx_id in ["MIT", "Apache-2.0", "BSD-3-Clause"]:
-                permissive_count += 1
+    gpl_components: list[str] = []
+    proprietary_components: list[str] = []
+
+    for component in components:
+        lic = component.license_spdx_id
+        if not lic:
+            continue
+        licenses[lic] = licenses.get(lic, 0) + 1
+        if any(g in lic for g in gpl_license_set) or "GPL" in lic:
+            gpl_count += 1
+            gpl_components.append(component.name or component.id)
+        elif lic in proprietary_license_set:
+            proprietary_count += 1
+            proprietary_components.append(component.name or component.id)
+        elif lic in permissive_license_set:
+            permissive_count += 1
+
+    # Real conflict detection via the engine
+    analyzer = SupplyChainRiskAnalyzer()
+    license_assessment = analyzer.assess_license_compliance(list(licenses.keys()))
+
+    conflicts: list[str] = []
+    for reason in license_assessment.get("conflicts", []):
+        # Reason is a description like "GPL incompatible with
+        # proprietary license" — enrich it with the specific
+        # components so the operator can act.
+        conflicts.append(
+            f"{reason}: GPL in {gpl_components[:5]}, "
+            f"Proprietary in {proprietary_components[:5]}"
+        )
 
     return LicenseBreakdown(
         total_components=len(components),
@@ -785,8 +922,8 @@ async def license_audit(
         gpl_components=gpl_count,
         proprietary_components=proprietary_count,
         permissive_components=permissive_count,
-        conflicts=[],
-        compliance_status="compliant" if proprietary_count == 0 or gpl_count == 0 else "conflict",
+        conflicts=conflicts,
+        compliance_status=license_assessment.get("compliance_status", "unknown"),
     )
 
 
@@ -852,6 +989,22 @@ async def dashboard_overview(
     )
     critical_vendors = vendor_critical_result.scalar() or 0
 
+    # Real averages (were hardcoded 45.5 / 62.3 — cosmetic fake data that
+    # would have been the first thing an auditor noticed)
+    avg_comp_result = await db.execute(
+        select(func.avg(SoftwareComponent.risk_score)).where(
+            SoftwareComponent.organization_id == getattr(current_user, "organization_id", None)
+        )
+    )
+    avg_component_risk = float(avg_comp_result.scalar() or 0.0)
+
+    avg_vendor_result = await db.execute(
+        select(func.avg(VendorAssessment.security_score)).where(
+            VendorAssessment.organization_id == getattr(current_user, "organization_id", None)
+        )
+    )
+    avg_vendor_score = float(avg_vendor_result.scalar() or 0.0)
+
     return DashboardOverview(
         total_sboms=total_sboms,
         total_components=total_components,
@@ -860,8 +1013,8 @@ async def dashboard_overview(
         high_risks_open=high_risks,
         vendors_assessed=total_vendors,
         critical_risk_vendors=critical_vendors,
-        average_component_risk=45.5,
-        average_vendor_score=62.3,
+        average_component_risk=round(avg_component_risk, 1),
+        average_vendor_score=round(avg_vendor_score, 1),
     )
 
 

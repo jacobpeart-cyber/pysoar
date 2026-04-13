@@ -12,6 +12,12 @@ services:
     container_name: pysoar-frontend
     ports:
       - "80:80"
+    # Bind-mount the host's built dist over the baked-in one so a
+    # `vite build` + `docker cp` (or a plain host-side copy) shows up
+    # instantly without rebuilding the image. The image still has a
+    # valid dist baked in for clean `docker compose up` on fresh hosts.
+    volumes:
+      - ./frontend/dist:/usr/share/nginx/html:ro
     depends_on:
       - api
     networks:

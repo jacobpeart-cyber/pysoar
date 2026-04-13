@@ -1,57 +1,111 @@
 """
-Celery Tasks for Phishing Simulation & Security Awareness Module
+Phishing Simulation Celery Tasks
 
-Background tasks for campaign execution, training assignment, reporting,
-and risk score recalculation.
+Asynchronous tasks for campaign launch, email batch sending, report
+generation, score recalculation, and campaign scheduling.
+
+Every task queries real database rows and performs real operations.
+No simulated data. No hardcoded numbers.
 """
 
-from datetime import datetime, timedelta, timezone
+import math
+from datetime import datetime, timezone
 
 from celery import shared_task
+from sqlalchemy import select
 
-from src.core.config import settings
 from src.core.logging import get_logger
 
 logger = get_logger(__name__)
 
 
+def _get_sync_session():
+    """Create a one-shot async session and run queries inside asyncio.run().
+
+    Celery tasks run in a sync worker context. We spin up a short-lived
+    async session per task invocation, execute the DB work, and close it.
+    """
+    import asyncio
+    from src.core.database import async_session_factory
+    return asyncio.new_event_loop(), async_session_factory
+
+
 @shared_task(bind=True, max_retries=3)
-def launch_scheduled_campaign(
-    self,
-    campaign_id: str,
-    organization_id: str,
-):
+def launch_scheduled_campaign(self, campaign_id: str, organization_id: str):
+    """Launch a phishing campaign by loading targets and queuing email batches.
+
+    1. Loads the PhishingCampaign row from the DB.
+    2. Loads the TargetGroup members list.
+    3. Sets campaign status to 'active' and total_targets.
+    4. Queues send_campaign_batch tasks for each batch of targets.
     """
-    Launch a scheduled phishing campaign.
+    import asyncio
+    from src.core.database import async_session_factory
+    from src.phishing_sim.models import PhishingCampaign, TargetGroup
 
-    Triggered at scheduled start time to activate and begin email distribution.
+    async def _run():
+        async with async_session_factory() as session:
+            result = await session.execute(
+                select(PhishingCampaign).where(PhishingCampaign.id == campaign_id)
+            )
+            campaign = result.scalar_one_or_none()
+            if not campaign:
+                logger.error(f"Campaign {campaign_id} not found")
+                return {"status": "error", "detail": "Campaign not found"}
 
-    Args:
-        campaign_id: Campaign ID to launch
-        organization_id: Organization context
+            # Load target group
+            targets = []
+            if campaign.target_group_id:
+                tg_result = await session.execute(
+                    select(TargetGroup).where(TargetGroup.id == campaign.target_group_id)
+                )
+                target_group = tg_result.scalar_one_or_none()
+                if target_group and target_group.members:
+                    targets = target_group.members if isinstance(target_group.members, list) else []
 
-    Returns:
-        Campaign launch status and statistics
-    """
+            if not targets:
+                logger.warning(f"Campaign {campaign_id} has no targets")
+                return {"status": "error", "detail": "No targets in campaign"}
+
+            # Activate campaign
+            campaign.status = "active"
+            campaign.total_targets = len(targets)
+            campaign.start_date = datetime.now(timezone.utc)
+            await session.commit()
+
+            # Queue batches
+            schedule = campaign.send_schedule or {}
+            batch_size = schedule.get("batch_size", 50)
+            batch_count = math.ceil(len(targets) / batch_size)
+
+            for i in range(batch_count):
+                send_campaign_batch.delay(
+                    campaign_id=campaign_id,
+                    batch_number=i + 1,
+                    batch_size=batch_size,
+                    organization_id=organization_id,
+                )
+
+            logger.info(
+                f"Campaign {campaign_id} launched: {len(targets)} targets, "
+                f"{batch_count} batches queued"
+            )
+
+            return {
+                "campaign_id": campaign_id,
+                "organization_id": organization_id,
+                "status": "launched",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "targets_queued": len(targets),
+                "batches_scheduled": batch_count,
+            }
+
     try:
-        logger.info(
-            f"Launching scheduled campaign {campaign_id}",
-            extra={"organization_id": organization_id},
-        )
-
-        # Simulate campaign launch
-        result = {
-            "campaign_id": campaign_id,
-            "organization_id": organization_id,
-            "status": "launched",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "targets_queued": 250,
-            "batches_scheduled": 5,
-        }
-
-        logger.info(f"Campaign {campaign_id} launched successfully", extra=result)
-        return result
-
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(_run())
+        finally:
+            loop.close()
     except Exception as e:
         logger.error(f"Failed to launch campaign {campaign_id}: {e}")
         raise self.retry(exc=e, countdown=60 * (2 ** self.request.retries))
@@ -65,220 +119,309 @@ def send_campaign_batch(
     batch_size: int,
     organization_id: str,
 ):
+    """Send a batch of phishing emails for a campaign.
+
+    Loads the campaign template, resolves the batch slice of targets
+    from the TargetGroup members list, renders each email via the
+    template, and sends via the configured SMTP service. Records
+    CampaignEvent rows for each delivery.
     """
-    Send a batch of phishing emails for a campaign.
+    import asyncio
+    from src.core.database import async_session_factory
+    from src.phishing_sim.models import PhishingCampaign, PhishingTemplate, TargetGroup, CampaignEvent
 
-    Executes in batches to control rate and server load. Each task
-    sends batch_size emails and records delivery events.
+    async def _run():
+        async with async_session_factory() as session:
+            result = await session.execute(
+                select(PhishingCampaign).where(PhishingCampaign.id == campaign_id)
+            )
+            campaign = result.scalar_one_or_none()
+            if not campaign:
+                return {"status": "error", "detail": "Campaign not found"}
 
-    Args:
-        campaign_id: Campaign ID
-        batch_number: Batch sequence number
-        batch_size: Number of emails in this batch
-        organization_id: Organization context
+            # Load template
+            template_body = "You have a new notification. Click here to review."
+            template_subject = "Action Required"
+            if campaign.template_id:
+                tmpl_result = await session.execute(
+                    select(PhishingTemplate).where(PhishingTemplate.id == campaign.template_id)
+                )
+                tmpl = tmpl_result.scalar_one_or_none()
+                if tmpl:
+                    template_body = tmpl.html_body or tmpl.text_body or template_body
+                    template_subject = tmpl.subject_line or template_subject
 
-    Returns:
-        Batch delivery statistics
-    """
+            # Load targets for this batch
+            targets = []
+            if campaign.target_group_id:
+                tg_result = await session.execute(
+                    select(TargetGroup).where(TargetGroup.id == campaign.target_group_id)
+                )
+                tg = tg_result.scalar_one_or_none()
+                if tg and isinstance(tg.members, list):
+                    start = (batch_number - 1) * batch_size
+                    targets = tg.members[start:start + batch_size]
+
+            if not targets:
+                return {"status": "skipped", "detail": "No targets in batch"}
+
+            # Send emails
+            delivered = 0
+            failed = 0
+            now = datetime.now(timezone.utc)
+
+            try:
+                from src.services.email_service import EmailService
+                email_service = EmailService()
+                can_send = email_service.is_configured
+            except Exception:
+                can_send = False
+
+            for target in targets:
+                email = target.get("email", "")
+                name = target.get("name", "")
+                if not email:
+                    failed += 1
+                    continue
+
+                if can_send:
+                    try:
+                        sent = await email_service.send_email(
+                            to=[email],
+                            subject=template_subject.replace("{{name}}", name),
+                            body=template_body.replace("{{name}}", name),
+                        )
+                        if sent:
+                            delivered += 1
+                        else:
+                            failed += 1
+                    except Exception as exc:
+                        logger.warning(f"Email send failed for {email}: {exc}")
+                        failed += 1
+                else:
+                    # SMTP not configured — record as pending, don't claim delivery
+                    failed += 1
+
+                # Record event
+                event = CampaignEvent(
+                    campaign_id=campaign_id,
+                    target_email=email,
+                    event_type="email_sent" if delivered > failed else "send_failed",
+                    organization_id=organization_id,
+                )
+                session.add(event)
+
+            campaign.emails_sent = (campaign.emails_sent or 0) + delivered
+            await session.commit()
+
+            return {
+                "campaign_id": campaign_id,
+                "batch_number": batch_number,
+                "delivered": delivered,
+                "failed": failed,
+                "timestamp": now.isoformat(),
+            }
+
     try:
-        logger.info(
-            f"Sending batch {batch_number} for campaign {campaign_id}",
-            extra={
-                "batch_size": batch_size,
-                "organization_id": organization_id,
-            },
-        )
-
-        # Simulate email batch sending
-        now = datetime.now(timezone.utc)
-        delivered = int(batch_size * 0.98)  # 98% delivery rate
-        bounced = batch_size - delivered
-
-        result = {
-            "campaign_id": campaign_id,
-            "batch_number": batch_number,
-            "sent": batch_size,
-            "delivered": delivered,
-            "bounced": bounced,
-            "delivery_rate": round((delivered / batch_size * 100), 2),
-            "timestamp": now.isoformat(),
-            "next_batch_delay_seconds": 3600,  # 1 hour between batches
-        }
-
-        logger.info(
-            f"Batch {batch_number} sent for campaign {campaign_id}",
-            extra=result,
-        )
-
-        return result
-
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(_run())
+        finally:
+            loop.close()
     except Exception as e:
         logger.error(f"Failed to send batch {batch_number} for campaign {campaign_id}: {e}")
         raise self.retry(exc=e, countdown=60 * (2 ** self.request.retries))
 
 
-@shared_task(bind=True, max_retries=3)
-def training_reminder(
-    self,
-    user_email: str,
-    training_module: str,
-    organization_id: str,
-):
-    """
-    Send training completion reminder to user.
+@shared_task(bind=True, max_retries=2)
+def generate_campaign_report(self, campaign_id: str, organization_id: str):
+    """Generate a campaign performance report from real DB data."""
+    import asyncio
+    from src.core.database import async_session_factory
+    from src.phishing_sim.models import PhishingCampaign, CampaignEvent
+    from sqlalchemy import func
 
-    Reminds users with incomplete or overdue training assignments.
-    Sent via email with deadline warning.
+    async def _run():
+        async with async_session_factory() as session:
+            result = await session.execute(
+                select(PhishingCampaign).where(PhishingCampaign.id == campaign_id)
+            )
+            campaign = result.scalar_one_or_none()
+            if not campaign:
+                return {"status": "error", "detail": "Campaign not found"}
 
-    Args:
-        user_email: User email
-        training_module: Training module name
-        organization_id: Organization context
+            # Count events by type
+            event_counts = {}
+            for event_type in ["email_sent", "email_opened", "link_clicked", "credential_submitted", "reported"]:
+                count = (await session.execute(
+                    select(func.count(CampaignEvent.id)).where(
+                        CampaignEvent.campaign_id == campaign_id,
+                        CampaignEvent.event_type == event_type,
+                    )
+                )).scalar() or 0
+                event_counts[event_type] = count
 
-    Returns:
-        Reminder send status
-    """
+            sent = event_counts.get("email_sent", 0)
+            click_rate = round((event_counts["link_clicked"] / sent) * 100, 1) if sent else 0.0
+            report_rate = round((event_counts["reported"] / sent) * 100, 1) if sent else 0.0
+
+            return {
+                "campaign_id": campaign_id,
+                "campaign_name": campaign.name,
+                "status": campaign.status,
+                "total_targets": campaign.total_targets,
+                "events": event_counts,
+                "click_rate": click_rate,
+                "report_rate": report_rate,
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+            }
+
     try:
-        logger.info(
-            f"Sending training reminder to {user_email}",
-            extra={
-                "module": training_module,
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(_run())
+        finally:
+            loop.close()
+    except Exception as e:
+        logger.error(f"Report generation failed for campaign {campaign_id}: {e}")
+        raise self.retry(exc=e, countdown=60)
+
+
+@shared_task(bind=True, max_retries=2)
+def recalculate_awareness_scores(self, organization_id: str):
+    """Recalculate security awareness scores from real campaign event data."""
+    import asyncio
+    from src.core.database import async_session_factory
+    from src.phishing_sim.models import PhishingCampaign, CampaignEvent, SecurityAwarenessScore
+    from sqlalchemy import func, and_
+
+    async def _run():
+        async with async_session_factory() as session:
+            # Get all campaign events for this org grouped by target_email
+            events_result = await session.execute(
+                select(
+                    CampaignEvent.target_email,
+                    CampaignEvent.event_type,
+                    func.count(CampaignEvent.id),
+                )
+                .where(CampaignEvent.organization_id == organization_id)
+                .group_by(CampaignEvent.target_email, CampaignEvent.event_type)
+            )
+
+            # Aggregate per user
+            user_stats: dict[str, dict[str, int]] = {}
+            for email, event_type, count in events_result.all():
+                if email not in user_stats:
+                    user_stats[email] = {}
+                user_stats[email][event_type] = count
+
+            updated = 0
+            for email, stats in user_stats.items():
+                sent = stats.get("email_sent", 0)
+                clicked = stats.get("link_clicked", 0)
+                reported = stats.get("reported", 0)
+                submitted = stats.get("credential_submitted", 0)
+
+                # Score: start at 100, lose points for clicks/submissions, gain for reports
+                score = 100
+                if sent > 0:
+                    score -= int((clicked / sent) * 40)
+                    score -= int((submitted / sent) * 30)
+                    score += int((reported / sent) * 20)
+                score = max(0, min(100, score))
+
+                # Upsert SecurityAwarenessScore
+                existing = (await session.execute(
+                    select(SecurityAwarenessScore).where(
+                        and_(
+                            SecurityAwarenessScore.user_email == email,
+                            SecurityAwarenessScore.organization_id == organization_id,
+                        )
+                    )
+                )).scalar_one_or_none()
+
+                if existing:
+                    existing.overall_score = score
+                    existing.phishing_score = score
+                    existing.times_clicked = clicked
+                    existing.times_submitted_credentials = submitted
+                    existing.times_reported = reported
+                else:
+                    new_score = SecurityAwarenessScore(
+                        user_email=email,
+                        organization_id=organization_id,
+                        overall_score=score,
+                        phishing_score=score,
+                        times_clicked=clicked,
+                        times_submitted_credentials=submitted,
+                        times_reported=reported,
+                    )
+                    session.add(new_score)
+
+                updated += 1
+
+            await session.commit()
+            return {
                 "organization_id": organization_id,
-            },
-        )
+                "users_updated": updated,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
 
-        # Simulate email sending
-        result = {
-            "user_email": user_email,
-            "training_module": training_module,
-            "reminder_type": "overdue",
-            "sent_at": datetime.now(timezone.utc).isoformat(),
-            "due_date": (datetime.now(timezone.utc) + timedelta(days=3)).isoformat(),
-            "status": "sent",
-        }
-
-        logger.info(f"Training reminder sent to {user_email}")
-        return result
-
-    except Exception as e:
-        logger.error(f"Failed to send training reminder to {user_email}: {e}")
-        raise self.retry(exc=e, countdown=60 * (2 ** self.request.retries))
-
-
-@shared_task(bind=True, max_retries=3)
-def monthly_awareness_report(
-    self,
-    organization_id: str,
-    month: str = None,
-    year: int = None,
-):
-    """
-    Generate monthly security awareness report.
-
-    Aggregates campaigns, user scores, training completion, and risk trends
-    for the specified month. Sent to security leadership.
-
-    Args:
-        organization_id: Organization context
-        month: Month (1-12), defaults to current month
-        year: Year, defaults to current year
-
-    Returns:
-        Report generation status and summary
-    """
     try:
-        now = datetime.now(timezone.utc)
-        report_month = month or now.month
-        report_year = year or now.year
-
-        logger.info(
-            f"Generating monthly awareness report for org {organization_id}",
-            extra={"month": report_month, "year": report_year},
-        )
-
-        # Simulate report generation
-        result = {
-            "organization_id": organization_id,
-            "period": f"{report_year}-{report_month:02d}",
-            "campaigns_executed": 8,
-            "total_participants": 450,
-            "avg_click_rate": 12.5,
-            "avg_submission_rate": 3.2,
-            "training_completed": 285,
-            "training_completion_rate": 63.3,
-            "high_risk_users": 45,
-            "improvement_vs_last_month": 8.3,  # percent
-            "generated_at": now.isoformat(),
-            "status": "sent_to_leadership",
-        }
-
-        logger.info(
-            f"Monthly report generated for org {organization_id}",
-            extra={
-                "campaigns": result["campaigns_executed"],
-                "participants": result["total_participants"],
-            },
-        )
-
-        return result
-
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(_run())
+        finally:
+            loop.close()
     except Exception as e:
-        logger.error(f"Failed to generate monthly report for org {organization_id}: {e}")
-        raise self.retry(exc=e, countdown=60 * (2 ** self.request.retries))
+        logger.error(f"Score recalculation failed for org {organization_id}: {e}")
+        raise self.retry(exc=e, countdown=60)
 
 
-@shared_task(bind=True, max_retries=3)
-def risk_score_recalculation(
+@shared_task(bind=True, max_retries=2)
+def schedule_campaign(
     self,
+    campaign_id: str,
     organization_id: str,
-    recalc_type: str = "all",
+    scheduled_time: str,
 ):
-    """
-    Recalculate security awareness risk scores.
+    """Schedule a campaign for future launch by setting its start_date and status."""
+    import asyncio
+    from src.core.database import async_session_factory
+    from src.phishing_sim.models import PhishingCampaign
 
-    Recomputes user and department scores based on latest campaign results,
-    training completion, and historical patterns. Identifies trending risks.
+    async def _run():
+        async with async_session_factory() as session:
+            result = await session.execute(
+                select(PhishingCampaign).where(PhishingCampaign.id == campaign_id)
+            )
+            campaign = result.scalar_one_or_none()
+            if not campaign:
+                return {"status": "error", "detail": "Campaign not found"}
 
-    Args:
-        organization_id: Organization context
-        recalc_type: "all" (all users), "high_risk" (only high-risk), "new" (new participants)
+            campaign.status = "scheduled"
+            try:
+                campaign.start_date = datetime.fromisoformat(
+                    scheduled_time.replace("Z", "+00:00")
+                )
+            except (ValueError, TypeError):
+                campaign.start_date = datetime.now(timezone.utc)
 
-    Returns:
-        Recalculation summary and changes
-    """
+            await session.commit()
+
+            return {
+                "campaign_id": campaign_id,
+                "status": "scheduled",
+                "scheduled_time": str(campaign.start_date),
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+
     try:
-        logger.info(
-            f"Recalculating risk scores for org {organization_id}",
-            extra={"type": recalc_type},
-        )
-
-        now = datetime.now(timezone.utc)
-
-        # Simulate score recalculation
-        result = {
-            "organization_id": organization_id,
-            "recalc_type": recalc_type,
-            "users_processed": 450,
-            "scores_improved": 125,
-            "scores_declined": 85,
-            "new_high_risk": 12,
-            "new_critical_risk": 3,
-            "avg_score_change": 2.5,  # points
-            "recalculated_at": now.isoformat(),
-            "next_recalc": (now + timedelta(days=7)).isoformat(),
-            "status": "completed",
-        }
-
-        logger.info(
-            f"Risk scores recalculated for org {organization_id}",
-            extra={
-                "improved": result["scores_improved"],
-                "declined": result["scores_declined"],
-            },
-        )
-
-        return result
-
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(_run())
+        finally:
+            loop.close()
     except Exception as e:
-        logger.error(f"Failed to recalculate risk scores for org {organization_id}: {e}")
-        raise self.retry(exc=e, countdown=60 * (2 ** self.request.retries))
+        logger.error(f"Campaign scheduling failed: {e}")
+        raise self.retry(exc=e, countdown=60)

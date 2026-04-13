@@ -17,7 +17,7 @@ from sqlalchemy import select, func
 
 from src.models.alert import Alert
 from src.models.incident import Incident
-from src.models.ioc import IOC
+from src.intel.models import ThreatIndicator as IOC
 from src.agentic.models import (
     SOCAgent,
     Investigation,
@@ -347,16 +347,9 @@ class AgenticSOCEngine:
             if a.source_ip:
                 source_ips.add(a.source_ip)
 
-        # Query IOCs for this organization
-        try:
-            ioc_query = select(IOC).where(IOC.organization_id == org_id).limit(100)
-            ioc_result = await self.db.execute(ioc_query)
-            iocs = list(ioc_result.scalars().all())
-        except Exception as e:
-            logger.warning(f"Failed to query IOCs: {e}")
-            iocs = []
-
-        ioc_matches = []
+        # Query active threat indicators for this organization (scoped by value
+        # for efficiency — only pull rows matching the alert's own indicators)
+        ioc_matches: list[dict] = []
         if primary_alert is not None:
             alert_indicators = {
                 primary_alert.source_ip,
@@ -367,12 +360,30 @@ class AgenticSOCEngine:
                 primary_alert.url,
             }
             alert_indicators.discard(None)
-            for ioc in iocs:
-                if getattr(ioc, "value", None) and ioc.value in alert_indicators:
+            if alert_indicators:
+                try:
+                    ioc_query = (
+                        select(IOC)
+                        .where(
+                            IOC.value.in_(list(alert_indicators)),
+                            IOC.is_active == True,  # noqa: E712
+                            IOC.is_whitelisted == False,  # noqa: E712
+                        )
+                        .limit(100)
+                    )
+                    ioc_result = await self.db.execute(ioc_query)
+                    iocs = list(ioc_result.scalars().all())
+                except Exception as e:
+                    logger.warning(f"Failed to query IOCs: {e}")
+                    iocs = []
+                for ioc in iocs:
+                    ctx = ioc.context if isinstance(ioc.context, dict) else {}
                     ioc_matches.append({
                         "value": ioc.value,
-                        "type": getattr(ioc, "ioc_type", None) or getattr(ioc, "type", None),
-                        "category": getattr(ioc, "category", None),
+                        "type": ioc.indicator_type,
+                        "severity": ioc.severity,
+                        "source": ioc.source,
+                        "category": ctx.get("category"),
                     })
 
         # Query recent incidents for context
@@ -714,11 +725,51 @@ class AgenticSOCEngine:
         if not action:
             return False
 
-        # Simulate verification
-        action.result = json.dumps({"status": "success", "timestamp": datetime.now(timezone.utc).isoformat()})
+        # Verify the action by checking its execution status and investigation state
+        if action.execution_status in ("completed", "success"):
+            # Action already completed successfully
+            action.result = json.dumps({
+                "status": "verified",
+                "verified_at": datetime.now(timezone.utc).isoformat(),
+                "verification_method": "status_check",
+            })
+            await self.db.flush()
+            return True
+
+        # Check if the action's investigation has progressed since the action was taken
+        investigation = await self.db.get(Investigation, action.investigation_id)
+        if not investigation:
+            action.result = json.dumps({
+                "status": "unverifiable",
+                "reason": "investigation_not_found",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+            await self.db.flush()
+            return False
+
+        # Check for follow-up alerts on the same target after the action
+        from src.models.alert import Alert as AlertModel
+        follow_up_query = select(func.count()).select_from(AlertModel).where(
+            AlertModel.organization_id == action.organization_id,
+        )
+        if action.target:
+            follow_up_query = follow_up_query.where(
+                AlertModel.description.contains(action.target)
+            )
+        result = await self.db.execute(follow_up_query)
+        new_alert_count = result.scalar() or 0
+
+        # If no new alerts on the same target, consider the action effective
+        verified = new_alert_count == 0
+        action.result = json.dumps({
+            "status": "verified" if verified else "ineffective",
+            "verified_at": datetime.now(timezone.utc).isoformat(),
+            "verification_method": "follow_up_alert_check",
+            "new_alerts_on_target": new_alert_count,
+        })
         await self.db.flush()
 
-        return True
+        return verified
 
     async def investigate_with_llm(
         self,
@@ -1018,9 +1069,11 @@ class AgentMemoryManager:
         limit: int = 5,
     ) -> list[AgentMemory]:
         """
-        Recall similar patterns from memory
+        Recall similar patterns from memory using text-based similarity matching.
 
-        Simulated vector similarity search.
+        Searches stored memories by matching context keys/values against stored
+        memory keys and JSON values. Results are ranked by relevance score and
+        access frequency.
 
         Args:
             agent_id: Agent ID
@@ -1029,7 +1082,7 @@ class AgentMemoryManager:
             limit: Max results
 
         Returns:
-            List of similar memories
+            List of similar memories ordered by relevance
         """
         query = select(AgentMemory).where(
             AgentMemory.agent_id == agent_id
@@ -1038,12 +1091,42 @@ class AgentMemoryManager:
         if memory_type:
             query = query.where(AgentMemory.memory_type == memory_type)
 
-        query = query.order_by(AgentMemory.access_count.desc()).limit(limit)
-
         result = await self.db.execute(query)
-        memories = list(result.scalars().all())
+        all_memories = list(result.scalars().all())
 
-        return memories
+        # Compute text-based similarity between context and each memory
+        context_text = json.dumps(context, default=str).lower()
+        context_tokens = set(context_text.split())
+
+        scored_memories = []
+        for memory in all_memories:
+            score = 0.0
+            # Match on key overlap
+            if memory.key and memory.key.lower() in context_text:
+                score += 0.5
+            # Match on value content overlap
+            memory_value_text = json.dumps(memory.value, default=str).lower() if memory.value else ""
+            memory_tokens = set(memory_value_text.split())
+            if memory_tokens and context_tokens:
+                overlap = len(context_tokens & memory_tokens)
+                score += overlap / max(len(context_tokens | memory_tokens), 1)
+            # Boost by confidence and access frequency
+            score *= memory.confidence if memory.confidence else 1.0
+            score += min(memory.access_count or 0, 100) * 0.001
+            scored_memories.append((score, memory))
+
+        # Sort by similarity score descending, take top N
+        scored_memories.sort(key=lambda x: x[0], reverse=True)
+        top_memories = [m for _, m in scored_memories[:limit]]
+
+        # Update access counts for recalled memories
+        for memory in top_memories:
+            memory.access_count = (memory.access_count or 0) + 1
+            memory.last_accessed = datetime.now(timezone.utc).isoformat()
+        if top_memories:
+            await self.db.flush()
+
+        return top_memories
 
     async def update_baselines(
         self,

@@ -27,7 +27,7 @@ async def list_users(
     role: str | None = None,
     is_active: bool | None = None,
 ):
-    """List all users (admin only)"""
+    """List all users (admin only, tenant-scoped)"""
     user_service = UserService(db)
     users, total = await user_service.list_users(
         page=page,
@@ -35,6 +35,7 @@ async def list_users(
         search=search,
         role=role,
         is_active=is_active,
+        organization_id=getattr(current_user, "organization_id", None),
     )
 
     return UserListResponse(
@@ -57,6 +58,7 @@ async def create_user(user_data: UserCreate, current_user: AdminUser = None, db:
             password=user_data.password,
             full_name=user_data.full_name,
             role=user_data.role,
+            organization_id=getattr(current_user, "organization_id", None),
         )
     except ValidationError as e:
         raise HTTPException(
@@ -73,8 +75,8 @@ async def get_user(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Get a user by ID"""
-    # Users can view their own profile, admins can view any profile
+    """Get a user by ID (self or same-org admin)"""
+    # Users can view their own profile, admins can view users in their own org
     if user_id != current_user.id and not current_user.is_admin:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -90,6 +92,17 @@ async def get_user(
             detail="User not found",
         )
 
+    # Cross-tenant isolation: even admins cannot look at users from other orgs
+    if (
+        user_id != current_user.id
+        and getattr(user, "organization_id", None)
+        != getattr(current_user, "organization_id", None)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found",
+        )
+
     return UserResponse.model_validate(user)
 
 
@@ -100,8 +113,7 @@ async def update_user(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Update a user"""
-    # Users can update their own profile (limited fields), admins can update any profile
+    """Update a user (self or same-org admin)"""
     if user_id != current_user.id and not current_user.is_admin:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -114,6 +126,17 @@ async def update_user(
         user_data.is_active = None
 
     user_service = UserService(db)
+
+    # Tenant isolation: admins can only update users in their own org
+    if user_id != current_user.id:
+        target = await user_service.get_by_id(user_id)
+        if not target or getattr(target, "organization_id", None) != getattr(
+            current_user, "organization_id", None
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found",
+            )
 
     try:
         update_data = user_data.model_dump(exclude_unset=True, exclude_none=True)
@@ -134,7 +157,7 @@ async def update_user(
 
 @router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_user(user_id: str, current_user: AdminUser = None, db: DatabaseSession = None):
-    """Delete a user (admin only)"""
+    """Delete a user (same-org admin only)"""
     # Prevent self-deletion
     if user_id == current_user.id:
         raise HTTPException(
@@ -143,6 +166,16 @@ async def delete_user(user_id: str, current_user: AdminUser = None, db: Database
         )
 
     user_service = UserService(db)
+
+    # Tenant isolation: admins can only delete users in their own org
+    target = await user_service.get_by_id(user_id)
+    if not target or getattr(target, "organization_id", None) != getattr(
+        current_user, "organization_id", None
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found",
+        )
 
     try:
         await user_service.delete(user_id)

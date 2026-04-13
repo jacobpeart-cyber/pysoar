@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Any
 from abc import ABC, abstractmethod
@@ -558,21 +559,45 @@ class TimelineReconstructor:
             timeline_result = self.build_timeline(case_id)
             events = timeline_result.get("events", [])
 
+            # Real gap detection: compute the real time delta between
+            # chronologically-ordered timeline events. Only include gaps
+            # longer than a threshold (default 1 hour) as "significant".
+            from datetime import datetime as _dt
+            SIGNIFICANT_GAP_SECONDS = 3600
+
+            parsed_events = []
+            for e in events:
+                ts_raw = e.get("timestamp") or e.get("event_time") or e.get("occurred_at")
+                if not ts_raw:
+                    continue
+                try:
+                    ts = _dt.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
+                    parsed_events.append((ts, e))
+                except (ValueError, TypeError):
+                    continue
+            parsed_events.sort(key=lambda p: p[0])
+
             gaps = []
-            if len(events) >= 2:
-                for i in range(len(events) - 1):
-                    # Simplified gap detection
-                    gap = {
-                        "from_event": events[i]["event_type"],
-                        "to_event": events[i + 1]["event_type"],
-                        "gap_duration": "TBD",
-                    }
-                    gaps.append(gap)
+            for i in range(len(parsed_events) - 1):
+                ts_a, ev_a = parsed_events[i]
+                ts_b, ev_b = parsed_events[i + 1]
+                delta_seconds = (ts_b - ts_a).total_seconds()
+                if delta_seconds >= SIGNIFICANT_GAP_SECONDS:
+                    gaps.append({
+                        "from_event": ev_a.get("event_type"),
+                        "from_timestamp": ts_a.isoformat(),
+                        "to_event": ev_b.get("event_type"),
+                        "to_timestamp": ts_b.isoformat(),
+                        "gap_seconds": int(delta_seconds),
+                        "gap_minutes": round(delta_seconds / 60.0, 1),
+                        "gap_hours": round(delta_seconds / 3600.0, 2),
+                    })
 
             return {
                 "status": "success",
                 "case_id": case_id,
                 "gap_count": len(gaps),
+                "significant_gap_threshold_seconds": SIGNIFICANT_GAP_SECONDS,
                 "gaps": gaps,
             }
         except Exception as e:
@@ -815,6 +840,56 @@ class ArtifactAnalyzer:
             self.logger.error(f"Failed to analyze network artifacts: {e}")
             return {"status": "error", "message": str(e)}
 
+    # ------------------------------------------------------------------
+    # IOC extraction regexes (module-level so they compile once)
+    # ------------------------------------------------------------------
+    # These are intentionally restrictive. DFIR analysts are happy with
+    # tight heuristics that miss occasional exotic formats in exchange
+    # for near-zero false positives, which is why we include things
+    # like "no trailing dot for domains" and "mask obvious private
+    # address ranges" before classifying an IPv4 as suspicious.
+    _IPV4_RE = re.compile(
+        r"\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b"
+    )
+    _IPV6_RE = re.compile(
+        r"\b(?:[A-F0-9]{1,4}:){2,7}[A-F0-9]{1,4}\b", re.IGNORECASE
+    )
+    _DOMAIN_RE = re.compile(
+        r"\b(?:(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)\.){1,}"
+        r"(?:[a-z]{2,24})\b",
+        re.IGNORECASE,
+    )
+    _URL_RE = re.compile(
+        r"\b(?:https?|ftp|file)://[^\s<>\"']+", re.IGNORECASE
+    )
+    _EMAIL_RE = re.compile(
+        r"\b[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,24}\b", re.IGNORECASE
+    )
+    # MD5 / SHA-1 / SHA-256 hashes (hex-only, exact length)
+    _HASH_RE = re.compile(
+        r"\b(?:[a-f0-9]{32}|[a-f0-9]{40}|[a-f0-9]{64})\b", re.IGNORECASE
+    )
+
+    @classmethod
+    def _walk_strings(cls, value: Any) -> list[str]:
+        """Flatten any nested dict/list into a list of string values so
+        the IOC regexes can scan arbitrary artifact shapes without
+        special-casing each artifact_type."""
+        out: list[str] = []
+        if value is None:
+            return out
+        if isinstance(value, str):
+            out.append(value)
+        elif isinstance(value, (int, float, bool)):
+            out.append(str(value))
+        elif isinstance(value, dict):
+            for v in value.values():
+                out.extend(cls._walk_strings(v))
+        elif isinstance(value, (list, tuple, set)):
+            for v in value:
+                out.extend(cls._walk_strings(v))
+        return out
+
     def extract_iocs(
         self,
         artifact_data: dict,
@@ -823,39 +898,80 @@ class ArtifactAnalyzer:
         """
         Extract IOCs (IPs, domains, hashes, emails, URLs) from artifacts.
 
-        Args:
-            artifact_data: Artifact data to analyze
-            artifact_type: Type of artifact
+        Previous behavior: returned whatever the caller happened to
+        pre-key as ``ip_addresses``, ``domains``, ``hashes``, ``urls``.
+        If the caller passed raw memory-dump bytes or shell history
+        strings, the analyzer found exactly zero IOCs — useless for
+        any real DFIR workflow.
 
-        Returns:
-            Extracted IOCs
+        New behavior: walks every string inside the artifact (nested
+        dicts and lists included) and runs real regex extraction for
+        IPv4, IPv6, domains, URLs, emails, and MD5/SHA-1/SHA-256
+        hashes. The pre-extracted lists the caller may have supplied
+        are still honored and merged in so existing call sites don't
+        regress.
         """
         try:
             self.logger.info(f"Extracting IOCs from {artifact_type}")
 
-            iocs = {
-                "ipv4_addresses": [],
-                "ipv6_addresses": [],
-                "domains": [],
-                "file_hashes": [],
-                "email_addresses": [],
-                "urls": [],
+            iocs: dict[str, set] = {
+                "ipv4_addresses": set(),
+                "ipv6_addresses": set(),
+                "domains": set(),
+                "file_hashes": set(),
+                "email_addresses": set(),
+                "urls": set(),
             }
 
-            # Simplified IOC extraction
-            if "ip_addresses" in artifact_data:
-                iocs["ipv4_addresses"] = artifact_data.get("ip_addresses", [])
-            if "domains" in artifact_data:
-                iocs["domains"] = artifact_data.get("domains", [])
-            if "hashes" in artifact_data:
-                iocs["file_hashes"] = artifact_data.get("hashes", [])
-            if "urls" in artifact_data:
-                iocs["urls"] = artifact_data.get("urls", [])
+            # Pre-keyed lists from caller (backward-compat)
+            if isinstance(artifact_data, dict):
+                for pre_key, ioc_key in (
+                    ("ip_addresses", "ipv4_addresses"),
+                    ("ipv4_addresses", "ipv4_addresses"),
+                    ("ipv6_addresses", "ipv6_addresses"),
+                    ("domains", "domains"),
+                    ("hashes", "file_hashes"),
+                    ("file_hashes", "file_hashes"),
+                    ("urls", "urls"),
+                    ("emails", "email_addresses"),
+                    ("email_addresses", "email_addresses"),
+                ):
+                    vals = artifact_data.get(pre_key)
+                    if isinstance(vals, list):
+                        iocs[ioc_key].update(str(v) for v in vals if v)
 
+            # Walk the whole structure and regex every string leaf
+            for s in self._walk_strings(artifact_data):
+                # URLs first so we can strip them from the text before
+                # running the domain regex (so "https://example.com"
+                # doesn't also appear in the domains bucket)
+                s_wo_url = s
+                for m in self._URL_RE.findall(s):
+                    iocs["urls"].add(m)
+                    s_wo_url = s_wo_url.replace(m, " ")
+
+                for m in self._IPV4_RE.findall(s_wo_url):
+                    iocs["ipv4_addresses"].add(m)
+                for m in self._IPV6_RE.findall(s_wo_url):
+                    iocs["ipv6_addresses"].add(m)
+                for m in self._DOMAIN_RE.findall(s_wo_url):
+                    # reject things that look like IPs or .local / .test
+                    lowered = m.lower()
+                    if self._IPV4_RE.fullmatch(lowered):
+                        continue
+                    if lowered.endswith((".local", ".test", ".internal", ".lan")):
+                        continue
+                    iocs["domains"].add(lowered)
+                for m in self._EMAIL_RE.findall(s_wo_url):
+                    iocs["email_addresses"].add(m.lower())
+                for m in self._HASH_RE.findall(s_wo_url):
+                    iocs["file_hashes"].add(m.lower())
+
+            result = {k: sorted(v) for k, v in iocs.items()}
             return {
                 "status": "success",
-                "iocs": iocs,
-                "total_extracted": sum(len(v) for v in iocs.values()),
+                "iocs": result,
+                "total_extracted": sum(len(v) for v in result.values()),
             }
         except Exception as e:
             self.logger.error(f"Failed to extract IOCs: {e}")
@@ -885,18 +1001,127 @@ class ArtifactAnalyzer:
                 "confidence_score": 0.0,
             }
 
-            # Simplified MITRE mapping based on artifact type
+            # Comprehensive MITRE ATT&CK mapping based on artifact type and evidence content
             artifact_mitre_map = {
-                "process": ["TA0002", "TA0003"],  # Execution, Persistence
-                "network_connection": ["TA0007", "TA0011"],  # Command & Control, Exfiltration
-                "file_system": ["TA0001"],  # Initial Access
-                "browser_history": ["TA0009"],  # Collection
-                "registry": ["TA0007", "TA0005"],  # Command & Control, Defense Evasion
+                "process": {
+                    "tactics": ["TA0002", "TA0003", "TA0005"],  # Execution, Persistence, Defense Evasion
+                    "techniques": {
+                        "powershell": ["T1059.001"],
+                        "cmd": ["T1059.003"],
+                        "wscript": ["T1059.005"],
+                        "cscript": ["T1059.005"],
+                        "rundll32": ["T1218.011"],
+                        "regsvr32": ["T1218.010"],
+                        "mshta": ["T1218.005"],
+                        "schtasks": ["T1053.005"],
+                        "at.exe": ["T1053.002"],
+                        "sc.exe": ["T1543.003"],
+                        "net.exe": ["T1087.001", "T1087.002"],
+                        "mimikatz": ["T1003.001"],
+                        "lsass": ["T1003.001"],
+                        "psexec": ["T1569.002", "T1021.002"],
+                        "wmic": ["T1047"],
+                        "certutil": ["T1140", "T1105"],
+                        "bitsadmin": ["T1197", "T1105"],
+                    },
+                },
+                "network_connection": {
+                    "tactics": ["TA0011", "TA0010", "TA0007"],  # C2, Exfiltration, Discovery
+                    "techniques": {
+                        "dns": ["T1071.004"],
+                        "http": ["T1071.001"],
+                        "https": ["T1071.001"],
+                        "smb": ["T1021.002"],
+                        "rdp": ["T1021.001"],
+                        "ssh": ["T1021.004"],
+                        "ftp": ["T1071.002"],
+                        "icmp": ["T1095"],
+                        "tor": ["T1090.003"],
+                        "vpn": ["T1090"],
+                    },
+                },
+                "file_system": {
+                    "tactics": ["TA0001", "TA0003", "TA0005", "TA0009"],  # Initial Access, Persistence, Defense Evasion, Collection
+                    "techniques": {
+                        "startup": ["T1547.001"],
+                        "temp": ["T1074.001"],
+                        "exe": ["T1204.002"],
+                        "dll": ["T1574.001"],
+                        "bat": ["T1059.003"],
+                        "ps1": ["T1059.001"],
+                        "doc": ["T1566.001"],
+                        "xls": ["T1566.001"],
+                        "pdf": ["T1566.001"],
+                        "zip": ["T1566.001"],
+                        "encrypted": ["T1027"],
+                        "hidden": ["T1564.001"],
+                    },
+                },
+                "browser_history": {
+                    "tactics": ["TA0009", "TA0001", "TA0042"],  # Collection, Initial Access, Resource Development
+                    "techniques": {
+                        "download": ["T1105"],
+                        "phish": ["T1566.002"],
+                        "drive-by": ["T1189"],
+                        "oauth": ["T1550.001"],
+                        "credential": ["T1539"],
+                        "webmail": ["T1114.003"],
+                    },
+                },
+                "registry": {
+                    "tactics": ["TA0003", "TA0005", "TA0004"],  # Persistence, Defense Evasion, Privilege Escalation
+                    "techniques": {
+                        "run": ["T1547.001"],
+                        "runonce": ["T1547.001"],
+                        "services": ["T1543.003"],
+                        "userinit": ["T1037.001"],
+                        "appinit": ["T1546.010"],
+                        "winlogon": ["T1547.004"],
+                        "image_file_execution": ["T1546.012"],
+                        "security": ["T1562.001"],
+                        "firewall": ["T1562.004"],
+                    },
+                },
+                "memory_dump": {
+                    "tactics": ["TA0006", "TA0004"],  # Credential Access, Privilege Escalation
+                    "techniques": {
+                        "lsass": ["T1003.001"],
+                        "sam": ["T1003.002"],
+                        "ntds": ["T1003.003"],
+                        "credential": ["T1003"],
+                    },
+                },
+                "email": {
+                    "tactics": ["TA0001", "TA0009"],  # Initial Access, Collection
+                    "techniques": {
+                        "attachment": ["T1566.001"],
+                        "link": ["T1566.002"],
+                        "forwarding": ["T1114.003"],
+                    },
+                },
             }
 
+            artifact_data_str = json.dumps(artifact_data, default=str).lower() if artifact_data else ""
+
             if artifact_type in artifact_mitre_map:
-                mappings["tactics"] = artifact_mitre_map[artifact_type]
-                mappings["confidence_score"] = 0.75
+                type_mapping = artifact_mitre_map[artifact_type]
+                mappings["tactics"] = type_mapping["tactics"]
+
+                # Match specific techniques based on artifact content evidence
+                matched_techniques = []
+                for keyword, techniques in type_mapping.get("techniques", {}).items():
+                    if keyword in artifact_data_str:
+                        matched_techniques.extend(techniques)
+
+                mappings["techniques"] = list(set(matched_techniques))
+                # Higher confidence if we matched specific techniques
+                if matched_techniques:
+                    mappings["confidence_score"] = 0.85
+                else:
+                    mappings["confidence_score"] = 0.60
+            else:
+                # Unknown artifact type - lower confidence general mapping
+                mappings["confidence_score"] = 0.30
 
             return {
                 "status": "success",

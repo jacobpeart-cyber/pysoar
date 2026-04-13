@@ -245,18 +245,28 @@ def ioc_extraction_task(
             "urls": set(),
         }
 
-        # Simulate processing multiple artifacts
-        if artifact_types:
-            for artifact_type in artifact_types:
-                # Simulate artifact data (in real implementation, would fetch from DB)
-                sample_artifact_data = {
-                    "ip_addresses": ["192.168.1.100", "10.0.0.1"],
-                    "domains": ["example.com", "malware.net"],
-                    "hashes": ["abc123", "def456"],
-                    "urls": ["http://example.com/malware", "https://evil.com/payload"],
-                }
+        # Query real ForensicArtifact rows from the database
+        import asyncio
+        from src.core.database import async_session_factory
+        from src.dfir.models import ForensicArtifact
+        from sqlalchemy import select
 
-                ioc_result = analyzer.extract_iocs(sample_artifact_data, artifact_type)
+        async def _get_artifacts():
+            async with async_session_factory() as db:
+                query = select(ForensicArtifact).where(
+                    ForensicArtifact.case_id == case_id
+                )
+                if artifact_types:
+                    query = query.where(ForensicArtifact.artifact_type.in_(artifact_types))
+                result = await db.execute(query)
+                return list(result.scalars().all())
+
+        db_artifacts = asyncio.run(_get_artifacts())
+
+        if db_artifacts:
+            for artifact in db_artifacts:
+                artifact_data = artifact.artifact_data or {}
+                ioc_result = analyzer.extract_iocs(artifact_data, artifact.artifact_type)
 
                 if ioc_result["status"] == "success":
                     iocs = ioc_result.get("iocs", {})
@@ -308,11 +318,30 @@ def legal_hold_reminder(
 
         manager = LegalHoldManager()
 
-        # Check expiry date (simplified - would query DB in real implementation)
-        expiry_threshold = datetime.utcnow() + timedelta(days=days_before_expiry)
+        # Query real LegalHold expiry date from the database
+        import asyncio
+        from src.core.database import async_session_factory
+        from src.dfir.models import LegalHold
+        from sqlalchemy import select
 
-        # Simulate checking hold expiry
-        is_expiring_soon = True  # Simplified check
+        async def _check_hold_expiry():
+            async with async_session_factory() as db:
+                query = select(LegalHold).where(LegalHold.id == hold_id)
+                result = await db.execute(query)
+                return result.scalar_one_or_none()
+
+        hold = asyncio.run(_check_hold_expiry())
+
+        if hold and hold.expiry_date:
+            try:
+                expiry_dt = datetime.fromisoformat(hold.expiry_date)
+                expiry_threshold = datetime.utcnow() + timedelta(days=days_before_expiry)
+                is_expiring_soon = expiry_dt <= expiry_threshold
+            except (ValueError, TypeError):
+                is_expiring_soon = False
+        else:
+            # No expiry date set or hold not found - no action needed
+            is_expiring_soon = False
 
         if is_expiring_soon:
             # Generate compliance report

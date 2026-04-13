@@ -4,14 +4,14 @@ import asyncio
 import csv
 import io
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
-from src.models.ioc import IOC
+from src.intel.models import ThreatIndicator as IOC  # unified table
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +42,7 @@ class ThreatIntelFeed:
             existing = await db.execute(
                 select(IOC).where(
                     IOC.value == indicator["value"],
-                    IOC.ioc_type == indicator["ioc_type"],
+                    IOC.indicator_type == indicator["ioc_type"],
                 )
             )
             if existing.scalar_one_or_none():
@@ -50,13 +50,14 @@ class ThreatIntelFeed:
 
             ioc = IOC(
                 value=indicator["value"],
-                ioc_type=indicator["ioc_type"],
-                threat_level=indicator.get("threat_level", "medium"),
+                indicator_type=indicator["ioc_type"],
+                severity=indicator.get("threat_level", "medium"),
                 source=f"threat_intel:{self.name}",
-                description=indicator.get("description"),
-                tags=indicator.get("tags", []),
-                first_seen=datetime.utcnow().isoformat(),
+                tags=indicator.get("tags", []) or [],
+                context={"description": indicator.get("description")} if indicator.get("description") else {},
+                first_seen=datetime.utcnow().replace(tzinfo=timezone.utc),
                 is_active=True,
+                is_whitelisted=False,
             )
             db.add(ioc)
             imported += 1

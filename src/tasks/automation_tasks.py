@@ -22,7 +22,7 @@ from sqlalchemy import and_, func, or_, select
 from src.core.database import async_session_factory
 from src.models.alert import Alert
 from src.models.incident import Incident
-from src.models.ioc import IOC
+from src.intel.models import ThreatIndicator as IOC
 from src.services.automation import AutomationService
 
 logger = logging.getLogger(__name__)
@@ -156,7 +156,10 @@ def periodic_ioc_sweep():
 
             # Load active IOC values once
             ioc_result = await db.execute(
-                select(IOC).where(IOC.status == "active")
+                select(IOC).where(
+                    IOC.is_active == True,  # noqa: E712
+                    IOC.is_whitelisted == False,  # noqa: E712
+                )
             )
             iocs = ioc_result.scalars().all()
             ioc_values = {ioc.value for ioc in iocs if ioc.value}

@@ -276,7 +276,15 @@ class ARFReportResponse(BaseModel):
 
 
 class STIGDashboardStats(BaseModel):
-    """STIG compliance dashboard statistics"""
+    """STIG compliance dashboard statistics.
+
+    The bottom three fields (``compliance_by_benchmark``,
+    ``findings_by_severity``, ``recent_scans``) are what the frontend's
+    Dashboard tab actually renders in its KPI cards, bar chart, and
+    recent-scans table. The schema previously omitted them and the
+    endpoint returned only the flat counts, so the UI showed zeros /
+    empty lists regardless of real scan data.
+    """
     organization_id: str = ""
     total_benchmarks: int = 0
     total_scans: int = 0
@@ -289,6 +297,9 @@ class STIGDashboardStats(BaseModel):
     scans_this_month: int = 0
     compliance_trend: str = "stable"
     top_failing_rules: list[dict[str, Any]] = []
+    compliance_by_benchmark: list[dict[str, Any]] = []
+    findings_by_severity: dict[str, int] = {}
+    recent_scans: list[dict[str, Any]] = []
 
 
 class RuleSearchResponse(BaseModel):

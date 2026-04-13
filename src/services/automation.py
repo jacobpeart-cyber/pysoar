@@ -31,7 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.alert import Alert
 from src.models.incident import Incident
-from src.models.ioc import IOC
+from src.intel.models import ThreatIndicator as IOC
 from src.collaboration.models import WarRoom, ActionItem
 from src.tickethub.models import TicketActivity
 
@@ -71,6 +71,8 @@ class AutomationService:
         }
         org_id = organization_id or getattr(alert, "organization_id", None)
 
+        failures: list[dict] = []
+
         # Step 1: IOC matching
         try:
             ioc_matches = await self._check_ioc_matches(alert)
@@ -79,6 +81,7 @@ class AutomationService:
                 logger.info(f"Alert {alert.id} matched {len(ioc_matches)} IOCs - escalated to critical")
         except Exception as e:
             logger.error(f"IOC matching failed for alert {alert.id}: {e}")
+            failures.append({"step": "ioc_matching", "error": str(e)[:300]})
 
         # Step 2: Auto-create incident for critical/high severity or repeated patterns
         try:
@@ -95,6 +98,7 @@ class AutomationService:
                         logger.info(f"Auto-created war room {war_room.id} for critical incident {incident.id}")
         except Exception as e:
             logger.error(f"Auto-incident creation failed for alert {alert.id}: {e}")
+            failures.append({"step": "auto_incident", "error": str(e)[:300]})
 
         # Step 4: Auto-trigger playbooks
         try:
@@ -102,6 +106,40 @@ class AutomationService:
             results["playbooks_triggered"] = triggered
         except Exception as e:
             logger.error(f"Playbook auto-trigger failed for alert {alert.id}: {e}")
+            failures.append({"step": "playbook_trigger", "error": str(e)[:300]})
+
+        # Step 5: Evaluate remediation policies against this alert.
+        # Any enabled RemediationPolicy whose trigger_type matches and
+        # whose severity threshold is met will fire its configured
+        # action — firewall_block on source_ip, isolate_host on the
+        # hostname, disable_account on the user, etc. Each fired
+        # policy creates a RemediationExecution row the operator can
+        # track in the Remediation page. Policies marked
+        # requires_approval=True land in awaiting_approval rather than
+        # executing immediately, matching the second-analyst sign-off
+        # contract the audit team expects.
+        try:
+            remediations = await self._evaluate_remediation_policies(alert, org_id)
+            results["remediations_triggered"] = remediations
+        except Exception as e:  # noqa: BLE001
+            logger.error(f"Remediation policy evaluation failed for alert {alert.id}: {e}")
+            failures.append({"step": "remediation_eval", "error": str(e)[:300]})
+
+        # Dead-letter trail: record any pipeline failures as an activity so
+        # operators can retry them later. (scheduled retry task can query this.)
+        if failures:
+            results["failures"] = failures
+            try:
+                dlq = TicketActivity(
+                    source_type="alert",
+                    source_id=str(alert.id),
+                    activity_type="automation_pipeline_failure",
+                    description=f"DLQ: {json.dumps(failures)[:800]}",
+                    organization_id=org_id,
+                )
+                self.db.add(dlq)
+            except Exception:
+                pass
 
         # Log activity
         try:
@@ -166,7 +204,129 @@ class AutomationService:
             except Exception as e:
                 logger.error(f"War room creation failed for incident {incident.id}: {e}")
 
+        # ------------------------------------------------------------------
+        # Agent-driven containment proposals
+        # ------------------------------------------------------------------
+        # If a Live Response agent is enrolled for any of the incident's
+        # affected systems, queue a triage bundle automatically:
+        #   - collect_process_list and collect_network_connections run
+        #     immediately (read-only, no approval gate)
+        #   - isolate_host is queued as awaiting_approval so the human
+        #     signs off before the host actually goes dark
+        # This is the "agentic" part of the SOC story — PySOAR proposes
+        # the containment actions but never pulls the trigger on high-
+        # blast ones without a second-analyst approval.
+        try:
+            results["agent_commands_queued"] = await self._queue_incident_containment(
+                incident=incident,
+                organization_id=org_id,
+                created_by=created_by,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Agent containment proposals failed for incident {incident.id}: {e}")
+            results["agent_commands_queued"] = 0
+
         return results
+
+    async def _queue_incident_containment(
+        self,
+        *,
+        incident: Incident,
+        organization_id: Optional[str],
+        created_by: Optional[str],
+    ) -> int:
+        """For each affected system that has an active IR-capable agent,
+        dispatch a triage + proposed containment command bundle."""
+        import json as _json
+
+        from sqlalchemy import and_, select
+
+        from src.agents.capabilities import AgentAction, AgentCapability
+        from src.agents.models import EndpointAgent
+        from src.agents.service import AgentService
+
+        # Parse affected_systems (stored as JSON string in Incident model)
+        raw = getattr(incident, "affected_systems", None)
+        if not raw:
+            return 0
+        try:
+            hosts = _json.loads(raw) if isinstance(raw, str) else list(raw)
+        except Exception:  # noqa: BLE001
+            return 0
+        if not isinstance(hosts, list) or not hosts:
+            return 0
+
+        svc = AgentService(self.db)
+        queued = 0
+        severity = (getattr(incident, "severity", "medium") or "medium").lower()
+
+        for host in hosts:
+            if not host:
+                continue
+            agent_q = select(EndpointAgent).where(
+                and_(
+                    EndpointAgent.hostname == str(host),
+                    EndpointAgent.status == "active",
+                )
+            )
+            if organization_id:
+                agent_q = agent_q.where(EndpointAgent.organization_id == organization_id)
+
+            agents = list((await self.db.execute(agent_q)).scalars().all())
+            if not agents:
+                continue
+
+            # Prefer an IR-capable agent; fall back to BAS for the
+            # read-only collects if no IR agent is present.
+            ir_agent = next(
+                (a for a in agents if AgentCapability.LIVE_RESPONSE.value in (a.capabilities or [])),
+                None,
+            )
+            triage_agent = ir_agent or next(
+                (a for a in agents if AgentCapability.BAS.value in (a.capabilities or [])),
+                None,
+            )
+            if triage_agent is None:
+                continue
+
+            # Read-only triage: queue immediately, no approval needed
+            for action in (
+                AgentAction.COLLECT_PROCESS_LIST.value,
+                AgentAction.COLLECT_NETWORK_CONNECTIONS.value,
+            ):
+                try:
+                    await svc.issue_command(
+                        agent=triage_agent,
+                        action=action,
+                        payload={},
+                        issued_by=created_by,
+                        incident_id=incident.id,
+                    )
+                    queued += 1
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        f"Failed to queue {action} for host={host} incident={incident.id}: {e}"
+                    )
+
+            # Proposed containment: isolate_host -> awaiting_approval.
+            # Only propose on high/critical incidents so automation
+            # doesn't spam the approval queue with low-severity noise.
+            if ir_agent is not None and severity in ("critical", "high"):
+                try:
+                    await svc.issue_command(
+                        agent=ir_agent,
+                        action=AgentAction.ISOLATE_HOST.value,
+                        payload={"reason": f"proposed by incident {incident.id} ({severity})"},
+                        issued_by=created_by,
+                        incident_id=incident.id,
+                    )
+                    queued += 1
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        f"Failed to propose isolate_host for host={host} incident={incident.id}: {e}"
+                    )
+
+        return queued
 
     # =========================================================================
     # MODULE EVENT HANDLERS - Each module calls these to trigger automation
@@ -650,9 +810,9 @@ class AutomationService:
     # =========================================================================
 
     async def _check_ioc_matches(self, alert: Alert) -> list[dict]:
-        """Check alert indicators against IOC database."""
+        """Check alert indicators against unified threat_indicators table."""
         indicators = []
-        for field in ("source_ip", "destination_ip"):
+        for field in ("source_ip", "destination_ip", "hostname", "domain", "url", "file_hash"):
             val = getattr(alert, field, None)
             if val:
                 indicators.append(val)
@@ -663,7 +823,8 @@ class AutomationService:
         result = await self.db.execute(
             select(IOC).where(
                 IOC.value.in_(indicators),
-                IOC.status == "active",
+                IOC.is_active == True,  # noqa: E712
+                IOC.is_whitelisted == False,  # noqa: E712
             )
         )
         matches = result.scalars().all()
@@ -671,11 +832,26 @@ class AutomationService:
         if matches:
             alert.severity = "critical"
             desc = getattr(alert, "description", "") or ""
-            match_info = ", ".join(f"{m.ioc_type}:{m.value}" for m in matches)
+            match_info = ", ".join(f"{m.indicator_type}:{m.value}" for m in matches)
             alert.description = f"{desc}\n[AUTO] IOC Match: {match_info}"
+            # Bump sighting counters
+            now = datetime.now(timezone.utc)
+            for m in matches:
+                m.sighting_count = (m.sighting_count or 0) + 1
+                m.last_sighting_at = now
+                m.last_seen = now
             await self.db.flush()
 
-        return [{"ioc_id": m.id, "value": m.value, "type": m.ioc_type} for m in matches]
+        return [
+            {
+                "ioc_id": m.id,
+                "value": m.value,
+                "type": m.indicator_type,
+                "severity": m.severity,
+                "source": m.source,
+            }
+            for m in matches
+        ]
 
     async def _auto_create_incident(
         self, alert: Alert, org_id: Optional[str], created_by: Optional[str]
@@ -792,3 +968,123 @@ class AutomationService:
                 elif actual != required:
                     return False
         return True
+
+    async def _evaluate_remediation_policies(
+        self,
+        alert: Alert,
+        organization_id: Optional[str],
+    ) -> list[str]:
+        """Find enabled RemediationPolicy rows that match this alert and
+        fire them. Returns a list of execution IDs created.
+
+        Matching rules:
+          * ``trigger_type`` == "alert" or "alert_severity"
+          * ``trigger_conditions.severity`` (list or string) must match
+            alert.severity if set
+          * Policy's cooldown is respected (don't fire the same policy
+            twice inside its cooldown_minutes window)
+
+        For each matching policy we write a RemediationExecution row
+        with ``status=awaiting_approval`` if the policy requires
+        approval, otherwise ``status=pending`` (the worker task or UI
+        button picks it up from there).
+        """
+        from datetime import datetime, timezone, timedelta
+
+        from src.remediation.models import (
+            RemediationExecution,
+            RemediationPolicy,
+        )
+
+        created_ids: list[str] = []
+
+        stmt = select(RemediationPolicy).where(
+            and_(
+                RemediationPolicy.is_enabled == True,  # noqa: E712
+                RemediationPolicy.trigger_type.in_(["alert", "alert_severity"]),
+            )
+        )
+        if organization_id:
+            stmt = stmt.where(
+                RemediationPolicy.organization_id == organization_id
+            )
+
+        result = await self.db.execute(stmt)
+        policies = list(result.scalars().all())
+        if not policies:
+            return []
+
+        alert_severity = (getattr(alert, "severity", None) or "").lower()
+        now = datetime.now(timezone.utc)
+
+        for policy in policies:
+            # Cooldown enforcement
+            if policy.last_executed_at and policy.cooldown_minutes:
+                last = policy.last_executed_at
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=timezone.utc)
+                if now - last < timedelta(minutes=policy.cooldown_minutes):
+                    continue
+
+            # Severity match
+            conds = policy.trigger_conditions or {}
+            required_sev = conds.get("severity")
+            if required_sev:
+                if isinstance(required_sev, list):
+                    if alert_severity not in [s.lower() for s in required_sev]:
+                        continue
+                elif alert_severity != str(required_sev).lower():
+                    continue
+
+            # Resolve target from the alert
+            target_entity = (
+                getattr(alert, "source_ip", None)
+                or getattr(alert, "hostname", None)
+                or str(alert.id)
+            )
+            target_type = "ip" if getattr(alert, "source_ip", None) else "host"
+
+            # Decide initial status based on policy's approval gate
+            initial_status = (
+                "awaiting_approval" if policy.requires_approval else "pending"
+            )
+
+            execution = RemediationExecution(
+                policy_id=policy.id,
+                trigger_source="alert",
+                trigger_id=str(alert.id),
+                trigger_details={
+                    "alert_id": str(alert.id),
+                    "alert_severity": alert_severity,
+                    "alert_source": getattr(alert, "source", None),
+                    "alert_title": getattr(alert, "title", None),
+                },
+                status=initial_status,
+                target_entity=target_entity,
+                target_type=target_type,
+                actions_planned=policy.actions or [],
+                actions_completed=[],
+                organization_id=organization_id or "",
+                created_by=None,  # auto-triggered, no human actor
+            )
+            self.db.add(execution)
+            try:
+                await self.db.flush()
+                await self.db.refresh(execution)
+                created_ids.append(execution.id)
+
+                policy.last_executed_at = now
+                policy.execution_count = (policy.execution_count or 0) + 1
+                await self.db.flush()
+
+                logger.info(
+                    f"Remediation policy '{policy.name}' triggered by alert "
+                    f"{alert.id} (execution={execution.id}, status={initial_status})"
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    f"Failed to create remediation execution for policy "
+                    f"{policy.id}: {exc}"
+                )
+
+        return created_ids

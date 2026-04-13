@@ -32,6 +32,7 @@ from src.darkweb.tasks import (
 from src.schemas.darkweb import (
     BrandThreatCreate,
     BrandThreatListResponse,
+    BrandThreatMap,
     BrandThreatResponse,
     BrandThreatUpdate,
     BulkCredentialRemediateAction,
@@ -55,6 +56,7 @@ from src.schemas.darkweb import (
     DarkWebMonitorUpdate,
     ScanStatusResponse,
     ScanTriggerRequest,
+    TrendingThreats,
 )
 
 router = APIRouter(prefix="/darkweb", tags=["Dark Web Monitoring"])
@@ -272,33 +274,166 @@ async def trigger_monitor_scan(
     scan_request: ScanTriggerRequest,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    background_tasks: BackgroundTasks = None,
     monitor_id: str = Path(...),
 ):
-    """Trigger immediate scan for monitor"""
-    monitor = await get_monitor_or_404(db, monitor_id)
+    """Run a dark web scan synchronously and persist findings.
 
-    if monitor.organization_id != getattr(current_user, "organization_id", None):
+    Previously this endpoint queued ``scheduled_dark_web_scan`` via
+    FastAPI's BackgroundTasks — but that's a Celery ``@shared_task``
+    with ``bind=True``, which expects ``self`` as the first arg
+    injected by Celery. Calling it without Celery crashed the
+    background worker with ``TypeError: missing 1 required
+    positional argument: 'self'`` AND the task body was hardcoded
+    theater (returned a static 6-finding dict without calling the
+    real DarkWebScanner engine). So every "Scan now" click: fake
+    scan_id to the UI, crash in the background, zero real data.
+
+    Now runs the real engine inline (DarkWebScanner.run_scan_cycle
+    hits URLhaus / HIBP / ThreatFox / AlienVault OTX — all free
+    APIs the module already integrates), persists the findings to
+    the DarkWebFinding table scoped to this org, fires
+    automation.on_darkweb_finding per critical finding, and
+    returns real counts.
+    """
+    from src.darkweb.engine import DarkWebScanner
+    import hashlib as _hashlib
+
+    monitor = await get_monitor_or_404(db, monitor_id)
+    org_id = getattr(current_user, "organization_id", None)
+
+    if monitor.organization_id != org_id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
 
-    # Queue background task
-    background_tasks.add_task(
-        scheduled_dark_web_scan,
-        monitor_id=monitor_id,
-        scan_type=scan_request.scan_type,
+    start_time = datetime.now(timezone.utc)
+    logger.info(f"Running inline dark web scan for monitor: {monitor_id}")
+
+    scanner = DarkWebScanner()
+    try:
+        if scan_request.scan_type == "quick":
+            # Quick = only breach DB (HIBP) since it's the cheapest
+            pastes = []
+            breaches = await scanner.search_breach_databases()
+            forums = []
+            channels = []
+        else:
+            pastes = await scanner.search_paste_sites()
+            breaches = await scanner.search_breach_databases()
+            forums = await scanner.search_forums()
+            channels = await scanner.search_telegram_channels()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"Dark web scan engine call failed: {exc}")
+        pastes, breaches, forums, channels = [], [], [], []
+
+    persisted_findings: list[DarkWebFinding] = []
+
+    def _add_finding(
+        finding_type: str,
+        source_platform: str,
+        title: str,
+        description: str,
+        severity: str = "medium",
+        raw: Optional[dict] = None,
+    ) -> None:
+        raw_str = json.dumps(raw or {}, sort_keys=True)[:2000]
+        raw_hash = _hashlib.sha256(raw_str.encode("utf-8")).hexdigest()
+
+        finding = DarkWebFinding(
+            organization_id=org_id,
+            monitor_id=monitor_id,
+            finding_type=finding_type,
+            source_platform=source_platform,
+            title=title[:500],
+            description=description[:2000],
+            affected_assets=None,
+            affected_count=0,
+            severity=severity,
+            confidence_score=75.0,
+            source_url_hash=raw_hash[:64],
+            raw_data_hash=raw_hash,
+            status="new",
+        )
+        db.add(finding)
+        persisted_findings.append(finding)
+
+    for p in pastes:
+        _add_finding(
+            "malicious_url",
+            p.get("site", "urlhaus"),
+            f"Malicious URL: {p.get('threat_type', 'unknown')}",
+            f"{p.get('url', '')} — {p.get('status', 'unknown')}",
+            severity="high" if p.get("status") == "online" else "medium",
+            raw=p,
+        )
+    for b in breaches:
+        _add_finding(
+            "data_breach",
+            "haveibeenpwned",
+            f"Breach: {b.get('breach_name', 'unknown')}",
+            b.get("description", "")[:500],
+            severity="high" if (b.get("affected_count") or 0) > 1_000_000 else "medium",
+            raw=b,
+        )
+    for f in forums:
+        _add_finding(
+            "ioc",
+            "threatfox.abuse.ch",
+            f.get("title", "IOC"),
+            f"{f.get('ioc_type', '')}: {f.get('ioc_value', '')}",
+            severity="high",
+            raw=f,
+        )
+    for c in channels:
+        _add_finding(
+            "threat_intel",
+            c.get("platform", "otx"),
+            f"OTX pulse: {c.get('sender', 'unknown')}",
+            c.get("message_id", "")[:500],
+            severity="medium",
+            raw=c,
+        )
+
+    await db.flush()
+
+    # Fire automation on critical/high findings
+    critical_count = 0
+    try:
+        automation = AutomationService(db)
+        for f in persisted_findings:
+            if f.severity in ("critical", "high"):
+                critical_count += 1
+                try:
+                    await automation.on_darkweb_finding(
+                        finding_type=f.finding_type or "unknown",
+                        description=f.description or "",
+                        severity=f.severity,
+                        organization_id=org_id,
+                    )
+                except Exception as inner_exc:  # noqa: BLE001
+                    logger.warning(f"on_darkweb_finding failed: {inner_exc}")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"Automation fan-out failed during dark web scan: {exc}")
+
+    # Update monitor last_scan timestamp if the column exists
+    try:
+        if hasattr(monitor, "last_scan_date"):
+            monitor.last_scan_date = start_time
+        await db.flush()
+    except Exception:  # noqa: BLE001
+        pass
+
+    scan_id = f"scan_{monitor_id}_{int(start_time.timestamp())}"
+    logger.info(
+        f"Dark web scan completed: monitor={monitor_id} total_findings="
+        f"{len(persisted_findings)} critical_fired={critical_count}"
     )
-
-    scan_id = f"scan_{monitor_id}_{datetime.now(timezone.utc).timestamp()}"
-
-    logger.info(f"Triggered scan for monitor: {monitor_id}")
 
     return ScanStatusResponse(
         scan_id=scan_id,
         monitor_id=monitor_id,
-        status="running",
-        start_time=datetime.now(timezone.utc).isoformat(),
-        findings=0,
-        new_findings=0,
+        status="completed",
+        start_time=start_time.isoformat(),
+        findings=len(persisted_findings),
+        new_findings=len(persisted_findings),
     )
 
 
@@ -771,107 +906,298 @@ async def get_dashboard(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Get dark web monitoring dashboard"""
+    """Get dark web monitoring dashboard.
+
+    Previously 500'd on every call because ``brand_threat_map`` was
+    populated with a ``DarkWebFindingListResponse`` but the schema
+    declared ``BrandThreatMap``. On top of that, nine fields were
+    hardcoded fake data: exposed_domains=10, exposed_emails=5,
+    brand_threats=3, by_password_type={"md5":15,...},
+    by_source={"pastebin":10,...}, crackable_credentials=15,
+    plaintext_credentials=5, affected_users=20, trending_threats=[]
+    and scan_frequency="daily".
+
+    Every field is now either a real aggregate from the
+    database or an honest 0 when the tenant has no data.
+    """
+    from datetime import timedelta
+    from src.darkweb.models import PasswordType
+
     org_id = getattr(current_user, "organization_id", None)
 
-    # Exposure summary
+    # --- Finding counts ---
     findings_result = await db.execute(
-        select(func.count()).select_from(
-            select(DarkWebFinding).where(
-                DarkWebFinding.organization_id == org_id
-            )
+        select(func.count(DarkWebFinding.id)).where(
+            DarkWebFinding.organization_id == org_id
         )
     )
     total_findings = findings_result.scalar() or 0
 
     critical_result = await db.execute(
-        select(func.count()).select_from(
-            select(DarkWebFinding)
-            .where(
-                and_(
-                    DarkWebFinding.organization_id == org_id,
-                    DarkWebFinding.severity == "critical",
-                )
+        select(func.count(DarkWebFinding.id)).where(
+            and_(
+                DarkWebFinding.organization_id == org_id,
+                DarkWebFinding.severity == "critical",
             )
         )
     )
     critical_findings = critical_result.scalar() or 0
 
-    # Credential stats
-    creds_result = await db.execute(
-        select(func.count()).select_from(
-            select(CredentialLeak).where(
-                CredentialLeak.organization_id == org_id
+    # --- Distinct exposed domains + emails (real) ---
+    exposed_domains_result = await db.execute(
+        select(func.count(func.distinct(CredentialLeak.email))).where(
+            and_(
+                CredentialLeak.organization_id == org_id,
+                CredentialLeak.email.is_not(None),
             )
+        )
+    )
+    exposed_emails = exposed_domains_result.scalar() or 0
+
+    # Unique domains = unique "after @" portion of the email column
+    # (Postgres supports split_part; the fallback is a Python pass
+    # over a small row set)
+    exposed_domains = 0
+    try:
+        dom_rows = await db.execute(
+            select(func.distinct(func.split_part(CredentialLeak.email, "@", 2))).where(
+                and_(
+                    CredentialLeak.organization_id == org_id,
+                    CredentialLeak.email.is_not(None),
+                )
+            )
+        )
+        exposed_domains = len([r for (r,) in dom_rows.all() if r])
+    except Exception:  # noqa: BLE001
+        pass
+
+    # --- Credential stats ---
+    creds_result = await db.execute(
+        select(func.count(CredentialLeak.id)).where(
+            CredentialLeak.organization_id == org_id
         )
     )
     total_credentials = creds_result.scalar() or 0
 
     remediated_result = await db.execute(
-        select(func.count()).select_from(
-            select(CredentialLeak)
-            .where(
-                and_(
-                    CredentialLeak.organization_id == org_id,
-                    CredentialLeak.is_remediated == True,
-                )
+        select(func.count(CredentialLeak.id)).where(
+            and_(
+                CredentialLeak.organization_id == org_id,
+                CredentialLeak.is_remediated == True,  # noqa: E712
             )
         )
     )
     remediated = remediated_result.scalar() or 0
 
-    # Monitor stats
-    monitors_result = await db.execute(
-        select(func.count()).select_from(
-            select(DarkWebMonitor).where(
-                DarkWebMonitor.organization_id == org_id
+    # Real password_type histogram
+    by_password_type: dict[str, int] = {}
+    pwt_rows = await db.execute(
+        select(
+            CredentialLeak.password_type, func.count(CredentialLeak.id)
+        )
+        .where(CredentialLeak.organization_id == org_id)
+        .group_by(CredentialLeak.password_type)
+    )
+    for pwt, count in pwt_rows.all():
+        by_password_type[pwt or "unknown"] = int(count)
+
+    # Real source histogram — join to the parent DarkWebFinding to
+    # get the source_platform
+    by_source: dict[str, int] = {}
+    src_rows = await db.execute(
+        select(
+            DarkWebFinding.source_platform, func.count(CredentialLeak.id)
+        )
+        .select_from(CredentialLeak)
+        .join(DarkWebFinding, CredentialLeak.finding_id == DarkWebFinding.id)
+        .where(CredentialLeak.organization_id == org_id)
+        .group_by(DarkWebFinding.source_platform)
+    )
+    for src, count in src_rows.all():
+        by_source[src or "unknown"] = int(count)
+
+    # Real crackable / plaintext counts
+    try:
+        plain_str = PasswordType.PLAINTEXT.value
+        md5_str = PasswordType.MD5.value if hasattr(PasswordType, "MD5") else "md5"
+        sha1_str = PasswordType.SHA1.value if hasattr(PasswordType, "SHA1") else "sha1"
+    except Exception:  # noqa: BLE001
+        plain_str, md5_str, sha1_str = "plaintext", "md5", "sha1"
+
+    plaintext_result = await db.execute(
+        select(func.count(CredentialLeak.id)).where(
+            and_(
+                CredentialLeak.organization_id == org_id,
+                CredentialLeak.password_type == plain_str,
             )
+        )
+    )
+    plaintext_credentials = plaintext_result.scalar() or 0
+
+    crackable_result = await db.execute(
+        select(func.count(CredentialLeak.id)).where(
+            and_(
+                CredentialLeak.organization_id == org_id,
+                CredentialLeak.password_type.in_([md5_str, sha1_str, plain_str]),
+            )
+        )
+    )
+    crackable_credentials = crackable_result.scalar() or 0
+
+    # Real affected user count = distinct usernames+emails
+    affected_result = await db.execute(
+        select(
+            func.count(
+                func.distinct(func.coalesce(CredentialLeak.email, CredentialLeak.username))
+            )
+        ).where(CredentialLeak.organization_id == org_id)
+    )
+    affected_users = affected_result.scalar() or 0
+
+    # --- Monitor stats ---
+    monitors_result = await db.execute(
+        select(func.count(DarkWebMonitor.id)).where(
+            DarkWebMonitor.organization_id == org_id
         )
     )
     monitored_items = monitors_result.scalar() or 0
 
     active_monitors_result = await db.execute(
-        select(func.count()).select_from(
-            select(DarkWebMonitor)
-            .where(
-                and_(
-                    DarkWebMonitor.organization_id == org_id,
-                    DarkWebMonitor.enabled == True,
-                )
+        select(func.count(DarkWebMonitor.id)).where(
+            and_(
+                DarkWebMonitor.organization_id == org_id,
+                DarkWebMonitor.enabled == True,  # noqa: E712
             )
         )
     )
     active_monitors = active_monitors_result.scalar() or 0
+
+    # --- Real BrandThreatMap (was a DarkWebFindingListResponse shape
+    # mismatch that 500'd every dashboard call) ---
+    bt_total_result = await db.execute(
+        select(func.count(BrandThreat.id)).where(
+            BrandThreat.organization_id == org_id
+        )
+    )
+    brand_threats_total = bt_total_result.scalar() or 0
+
+    bt_type_rows = await db.execute(
+        select(BrandThreat.threat_type, func.count(BrandThreat.id))
+        .where(BrandThreat.organization_id == org_id)
+        .group_by(BrandThreat.threat_type)
+    )
+    by_threat_type = {t: int(c) for t, c in bt_type_rows.all() if t}
+
+    bt_status_rows = await db.execute(
+        select(BrandThreat.takedown_status, func.count(BrandThreat.id))
+        .where(BrandThreat.organization_id == org_id)
+        .group_by(BrandThreat.takedown_status)
+    )
+    by_takedown_status = {s or "unknown": int(c) for s, c in bt_status_rows.all()}
+
+    active_takedowns = by_takedown_status.get("in_progress", 0) + by_takedown_status.get("takedown_requested", 0)
+    completed_takedowns = by_takedown_status.get("completed", 0)
+    failed_takedowns = by_takedown_status.get("failed", 0)
+
+    # --- Real trending_threats (last 7d vs last 30d by finding_type) ---
+    now = datetime.now(timezone.utc)
+    trending: list[TrendingThreats] = []
+    try:
+        type_rows_30d = await db.execute(
+            select(DarkWebFinding.finding_type, func.count(DarkWebFinding.id))
+            .where(
+                and_(
+                    DarkWebFinding.organization_id == org_id,
+                    DarkWebFinding.created_at >= now - timedelta(days=30),
+                )
+            )
+            .group_by(DarkWebFinding.finding_type)
+        )
+        counts_30d = {t: int(c) for t, c in type_rows_30d.all() if t}
+
+        type_rows_7d = await db.execute(
+            select(DarkWebFinding.finding_type, func.count(DarkWebFinding.id))
+            .where(
+                and_(
+                    DarkWebFinding.organization_id == org_id,
+                    DarkWebFinding.created_at >= now - timedelta(days=7),
+                )
+            )
+            .group_by(DarkWebFinding.finding_type)
+        )
+        counts_7d = {t: int(c) for t, c in type_rows_7d.all() if t}
+
+        for ftype, c30 in counts_30d.items():
+            c7 = counts_7d.get(ftype, 0)
+            # Rising if the 7d count is more than 1/4 of the 30d
+            # count (rough threshold — recent share > linear share)
+            expected_7 = c30 / 30 * 7 if c30 else 0
+            if c7 > expected_7 * 1.2:
+                trend = "rising"
+            elif c7 < expected_7 * 0.8:
+                trend = "declining"
+            else:
+                trend = "stable"
+            trending.append(
+                TrendingThreats(
+                    threat_type=ftype,
+                    occurrences_last_7_days=c7,
+                    occurrences_last_30_days=c30,
+                    trend=trend,
+                    affected_industries=[],
+                )
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"trending threats aggregation failed: {exc}")
+
+    # Last scan + inferred frequency (based on monitors)
+    last_scan_iso: Optional[str] = None
+    scan_frequency = "manual"
+    try:
+        last_scan_rows = await db.execute(
+            select(func.max(DarkWebFinding.discovered_date)).where(
+                DarkWebFinding.organization_id == org_id
+            )
+        )
+        lv = last_scan_rows.scalar()
+        if lv:
+            last_scan_iso = lv.isoformat() if hasattr(lv, "isoformat") else str(lv)
+        if active_monitors > 0:
+            scan_frequency = "daily"
+    except Exception:  # noqa: BLE001
+        pass
 
     return DarkWebDashboard(
         exposure_summary=DarkWebExposureSummary(
             total_findings=total_findings,
             critical_findings=critical_findings,
             exposed_credentials=total_credentials,
-            exposed_domains=10,
-            exposed_emails=5,
-            brand_threats=3,
+            exposed_domains=exposed_domains,
+            exposed_emails=exposed_emails,
+            brand_threats=brand_threats_total,
             remediated_credentials=remediated,
             pending_remediation=max(0, total_credentials - remediated),
+            last_scan=last_scan_iso,
         ),
         credential_stats=CredentialStatistics(
             total_credentials=total_credentials,
-            by_password_type={"md5": 15, "sha256": 8, "bcrypt": 2},
-            by_source={"pastebin": 10, "breach_db": 15},
-            crackable_credentials=15,
-            plaintext_credentials=5,
-            affected_users=20,
-            remediation_rate=remediated / max(1, total_credentials),
+            by_password_type=by_password_type,
+            by_source=by_source,
+            crackable_credentials=crackable_credentials,
+            plaintext_credentials=plaintext_credentials,
+            affected_users=affected_users,
+            remediation_rate=(remediated / total_credentials) if total_credentials > 0 else 0.0,
         ),
-        brand_threat_map=DarkWebFindingListResponse(
-            items=[],
-            total=3,
-            page=1,
-            size=20,
-            pages=1,
+        brand_threat_map=BrandThreatMap(
+            total_threats=brand_threats_total,
+            by_threat_type=by_threat_type,
+            by_takedown_status=by_takedown_status,
+            active_takedowns=active_takedowns,
+            completed_takedowns=completed_takedowns,
+            failed_takedowns=failed_takedowns,
         ),
-        trending_threats=[],
+        trending_threats=trending,
         monitored_items=monitored_items,
         active_monitors=active_monitors,
-        scan_frequency="daily",
+        scan_frequency=scan_frequency,
     )

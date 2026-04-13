@@ -11,7 +11,26 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 from src.core.config import settings
 from src.models import Base
 
-# Import all models so they're registered with Base.metadata for autogenerate
+# Import all models so they're registered with Base.metadata for autogenerate.
+#
+# NOTE: models here must stay in sync with the codebase or `alembic upgrade`
+# will fail on ImportError. We wrap each module in try/except and log a
+# warning so a stale/removed symbol in ONE module does not block migrations
+# for the whole platform. For a raw-SQL migration (like 007) we actually
+# don't need any of these imports, but they are still kept for
+# `alembic revision --autogenerate` support.
+import logging as _logging
+_log = _logging.getLogger("alembic.env")
+
+def _try_import(name: str, names: list[str]) -> None:
+    try:
+        mod = __import__(name, fromlist=names)
+        for n in names:
+            if not hasattr(mod, n):
+                _log.warning("alembic env: %s has no attribute %s", name, n)
+    except Exception as e:  # noqa: BLE001
+        _log.warning("alembic env: skipping %s (%s)", name, e)
+
 # Core models
 from src.models.user import User
 from src.models.alert import Alert
@@ -24,15 +43,9 @@ from src.models.case import CaseNote, CaseAttachment, CaseTimeline, Task
 from src.models.organization import Organization, OrganizationMember, Team, TeamMember
 from src.models.api_key import APIKey
 
-# Module-specific models
-from src.ai.models import (
-    AIModel,
-    AIAnalysis,
-    ThreatPrediction,
-    AnomalyDetection,
-    NLQuery,
-)
-from src.siem.models import SIEMDataSource, DetectionRule, LogEntry, CorrelationEvent
+# Module-specific models (best-effort so stale names don't break upgrades)
+_try_import("src.ai.models", ["MLModel", "AIAnalysis", "ThreatPrediction", "AnomalyDetection", "NLQuery"])
+_try_import("src.siem.models", ["SIEMDataSource", "DetectionRule", "LogEntry", "CorrelationEvent"])
 from src.intel.models import (
     ThreatFeed,
     ThreatIndicator,
@@ -41,208 +54,35 @@ from src.intel.models import (
     IntelReport,
     IndicatorSighting,
 )
-from src.hunting.models import (
-    HuntHypothesis,
-    HuntNotebook,
-    HuntFinding,
-    HuntTemplate,
-    HuntSession,
-)
-from src.exposure.models import (
-    ExposureAsset,
-    ExposureScan,
-    AttackSurface,
-    Vulnerability,
-    AssetVulnerability,
-    RemediationTicket,
-)
-from src.ai.models import AIModel, AIAnalysis, ThreatPrediction, AnomalyDetection
-from src.ueba.models import (
-    UserBehavior,
-    BehaviorBaseline,
-    UEBARiskAlert,
-    EntityProfile,
-    PeerGroup,
-    BehaviorEvent,
-)
-from src.simulation.models import (
-    AttackCampaign,
-    SimulationTest,
-    AttackTechnique,
-    AdversaryProfile,
-    SecurityPostureScore,
-)
-from src.deception.models import (
-    Honeypot,
-    HoneyToken,
-    DeceptionCampaign,
-    DecoyInteraction,
-    Decoy,
-)
-from src.remediation.models import (
-    RemediationPolicy,
-    RemediationAction,
-    RemediationPlaybook,
-    RemediationExecution,
-    RemediationIntegration,
-)
-from src.compliance.models import (
-    ComplianceFramework,
-    ComplianceControl,
-    POAM,
-    ComplianceEvidence,
-    ComplianceAssessment,
-    CISADirective,
-    CUIMarking,
-)
-from src.zerotrust.models import (
-    ZeroTrustPolicy,
-    DeviceTrustProfile,
-    AccessDecision,
-    MicroSegment,
-    IdentityVerification,
-)
-from src.stig.models import (
-    STIGBenchmark,
-    STIGRule,
-    STIGScanResult,
-    SCAPProfile,
-)
-from src.audit_evidence.models import (
-    AuditTrail,
-    EvidencePackage,
-    AutomatedEvidenceRule,
-)
-from src.dfir.models import (
-    ForensicCase,
-    ForensicEvidence,
-    ForensicArtifact,
-    LegalHold,
-    ForensicTimeline,
-)
-from src.itdr.models import (
-    IdentityThreat,
-    CredentialMonitor,
-    PrivilegedAccessEvent,
-    CredentialExposure,
-    AccessAnomaly,
-    IdentityProfile,
-)
-from src.vulnmgmt.models import (
-    Vulnerability as VulnVulnerability,
-    VulnScan,
-    PatchOperation,
-    VulnerabilityException,
-    VulnerabilityInstance,
-    ScanProfile,
-)
-from src.supplychain.models import (
-    SBOMComponent,
-    SBOM,
-    SoftwareComponent,
-    SupplyChainRisk,
-    VendorAssessment,
-)
-from src.darkweb.models import (
-    DarkwebAlert,
-    CredentialLeak,
-    DarkwebMonitor,
-    DarkwebFinding,
-    DarkwebBrandThreat,
-)
-from src.integrations.models import (
-    IntegrationConnector,
-    InstalledIntegration,
-    IntegrationAction,
-    IntegrationExecution,
-    WebhookEndpoint,
-)
-from src.agentic.models import (
-    SOCAgent,
-    Investigation,
-    ReasoningChain,
-    AgentAction,
-    AgentMemory,
-)
-from src.playbook_builder.models import (
-    VisualPlaybook,
-    PlaybookNode,
-    PlaybookEdge,
-    PlaybookNodeExecution,
-    PlaybookExecution as PBExecution,
-)
-from src.dlp.models import (
-    DLPPolicy,
-    DLPIncident,
-    DataClassification,
-    DLPViolation,
-    SensitiveDataDiscovery,
-)
-from src.risk_quant.models import (
-    RiskScenario,
-    LossAnalysis,
-    ControlAssessment,
-    RiskRegister,
-    FAIRAnalysis,
-    BusinessImpactAssessment,
-)
-from src.ot_security.models import (
-    OTAsset,
-    OTAlert,
-    OTZone,
-    OTIncident,
-    OTPolicyRule,
-)
-from src.container_security.models import (
-    ContainerImage,
-    ContainerScan,
-    KubernetesCluster,
-    K8sSecurityFinding,
-    RuntimeAlert,
-    ImageVulnerability,
-)
-from src.privacy.models import (
-    DataSubjectRequest,
-    PrivacyImpactAssessment,
-    ConsentRecord,
-    ProcessingRecord,
-    PrivacyIncident,
-)
-from src.threat_modeling.models import (
-    ThreatModel,
-    ThreatModelComponent,
-    IdentifiedThreat,
-    ThreatMitigation,
-    AttackTree,
-)
-from src.api_security.models import (
-    APIEndpoint,
-    APIVulnerability,
-    APISecurityPolicy,
-    APIComplianceCheck,
-    APIAnomalyDetection,
-)
-from src.data_lake.models import (
-    DataSource,
-    DataPipeline,
-    UnifiedDataModel,
-    DataPartition,
-    QueryJob,
-)
-from src.collaboration.models import (
-    WarRoom,
-    WarRoomMessage,
-    ActionItem,
-    SharedArtifact,
-    IncidentTimeline,
-)
-from src.phishing_sim.models import (
-    PhishingCampaign,
-    PhishingTemplate,
-    CampaignEvent,
-    TargetGroup,
-    SecurityAwarenessScore,
-)
+_try_import("src.hunting.models", ["HuntHypothesis", "HuntNotebook", "HuntFinding", "HuntTemplate", "HuntSession"])
+_try_import("src.exposure.models", ["ExposureAsset", "ExposureScan", "AttackSurface", "AssetVulnerability", "RemediationTicket"])
+_try_import("src.ueba.models", ["UserBehavior", "BehaviorBaseline", "UEBARiskAlert", "EntityProfile", "PeerGroup", "BehaviorEvent"])
+_try_import("src.simulation.models", ["AttackCampaign", "SimulationTest", "AttackTechnique", "AdversaryProfile", "SecurityPostureScore"])
+_try_import("src.deception.models", ["Honeypot", "HoneyToken", "DeceptionCampaign", "DecoyInteraction", "Decoy"])
+_try_import("src.remediation.models", ["RemediationPolicy", "RemediationAction", "RemediationPlaybook", "RemediationExecution", "RemediationIntegration"])
+_try_import("src.compliance.models", ["ComplianceFramework", "ComplianceControl", "POAM", "ComplianceEvidence", "ComplianceAssessment", "CISADirective", "CUIMarking"])
+_try_import("src.zerotrust.models", ["ZeroTrustPolicy", "DeviceTrustProfile", "AccessDecision", "MicroSegment", "IdentityVerification"])
+_try_import("src.stig.models", ["STIGBenchmark", "STIGRule", "STIGScanResult", "SCAPProfile"])
+_try_import("src.audit_evidence.models", ["AuditTrail", "EvidencePackage", "AutomatedEvidenceRule"])
+_try_import("src.dfir.models", ["ForensicCase", "ForensicEvidence", "ForensicArtifact", "LegalHold", "ForensicTimeline"])
+_try_import("src.itdr.models", ["IdentityThreat", "CredentialMonitor", "PrivilegedAccessEvent", "CredentialExposure", "AccessAnomaly", "IdentityProfile"])
+_try_import("src.vulnmgmt.models", ["Vulnerability", "VulnScan", "PatchOperation", "VulnerabilityException", "VulnerabilityInstance", "ScanProfile"])
+_try_import("src.supplychain.models", ["SBOMComponent", "SBOM", "SoftwareComponent", "SupplyChainRisk", "VendorAssessment"])
+_try_import("src.darkweb.models", ["DarkwebAlert", "CredentialLeak", "DarkwebMonitor", "DarkwebFinding", "DarkwebBrandThreat"])
+_try_import("src.integrations.models", ["IntegrationConnector", "InstalledIntegration", "IntegrationAction", "IntegrationExecution", "WebhookEndpoint"])
+_try_import("src.agentic.models", ["SOCAgent", "Investigation", "ReasoningChain", "AgentAction", "AgentMemory"])
+_try_import("src.playbook_builder.models", ["VisualPlaybook", "PlaybookNode", "PlaybookEdge", "PlaybookNodeExecution", "PlaybookExecution"])
+_try_import("src.dlp.models", ["DLPPolicy", "DLPIncident", "DataClassification", "DLPViolation", "SensitiveDataDiscovery"])
+_try_import("src.risk_quant.models", ["RiskScenario", "LossAnalysis", "ControlAssessment", "RiskRegister", "FAIRAnalysis", "BusinessImpactAssessment"])
+_try_import("src.ot_security.models", ["OTAsset", "OTAlert", "OTZone", "OTIncident", "OTPolicyRule"])
+_try_import("src.container_security.models", ["ContainerImage", "ContainerScan", "KubernetesCluster", "K8sSecurityFinding", "RuntimeAlert", "ImageVulnerability"])
+_try_import("src.privacy.models", ["DataSubjectRequest", "PrivacyImpactAssessment", "ConsentRecord", "ProcessingRecord", "PrivacyIncident"])
+_try_import("src.threat_modeling.models", ["ThreatModel", "ThreatModelComponent", "IdentifiedThreat", "ThreatMitigation", "AttackTree"])
+_try_import("src.api_security.models", ["APIEndpoint", "APIVulnerability", "APISecurityPolicy", "APIComplianceCheck", "APIAnomalyDetection"])
+_try_import("src.data_lake.models", ["DataSource", "DataPipeline", "UnifiedDataModel", "DataPartition", "QueryJob"])
+_try_import("src.collaboration.models", ["WarRoom", "WarRoomMessage", "ActionItem", "SharedArtifact", "IncidentTimeline"])
+_try_import("src.phishing_sim.models", ["PhishingCampaign", "PhishingTemplate", "CampaignEvent", "TargetGroup", "SecurityAwarenessScore"])
+_try_import("src.agents.models", ["EndpointAgent", "AgentCommand", "AgentResult", "AgentHeartbeat"])
 
 # Alembic Config object
 config = context.config
