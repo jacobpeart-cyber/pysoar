@@ -147,7 +147,7 @@ class InvestigationResponse(InvestigationBase, DBModel):
     findings_summary: Optional[str] = None
     recommendations: Optional[list[str]] = None
     mitre_techniques: Optional[list[str]] = None
-    affected_assets: Optional[dict[str, Any]] = None
+    affected_assets: Optional[Any] = None
     resolution_type: Optional[str] = None
     human_feedback: Optional[str] = None
     feedback_rating: Optional[int] = None
