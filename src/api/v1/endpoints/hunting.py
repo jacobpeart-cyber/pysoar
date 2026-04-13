@@ -2,7 +2,7 @@
 
 import json
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, BackgroundTasks, Body, HTTPException, Query, status
@@ -119,23 +119,148 @@ async def hypothesis_to_response(db: AsyncSession, hypothesis: HuntHypothesis) -
     return data
 
 
-async def execute_hunt_session(session_id: str):
-    """Background task to execute a hunt session"""
+async def execute_hunt_session(session_id: str):  # noqa: C901
+    """Background task to run a real hunt against the SIEM logs + IOC DB.
+
+    The hunt engine:
+      1. Marks the session RUNNING
+      2. Loads the hypothesis (data_sources, mitre_techniques, description)
+      3. For each indicator mentioned in the hypothesis description, checks
+         against the unified threat_indicators table
+      4. Queries the SIEM LogEntry table for keywords / techniques in the
+         last 24 hours and creates HuntFinding rows for matches
+      5. Counts and writes back the aggregate counts
+      6. Marks the session COMPLETED with duration
+
+    Best-effort: any exception marks the session FAILED (not silently
+    rolled back and left dangling as it was before).
+    """
+    logger.info(f"execute_hunt_session START session_id={session_id}")
     async with async_session_factory() as db:
+        session = None
         try:
-            session = await get_session_or_404(db, session_id)
+            # Fetch session directly (can't use the request-bound
+            # get_session_or_404 helper from a background task).
+            session_result = await db.execute(
+                select(HuntSession).where(HuntSession.id == session_id)
+            )
+            session = session_result.scalar_one_or_none()
+            if not session:
+                logger.warning(f"execute_hunt_session: session {session_id} not found")
+                return
+
+            hyp_result = await db.execute(
+                select(HuntHypothesis).where(HuntHypothesis.id == session.hypothesis_id)
+            )
+            hypothesis = hyp_result.scalar_one_or_none()
+
             session.status = "RUNNING"
             session.started_at = datetime.now(timezone.utc)
             await db.flush()
 
-            # Query existing findings linked to this session
-            findings_result = await db.execute(
-                select(HuntFinding).where(HuntFinding.session_id == session_id)
-            )
-            findings = list(findings_result.scalars().all())
-            session.findings_count = len(findings)
+            findings_created = 0
+            iocs_checked = 0
+            logs_scanned = 0
 
-            # Calculate duration
+            if hypothesis:
+                # Step 1 — derive search keywords. Title + description words
+                # longer than 3 chars, plus MITRE technique IDs.
+                import re as _re
+                text = f"{hypothesis.title or ''} {hypothesis.description or ''}"
+                keywords = {
+                    w.lower() for w in _re.findall(r"[A-Za-z][A-Za-z0-9_-]{3,}", text)
+                    if w.lower() not in {"the", "and", "for", "with", "this", "that", "from", "user", "data"}
+                }
+                mitre_ids = safe_json_loads(hypothesis.mitre_techniques, []) or []
+
+                # Step 2 — scan recent SIEM logs (last 24h) for any keyword match
+                from src.siem.models import LogEntry
+                since = datetime.now(timezone.utc) - timedelta(days=1)
+                log_query = select(LogEntry).where(
+                    LogEntry.timestamp >= since.isoformat()
+                ).limit(500)
+                log_result = await db.execute(log_query)
+                candidate_logs = list(log_result.scalars().all())
+                logs_scanned = len(candidate_logs)
+
+                for log in candidate_logs:
+                    haystack = " ".join(filter(None, [
+                        log.message, log.raw_log, log.hostname, log.username,
+                        log.process_name, log.action,
+                    ])).lower()
+                    matched_keywords = [k for k in keywords if k in haystack]
+                    if matched_keywords:
+                        finding = HuntFinding(
+                            session_id=session_id,
+                            title=f"Log match: {log.message[:120] if log.message else log.raw_log[:120]}",
+                            description=(
+                                f"Log matched {len(matched_keywords)} hypothesis keywords: "
+                                + ", ".join(matched_keywords[:5])
+                            ),
+                            severity=log.severity or "medium",
+                            evidence=json.dumps({
+                                "log_id": log.id,
+                                "timestamp": log.timestamp,
+                                "source_type": log.source_type,
+                                "matched_keywords": matched_keywords[:10],
+                            }),
+                            mitre_techniques=json.dumps(mitre_ids) if mitre_ids else None,
+                        )
+                        db.add(finding)
+                        findings_created += 1
+
+                # Step 3 — check active threat indicators against the hypothesis
+                # data_sources list (e.g. list of IPs/domains to investigate).
+                from src.intel.models import ThreatIndicator
+                data_sources = safe_json_loads(hypothesis.data_sources, []) or []
+                for src_value in data_sources[:50]:  # cap
+                    if not isinstance(src_value, str):
+                        continue
+                    ioc_result = await db.execute(
+                        select(ThreatIndicator).where(
+                            ThreatIndicator.value == src_value,
+                            ThreatIndicator.is_active == True,  # noqa: E712
+                        )
+                    )
+                    matches = ioc_result.scalars().all()
+                    iocs_checked += 1
+                    for ioc in matches:
+                        finding = HuntFinding(
+                            session_id=session_id,
+                            title=f"IOC match: {ioc.indicator_type}:{ioc.value}",
+                            description=(
+                                f"Hypothesis data source matched a known threat indicator "
+                                f"from feed '{ioc.source or 'unknown'}'"
+                            ),
+                            severity=ioc.severity or "high",
+                            evidence=json.dumps({
+                                "indicator_id": ioc.id,
+                                "type": ioc.indicator_type,
+                                "value": ioc.value,
+                                "source": ioc.source,
+                                "tags": ioc.tags or [],
+                            }),
+                        )
+                        db.add(finding)
+                        findings_created += 1
+
+            # Flush the new findings before counting so the count query
+            # can see them in this session's transaction.
+            await db.flush()
+            findings_count_result = await db.execute(
+                select(func.count(HuntFinding.id)).where(HuntFinding.session_id == session_id)
+            )
+            session.findings_count = findings_count_result.scalar() or 0
+            session.events_analyzed = logs_scanned
+            session.query_count = iocs_checked + 1  # +1 for the log scan
+
+            # Store per-run hunt telemetry for the UI to display
+            session.queries_executed = json.dumps({
+                "logs_scanned": logs_scanned,
+                "iocs_checked": iocs_checked,
+                "findings_created_this_run": findings_created,
+            })
+
             completed_at = datetime.now(timezone.utc)
             session.status = "COMPLETED"
             session.completed_at = completed_at
@@ -144,8 +269,28 @@ async def execute_hunt_session(session_id: str):
                     (completed_at - session.started_at).total_seconds()
                 )
             await db.commit()
+            logger.info(
+                f"execute_hunt_session DONE session_id={session_id} "
+                f"findings_created={findings_created} logs_scanned={logs_scanned} "
+                f"iocs_checked={iocs_checked}"
+            )
         except Exception as e:
-            await db.rollback()
+            logger.error(f"execute_hunt_session FAILED session_id={session_id}: {e}", exc_info=True)
+            try:
+                await db.rollback()
+                # Re-fetch the session in a clean state and mark it failed
+                fail_result = await db.execute(
+                    select(HuntSession).where(HuntSession.id == session_id)
+                )
+                fail_session = fail_result.scalar_one_or_none()
+                if fail_session:
+                    fail_session.status = "FAILED"
+                    fail_session.completed_at = datetime.now(timezone.utc)
+                    fail_session.error_message = str(e)[:500]
+                    await db.commit()
+            except Exception as inner:
+                logger.error(f"Could not mark session {session_id} as FAILED: {inner}")
+                await db.rollback()
 
 
 # ============================================================================
@@ -192,7 +337,12 @@ async def list_hypotheses(
     )
     total = count_result.scalar() or 0
 
-    # Apply sorting
+    # Apply sorting — whitelist sortable columns
+    _ALLOWED_HYP_SORTS = {
+        "created_at", "updated_at", "title", "priority", "status", "hunt_type",
+    }
+    if sort_by not in _ALLOWED_HYP_SORTS:
+        sort_by = "created_at"
     sort_column = getattr(HuntHypothesis, sort_by, HuntHypothesis.created_at)
     if sort_order == "desc":
         query = query.order_by(sort_column.desc())
@@ -352,6 +502,12 @@ async def create_session(session_data: HuntSessionCreate, current_user: CurrentU
     await db.flush()
     await db.refresh(hunt_session)
 
+    # EXPLICIT commit before scheduling the background task — otherwise
+    # the task (which opens a fresh AsyncSession) races with get_db()'s
+    # post-yield commit and may not see this row yet, resulting in a
+    # silent "session not found" failure.
+    await db.commit()
+
     # Trigger background execution
     background_tasks.add_task(execute_hunt_session, hunt_session.id)
 
@@ -384,7 +540,13 @@ async def list_sessions(
     )
     total = count_result.scalar() or 0
 
-    # Apply sorting
+    # Apply sorting — whitelist sortable columns
+    _ALLOWED_SESSION_SORTS = {
+        "created_at", "started_at", "completed_at", "status", "duration_seconds",
+        "findings_count", "events_analyzed",
+    }
+    if sort_by not in _ALLOWED_SESSION_SORTS:
+        sort_by = "created_at"
     sort_column = getattr(HuntSession, sort_by, HuntSession.created_at)
     if sort_order == "desc":
         query = query.order_by(sort_column.desc())
@@ -519,7 +681,12 @@ async def list_findings(
     )
     total = count_result.scalar() or 0
 
-    # Apply sorting
+    # Apply sorting — whitelist sortable columns
+    _ALLOWED_FINDING_SORTS = {
+        "created_at", "updated_at", "severity", "classification", "title", "status",
+    }
+    if sort_by not in _ALLOWED_FINDING_SORTS:
+        sort_by = "created_at"
     sort_column = getattr(HuntFinding, sort_by, HuntFinding.created_at)
     if sort_order == "desc":
         query = query.order_by(sort_column.desc())
@@ -620,22 +787,75 @@ async def escalate_finding(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Escalate a finding to a new case"""
+    """Escalate a hunt finding to a real Incident.
+
+    Previously this endpoint just generated a random UUID and pretended
+    the finding was escalated, without ever creating a case. Now it
+    creates a real Incident record, links the finding to it, and fires
+    the cross-module automation pipeline (which auto-creates a war
+    room for critical/high severity findings).
+    """
+    from src.models.incident import Incident, IncidentStatus
+
     finding = await get_finding_or_404(db, finding_id)
 
-    # Generate a case ID and link the finding to it
-    import uuid
-    case_id = str(uuid.uuid4())
+    if finding.escalated_to_case and finding.case_id:
+        # Idempotent — return the existing incident link
+        return {
+            "status": "already_escalated",
+            "finding_id": finding.id,
+            "case_id": finding.case_id,
+        }
+
+    # Map finding severity onto a sensible incident severity
+    sev_map = {
+        "critical": "critical",
+        "high": "high",
+        "medium": "medium",
+        "low": "low",
+    }
+    incident_severity = sev_map.get((finding.severity or "").lower(), "medium")
+
+    incident = Incident(
+        title=f"Hunt escalation: {finding.title}",
+        description=(
+            (finding.description or "") + "\n\n---\n"
+            f"Escalated from hunt finding {finding.id}.\n"
+            f"Session: {finding.session_id}"
+        ),
+        severity=incident_severity,
+        status=IncidentStatus.OPEN.value,
+        incident_type="hunt_finding",
+        detected_at=datetime.now(timezone.utc).isoformat(),
+    )
+    db.add(incident)
+    await db.flush()
+
     finding.escalated_to_case = True
-    finding.case_id = case_id
+    finding.case_id = incident.id
+
+    # Fire the incident automation pipeline (war room + action items
+    # for critical/high severity)
+    try:
+        automation = AutomationService(db)
+        await automation.on_incident_created(
+            incident,
+            organization_id=getattr(current_user, "organization_id", None) if current_user else None,
+            created_by=str(current_user.id) if current_user else None,
+        )
+    except Exception as automation_exc:
+        logger.warning(f"Automation on_incident_created failed after escalation: {automation_exc}")
+
     await db.flush()
     await db.refresh(finding)
 
     return {
         "status": "success",
         "finding_id": finding.id,
+        "incident_id": incident.id,
         "case_id": finding.case_id,
-        "message": "Finding escalated to case",
+        "incident_severity": incident_severity,
+        "message": f"Finding escalated to incident {incident.id}",
     }
 
 
@@ -735,6 +955,27 @@ async def instantiate_template(
 # ============================================================================
 
 
+def notebook_to_response(notebook: HuntNotebook) -> HuntNotebookResponse:
+    """Build a HuntNotebookResponse, coercing the JSON content column.
+
+    The content column is stored as JSON (Postgres). asyncpg may return
+    it as a native list/dict, a JSON-encoded string (legacy writes), or
+    None (fresh notebook). Pydantic's `list[HuntNotebookCell]` field
+    can't parse a string, so we coerce first.
+    """
+    return HuntNotebookResponse(
+        id=notebook.id,
+        session_id=notebook.session_id,
+        title=notebook.title,
+        content=_coerce_notebook_cells(notebook.content),
+        version=notebook.version,
+        is_published=notebook.is_published,
+        published_at=notebook.published_at,
+        created_at=notebook.created_at,
+        updated_at=notebook.updated_at,
+    )
+
+
 @router.get("/notebooks", response_model=HuntNotebookListResponse)
 async def list_notebooks(
     current_user: CurrentUser = None,
@@ -763,7 +1004,7 @@ async def list_notebooks(
     notebooks = list(result.scalars().all())
 
     return HuntNotebookListResponse(
-        items=[HuntNotebookResponse.model_validate(n) for n in notebooks],
+        items=[notebook_to_response(n) for n in notebooks],
         total=total,
         page=page,
         size=size,
@@ -784,7 +1025,7 @@ async def create_notebook(
     notebook = HuntNotebook(
         session_id=notebook_data.session_id,
         title=notebook_data.title,
-        content=json.dumps([]),
+        content=[],
         version=1,
         is_published=False,
     )
@@ -793,7 +1034,7 @@ async def create_notebook(
     await db.flush()
     await db.refresh(notebook)
 
-    return HuntNotebookResponse.model_validate(notebook)
+    return notebook_to_response(notebook)
 
 
 @router.get("/notebooks/{notebook_id}", response_model=HuntNotebookResponse)
@@ -804,7 +1045,7 @@ async def get_notebook(
 ):
     """Get a notebook by ID"""
     notebook = await get_notebook_or_404(db, notebook_id)
-    return HuntNotebookResponse.model_validate(notebook)
+    return notebook_to_response(notebook)
 
 
 @router.put("/notebooks/{notebook_id}", response_model=HuntNotebookResponse)
@@ -823,14 +1064,17 @@ async def update_notebook(
         notebook.title = update_data["title"]
 
     if "content" in update_data:
-        notebook.content = json.dumps(update_data["content"])
+        # Store as native list/dict — the Postgres JSON column accepts
+        # Python objects directly via asyncpg. json.dumps()-ing and
+        # storing a string is the bug that caused the crash chain.
+        notebook.content = update_data["content"]
         notebook.version += 1
 
     notebook.updated_at = datetime.now(timezone.utc)
     await db.flush()
     await db.refresh(notebook)
 
-    return HuntNotebookResponse.model_validate(notebook)
+    return notebook_to_response(notebook)
 
 
 @router.post("/notebooks/{notebook_id}/execute-cell", response_model=None)
@@ -840,13 +1084,22 @@ async def execute_notebook_cell(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Execute a query cell in a notebook"""
+    """Execute a query cell in a notebook.
+
+    Supports a small DSL for hunt notebook cells:
+      - "findings"          -> list all findings for this hunt session
+      - "findings severity:<level>" -> filter
+      - "logs <keyword>"    -> search SIEM log messages (last 24h)
+      - "ioc <value>"       -> look up a threat indicator
+      - "session"           -> session-level stats
+
+    Anything else falls back to showing the session's findings.
+    """
     notebook = await get_notebook_or_404(db, notebook_id)
 
     start_time = datetime.now(timezone.utc)
+    cells = _coerce_notebook_cells(notebook.content)
 
-    # Parse notebook content and retrieve the target cell
-    cells = safe_json_loads(notebook.content, {}) if isinstance(notebook.content, str) else (notebook.content or [])
     if cell_data.cell_index < 0 or cell_data.cell_index >= len(cells):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -854,32 +1107,110 @@ async def execute_notebook_cell(
         )
 
     cell = cells[cell_data.cell_index]
+    query_text = (cell_data.query or cell.get("query") or cell.get("content") or "").strip()
+    query_lower = query_text.lower()
 
-    # Execute query against hunting model tables based on cell content
-    query_text = cell.get("query") or cell.get("source") or ""
-    results = []
+    results: list[dict] = []
+    result_type = "findings"
 
-    # Query findings from the session linked to this notebook
-    findings_result = await db.execute(
-        select(HuntFinding).where(HuntFinding.session_id == notebook.session_id).limit(100)
-    )
-    findings = findings_result.scalars().all()
-    results = [
-        {"id": f.id, "title": f.title, "severity": f.severity, "classification": f.classification}
-        for f in findings
-    ]
+    if query_lower.startswith("logs"):
+        # logs <keyword>
+        keyword = query_text[4:].strip()
+        from src.siem.models import LogEntry
+        since = datetime.now(timezone.utc) - timedelta(days=1)
+        log_query = select(LogEntry).where(LogEntry.timestamp >= since.isoformat())
+        if keyword:
+            like = f"%{keyword}%"
+            log_query = log_query.where(
+                (LogEntry.message.ilike(like)) | (LogEntry.raw_log.ilike(like))
+            )
+        log_query = log_query.order_by(LogEntry.timestamp.desc()).limit(100)
+        log_result = await db.execute(log_query)
+        for lg in log_result.scalars().all():
+            results.append({
+                "id": lg.id,
+                "timestamp": lg.timestamp,
+                "severity": lg.severity,
+                "source_type": lg.source_type,
+                "hostname": lg.hostname,
+                "message": (lg.message or lg.raw_log or "")[:300],
+            })
+        result_type = "logs"
+
+    elif query_lower.startswith("ioc"):
+        # ioc <value>
+        ioc_value = query_text[3:].strip()
+        if ioc_value:
+            from src.intel.models import ThreatIndicator
+            ioc_result = await db.execute(
+                select(ThreatIndicator).where(ThreatIndicator.value == ioc_value).limit(25)
+            )
+            for ind in ioc_result.scalars().all():
+                results.append({
+                    "id": ind.id,
+                    "type": ind.indicator_type,
+                    "value": ind.value,
+                    "severity": ind.severity,
+                    "source": ind.source,
+                    "confidence": ind.confidence,
+                    "is_active": ind.is_active,
+                    "is_whitelisted": ind.is_whitelisted,
+                    "sighting_count": ind.sighting_count,
+                })
+        result_type = "indicators"
+
+    elif query_lower.startswith("session"):
+        # Session stats
+        session_result = await db.execute(
+            select(HuntSession).where(HuntSession.id == notebook.session_id)
+        )
+        s = session_result.scalar_one_or_none()
+        if s:
+            results.append({
+                "session_id": s.id,
+                "status": s.status,
+                "started_at": s.started_at.isoformat() if s.started_at else None,
+                "completed_at": s.completed_at.isoformat() if s.completed_at else None,
+                "duration_seconds": s.duration_seconds,
+                "query_count": s.query_count,
+                "events_analyzed": s.events_analyzed,
+                "findings_count": s.findings_count,
+            })
+        result_type = "session_stats"
+
+    else:
+        # Default: findings for this session, optionally filtered
+        f_query = select(HuntFinding).where(HuntFinding.session_id == notebook.session_id)
+        if "severity:" in query_lower:
+            sev = query_lower.split("severity:", 1)[1].split()[0]
+            f_query = f_query.where(HuntFinding.severity == sev)
+        f_query = f_query.order_by(HuntFinding.created_at.desc()).limit(100)
+        f_result = await db.execute(f_query)
+        for f in f_result.scalars().all():
+            results.append({
+                "id": f.id,
+                "title": f.title,
+                "severity": f.severity,
+                "classification": f.classification,
+                "created_at": f.created_at.isoformat() if f.created_at else None,
+            })
+        result_type = "findings"
 
     elapsed_ms = int((datetime.now(timezone.utc) - start_time).total_seconds() * 1000)
 
-    # Update cell with execution output
+    # Persist the cell output back onto the notebook
     cells[cell_data.cell_index]["output"] = results
     cells[cell_data.cell_index]["execution_time_ms"] = elapsed_ms
-    notebook.content = json.dumps(cells)
+    cells[cell_data.cell_index]["executed_at"] = datetime.now(timezone.utc).isoformat()
+    cells[cell_data.cell_index]["result_type"] = result_type
+    notebook.content = cells
     await db.flush()
 
     return {
         "status": "success",
         "cell_index": cell_data.cell_index,
+        "result_type": result_type,
+        "result_count": len(results),
         "execution_time_ms": elapsed_ms,
         "result": results,
     }
@@ -900,7 +1231,7 @@ async def publish_notebook(
     await db.flush()
     await db.refresh(notebook)
 
-    return HuntNotebookResponse.model_validate(notebook)
+    return notebook_to_response(notebook)
 
 
 @router.get("/notebooks/{notebook_id}/export", response_model=None)
@@ -910,23 +1241,102 @@ async def export_notebook(
     db: DatabaseSession = None,
     format: str = Query("json", pattern="^(json|markdown|html)$"),
 ):
-    """Export a notebook in the specified format"""
+    """Export a notebook in the specified format.
+
+    Supports json (structured payload), markdown (human-readable), or
+    html (browsable). Previously crashed with AttributeError because it
+    referenced `notebook.tags` — the HuntNotebook model has no `tags`
+    column.
+    """
     notebook = await get_notebook_or_404(db, notebook_id)
 
-    cells = safe_json_loads(notebook.content, {}) if isinstance(notebook.content, str) else (notebook.content or [])
-    tags = safe_json_loads(notebook.tags, []) if isinstance(notebook.tags, str) and notebook.tags else (notebook.tags or [])
+    cells = _coerce_notebook_cells(notebook.content)
+
+    payload = {
+        "notebook_id": notebook.id,
+        "title": notebook.title,
+        "version": notebook.version,
+        "is_published": notebook.is_published,
+        "published_at": notebook.published_at.isoformat() if notebook.published_at else None,
+        "created_at": notebook.created_at.isoformat() if notebook.created_at else None,
+        "updated_at": notebook.updated_at.isoformat() if notebook.updated_at else None,
+        "cells": cells,
+    }
+
+    if format == "markdown":
+        lines = [f"# {notebook.title}", ""]
+        if notebook.published_at:
+            lines.append(f"*Published: {notebook.published_at.isoformat()}*")
+        lines.append("")
+        for idx, cell in enumerate(cells):
+            cell_type = cell.get("cell_type", "text")
+            content = cell.get("content", "")
+            lines.append(f"## Cell {idx + 1} — {cell_type}")
+            if cell_type == "markdown":
+                lines.append(str(content))
+            else:
+                lines.append("```")
+                lines.append(str(content))
+                lines.append("```")
+            if cell.get("output") is not None:
+                lines.append("")
+                lines.append("**Output:**")
+                lines.append("```json")
+                lines.append(json.dumps(cell["output"], indent=2, default=str))
+                lines.append("```")
+            lines.append("")
+        return {
+            "format": "markdown",
+            "filename": f"{notebook.title.replace(' ', '_')}.md",
+            "content": "\n".join(lines),
+        }
+
+    if format == "html":
+        html_body = [f"<h1>{notebook.title}</h1>"]
+        for idx, cell in enumerate(cells):
+            cell_type = cell.get("cell_type", "text")
+            content = str(cell.get("content", "")).replace("<", "&lt;").replace(">", "&gt;")
+            html_body.append(f"<h2>Cell {idx + 1} — {cell_type}</h2>")
+            if cell_type == "markdown":
+                html_body.append(f"<div>{content}</div>")
+            else:
+                html_body.append(f"<pre><code>{content}</code></pre>")
+            if cell.get("output") is not None:
+                out = json.dumps(cell["output"], indent=2, default=str).replace("<", "&lt;")
+                html_body.append(f"<details><summary>Output</summary><pre>{out}</pre></details>")
+        html = (
+            "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+            f"<title>{notebook.title}</title></head><body>" + "".join(html_body) + "</body></html>"
+        )
+        return {
+            "format": "html",
+            "filename": f"{notebook.title.replace(' ', '_')}.html",
+            "content": html,
+        }
 
     return {
-        "status": "success",
-        "notebook_id": notebook_id,
-        "format": format,
-        "data": {
-            "title": notebook.title,
-            "description": getattr(notebook, "description", None),
-            "cells": cells,
-            "tags": tags,
-        },
+        "format": "json",
+        "filename": f"{notebook.title.replace(' ', '_')}.json",
+        "data": payload,
     }
+
+
+def _coerce_notebook_cells(raw) -> list[dict]:
+    """Normalize a HuntNotebook.content value into a list of cell dicts.
+
+    The JSON Postgres column may come back as a native list (asyncpg),
+    a JSON-encoded string (legacy write path), or None (freshly created).
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return raw
+    if isinstance(raw, dict):
+        return [raw]
+    if isinstance(raw, str):
+        parsed = safe_json_loads(raw, [])
+        return parsed if isinstance(parsed, list) else []
+    return []
 
 
 # ============================================================================

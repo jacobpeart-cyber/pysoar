@@ -8,9 +8,9 @@ continuous monitoring, and audit readiness checking.
 from typing import Optional
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Body
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Body, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, and_, func
 
 from src.api.deps import CurrentUser, DatabaseSession, get_current_active_user
 from src.core.database import get_db
@@ -169,6 +169,191 @@ async def detect_suspicious_activity(
 # ============================================================================
 
 
+@router.post("/evidence/upload", response_model=None)
+async def upload_evidence_file(
+    file: UploadFile = File(...),
+    control_id: str = Form(...),
+    title: str = Form(...),
+    evidence_type: str = Form("document"),
+    description: str = Form(""),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
+):
+    """Upload a real evidence artifact for a specific compliance control.
+
+    Stores the file under ``uploads/evidence/<org>/<control_id>/<uuid>_<filename>``,
+    computes a SHA-512 hash, and creates a ``ComplianceEvidence`` row tied to
+    the referenced ``ComplianceControl``. Raises 404 if the control doesn't
+    exist for the caller's org so users can't upload evidence into a
+    non-existent or cross-tenant control.
+    """
+    import hashlib
+    import os
+    import uuid as _uuid
+
+    from src.compliance.models import ComplianceControl, ComplianceEvidence
+
+    org_id = getattr(current_user, "organization_id", None)
+
+    # Verify control exists and belongs to the caller's org
+    ctrl_result = await db.execute(
+        select(ComplianceControl).where(
+            and_(
+                ComplianceControl.id == control_id,
+                ComplianceControl.organization_id == org_id,
+            )
+        )
+    )
+    control = ctrl_result.scalar_one_or_none()
+    if not control:
+        raise HTTPException(
+            status_code=404,
+            detail="Compliance control not found for this organization",
+        )
+
+    # Persist file to disk under an org + control namespaced directory
+    upload_root = os.getenv("EVIDENCE_UPLOAD_DIR", "uploads/evidence")
+    target_dir = os.path.join(upload_root, str(org_id or "unknown"), control_id)
+    os.makedirs(target_dir, exist_ok=True)
+
+    safe_name = (file.filename or "evidence").replace("/", "_").replace("\\", "_")
+    unique = f"{_uuid.uuid4().hex}_{safe_name}"
+    dest_path = os.path.join(target_dir, unique)
+
+    hasher = hashlib.sha512()
+    total_bytes = 0
+    with open(dest_path, "wb") as f:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            total_bytes += len(chunk)
+            hasher.update(chunk)
+            f.write(chunk)
+
+    evidence = ComplianceEvidence(
+        control_id_ref=control_id,
+        evidence_type=evidence_type,
+        title=title,
+        description=description or None,
+        file_path=dest_path,
+        file_hash=hasher.hexdigest(),
+        collected_at=datetime.now(timezone.utc),
+        collected_by=getattr(current_user, "full_name", None) or getattr(current_user, "email", "unknown"),
+        is_automated=False,
+        is_valid=True,
+        review_status="pending",
+        tags=[],
+        organization_id=org_id,
+    )
+    db.add(evidence)
+    await db.flush()
+    await db.refresh(evidence)
+
+    return {
+        "status": "uploaded",
+        "evidence_id": evidence.id,
+        "control_id": control_id,
+        "file_path": dest_path,
+        "file_hash": evidence.file_hash,
+        "file_size_bytes": total_bytes,
+        "title": title,
+        "uploaded_at": evidence.collected_at.isoformat(),
+    }
+
+
+@router.get("/evidence/{evidence_id}/download")
+async def download_evidence_file(
+    evidence_id: str,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
+):
+    """Stream a previously uploaded evidence artifact back to the caller.
+
+    Tenant-scoped via organization_id — a user in org A cannot download
+    evidence from org B even by ID.
+    """
+    import os
+    from fastapi.responses import FileResponse
+    from src.compliance.models import ComplianceEvidence
+
+    org_id = getattr(current_user, "organization_id", None)
+    result = await db.execute(
+        select(ComplianceEvidence).where(
+            and_(
+                ComplianceEvidence.id == evidence_id,
+                ComplianceEvidence.organization_id == org_id,
+            )
+        )
+    )
+    evidence = result.scalar_one_or_none()
+    if not evidence:
+        raise HTTPException(status_code=404, detail="Evidence not found")
+    if not evidence.file_path or not os.path.exists(evidence.file_path):
+        raise HTTPException(
+            status_code=404,
+            detail="Evidence file missing on disk",
+        )
+    original_name = os.path.basename(evidence.file_path).split("_", 1)[-1] or "evidence"
+    return FileResponse(
+        path=evidence.file_path,
+        media_type="application/octet-stream",
+        filename=original_name,
+    )
+
+
+@router.get("/reports/monthly")
+async def download_monthly_report(
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
+):
+    """Generate and stream a monthly FedRAMP ConMon report as a JSON download.
+
+    Runs the real ``ContinuousMonitor.generate_conmon_report()`` and wraps
+    it in a FedRAMP-shaped monthly report envelope: report metadata, the
+    30-day window, the real control check summary, and POA&M progress.
+    Returns the document as a StreamingResponse so the browser saves it
+    as a dated filename instead of rendering JSON in a tab.
+    """
+    import io
+    import json as _json
+    from fastapi.responses import StreamingResponse
+
+    try:
+        monitor = ContinuousMonitor(db, getattr(current_user, "organization_id", None))
+        conmon = await monitor.generate_conmon_report()
+    except Exception as exc:
+        logger.error(f"Monthly report generation failed: {exc}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to generate monthly report",
+        )
+
+    now = datetime.now(timezone.utc)
+    window_start = now - timedelta(days=30)
+
+    document = {
+        "report_type": "FedRAMP Continuous Monitoring Monthly Report",
+        "generated_at": now.isoformat(),
+        "reporting_period": {
+            "start": window_start.isoformat(),
+            "end": now.isoformat(),
+            "days": 30,
+        },
+        "organization_id": getattr(current_user, "organization_id", None),
+        "conmon_report": conmon.model_dump() if hasattr(conmon, "model_dump") else conmon,
+    }
+
+    content = _json.dumps(document, indent=2, default=str)
+    filename = f"pysoar_conmon_monthly_{now.strftime('%Y-%m')}.json"
+
+    return StreamingResponse(
+        io.BytesIO(content.encode("utf-8")),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.post("/evidence/collect", response_model=None)
 async def collect_evidence(
     request: dict = Body(...),
@@ -228,25 +413,180 @@ async def verify_evidence_integrity(
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
 
 
+@router.delete("/evidence/{evidence_id}", status_code=204)
+async def delete_evidence_item(
+    evidence_id: str,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
+):
+    """Delete a ComplianceEvidence row.
+
+    The frontend's "Delete" button hit this route and silently 404'd
+    because it wasn't declared. Now validates ownership (org-scoped),
+    soft-deletes by setting ``is_valid=False``, and writes an audit
+    trail entry so an assessor can see the removal.
+    """
+    from src.compliance.models import ComplianceEvidence
+
+    org_id = getattr(current_user, "organization_id", None)
+    result = await db.execute(
+        select(ComplianceEvidence).where(
+            and_(
+                ComplianceEvidence.id == evidence_id,
+                ComplianceEvidence.organization_id == org_id,
+            )
+        )
+    )
+    evidence = result.scalar_one_or_none()
+    if evidence is None:
+        raise HTTPException(status_code=404, detail="Evidence not found")
+
+    evidence.is_valid = False
+    evidence.review_status = "rejected"
+    evidence.reviewed_by = str(getattr(current_user, "id", ""))
+    evidence.reviewed_at = datetime.now(timezone.utc)
+    await db.flush()
+
+    # Record the deletion in the audit trail
+    try:
+        audit_logger = AuditLogger(db, org_id)
+        await audit_logger.log_event(
+            event_type="change",
+            action="evidence.soft_delete",
+            actor_type="user",
+            actor_id=str(getattr(current_user, "id", "")),
+            resource_type="ComplianceEvidence",
+            resource_id=evidence_id,
+            description=f"Evidence {evidence_id} soft-deleted",
+            result="success",
+            risk_level="medium",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"Audit trail for evidence delete failed: {exc}")
+
+    return None
+
+
+@router.post("/evidence/{evidence_id}/approve", status_code=200)
+async def approve_evidence_item(
+    evidence_id: str,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
+):
+    """Mark a ComplianceEvidence row as approved.
+
+    Frontend "Approve" button hit this route and 404'd the same way
+    the delete button did. Now sets review_status=approved, records
+    the approver + timestamp, and writes an audit trail entry.
+    """
+    from src.compliance.models import ComplianceEvidence
+
+    org_id = getattr(current_user, "organization_id", None)
+    result = await db.execute(
+        select(ComplianceEvidence).where(
+            and_(
+                ComplianceEvidence.id == evidence_id,
+                ComplianceEvidence.organization_id == org_id,
+            )
+        )
+    )
+    evidence = result.scalar_one_or_none()
+    if evidence is None:
+        raise HTTPException(status_code=404, detail="Evidence not found")
+
+    evidence.review_status = "approved"
+    evidence.reviewed_by = str(getattr(current_user, "id", ""))
+    evidence.reviewed_at = datetime.now(timezone.utc)
+    await db.flush()
+    await db.refresh(evidence)
+
+    try:
+        audit_logger = AuditLogger(db, org_id)
+        await audit_logger.log_event(
+            event_type="policy",
+            action="evidence.approve",
+            actor_type="user",
+            actor_id=str(getattr(current_user, "id", "")),
+            resource_type="ComplianceEvidence",
+            resource_id=evidence_id,
+            description=f"Evidence {evidence_id} approved",
+            result="success",
+            risk_level="low",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"Audit trail for evidence approve failed: {exc}")
+
+    return {
+        "id": evidence.id,
+        "status": evidence.review_status,
+        "reviewed_by": evidence.reviewed_by,
+        "reviewed_at": evidence.reviewed_at.isoformat() if evidence.reviewed_at else None,
+    }
+
+
 @router.get("/evidence/list", response_model=list[dict])
 async def list_evidence_items(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
     evidence_type: Optional[str] = None,
+    status_filter: Optional[str] = Query(None, alias="status"),
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=500),
 ):
-    """List evidence items"""
+    """List evidence items from the ComplianceEvidence repository.
+
+    Returns data in the shape the frontend expects: id, title, type,
+    control, source, collected, status, contentUrl.
+    """
     try:
-        query = select(AutomatedEvidenceRule).where(
-            AutomatedEvidenceRule.organization_id == getattr(current_user, "organization_id", None)
+        from src.compliance.models import ComplianceEvidence, ComplianceControl
+
+        org_id = getattr(current_user, "organization_id", None)
+        query = select(ComplianceEvidence).where(
+            ComplianceEvidence.organization_id == org_id
         )
-        if evidence_type:
-            query = query.where(AutomatedEvidenceRule.rule_type == evidence_type)
-        query = query.offset(skip).limit(limit)
+        if evidence_type and evidence_type != "all":
+            query = query.where(ComplianceEvidence.evidence_type == evidence_type)
+        if status_filter and status_filter != "all":
+            query = query.where(ComplianceEvidence.review_status == status_filter)
+        query = query.order_by(ComplianceEvidence.collected_at.desc()).offset(skip).limit(limit)
+
         result = await db.execute(query)
-        items = result.scalars().all()
-        return list(items)
+        evidence_rows = list(result.scalars().all())
+
+        # Resolve control_id labels in one batch lookup
+        control_ids = {e.control_id_ref for e in evidence_rows if e.control_id_ref}
+        control_map: dict[str, str] = {}
+        if control_ids:
+            ctrl_result = await db.execute(
+                select(ComplianceControl).where(ComplianceControl.id.in_(control_ids))
+            )
+            control_map = {c.id: c.control_id for c in ctrl_result.scalars().all()}
+
+        type_alias = {
+            "configuration": "config",
+            "scan_result": "scan",
+            "automated_test": "scan",
+            "policy": "document",
+            "procedure": "document",
+            "interview_notes": "document",
+            "training_record": "document",
+        }
+
+        items: list[dict] = []
+        for e in evidence_rows:
+            items.append({
+                "id": e.id,
+                "title": e.title,
+                "type": type_alias.get(e.evidence_type, e.evidence_type or "document"),
+                "control": control_map.get(e.control_id_ref, e.control_id_ref or "—"),
+                "source": e.source_system or "manual",
+                "collected": e.collected_at.isoformat() if e.collected_at else None,
+                "status": e.review_status or "pending",
+                "contentUrl": e.file_path,
+                "created_at": e.created_at.isoformat() if e.created_at else None,
+            })
+        return items
     except Exception as e:
         logger.error(f"Error listing evidence: {str(e)}")
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
@@ -272,7 +612,7 @@ async def create_evidence_package(
             framework_id=request.framework_id,
             assessor=request.assessor,
             due_date=request.due_date,
-            metadata=request.metadata or {},
+            extra_metadata=request.metadata or {},
             organization_id=getattr(current_user, "organization_id", None),
         )
         db.add(package)
@@ -412,6 +752,21 @@ async def run_conmon_cycle(
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
 
 
+@router.post("/conmon/run", response_model=None)
+async def run_conmon_alias(
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
+):
+    """Alias for /conmon/run-cycle used by the frontend ConMon button."""
+    try:
+        monitor = ContinuousMonitor(db, getattr(current_user, "organization_id", None))
+        report = await monitor.generate_conmon_report()
+        return {"ok": True, "report": report}
+    except Exception as e:
+        logger.error(f"Error running ConMon cycle (alias): {str(e)}")
+        raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
+
+
 @router.get("/conmon/report", response_model=ConMonReportResponse)
 async def get_conmon_report(
     db: DatabaseSession = None,
@@ -432,15 +787,39 @@ async def get_conmon_status(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
 ):
-    """Get ConMon status"""
+    """Get ConMon status per control check.
+
+    Returns an ARRAY of ConMonStatus rows (one per control check) so the
+    frontend can render them in a grid. Each row has {id, name, active,
+    lastRun, status, compliance_percentage, details}.
+    """
     try:
         monitor = ContinuousMonitor(db, getattr(current_user, "organization_id", None))
-        cycle_results = await monitor.run_conmon_cycle()
-        return {
-            "status": "compliant",
-            "checks": cycle_results,
-            "last_run": datetime.now(timezone.utc).isoformat(),
+        cycle = await monitor.run_conmon_cycle()
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        label_map = {
+            "vulnerability_scanning": "Vulnerability Scanning (SI-2)",
+            "configuration_baseline": "Configuration Baseline (CM-3)",
+            "incident_reporting": "Incident Reporting (IR-4)",
+            "poam_progress": "POA&M Progress",
         }
+
+        rows: list[dict] = []
+        for key, label in label_map.items():
+            check = cycle.get(key) or {}
+            check_status = check.get("status", "unknown")
+            is_active = check_status in ("compliant", "on_track")
+            rows.append({
+                "id": key,
+                "name": label,
+                "active": is_active,
+                "status": check_status,
+                "lastRun": now_iso,
+                "compliance_percentage": check.get("compliance_percentage", 0),
+                "details": check,
+            })
+        return rows
     except Exception as e:
         logger.error(f"Error getting ConMon status: {str(e)}")
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
@@ -473,10 +852,64 @@ async def check_evidence_coverage(
     framework_id: str = Query(...),
     current_user: CurrentUser = None,
 ):
-    """Check evidence coverage for framework"""
+    """Check evidence coverage for framework.
+
+    Each control that came back without sufficient evidence fires
+    ``automation.on_fedramp_evidence_gap``, which creates a POAM and
+    runs the full compliance automation chain. Previously the
+    coverage check returned a gap list to the UI but those gaps
+    never produced any POAMs or alerts, so an assessor preparing a
+    FedRAMP package would see "covered: no" on a control and nothing
+    actionable would happen downstream.
+
+    Capped at 25 gap events per call so a completely uncovered
+    framework (191 controls for FedRAMP Moderate) can't fan out 191
+    alerts in one API hit.
+    """
+    org_id = getattr(current_user, "organization_id", None)
     try:
-        checker = AuditReadinessChecker(db, getattr(current_user, "organization_id", None))
+        checker = AuditReadinessChecker(db, org_id)
         result = await checker.check_evidence_coverage(framework_id)
+
+        # Fan out the gaps to the compliance automation pipeline
+        try:
+            gaps = []
+            if isinstance(result, dict):
+                gaps = result.get("uncovered_controls") or result.get("gaps") or []
+            elif hasattr(result, "uncovered_controls"):
+                gaps = result.uncovered_controls or []
+            elif hasattr(result, "gaps"):
+                gaps = result.gaps or []
+
+            if gaps:
+                from src.services.automation import AutomationService
+                automation = AutomationService(db)
+                fired = 0
+                for gap in gaps[:25]:
+                    # gap may be a dict or a scalar control_id string
+                    if isinstance(gap, dict):
+                        control_id = gap.get("control_id") or gap.get("id") or "unknown"
+                        control_title = gap.get("title") or gap.get("control_title") or f"Uncovered control {control_id}"
+                    else:
+                        control_id = str(gap)
+                        control_title = f"Uncovered control {control_id}"
+                    try:
+                        await automation.on_fedramp_evidence_gap(
+                            control_id=control_id,
+                            control_title=control_title,
+                            organization_id=org_id,
+                        )
+                        fired += 1
+                    except Exception as inner_exc:  # noqa: BLE001
+                        logger.warning(
+                            f"on_fedramp_evidence_gap failed for {control_id}: {inner_exc}"
+                        )
+                logger.info(
+                    f"Fired {fired} evidence-gap events for framework={framework_id}"
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Evidence gap fan-out failed: {exc}")
+
         return result
     except Exception as e:
         logger.error(f"Error checking evidence coverage: {str(e)}")
@@ -578,41 +1011,110 @@ async def get_audit_dashboard_stats(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
 ):
-    """Get audit and evidence dashboard statistics"""
+    """Get audit and evidence dashboard statistics.
+
+    Four fields used to be hardcoded (event_types_breakdown = {},
+    risk_distribution = {}, avg_evidence_package_compliance = 92.0,
+    suspicious_activities_detected = 0). Now they are computed from
+    real AuditTrail + ComplianceEvidence data.
+    """
+    from src.compliance.models import ComplianceEvidence
+
+    org_id = getattr(current_user, "organization_id", None)
+
     try:
         # Count audit entries
         audit_query = select(AuditTrail).where(
-            AuditTrail.organization_id == getattr(current_user, "organization_id", None)
+            AuditTrail.organization_id == org_id
         )
         audits = await db.scalars(audit_query)
         audit_list = list(audits)
 
         # Count packages
         pkg_query = select(EvidencePackage).where(
-            EvidencePackage.organization_id == getattr(current_user, "organization_id", None)
+            EvidencePackage.organization_id == org_id
         )
         packages = await db.scalars(pkg_query)
         pkg_list = list(packages)
 
-        # Calculate stats
-        this_month = datetime.now(timezone.utc).replace(day=1)
+        this_month = datetime.now(timezone.utc).replace(
+            day=1, hour=0, minute=0, second=0, microsecond=0
+        )
         month_audits = len(
-            [a for a in audit_list if a.created_at >= this_month]
+            [a for a in audit_list if a.created_at and a.created_at >= this_month]
         )
         pkg_in_progress = len([p for p in pkg_list if p.status == "collecting"])
         pkg_submitted = len([p for p in pkg_list if p.status == "submitted"])
 
+        # --- Real event_types_breakdown ---
+        event_types_breakdown: dict[str, int] = {}
+        for a in audit_list:
+            key = a.event_type or "unknown"
+            event_types_breakdown[key] = event_types_breakdown.get(key, 0) + 1
+
+        # --- Real risk_distribution ---
+        risk_distribution: dict[str, int] = {}
+        for a in audit_list:
+            key = (a.risk_level or "unknown").lower()
+            risk_distribution[key] = risk_distribution.get(key, 0) + 1
+
+        # --- Real avg_evidence_package_compliance ---
+        # For each package, compute the share of its referenced evidence
+        # items that are in approved status. Average across packages.
+        avg_pkg_compliance = 0.0
+        if pkg_list:
+            pkg_scores: list[float] = []
+            for p in pkg_list:
+                items = p.evidence_items or []
+                if not items:
+                    continue
+                evidence_ids = [str(i) for i in items if i]
+                if not evidence_ids:
+                    continue
+                ev_result = await db.execute(
+                    select(ComplianceEvidence).where(
+                        and_(
+                            ComplianceEvidence.id.in_(evidence_ids),
+                            ComplianceEvidence.organization_id == org_id,
+                        )
+                    )
+                )
+                ev_rows = list(ev_result.scalars().all())
+                if not ev_rows:
+                    continue
+                approved = sum(1 for e in ev_rows if e.review_status == "approved")
+                pkg_scores.append((approved / len(ev_rows)) * 100.0)
+            if pkg_scores:
+                avg_pkg_compliance = round(sum(pkg_scores) / len(pkg_scores), 1)
+
+        # --- Real suspicious_activities_detected ---
+        # Count distinct actors who had the AuditLogger flag them in the
+        # last 30 days. We reuse the engine's detection rather than
+        # inventing a new heuristic here.
+        suspicious_count = 0
+        try:
+            audit_logger = AuditLogger(db, org_id)
+            # Take distinct actors who have written audit events and
+            # check each one. Cap at 25 actors to bound the work.
+            actor_ids = list({a.actor_id for a in audit_list if a.actor_id})[:25]
+            for actor_id in actor_ids:
+                activities = await audit_logger.detect_suspicious_activity(actor_id)
+                if activities:
+                    suspicious_count += 1
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"suspicious activity detection failed: {exc}")
+
         return AuditDashboardStats(
-            organization_id=getattr(current_user, "organization_id", None),
+            organization_id=org_id or "",
             total_audit_entries=len(audit_list),
             audit_entries_this_month=month_audits,
-            event_types_breakdown={},
-            risk_distribution={},
+            event_types_breakdown=event_types_breakdown,
+            risk_distribution=risk_distribution,
             total_evidence_packages=len(pkg_list),
             evidence_packages_in_progress=pkg_in_progress,
             evidence_packages_submitted=pkg_submitted,
-            avg_evidence_package_compliance=92.0,
-            suspicious_activities_detected=0,
+            avg_evidence_package_compliance=avg_pkg_compliance,
+            suspicious_activities_detected=suspicious_count,
             critical_audit_events=len([a for a in audit_list if a.risk_level == "critical"]),
         )
     except Exception as e:

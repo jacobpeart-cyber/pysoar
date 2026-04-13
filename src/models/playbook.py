@@ -96,6 +96,13 @@ class PlaybookExecution(BaseModel):
 
     __tablename__ = "playbook_executions"
 
+    organization_id: Mapped[Optional[str]] = mapped_column(
+        String(36),
+        ForeignKey("organizations.id"),
+        nullable=True,
+        index=True,
+    )
+
     # Foreign keys
     playbook_id: Mapped[str] = mapped_column(
         String(36),

@@ -228,7 +228,7 @@ class MessageEngine:
             attachments=json.dumps(attachments or []),
             mentioned_users=json.dumps(mentioned_users or []),
             reactions=json.dumps({}),
-            metadata=json.dumps(metadata or {}),
+            extra_metadata=json.dumps(metadata or {}),
         )
         self.db.add(message)
         await self.db.flush()

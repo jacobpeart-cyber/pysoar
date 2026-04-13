@@ -6,11 +6,13 @@ access anomaly analysis, and privileged access management.
 """
 
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, status, BackgroundTasks
-from sqlalchemy import func, select
+import json
+
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DatabaseSession
@@ -444,18 +446,202 @@ async def respond_to_threat(
 @router.post("/threats/scan")
 async def run_threat_scan(
     current_user: CurrentUser = None,
-    background_tasks: BackgroundTasks = None,
-    organization_id: Optional[str] = None,
+    db: DatabaseSession = None,
 ):
-    """Run comprehensive threat detection scan"""
-    org_id = organization_id or getattr(current_user, 'organization_id', None)
-    logger.info(f"Initiating threat scan for org={org_id}")
+    """Run identity threat detection scan synchronously.
 
+    Previously returned a fake scan_id and claimed work was happening
+    in the background — nothing actually ran. Now scans every
+    IdentityProfile in the caller's organization for three real
+    risk signals and creates IdentityThreat rows for each hit:
+
+      - **dormant_admin**: is_dormant == True AND role contains "admin"
+      - **mfa_missing_privileged**: mfa_enabled == False AND
+        role contains "admin" or "root" or is_privileged == True
+      - **stale_credential**: last_password_change older than 180 days
+
+    Already-open threats of the same type on the same identity are
+    skipped so re-running the scan is idempotent within its cooldown
+    window. The dropped ``organization_id`` query parameter was a
+    cross-tenant vector — we now always use current_user.organization_id.
+    """
+    from src.itdr.models import ThreatStatus, PrivilegeLevel
+
+    org_id = getattr(current_user, "organization_id", None)
+    logger.info(f"Running identity threat scan for org={org_id}")
+
+    now = datetime.now(timezone.utc)
+    cutoff_180d = now - timedelta(days=180)
+
+    id_query = select(IdentityProfile)
+    if org_id:
+        id_query = id_query.where(IdentityProfile.organization_id == org_id)
+    identities = list((await db.execute(id_query)).scalars().all())
+
+    # Preload open threats so we can dedupe
+    existing_q = select(IdentityThreat).where(
+        IdentityThreat.status.in_([
+            ThreatStatus.DETECTED.value,
+            ThreatStatus.INVESTIGATING.value,
+        ])
+    )
+    if org_id:
+        existing_q = existing_q.where(IdentityThreat.organization_id == org_id)
+    existing_rows = list((await db.execute(existing_q)).scalars().all())
+    existing_by_identity: dict[str, set[str]] = {}
+    for t in existing_rows:
+        existing_by_identity.setdefault(t.identity_id, set()).add(t.threat_type)
+
+    def _create_threat(
+        identity_id: str,
+        threat_type: str,
+        severity: str,
+        evidence: dict,
+    ) -> bool:
+        if threat_type in existing_by_identity.get(identity_id, set()):
+            return False
+        threat = IdentityThreat(
+            organization_id=org_id,
+            identity_id=identity_id,
+            threat_type=threat_type,
+            severity=severity,
+            confidence_score=0.9,
+            evidence=evidence,
+            status=ThreatStatus.DETECTED.value,
+        )
+        db.add(threat)
+        return True
+
+    def _parse_iso(ts: Optional[str]) -> Optional[datetime]:
+        """IdentityProfile stores last_password_change as an ISO
+        string rather than a DateTime column, so normalize it here."""
+        if not ts:
+            return None
+        try:
+            dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            return None
+
+    scanned = len(identities)
+    created = 0
+    # Collect (identity, threat_type, severity) tuples so we can fire
+    # automation.on_itdr_threat for each one AFTER the flush — that
+    # keeps the event fan-out outside the tight loop and ensures the
+    # threat row is committed before downstream handlers read it.
+    fired_threats: list[tuple[str, str, str, str]] = []
+    for identity in identities:
+        # role_assignments is a JSON list on the model, not a scalar role.
+        role_list = getattr(identity, "role_assignments", None) or []
+        if isinstance(role_list, str):
+            try:
+                role_list = json.loads(role_list)
+            except Exception:  # noqa: BLE001
+                role_list = []
+        roles_lower = [str(r).lower() for r in role_list] if isinstance(role_list, list) else []
+        has_admin_role = any(("admin" in r or "root" in r) for r in roles_lower)
+
+        privilege_level = (getattr(identity, "privilege_level", "") or "").lower()
+        is_privileged = has_admin_role or privilege_level in (
+            PrivilegeLevel.ADMIN.value if hasattr(PrivilegeLevel, "ADMIN") else "admin",
+            "privileged",
+            "root",
+            "super",
+        )
+
+        # 1) dormant_admin
+        if getattr(identity, "is_dormant", False) and has_admin_role:
+            if _create_threat(
+                identity.id,
+                "dormant_admin",
+                "high",
+                {
+                    "username": identity.username,
+                    "roles": role_list,
+                    "reason": "dormant account retains admin privileges",
+                },
+            ):
+                created += 1
+                fired_threats.append(
+                    ("dormant_admin", identity.username, "high",
+                     "Dormant privileged account retains admin privileges")
+                )
+
+        # 2) mfa_missing_privileged
+        if is_privileged and not getattr(identity, "mfa_enabled", False):
+            if _create_threat(
+                identity.id,
+                "mfa_missing_privileged",
+                "critical",
+                {
+                    "username": identity.username,
+                    "privilege_level": privilege_level,
+                    "reason": "privileged identity has no MFA enrolled",
+                },
+            ):
+                created += 1
+                fired_threats.append(
+                    ("mfa_missing_privileged", identity.username, "critical",
+                     "Privileged identity has no MFA enrolled")
+                )
+
+        # 3) stale_credential (password > 180 days old)
+        last_pw = _parse_iso(getattr(identity, "last_password_change", None))
+        if last_pw is not None and last_pw < cutoff_180d:
+            age_days = (now - last_pw).days
+            if _create_threat(
+                identity.id,
+                "stale_credential",
+                "medium",
+                {
+                    "username": identity.username,
+                    "last_password_change": last_pw.isoformat(),
+                    "age_days": age_days,
+                },
+            ):
+                created += 1
+                fired_threats.append(
+                    ("stale_credential", identity.username, "medium",
+                     f"Password last rotated {age_days} days ago")
+                )
+
+    await db.flush()
+
+    # Fan out to the cross-module automation pipeline. Each threat
+    # that was actually created (not deduped) fires on_itdr_threat,
+    # which creates an Alert and runs the full on_alert_created chain
+    # (IOC match -> auto-incident -> war room -> remediation policy
+    # eval -> agent containment if affected_systems is set). Failures
+    # are logged but don't roll back the scan — we'd rather have the
+    # threat rows persisted than lose the whole scan on an
+    # automation hiccup.
+    try:
+        automation = AutomationService(db)
+        for threat_type, username, severity, details in fired_threats:
+            try:
+                await automation.on_itdr_threat(
+                    threat_type=threat_type,
+                    identity=username,
+                    risk_level=severity,
+                    details=details,
+                    organization_id=org_id,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    f"on_itdr_threat failed for {username}/{threat_type}: {exc}"
+                )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"AutomationService setup failed during threat scan: {exc}")
+
+    logger.info(
+        f"Identity threat scan complete: scanned={scanned} created={created}"
+    )
     return {
-        "status": "initiated",
-        "scan_id": f"scan_{datetime.now(timezone.utc).timestamp()}",
-        "message": "Threat detection scan initiated in background",
-        "organization_id": organization_id or getattr(current_user, "organization_id", None),
+        "status": "completed",
+        "organization_id": org_id,
+        "identities_scanned": scanned,
+        "threats_created": created,
+        "completed_at": now.isoformat(),
     }
 
 
@@ -547,14 +733,112 @@ async def get_exposure(
 async def check_credential_exposure(
     identity_id: str,
     current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
-    """Check identity credentials for exposure"""
-    logger.info(f"Checking credential exposure for identity {identity_id}")
+    """Check an identity's credentials against known exposure sources.
+
+    Queries the ``darkweb_credential_leaks`` table for any leaks that
+    match this identity's email or username, and creates a new
+    ``CredentialExposure`` row for each unique hit that isn't already
+    tracked for this identity. Returns the number of new exposures
+    found plus the existing ones so the operator can act immediately.
+
+    Previous version just returned ``{"status": "check_initiated"}``
+    and did nothing — the button was theater.
+    """
+    from src.darkweb.models import CredentialLeak
+
+    identity = await get_identity_or_404(db, identity_id)
+    org_id = getattr(current_user, "organization_id", None)
+
+    # Match leaks by email OR username (case-insensitive)
+    email = (identity.email or "").lower()
+    username = (identity.username or "").lower()
+
+    leak_query = select(CredentialLeak).where(
+        CredentialLeak.organization_id == org_id
+    )
+    if email or username:
+        conditions = []
+        if email:
+            conditions.append(func.lower(CredentialLeak.email) == email)
+        if username:
+            conditions.append(func.lower(CredentialLeak.username) == username)
+        leak_query = leak_query.where(or_(*conditions))
+    else:
+        leak_query = leak_query.where(CredentialLeak.email.is_(None))  # no-op
+
+    leak_rows = list((await db.execute(leak_query)).scalars().all())
+
+    # Dedupe against existing CredentialExposure rows for this identity
+    existing_q = select(CredentialExposure).where(
+        and_(
+            CredentialExposure.organization_id == org_id,
+            CredentialExposure.identity_id == identity_id,
+        )
+    )
+    existing = list((await db.execute(existing_q)).scalars().all())
+    existing_sources = {
+        f"{e.exposure_source}:{e.breach_name or ''}" for e in existing
+    }
+
+    new_exposures: list[CredentialExposure] = []
+    for leak in leak_rows:
+        key = f"darkweb:{leak.breach_source or ''}"
+        if key in existing_sources:
+            continue
+        exposure = CredentialExposure(
+            organization_id=org_id,
+            identity_id=identity_id,
+            exposure_source="darkweb",
+            credential_type=leak.password_type or "password",
+            exposure_date=leak.breach_date,
+            discovery_date=datetime.now(timezone.utc).isoformat(),
+            breach_name=leak.breach_source,
+            is_remediated=leak.is_remediated,
+        )
+        db.add(exposure)
+        new_exposures.append(exposure)
+        existing_sources.add(key)
+
+    await db.flush()
+
+    logger.info(
+        f"Credential exposure check for {identity_id}: "
+        f"{len(leak_rows)} leaks matched, {len(new_exposures)} new exposures created"
+    )
+
+    # Cross-module loop: NEW credential exposures are high-severity
+    # events that should kick the full automation chain. Use the
+    # darkweb handler because that's where the evidence lives — it
+    # creates an Alert with source=darkweb and fires on_alert_created
+    # (IOC match / auto-incident / remediation policy eval).
+    if new_exposures:
+        try:
+            automation = AutomationService(db)
+            sources = sorted({e.breach_name or "unknown" for e in new_exposures})
+            await automation.on_darkweb_finding(
+                finding_type="exposed_credentials",
+                description=(
+                    f"{len(new_exposures)} new credential exposure(s) found for "
+                    f"{identity.email or identity.username} in breaches: "
+                    f"{', '.join(sources)}"
+                ),
+                severity="high",
+                organization_id=org_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"on_darkweb_finding failed for new credential exposures: {exc}"
+            )
 
     return {
-        "status": "check_initiated",
+        "status": "completed",
         "identity_id": identity_id,
-        "sources_checked": ["dark_web", "paste_sites", "breach_databases"],
+        "leaks_matched": len(leak_rows),
+        "new_exposures_created": len(new_exposures),
+        "total_exposures_now": len(existing) + len(new_exposures),
+        "sources_checked": ["darkweb_credential_leaks"],
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -563,16 +847,65 @@ async def check_credential_exposure(
 async def remediate_exposures(
     data: CredentialRemediationRequest,
     current_user: CurrentUser = None,
+    db: DatabaseSession = None,
 ):
-    """Remediate exposed credentials"""
-    logger.info(f"Remediating {len(data.exposure_ids)} credential exposures")
+    """Mark credential exposures as remediated and record the action.
+
+    Previously returned ``remediation_initiated`` without touching the
+    database — the exposure rows stayed unremediated forever. Now
+    updates each CredentialExposure row with ``is_remediated=True``,
+    the remediation_action string, and a remediation_date stamp.
+    Only exposures belonging to the caller's org are touched, so one
+    tenant can't remediate another tenant's exposures.
+    """
+    org_id = getattr(current_user, "organization_id", None)
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    updated_count = 0
+    skipped_count = 0
+
+    if not data.exposure_ids:
+        return {
+            "status": "no_exposures_provided",
+            "updated": 0,
+            "skipped": 0,
+        }
+
+    query = select(CredentialExposure).where(
+        and_(
+            CredentialExposure.id.in_(data.exposure_ids),
+            CredentialExposure.organization_id == org_id,
+        )
+    )
+    exposures = list((await db.execute(query)).scalars().all())
+
+    for exposure in exposures:
+        if exposure.is_remediated:
+            skipped_count += 1
+            continue
+        exposure.is_remediated = True
+        exposure.remediation_date = now_iso
+        exposure.remediation_action = data.remediation_type
+        updated_count += 1
+
+    # Any IDs the caller supplied that didn't belong to this org or
+    # didn't exist get counted as skipped so the operator can see they
+    # were ignored rather than silently succeeded.
+    missing = set(data.exposure_ids) - {e.id for e in exposures}
+    skipped_count += len(missing)
+
+    await db.flush()
+
+    logger.info(
+        f"Credential remediation: updated={updated_count} skipped={skipped_count}"
+    )
 
     return {
-        "status": "remediation_initiated",
-        "exposure_count": len(data.exposure_ids),
+        "status": "completed",
+        "updated": updated_count,
+        "skipped": skipped_count,
         "remediation_type": data.remediation_type,
-        "actions_pending": len(data.exposure_ids),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "timestamp": now_iso,
     }
 
 
@@ -941,7 +1274,23 @@ async def get_risk_overview(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Get ITDR risk overview"""
+    """Get ITDR risk overview with real trend + compliance data.
+
+    Previous version returned hardcoded ``risk_trends: {"trend":
+    "stable", "30day_change": "-5%"}`` and
+    ``compliance_status: {pci_dss: compliant, sox: compliant,
+    hipaa: compliant}`` regardless of actual posture. A compliance
+    officer seeing "everything compliant" on a tenant that hasn't
+    even loaded a framework would have caught the lie immediately.
+
+    Now:
+      - ``risk_trends.30day_change`` compares threat count in the
+        last 30 days vs the prior 30 days and reports real delta.
+      - ``compliance_status`` queries ComplianceFramework rows scoped
+        to this org and reports each framework's real ``status``
+        column value. If no framework is loaded, the key is absent
+        rather than falsely claiming compliant.
+    """
     org_id = getattr(current_user, "organization_id", None)
 
     threat_base = select(func.count()).select_from(IdentityThreat)
@@ -964,19 +1313,71 @@ async def get_risk_overview(
     if high_count > 0:
         critical_findings.append(f"{high_count} high-severity threats")
 
+    # --- Real 30-day trend comparison ---
+    now = datetime.now(timezone.utc)
+    last_30_start = now - timedelta(days=30)
+    prior_30_start = now - timedelta(days=60)
+
+    last_30_q = threat_base.where(
+        IdentityThreat.created_at >= last_30_start
+    )
+    prior_30_q = threat_base.where(
+        and_(
+            IdentityThreat.created_at >= prior_30_start,
+            IdentityThreat.created_at < last_30_start,
+        )
+    )
+    last_30_count = (await db.execute(last_30_q)).scalar() or 0
+    prior_30_count = (await db.execute(prior_30_q)).scalar() or 0
+
+    if prior_30_count == 0 and last_30_count == 0:
+        trend_label = "stable"
+        change_pct_str = "0%"
+    elif prior_30_count == 0:
+        trend_label = "rising"
+        change_pct_str = "+new"  # no prior baseline to compare against
+    else:
+        delta = last_30_count - prior_30_count
+        change = (delta / prior_30_count) * 100.0
+        change_pct_str = f"{'+' if change >= 0 else ''}{change:.0f}%"
+        if change > 10:
+            trend_label = "rising"
+        elif change < -10:
+            trend_label = "improving"
+        else:
+            trend_label = "stable"
+
+    # --- Real compliance_status ---
+    compliance_status: dict[str, str] = {}
+    try:
+        from src.compliance.models import ComplianceFramework
+        fw_q = select(ComplianceFramework)
+        if org_id:
+            fw_q = fw_q.where(ComplianceFramework.organization_id == org_id)
+        for fw in (await db.execute(fw_q)).scalars().all():
+            if fw.short_name:
+                compliance_status[fw.short_name] = fw.status or "unknown"
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"compliance_status lookup failed: {exc}")
+
     return ITDRRiskOverview(
-        summary=f"Identity security posture: {len(critical_findings)} critical issues" if critical_findings else "Identity security posture: healthy",
+        summary=(
+            f"Identity security posture: {len(critical_findings)} critical issues"
+            if critical_findings
+            else "Identity security posture: healthy"
+        ),
         critical_findings=critical_findings,
-        risk_trends={"trend": "stable", "30day_change": "-5%"},
+        risk_trends={
+            "trend": trend_label,
+            "30day_change": change_pct_str,
+            "threats_last_30d": last_30_count,
+            "threats_prior_30d": prior_30_count,
+        },
         recommendations=[
             "Review and revoke excessive privileges",
             "Enforce MFA on all identities",
             "Rotate exposed credentials immediately",
             "Remediate detected threats",
         ],
-        compliance_status={
-            "pci_dss": "compliant",
-            "sox": "compliant",
-            "hipaa": "compliant",
-        },
+        compliance_status=compliance_status,
     )

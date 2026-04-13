@@ -174,14 +174,20 @@ async def deploy_decoy(
 @router.get("/decoys", response_model=list[DecoyResponse])
 async def list_decoys(
     db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     decoy_type: str | None = Query(None),
     decoy_status: str | None = Query(None, alias="status"),
     category: str | None = Query(None),
-    organization_id: str | None = Query(None),
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
 ):
-    """List all decoys with optional filtering."""
+    """List all decoys with optional filtering.
+
+    **Auth + tenancy**: caller must be authenticated. Results are
+    scoped to the caller's organization — there is deliberately no
+    ``organization_id`` query parameter (previous versions accepted
+    one, which let anonymous callers dump any tenant's decoys).
+    """
     try:
         query = select(Decoy)
 
@@ -192,8 +198,10 @@ async def list_decoys(
             filters.append(Decoy.status == decoy_status)
         if category:
             filters.append(Decoy.category == category)
-        if organization_id:
-            filters.append(Decoy.organization_id == organization_id)
+
+        org_id = getattr(current_user, "organization_id", None)
+        if org_id:
+            filters.append(Decoy.organization_id == org_id)
 
         if filters:
             query = query.where(and_(*filters))
@@ -229,6 +237,7 @@ async def list_decoys(
 async def get_decoy_detail(
     decoy_id: UUID,
     db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Get detailed information about a specific decoy."""
     try:
@@ -467,13 +476,17 @@ async def generate_token(
 @router.get("/tokens", response_model=list[HoneyTokenResponse])
 async def list_tokens(
     db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     token_type: str | None = Query(None),
     token_status: str | None = Query(None, alias="status"),
-    organization_id: str | None = Query(None),
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
 ):
-    """List all honeytokens with optional filtering."""
+    """List all honeytokens with optional filtering.
+
+    Authenticated and org-scoped. Results are limited to the caller's
+    organization; there is no client-supplied ``organization_id``.
+    """
     try:
         query = select(HoneyToken)
 
@@ -482,8 +495,9 @@ async def list_tokens(
             filters.append(HoneyToken.token_type == token_type)
         if token_status:
             filters.append(HoneyToken.status == token_status)
-        if organization_id:
-            filters.append(HoneyToken.organization_id == organization_id)
+        org_id = getattr(current_user, "organization_id", None)
+        if org_id:
+            filters.append(HoneyToken.organization_id == org_id)
 
         if filters:
             query = query.where(and_(*filters))
@@ -515,6 +529,7 @@ async def list_tokens(
 async def get_token(
     token_id: UUID,
     db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Get details about a specific honeytoken."""
     try:
@@ -538,6 +553,7 @@ async def get_token(
 async def check_token(
     token_id: UUID,
     db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Check if a honeytoken has been used/triggered."""
     try:
@@ -601,10 +617,15 @@ async def delete_token(
 async def rotate_tokens(
     db: DatabaseSession = None,
     token_type: str = Query(...),
-    organization_id: str | None = Query(None),
     current_user: CurrentUser = None,
 ):
-    """Rotate all tokens of a specific type."""
+    """Rotate all tokens of a specific type.
+
+    Org-scoped: only rotates tokens belonging to the caller's
+    organization. Previous version accepted an ``organization_id``
+    query parameter which would let an authenticated caller rotate
+    another tenant's tokens and break their active honeypot bait.
+    """
     try:
         import hashlib
         import secrets
@@ -615,6 +636,7 @@ async def rotate_tokens(
                 HoneyToken.status == "active",
             )
         )
+        organization_id = getattr(current_user, "organization_id", None)
         if organization_id:
             query = query.where(HoneyToken.organization_id == organization_id)
 
@@ -656,14 +678,18 @@ async def rotate_tokens(
 @router.get("/interactions", response_model=list[DecoyInteractionResponse])
 async def list_interactions(
     db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     decoy_id: UUID | None = Query(None),
     source_ip: str | None = Query(None),
     threat_level: str | None = Query(None),
-    organization_id: str | None = Query(None),
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
 ):
-    """List all decoy interactions with optional filtering."""
+    """List all decoy interactions with optional filtering.
+
+    Authenticated and org-scoped. Interactions from other tenants are
+    never returned, and there is no client-supplied organization_id.
+    """
     try:
         query = select(DecoyInteraction)
 
@@ -674,10 +700,9 @@ async def list_interactions(
             filters.append(DecoyInteraction.source_ip == source_ip)
         if threat_level:
             filters.append(DecoyInteraction.threat_assessment == threat_level)
-        if organization_id:
-            filters.append(
-                DecoyInteraction.organization_id == organization_id
-            )
+        org_id = getattr(current_user, "organization_id", None)
+        if org_id:
+            filters.append(DecoyInteraction.organization_id == org_id)
 
         if filters:
             query = query.where(and_(*filters))
@@ -720,6 +745,7 @@ async def list_interactions(
 )
 async def get_interaction_timeline(
     db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     decoy_id: UUID = Query(...),
     hours: int = Query(24, ge=1, le=720),
 ):
@@ -791,6 +817,7 @@ async def get_interaction_timeline(
 async def get_interaction(
     interaction_id: UUID,
     db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Get details about a specific interaction."""
     try:
@@ -956,13 +983,16 @@ async def create_campaign(
 @router.get("/campaigns", response_model=list[DeceptionCampaignResponse])
 async def list_campaigns(
     db: DatabaseSession = None,
+    current_user: CurrentUser = None,
     objective: str | None = Query(None),
     campaign_status: str | None = Query(None, alias="status"),
-    organization_id: str | None = Query(None),
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
 ):
-    """List all deception campaigns with optional filtering."""
+    """List all deception campaigns with optional filtering.
+
+    Authenticated and org-scoped. No client-supplied organization_id.
+    """
     try:
         query = select(DeceptionCampaign)
 
@@ -971,10 +1001,9 @@ async def list_campaigns(
             filters.append(DeceptionCampaign.objective == objective)
         if campaign_status:
             filters.append(DeceptionCampaign.status == campaign_status)
-        if organization_id:
-            filters.append(
-                DeceptionCampaign.organization_id == organization_id
-            )
+        org_id = getattr(current_user, "organization_id", None)
+        if org_id:
+            filters.append(DeceptionCampaign.organization_id == org_id)
 
         if filters:
             query = query.where(and_(*filters))
@@ -1015,6 +1044,7 @@ async def list_campaigns(
 async def get_campaign_detail(
     campaign_id: UUID,
     db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Get detailed information about a campaign."""
     try:
@@ -1099,6 +1129,7 @@ async def update_campaign_status(
 async def get_campaign_effectiveness(
     campaign_id: UUID,
     db: DatabaseSession = None,
+    current_user: CurrentUser = None,
 ):
     """Get effectiveness assessment of a campaign."""
     try:
@@ -1170,10 +1201,16 @@ async def get_campaign_effectiveness(
 @router.get("/dashboard", response_model=DeceptionDashboardResponse)
 async def get_dashboard(
     db: DatabaseSession = None,
-    organization_id: str | None = Query(None),
+    current_user: CurrentUser = None,
 ):
-    """Get deception module dashboard statistics."""
+    """Get deception module dashboard statistics.
+
+    Authenticated and org-scoped to the caller's organization. No
+    client-supplied ``organization_id`` — that was a cross-tenant leak
+    vector that let anonymous callers dump any tenant's stats.
+    """
     try:
+        organization_id = getattr(current_user, "organization_id", None)
         now = datetime.now(timezone.utc)
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         week_start = today_start - timedelta(days=today_start.weekday())
@@ -1290,6 +1327,26 @@ async def get_dashboard(
         critical_r = await db.execute(critical_q)
         critical_interactions = critical_r.scalar() or 0
 
+        # Average interaction duration over the last 30 days. The frontend
+        # labels this "average response time" — we interpret that as the
+        # mean session duration on a decoy (how long an attacker stayed
+        # engaged), which is what the DecoyInteraction model actually
+        # tracks via session_duration_seconds.
+        avg_duration_q = select(
+            func.avg(DecoyInteraction.session_duration_seconds)
+        ).where(
+            and_(
+                DecoyInteraction.created_at >= now - timedelta(days=30),
+                DecoyInteraction.session_duration_seconds.is_not(None),
+            )
+        )
+        if organization_id:
+            avg_duration_q = avg_duration_q.where(
+                DecoyInteraction.organization_id == organization_id
+            )
+        avg_duration_r = await db.execute(avg_duration_q)
+        avg_session_duration = float(avg_duration_r.scalar() or 0.0)
+
         stats = DeceptionDashboardStats(
             total_decoys=total_decoys,
             active_decoys=active_decoys,
@@ -1305,7 +1362,7 @@ async def get_dashboard(
             unique_attackers_this_week=unique_attackers_week,
             high_severity_interactions=high_severity,
             critical_interactions=critical_interactions,
-            average_interaction_response_time_seconds=0.0,
+            average_interaction_response_time_seconds=round(avg_session_duration, 2),
         )
 
         # Recent interactions
@@ -1332,6 +1389,67 @@ async def get_dashboard(
         active_camp_result = await db.execute(active_campaigns_q)
         active_camp_list = list(active_camp_result.scalars().all())
 
+        # --- Top attacker profiles (last 30d) ---
+        # Group DecoyInteraction by source_ip to find the top 5 busiest
+        # attackers, with their interaction count, highest threat level
+        # seen, and their most recent hit. This is the foundation for an
+        # "attacker timeline" view when the frontend adds one.
+        top_attackers_q = (
+            select(
+                DecoyInteraction.source_ip,
+                func.count(DecoyInteraction.id).label("interaction_count"),
+                func.max(DecoyInteraction.created_at).label("last_seen"),
+            )
+            .where(DecoyInteraction.created_at >= now - timedelta(days=30))
+            .group_by(DecoyInteraction.source_ip)
+            .order_by(func.count(DecoyInteraction.id).desc())
+            .limit(5)
+        )
+        if organization_id:
+            top_attackers_q = top_attackers_q.where(
+                DecoyInteraction.organization_id == organization_id
+            )
+        top_attackers_result = await db.execute(top_attackers_q)
+        top_attacker_profiles = [
+            {
+                "source_ip": row.source_ip,
+                "interaction_count": int(row.interaction_count),
+                "last_seen": row.last_seen.isoformat() if row.last_seen else None,
+            }
+            for row in top_attackers_result.all()
+            if row.source_ip
+        ]
+
+        # --- Dashboard recommendations ---
+        # Derive from real coverage state + threat state. Each rule
+        # here is a simple, surfaceable recommendation the operator can
+        # act on in a single click from the UI.
+        dashboard_recs: list[str] = []
+        if total_decoys == 0:
+            dashboard_recs.append(
+                "No decoys deployed — deploy at least one network honeypot to start catching reconnaissance."
+            )
+        elif active_decoys == 0 and total_decoys > 0:
+            dashboard_recs.append(
+                "You have decoys defined but none are active — re-enable or rotate them."
+            )
+        if active_tokens == 0 and total_tokens == 0:
+            dashboard_recs.append(
+                "No honeytokens active — deploy at least one (AWS key or API key) in a plausible location to detect credential theft."
+            )
+        if triggered_tokens > 0:
+            dashboard_recs.append(
+                f"{triggered_tokens} honeytoken(s) triggered — investigate in the Interactions tab and rotate compromised tokens."
+            )
+        if critical_interactions > 0:
+            dashboard_recs.append(
+                f"{critical_interactions} critical-severity interaction(s) detected — review and escalate to incidents."
+            )
+        if active_campaigns == 0 and total_decoys > 2:
+            dashboard_recs.append(
+                "Decoys are deployed but not grouped into campaigns — create a campaign to track effectiveness."
+            )
+
         logger.info("Retrieved dashboard statistics")
 
         return DeceptionDashboardResponse(
@@ -1344,8 +1462,8 @@ async def get_dashboard(
                 DeceptionCampaignResponse.model_validate(c)
                 for c in active_camp_list
             ],
-            top_attacker_profiles=[],
-            recommendations=[],
+            top_attacker_profiles=top_attacker_profiles,
+            recommendations=dashboard_recs,
         )
 
     except Exception as e:
@@ -1359,10 +1477,14 @@ async def get_dashboard(
 @router.get("/coverage", response_model=CoverageMapResponse)
 async def get_coverage_map(
     db: DatabaseSession = None,
-    organization_id: str | None = Query(None),
+    current_user: CurrentUser = None,
 ):
-    """Get network coverage map for deception infrastructure."""
+    """Get network coverage map for deception infrastructure.
+
+    Authenticated and org-scoped. No client-supplied organization_id.
+    """
     try:
+        organization_id = getattr(current_user, "organization_id", None)
         query = select(Decoy).where(Decoy.status == "active")
         if organization_id:
             query = query.where(Decoy.organization_id == organization_id)
@@ -1419,10 +1541,14 @@ async def get_coverage_map(
 @router.get("/recommendations", response_model=RecommendationsResponse)
 async def get_recommendations(
     db: DatabaseSession = None,
-    organization_id: str | None = Query(None),
+    current_user: CurrentUser = None,
 ):
-    """Get recommendations for improving deception coverage."""
+    """Get recommendations for improving deception coverage.
+
+    Authenticated and org-scoped. No client-supplied organization_id.
+    """
     try:
+        organization_id = getattr(current_user, "organization_id", None)
         # Count decoys by category to find gaps
         query = (
             select(Decoy.category, func.count(Decoy.id))
@@ -1449,12 +1575,100 @@ async def get_recommendations(
             cat for cat in all_categories if cat not in coverage_by_category
         ]
 
+        # Map each category gap to a concrete DeploymentRecommendation.
+        # Must match the DeploymentRecommendation schema shape, not a
+        # bare string. The ``high_priority`` ones are gaps in categories
+        # where the tenant has zero coverage against a common attack
+        # vector (credential theft, AD lateral movement, cloud key abuse).
+        from src.schemas.deception import DeploymentRecommendation
+
+        rec_templates: dict[str, dict] = {
+            "network": {
+                "decoy_type": "honeypot",
+                "service": "ssh",
+                "purpose": "Catch scanning and lateral movement with an SSH/RDP emulation.",
+                "priority": "medium",
+                "estimated_value": "high",
+            },
+            "credential": {
+                "decoy_type": "honeytoken",
+                "location": "config files, CI environment, .env",
+                "purpose": "Detect credential theft via fake AWS keys and API keys.",
+                "priority": "high",
+                "estimated_value": "high",
+            },
+            "file": {
+                "decoy_type": "honeyfile",
+                "location": "shared drives, user profiles",
+                "filename": "customer-data-backup.xlsx",
+                "purpose": "Detect ransomware reconnaissance and insider data access.",
+                "priority": "medium",
+                "estimated_value": "high",
+            },
+            "dns": {
+                "decoy_type": "honeypot",
+                "service": "dns",
+                "purpose": "Catch subdomain enumeration and exfiltration over DNS.",
+                "priority": "medium",
+                "estimated_value": "medium",
+            },
+            "email": {
+                "decoy_type": "honeytoken",
+                "location": "address book, archived mailboxes",
+                "purpose": "Catch mailbox compromise via honeytoken email aliases.",
+                "priority": "medium",
+                "estimated_value": "medium",
+            },
+            "cloud": {
+                "decoy_type": "honeytoken",
+                "location": "AWS/GCP/Azure",
+                "purpose": "Detect cloud enumeration and IAM key abuse with decoy buckets/IAM users.",
+                "priority": "high",
+                "estimated_value": "high",
+            },
+            "active_directory": {
+                "decoy_type": "honeycred",
+                "location": "Active Directory",
+                "purpose": "Catch Kerberoasting with SPN-protected decoy accounts.",
+                "priority": "high",
+                "estimated_value": "high",
+            },
+            "database": {
+                "decoy_type": "honeypot",
+                "service": "postgres",
+                "purpose": "Catch SQL injection and data theft with a decoy DB and plausible table names.",
+                "priority": "medium",
+                "estimated_value": "high",
+            },
+        }
+        high_priority_categories = {"credential", "active_directory", "cloud"}
+
+        def _build_rec(cat: str) -> DeploymentRecommendation:
+            t = rec_templates[cat]
+            return DeploymentRecommendation(
+                zone=cat,
+                decoy_type=t.get("decoy_type", ""),
+                service=t.get("service"),
+                location=t.get("location"),
+                filename=t.get("filename"),
+                purpose=t.get("purpose", ""),
+                priority=t.get("priority", "medium"),
+                estimated_value=t.get("estimated_value", "high"),
+            )
+
+        recommendations = [_build_rec(g) for g in gaps if g in rec_templates]
+        high_priority_items = [
+            _build_rec(g)
+            for g in gaps
+            if g in rec_templates and g in high_priority_categories
+        ]
+
         logger.info("Retrieved deception recommendations")
 
         return RecommendationsResponse(
-            recommendations=[],
+            recommendations=recommendations,
             coverage_gaps=gaps,
-            high_priority_items=[],
+            high_priority_items=high_priority_items,
         )
 
     except Exception as e:

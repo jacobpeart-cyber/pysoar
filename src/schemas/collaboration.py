@@ -98,7 +98,7 @@ class WarRoomMessageBase(BaseModel):
     content: str = Field(..., min_length=1)
     message_type: str = "text"
     mentioned_users: Optional[list[str]] = None
-    metadata: Optional[dict[str, Any]] = None
+    extra_metadata: Optional[dict[str, Any]] = None
 
 
 class WarRoomMessageCreate(WarRoomMessageBase):

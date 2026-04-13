@@ -497,19 +497,56 @@ class BrandProtection:
         self, domain: str, max_distance: int = 2
     ) -> list[tuple[str, float]]:
         """Generate typosquat variants using Levenshtein distance"""
-        # Simulated suspicious domains
-        suspicious = [
-            f"{domain.replace('.com', '.co')}",
-            f"{domain.replace('a', 'e')}",
-            f"{domain}s",
-        ]
+        base, _, tld = domain.rpartition(".")
+        if not base:
+            return []
 
+        candidates = []
+
+        # Character substitution variants
+        for i in range(len(base)):
+            for c in "abcdefghijklmnopqrstuvwxyz0123456789":
+                if c != base[i]:
+                    variant = base[:i] + c + base[i + 1:] + "." + tld
+                    candidates.append(variant)
+
+        # Character insertion
+        for i in range(len(base) + 1):
+            for c in "abcdefghijklmnopqrstuvwxyz0123456789-":
+                variant = base[:i] + c + base[i:] + "." + tld
+                candidates.append(variant)
+
+        # Character deletion
+        for i in range(len(base)):
+            variant = base[:i] + base[i + 1:] + "." + tld
+            if variant != "." + tld:
+                candidates.append(variant)
+
+        # Adjacent character transposition
+        for i in range(len(base) - 1):
+            swapped = list(base)
+            swapped[i], swapped[i + 1] = swapped[i + 1], swapped[i]
+            variant = "".join(swapped) + "." + tld
+            candidates.append(variant)
+
+        # Character duplication
+        for i in range(len(base)):
+            variant = base[:i] + base[i] + base[i:] + "." + tld
+            candidates.append(variant)
+
+        # Filter by Levenshtein distance (using SequenceMatcher ratio as proxy)
         results = []
-        for susp in suspicious:
-            similarity = SequenceMatcher(None, domain, susp).ratio()
+        seen = set()
+        for candidate in candidates:
+            if candidate == domain or candidate in seen:
+                continue
+            seen.add(candidate)
+            similarity = SequenceMatcher(None, domain, candidate).ratio()
             if similarity >= self.similarity_threshold:
-                results.append((susp, similarity))
+                results.append((candidate, similarity))
 
+        # Sort by similarity descending
+        results.sort(key=lambda x: x[1], reverse=True)
         return results
 
     def _generate_homoglyph_variants(self, domain: str) -> list[str]:
@@ -723,12 +760,61 @@ class ThreatIntelCorrelator:
         return enriched
 
     def _attribute_actor(self, finding: dict[str, Any]) -> Optional[dict[str, Any]]:
-        """Attribute finding to threat actor"""
-        # Simplified actor attribution
+        """Attribute finding to threat actor based on available evidence"""
+        actor_name = "Unknown"
+        confidence = 0
+        aliases = []
+
+        # Extract attribution signals from the finding
+        source_platform = finding.get("source_platform", "")
+        finding_type = finding.get("finding_type", "") or finding.get("type", "")
+        content = str(finding.get("content", "")) + str(finding.get("description", ""))
+        tags = finding.get("tags", []) if isinstance(finding.get("tags"), list) else []
+
+        # Known actor keyword signatures (common threat groups and their indicators)
+        actor_signatures = {
+            "LockBit": {"keywords": ["lockbit", "lockbit3", "lockbit 3.0"], "aliases": ["LockBit 3.0", "LockBitSupp"], "platforms": ["ransomware_forum", "tor"]},
+            "BlackCat/ALPHV": {"keywords": ["alphv", "blackcat", "noberus"], "aliases": ["ALPHV", "Noberus", "BlackCat"], "platforms": ["ransomware_forum", "tor"]},
+            "Cl0p": {"keywords": ["cl0p", "clop", "ta505"], "aliases": ["TA505", "FIN11"], "platforms": ["ransomware_forum", "tor"]},
+            "Lazarus Group": {"keywords": ["lazarus", "hidden cobra", "apt38", "bluenoroff"], "aliases": ["Hidden Cobra", "APT38", "BlueNoroff"], "platforms": ["paste_site", "forum"]},
+            "FIN7": {"keywords": ["fin7", "carbanak", "anunak"], "aliases": ["Carbanak", "Anunak"], "platforms": ["forum", "marketplace"]},
+            "APT28": {"keywords": ["apt28", "fancy bear", "sofacy", "pawn storm"], "aliases": ["Fancy Bear", "Sofacy", "Pawn Storm"], "platforms": ["forum", "paste_site"]},
+            "APT29": {"keywords": ["apt29", "cozy bear", "nobelium"], "aliases": ["Cozy Bear", "Nobelium", "The Dukes"], "platforms": ["forum", "paste_site"]},
+        }
+
+        content_lower = content.lower()
+        best_match_confidence = 0
+
+        for actor, signature in actor_signatures.items():
+            match_score = 0
+            # Check keyword matches
+            for keyword in signature["keywords"]:
+                if keyword in content_lower:
+                    match_score += 40
+            # Check tags
+            for tag in tags:
+                for keyword in signature["keywords"]:
+                    if keyword in tag.lower():
+                        match_score += 30
+            # Platform correlation
+            if source_platform in signature["platforms"]:
+                match_score += 10
+
+            if match_score > best_match_confidence:
+                best_match_confidence = match_score
+                actor_name = actor
+                aliases = signature["aliases"]
+                confidence = min(95, match_score)
+
+        if best_match_confidence == 0:
+            actor_name = "Unattributed"
+            confidence = 0
+            aliases = []
+
         return {
-            "actor_name": "Unknown Threat Actor",
-            "confidence": 30,
-            "known_aliases": [],
+            "actor_name": actor_name,
+            "confidence": confidence,
+            "known_aliases": aliases,
         }
 
     def _map_campaign(self, finding: dict[str, Any]) -> Optional[dict[str, Any]]:

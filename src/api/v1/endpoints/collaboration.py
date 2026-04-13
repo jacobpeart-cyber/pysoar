@@ -74,40 +74,48 @@ router = APIRouter(prefix="/collaboration", tags=["Collaboration"])
 # ============================================================================
 
 
-async def get_war_room_or_404(db: AsyncSession, room_id: str) -> WarRoom:
-    """Get war room by ID or raise 404"""
-    result = await db.execute(select(WarRoom).where(WarRoom.id == room_id))
+async def get_war_room_or_404(db: AsyncSession, room_id: str, org_id: Optional[str] = None) -> WarRoom:
+    """Get war room by ID or raise 404 (tenant-scoped when org_id provided)"""
+    stmt = select(WarRoom).where(WarRoom.id == room_id)
+    if org_id is not None:
+        stmt = stmt.where(WarRoom.organization_id == org_id)
+    result = await db.execute(stmt)
     room = result.scalar_one_or_none()
     if not room:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="War room not found")
     return room
 
 
-async def get_message_or_404(db: AsyncSession, message_id: str) -> WarRoomMessage:
-    """Get message by ID or raise 404"""
-    result = await db.execute(
-        select(WarRoomMessage).where(WarRoomMessage.id == message_id)
-    )
+async def get_message_or_404(db: AsyncSession, message_id: str, org_id: Optional[str] = None) -> WarRoomMessage:
+    """Get message by ID or raise 404 (tenant-scoped when org_id provided)"""
+    stmt = select(WarRoomMessage).where(WarRoomMessage.id == message_id)
+    if org_id is not None:
+        stmt = stmt.where(WarRoomMessage.organization_id == org_id)
+    result = await db.execute(stmt)
     message = result.scalar_one_or_none()
     if not message:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Message not found")
     return message
 
 
-async def get_artifact_or_404(db: AsyncSession, artifact_id: str) -> SharedArtifact:
-    """Get artifact by ID or raise 404"""
-    result = await db.execute(
-        select(SharedArtifact).where(SharedArtifact.id == artifact_id)
-    )
+async def get_artifact_or_404(db: AsyncSession, artifact_id: str, org_id: Optional[str] = None) -> SharedArtifact:
+    """Get artifact by ID or raise 404 (tenant-scoped when org_id provided)"""
+    stmt = select(SharedArtifact).where(SharedArtifact.id == artifact_id)
+    if org_id is not None:
+        stmt = stmt.where(SharedArtifact.organization_id == org_id)
+    result = await db.execute(stmt)
     artifact = result.scalar_one_or_none()
     if not artifact:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact not found")
     return artifact
 
 
-async def get_action_or_404(db: AsyncSession, action_id: str) -> ActionItem:
-    """Get action item by ID or raise 404"""
-    result = await db.execute(select(ActionItem).where(ActionItem.id == action_id))
+async def get_action_or_404(db: AsyncSession, action_id: str, org_id: Optional[str] = None) -> ActionItem:
+    """Get action item by ID or raise 404 (tenant-scoped when org_id provided)"""
+    stmt = select(ActionItem).where(ActionItem.id == action_id)
+    if org_id is not None:
+        stmt = stmt.where(ActionItem.organization_id == org_id)
+    result = await db.execute(stmt)
     action = result.scalar_one_or_none()
     if not action:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Action item not found")
@@ -196,7 +204,7 @@ async def get_war_room(
     room_id: str = Path(...),
 ):
     """Get war room details"""
-    room = await get_war_room_or_404(db, room_id)
+    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
     return room
 
 
@@ -208,7 +216,7 @@ async def update_war_room(
     room_id: str = Path(...),
 ):
     """Update war room"""
-    room = await get_war_room_or_404(db, room_id)
+    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
 
     if room_data.name:
         room.name = room_data.name
@@ -235,7 +243,7 @@ async def archive_war_room(
     room_id: str = Path(...),
 ):
     """Archive war room"""
-    room = await get_war_room_or_404(db, room_id)
+    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
     manager = WarRoomManager(db)
     await manager.archive_room(room_id)
     await db.commit()
@@ -249,7 +257,7 @@ async def get_room_summary(
     room_id: str = Path(...),
 ):
     """Get war room summary with metrics"""
-    room = await get_war_room_or_404(db, room_id)
+    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
     manager = WarRoomManager(db)
     summary = await manager.get_room_summary(room_id)
     return WarRoomSummary(**summary)
@@ -262,7 +270,7 @@ async def join_war_room(
     room_id: str = Path(...),
 ):
     """Join a war room"""
-    room = await get_war_room_or_404(db, room_id)
+    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
     manager = WarRoomManager(db)
     success = await manager.join_room(room_id, current_user.id)
 
@@ -283,7 +291,7 @@ async def leave_war_room(
     room_id: str = Path(...),
 ):
     """Leave a war room"""
-    room = await get_war_room_or_404(db, room_id)
+    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
     manager = WarRoomManager(db)
     await manager.leave_room(room_id, current_user.id)
     await db.commit()
@@ -298,7 +306,7 @@ async def set_war_room_commander(
     user_id: str = Path(...),
 ):
     """Set incident commander for war room"""
-    room = await get_war_room_or_404(db, room_id)
+    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
     manager = WarRoomManager(db)
     success = await manager.set_commander(room_id, user_id)
 
@@ -322,7 +330,7 @@ async def send_message(
     room_id: str = Path(...),
 ):
     """Send message to war room"""
-    room = await get_war_room_or_404(db, room_id)
+    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
     engine = MessageEngine(db)
 
     message = await engine.send_message(
@@ -334,7 +342,7 @@ async def send_message(
         message_type=msg_data.message_type,
         attachments=msg_data.attachments,
         mentioned_users=msg_data.mentioned_users,
-        metadata=msg_data.metadata,
+        metadata=msg_data.extra_metadata,
     )
     await db.commit()
     return message
@@ -349,7 +357,7 @@ async def get_room_messages(
     size: int = Query(50, ge=1, le=200),
 ):
     """Get room message history"""
-    room = await get_war_room_or_404(db, room_id)
+    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
     engine = MessageEngine(db)
     messages, total = await engine.get_message_history(room_id, page=page, size=size)
 
@@ -369,7 +377,7 @@ async def edit_message(
     message_id: str = Path(...),
 ):
     """Edit message"""
-    message = await get_message_or_404(db, message_id)
+    message = await get_message_or_404(db, message_id, getattr(current_user, "organization_id", None))
     engine = MessageEngine(db)
     success = await engine.edit_message(message_id, msg_data.content)
 
@@ -388,7 +396,7 @@ async def pin_message(
     message_id: str = Path(...),
 ):
     """Pin message in room"""
-    message = await get_message_or_404(db, message_id)
+    message = await get_message_or_404(db, message_id, getattr(current_user, "organization_id", None))
     engine = MessageEngine(db)
     success = await engine.pin_message(message.room_id, message_id)
 
@@ -408,7 +416,7 @@ async def search_messages(
     limit: int = Query(50, ge=1, le=200),
 ):
     """Search messages in room"""
-    room = await get_war_room_or_404(db, room_id)
+    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
     engine = MessageEngine(db)
     messages = await engine.search_messages(room_id, q, limit=limit)
     return messages
@@ -422,8 +430,8 @@ async def get_message_thread(
     message_id: str = Path(...),
 ):
     """Get message thread"""
-    room = await get_war_room_or_404(db, room_id)
-    parent = await get_message_or_404(db, message_id)
+    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
+    parent = await get_message_or_404(db, message_id, getattr(current_user, "organization_id", None))
 
     # Get replies
     result = await db.execute(
@@ -449,7 +457,7 @@ async def upload_artifact(
     room_id: str = Path(...),
 ):
     """Upload artifact to war room"""
-    room = await get_war_room_or_404(db, room_id)
+    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
     manager = ArtifactManager(db)
 
     artifact = await manager.upload_artifact(
@@ -478,7 +486,7 @@ async def list_room_artifacts(
     artifact_type: Optional[str] = None,
 ):
     """List artifacts in room"""
-    room = await get_war_room_or_404(db, room_id)
+    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
 
     query = select(SharedArtifact).where(SharedArtifact.room_id == room_id)
 
@@ -513,7 +521,7 @@ async def get_artifact(
     artifact_id: str = Path(...),
 ):
     """Get artifact details"""
-    artifact = await get_artifact_or_404(db, artifact_id)
+    artifact = await get_artifact_or_404(db, artifact_id, getattr(current_user, "organization_id", None))
     return artifact
 
 
@@ -524,7 +532,7 @@ async def download_artifact(
     artifact_id: str = Path(...),
 ):
     """Track artifact download"""
-    artifact = await get_artifact_or_404(db, artifact_id)
+    artifact = await get_artifact_or_404(db, artifact_id, getattr(current_user, "organization_id", None))
     manager = ArtifactManager(db)
     await manager.track_downloads(artifact_id)
     await db.commit()
@@ -538,7 +546,7 @@ async def get_artifact_index(
     room_id: str = Path(...),
 ):
     """Get artifact index for room"""
-    room = await get_war_room_or_404(db, room_id)
+    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
     manager = ArtifactManager(db)
     index = await manager.generate_artifact_index(room_id)
     return index
@@ -557,7 +565,7 @@ async def create_action_item(
     room_id: str = Path(...),
 ):
     """Create action item"""
-    room = await get_war_room_or_404(db, room_id)
+    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
     tracker = ActionTracker(db)
 
     action = await tracker.create_action_item(
@@ -585,7 +593,7 @@ async def list_room_actions(
     assigned_to: Optional[str] = None,
 ):
     """List action items in room"""
-    room = await get_war_room_or_404(db, room_id)
+    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
 
     query = select(ActionItem).where(ActionItem.room_id == room_id)
 
@@ -624,7 +632,7 @@ async def update_action_item(
     action_id: str = Path(...),
 ):
     """Update action item"""
-    action = await get_action_or_404(db, action_id)
+    action = await get_action_or_404(db, action_id, getattr(current_user, "organization_id", None))
 
     if action_data.title:
         action.title = action_data.title
@@ -654,7 +662,7 @@ async def get_action_report(
     room_id: str = Path(...),
 ):
     """Get action items report"""
-    room = await get_war_room_or_404(db, room_id)
+    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
     tracker = ActionTracker(db)
     report = await tracker.generate_action_report(room_id)
     return ActionReport(**report)
@@ -673,7 +681,7 @@ async def add_timeline_event(
     room_id: str = Path(...),
 ):
     """Add event to timeline"""
-    room = await get_war_room_or_404(db, room_id)
+    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
     manager = TimelineManager(db)
 
     event = await manager.add_event(
@@ -702,7 +710,7 @@ async def get_timeline(
     key_only: bool = False,
 ):
     """Get timeline events"""
-    room = await get_war_room_or_404(db, room_id)
+    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
     manager = TimelineManager(db)
 
     event_types = [event_type] if event_type else None
@@ -728,7 +736,7 @@ async def get_timeline_report(
     room_id: str = Path(...),
 ):
     """Get timeline report"""
-    room = await get_war_room_or_404(db, room_id)
+    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
     manager = TimelineManager(db)
     report = await manager.generate_timeline_report(room_id)
     return {"report": report}
@@ -742,7 +750,7 @@ async def export_timeline(
     format: str = Query("json", pattern="^(json|text)$"),
 ):
     """Export timeline"""
-    room = await get_war_room_or_404(db, room_id)
+    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
     manager = TimelineManager(db)
     export_data = await manager.export_timeline(room_id, format=format)
     return {"data": export_data, "format": format}
@@ -760,7 +768,7 @@ async def generate_post_mortem(
     room_id: str = Path(...),
 ):
     """Generate post-mortem report"""
-    room = await get_war_room_or_404(db, room_id)
+    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
     generator = PostMortemGenerator(db)
     report = await generator.generate_post_mortem(room_id)
     return PostMortemReport(**report)
@@ -773,7 +781,7 @@ async def get_postmortem_analysis(
     room_id: str = Path(...),
 ):
     """Get complete post-mortem analysis"""
-    room = await get_war_room_or_404(db, room_id)
+    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
     generator = PostMortemGenerator(db)
 
     report = await generator.generate_post_mortem(room_id)
@@ -808,15 +816,19 @@ async def get_collaboration_dashboard(
     db: DatabaseSession = None,
 ):
     """Get collaboration dashboard"""
+    org_id = getattr(current_user, "organization_id", None)
     manager = WarRoomManager(db)
 
     # Get active rooms
-    active_rooms = await manager.get_active_rooms(getattr(current_user, "organization_id", None))
+    active_rooms = await manager.get_active_rooms(org_id)
 
-    # Build dashboard
+    # Build dashboard (tenant-scoped)
     pending_actions_result = await db.execute(
         select(func.count(ActionItem.id)).where(
-            ActionItem.status == ActionStatus.PENDING.value
+            and_(
+                ActionItem.organization_id == org_id,
+                ActionItem.status == ActionStatus.PENDING.value,
+            )
         )
     )
     pending_actions = pending_actions_result.scalar() or 0
@@ -824,6 +836,7 @@ async def get_collaboration_dashboard(
     overdue_actions_result = await db.execute(
         select(func.count(ActionItem.id)).where(
             and_(
+                ActionItem.organization_id == org_id,
                 ActionItem.due_date < datetime.utcnow(),
                 ActionItem.status != ActionStatus.COMPLETED.value,
             )
@@ -837,10 +850,15 @@ async def get_collaboration_dashboard(
         summary = await manager.get_room_summary(room.id)
         recent_summaries.append(WarRoomSummary(**summary))
 
-    # Critical actions
+    # Critical actions (tenant-scoped)
     critical_result = await db.execute(
         select(ActionItem)
-        .where(ActionItem.status == ActionStatus.PENDING.value)
+        .where(
+            and_(
+                ActionItem.organization_id == org_id,
+                ActionItem.status == ActionStatus.PENDING.value,
+            )
+        )
         .order_by(ActionItem.priority)
         .limit(5)
     )
@@ -870,7 +888,7 @@ async def get_room_activity_metrics(
     room_id: str = Path(...),
 ):
     """Get activity metrics for room"""
-    room = await get_war_room_or_404(db, room_id)
+    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
     from datetime import timedelta
     from src.models.base import utc_now
 
@@ -923,10 +941,22 @@ async def get_room_activity_metrics(
     )
     overdue_actions = overdue_result.scalar() or 0
 
+    # Real distinct-participant count in the last hour: count unique sender_ids
+    # on messages posted in the window.
+    participants_result = await db.execute(
+        select(func.count(func.distinct(WarRoomMessage.sender_id))).where(
+            and_(
+                WarRoomMessage.room_id == room_id,
+                WarRoomMessage.created_at >= hour_ago,
+            )
+        )
+    )
+    active_participants = participants_result.scalar() or 0
+
     return RoomActivityMetrics(
         messages_last_hour=messages_last_hour,
         messages_last_24h=messages_last_24h,
-        active_participants_last_hour=1,  # Simplified
+        active_participants_last_hour=active_participants,
         pending_actions=pending_actions,
         overdue_actions=overdue_actions,
     )
@@ -940,7 +970,7 @@ async def search_collaboration(
     q: str = Query(..., min_length=1),
 ):
     """Search across messages and artifacts"""
-    room = await get_war_room_or_404(db, room_id)
+    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
     msg_engine = MessageEngine(db)
 
     messages = await msg_engine.search_messages(room_id, q, limit=50)

@@ -42,6 +42,7 @@ from src.schemas.container_security import (
     PodQuarantineRequest,
     DashboardOverviewResponse,
     ComplianceMatrixResponse,
+    ClusterComplianceResponse,
     PaginationParams,
 )
 from src.container_security.models import (
@@ -232,9 +233,12 @@ async def scan_image(
         db=db,
     )
 
-    # Persist new vulnerabilities that aren't already in the DB
+    # Persist new vulnerabilities that aren't already in the DB (defense in depth)
     existing_stmt = select(ImageVulnerability.cve_id).where(
-        ImageVulnerability.image_id == image_id
+        and_(
+            ImageVulnerability.image_id == image_id,
+            ImageVulnerability.organization_id == org_id,
+        )
     )
     existing_result = await db.execute(existing_stmt)
     existing_cves = {r[0] for r in existing_result.all()}
@@ -945,6 +949,16 @@ async def get_dashboard_overview(
     finding_result = await db.execute(finding_stmt)
     critical_findings = finding_result.scalar() or 0
 
+    # Count all open findings (status == "open")
+    open_stmt = select(func.count(K8sSecurityFinding.id)).where(
+        and_(
+            K8sSecurityFinding.organization_id == getattr(current_user, "organization_id", None),
+            K8sSecurityFinding.status == "open",
+        )
+    )
+    open_result = await db.execute(open_stmt)
+    open_findings = open_result.scalar() or 0
+
     # Count new alerts
     alert_stmt = select(func.count(RuntimeAlert.id)).where(
         and_(
@@ -954,6 +968,16 @@ async def get_dashboard_overview(
     )
     alert_result = await db.execute(alert_stmt)
     new_alerts = alert_result.scalar() or 0
+
+    # Count all active (not-resolved) runtime alerts
+    active_alert_stmt = select(func.count(RuntimeAlert.id)).where(
+        and_(
+            RuntimeAlert.organization_id == getattr(current_user, "organization_id", None),
+            RuntimeAlert.status.notin_(["resolved", "false_positive"]),
+        )
+    )
+    active_alert_result = await db.execute(active_alert_stmt)
+    active_alerts = active_alert_result.scalar() or 0
 
     # High risk images
     high_risk_stmt = select(func.count(ContainerImage.id)).where(
@@ -975,6 +999,70 @@ async def get_dashboard_overview(
     non_compliant_result = await db.execute(non_compliant_stmt)
     non_compliant_clusters = non_compliant_result.scalar() or 0
 
+    # Top vulnerabilities (by severity, newest)
+    top_vulns_stmt = (
+        select(ImageVulnerability)
+        .where(
+            and_(
+                ImageVulnerability.organization_id == getattr(current_user, "organization_id", None),
+                ImageVulnerability.severity.in_(["critical", "high"]),
+            )
+        )
+        .order_by(ImageVulnerability.created_at.desc())
+        .limit(10)
+    )
+    top_vulns_result = await db.execute(top_vulns_stmt)
+    top_vulnerabilities = [
+        {
+            "cve_id": getattr(v, "cve_id", None),
+            "severity": v.severity,
+            "package_name": getattr(v, "package_name", None),
+            "image_id": getattr(v, "image_id", None),
+            "cvss_score": getattr(v, "cvss_score", None),
+        }
+        for v in top_vulns_result.scalars().all()
+    ]
+
+    # Cluster compliance summary with REAL findings counts per cluster
+    org_id = getattr(current_user, "organization_id", None)
+    cluster_list_stmt = select(KubernetesCluster).where(
+        KubernetesCluster.organization_id == org_id
+    )
+    cluster_list_result = await db.execute(cluster_list_stmt)
+    clusters = list(cluster_list_result.scalars().all())
+
+    # Fetch findings counts for all clusters in a single grouped query
+    findings_by_cluster: dict = {}
+    if clusters:
+        findings_count_result = await db.execute(
+            select(
+                K8sSecurityFinding.cluster_id,
+                func.count(K8sSecurityFinding.id),
+            )
+            .where(
+                and_(
+                    K8sSecurityFinding.organization_id == org_id,
+                    K8sSecurityFinding.cluster_id.in_([c.id for c in clusters]),
+                    K8sSecurityFinding.status == "open",
+                )
+            )
+            .group_by(K8sSecurityFinding.cluster_id)
+        )
+        for cluster_id, count in findings_count_result.all():
+            findings_by_cluster[cluster_id] = count
+
+    cluster_compliance = []
+    for c in clusters:
+        score = getattr(c, "compliance_score", 0) or 0
+        cluster_compliance.append(
+            ClusterComplianceResponse(
+                cluster_name=c.name,
+                compliance_score=int(score),
+                findings_count=findings_by_cluster.get(c.id, 0),
+                status="compliant" if score >= 80 else ("non_compliant" if score < 60 else "partial"),
+            )
+        )
+
     return DashboardOverviewResponse(
         total_images=total_images,
         total_clusters=total_clusters,
@@ -983,8 +1071,12 @@ async def get_dashboard_overview(
         runtime_alerts_new=new_alerts,
         high_risk_images=high_risk_images,
         non_compliant_clusters=non_compliant_clusters,
-        top_vulnerabilities=[],
-        cluster_compliance=[],
+        open_findings=open_findings,
+        active_alerts=active_alerts,
+        critical_vulnerabilities=vuln_counts["critical"],
+        high_vulnerabilities=vuln_counts["high"],
+        top_vulnerabilities=top_vulnerabilities,
+        cluster_compliance=cluster_compliance,
         runtime_alert_trends=[],
     )
 

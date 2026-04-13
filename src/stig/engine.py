@@ -409,34 +409,99 @@ class STIGRemediator:
         self, findings: dict[str, Any], platform: str
     ) -> str:
         """
-        Generate platform-specific remediation script
+        Generate platform-specific remediation script.
 
-        Args:
-            findings: Dictionary of findings to remediate
-            platform: Target platform (windows, linux, etc.)
+        Previously produced a dummy template that just wrote
+        ``# Add platform-specific remediation commands`` under each
+        rule ID — useless when a SOC analyst copy-pastes it.
 
-        Returns:
-            Generated remediation script
+        Now looks up each finding's STIGRule in the database and
+        interpolates its real ``fix_text`` from the DISA benchmark. The
+        output is a shellable / runnable script with real commands the
+        operator can either execute directly or feed to the
+        Agent Platform. If a rule has no fix_text defined, the script
+        emits a TODO block so the analyst sees which rules still need
+        manual work rather than a silent skip.
         """
-        script_lines = []
+        is_windows = platform.lower() in ("windows", "win32")
 
-        if platform.lower() in ["windows", "win32"]:
-            script_lines.append("# PowerShell Remediation Script")
-            script_lines.append("# Generated for Windows remediation")
-            script_lines.append("")
+        script_lines: list[str] = []
+        if is_windows:
+            script_lines += [
+                "# PySOAR STIG Remediation Script — PowerShell",
+                "# Generated: " + datetime.now(timezone.utc).isoformat(),
+                f"# Platform: {platform}",
+                f"# Total rules: {len(findings)}",
+                "",
+                "$ErrorActionPreference = 'Continue'",
+                "",
+            ]
         else:
-            script_lines.append("#!/bin/bash")
-            script_lines.append("# Bash Remediation Script")
-            script_lines.append("# Generated for Linux/Unix remediation")
-            script_lines.append("")
+            script_lines += [
+                "#!/usr/bin/env bash",
+                "# PySOAR STIG Remediation Script — Bash",
+                "# Generated: " + datetime.now(timezone.utc).isoformat(),
+                f"# Platform: {platform}",
+                f"# Total rules: {len(findings)}",
+                "",
+                "set -u",
+                "",
+            ]
 
-        script_lines.append(f"# Remediation Script - Generated {datetime.now(timezone.utc).isoformat()}")
-        script_lines.append(f"# Total findings: {len(findings)}")
-        script_lines.append("")
+        rule_ids = list(findings.keys())[:50]  # Safety cap
 
-        for rule_id, finding in list(findings.items())[:50]:  # Limit to 50
-            script_lines.append(f"# Remediate {rule_id}")
-            script_lines.append("# Add platform-specific remediation commands")
+        # Load all rules in one query rather than N individual lookups
+        rules_by_id: dict[str, STIGRule] = {}
+        if rule_ids:
+            stmt = select(STIGRule).where(STIGRule.rule_id.in_(rule_ids))
+            result = await self.session.scalars(stmt)
+            for r in result:
+                rules_by_id[r.rule_id] = r
+
+        for rule_id in rule_ids:
+            finding = findings.get(rule_id, {})
+            rule = rules_by_id.get(rule_id)
+            title = getattr(rule, "title", None) or finding.get("title", "unknown")
+            severity = getattr(rule, "severity", None) or finding.get("severity", "medium")
+            fix_text = getattr(rule, "fix_text", None)
+
+            script_lines.append(f"# --- {rule_id} ({severity}) ---")
+            script_lines.append(f"# {title}")
+
+            if fix_text:
+                # fix_text often contains multiple shell lines separated
+                # by newlines and DISA-style bullets. We comment-out any
+                # line that looks like prose so the script still runs
+                # cleanly as a shell / ps1 file.
+                for raw_line in fix_text.splitlines():
+                    stripped = raw_line.strip()
+                    if not stripped:
+                        script_lines.append("")
+                        continue
+                    looks_like_command = (
+                        stripped.startswith("$")
+                        or stripped.startswith("sudo ")
+                        or stripped.startswith("chmod ")
+                        or stripped.startswith("chown ")
+                        or stripped.startswith("systemctl ")
+                        or stripped.startswith("sed ")
+                        or stripped.startswith("echo ")
+                        or stripped.startswith("setfacl ")
+                        or stripped.startswith("yum ")
+                        or stripped.startswith("apt ")
+                        or stripped.startswith("Set-")
+                        or stripped.startswith("Get-")
+                        or stripped.startswith("Register-")
+                    )
+                    if looks_like_command:
+                        script_lines.append(raw_line)
+                    else:
+                        script_lines.append("# " + raw_line)
+            else:
+                script_lines.append(
+                    "# TODO: no fix_text in benchmark for this rule — requires manual remediation"
+                )
+
             script_lines.append("")
 
         return "\n".join(script_lines)
@@ -973,19 +1038,84 @@ class SCAPEngine:
         logger.info("Validating OVAL definitions")
 
         try:
-            # Simulated OVAL validation
             root = ET.fromstring(content)
-            tests = len(root.findall(".//test"))
-            objects = len(root.findall(".//object"))
-            states = len(root.findall(".//state"))
+
+            # Define OVAL namespace patterns for proper element searching
+            oval_ns = {
+                "oval": "http://oval.mitre.org/XMLSchema/oval-definitions-5",
+                "oval-def": "http://oval.mitre.org/XMLSchema/oval-definitions-5",
+                "ind-def": "http://oval.mitre.org/XMLSchema/oval-definitions-5#independent",
+                "win-def": "http://oval.mitre.org/XMLSchema/oval-definitions-5#windows",
+                "unix-def": "http://oval.mitre.org/XMLSchema/oval-definitions-5#unix",
+                "linux-def": "http://oval.mitre.org/XMLSchema/oval-definitions-5#linux",
+            }
+
+            errors = []
+            warnings = []
+
+            # Count elements with both namespaced and non-namespaced searches
+            tests = root.findall(".//{http://oval.mitre.org/XMLSchema/oval-definitions-5}test")
+            if not tests:
+                tests = root.findall(".//test")
+            objects = root.findall(".//{http://oval.mitre.org/XMLSchema/oval-definitions-5}object")
+            if not objects:
+                objects = root.findall(".//object")
+            states = root.findall(".//{http://oval.mitre.org/XMLSchema/oval-definitions-5}state")
+            if not states:
+                states = root.findall(".//state")
+            definitions = root.findall(".//{http://oval.mitre.org/XMLSchema/oval-definitions-5}definition")
+            if not definitions:
+                definitions = root.findall(".//definition")
+
+            # Validate that tests reference existing objects and states
+            test_count = len(tests)
+            object_count = len(objects)
+            state_count = len(states)
+            definition_count = len(definitions)
+
+            # Collect object and state IDs for cross-reference validation
+            object_ids = set()
+            for obj in objects:
+                obj_id = obj.get("id")
+                if obj_id:
+                    object_ids.add(obj_id)
+
+            state_ids = set()
+            for state in states:
+                state_id = state.get("id")
+                if state_id:
+                    state_ids.add(state_id)
+
+            # Validate test references
+            for test in tests:
+                test_id = test.get("id", "unknown")
+                # Check for object references in test
+                for child in test:
+                    obj_ref = child.get("object_ref")
+                    if obj_ref and obj_ref not in object_ids:
+                        errors.append(f"Test {test_id} references non-existent object {obj_ref}")
+                    state_ref = child.get("state_ref")
+                    if state_ref and state_ref not in state_ids:
+                        errors.append(f"Test {test_id} references non-existent state {state_ref}")
+
+            # Structural warnings
+            if test_count == 0:
+                warnings.append("No OVAL tests found in content")
+            if object_count == 0:
+                warnings.append("No OVAL objects found in content")
+            if definition_count == 0:
+                warnings.append("No OVAL definitions found in content")
+
+            is_valid = len(errors) == 0
 
             return {
-                "valid": True,
-                "tests_found": tests,
-                "objects_found": objects,
-                "states_found": states,
-                "errors": [],
-                "warnings": [],
+                "valid": is_valid,
+                "tests_found": test_count,
+                "objects_found": object_count,
+                "states_found": state_count,
+                "definitions_found": definition_count,
+                "errors": errors,
+                "warnings": warnings,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
 

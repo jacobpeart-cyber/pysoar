@@ -129,10 +129,12 @@ class ExecutionActionResult(BaseModel):
     """Single action execution result."""
     action_type: str = ""
     target: Optional[str] = None
+    result: Optional[str] = None
     success: bool = False
     details: dict = Field(default_factory=dict)
     error: Optional[str] = None
-    timestamp: datetime
+    timestamp: Optional[datetime] = None
+    ioc_id: Optional[str] = None
 
 
 class ExecutionProgressResponse(BaseModel):

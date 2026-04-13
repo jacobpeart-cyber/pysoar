@@ -101,10 +101,41 @@ def protocol_monitoring(self, organization_id: str):
         enforcer = PurdueModelEnforcer(organization_id)
 
         async def _monitor():
-            # Simulate network traffic analysis
-            violations = await monitor.monitor_communications(enforcer)
-            logger.info(f"Found {len(violations)} communication violations")
-            return {"violations": len(violations)}
+            # Query real OTAlert rows for protocol violations and anomalies
+            from src.core.database import async_session_factory
+            from sqlalchemy import func
+
+            async with async_session_factory() as db:
+                # Get recent OT alerts for this organization
+                alert_query = select(OTAlert).where(
+                    OTAlert.organization_id == organization_id,
+                    OTAlert.status == "new",
+                )
+                result = await db.execute(alert_query)
+                recent_alerts = list(result.scalars().all())
+
+                # Also run the monitor for zone violations
+                violations = await monitor.monitor_communications(enforcer)
+
+                # Count protocol-specific violations from real alerts
+                protocol_violations = [a for a in recent_alerts if a.alert_type in ("protocol_violation", "unauthorized_command", "communication_anomaly")]
+
+                # Get asset count for context
+                asset_count_query = select(func.count(OTAsset.id)).where(
+                    OTAsset.organization_id == organization_id
+                )
+                asset_result = await db.execute(asset_count_query)
+                total_assets = asset_result.scalar() or 0
+
+            total_violations = len(violations) + len(protocol_violations)
+            logger.info(f"Found {total_violations} communication violations across {total_assets} assets")
+            return {
+                "violations": total_violations,
+                "zone_violations": len(violations),
+                "protocol_violations": len(protocol_violations),
+                "total_assets_monitored": total_assets,
+                "new_alerts": len(recent_alerts),
+            }
 
         logger.info(f"Protocol monitoring task for {organization_id} queued")
         return asyncio.run(_monitor())

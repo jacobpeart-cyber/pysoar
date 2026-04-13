@@ -353,12 +353,23 @@ class HuntExecutor:
                 # Convert dict to SearchQuery if needed
                 search_query = SearchQuery(**query_dict)
 
-            # Simulate search results (in real implementation, use search_service)
-            search_result = {
-                "items": [],
-                "total": 0,
-                "query_text": getattr(search_query, "query_text", ""),
-            }
+            # Execute the query against the real SIEM log search service
+            search_service = LogSearchService()
+            try:
+                result_obj = await search_service.search(self.db, search_query)
+                search_result = {
+                    "items": result_obj.items if result_obj else [],
+                    "total": result_obj.total if result_obj else 0,
+                    "query_text": getattr(search_query, "query_text", ""),
+                }
+            except Exception as search_err:
+                logger.warning(f"Search query failed: {search_err}")
+                search_result = {
+                    "items": [],
+                    "total": 0,
+                    "query_text": getattr(search_query, "query_text", ""),
+                    "error": str(search_err),
+                }
 
             end_time = datetime.now(timezone.utc)
             execution_ms = int((end_time - start_time).total_seconds() * 1000)
@@ -612,12 +623,36 @@ class HuntAnalyzer:
         clusters = []
         current_cluster = [sorted_results[0]]
 
+        # Group events that occur within a 5-minute time window of each other
+        time_window_seconds = 300
+
         for i in range(1, len(sorted_results)):
             result = sorted_results[i]
             prev_result = sorted_results[i - 1]
 
-            # Check if within time window (simplified)
-            if i < 10:  # Simplified: group first 10 as cluster
+            # Parse timestamps and check temporal proximity
+            try:
+                curr_ts = result.get("timestamp", "")
+                prev_ts = prev_result.get("timestamp", "")
+                if curr_ts and prev_ts:
+                    from datetime import datetime as _dt
+                    curr_time = _dt.fromisoformat(curr_ts.replace("Z", "+00:00"))
+                    prev_time = _dt.fromisoformat(prev_ts.replace("Z", "+00:00"))
+                    time_diff = abs((curr_time - prev_time).total_seconds())
+                    within_window = time_diff <= time_window_seconds
+                else:
+                    within_window = False
+            except (ValueError, TypeError):
+                within_window = False
+
+            # Also check similarity of event attributes (source, type, host)
+            same_source = result.get("source") == prev_result.get("source") and result.get("source") is not None
+            same_type = result.get("event_type") == prev_result.get("event_type") and result.get("event_type") is not None
+            same_host = result.get("hostname") == prev_result.get("hostname") and result.get("hostname") is not None
+
+            attribute_similarity = sum([same_source, same_type, same_host])
+
+            if within_window or attribute_similarity >= 2:
                 current_cluster.append(result)
             else:
                 if len(current_cluster) >= 3:

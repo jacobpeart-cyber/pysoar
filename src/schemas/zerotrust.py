@@ -272,7 +272,14 @@ class PillarAssessmentResponse(BaseModel):
 
 
 class ZeroTrustDashboardStats(BaseModel):
-    """Schema for Zero Trust dashboard statistics"""
+    """Schema for Zero Trust dashboard statistics.
+
+    ``pillars`` exposes the per-pillar NIST 800-207 maturity breakdown
+    (7 pillars) so the frontend can render it without a second round
+    trip to /maturity/pillars. Previously the frontend read
+    ``data?.pillars`` from this response but the backend never sent
+    it, so the pillar table was always empty.
+    """
 
     total_policies: int = 0
     enabled_policies: int = 0
@@ -289,6 +296,7 @@ class ZeroTrustDashboardStats(BaseModel):
     violation_count: int = 0
     maturity_score: float = 0.0
     maturity_level: str = ""
+    pillars: dict = Field(default_factory=dict)
     last_updated: datetime
 
 

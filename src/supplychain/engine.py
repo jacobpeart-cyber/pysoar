@@ -134,47 +134,126 @@ class SBOMGenerator:
             raise
 
     def generate_spdx_output(self, sbom_data: dict[str, Any]) -> str:
-        """Generate SPDX JSON output
+        """Generate a spec-compliant SPDX 2.3 JSON document.
 
-        Args:
-            sbom_data: SBOM data dictionary
-
-        Returns:
-            SPDX JSON formatted string
+        Expects ``sbom_data["components"]`` to be a list of dicts already
+        shaped by the endpoint layer (name, version, SPDXID, licenseConcluded,
+        licenseDeclared, purl, hashes, externalRefs). Emits the DESCRIBES
+        relationship connecting the document root to each package.
         """
+        packages = []
+        relationships = list(sbom_data.get("relationships", []))
+        doc_name = sbom_data.get("name", "Application")
+        doc_id = sbom_data.get("id", "unknown")
+
+        for c in sbom_data.get("components", []):
+            spdx_id = c.get("SPDXID") or f"SPDXRef-Package-{c.get('id', 'unknown')}"
+            pkg = {
+                "SPDXID": spdx_id,
+                "name": c.get("name", "unknown"),
+                "versionInfo": c.get("version", "NOASSERTION"),
+                "supplier": c.get("supplier", "NOASSERTION"),
+                "downloadLocation": c.get("source_url", "NOASSERTION"),
+                "filesAnalyzed": False,
+                "licenseConcluded": c.get("licenseConcluded", "NOASSERTION"),
+                "licenseDeclared": c.get("licenseDeclared", "NOASSERTION"),
+                "copyrightText": c.get("copyrightText", "NOASSERTION"),
+            }
+            if c.get("hashes"):
+                pkg["checksums"] = [
+                    {"algorithm": h["alg"], "checksumValue": h["content"]}
+                    for h in c["hashes"]
+                    if h.get("content")
+                ]
+            if c.get("externalRefs"):
+                pkg["externalRefs"] = [
+                    {
+                        "referenceCategory": "PACKAGE-MANAGER",
+                        "referenceType": ref["referenceType"],
+                        "referenceLocator": ref["referenceLocator"],
+                    }
+                    for ref in c["externalRefs"]
+                    if ref.get("referenceLocator")
+                ]
+            packages.append(pkg)
+
+            # Document DESCRIBES every top-level package
+            relationships.append({
+                "spdxElementId": "SPDXRef-DOCUMENT",
+                "relatedSpdxElement": spdx_id,
+                "relationshipType": "DESCRIBES",
+            })
+
         spdx_doc = {
             "spdxVersion": f"SPDX-{self.SPDX_VERSION}",
             "dataLicense": "CC0-1.0",
             "SPDXID": "SPDXRef-DOCUMENT",
-            "name": sbom_data.get("name", "Application"),
-            "documentNamespace": f"https://sbom.pysoar/{sbom_data.get('id', 'unknown')}",
+            "name": doc_name,
+            "documentNamespace": f"https://sbom.pysoar/{doc_id}",
             "creationInfo": {
                 "created": datetime.utcnow().isoformat() + "Z",
-                "creators": [sbom_data.get("created_by_tool", "PySOAR")],
+                "creators": [f"Tool: {sbom_data.get('created_by_tool', 'PySOAR')}"],
                 "licenseListVersion": "3.19",
             },
-            "packages": sbom_data.get("components", []),
-            "relationships": sbom_data.get("relationships", []),
+            "packages": packages,
+            "relationships": relationships,
         }
         return json.dumps(spdx_doc, indent=2)
 
     def generate_cyclonedx_output(self, sbom_data: dict[str, Any]) -> str:
-        """Generate CycloneDX JSON output
+        """Generate a spec-compliant CycloneDX 1.4 JSON document.
 
-        Args:
-            sbom_data: SBOM data dictionary
-
-        Returns:
-            CycloneDX JSON formatted string
+        Expects ``sbom_data["components"]`` to include name/version/purl/
+        hashes/licenseConcluded from the endpoint layer. Emits a proper
+        ``dependencies`` graph derived from the passed-in relationships.
         """
+        app_ref = sbom_data.get("id", "application")
+
+        cdx_components = []
+        for c in sbom_data.get("components", []):
+            entry = {
+                "bom-ref": c.get("bom-ref", c.get("id", "unknown")),
+                "type": c.get("type", "library"),
+                "name": c.get("name", "unknown"),
+                "version": c.get("version", "NOASSERTION"),
+            }
+            if c.get("supplier") and c["supplier"] != "NOASSERTION":
+                entry["supplier"] = {"name": c["supplier"].replace("Organization: ", "")}
+            if c.get("purl"):
+                entry["purl"] = c["purl"]
+            if c.get("cpe"):
+                entry["cpe"] = c["cpe"]
+            if c.get("hashes"):
+                entry["hashes"] = [
+                    {"alg": h["alg"], "content": h["content"]}
+                    for h in c["hashes"]
+                    if h.get("content")
+                ]
+            license_val = c.get("licenseConcluded") or c.get("licenseDeclared")
+            if license_val and license_val != "NOASSERTION":
+                entry["licenses"] = [{"license": {"id": license_val}}]
+            cdx_components.append(entry)
+
+        # Build dependencies graph from relationships
+        dep_map: dict[str, list[str]] = {}
+        for rel in sbom_data.get("relationships", []):
+            parent = rel.get("spdxElementId", "").replace("SPDXRef-Package-", "")
+            child = rel.get("relatedSpdxElement", "").replace("SPDXRef-Package-", "")
+            if parent and child:
+                dep_map.setdefault(parent, []).append(child)
+
+        dependencies = [
+            {"ref": ref, "dependsOn": deps} for ref, deps in dep_map.items()
+        ]
+
         cyclonedx_doc = {
             "bomFormat": "CycloneDX",
             "specVersion": self.CYCLONEDX_VERSION,
-            "serialNumber": f"urn:uuid:{sbom_data.get('id', 'unknown')}",
+            "serialNumber": f"urn:uuid:{app_ref}",
             "version": 1,
             "metadata": {
                 "timestamp": datetime.utcnow().isoformat() + "Z",
-                "tools": [{"name": sbom_data.get("created_by_tool", "PySOAR")}],
+                "tools": [{"vendor": "PySOAR", "name": sbom_data.get("created_by_tool", "PySOAR")}],
                 "component": {
                     "bom-ref": "application",
                     "type": "application",
@@ -182,7 +261,8 @@ class SBOMGenerator:
                     "version": sbom_data.get("version", "1.0"),
                 },
             },
-            "components": sbom_data.get("components", []),
+            "components": cdx_components,
+            "dependencies": dependencies,
         }
         return json.dumps(cyclonedx_doc, indent=2)
 

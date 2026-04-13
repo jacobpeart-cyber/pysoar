@@ -43,6 +43,10 @@ class UserResponse(UserBase, DBModel):
     is_superuser: bool = False
     avatar_url: Optional[str] = None
     last_login: Optional[str] = None
+    # Exposed so the frontend can subscribe to per-org WebSocket
+    # channels (agents:<org_id>, purple:<org_id>:<sim_id>) without
+    # needing a second round-trip to fetch organization membership.
+    organization_id: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 

@@ -237,14 +237,93 @@ class STRIDEAnalyzer:
         Returns:
             List of MITRE technique IDs
         """
-        # Simplified mapping based on STRIDE category
+        # Comprehensive STRIDE-to-MITRE ATT&CK mapping
         mappings = {
-            STRIDECategory.SPOOFING: ["T1589", "T1598"],  # Gathering info
-            STRIDECategory.TAMPERING: ["T1565", "T1492"],  # Data destruction
-            STRIDECategory.REPUDIATION: ["T1070"],  # Indicator removal
-            STRIDECategory.INFORMATION_DISCLOSURE: ["T1005", "T1041"],  # Data gathering
-            STRIDECategory.DENIAL_OF_SERVICE: ["T1499"],  # Network DoS
-            STRIDECategory.ELEVATION_OF_PRIVILEGE: ["T1548"],  # Abuse elevation
+            STRIDECategory.SPOOFING: [
+                "T1589",    # Gather Victim Identity Information
+                "T1598",    # Phishing for Information
+                "T1557",    # Adversary-in-the-Middle
+                "T1556",    # Modify Authentication Process
+                "T1550",    # Use Alternate Authentication Material
+                "T1539",    # Steal Web Session Cookie
+                "T1528",    # Steal Application Access Token
+                "T1558",    # Steal or Forge Kerberos Tickets
+                "T1134",    # Access Token Manipulation
+                "T1583.001",  # Acquire Infrastructure: Domains
+            ],
+            STRIDECategory.TAMPERING: [
+                "T1565",    # Data Manipulation
+                "T1565.001",  # Stored Data Manipulation
+                "T1565.002",  # Transmitted Data Manipulation
+                "T1565.003",  # Runtime Data Manipulation
+                "T1485",    # Data Destruction
+                "T1491",    # Defacement
+                "T1491.001",  # Internal Defacement
+                "T1491.002",  # External Defacement
+                "T1195",    # Supply Chain Compromise
+                "T1195.002",  # Compromise Software Supply Chain
+                "T1059",    # Command and Scripting Interpreter
+                "T1055",    # Process Injection
+            ],
+            STRIDECategory.REPUDIATION: [
+                "T1070",    # Indicator Removal
+                "T1070.001",  # Clear Windows Event Logs
+                "T1070.002",  # Clear Linux or Mac System Logs
+                "T1070.003",  # Clear Command History
+                "T1070.004",  # File Deletion
+                "T1070.006",  # Timestomp
+                "T1562",    # Impair Defenses
+                "T1562.001",  # Disable or Modify Tools
+                "T1562.002",  # Disable Windows Event Logging
+                "T1036",    # Masquerading
+            ],
+            STRIDECategory.INFORMATION_DISCLOSURE: [
+                "T1005",    # Data from Local System
+                "T1039",    # Data from Network Shared Drive
+                "T1025",    # Data from Removable Media
+                "T1041",    # Exfiltration Over C2 Channel
+                "T1048",    # Exfiltration Over Alternative Protocol
+                "T1567",    # Exfiltration Over Web Service
+                "T1530",    # Data from Cloud Storage
+                "T1119",    # Automated Collection
+                "T1213",    # Data from Information Repositories
+                "T1114",    # Email Collection
+                "T1557",    # Adversary-in-the-Middle
+                "T1040",    # Network Sniffing
+                "T1552",    # Unsecured Credentials
+                "T1003",    # OS Credential Dumping
+            ],
+            STRIDECategory.DENIAL_OF_SERVICE: [
+                "T1499",    # Endpoint Denial of Service
+                "T1499.001",  # OS Exhaustion Flood
+                "T1499.002",  # Service Exhaustion Flood
+                "T1499.003",  # Application Exhaustion Flood
+                "T1499.004",  # Application or System Exploitation
+                "T1498",    # Network Denial of Service
+                "T1498.001",  # Direct Network Flood
+                "T1498.002",  # Reflection Amplification
+                "T1489",    # Service Stop
+                "T1486",    # Data Encrypted for Impact
+                "T1561",    # Disk Wipe
+                "T1529",    # System Shutdown/Reboot
+            ],
+            STRIDECategory.ELEVATION_OF_PRIVILEGE: [
+                "T1548",    # Abuse Elevation Control Mechanism
+                "T1548.001",  # Setuid and Setgid
+                "T1548.002",  # Bypass User Account Control
+                "T1548.003",  # Sudo and Sudo Caching
+                "T1068",    # Exploitation for Privilege Escalation
+                "T1134",    # Access Token Manipulation
+                "T1078",    # Valid Accounts
+                "T1078.001",  # Default Accounts
+                "T1078.002",  # Domain Accounts
+                "T1078.003",  # Local Accounts
+                "T1053",    # Scheduled Task/Job
+                "T1546",    # Event Triggered Execution
+                "T1547",    # Boot or Logon Autostart Execution
+                "T1574",    # Hijack Execution Flow
+                "T1055",    # Process Injection
+            ],
         }
 
         category = threat.stride_category
@@ -527,20 +606,83 @@ class AttackTreeGenerator:
         self, tree: dict[str, Any]
     ) -> dict[str, Any]:
         """
-        Calculate metrics for attack paths (cost, skill, probability)
+        Calculate real metrics for attack paths (cost, skill, probability)
+        derived from the threats actually present in the tree. Previous
+        version returned hardcoded fake values (average_cost=5000,
+        average_skill="medium", highest_probability=0.75) regardless of
+        the input — useless for any real assessment.
 
-        Args:
-            tree: Attack tree
-
-        Returns:
-            Path metrics
+        New behavior: walks the tree and computes metrics from each
+        threat's risk_score / likelihood / impact fields using standard
+        CAPEC-style heuristics.
         """
+        threats = self._flatten_tree(tree)
+        if not threats:
+            return {
+                "total_paths": 0,
+                "average_cost": 0,
+                "average_skill": "unknown",
+                "highest_probability": 0.0,
+            }
+
+        # Cost heuristic: lower-effort attacks (high-likelihood, low-risk-score)
+        # cost attackers less. Scale around 2k-50k USD based on inverse of
+        # risk_score + likelihood.
+        LIKELIHOOD_WEIGHTS = {"low": 0.25, "medium": 0.5, "high": 0.75, "critical": 1.0}
+        IMPACT_WEIGHTS = {"low": 0.25, "medium": 0.5, "high": 0.75, "critical": 1.0}
+
+        costs = []
+        probabilities = []
+        skill_levels = []
+
+        for t in threats:
+            lw = LIKELIHOOD_WEIGHTS.get((t.get("likelihood") or "medium").lower(), 0.5)
+            iw = IMPACT_WEIGHTS.get((t.get("impact") or "medium").lower(), 0.5)
+
+            # High-likelihood × low-impact = cheap attacks; inverse for costly
+            estimated_cost = int(50_000 * (1.0 - lw) + 2000)
+            costs.append(estimated_cost)
+
+            # Probability as the product of likelihood weight and a
+            # risk_score-normalized confidence (risk_score is 1..25 from the
+            # 5x5 matrix).
+            rs = float(t.get("risk_score") or 0)
+            probability = lw * min(1.0, rs / 25.0) if rs > 0 else lw * 0.5
+            probabilities.append(round(probability, 3))
+
+            # Skill inferred from impact: higher impact threats generally
+            # require more sophisticated attackers.
+            if iw >= 0.75:
+                skill_levels.append("high")
+            elif iw >= 0.5:
+                skill_levels.append("medium")
+            else:
+                skill_levels.append("low")
+
+        # Most common skill level wins
+        skill_counts = {"low": 0, "medium": 0, "high": 0}
+        for s in skill_levels:
+            skill_counts[s] = skill_counts.get(s, 0) + 1
+        dominant_skill = max(skill_counts.items(), key=lambda kv: kv[1])[0]
+
         return {
             "total_paths": self._count_paths(tree),
-            "average_cost": 5000,
-            "average_skill": "medium",
-            "highest_probability": 0.75,
+            "average_cost": int(sum(costs) / len(costs)),
+            "average_skill": dominant_skill,
+            "highest_probability": max(probabilities) if probabilities else 0.0,
+            "threat_count": len(threats),
         }
+
+    def _flatten_tree(self, tree: dict[str, Any]) -> list[dict[str, Any]]:
+        """Recursively flatten an attack tree into a list of threat dicts."""
+        out: list[dict[str, Any]] = []
+        if not tree or not isinstance(tree, dict):
+            return out
+        if tree.get("goal") or tree.get("risk_score") is not None:
+            out.append(tree)
+        for child in tree.get("children", []) or []:
+            out.extend(self._flatten_tree(child))
+        return out
 
     def _count_paths(self, node: dict[str, Any]) -> int:
         """Count total attack paths in tree"""

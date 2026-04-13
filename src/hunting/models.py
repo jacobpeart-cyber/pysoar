@@ -95,6 +95,10 @@ class HuntHypothesis(BaseModel):
 
     __tablename__ = "hunt_hypotheses"
 
+    organization_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("organizations.id"), nullable=True, index=True
+    )
+
     # Core fields
     title: Mapped[str] = mapped_column(String(500), nullable=False, index=True)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
@@ -154,6 +158,10 @@ class HuntSession(BaseModel):
 
     __tablename__ = "hunt_sessions"
 
+    organization_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("organizations.id"), nullable=True, index=True
+    )
+
     # Relationship to hypothesis
     hypothesis_id: Mapped[str] = mapped_column(
         String(36),
@@ -208,6 +216,10 @@ class HuntFinding(BaseModel):
     """
 
     __tablename__ = "hunt_findings"
+
+    organization_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("organizations.id"), nullable=True, index=True
+    )
 
     # Relationship to session
     session_id: Mapped[str] = mapped_column(

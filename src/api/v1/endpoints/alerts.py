@@ -2,11 +2,11 @@
 
 import json
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, status
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DatabaseSession
@@ -41,9 +41,12 @@ async def process_alert_correlation(alert_id: str):
             await db.rollback()
 
 
-async def get_alert_or_404(db: AsyncSession, alert_id: str) -> Alert:
-    """Get alert by ID or raise 404"""
-    result = await db.execute(select(Alert).where(Alert.id == alert_id))
+async def get_alert_or_404(db: AsyncSession, alert_id: str, org_id: Optional[str] = None) -> Alert:
+    """Get alert by ID or raise 404 (tenant-scoped)"""
+    stmt = select(Alert).where(Alert.id == alert_id)
+    if org_id is not None:
+        stmt = stmt.where(Alert.organization_id == org_id)
+    result = await db.execute(stmt)
     alert = result.scalar_one_or_none()
     if not alert:
         raise HTTPException(
@@ -70,7 +73,8 @@ async def list_alerts(
     sort_order: str = "desc",
 ):
     """List alerts with filtering and pagination"""
-    query = select(Alert)
+    org_id = getattr(current_user, "organization_id", None)
+    query = select(Alert).where(Alert.organization_id == org_id)
 
     # Apply filters
     if search:
@@ -100,7 +104,15 @@ async def list_alerts(
     )
     total = count_result.scalar() or 0
 
-    # Apply sorting
+    # Apply sorting — whitelist sortable columns to prevent clients from
+    # ordering by arbitrary (potentially sensitive) attributes via the query
+    # string. Anything outside this set falls back to created_at DESC.
+    _ALLOWED_ALERT_SORTS = {
+        "created_at", "updated_at", "severity", "status", "source",
+        "title", "assigned_to",
+    }
+    if sort_by not in _ALLOWED_ALERT_SORTS:
+        sort_by = "created_at"
     sort_column = getattr(Alert, sort_by, Alert.created_at)
     if sort_order == "desc":
         query = query.order_by(sort_column.desc())
@@ -126,6 +138,7 @@ async def list_alerts(
 async def create_alert(alert_data: AlertCreate, current_user: CurrentUser = None, db: DatabaseSession = None, background_tasks: BackgroundTasks = None):
     """Create a new alert"""
     alert = Alert(
+        organization_id=getattr(current_user, "organization_id", None) if current_user else None,
         title=alert_data.title,
         description=alert_data.description,
         severity=alert_data.severity,
@@ -180,34 +193,70 @@ async def get_alert_stats(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Get alert statistics"""
+    """Get alert statistics with real date-filtered counts (tenant-scoped)."""
+    org_id = getattr(current_user, "organization_id", None)
+    now = datetime.now(timezone.utc)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    week_start = now - timedelta(days=7)
+
+    org_filter = Alert.organization_id == org_id
+
     # Total count
-    total_result = await db.execute(select(func.count(Alert.id)))
+    total_result = await db.execute(
+        select(func.count(Alert.id)).where(org_filter)
+    )
     total = total_result.scalar() or 0
 
     # By severity
     severity_result = await db.execute(
         select(Alert.severity, func.count(Alert.id))
+        .where(org_filter)
         .group_by(Alert.severity)
     )
-    by_severity = dict(severity_result.all())
+    by_severity = {k: v for k, v in severity_result.all() if k is not None}
 
     # By status
     status_result = await db.execute(
         select(Alert.status, func.count(Alert.id))
+        .where(org_filter)
         .group_by(Alert.status)
     )
-    by_status = dict(status_result.all())
+    by_status = {k: v for k, v in status_result.all() if k is not None}
 
     # By source
     source_result = await db.execute(
         select(Alert.source, func.count(Alert.id))
+        .where(org_filter)
         .group_by(Alert.source)
     )
-    by_source = dict(source_result.all())
+    by_source = {k: v for k, v in source_result.all() if k is not None}
 
-    # New today (simplified - in production use proper date filtering)
-    new_today = by_status.get(AlertStatus.NEW.value, 0)
+    # Real "new today" and "new this week" counts
+    today_result = await db.execute(
+        select(func.count(Alert.id)).where(
+            and_(org_filter, Alert.created_at >= today_start)
+        )
+    )
+    new_today = today_result.scalar() or 0
+
+    week_result = await db.execute(
+        select(func.count(Alert.id)).where(
+            and_(org_filter, Alert.created_at >= week_start)
+        )
+    )
+    new_this_week = week_result.scalar() or 0
+
+    today_iso_prefix = today_start.isoformat()
+    resolved_result = await db.execute(
+        select(func.count(Alert.id)).where(
+            and_(
+                org_filter,
+                Alert.resolved_at.is_not(None),
+                Alert.resolved_at >= today_iso_prefix,
+            )
+        )
+    )
+    resolved_today = resolved_result.scalar() or 0
 
     return AlertStats(
         total=total,
@@ -215,7 +264,8 @@ async def get_alert_stats(
         by_status=by_status,
         by_source=by_source,
         new_today=new_today,
-        new_this_week=total,  # Simplified
+        new_this_week=new_this_week,
+        resolved_today=resolved_today,
     )
 
 
@@ -226,7 +276,7 @@ async def get_alert(
     db: DatabaseSession = None,
 ):
     """Get an alert by ID"""
-    alert = await get_alert_or_404(db, alert_id)
+    alert = await get_alert_or_404(db, alert_id, getattr(current_user, "organization_id", None))
     return AlertResponse.model_validate(alert)
 
 
@@ -238,7 +288,7 @@ async def update_alert(
     db: DatabaseSession = None,
 ):
     """Update an alert"""
-    alert = await get_alert_or_404(db, alert_id)
+    alert = await get_alert_or_404(db, alert_id, getattr(current_user, "organization_id", None))
 
     update_data = alert_data.model_dump(exclude_unset=True, exclude_none=True)
 
@@ -266,9 +316,12 @@ async def delete_alert(
     db: DatabaseSession = None,
 ):
     """Delete an alert"""
-    alert = await get_alert_or_404(db, alert_id)
+    alert = await get_alert_or_404(db, alert_id, getattr(current_user, "organization_id", None))
     await db.delete(alert)
     await db.flush()
+
+
+_VALID_BULK_ACTIONS = {"acknowledge", "close", "assign", "resolve", "delete", "in_progress"}
 
 
 @router.post("/bulk", response_model=None)
@@ -277,13 +330,44 @@ async def bulk_action(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Perform bulk action on alerts"""
-    success_count = 0
-    failures = []
+    """Perform bulk action on alerts.
 
+    Supported actions: acknowledge, in_progress, resolve, close, assign, delete.
+    `assign` requires `value` to be set to a user ID.
+    """
+    if action_data.action not in _VALID_BULK_ACTIONS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid action. Supported: {sorted(_VALID_BULK_ACTIONS)}",
+        )
+    if action_data.action == "assign" and not action_data.value:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="The 'assign' action requires a non-empty value (user ID).",
+        )
+    if not action_data.alert_ids:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="alert_ids must contain at least one alert ID.",
+        )
+    if len(action_data.alert_ids) > 500:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="A single bulk request may target at most 500 alerts.",
+        )
+
+    success_count = 0
+    failures: list[dict] = []
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    org_id = getattr(current_user, "organization_id", None)
     for alert_id in action_data.alert_ids:
         try:
-            result = await db.execute(select(Alert).where(Alert.id == alert_id))
+            result = await db.execute(
+                select(Alert).where(
+                    and_(Alert.id == alert_id, Alert.organization_id == org_id)
+                )
+            )
             alert = result.scalar_one_or_none()
 
             if not alert:
@@ -292,18 +376,24 @@ async def bulk_action(
 
             if action_data.action == "acknowledge":
                 alert.status = AlertStatus.ACKNOWLEDGED.value
+            elif action_data.action == "in_progress":
+                alert.status = AlertStatus.IN_PROGRESS.value
             elif action_data.action == "close":
                 alert.status = AlertStatus.CLOSED.value
+                if not alert.resolved_at:
+                    alert.resolved_at = now_iso
             elif action_data.action == "assign":
                 alert.assigned_to = action_data.value
             elif action_data.action == "resolve":
                 alert.status = AlertStatus.RESOLVED.value
-                alert.resolved_at = datetime.now(timezone.utc).isoformat()
+                alert.resolved_at = now_iso
+            elif action_data.action == "delete":
+                await db.delete(alert)
 
             success_count += 1
 
         except Exception as e:
-            failures.append({"id": alert_id, "error": str(e)})
+            failures.append({"id": alert_id, "error": str(e)[:200]})
 
     await db.flush()
 

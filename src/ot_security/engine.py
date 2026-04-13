@@ -114,12 +114,36 @@ class OTMonitor:
                 logger.error(f"Invalid network range: {network_range}")
                 return discovered
 
-            # Simulate discovery by sweeping network
-            # In production, use actual network monitoring sensors
-            for ip in list(network.hosts())[:256]:  # Limit to first 256 for demo
-                asset = await self._probe_device(str(ip))
-                if asset:
-                    discovered.append(asset)
+            # Query existing OT assets in the database that fall within this network range
+            from src.core.database import async_session_factory
+            from sqlalchemy import select
+            from src.ot_security.models import OTAsset
+
+            async with async_session_factory() as db:
+                query = select(OTAsset).where(
+                    OTAsset.organization_id == self.organization_id
+                )
+                result = await db.execute(query)
+                existing_assets = list(result.scalars().all())
+
+            # Filter assets whose IP falls within the target network range
+            for asset in existing_assets:
+                asset_ip = getattr(asset, 'ip_address', None)
+                if asset_ip:
+                    try:
+                        if ip_address(asset_ip) in network:
+                            discovered.append({
+                                "ip_address": asset_ip,
+                                "protocols_detected": [asset.protocol] if asset.protocol else [],
+                                "asset_type": asset.asset_type,
+                                "vendor": asset.vendor,
+                                "model": asset.model,
+                                "firmware_version": asset.firmware_version,
+                                "name": asset.name,
+                                "id": asset.id,
+                            })
+                    except (ValueError, TypeError):
+                        continue
 
             logger.info(f"Discovered {len(discovered)} OT assets")
             return discovered
@@ -130,54 +154,75 @@ class OTMonitor:
 
     async def _probe_device(self, ip_address_str: str) -> Optional[Dict[str, Any]]:
         """
-        Probe device for protocol signatures and device information.
+        Probe device by looking up known asset data from the database.
 
-        Simulates connecting to common OT protocols and parsing responses.
+        Derives protocol information from stored asset records.
         """
-        # Simulate protocol fingerprinting
-        device_info = {
+        from src.core.database import async_session_factory
+        from sqlalchemy import select
+        from src.ot_security.models import OTAsset
+
+        async with async_session_factory() as db:
+            query = select(OTAsset).where(
+                OTAsset.organization_id == self.organization_id,
+                OTAsset.ip_address == ip_address_str,
+            )
+            result = await db.execute(query)
+            asset = result.scalar_one_or_none()
+
+        if not asset:
+            return None
+
+        protocols = []
+        if asset.protocol:
+            protocols.append(asset.protocol)
+
+        return {
             "ip_address": ip_address_str,
-            "protocols_detected": [],
-            "asset_type": None,
-            "vendor": None,
-            "model": None,
+            "protocols_detected": protocols,
+            "asset_type": asset.asset_type,
+            "vendor": asset.vendor,
+            "model": asset.model,
+            "firmware_version": asset.firmware_version,
+            "name": asset.name,
+            "id": asset.id,
         }
 
-        # In production, perform actual protocol probes
-        # Check Modbus TCP
-        if self._check_modbus_tcp(ip_address_str):
-            device_info["protocols_detected"].append("modbus_tcp")
-            device_info["asset_type"] = "plc"
-
-        # Check OPC-UA
-        if self._check_opc_ua(ip_address_str):
-            device_info["protocols_detected"].append("opc_ua")
-            device_info["asset_type"] = "scada_server"
-
-        # Check DNP3
-        if self._check_dnp3(ip_address_str):
-            device_info["protocols_detected"].append("dnp3")
-            device_info["asset_type"] = "rtu"
-
-        if device_info["protocols_detected"]:
-            return device_info
-
-        return None
-
     def _check_modbus_tcp(self, ip: str) -> bool:
-        """Check if device responds to Modbus TCP (port 502)"""
-        # Simulation only
-        return hash(ip) % 10 < 3
+        """Check if device responds to Modbus TCP (port 502) via socket probe"""
+        import socket
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(self.protocol_profiles["modbus_tcp"]["default_timeout"])
+            result = sock.connect_ex((ip, 502))
+            sock.close()
+            return result == 0
+        except (socket.error, OSError):
+            return False
 
     def _check_opc_ua(self, ip: str) -> bool:
-        """Check if device responds to OPC-UA (port 4840)"""
-        # Simulation only
-        return hash(ip) % 15 < 2
+        """Check if device responds to OPC-UA (port 4840) via socket probe"""
+        import socket
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(self.protocol_profiles.get("opc_ua", {}).get("default_timeout", 3))
+            result = sock.connect_ex((ip, 4840))
+            sock.close()
+            return result == 0
+        except (socket.error, OSError):
+            return False
 
     def _check_dnp3(self, ip: str) -> bool:
-        """Check if device responds to DNP3 (port 20000)"""
-        # Simulation only
-        return hash(ip) % 20 < 2
+        """Check if device responds to DNP3 (port 20000) via socket probe"""
+        import socket
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(self.protocol_profiles["dnp3"]["default_timeout"])
+            result = sock.connect_ex((ip, 20000))
+            sock.close()
+            return result == 0
+        except (socket.error, OSError):
+            return False
 
     async def monitor_communications(
         self, zone_enforcer: "PurdueModelEnforcer"

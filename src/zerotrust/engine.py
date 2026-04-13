@@ -8,7 +8,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from sqlalchemy import and_, desc, select
+from sqlalchemy import and_, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.logging import get_logger
@@ -567,6 +567,47 @@ class MicroSegmentationEngine:
         logger.info("segment_created", segment_id=segment.id, name=name)
         return segment
 
+    @staticmethod
+    def _safe_json_list(raw: Optional[str]) -> list:
+        """Parse a JSON column that is supposed to be a list, returning
+        an empty list on any corruption / manual-edit damage rather
+        than crashing the entire evaluate_traffic path."""
+        if not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, list) else []
+        except (ValueError, TypeError):
+            logger.warning(
+                "microsegment json column failed to parse; treating as empty",
+                extra={"raw": raw[:120]},
+            )
+            return []
+
+    @staticmethod
+    def _ip_in_any_cidr(ip_str: str, cidr_list: list) -> bool:
+        """Real network containment check using the stdlib ``ipaddress``
+        module. The previous implementation did a substring prefix
+        match on the first three octets, which produced wrong answers
+        for every prefix that wasn't exactly /24 — e.g. 10.0.0.0/16
+        never matched 10.0.5.42, and 10.0.0.0/28 silently matched the
+        entire /24."""
+        import ipaddress
+
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except (ValueError, TypeError):
+            return False
+
+        for cidr in cidr_list:
+            try:
+                network = ipaddress.ip_network(cidr, strict=False)
+                if ip in network:
+                    return True
+            except (ValueError, TypeError):
+                continue
+        return False
+
     async def evaluate_traffic(
         self,
         source: str,
@@ -592,12 +633,10 @@ class MicroSegmentationEngine:
 
         matched_segments = []
         for segment in segments:
-            cidr_ranges = json.loads(segment.cidr_ranges or "[]")
-            # Check if source or destination falls within segment CIDR ranges
-            source_in_segment = any(source.startswith(cidr.split("/")[0].rsplit(".", 1)[0]) for cidr in cidr_ranges) if cidr_ranges else False
-            dest_in_segment = any(destination.startswith(cidr.split("/")[0].rsplit(".", 1)[0]) for cidr in cidr_ranges) if cidr_ranges else False
-
-            if source_in_segment or dest_in_segment:
+            cidr_ranges = self._safe_json_list(segment.cidr_ranges)
+            if not cidr_ranges:
+                continue
+            if self._ip_in_any_cidr(source, cidr_ranges) or self._ip_in_any_cidr(destination, cidr_ranges):
                 matched_segments.append(segment)
 
         if not matched_segments:
@@ -609,8 +648,8 @@ class MicroSegmentationEngine:
 
         # Evaluate against each matched segment's policies
         for segment in matched_segments:
-            allowed_protocols = json.loads(segment.allowed_protocols or "[]")
-            allowed_ports = json.loads(segment.allowed_ports or "[]")
+            allowed_protocols = self._safe_json_list(segment.allowed_protocols)
+            allowed_ports_raw = self._safe_json_list(segment.allowed_ports)
 
             # Check protocol
             if allowed_protocols and protocol not in allowed_protocols:
@@ -620,13 +659,18 @@ class MicroSegmentationEngine:
                     "segments": [{"id": segment.id, "name": segment.name}],
                 }
 
-            # Check port
-            if allowed_ports and port not in [int(p) for p in allowed_ports]:
-                return {
-                    "allowed": False,
-                    "reason": f"Port {port} not allowed in segment '{segment.name}'",
-                    "segments": [{"id": segment.id, "name": segment.name}],
-                }
+            # Check port (tolerate mixed int/str in the JSON column)
+            if allowed_ports_raw:
+                try:
+                    allowed_ports = {int(p) for p in allowed_ports_raw}
+                except (TypeError, ValueError):
+                    allowed_ports = set()
+                if allowed_ports and port not in allowed_ports:
+                    return {
+                        "allowed": False,
+                        "reason": f"Port {port} not allowed in segment '{segment.name}'",
+                        "segments": [{"id": segment.id, "name": segment.name}],
+                    }
 
         return {
             "allowed": True,
@@ -945,12 +989,17 @@ class ZeroTrustScorer:
         """
         logger.info("calculating_zero_trust_maturity")
 
+        # NIST SP 800-207 defines 7 zero-trust pillars; the previous
+        # calculation only scored 5 and hid "visibility & analytics"
+        # and "automation & orchestration" from the maturity dashboard.
         pillars = {
             "identity": await self.assess_pillar("identity"),
             "devices": await self.assess_pillar("devices"),
             "networks": await self.assess_pillar("networks"),
             "applications": await self.assess_pillar("applications"),
             "data": await self.assess_pillar("data"),
+            "visibility": await self.assess_pillar("visibility"),
+            "automation": await self.assess_pillar("automation"),
         }
 
         # Calculate overall score (average of pillars)
@@ -1076,6 +1125,107 @@ class ZeroTrustScorer:
             score += min(len(data_policies) * 10.0, 40.0)
             if data_policies:
                 score += (len(classified) / len(data_policies)) * 50.0
+
+        elif pillar == "visibility":
+            # NIST 800-207 "Visibility & Analytics": measured by the
+            # presence of active SIEM detection rules, recent log
+            # ingestion, and UEBA entity coverage. The idea is that
+            # zero trust requires continuous monitoring, so we give
+            # credit for each of those signals existing.
+            from datetime import datetime as _dt, timedelta as _td
+
+            active_rules = 0
+            log_count_24h = 0
+            entity_count = 0
+            try:
+                from src.siem.models import DetectionRule, LogEntry, RuleStatus
+                rules_q = await self.db.execute(
+                    select(func.count(DetectionRule.id)).where(
+                        DetectionRule.status == RuleStatus.ACTIVE.value
+                    )
+                )
+                active_rules = rules_q.scalar() or 0
+                logs_q = await self.db.execute(
+                    select(func.count(LogEntry.id)).where(
+                        LogEntry.created_at >= _dt.utcnow() - _td(hours=24)
+                    )
+                )
+                log_count_24h = logs_q.scalar() or 0
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                from src.ueba.models import EntityProfile
+                entities_q = await self.db.execute(
+                    select(func.count(EntityProfile.id)).where(
+                        EntityProfile.organization_id == self.organization_id
+                    )
+                )
+                entity_count = entities_q.scalar() or 0
+            except Exception:  # noqa: BLE001
+                pass
+
+            details["active_detection_rules"] = active_rules
+            details["logs_last_24h"] = log_count_24h
+            details["ueba_entities"] = entity_count
+            # Scoring: 10 baseline + up to 40 for rules + 30 for log
+            # ingestion + 20 for UEBA entities.
+            score = 10.0
+            score += min(active_rules * 2.0, 40.0)
+            if log_count_24h > 0:
+                score += min((log_count_24h / 1000.0) * 30.0, 30.0)
+            score += min(entity_count * 2.0, 20.0)
+
+        elif pillar == "automation":
+            # NIST 800-207 "Automation & Orchestration": enabled
+            # playbooks, enabled remediation policies, and enrolled
+            # endpoint agents. A mature ZT posture automates response
+            # rather than relying on humans clicking buttons.
+            enabled_playbooks = 0
+            enabled_policies = 0
+            agent_count = 0
+            try:
+                from src.models.playbook import Playbook
+                pb_q = await self.db.execute(
+                    select(func.count(Playbook.id)).where(
+                        Playbook.is_enabled == True  # noqa: E712
+                    )
+                )
+                enabled_playbooks = pb_q.scalar() or 0
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                from src.remediation.models import RemediationPolicy
+                rp_q = await self.db.execute(
+                    select(func.count(RemediationPolicy.id)).where(
+                        and_(
+                            RemediationPolicy.is_enabled == True,  # noqa: E712
+                            RemediationPolicy.organization_id == self.organization_id,
+                        )
+                    )
+                )
+                enabled_policies = rp_q.scalar() or 0
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                from src.agents.models import EndpointAgent
+                ag_q = await self.db.execute(
+                    select(func.count(EndpointAgent.id)).where(
+                        EndpointAgent.organization_id == self.organization_id
+                    )
+                )
+                agent_count = ag_q.scalar() or 0
+            except Exception:  # noqa: BLE001
+                pass
+
+            details["enabled_playbooks"] = enabled_playbooks
+            details["enabled_remediation_policies"] = enabled_policies
+            details["enrolled_agents"] = agent_count
+            # Scoring: 10 baseline + up to 30 for playbooks + 30 for
+            # remediation policies + 30 for enrolled agents.
+            score = 10.0
+            score += min(enabled_playbooks * 5.0, 30.0)
+            score += min(enabled_policies * 5.0, 30.0)
+            score += min(agent_count * 5.0, 30.0)
 
         score = min(score, 100.0)
         maturity_level = self.get_maturity_level_from_score(score)

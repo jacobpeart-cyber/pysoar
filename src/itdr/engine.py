@@ -424,20 +424,42 @@ class CredentialMonitor:
         """
         exposures = []
 
-        for cred in credentials:
-            user = cred.get("user")
-            cred_type = cred.get("type")
-            value_hash = cred.get("hash")
+        # Check against real CredentialLeak table from the dark web monitoring module
+        known_exposed_emails: set[str] = set()
+        try:
+            from src.darkweb.models import CredentialLeak
+            import asyncio
+            from src.core.database import async_session_factory
+            from sqlalchemy import select as _sel
 
-            # Simulate breach database lookup
-            is_exposed = hash(value_hash or "") % 100 < 15  # 15% exposure rate simulation
+            async def _load_leaked():
+                async with async_session_factory() as session:
+                    rows = (await session.execute(
+                        _sel(CredentialLeak.email).where(
+                            CredentialLeak.is_remediated == False  # noqa: E712
+                        )
+                    )).scalars().all()
+                    return {e.lower() for e in rows if e}
+
+            try:
+                known_exposed_emails = asyncio.run(_load_leaked())
+            except RuntimeError:
+                pass
+        except ImportError:
+            self.logger.debug("CredentialLeak model not available, skipping breach lookup")
+
+        for cred in credentials:
+            user = cred.get("user", "")
+            cred_type = cred.get("type")
+
+            is_exposed = user.lower() in known_exposed_emails if user else False
 
             if is_exposed:
                 exposure = {
                     "user": user,
                     "credential_type": cred_type,
                     "is_exposed": True,
-                    "exposure_source": "dark_web",
+                    "exposure_source": "credential_leak_database",
                     "exposure_date": datetime.now(timezone.utc).isoformat(),
                     "risk_level": "high",
                 }
@@ -697,38 +719,88 @@ class CredentialMonitor:
             "failure_count": 0,
         }
 
-        for exposure in exposures:
-            user = exposure.get("user")
-            cred_type = exposure.get("credential_type")
+        import asyncio
+        from src.core.database import async_session_factory
 
-            # Simulate remediation actions
-            if cred_type == "password":
+        async def _remediate_user(user_email: str, cred_type: str) -> dict:
+            async with async_session_factory() as session:
+                from src.models.user import User
+                from sqlalchemy import select as _sel
+
+                result = await session.execute(
+                    _sel(User).where(User.email == user_email)
+                )
+                user_record = result.scalar_one_or_none()
+
+                if cred_type == "password" and user_record:
+                    # Force password reset by disabling the account and
+                    # creating a TicketActivity requesting password change.
+                    user_record.is_active = False
+                    from src.tickethub.models import TicketActivity
+                    activity = TicketActivity(
+                        source_type="identity_threat",
+                        source_id=user_record.id,
+                        activity_type="forced_password_reset",
+                        description=f"Account disabled due to credential exposure. Password reset required for {user_email}.",
+                    )
+                    session.add(activity)
+                    await session.commit()
+                    return {
+                        "user": user_email,
+                        "action": "password_reset",
+                        "status": "completed",
+                        "details": f"Account disabled and password reset ticket created for {user_email}",
+                        "success": True,
+                    }
+                elif cred_type == "api_key" and user_record:
+                    # Revoke all API keys for this user
+                    from src.models.api_key import APIKey
+                    keys = (await session.execute(
+                        _sel(APIKey).where(APIKey.owner_id == user_record.id, APIKey.is_active == True)
+                    )).scalars().all()
+                    revoked_count = 0
+                    for key in keys:
+                        key.is_active = False
+                        revoked_count += 1
+                    await session.commit()
+                    return {
+                        "user": user_email,
+                        "action": "token_revocation",
+                        "status": "completed",
+                        "details": f"Revoked {revoked_count} API key(s) for {user_email}",
+                        "success": True,
+                    }
+                else:
+                    return {
+                        "user": user_email,
+                        "action": f"remediate_{cred_type}",
+                        "status": "pending_manual_review",
+                        "details": f"User not found or unsupported credential type ({cred_type}). Manual remediation required.",
+                        "success": False,
+                    }
+
+        for exposure in exposures:
+            user_email = exposure.get("user", "")
+            cred_type = exposure.get("credential_type", "unknown")
+
+            try:
+                action = asyncio.run(_remediate_user(user_email, cred_type))
+            except RuntimeError:
                 action = {
-                    "user": user,
-                    "action": "password_reset",
-                    "status": "initiated",
-                    "details": f"Password reset initiated for {user}",
+                    "user": user_email,
+                    "action": f"remediate_{cred_type}",
+                    "status": "error",
+                    "details": "Could not execute remediation (event loop conflict)",
+                    "success": False,
                 }
-                results["success_count"] += 1
-            elif cred_type == "api_key":
-                action = {
-                    "user": user,
-                    "action": "token_revocation",
-                    "status": "completed",
-                    "details": f"API key revoked for {user}",
-                }
+
+            if action.get("success"):
                 results["success_count"] += 1
             else:
-                action = {
-                    "user": user,
-                    "action": f"remediate_{cred_type}",
-                    "status": "pending_approval",
-                    "details": f"Remediation pending for {cred_type}",
-                }
                 results["failure_count"] += 1
 
             results["actions_taken"].append(action)
-            self.logger.info(f"Remediation action: {action['action']} for {user}")
+            self.logger.info(f"Remediation action: {action['action']} for {user_email} -> {action['status']}")
 
         return results
 

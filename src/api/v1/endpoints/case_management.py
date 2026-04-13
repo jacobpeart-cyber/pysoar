@@ -71,8 +71,8 @@ class NoteResponse(BaseModel):
     incident_id: str
     author_id: str
     author_name: Optional[str] = None
-    created_at: str
-    updated_at: str
+    created_at: datetime
+    updated_at: datetime
 
     class Config:
         from_attributes = True
@@ -107,15 +107,15 @@ class TaskResponse(BaseModel):
     description: Optional[str]
     status: str
     priority: int
-    due_date: Optional[str]
-    completed_at: Optional[str]
+    due_date: Optional[str]  # stored as ISO string on the Task model
+    completed_at: Optional[str]  # stored as ISO string on the Task model
     incident_id: str
     assigned_to: Optional[str]
     assignee_name: Optional[str] = None
     created_by: str
     creator_name: Optional[str] = None
-    created_at: str
-    updated_at: str
+    created_at: datetime
+    updated_at: datetime
 
     class Config:
         from_attributes = True
@@ -137,7 +137,7 @@ class AttachmentResponse(BaseModel):
     incident_id: str
     uploaded_by: str
     uploader_name: Optional[str] = None
-    created_at: str
+    created_at: datetime
 
     class Config:
         from_attributes = True
@@ -156,7 +156,7 @@ class TimelineResponse(BaseModel):
     incident_id: str
     actor_id: Optional[str]
     actor_name: Optional[str] = None
-    created_at: str
+    created_at: datetime
 
     class Config:
         from_attributes = True
@@ -208,7 +208,7 @@ async def add_timeline_event(
         description=description,
         old_value=old_value,
         new_value=new_value,
-        metadata=json.dumps(metadata) if metadata else None,
+        event_metadata=json.dumps(metadata) if metadata else None,
         actor_id=actor_id,
     )
     db.add(event)
@@ -786,6 +786,52 @@ async def upload_attachment(
     )
 
 
+@router.get(
+    "/incidents/{incident_id}/attachments/{attachment_id}/download",
+)
+async def download_attachment(
+    incident_id: str,
+    attachment_id: str,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
+):
+    """Stream an incident attachment back to the caller as a real file download.
+
+    Enforces the same tenant boundary as the rest of the incidents API: the
+    attachment must belong to an incident the caller can see. File is streamed
+    with the original filename in Content-Disposition.
+    """
+    from fastapi.responses import FileResponse
+
+    await get_incident_or_404(db, incident_id)
+
+    result = await db.execute(
+        select(CaseAttachment).where(
+            CaseAttachment.id == attachment_id,
+            CaseAttachment.incident_id == incident_id,
+        )
+    )
+    attachment = result.scalar_one_or_none()
+
+    if not attachment:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Attachment not found",
+        )
+
+    if not attachment.file_path or not os.path.exists(attachment.file_path):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Attachment file missing on disk",
+        )
+
+    return FileResponse(
+        path=attachment.file_path,
+        media_type=attachment.mime_type or "application/octet-stream",
+        filename=attachment.original_filename or "attachment",
+    )
+
+
 @router.delete(
     "/incidents/{incident_id}/attachments/{attachment_id}",
     status_code=status.HTTP_204_NO_CONTENT,
@@ -866,7 +912,7 @@ async def get_timeline(
             description=event.description,
             old_value=event.old_value,
             new_value=event.new_value,
-            metadata=safe_json_loads(event.metadata, {}) if event.metadata else None,
+            metadata=safe_json_loads(event.event_metadata, {}) if event.event_metadata else None,
             incident_id=event.incident_id,
             actor_id=event.actor_id,
             actor_name=event.actor.full_name if event.actor else None,
@@ -909,7 +955,7 @@ async def create_timeline_event(
         description=event.description,
         old_value=event.old_value,
         new_value=event.new_value,
-        metadata=safe_json_loads(event.metadata, {}) if event.metadata else None,
+        metadata=safe_json_loads(event.event_metadata, {}) if event.event_metadata else None,
         incident_id=event.incident_id,
         actor_id=event.actor_id,
         actor_name=current_user.full_name,

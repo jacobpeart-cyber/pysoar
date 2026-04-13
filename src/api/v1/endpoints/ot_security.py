@@ -7,11 +7,11 @@ incident coordination, and compliance reporting.
 
 import json
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, status
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DatabaseSession
@@ -68,10 +68,13 @@ logger = get_logger(__name__)
 router = APIRouter(prefix="/ot_security", tags=["OT Security"])
 
 
-# Helper functions
-async def get_asset_or_404(db: AsyncSession, asset_id: str) -> OTAsset:
-    """Get OT asset by ID or raise 404"""
-    result = await db.execute(select(OTAsset).where(OTAsset.id == asset_id))
+# Helper functions (tenant-scoped)
+async def get_asset_or_404(db: AsyncSession, asset_id: str, org_id: Optional[str] = None) -> OTAsset:
+    """Get OT asset by ID or raise 404 (tenant-scoped)"""
+    stmt = select(OTAsset).where(OTAsset.id == asset_id)
+    if org_id is not None:
+        stmt = stmt.where(OTAsset.organization_id == org_id)
+    result = await db.execute(stmt)
     asset = result.scalar_one_or_none()
     if not asset:
         raise HTTPException(
@@ -81,9 +84,12 @@ async def get_asset_or_404(db: AsyncSession, asset_id: str) -> OTAsset:
     return asset
 
 
-async def get_alert_or_404(db: AsyncSession, alert_id: str) -> OTAlert:
-    """Get OT alert by ID or raise 404"""
-    result = await db.execute(select(OTAlert).where(OTAlert.id == alert_id))
+async def get_alert_or_404(db: AsyncSession, alert_id: str, org_id: Optional[str] = None) -> OTAlert:
+    """Get OT alert by ID or raise 404 (tenant-scoped)"""
+    stmt = select(OTAlert).where(OTAlert.id == alert_id)
+    if org_id is not None:
+        stmt = stmt.where(OTAlert.organization_id == org_id)
+    result = await db.execute(stmt)
     alert = result.scalar_one_or_none()
     if not alert:
         raise HTTPException(
@@ -93,9 +99,12 @@ async def get_alert_or_404(db: AsyncSession, alert_id: str) -> OTAlert:
     return alert
 
 
-async def get_zone_or_404(db: AsyncSession, zone_id: str) -> OTZone:
-    """Get OT zone by ID or raise 404"""
-    result = await db.execute(select(OTZone).where(OTZone.id == zone_id))
+async def get_zone_or_404(db: AsyncSession, zone_id: str, org_id: Optional[str] = None) -> OTZone:
+    """Get OT zone by ID or raise 404 (tenant-scoped)"""
+    stmt = select(OTZone).where(OTZone.id == zone_id)
+    if org_id is not None:
+        stmt = stmt.where(OTZone.organization_id == org_id)
+    result = await db.execute(stmt)
     zone = result.scalar_one_or_none()
     if not zone:
         raise HTTPException(
@@ -105,9 +114,12 @@ async def get_zone_or_404(db: AsyncSession, zone_id: str) -> OTZone:
     return zone
 
 
-async def get_incident_or_404(db: AsyncSession, incident_id: str) -> OTIncident:
-    """Get OT incident by ID or raise 404"""
-    result = await db.execute(select(OTIncident).where(OTIncident.id == incident_id))
+async def get_incident_or_404(db: AsyncSession, incident_id: str, org_id: Optional[str] = None) -> OTIncident:
+    """Get OT incident by ID or raise 404 (tenant-scoped)"""
+    stmt = select(OTIncident).where(OTIncident.id == incident_id)
+    if org_id is not None:
+        stmt = stmt.where(OTIncident.organization_id == org_id)
+    result = await db.execute(stmt)
     incident = result.scalar_one_or_none()
     if not incident:
         raise HTTPException(
@@ -117,9 +129,12 @@ async def get_incident_or_404(db: AsyncSession, incident_id: str) -> OTIncident:
     return incident
 
 
-async def get_policy_or_404(db: AsyncSession, policy_id: str) -> OTPolicyRule:
-    """Get OT policy rule by ID or raise 404"""
-    result = await db.execute(select(OTPolicyRule).where(OTPolicyRule.id == policy_id))
+async def get_policy_or_404(db: AsyncSession, policy_id: str, org_id: Optional[str] = None) -> OTPolicyRule:
+    """Get OT policy rule by ID or raise 404 (tenant-scoped)"""
+    stmt = select(OTPolicyRule).where(OTPolicyRule.id == policy_id)
+    if org_id is not None:
+        stmt = stmt.where(OTPolicyRule.organization_id == org_id)
+    result = await db.execute(stmt)
     policy = result.scalar_one_or_none()
     if not policy:
         raise HTTPException(
@@ -221,7 +236,7 @@ async def create_asset(
 @router.get("/assets/{asset_id}", response_model=OTAssetResponse)
 async def get_asset(asset_id: str, current_user: CurrentUser = None, db: DatabaseSession = None):
     """Get OT asset by ID"""
-    asset = await get_asset_or_404(db, asset_id)
+    asset = await get_asset_or_404(db, asset_id, getattr(current_user, "organization_id", None))
     return OTAssetResponse.model_validate(asset)
 
 
@@ -233,7 +248,7 @@ async def update_asset(
     db: DatabaseSession = None,
 ):
     """Update OT asset"""
-    asset = await get_asset_or_404(db, asset_id)
+    asset = await get_asset_or_404(db, asset_id, getattr(current_user, "organization_id", None))
 
     update_data = asset_data.model_dump(exclude_unset=True)
     for key, value in update_data.items():
@@ -248,7 +263,7 @@ async def update_asset(
 @router.delete("/assets/{asset_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_asset(asset_id: str, current_user: CurrentUser = None, db: DatabaseSession = None):
     """Delete OT asset"""
-    asset = await get_asset_or_404(db, asset_id)
+    asset = await get_asset_or_404(db, asset_id, getattr(current_user, "organization_id", None))
     await db.delete(asset)
     await db.commit()
 
@@ -269,7 +284,7 @@ async def discover_asset_networks(
 @router.get("/assets/{asset_id}/status")
 async def get_asset_status(asset_id: str, current_user: CurrentUser = None, db: DatabaseSession = None):
     """Get current status of OT asset"""
-    asset = await get_asset_or_404(db, asset_id)
+    asset = await get_asset_or_404(db, asset_id, getattr(current_user, "organization_id", None))
 
     return {
         "asset_id": asset.id,
@@ -287,7 +302,7 @@ async def get_asset_risk_assessment(
     asset_id: str, current_user: CurrentUser = None, db: DatabaseSession = None
 ):
     """Get risk assessment for OT asset"""
-    asset = await get_asset_or_404(db, asset_id)
+    asset = await get_asset_or_404(db, asset_id, getattr(current_user, "organization_id", None))
     assessor = OTVulnerabilityAssessor(getattr(current_user, "organization_id", None))
 
     vulns = await assessor.check_known_vulnerabilities(asset.to_dict())
@@ -306,7 +321,7 @@ async def get_asset_risk_assessment(
 @router.post("/assets/{asset_id}/firmware_check")
 async def check_asset_firmware(asset_id: str, current_user: CurrentUser = None, db: DatabaseSession = None):
     """Check firmware version and vulnerabilities"""
-    asset = await get_asset_or_404(db, asset_id)
+    asset = await get_asset_or_404(db, asset_id, getattr(current_user, "organization_id", None))
     assessor = OTVulnerabilityAssessor(getattr(current_user, "organization_id", None))
 
     vulns = await assessor.scan_firmware_versions([asset.to_dict()])
@@ -412,7 +427,7 @@ async def create_alert(
 @router.get("/alerts/{alert_id}", response_model=OTAlertResponse)
 async def get_alert(alert_id: str, current_user: CurrentUser = None, db: DatabaseSession = None):
     """Get OT alert by ID"""
-    alert = await get_alert_or_404(db, alert_id)
+    alert = await get_alert_or_404(db, alert_id, getattr(current_user, "organization_id", None))
     return OTAlertResponse.model_validate(alert)
 
 
@@ -424,7 +439,7 @@ async def update_alert(
     db: DatabaseSession = None,
 ):
     """Update OT alert status"""
-    alert = await get_alert_or_404(db, alert_id)
+    alert = await get_alert_or_404(db, alert_id, getattr(current_user, "organization_id", None))
 
     update_data = alert_data.model_dump(exclude_unset=True)
     for key, value in update_data.items():
@@ -439,7 +454,7 @@ async def update_alert(
 @router.post("/alerts/{alert_id}/investigate")
 async def investigate_alert(alert_id: str, current_user: CurrentUser = None, db: DatabaseSession = None):
     """Start investigation of OT alert"""
-    alert = await get_alert_or_404(db, alert_id)
+    alert = await get_alert_or_404(db, alert_id, getattr(current_user, "organization_id", None))
     alert.status = "investigating"
 
     await db.commit()
@@ -456,7 +471,7 @@ async def respond_to_alert(
     response_action: str = Query(...),
 ):
     """Record response action to alert"""
-    alert = await get_alert_or_404(db, alert_id)
+    alert = await get_alert_or_404(db, alert_id, getattr(current_user, "organization_id", None))
     alert.response_action = response_action
     alert.status = "contained"
 
@@ -557,7 +572,7 @@ async def create_zone(
 @router.get("/zones/{zone_id}", response_model=OTZoneResponse)
 async def get_zone(zone_id: str, current_user: CurrentUser = None, db: DatabaseSession = None):
     """Get OT zone by ID"""
-    zone = await get_zone_or_404(db, zone_id)
+    zone = await get_zone_or_404(db, zone_id, getattr(current_user, "organization_id", None))
     return OTZoneResponse.model_validate(zone)
 
 
@@ -569,7 +584,7 @@ async def update_zone(
     db: DatabaseSession = None,
 ):
     """Update OT zone"""
-    zone = await get_zone_or_404(db, zone_id)
+    zone = await get_zone_or_404(db, zone_id, getattr(current_user, "organization_id", None))
 
     update_data = zone_data.model_dump(exclude_unset=True)
     for key, value in update_data.items():
@@ -584,7 +599,7 @@ async def update_zone(
 @router.delete("/zones/{zone_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_zone(zone_id: str, current_user: CurrentUser = None, db: DatabaseSession = None):
     """Delete OT zone"""
-    zone = await get_zone_or_404(db, zone_id)
+    zone = await get_zone_or_404(db, zone_id, getattr(current_user, "organization_id", None))
     await db.delete(zone)
     await db.commit()
 
@@ -592,7 +607,7 @@ async def delete_zone(zone_id: str, current_user: CurrentUser = None, db: Databa
 @router.post("/zones/{zone_id}/compliance_check")
 async def check_zone_compliance(zone_id: str, current_user: CurrentUser = None, db: DatabaseSession = None):
     """Check zone compliance with Purdue model"""
-    zone = await get_zone_or_404(db, zone_id)
+    zone = await get_zone_or_404(db, zone_id, getattr(current_user, "organization_id", None))
     enforcer = PurdueModelEnforcer(getattr(current_user, "organization_id", None))
 
     report = await enforcer.generate_zone_compliance_report([zone.to_dict()])
@@ -605,7 +620,7 @@ async def get_zone_communication_matrix(
     zone_id: str, current_user: CurrentUser = None, db: DatabaseSession = None
 ):
     """Get zone-to-zone communication policy matrix"""
-    zone = await get_zone_or_404(db, zone_id)
+    zone = await get_zone_or_404(db, zone_id, getattr(current_user, "organization_id", None))
 
     return {
         "zone_id": zone.id,
@@ -618,7 +633,7 @@ async def get_zone_communication_matrix(
 @router.post("/zones/{zone_id}/segmentation_audit")
 async def audit_zone_segmentation(zone_id: str, current_user: CurrentUser = None, db: DatabaseSession = None):
     """Audit network segmentation for zone"""
-    zone = await get_zone_or_404(db, zone_id)
+    zone = await get_zone_or_404(db, zone_id, getattr(current_user, "organization_id", None))
 
     zone.last_audit = datetime.now(timezone.utc)
     zone.segmentation_verified = True
@@ -704,7 +719,7 @@ async def create_incident(
 @router.get("/incidents/{incident_id}", response_model=OTIncidentResponse)
 async def get_incident(incident_id: str, current_user: CurrentUser = None, db: DatabaseSession = None):
     """Get OT incident by ID"""
-    incident = await get_incident_or_404(db, incident_id)
+    incident = await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
     return OTIncidentResponse.model_validate(incident)
 
 
@@ -716,7 +731,7 @@ async def update_incident(
     db: DatabaseSession = None,
 ):
     """Update OT incident"""
-    incident = await get_incident_or_404(db, incident_id)
+    incident = await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
 
     update_data = incident_data.model_dump(exclude_unset=True)
     for key, value in update_data.items():
@@ -736,7 +751,7 @@ async def set_containment_strategy(
     strategy: str = Query(...),
 ):
     """Set containment strategy for incident"""
-    incident = await get_incident_or_404(db, incident_id)
+    incident = await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
     incident.containment_strategy = strategy
     incident.status = "containing"
 
@@ -750,7 +765,7 @@ async def initiate_safe_shutdown(
     incident_id: str, current_user: CurrentUser = None, db: DatabaseSession = None
 ):
     """Initiate safe shutdown procedure for incident"""
-    incident = await get_incident_or_404(db, incident_id)
+    incident = await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
 
     safety_mgr = SafetyManager(getattr(current_user, "organization_id", None))
     shutdown_plan = await safety_mgr.initiate_safe_shutdown(
@@ -768,7 +783,7 @@ async def get_post_incident_report(
     incident_id: str, current_user: CurrentUser = None, db: DatabaseSession = None
 ):
     """Generate post-incident report"""
-    incident = await get_incident_or_404(db, incident_id)
+    incident = await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
 
     safety_mgr = SafetyManager(getattr(current_user, "organization_id", None))
     report = await safety_mgr.generate_safety_incident_report(incident.to_dict())
@@ -844,7 +859,7 @@ async def create_policy(
 @router.get("/policies/{policy_id}", response_model=OTPolicyRuleResponse)
 async def get_policy(policy_id: str, current_user: CurrentUser = None, db: DatabaseSession = None):
     """Get OT policy rule by ID"""
-    policy = await get_policy_or_404(db, policy_id)
+    policy = await get_policy_or_404(db, policy_id, getattr(current_user, "organization_id", None))
     return OTPolicyRuleResponse.model_validate(policy)
 
 
@@ -856,7 +871,7 @@ async def update_policy(
     db: DatabaseSession = None,
 ):
     """Update OT policy rule"""
-    policy = await get_policy_or_404(db, policy_id)
+    policy = await get_policy_or_404(db, policy_id, getattr(current_user, "organization_id", None))
 
     update_data = policy_data.model_dump(exclude_unset=True)
     for key, value in update_data.items():
@@ -871,7 +886,7 @@ async def update_policy(
 @router.delete("/policies/{policy_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_policy(policy_id: str, current_user: CurrentUser = None, db: DatabaseSession = None):
     """Delete OT policy rule"""
-    policy = await get_policy_or_404(db, policy_id)
+    policy = await get_policy_or_404(db, policy_id, getattr(current_user, "organization_id", None))
     await db.delete(policy)
     await db.commit()
 
@@ -879,7 +894,7 @@ async def delete_policy(policy_id: str, current_user: CurrentUser = None, db: Da
 @router.post("/policies/{policy_id}/enable")
 async def enable_policy(policy_id: str, current_user: CurrentUser = None, db: DatabaseSession = None):
     """Enable OT policy rule"""
-    policy = await get_policy_or_404(db, policy_id)
+    policy = await get_policy_or_404(db, policy_id, getattr(current_user, "organization_id", None))
     policy.enabled = True
 
     await db.commit()
@@ -890,7 +905,7 @@ async def enable_policy(policy_id: str, current_user: CurrentUser = None, db: Da
 @router.post("/policies/{policy_id}/disable")
 async def disable_policy(policy_id: str, current_user: CurrentUser = None, db: DatabaseSession = None):
     """Disable OT policy rule"""
-    policy = await get_policy_or_404(db, policy_id)
+    policy = await get_policy_or_404(db, policy_id, getattr(current_user, "organization_id", None))
     policy.enabled = False
 
     await db.commit()
@@ -906,7 +921,7 @@ async def get_policy_violation_history(
     limit: int = Query(10, ge=1, le=100),
 ):
     """Get policy violation history"""
-    policy = await get_policy_or_404(db, policy_id)
+    policy = await get_policy_or_404(db, policy_id, getattr(current_user, "organization_id", None))
 
     return {
         "policy_id": policy.id,
@@ -923,6 +938,8 @@ async def get_policy_violation_history(
 async def get_ot_dashboard(current_user: CurrentUser = None, db: DatabaseSession = None):
     """Get OT security dashboard"""
     org_id = getattr(current_user, "organization_id", None)
+    now = datetime.now(timezone.utc)
+    window_24h = now - timedelta(hours=24)
 
     # Get asset counts
     asset_result = await db.execute(
@@ -932,30 +949,66 @@ async def get_ot_dashboard(current_user: CurrentUser = None, db: DatabaseSession
 
     online_result = await db.execute(
         select(func.count()).select_from(OTAsset).where(
-            (OTAsset.organization_id == org_id) & (OTAsset.is_online == True)
+            and_(OTAsset.organization_id == org_id, OTAsset.is_online == True)
         )
     )
     online_count = online_result.scalar() or 0
 
-    # Get alert counts
+    # Get alert counts (real 24h windows, not //3 / //4)
     alert_result = await db.execute(
         select(func.count()).select_from(OTAlert).where(OTAlert.organization_id == org_id)
     )
     total_alerts = alert_result.scalar() or 0
 
+    new_24h_result = await db.execute(
+        select(func.count()).select_from(OTAlert).where(
+            and_(
+                OTAlert.organization_id == org_id,
+                OTAlert.created_at >= window_24h,
+            )
+        )
+    )
+    new_alerts_24h = new_24h_result.scalar() or 0
+
+    resolved_24h_result = await db.execute(
+        select(func.count()).select_from(OTAlert).where(
+            and_(
+                OTAlert.organization_id == org_id,
+                OTAlert.status.in_(["resolved", "contained", "false_positive"]),
+                OTAlert.updated_at >= window_24h,
+            )
+        )
+    )
+    resolved_24h = resolved_24h_result.scalar() or 0
+
     # Get zone counts by level
     zones_result = await db.execute(
         select(OTZone).where(OTZone.organization_id == org_id)
     )
-    zones = zones_result.scalars().all()
+    zones = list(zones_result.scalars().all())
 
-    zones_by_level = {}
+    zones_by_level: dict = {}
     for zone in zones:
         level = zone.purdue_level
         zones_by_level[level] = zones_by_level.get(level, 0) + 1
 
+    # Real compliance score: share of zones with compliance_status == "compliant"
+    compliant_zones = sum(1 for z in zones if z.compliance_status == "compliant")
+    zone_compliance = (compliant_zones / len(zones)) if zones else 0.0
+
+    # Firmware currency rate across assets
+    firmware_current_result = await db.execute(
+        select(func.count()).select_from(OTAsset).where(
+            and_(OTAsset.organization_id == org_id, OTAsset.firmware_current == True)
+        )
+    )
+    firmware_current_count = firmware_current_result.scalar() or 0
+    firmware_score = (firmware_current_count / total_assets) if total_assets else 0.0
+
+    overall_compliance = round((zone_compliance + firmware_score) / 2, 3) if (zones or total_assets) else 0.0
+
     return OTDashboardResponse(
-        timestamp=datetime.now(timezone.utc),
+        timestamp=now,
         asset_inventory=AssetInventoryStats(
             total_assets=total_assets,
             online_count=online_count,
@@ -963,18 +1016,79 @@ async def get_ot_dashboard(current_user: CurrentUser = None, db: DatabaseSession
         ),
         alert_summary=AlertStats(
             total_alerts=total_alerts,
-            new_alerts_24h=total_alerts // 3,
-            resolved_24h=total_alerts // 4,
+            new_alerts_24h=new_alerts_24h,
+            resolved_24h=resolved_24h,
         ),
         zones_by_level=zones_by_level,
         compliance_scores=ComplianceScores(
-            overall=0.75,
+            overall=overall_compliance,
         ),
         purdue_model_visualization={
             "levels": zones_by_level,
             "segmentation_complete": len(zones_by_level) >= 4,
+            "zone_compliance": round(zone_compliance, 3),
+            "firmware_score": round(firmware_score, 3),
         },
     )
+
+
+# Map Purdue string enum to numeric level
+_PURDUE_LEVEL_NUMERIC = {
+    "level0_process": 0,
+    "level1_control": 1,
+    "level2_supervisory": 2,
+    "level3_operations": 3,
+    "level3_5_dmz": 3,  # collapsed with ops for visualization
+    "level4_enterprise": 4,
+    "level5_internet": 5,
+}
+
+
+@router.get("/purdue-map")
+async def get_purdue_map(current_user: CurrentUser = None, db: DatabaseSession = None):
+    """Return asset devices grouped by numeric Purdue level for the visualization tab."""
+    org_id = getattr(current_user, "organization_id", None)
+
+    result = await db.execute(
+        select(OTAsset).where(OTAsset.organization_id == org_id)
+    )
+    assets = list(result.scalars().all())
+
+    buckets: dict = {lvl: [] for lvl in range(6)}
+    for a in assets:
+        lvl = _PURDUE_LEVEL_NUMERIC.get(a.purdue_level, 3)
+        buckets[lvl].append(
+            {
+                "id": a.id,
+                "name": a.name,
+                "asset_type": a.asset_type,
+                "type": a.asset_type,
+                "ip_address": a.ip_address,
+                "ipAddress": a.ip_address,
+                "ip": a.ip_address,
+                "vendor": a.vendor,
+                "protocol": a.protocol,
+                "zone": a.zone,
+                "criticality": a.criticality,
+                "is_online": a.is_online,
+                "status": "online" if a.is_online else "offline",
+                "last_seen": a.last_seen.isoformat() if a.last_seen else None,
+            }
+        )
+
+    levels = [
+        {"level": lvl, "devices": buckets[lvl], "device_count": len(buckets[lvl])}
+        for lvl in sorted(buckets.keys())
+    ]
+    total_devices = sum(len(v) for v in buckets.values())
+    segmented = sum(1 for lvl, devs in buckets.items() if devs) >= 4
+
+    return {
+        "levels": levels,
+        "total_devices": total_devices,
+        "segmentation_complete": segmented,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 # ===== OT COMPLIANCE =====

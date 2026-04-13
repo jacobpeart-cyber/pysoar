@@ -39,19 +39,67 @@ def async_playbook_execution(
         from src.playbook_builder.models import VisualPlaybook, VisualPlaybookExecution
         from sqlalchemy import select
 
-        # This is a simplified version - would need async context in real implementation
+        import asyncio
+
+        async def _execute():
+            async with async_session_factory() as db:
+                # Look up the playbook and execution record
+                playbook_query = select(VisualPlaybook).where(VisualPlaybook.id == playbook_id)
+                pb_result = await db.execute(playbook_query)
+                playbook = pb_result.scalar_one_or_none()
+
+                exec_query = select(VisualPlaybookExecution).where(VisualPlaybookExecution.id == execution_id)
+                exec_result = await db.execute(exec_query)
+                execution = exec_result.scalar_one_or_none()
+
+                if not playbook or not execution:
+                    return {
+                        "execution_id": execution_id,
+                        "playbook_id": playbook_id,
+                        "status": "failed",
+                        "error": "playbook or execution record not found",
+                    }
+
+                started_at = datetime.now(timezone.utc)
+                execution.status = "running"
+                execution.started_at = started_at.isoformat()
+                await db.commit()
+
+                try:
+                    # Run the playbook through the execution engine
+                    engine = PlaybookExecutionEngine(db)
+                    result = await engine.execute_playbook(
+                        playbook=playbook,
+                        trigger_event=trigger_event,
+                        variables=variables or {},
+                    )
+
+                    completed_at = datetime.now(timezone.utc)
+                    duration_ms = int((completed_at - started_at).total_seconds() * 1000)
+
+                    execution.status = "completed"
+                    execution.completed_at = completed_at.isoformat()
+                    execution.duration_ms = duration_ms
+                    await db.commit()
+
+                    return {
+                        "execution_id": execution_id,
+                        "playbook_id": playbook_id,
+                        "status": "completed",
+                        "started_at": started_at.isoformat(),
+                        "completed_at": completed_at.isoformat(),
+                        "duration_ms": duration_ms,
+                    }
+
+                except Exception as exec_err:
+                    execution.status = "failed"
+                    execution.error_message = str(exec_err)
+                    execution.completed_at = datetime.now(timezone.utc).isoformat()
+                    await db.commit()
+                    raise
+
         logger.info(f"Executing playbook {playbook_id}")
-
-        # Simulate execution
-        execution_result = {
-            "execution_id": execution_id,
-            "playbook_id": playbook_id,
-            "status": "completed",
-            "started_at": datetime.now(timezone.utc).isoformat(),
-            "completed_at": datetime.now(timezone.utc).isoformat(),
-            "duration_ms": 1500,
-        }
-
+        execution_result = asyncio.run(_execute())
         logger.info(f"Playbook execution completed: {execution_id}")
         return execution_result
 

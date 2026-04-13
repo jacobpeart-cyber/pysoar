@@ -372,26 +372,27 @@ class ToolExecutor:
         """Look up IOC in threat intelligence database"""
         from sqlalchemy import select
         from src.core.database import async_session_factory
-        from src.models.ioc import IOC
+        from src.intel.models import ThreatIndicator
 
         indicator = args.get("indicator", "")
 
         async with async_session_factory() as db:
             result = await db.execute(
-                select(IOC).where(IOC.value == indicator)
+                select(ThreatIndicator).where(ThreatIndicator.value == indicator)
             )
             ioc = result.scalars().first()
 
             if ioc:
+                ctx = ioc.context if isinstance(ioc.context, dict) else {}
                 return {
                     "indicator": indicator,
                     "found": True,
-                    "threat_level": ioc.threat_level,
-                    "ioc_type": ioc.ioc_type,
-                    "description": ioc.description,
+                    "threat_level": ioc.severity,
+                    "ioc_type": ioc.indicator_type,
+                    "description": ctx.get("description"),
                     "source": ioc.source,
-                    "status": ioc.status,
-                    "first_seen": str(ioc.created_at),
+                    "status": "active" if ioc.is_active else "inactive",
+                    "first_seen": str(ioc.first_seen or ioc.created_at),
                 }
             return {
                 "indicator": indicator,

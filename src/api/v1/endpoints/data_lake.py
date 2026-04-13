@@ -2,11 +2,11 @@
 
 import json
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Path, HTTPException, Query, status
-from sqlalchemy import func, select
+from fastapi import APIRouter, Body, Path, HTTPException, Query, status
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DatabaseSession
@@ -706,6 +706,171 @@ async def estimate_query_cost(
 # ==================== DATA CATALOG ENDPOINTS ====================
 
 
+@router.get("/catalog")
+async def list_catalog(
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+):
+    """List all catalog datasets for this org (wraps DataSource + UnifiedDataModel)."""
+    org_id = getattr(current_user, "organization_id", None)
+
+    sources = (await db.execute(
+        select(DataSource).where(DataSource.organization_id == org_id)
+    )).scalars().all()
+    models = (await db.execute(
+        select(UnifiedDataModel).where(UnifiedDataModel.organization_id == org_id)
+    )).scalars().all()
+
+    entries = []
+    for s in sources:
+        entries.append({
+            "id": s.id,
+            "name": s.name,
+            "description": s.description,
+            "type": "source",
+            "source_type": s.source_type,
+            "status": s.status,
+            "format": getattr(s, "format", None),
+        })
+    for m in models:
+        entries.append({
+            "id": m.id,
+            "name": m.name,
+            "description": m.description,
+            "type": "unified_model",
+            "entity_type": m.entity_type,
+        })
+    return entries
+
+
+@router.post("/query")
+async def run_catalog_filter_query(
+    payload: dict = Body(...),
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+):
+    """Filter-query against the data lake catalog (sources + partitions).
+
+    This is NOT an arbitrary SQL executor — PySOAR's data lake module tracks
+    metadata about ingested sources and partitioned storage, not the raw
+    data itself. This endpoint accepts a JSON filter spec and returns real
+    matching DataSource and DataPartition rows from the database, tenant-
+    scoped and auditable via persisted QueryJob rows.
+
+    Request shape::
+
+        {
+          "source_type": "siem",          # optional exact match
+          "source_name_contains": "auth", # optional ilike
+          "storage_tier": "hot",          # optional exact match
+          "time_range_start": "2026-01",  # optional ISO prefix match
+          "limit": 100                     # optional, default 100, max 1000
+        }
+
+    Returns the matching sources and partitions plus record counts.
+    """
+    org_id = getattr(current_user, "organization_id", None)
+
+    # Parse filter spec
+    source_type = payload.get("source_type")
+    name_contains = payload.get("source_name_contains") or payload.get("search")
+    storage_tier = payload.get("storage_tier")
+    time_range_start = payload.get("time_range_start")
+    limit = min(int(payload.get("limit", 100)), 1000)
+
+    # Build source filter
+    source_stmt = select(DataSource).where(DataSource.organization_id == org_id)
+    if source_type:
+        source_stmt = source_stmt.where(DataSource.source_type == source_type)
+    if name_contains:
+        source_stmt = source_stmt.where(DataSource.name.ilike(f"%{name_contains}%"))
+    source_stmt = source_stmt.limit(limit)
+
+    sources_rows = (await db.execute(source_stmt)).scalars().all()
+    matched_source_ids = [s.id for s in sources_rows]
+
+    # Build partition filter (scoped to matched sources if source filter was given,
+    # otherwise all org partitions)
+    part_stmt = select(DataPartition).where(DataPartition.organization_id == org_id)
+    if matched_source_ids and (source_type or name_contains):
+        part_stmt = part_stmt.where(DataPartition.source_id.in_(matched_source_ids))
+    if storage_tier:
+        part_stmt = part_stmt.where(DataPartition.storage_tier == storage_tier)
+    if time_range_start:
+        part_stmt = part_stmt.where(DataPartition.time_range_start >= time_range_start)
+    part_stmt = part_stmt.limit(limit)
+
+    parts_rows = (await db.execute(part_stmt)).scalars().all()
+
+    # Real aggregates
+    total_records = sum(p.record_count or 0 for p in parts_rows)
+    total_bytes = sum(p.size_bytes or 0 for p in parts_rows)
+
+    sources_out = [
+        {
+            "id": s.id,
+            "name": s.name,
+            "source_type": s.source_type,
+            "status": s.status,
+            "format": s.format,
+            "last_event_received": s.last_event_received,
+        }
+        for s in sources_rows
+    ]
+    parts_out = [
+        {
+            "id": p.id,
+            "source_id": p.source_id,
+            "partition_key": p.partition_key,
+            "time_range_start": p.time_range_start,
+            "time_range_end": p.time_range_end,
+            "record_count": p.record_count,
+            "size_bytes": p.size_bytes,
+            "storage_tier": p.storage_tier,
+            "format": p.format,
+        }
+        for p in parts_rows
+    ]
+
+    # Persist a QueryJob audit record for history
+    now = datetime.now(timezone.utc)
+    started = now
+    try:
+        import json as _json
+        job = QueryJob(
+            organization_id=org_id,
+            query_text=_json.dumps(payload)[:4000],
+            query_language="catalog_filter",
+            status="completed",
+            data_sources_queried=matched_source_ids,
+            records_scanned=total_records,
+            records_returned=len(parts_rows),
+            execution_time_ms=int((datetime.now(timezone.utc) - started).total_seconds() * 1000),
+            submitted_by=str(getattr(current_user, "id", "")),
+        )
+        db.add(job)
+        await db.commit()
+        await db.refresh(job)
+    except Exception as exc:
+        logger.warning(f"QueryJob persist failed: {exc}")
+        await db.rollback()
+        job = None
+
+    return {
+        "filter": payload,
+        "sources": sources_out,
+        "partitions": parts_out,
+        "aggregate": {
+            "source_count": len(sources_out),
+            "partition_count": len(parts_out),
+            "total_records": total_records,
+            "total_bytes": total_bytes,
+        },
+        "job_id": getattr(job, "id", None),
+        "timestamp": now.isoformat(),
+    }
+
+
 @router.get("/catalog/datasets")
 async def search_datasets(
     current_user: CurrentUser = None,
@@ -723,19 +888,110 @@ async def search_datasets(
 @router.get("/catalog/lineage/{dataset_id}")
 async def get_data_lineage(
     current_user: CurrentUser = None,
+    db: DatabaseSession = None,
     dataset_id: str = Path(...),
 ):
-    """Get data lineage for a dataset"""
-    try:
-        catalog = DataCatalog()
-        # Simplified lineage response
-        return {
-            "dataset_id": dataset_id,
-            "upstream_sources": [],
-            "downstream_consumers": [],
-        }
-    except Exception as e:
-        raise HTTPException(status_code=400, detail="Operation failed. Please try again or contact support.")
+    """Real dataset lineage: upstream source + downstream pipelines + partitions.
+
+    ``dataset_id`` is either a DataSource id or a UnifiedDataModel id.
+    Builds a real lineage graph from the database:
+        upstream: the DataSource row (for source-rooted lookups)
+        downstream: every DataPipeline row whose ``sources`` list contains
+                    this id AND every DataPartition rooted at this source
+    Tenant-scoped via organization_id on every query.
+    """
+    org_id = getattr(current_user, "organization_id", None)
+
+    # Try resolving as a DataSource first
+    src = (
+        await db.execute(
+            select(DataSource).where(
+                and_(DataSource.id == dataset_id, DataSource.organization_id == org_id)
+            )
+        )
+    ).scalar_one_or_none()
+
+    model = None
+    if not src:
+        model = (
+            await db.execute(
+                select(UnifiedDataModel).where(
+                    and_(
+                        UnifiedDataModel.id == dataset_id,
+                        UnifiedDataModel.organization_id == org_id,
+                    )
+                )
+            )
+        ).scalar_one_or_none()
+
+    if not src and not model:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    upstream: list[dict] = []
+    downstream: list[dict] = []
+    partitions: list[dict] = []
+
+    if src:
+        upstream.append({
+            "type": "source",
+            "id": src.id,
+            "name": src.name,
+            "source_type": src.source_type,
+            "ingestion_type": src.ingestion_type,
+        })
+
+        # Partitions rooted at this source
+        part_rows = (
+            await db.execute(
+                select(DataPartition).where(
+                    and_(
+                        DataPartition.source_id == src.id,
+                        DataPartition.organization_id == org_id,
+                    )
+                )
+            )
+        ).scalars().all()
+        partitions = [
+            {
+                "id": p.id,
+                "partition_key": p.partition_key,
+                "time_range_start": p.time_range_start,
+                "time_range_end": p.time_range_end,
+                "record_count": p.record_count,
+                "size_bytes": p.size_bytes,
+                "storage_tier": p.storage_tier,
+            }
+            for p in part_rows
+        ]
+
+    # Pipelines that reference this dataset via source_id FK
+    pipelines = (
+        await db.execute(
+            select(DataPipeline).where(
+                and_(
+                    DataPipeline.organization_id == org_id,
+                    DataPipeline.source_id == dataset_id,
+                )
+            )
+        )
+    ).scalars().all()
+    for p in pipelines:
+        downstream.append({
+            "type": "pipeline",
+            "id": p.id,
+            "name": p.name,
+            "pipeline_type": p.pipeline_type,
+            "status": p.status,
+            "destination": p.destination,
+        })
+
+    return {
+        "dataset_id": dataset_id,
+        "upstream_sources": upstream,
+        "downstream_consumers": downstream,
+        "partitions": partitions,
+        "resolved_as": "source" if src else "unified_model",
+    }
 
 
 @router.get("/catalog/quality/{dataset_id}")
@@ -744,18 +1000,96 @@ async def get_data_quality(
     db: DatabaseSession = None,
     dataset_id: str = Path(...),
 ):
-    """Get data quality report for dataset"""
-    try:
-        catalog = DataCatalog()
-        report = {
-            "dataset_id": dataset_id,
-            "quality_score": 98.5,
-            "issues": 2,
-            "status": "healthy",
-        }
-        return report
-    except Exception as e:
-        raise HTTPException(status_code=400, detail="Operation failed. Please try again or contact support.")
+    """Real data quality report for a dataset.
+
+    Quality is computed from observable DataPartition metadata on this org:
+        - ingestion freshness: how recent is the latest partition?
+        - record volume: total_record_count
+        - storage distribution: bytes per storage_tier
+        - partition count + indexed ratio
+        - time coverage: earliest and latest time_range
+    Raises 404 if the dataset is not a DataSource belonging to the caller's org.
+    """
+    org_id = getattr(current_user, "organization_id", None)
+
+    src = (
+        await db.execute(
+            select(DataSource).where(
+                and_(DataSource.id == dataset_id, DataSource.organization_id == org_id)
+            )
+        )
+    ).scalar_one_or_none()
+    if not src:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+
+    part_rows = (
+        await db.execute(
+            select(DataPartition).where(
+                and_(
+                    DataPartition.source_id == src.id,
+                    DataPartition.organization_id == org_id,
+                )
+            )
+        )
+    ).scalars().all()
+
+    total_records = sum(p.record_count or 0 for p in part_rows)
+    total_bytes = sum(p.size_bytes or 0 for p in part_rows)
+    indexed_count = sum(1 for p in part_rows if p.is_indexed)
+    indexed_ratio = (indexed_count / len(part_rows)) if part_rows else 0.0
+
+    by_tier: dict = {}
+    for p in part_rows:
+        tier = p.storage_tier or "unknown"
+        by_tier[tier] = by_tier.get(tier, 0) + (p.size_bytes or 0)
+
+    earliest = None
+    latest = None
+    for p in part_rows:
+        if p.time_range_start and (earliest is None or p.time_range_start < earliest):
+            earliest = p.time_range_start
+        if p.time_range_end and (latest is None or p.time_range_end > latest):
+            latest = p.time_range_end
+
+    # Freshness: how old is the most recent partition relative to now
+    freshness_hours = None
+    if latest:
+        try:
+            latest_dt = datetime.fromisoformat(str(latest).replace("Z", "+00:00"))
+            if latest_dt.tzinfo is None:
+                latest_dt = latest_dt.replace(tzinfo=timezone.utc)
+            freshness_hours = round(
+                (datetime.now(timezone.utc) - latest_dt).total_seconds() / 3600.0, 2
+            )
+        except Exception:
+            freshness_hours = None
+
+    # Status derivation: healthy if freshness < 24h AND at least one partition,
+    # degraded if freshness < 168h, stale otherwise.
+    if not part_rows:
+        status = "no_data"
+    elif freshness_hours is None:
+        status = "unknown"
+    elif freshness_hours < 24:
+        status = "healthy"
+    elif freshness_hours < 168:
+        status = "degraded"
+    else:
+        status = "stale"
+
+    return {
+        "dataset_id": dataset_id,
+        "dataset_name": src.name,
+        "source_type": src.source_type,
+        "status": status,
+        "freshness_hours": freshness_hours,
+        "partition_count": len(part_rows),
+        "total_records": total_records,
+        "total_bytes": total_bytes,
+        "indexed_ratio": round(indexed_ratio, 3),
+        "storage_bytes_by_tier": by_tier,
+        "time_range": {"earliest": earliest, "latest": latest},
+    }
 
 
 # ==================== DASHBOARD ENDPOINTS ====================
@@ -766,47 +1100,89 @@ async def get_dashboard_metrics(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Get unified dashboard metrics"""
+    """Get unified dashboard metrics (real counts from DB, not hardcoded lies)."""
+    org_id = getattr(current_user, "organization_id", None)
+    now = datetime.now(timezone.utc)
+    window_24h = now - timedelta(hours=24)
+
+    # Sources
+    sources_total = (await db.execute(
+        select(func.count()).select_from(DataSource).where(DataSource.organization_id == org_id)
+    )).scalar() or 0
+    sources_active = (await db.execute(
+        select(func.count()).select_from(DataSource).where(
+            and_(DataSource.organization_id == org_id, DataSource.status == "active")
+        )
+    )).scalar() or 0
+
+    # Pipelines
+    pipelines_total = (await db.execute(
+        select(func.count()).select_from(DataPipeline).where(DataPipeline.organization_id == org_id)
+    )).scalar() or 0
+    pipelines_active = (await db.execute(
+        select(func.count()).select_from(DataPipeline).where(
+            and_(DataPipeline.organization_id == org_id, DataPipeline.status == "active")
+        )
+    )).scalar() or 0
+    pipelines_failed = (await db.execute(
+        select(func.count()).select_from(DataPipeline).where(
+            and_(DataPipeline.organization_id == org_id, DataPipeline.status == "failed")
+        )
+    )).scalar() or 0
+
+    # Storage (sum real partition sizes if the column exists)
+    total_bytes = 0
     try:
-        # Gather metrics from all sources
-        storage_mgr = StorageManager()
-        query_engine = QueryEngine()
+        total_bytes = (await db.execute(
+            select(func.coalesce(func.sum(DataPartition.size_bytes), 0)).where(
+                DataPartition.organization_id == org_id
+            )
+        )).scalar() or 0
+    except Exception:
+        total_bytes = 0
 
-        ingestion_metrics = {
-            "events_per_second": 12543,
-            "daily_ingestion_gb": 1234,
-            "success_rate": 99.98,
-        }
+    # Queries in last 24h
+    queries_24h = 0
+    avg_exec_ms = 0
+    try:
+        queries_24h = (await db.execute(
+            select(func.count()).select_from(QueryJob).where(
+                and_(QueryJob.organization_id == org_id, QueryJob.created_at >= window_24h)
+            )
+        )).scalar() or 0
+        avg_exec_ms = (await db.execute(
+            select(func.coalesce(func.avg(QueryJob.execution_time_ms), 0)).where(
+                and_(QueryJob.organization_id == org_id, QueryJob.created_at >= window_24h)
+            )
+        )).scalar() or 0
+    except Exception:
+        pass
 
-        storage_usage = {
-            "total_bytes": 5368709120000,  # 5TB
-            "hot_gb": 500,
-            "warm_gb": 1500,
-            "cold_gb": 2500,
-        }
-
-        query_performance = {
-            "avg_execution_time_ms": 1234,
-            "p95_execution_time_ms": 5678,
-            "total_queries_24h": 45000,
-        }
-
-        pipeline_health = {
-            "active_pipelines": 42,
-            "failed_pipelines": 1,
-            "avg_success_rate": 99.76,
-        }
-
-        return {
-            "ingestion_metrics": ingestion_metrics,
-            "storage_usage": storage_usage,
-            "query_performance": query_performance,
-            "pipeline_health": pipeline_health,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=400, detail="Operation failed. Please try again or contact support.")
+    return {
+        "ingestion_metrics": {
+            "active_sources": sources_active,
+            "total_sources": sources_total,
+            "success_rate": round(
+                (pipelines_active / pipelines_total * 100) if pipelines_total else 0.0, 2
+            ),
+        },
+        "storage_usage": {
+            "total_bytes": int(total_bytes),
+        },
+        "query_performance": {
+            "avg_execution_time_ms": int(avg_exec_ms or 0),
+            "total_queries_24h": int(queries_24h),
+        },
+        "pipeline_health": {
+            "active_pipelines": pipelines_active,
+            "total_pipelines": pipelines_total,
+            "failed_pipelines": pipelines_failed,
+            "avg_success_rate": round(
+                (pipelines_active / pipelines_total * 100) if pipelines_total else 0.0, 2
+            ),
+        },
+        "timestamp": now.isoformat(),
+    }
 
 
 @router.get("/dashboard/storage-breakdown")
@@ -814,24 +1190,49 @@ async def get_storage_breakdown(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Get detailed storage usage breakdown"""
+    """Get detailed storage usage breakdown (real bytes by tier and source)."""
+    org_id = getattr(current_user, "organization_id", None)
+
+    # Total + by tier
+    total_bytes = 0
+    by_tier: dict = {}
     try:
-        storage_usage = {
-            "total_bytes": 5368709120000,
-            "by_tier": {
-                "hot": 536870912000,  # 500GB
-                "warm": 1610612736000,  # 1.5TB
-                "cold": 2684354560000,  # 2.5TB
-            },
-            "by_source": {
-                "siem": 2147483648000,  # 2TB
-                "edr": 1610612736000,  # 1.5TB
-                "cloud": 1074790400000,  # 1TB
-            },
-        }
-        return storage_usage
-    except Exception as e:
-        raise HTTPException(status_code=400, detail="Operation failed. Please try again or contact support.")
+        total_bytes = (await db.execute(
+            select(func.coalesce(func.sum(DataPartition.size_bytes), 0)).where(
+                DataPartition.organization_id == org_id
+            )
+        )).scalar() or 0
+
+        tier_result = await db.execute(
+            select(DataPartition.storage_tier, func.coalesce(func.sum(DataPartition.size_bytes), 0))
+            .where(DataPartition.organization_id == org_id)
+            .group_by(DataPartition.storage_tier)
+        )
+        for tier, bytes_ in tier_result.all():
+            by_tier[tier or "unknown"] = int(bytes_ or 0)
+    except Exception:
+        by_tier = {}
+
+    # By source name (join through DataSource)
+    by_source: dict = {}
+    try:
+        src_result = await db.execute(
+            select(DataSource.name, func.coalesce(func.sum(DataPartition.size_bytes), 0))
+            .select_from(DataPartition)
+            .join(DataSource, DataSource.id == DataPartition.source_id)
+            .where(DataSource.organization_id == org_id)
+            .group_by(DataSource.name)
+        )
+        for name, bytes_ in src_result.all():
+            by_source[name or "unknown"] = int(bytes_ or 0)
+    except Exception:
+        by_source = {}
+
+    return {
+        "total_bytes": int(total_bytes),
+        "by_tier": by_tier,
+        "by_source": by_source,
+    }
 
 
 @router.get("/dashboard/pipeline-status")

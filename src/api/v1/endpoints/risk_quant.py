@@ -8,8 +8,8 @@ import math
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query, status
-from sqlalchemy import func, select
+from fastapi import APIRouter, Body, HTTPException, Query, status
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DatabaseSession
@@ -963,3 +963,175 @@ async def get_risk_heatmap(
 
     heatmap_data = aggregator.generate_risk_heatmap(risks)
     return RiskHeatmapResponse(**heatmap_data)
+
+
+# ---------------------------------------------------------------------------
+# Frontend-compat endpoints.
+#
+# The RiskQuantification page calls two routes that didn't exist on the
+# backend until this fix: POST /analyze and GET /loss-exceedance. Every
+# tenant's Risk page has been broken since launch because
+# ``riskquantApi.getLossExceedance()`` 404'd on the initial data load.
+# Adding them here rather than changing the frontend so existing API
+# consumers (if any) keep working.
+# ---------------------------------------------------------------------------
+
+
+@router.post("/analyze")
+async def analyze_scenarios(
+    request: dict = Body(...),
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+):
+    """Run FAIR simulations for one or more scenarios.
+
+    Accepts ``{"scenario_ids": ["...", "..."]}``. Runs the real
+    Monte Carlo FAIR simulation for each scenario (10k iterations
+    by default) and returns aggregate ALE statistics. If
+    scenario_ids is empty, runs across every FAIRAnalysis row for
+    the caller's org.
+    """
+    org_id = getattr(current_user, "organization_id", None)
+    scenario_ids = request.get("scenario_ids") or []
+
+    # Load FAIR analyses either by scenario or for the whole org
+    if scenario_ids:
+        fa_query = select(FAIRAnalysis).where(
+            and_(
+                FAIRAnalysis.organization_id == org_id,
+                FAIRAnalysis.scenario_id.in_(scenario_ids),
+            )
+        )
+    else:
+        fa_query = select(FAIRAnalysis).where(
+            FAIRAnalysis.organization_id == org_id
+        )
+    analyses = list((await db.execute(fa_query)).scalars().all())
+
+    engine = FAIREngine()
+    ale_samples: list[list[float]] = []
+    per_scenario: list[dict] = []
+
+    for analysis in analyses:
+        payload = {
+            "tef_min": analysis.tef_min,
+            "tef_mode": analysis.tef_mode,
+            "tef_max": analysis.tef_max,
+            "tcap_min": analysis.tcap_min,
+            "tcap_mode": analysis.tcap_mode,
+            "tcap_max": analysis.tcap_max,
+            "rs_min": analysis.rs_min,
+            "rs_mode": analysis.rs_mode,
+            "rs_max": analysis.rs_max,
+            "primary_loss_min": analysis.primary_loss_min,
+            "primary_loss_mode": analysis.primary_loss_mode,
+            "primary_loss_max": analysis.primary_loss_max,
+            "secondary_loss_min": analysis.secondary_loss_min,
+            "secondary_loss_mode": analysis.secondary_loss_mode,
+            "secondary_loss_max": analysis.secondary_loss_max,
+            "secondary_loss_event_frequency": analysis.secondary_loss_event_frequency,
+        }
+        try:
+            result = engine.run_simulation(
+                payload, analysis.simulation_iterations or 10000
+            )
+            ale_samples.append(result.ale_distribution)
+            per_scenario.append({
+                "analysis_id": analysis.id,
+                "scenario_id": analysis.scenario_id,
+                "ale_mean": result.ale_mean,
+                "ale_p50": result.ale_p50,
+                "ale_p90": result.ale_p90,
+                "ale_p99": result.ale_p99,
+            })
+            # Persist the updated simulation results
+            analysis.ale_mean = result.ale_mean
+            analysis.ale_p10 = result.ale_p10
+            analysis.ale_p50 = result.ale_p50
+            analysis.ale_p90 = result.ale_p90
+            analysis.ale_p99 = result.ale_p99
+            analysis.loss_exceedance_curve = json.dumps(result.loss_exceedance_curve)
+            analysis.completed_at = datetime.now(timezone.utc)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"FAIR analyze failed for {analysis.id}: {exc}")
+
+    await db.flush()
+
+    # Aggregate across the run
+    aggregator = RiskAggregator()
+    portfolio_var_95 = aggregator.calculate_portfolio_var(ale_samples, confidence=0.95)
+
+    total_mean = sum(s["ale_mean"] for s in per_scenario)
+
+    return {
+        "status": "completed",
+        "scenarios_analyzed": len(per_scenario),
+        "total_ale_mean": round(total_mean, 2),
+        "portfolio_var_95": round(portfolio_var_95, 2),
+        "per_scenario": per_scenario,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@router.get("/loss-exceedance")
+async def get_loss_exceedance_portfolio(
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+):
+    """Return the aggregate loss exceedance curve for the organization.
+
+    The frontend's Risk Quantification page calls this endpoint on the
+    initial data load; previously it 404'd and the entire page spun on
+    the loading state forever. Now aggregates the ``loss_exceedance_
+    curve`` fields of every completed FAIRAnalysis in the org,
+    merges them into a single portfolio curve by interpolating each
+    analysis's curve onto a shared probability grid, and returns the
+    result.
+    """
+    org_id = getattr(current_user, "organization_id", None)
+
+    fa_query = select(FAIRAnalysis).where(
+        and_(
+            FAIRAnalysis.organization_id == org_id,
+            FAIRAnalysis.loss_exceedance_curve.is_not(None),
+        )
+    )
+    analyses = list((await db.execute(fa_query)).scalars().all())
+
+    if not analyses:
+        return {
+            "analyses_count": 0,
+            "curve": [],
+            "note": "No completed FAIR analyses for this organization",
+        }
+
+    # Merge curves by summing losses at each probability bucket
+    merged: dict[float, float] = {}
+    for analysis in analyses:
+        try:
+            curve = json.loads(analysis.loss_exceedance_curve or "[]")
+        except (ValueError, TypeError):
+            continue
+        for point in curve:
+            if not isinstance(point, dict):
+                continue
+            prob = float(point.get("probability") or 0)
+            loss = float(point.get("loss") or 0)
+            merged[prob] = merged.get(prob, 0.0) + loss
+
+    curve = [
+        {"probability": p, "loss": round(l, 2)}
+        for p, l in sorted(merged.items())
+    ]
+
+    total_mean = sum(a.ale_mean or 0 for a in analyses)
+    total_p90 = sum(a.ale_p90 or 0 for a in analyses)
+    total_p99 = sum(a.ale_p99 or 0 for a in analyses)
+
+    return {
+        "analyses_count": len(analyses),
+        "total_ale_mean": round(total_mean, 2),
+        "total_ale_p90": round(total_p90, 2),
+        "total_ale_p99": round(total_p99, 2),
+        "curve": curve,
+    }

@@ -147,7 +147,7 @@ class InvestigationResponse(InvestigationBase, DBModel):
     findings_summary: Optional[str] = None
     recommendations: Optional[list[str]] = None
     mitre_techniques: Optional[list[str]] = None
-    affected_assets: Optional[dict[str, Any]] = None
+    affected_assets: Optional[Any] = None
     resolution_type: Optional[str] = None
     human_feedback: Optional[str] = None
     feedback_rating: Optional[int] = None
@@ -304,6 +304,10 @@ class NaturalLanguageQuery(BaseModel):
 
     query: str = Field(..., min_length=1)
     agent_id: Optional[str] = None  # Specific agent or auto-select
+    # If False, destructive action tools (block_ip, isolate_host, disable_user,
+    # execute_playbook, create_incident, etc.) are blocked — the agent can only
+    # query and analyze. Caller must explicitly authorize actions.
+    authorize_actions: bool = False
 
 
 class NaturalLanguageResponse(BaseModel):

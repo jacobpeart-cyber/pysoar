@@ -1,6 +1,12 @@
-"""IOC (Indicator of Compromise) management endpoints"""
+"""IOC (Indicator of Compromise) management endpoints.
 
-import json
+Backed by the unified `threat_indicators` table. Legacy IOC-specific fields
+(description, category, malware_family, threat_actor, campaign, source_url,
+source_reference, enrichment_data, is_internal) are stored inside the
+ThreatIndicator.context JSON dict to preserve the wire contract for the
+existing frontend IOCs page.
+"""
+
 import math
 from datetime import datetime, timezone
 from typing import Optional
@@ -10,12 +16,11 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DatabaseSession
-from src.core.utils import safe_json_loads
-from src.models.ioc import IOC, IOCStatus
+from src.intel.models import ThreatIndicator
 from src.schemas.ioc import (
     IOCBulkCreate,
     IOCCreate,
-    IOCEnrichRequest,
+    IOCEnrichRequest,  # noqa: F401 - exported for compat
     IOCListResponse,
     IOCResponse,
     IOCSearchRequest,
@@ -25,9 +30,66 @@ from src.schemas.ioc import (
 router = APIRouter(prefix="/iocs", tags=["IOCs"])
 
 
-async def get_ioc_or_404(db: AsyncSession, ioc_id: str) -> IOC:
-    """Get IOC by ID or raise 404"""
-    result = await db.execute(select(IOC).where(IOC.id == ioc_id))
+# --------------------------------------------------------------------------- #
+# Field mapping helpers
+# --------------------------------------------------------------------------- #
+
+def _parse_dt(value) -> Optional[datetime]:
+    """Accept str or datetime and return aware datetime or None."""
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _dt_iso(value: Optional[datetime]) -> Optional[str]:
+    return value.isoformat() if value else None
+
+
+def ioc_to_response(ioc: ThreatIndicator) -> IOCResponse:
+    """Convert a unified ThreatIndicator row into the legacy IOCResponse shape."""
+    ctx = ioc.context if isinstance(ioc.context, dict) else {}
+
+    return IOCResponse(
+        id=ioc.id,
+        value=ioc.value,
+        ioc_type=ioc.indicator_type,
+        status="active" if ioc.is_active else "inactive",
+        threat_level=ioc.severity or "unknown",
+        confidence=ioc.confidence if ioc.confidence is not None else 50,
+        description=ctx.get("description"),
+        tags=ioc.tags or [],
+        category=ctx.get("category"),
+        source=ioc.source,
+        source_url=ctx.get("source_url"),
+        source_reference=ctx.get("source_reference"),
+        malware_family=ctx.get("malware_family"),
+        threat_actor=ctx.get("threat_actor"),
+        campaign=ctx.get("campaign"),
+        mitre_tactics=ioc.mitre_tactics or [],
+        mitre_techniques=ioc.mitre_techniques or [],
+        enrichment_data=ctx.get("enrichment_data"),
+        last_enriched=ctx.get("last_enriched"),
+        first_seen=_dt_iso(ioc.first_seen),
+        last_seen=_dt_iso(ioc.last_seen),
+        expires_at=_dt_iso(ioc.expires_at),
+        sighting_count=ioc.sighting_count or 0,
+        last_sighting=_dt_iso(ioc.last_sighting_at),
+        is_whitelisted=bool(ioc.is_whitelisted),
+        is_internal=bool(ctx.get("is_internal", False)),
+        created_at=ioc.created_at,
+        updated_at=ioc.updated_at,
+    )
+
+
+async def get_ioc_or_404(db: AsyncSession, ioc_id: str) -> ThreatIndicator:
+    """Get IOC by ID or raise 404."""
+    result = await db.execute(select(ThreatIndicator).where(ThreatIndicator.id == ioc_id))
     ioc = result.scalar_one_or_none()
     if not ioc:
         raise HTTPException(
@@ -37,44 +99,29 @@ async def get_ioc_or_404(db: AsyncSession, ioc_id: str) -> IOC:
     return ioc
 
 
-def ioc_to_response(ioc: IOC) -> IOCResponse:
-    """Convert IOC model to response schema"""
-    tags = safe_json_loads(ioc.tags, []) if ioc.tags else None
-    mitre_tactics = safe_json_loads(ioc.mitre_tactics, []) if ioc.mitre_tactics else None
-    mitre_techniques = safe_json_loads(ioc.mitre_techniques, []) if ioc.mitre_techniques else None
-    enrichment_data = safe_json_loads(ioc.enrichment_data, {}) if ioc.enrichment_data else None
+def _build_context_from_create(ioc_data: IOCCreate) -> dict:
+    """Stash legacy-only fields into the ThreatIndicator.context JSON."""
+    ctx: dict = {}
+    if ioc_data.description:
+        ctx["description"] = ioc_data.description
+    if ioc_data.category:
+        ctx["category"] = ioc_data.category
+    if ioc_data.source_url:
+        ctx["source_url"] = ioc_data.source_url
+    if ioc_data.source_reference:
+        ctx["source_reference"] = ioc_data.source_reference
+    if ioc_data.malware_family:
+        ctx["malware_family"] = ioc_data.malware_family
+    if ioc_data.threat_actor:
+        ctx["threat_actor"] = ioc_data.threat_actor
+    if ioc_data.campaign:
+        ctx["campaign"] = ioc_data.campaign
+    return ctx
 
-    return IOCResponse(
-        id=ioc.id,
-        value=ioc.value,
-        ioc_type=ioc.ioc_type,
-        status=ioc.status,
-        threat_level=ioc.threat_level,
-        confidence=ioc.confidence,
-        description=ioc.description,
-        tags=tags,
-        category=ioc.category,
-        source=ioc.source,
-        source_url=ioc.source_url,
-        source_reference=ioc.source_reference,
-        malware_family=ioc.malware_family,
-        threat_actor=ioc.threat_actor,
-        campaign=ioc.campaign,
-        mitre_tactics=mitre_tactics,
-        mitre_techniques=mitre_techniques,
-        enrichment_data=enrichment_data,
-        last_enriched=ioc.last_enriched,
-        first_seen=ioc.first_seen,
-        last_seen=ioc.last_seen,
-        expires_at=ioc.expires_at,
-        sighting_count=ioc.sighting_count,
-        last_sighting=ioc.last_sighting,
-        is_whitelisted=ioc.is_whitelisted,
-        is_internal=ioc.is_internal,
-        created_at=ioc.created_at,
-        updated_at=ioc.updated_at,
-    )
 
+# --------------------------------------------------------------------------- #
+# Endpoints
+# --------------------------------------------------------------------------- #
 
 @router.get("", response_model=IOCListResponse)
 async def list_iocs(
@@ -88,39 +135,32 @@ async def list_iocs(
     threat_level: Optional[str] = None,
     is_whitelisted: Optional[bool] = None,
 ):
-    """List IOCs with filtering and pagination"""
-    query = select(IOC)
+    """List IOCs (unified threat indicators) with filtering and pagination."""
+    query = select(ThreatIndicator)
 
-    # Apply filters
     if search:
         search_filter = f"%{search}%"
-        query = query.where(
-            (IOC.value.ilike(search_filter))
-            | (IOC.description.ilike(search_filter))
-            | (IOC.malware_family.ilike(search_filter))
-            | (IOC.threat_actor.ilike(search_filter))
-        )
+        query = query.where(ThreatIndicator.value.ilike(search_filter))
 
     if ioc_type:
-        query = query.where(IOC.ioc_type == ioc_type)
+        query = query.where(ThreatIndicator.indicator_type == ioc_type)
 
     if ioc_status:
-        query = query.where(IOC.status == ioc_status)
+        if ioc_status == "active":
+            query = query.where(ThreatIndicator.is_active == True)  # noqa: E712
+        else:
+            query = query.where(ThreatIndicator.is_active == False)  # noqa: E712
 
     if threat_level:
-        query = query.where(IOC.threat_level == threat_level)
+        query = query.where(ThreatIndicator.severity == threat_level)
 
     if is_whitelisted is not None:
-        query = query.where(IOC.is_whitelisted == is_whitelisted)
+        query = query.where(ThreatIndicator.is_whitelisted == is_whitelisted)
 
-    # Get total count
-    count_result = await db.execute(
-        select(func.count()).select_from(query.subquery())
-    )
+    count_result = await db.execute(select(func.count()).select_from(query.subquery()))
     total = count_result.scalar() or 0
 
-    # Apply sorting and pagination
-    query = query.order_by(IOC.created_at.desc())
+    query = query.order_by(ThreatIndicator.created_at.desc())
     query = query.offset((page - 1) * size).limit(size)
 
     result = await db.execute(query)
@@ -141,43 +181,46 @@ async def create_ioc(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Create a new IOC"""
-    # Check for duplicate
+    """Create a new IOC in the unified threat_indicators table."""
+    now = datetime.now(timezone.utc)
+
+    # Check for duplicate (same value + type)
     result = await db.execute(
-        select(IOC).where(
-            (IOC.value == ioc_data.value) & (IOC.ioc_type == ioc_data.ioc_type)
+        select(ThreatIndicator).where(
+            (ThreatIndicator.value == ioc_data.value)
+            & (ThreatIndicator.indicator_type == ioc_data.ioc_type)
         )
     )
     existing = result.scalar_one_or_none()
 
     if existing:
-        # Update sighting count and return existing
-        existing.sighting_count += 1
-        existing.last_sighting = datetime.now(timezone.utc).isoformat()
+        existing.sighting_count = (existing.sighting_count or 0) + 1
+        existing.last_sighting_at = now
+        existing.last_seen = now
         await db.flush()
         await db.refresh(existing)
         return ioc_to_response(existing)
 
-    ioc = IOC(
+    ctx = _build_context_from_create(ioc_data)
+    org_id = getattr(current_user, "organization_id", None)
+
+    ioc = ThreatIndicator(
         value=ioc_data.value,
-        ioc_type=ioc_data.ioc_type,
-        status=IOCStatus.ACTIVE.value,
-        threat_level=ioc_data.threat_level,
+        indicator_type=ioc_data.ioc_type,
+        is_active=True,
+        is_whitelisted=False,
+        severity=ioc_data.threat_level or "informational",
         confidence=ioc_data.confidence,
-        description=ioc_data.description,
-        tags=json.dumps(ioc_data.tags) if ioc_data.tags else None,
-        category=ioc_data.category,
         source=ioc_data.source,
-        source_url=ioc_data.source_url,
-        source_reference=ioc_data.source_reference,
-        malware_family=ioc_data.malware_family,
-        threat_actor=ioc_data.threat_actor,
-        campaign=ioc_data.campaign,
-        mitre_tactics=json.dumps(ioc_data.mitre_tactics) if ioc_data.mitre_tactics else None,
-        mitre_techniques=json.dumps(ioc_data.mitre_techniques) if ioc_data.mitre_techniques else None,
-        expires_at=ioc_data.expires_at,
-        first_seen=datetime.now(timezone.utc).isoformat(),
+        tags=ioc_data.tags or [],
+        mitre_tactics=ioc_data.mitre_tactics or [],
+        mitre_techniques=ioc_data.mitre_techniques or [],
+        context=ctx,
+        first_seen=now,
+        last_seen=now,
+        expires_at=_parse_dt(ioc_data.expires_at),
         sighting_count=1,
+        organization_id=org_id,
     )
 
     db.add(ioc)
@@ -193,38 +236,43 @@ async def bulk_create_iocs(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Bulk create IOCs"""
+    """Bulk create IOCs."""
     created_count = 0
     updated_count = 0
-    failures = []
+    failures: list[dict] = []
+    now = datetime.now(timezone.utc)
+    org_id = getattr(current_user, "organization_id", None)
 
     for ioc_data in bulk_data.iocs:
         try:
-            # Check for duplicate
             result = await db.execute(
-                select(IOC).where(
-                    (IOC.value == ioc_data.value) & (IOC.ioc_type == ioc_data.ioc_type)
+                select(ThreatIndicator).where(
+                    (ThreatIndicator.value == ioc_data.value)
+                    & (ThreatIndicator.indicator_type == ioc_data.ioc_type)
                 )
             )
             existing = result.scalar_one_or_none()
 
             if existing:
-                existing.sighting_count += 1
-                existing.last_sighting = datetime.now(timezone.utc).isoformat()
+                existing.sighting_count = (existing.sighting_count or 0) + 1
+                existing.last_sighting_at = now
+                existing.last_seen = now
                 updated_count += 1
             else:
-                ioc = IOC(
+                ioc = ThreatIndicator(
                     value=ioc_data.value,
-                    ioc_type=ioc_data.ioc_type,
-                    status=IOCStatus.ACTIVE.value,
-                    threat_level=ioc_data.threat_level,
+                    indicator_type=ioc_data.ioc_type,
+                    is_active=True,
+                    is_whitelisted=False,
+                    severity=ioc_data.threat_level or "informational",
                     confidence=ioc_data.confidence,
-                    description=ioc_data.description,
-                    tags=json.dumps(ioc_data.tags) if ioc_data.tags else None,
-                    category=ioc_data.category,
                     source=ioc_data.source,
-                    first_seen=datetime.now(timezone.utc).isoformat(),
+                    tags=ioc_data.tags or [],
+                    context=_build_context_from_create(ioc_data),
+                    first_seen=now,
+                    last_seen=now,
                     sighting_count=1,
+                    organization_id=org_id,
                 )
                 db.add(ioc)
                 created_count += 1
@@ -248,7 +296,7 @@ async def get_ioc(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Get an IOC by ID"""
+    """Get an IOC by ID."""
     ioc = await get_ioc_or_404(db, ioc_id)
     return ioc_to_response(ioc)
 
@@ -260,17 +308,35 @@ async def update_ioc(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Update an IOC"""
+    """Update an IOC."""
     ioc = await get_ioc_or_404(db, ioc_id)
 
     update_data = ioc_data.model_dump(exclude_unset=True, exclude_none=True)
+    ctx = dict(ioc.context) if isinstance(ioc.context, dict) else {}
 
-    # Handle JSON fields
+    # Handle legacy fields that map into ThreatIndicator columns
+    if "status" in update_data:
+        ioc.is_active = update_data.pop("status") == "active"
+    if "threat_level" in update_data:
+        ioc.severity = update_data.pop("threat_level")
+    if "confidence" in update_data:
+        ioc.confidence = update_data.pop("confidence")
     if "tags" in update_data:
-        update_data["tags"] = json.dumps(update_data["tags"])
+        ioc.tags = update_data.pop("tags") or []
+    if "is_whitelisted" in update_data:
+        ioc.is_whitelisted = update_data.pop("is_whitelisted")
+    if "expires_at" in update_data:
+        ioc.expires_at = _parse_dt(update_data.pop("expires_at"))
 
-    for key, value in update_data.items():
-        setattr(ioc, key, value)
+    # Everything else goes into context
+    for legacy_key in (
+        "description", "category", "malware_family", "threat_actor", "campaign",
+    ):
+        if legacy_key in update_data:
+            ctx[legacy_key] = update_data.pop(legacy_key)
+
+    if ctx != ioc.context:
+        ioc.context = ctx
 
     await db.flush()
     await db.refresh(ioc)
@@ -284,7 +350,7 @@ async def delete_ioc(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Delete an IOC"""
+    """Delete an IOC."""
     ioc = await get_ioc_or_404(db, ioc_id)
     await db.delete(ioc)
     await db.flush()
@@ -296,20 +362,18 @@ async def search_ioc(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Search for an IOC by value"""
-    query = select(IOC).where(IOC.value == search_data.value)
-
+    """Search for an IOC by value."""
+    query = select(ThreatIndicator).where(ThreatIndicator.value == search_data.value)
     if search_data.ioc_type:
-        query = query.where(IOC.ioc_type == search_data.ioc_type)
+        query = query.where(ThreatIndicator.indicator_type == search_data.ioc_type)
 
     result = await db.execute(query)
     iocs = list(result.scalars().all())
 
-    # Update last_seen for found IOCs
-    now = datetime.now(timezone.utc).isoformat()
+    now = datetime.now(timezone.utc)
     for ioc in iocs:
         ioc.last_seen = now
-        ioc.sighting_count += 1
+        ioc.sighting_count = (ioc.sighting_count or 0) + 1
 
     await db.flush()
 
@@ -322,46 +386,51 @@ async def enrich_ioc(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Enrich an IOC with threat intelligence"""
-    from src.intel.models import ThreatIndicator
+    """Enrich an IOC by aggregating all matching threat indicators by value.
 
+    Because ioc and threat_indicators are now the same table, enrichment
+    means "look for other rows with the same value across different feeds
+    and fold their context together."
+    """
     ioc = await get_ioc_or_404(db, ioc_id)
 
-    # Query threat indicators that match this IOC value
-    ti_result = await db.execute(
+    sibling_result = await db.execute(
         select(ThreatIndicator).where(
             ThreatIndicator.value == ioc.value,
-            ThreatIndicator.is_active == True,
+            ThreatIndicator.id != ioc.id,
+            ThreatIndicator.is_active == True,  # noqa: E712
         )
     )
-    indicators = list(ti_result.scalars().all())
+    siblings = list(sibling_result.scalars().all())
 
-    # Build enrichment data from matching threat indicators
-    enrichment = safe_json_loads(ioc.enrichment_data, {}) if ioc.enrichment_data else {}
+    ctx = dict(ioc.context) if isinstance(ioc.context, dict) else {}
+    enrichment = dict(ctx.get("enrichment_data") or {})
 
-    for indicator in indicators:
-        source_key = f"threat_feed_{indicator.feed_id}" if indicator.feed_id else f"local_{indicator.id}"
-        enrichment[source_key] = {
-            "confidence": indicator.confidence,
-            "severity": indicator.severity,
-            "tags": indicator.tags,
-            "context": indicator.context,
-            "first_seen": indicator.first_seen.isoformat() if indicator.first_seen else None,
-            "last_seen": indicator.last_seen.isoformat() if indicator.last_seen else None,
-            "sighting_count": indicator.sighting_count,
-            "mitre_tactics": indicator.mitre_tactics,
-            "mitre_techniques": indicator.mitre_techniques,
+    for sib in siblings:
+        key = f"feed_{sib.feed_id}" if sib.feed_id else f"local_{sib.id[:8]}"
+        enrichment[key] = {
+            "confidence": sib.confidence,
+            "severity": sib.severity,
+            "tags": sib.tags,
+            "context": sib.context,
+            "first_seen": _dt_iso(sib.first_seen),
+            "last_seen": _dt_iso(sib.last_seen),
+            "sighting_count": sib.sighting_count,
+            "mitre_tactics": sib.mitre_tactics,
+            "mitre_techniques": sib.mitre_techniques,
+            "source": sib.source,
         }
 
-    # If we found matching indicators, update confidence based on them
-    if indicators:
-        scores = [ind.confidence for ind in indicators if ind.confidence is not None]
+    if siblings:
+        scores = [s.confidence for s in siblings if s.confidence is not None]
         if scores:
             enrichment["composite_confidence"] = int(sum(scores) / len(scores))
-            enrichment["source_count"] = len(indicators)
+            enrichment["source_count"] = len(siblings) + 1
 
-    ioc.enrichment_data = json.dumps(enrichment)
-    ioc.last_enriched = datetime.now(timezone.utc).isoformat()
+    ctx["enrichment_data"] = enrichment
+    ctx["last_enriched"] = datetime.now(timezone.utc).isoformat()
+    ioc.context = ctx
+
     await db.flush()
     await db.refresh(ioc)
 

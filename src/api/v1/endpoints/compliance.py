@@ -5,7 +5,7 @@ Complete API for managing compliance frameworks, controls, assessments, and evid
 Supports FedRAMP, NIST, CMMC, SOC 2, HIPAA, PCI-DSS, DFARS, and CISA compliance.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Dict, Any
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query
@@ -155,8 +155,29 @@ async def trigger_assessment(
     run_compliance_assessment.delay(framework_id, getattr(current_user, "organization_id", None))
 
     # Run assessment synchronously for immediate response
-    engine = ComplianceEngine(db, getattr(current_user, "organization_id", None))
+    org_id = getattr(current_user, "organization_id", None)
+    engine = ComplianceEngine(db, org_id)
     assessment = await engine.assess_framework(framework_id)
+
+    # Cross-module loop: if the framework's assessment came back
+    # with less than 80% compliance, fire on_compliance_failure so
+    # the framework drops into the automation pipeline — Alert,
+    # POAM creation, and remediation policy evaluation all get
+    # their shot at the finding. 80% is the standard FedRAMP
+    # Moderate "partially compliant" threshold.
+    try:
+        score = (assessment.get("compliance_score") if isinstance(assessment, dict) else None) or 0
+        if score < 80.0:
+            from src.services.automation import AutomationService
+            automation = AutomationService(db)
+            await automation.on_compliance_failure(
+                control_id=framework.short_name or framework_id,
+                control_title=f"{framework.name}: {score:.1f}% compliant",
+                framework=framework.name,
+                organization_id=org_id,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"on_compliance_failure fan-out failed: {exc}")
 
     return assessment
 
@@ -316,7 +337,7 @@ async def list_controls(
     status: Optional[str] = None,
     baseline: Optional[str] = None,
     skip: int = Query(0, ge=0),
-    limit: int = Query(20, ge=1, le=100),
+    limit: int = Query(20, ge=1, le=1000),
 ):
     """
     List controls with filtering by framework, family, status, baseline.
@@ -448,10 +469,32 @@ async def cross_map_controls(
     target_framework_id: str = Query(...),
     current_user: CurrentUser = None,
 ):
-    """Get cross-framework control mapping."""
-    engine = ComplianceEngine(db, getattr(current_user, "organization_id", None))
-    mapping = await engine.cross_map_controls(source_framework_id, target_framework_id)
+    """Get cross-framework control mapping.
 
+    Verifies both frameworks belong to the caller's org before running
+    the mapping. Without this check, an authenticated user could pass
+    any framework UUID (e.g. another tenant's FedRAMP instance) and
+    read its control relationships.
+    """
+    org_id = getattr(current_user, "organization_id", None)
+
+    for fw_id in (source_framework_id, target_framework_id):
+        check = await db.execute(
+            select(ComplianceFramework).where(
+                and_(
+                    ComplianceFramework.id == fw_id,
+                    ComplianceFramework.organization_id == org_id,
+                )
+            )
+        )
+        if check.scalar_one_or_none() is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Framework {fw_id} not found in your organization",
+            )
+
+    engine = ComplianceEngine(db, org_id)
+    mapping = await engine.cross_map_controls(source_framework_id, target_framework_id)
     return mapping
 
 
@@ -486,7 +529,7 @@ async def list_poams(
         stmt = stmt.where(POAM.risk_level == risk_level)
 
     if overdue_only:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         stmt = stmt.where(
             and_(
                 POAM.scheduled_completion_date < now,
@@ -533,7 +576,7 @@ async def get_overdue_poams(
     current_user: CurrentUser = None,
 ):
     """Get overdue POA&Ms."""
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     stmt = select(POAM).where(
         and_(
             POAM.organization_id == getattr(current_user, "organization_id", None),
@@ -557,7 +600,7 @@ async def get_poam_report(
     result = await db.execute(stmt)
     all_poams = result.scalars().all()
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     overdue = [p for p in all_poams if p.scheduled_completion_date < now and p.status != "completed"]
     open_items = [p for p in all_poams if p.status in ["open", "in_progress"]]
     completed = [p for p in all_poams if p.status == "completed"]
@@ -685,7 +728,7 @@ async def upload_evidence(
         description=description,
         content=content,
         file_path=file_path,
-        collected_at=datetime.utcnow(),
+        collected_at=datetime.now(timezone.utc),
         collected_by=current_user.id,
         organization_id=getattr(current_user, "organization_id", None),
     )
@@ -741,7 +784,7 @@ async def review_evidence(
 
     evidence.review_status = review_status
     evidence.reviewed_by = reviewed_by
-    evidence.reviewed_at = datetime.utcnow()
+    evidence.reviewed_at = datetime.now(timezone.utc)
 
     await db.commit()
     await db.refresh(evidence)
@@ -845,7 +888,7 @@ async def audit_cui_handling(
     result = await db.execute(stmt)
     markings = result.scalars().all()
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     total = len(markings)
     active = sum(1 for m in markings if m.is_active)
     expired = sum(1 for m in markings if m.declassification_date and m.declassification_date < now)
@@ -977,7 +1020,7 @@ async def get_dashboard_stats(
     implemented_count = result.scalar() or 0
 
     # POA&Ms
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     stmt = select(POAM).where(
         and_(
             POAM.organization_id == getattr(current_user, "organization_id", None),
@@ -1045,7 +1088,7 @@ async def get_dashboard_stats(
         "active_cisa_directives": active_directives,
         "cui_assets_total": total_cui,
         "cui_assets_active": active_cui,
-        "last_updated": datetime.utcnow(),
+        "last_updated": datetime.now(timezone.utc),
     }
 
 
@@ -1061,7 +1104,7 @@ async def get_score_history(
         and_(
             ComplianceAssessment.organization_id == getattr(current_user, "organization_id", None),
             ComplianceAssessment.assessment_date
-            >= datetime.utcnow() - timedelta(days=days),
+            >= datetime.now(timezone.utc) - timedelta(days=days),
         )
     )
 

@@ -101,15 +101,26 @@ async def list_organizations(
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, ge=1, le=100),
 ):
-    """List all organizations (admin sees all, users see their own)"""
-    if current_user.is_admin:
+    """List organizations visible to the caller.
+
+    Platform superusers see every organization. Every other role — including
+    per-tenant ``admin`` role — only sees organizations they are members of
+    (via OrganizationMember) or the one matching their primary
+    ``users.organization_id``. This stops a tenant admin from enumerating
+    every other customer's organization via this endpoint.
+    """
+    if getattr(current_user, "is_superuser", False):
         query = select(Organization)
     else:
-        # Get organizations the user is a member of
         member_subquery = select(OrganizationMember.organization_id).where(
             OrganizationMember.user_id == current_user.id
         )
-        query = select(Organization).where(Organization.id.in_(member_subquery))
+        filters = [Organization.id.in_(member_subquery)]
+        primary_org = getattr(current_user, "organization_id", None)
+        if primary_org:
+            filters.append(Organization.id == primary_org)
+        from sqlalchemy import or_ as _or
+        query = select(Organization).where(_or(*filters))
 
     query = query.offset(skip).limit(limit).order_by(Organization.created_at.desc())
     result = await db.execute(query)
@@ -224,7 +235,13 @@ async def delete_organization(
     db: DatabaseSession = None,
     admin_user: User = Depends(get_current_admin_user),
 ):
-    """Delete an organization (admin only)"""
+    """Delete an organization (platform superuser only)"""
+    if not getattr(admin_user, "is_superuser", False):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only platform superusers can delete organizations",
+        )
+
     result = await db.execute(select(Organization).where(Organization.id == org_id))
     org = result.scalar_one_or_none()
 
@@ -582,7 +599,12 @@ async def _get_organization(
     db: AsyncSession,
     require_admin: bool = False,
 ) -> Organization:
-    """Get an organization with access check"""
+    """Get an organization with a real access check.
+
+    Only platform superusers bypass the membership check. Per-tenant admin
+    role no longer grants cross-tenant access — they must be members of the
+    specific organization they're trying to touch.
+    """
     result = await db.execute(select(Organization).where(Organization.id == org_id))
     org = result.scalar_one_or_none()
 
@@ -592,26 +614,31 @@ async def _get_organization(
             detail="Organization not found",
         )
 
-    # Check access
-    if not user.is_admin:
-        member_result = await db.execute(
-            select(OrganizationMember).where(
-                OrganizationMember.organization_id == org_id,
-                OrganizationMember.user_id == user.id,
-            )
+    if getattr(user, "is_superuser", False):
+        return org
+
+    # Must be a member (or primary org) to access.
+    member_result = await db.execute(
+        select(OrganizationMember).where(
+            OrganizationMember.organization_id == org_id,
+            OrganizationMember.user_id == user.id,
         )
-        member = member_result.scalar_one_or_none()
+    )
+    member = member_result.scalar_one_or_none()
 
-        if not member:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Not a member of this organization",
-            )
+    primary_org = getattr(user, "organization_id", None)
+    if not member and primary_org != org_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not a member of this organization",
+        )
 
-        if require_admin and member.role not in [
+    if require_admin:
+        is_org_admin = member and member.role in [
             OrganizationRole.OWNER.value,
             OrganizationRole.ADMIN.value,
-        ]:
+        ]
+        if not is_org_admin:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
                 detail="Admin access required",

@@ -54,6 +54,13 @@ class Alert(BaseModel):
 
     __tablename__ = "alerts"
 
+    organization_id: Mapped[Optional[str]] = mapped_column(
+        String(36),
+        ForeignKey("organizations.id"),
+        nullable=True,
+        index=True,
+    )
+
     # Core fields
     title: Mapped[str] = mapped_column(String(500), nullable=False, index=True)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

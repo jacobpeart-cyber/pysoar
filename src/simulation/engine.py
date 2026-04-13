@@ -258,13 +258,39 @@ class SimulationOrchestrator:
             test.executor = test_cmd.get("executor", "powershell")
             test.command_executed = command
 
-            # Simulate command execution (in production, would actually execute)
-            output = f"[SIMULATED] Executed: {command}\nTest output simulated"
-            test.output = output
-            test.status = "passed"
+            # Try to execute the atomic test on a real endpoint agent if
+            # one is available in scope. Fall back to coverage-only
+            # scoring if no agent matches or the agent doesn't respond
+            # within the dispatch window. Either way the detection score
+            # is still computed from the DetectionRule table, so the
+            # security posture number remains well-defined regardless of
+            # whether a physical host was involved.
+            agent_result = await self._try_dispatch_to_agent(
+                test=test,
+                technique=technique,
+                command=command,
+                executor=test_cmd.get("executor", "sh"),
+            )
 
-            # Check for detection (with timeout)
-            detected = await self._check_detection(test, wait_seconds=300)
+            if agent_result is not None:
+                test.output = agent_result.stdout or ""
+                if agent_result.stderr:
+                    test.error_output = agent_result.stderr
+                test.status = "passed" if agent_result.status == "success" else "error"
+            else:
+                # No live agent — score against detection rule coverage only
+                test.output = (
+                    f"[COVERAGE-ONLY] Technique {technique.mitre_id} plan:\n"
+                    f"  executor: {test_cmd.get('executor', 'powershell')}\n"
+                    f"  command: {command}\n"
+                    f"  description: {technique.description or ''}\n"
+                    f"  (No BAS-capable agent enrolled in scope — "
+                    f"scored against detection rule coverage only.)"
+                )
+                test.status = "passed"
+
+            # Deterministic detection lookup against active detection rules
+            detected = await self._check_detection(test, technique)
             test.was_detected = detected
 
             # Run cleanup if test passed and cleanup command exists
@@ -289,42 +315,166 @@ class SimulationOrchestrator:
             "detection_time": test.detection_time_seconds
         }
 
-    async def _check_detection(self, test: SimulationTest, wait_seconds: int = 300) -> bool:
+    async def _try_dispatch_to_agent(
+        self,
+        test: SimulationTest,
+        technique: "AttackTechnique",
+        command: str,
+        executor: str,
+        max_wait_seconds: int = 30,
+    ):
+        """Dispatch this atomic test to a live BAS-capable endpoint agent.
+
+        The simulation's ``scope`` may contain a ``target_host`` hint. We
+        look for an ACTIVE agent whose hostname matches the hint AND has
+        the ``bas`` capability. If one exists, we issue a
+        ``run_atomic_test`` command via AgentService (which chains the
+        audit hash) and poll the agent_results table until a row lands
+        or we time out. Returns the AgentResult row, or None if no agent
+        matched or the agent didn't report back in time.
+
+        Any exception here is non-fatal — the test simply degrades to
+        coverage-only scoring rather than failing the whole simulation.
         """
-        Check if SIEM detected the simulation activity.
+        try:
+            from src.agents.capabilities import AgentAction, AgentCapability
+            from src.agents.models import AgentCommand, AgentResult, EndpointAgent
+            from src.agents.service import AgentService
 
-        Polls for detection results within the specified timeout period.
+            simulation = await self._get_simulation(test.simulation_id)
+            if simulation is None:
+                return None
 
-        Args:
-            test: SimulationTest to check
-            wait_seconds: Maximum seconds to wait for detection
+            scope = simulation.scope or {}
+            target_host = scope.get("target_host") if isinstance(scope, dict) else None
+            org_id = simulation.organization_id
 
-        Returns:
-            True if activity was detected, False if timeout or not detected
+            agent_query = select(EndpointAgent).where(
+                EndpointAgent.status == "active"
+            )
+            if org_id:
+                agent_query = agent_query.where(EndpointAgent.organization_id == org_id)
+            if target_host:
+                agent_query = agent_query.where(EndpointAgent.hostname == target_host)
+
+            result = await self.session.execute(agent_query)
+            candidates = list(result.scalars().all())
+
+            agent = None
+            for candidate in candidates:
+                caps = candidate.capabilities or []
+                if AgentCapability.BAS.value in caps:
+                    agent = candidate
+                    break
+
+            if agent is None:
+                return None
+
+            svc = AgentService(self.session)
+            payload = {
+                "command": command,
+                "executor": executor,
+                "mitre_id": technique.mitre_id,
+            }
+            cmd = await svc.issue_command(
+                agent=agent,
+                action=AgentAction.RUN_ATOMIC_TEST.value,
+                payload=payload,
+                simulation_id=test.simulation_id,
+            )
+            await self.session.commit()
+
+            # Poll for the result. The agent polls on its own ~30s cycle
+            # so we wait up to max_wait_seconds before bailing out.
+            deadline = time.time() + max_wait_seconds
+            poll_interval = 2
+            while time.time() < deadline:
+                await asyncio.sleep(poll_interval)
+                result_row = (
+                    await self.session.execute(
+                        select(AgentResult).where(AgentResult.command_id == cmd.id)
+                    )
+                ).scalar_one_or_none()
+                if result_row is not None:
+                    return result_row
+                # Refresh command to see if it expired / rejected
+                cmd_row = (
+                    await self.session.execute(
+                        select(AgentCommand).where(AgentCommand.id == cmd.id)
+                    )
+                ).scalar_one_or_none()
+                if cmd_row and cmd_row.status in ("rejected", "expired", "failed"):
+                    break
+            return None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"Agent dispatch failed for test {test.id}: {exc} — "
+                f"falling back to coverage-only scoring"
+            )
+            return None
+
+    async def _check_detection(
+        self,
+        test: SimulationTest,
+        technique: "AttackTechnique",
+    ) -> bool:
         """
-        start_time = time.time()
-        poll_interval = 5  # seconds
+        Determine whether this technique is covered by the org's detection rules.
 
-        while time.time() - start_time < wait_seconds:
-            # In production, would query actual SIEM/EDR
-            # For simulation: randomly determine detection based on test setup
-            import random
-            detected = random.random() > 0.3  # 70% detection rate
+        This is the scoring heart of the BAS engine. It is **deterministic**
+        (the same technique always scores the same way for a given ruleset)
+        and it reflects the *real* coverage of the platform's DetectionRule
+        table. That way the security posture score actually measures
+        something — "do you have a rule that claims to detect this MITRE
+        technique?" — instead of random noise.
 
-            if detected:
-                elapsed = int(time.time() - start_time)
-                test.detection_time_seconds = elapsed
-                test.detection_source = "simulated_siem"
-                test.detection_details = {
-                    "rule_id": "SIM_TEST_001",
-                    "alert_severity": "medium",
-                    "detected_at": datetime.utcnow().isoformat()
-                }
-                return True
+        Detection is granted if ANY active detection rule lists this
+        technique's mitre_id in its ``mitre_techniques`` JSON array.
+        """
+        from src.siem.models import DetectionRule, RuleStatus
 
-            await asyncio.sleep(poll_interval)
+        mitre_id = technique.mitre_id
+        if not mitre_id:
+            return False
 
-        return False
+        # Active detection rules whose mitre_techniques contains this id.
+        # ``mitre_techniques`` is a Text column holding a JSON array, so we
+        # use SQL LIKE to pre-filter and then confirm in Python against a
+        # parsed list to avoid false positives (e.g. "T1059" matching "T10591").
+        stmt = select(DetectionRule).where(
+            and_(
+                DetectionRule.status == RuleStatus.ACTIVE.value,
+                DetectionRule.mitre_techniques.is_not(None),
+                DetectionRule.mitre_techniques.like(f"%{mitre_id}%"),
+            )
+        )
+        result = await self.session.execute(stmt)
+        candidates = list(result.scalars().all())
+
+        matching_rule = None
+        for rule in candidates:
+            try:
+                rule_techniques = json.loads(rule.mitre_techniques or "[]")
+            except (ValueError, TypeError):
+                continue
+            if isinstance(rule_techniques, list) and mitre_id in rule_techniques:
+                matching_rule = rule
+                break
+
+        if matching_rule is None:
+            return False
+
+        test.detection_time_seconds = 0  # instantaneous: we're scoring coverage, not latency
+        test.detection_source = f"detection_rule:{matching_rule.name}"
+        test.detection_details = {
+            "rule_id": matching_rule.id,
+            "rule_name": matching_rule.name,
+            "rule_title": matching_rule.title,
+            "alert_severity": matching_rule.severity,
+            "matched_at": utc_now().isoformat(),
+            "match_type": "mitre_technique_mapping",
+        }
+        return True
 
     async def _run_cleanup(self, test: SimulationTest, cleanup_command: str) -> bool:
         """
@@ -1027,7 +1177,7 @@ class AdversaryEmulator:
                 target_sectors=profile_data.get("target_sectors", []),
                 tools_used=profile_data.get("tools_used", []),
                 is_builtin=profile_data.get("is_builtin", True),
-                organization_id="builtin",  # System-wide profiles
+                organization_id=None,  # Built-in profiles are global reference data
                 created_at=utc_now(),
                 updated_at=utc_now(),
             )
@@ -1038,8 +1188,18 @@ class AdversaryEmulator:
         logger.info(f"Loaded {count} built-in adversary profiles")
         return count
 
-    async def create_emulation_plan(self, adversary_id: str, organization_id: str) -> AttackSimulation:
-        """Create an attack simulation based on an adversary profile."""
+    async def create_emulation_plan(
+        self,
+        adversary_id: str,
+        organization_id: Optional[str],
+        created_by: str,
+    ) -> AttackSimulation:
+        """Create an attack simulation based on an adversary profile.
+
+        ``created_by`` must be a real user id — attack_simulations.created_by
+        is an FK into the users table. Previously this method hardcoded
+        "system" which violated the FK and blew up every emulation.
+        """
         stmt = select(AdversaryProfile).where(AdversaryProfile.id == adversary_id)
         result = await self.session.execute(stmt)
         profile = result.scalar_one_or_none()
@@ -1054,7 +1214,7 @@ class AdversaryEmulator:
             techniques=profile.ttps,
             scope={"target": "lab_environment"},
             target_environment="lab",
-            created_by="system",
+            created_by=created_by,
             organization_id=organization_id,
             description=f"Emulation of {profile.name} attack patterns: {', '.join(profile.objectives)}"
         )

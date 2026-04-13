@@ -33,7 +33,10 @@ class ComplianceFramework(BaseModel):
 
     __tablename__ = "compliance_frameworks"
 
-    name: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
+    # Framework name is unique PER ORGANIZATION (see __table_args__ below),
+    # not globally. A multi-tenant deployment needs every org to track
+    # its own "FedRAMP Moderate" / "SOC 2" / etc.
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
     short_name: Mapped[str] = mapped_column(
         String(50), nullable=False, index=True
     )  # fedramp, nist_800_53, cmmc, etc.
@@ -173,9 +176,9 @@ class POAM(BaseModel):
         String(50), default="open", index=True
     )  # open, in_progress, delayed, completed, cancelled, accepted
     milestone_changes: Mapped[List[Dict[str, Any]]] = mapped_column(JSON, default=[])
-    scheduled_completion_date: Mapped[datetime] = mapped_column(DateTime, index=True)
+    scheduled_completion_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     actual_completion_date: Mapped[Optional[datetime]] = mapped_column(
-        DateTime, nullable=True
+        DateTime(timezone=True), nullable=True
     )
 
     milestones: Mapped[List[Dict[str, Any]]] = mapped_column(JSON, default=[])

@@ -14,6 +14,7 @@ celery_app = Celery(
     include=[
         "src.workers.tasks",
         "src.tasks.automation_tasks",
+        "src.intel.tasks",
     ],
 )
 
@@ -68,5 +69,10 @@ celery_app.conf.beat_schedule = {
     "hourly-correlation-sweep": {
         "task": "automation.hourly_correlation_sweep",
         "schedule": 3600.0,  # Every 1 hour
+    },
+    # --- Threat intelligence feed polling (src.intel.tasks) ---
+    "poll-threat-feeds": {
+        "task": "intel.poll_threat_feeds",
+        "schedule": 1800.0,  # Every 30 minutes — fetch all enabled feeds
     },
 }
