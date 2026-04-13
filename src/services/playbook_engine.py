@@ -710,7 +710,7 @@ class PlaybookAction:
                     source_type=target_type,
                     source_id=target_id,
                     content=comment_text,
-                    author_id=context.get("user_id", "playbook_engine"),
+                    author_id=context.get("user_id") or context.get("triggered_by"),
                 )
                 session.add(row)
                 await session.commit()
