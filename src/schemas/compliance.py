@@ -113,7 +113,9 @@ class ComplianceFrameworkResponse(DBModel):
     total_controls: int = 0
     implemented_controls: int = 0
     compliance_score: float = 0.0
-    status: FrameworkStatus
+    # Plain str (not the Enum) so a row with an unexpected status value
+    # doesn't 500 the entire frameworks list.
+    status: str = "not_started"
     last_assessment_at: Optional[datetime] = None
     next_assessment_due: Optional[datetime] = None
     certification_level: Optional[str] = None
@@ -137,14 +139,14 @@ class ComplianceControlResponse(DBModel):
     description: Optional[str] = None
     priority: str = ""
     baseline: Optional[str] = None
-    status: ControlStatus
+    status: str = "not_implemented"
     implementation_status: float = 0.0
     implementation_details: Optional[str] = None
     responsible_party: Optional[str] = None
     assessment_method: str = ""
     assessment_frequency: str = ""
     last_assessed_at: Optional[datetime] = None
-    last_assessment_result: Optional[AssessmentResult] = None
+    last_assessment_result: Optional[str] = None
     evidence_ids: List[str] = []
     related_controls: Dict[str, Any] = {}
     mitre_techniques: List[str] = []
@@ -168,10 +170,10 @@ class POAMResponse(DBModel):
     weakness_name: str = ""
     weakness_description: Optional[str] = None
     weakness_source: str = ""
-    risk_level: RiskLevel
+    risk_level: str = "high"
     original_risk_rating: Optional[float] = None
     residual_risk_rating: Optional[float] = None
-    status: POAMStatus
+    status: str = "open"
     milestone_changes: List[Dict[str, Any]] = []
     scheduled_completion_date: Optional[datetime] = None
     actual_completion_date: Optional[datetime] = None
@@ -195,7 +197,7 @@ class ComplianceEvidenceResponse(DBModel):
 
     id: str = ""
     control_id_ref: str = ""
-    evidence_type: EvidenceType
+    evidence_type: str = "document"
     title: str = ""
     description: Optional[str] = None
     file_path: Optional[str] = None
@@ -207,7 +209,7 @@ class ComplianceEvidenceResponse(DBModel):
     is_automated: bool = False
     is_valid: bool = False
     expires_at: Optional[datetime] = None
-    review_status: ReviewStatus
+    review_status: str = "pending"
     reviewed_by: Optional[str] = None
     reviewed_at: Optional[datetime] = None
     tags: List[str] = []

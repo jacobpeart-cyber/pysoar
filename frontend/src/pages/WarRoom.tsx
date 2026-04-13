@@ -111,6 +111,7 @@ export default function WarRoom() {
   const [showCreateAction, setShowCreateAction] = useState(false);
   const [newMessage, setNewMessage] = useState('');
   const [createError, setCreateError] = useState<string | null>(null);
+  const [chatError, setChatError] = useState<string | null>(null);
 
   // ---------------------------------------------------------------------------
   // Queries
@@ -197,7 +198,11 @@ export default function WarRoom() {
       return collaborationApi.sendMessage(data.roomId, { content: data.content });
     },
     onSuccess: () => {
+      setChatError(null);
       queryClient.invalidateQueries({ queryKey: ['roomMessages', selectedRoom?.id] });
+    },
+    onError: (err: any) => {
+      setChatError(err?.response?.data?.detail || err?.message || 'Failed to send message');
     },
   });
 
@@ -548,6 +553,9 @@ export default function WarRoom() {
               </div>
 
               <div className="border-t border-gray-700 p-6 space-y-3">
+                {chatError && (
+                  <div className="bg-red-900/30 border border-red-700 rounded p-2 text-sm text-red-300">{chatError}</div>
+                )}
                 <div className="flex gap-2">
                   <input
                     type="text"

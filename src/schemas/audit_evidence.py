@@ -92,7 +92,10 @@ class EvidencePackageBase(BaseModel):
     status: str = "collecting"
     assessor: Optional[str] = None
     due_date: Optional[datetime] = None
-    metadata: Optional[dict[str, Any]] = None
+    # Field name `metadata` collides with SQLAlchemy Base.metadata registry
+    # — getattr(orm, "metadata") returns the MetaData object, breaking
+    # from_attributes serialization. Match the model attribute exactly.
+    extra_metadata: Optional[dict[str, Any]] = None
 
 
 class EvidencePackageResponse(EvidencePackageBase):

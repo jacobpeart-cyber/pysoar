@@ -208,7 +208,7 @@ async def add_timeline_event(
         description=description,
         old_value=old_value,
         new_value=new_value,
-        metadata=json.dumps(metadata) if metadata else None,
+        event_metadata=json.dumps(metadata) if metadata else None,
         actor_id=actor_id,
     )
     db.add(event)
@@ -912,7 +912,7 @@ async def get_timeline(
             description=event.description,
             old_value=event.old_value,
             new_value=event.new_value,
-            metadata=safe_json_loads(event.metadata, {}) if event.metadata else None,
+            metadata=safe_json_loads(event.event_metadata, {}) if event.event_metadata else None,
             incident_id=event.incident_id,
             actor_id=event.actor_id,
             actor_name=event.actor.full_name if event.actor else None,
@@ -955,7 +955,7 @@ async def create_timeline_event(
         description=event.description,
         old_value=event.old_value,
         new_value=event.new_value,
-        metadata=safe_json_loads(event.metadata, {}) if event.metadata else None,
+        metadata=safe_json_loads(event.event_metadata, {}) if event.event_metadata else None,
         incident_id=event.incident_id,
         actor_id=event.actor_id,
         actor_name=current_user.full_name,

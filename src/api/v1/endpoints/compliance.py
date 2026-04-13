@@ -5,7 +5,7 @@ Complete API for managing compliance frameworks, controls, assessments, and evid
 Supports FedRAMP, NIST, CMMC, SOC 2, HIPAA, PCI-DSS, DFARS, and CISA compliance.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Dict, Any
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query
@@ -529,7 +529,7 @@ async def list_poams(
         stmt = stmt.where(POAM.risk_level == risk_level)
 
     if overdue_only:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         stmt = stmt.where(
             and_(
                 POAM.scheduled_completion_date < now,
@@ -576,7 +576,7 @@ async def get_overdue_poams(
     current_user: CurrentUser = None,
 ):
     """Get overdue POA&Ms."""
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     stmt = select(POAM).where(
         and_(
             POAM.organization_id == getattr(current_user, "organization_id", None),
@@ -600,7 +600,7 @@ async def get_poam_report(
     result = await db.execute(stmt)
     all_poams = result.scalars().all()
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     overdue = [p for p in all_poams if p.scheduled_completion_date < now and p.status != "completed"]
     open_items = [p for p in all_poams if p.status in ["open", "in_progress"]]
     completed = [p for p in all_poams if p.status == "completed"]
@@ -728,7 +728,7 @@ async def upload_evidence(
         description=description,
         content=content,
         file_path=file_path,
-        collected_at=datetime.utcnow(),
+        collected_at=datetime.now(timezone.utc),
         collected_by=current_user.id,
         organization_id=getattr(current_user, "organization_id", None),
     )
@@ -784,7 +784,7 @@ async def review_evidence(
 
     evidence.review_status = review_status
     evidence.reviewed_by = reviewed_by
-    evidence.reviewed_at = datetime.utcnow()
+    evidence.reviewed_at = datetime.now(timezone.utc)
 
     await db.commit()
     await db.refresh(evidence)
@@ -888,7 +888,7 @@ async def audit_cui_handling(
     result = await db.execute(stmt)
     markings = result.scalars().all()
 
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     total = len(markings)
     active = sum(1 for m in markings if m.is_active)
     expired = sum(1 for m in markings if m.declassification_date and m.declassification_date < now)
@@ -1020,7 +1020,7 @@ async def get_dashboard_stats(
     implemented_count = result.scalar() or 0
 
     # POA&Ms
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     stmt = select(POAM).where(
         and_(
             POAM.organization_id == getattr(current_user, "organization_id", None),
@@ -1088,7 +1088,7 @@ async def get_dashboard_stats(
         "active_cisa_directives": active_directives,
         "cui_assets_total": total_cui,
         "cui_assets_active": active_cui,
-        "last_updated": datetime.utcnow(),
+        "last_updated": datetime.now(timezone.utc),
     }
 
 
@@ -1104,7 +1104,7 @@ async def get_score_history(
         and_(
             ComplianceAssessment.organization_id == getattr(current_user, "organization_id", None),
             ComplianceAssessment.assessment_date
-            >= datetime.utcnow() - timedelta(days=days),
+            >= datetime.now(timezone.utc) - timedelta(days=days),
         )
     )
 

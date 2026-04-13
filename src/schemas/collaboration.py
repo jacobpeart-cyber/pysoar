@@ -98,7 +98,11 @@ class WarRoomMessageBase(BaseModel):
     content: str = Field(..., min_length=1)
     message_type: str = "text"
     mentioned_users: Optional[list[str]] = None
-    metadata: Optional[dict[str, Any]] = None
+    # Field name `metadata` collides with SQLAlchemy Base.metadata registry
+    # — getattr(orm_obj, "metadata") returns the MetaData object, not the
+    # column. The DB column is named "metadata" but mapped to extra_metadata
+    # on the model; mirror that here.
+    extra_metadata: Optional[dict[str, Any]] = None
 
 
 class WarRoomMessageCreate(WarRoomMessageBase):

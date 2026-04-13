@@ -1,7 +1,7 @@
 """Audit log schemas"""
 
 from datetime import datetime
-from typing import Optional, List
+from typing import Any, Optional, List
 from src.schemas.base import DBModel
 from pydantic import BaseModel
 
@@ -31,8 +31,11 @@ class AuditLogResponse(AuditLogBase, DBModel):
     user_id: Optional[str] = None
     user_email: Optional[str] = None
     user_name: Optional[str] = None
-    old_value: Optional[str] = None
-    new_value: Optional[str] = None
+    # old_value/new_value are stored as JSON strings on the model. DBModel's
+    # validator JSON-parses any string starting with { or [, so we accept
+    # either a dict/list (after parsing) or a raw string passthrough.
+    old_value: Optional[Any] = None
+    new_value: Optional[Any] = None
     created_at: Optional[datetime] = None
 
     class Config:
