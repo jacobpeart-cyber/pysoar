@@ -20,11 +20,45 @@ import {
   Clock,
   Search,
   Shield,
+  Play,
+  Zap,
 } from 'lucide-react';
 import { api } from '../lib/api';
 import clsx from 'clsx';
+import FormModal from '../components/FormModal';
 
 type TabType = 'dashboard' | 'audit-trail' | 'evidence' | 'packages' | 'conmon';
+
+// ---- Module-scope helpers (shared by all tab sub-components) ----
+// These used to live inside the main AuditEvidence component which meant
+// the sub-component functions (EvidenceTab, AuditTrailTab, etc.) tried to
+// reference them from a closure they never captured → ReferenceError at
+// render time. Lifting them to module scope fixes that.
+
+const statusColorMap: Record<string, string> = {
+  success: 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400',
+  failure: 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400',
+  pending: 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-400',
+  reviewed: 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400',
+  approved: 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400',
+  draft: 'bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-400',
+  'in-review': 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400',
+  submitted: 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-400',
+};
+
+const riskColorMap: Record<string, string> = {
+  low: 'text-green-600 dark:text-green-400',
+  medium: 'text-yellow-600 dark:text-yellow-400',
+  high: 'text-red-600 dark:text-red-400',
+};
+
+function getStatusColor(status: string): string {
+  return statusColorMap[status] || 'bg-gray-100 text-gray-800';
+}
+
+function getRiskColor(risk: string): string {
+  return riskColorMap[risk] || 'text-gray-600';
+}
 
 interface DashboardData {
   auditEventsCount: number;
@@ -52,12 +86,13 @@ interface AuditEvent {
 interface EvidenceItem {
   id: string;
   title: string;
-  type: 'document' | 'screenshot' | 'log' | 'config' | 'scan';
+  type: 'document' | 'screenshot' | 'log' | 'config' | 'scan' | string;
   control: string;
   source: string;
-  collected: string;
-  status: 'pending' | 'reviewed' | 'approved';
-  contentUrl?: string;
+  collected?: string;
+  status: 'pending' | 'reviewed' | 'approved' | string;
+  contentUrl?: string | null;
+  created_at?: string;
 }
 
 interface Package {
@@ -75,6 +110,9 @@ interface ConMonStatus {
   name: string;
   active: boolean;
   lastRun: string;
+  status?: string;
+  compliance_percentage?: number;
+  last_run?: string; // back-compat alias
 }
 
 export default function AuditEvidence() {
@@ -92,17 +130,31 @@ export default function AuditEvidence() {
     queryKey: ['audit-evidence-dashboard'],
     queryFn: async () => {
       try {
-      // Dashboard endpoint doesn't exist — derive from packages
-      const pkgRes = await api.get('/audit-evidence/packages');
-      const pkgs = Array.isArray(pkgRes.data) ? pkgRes.data : (pkgRes.data?.items || []);
-      return {
-        total_evidence: pkgs.length,
-        total_packages: pkgs.length,
-        compliance_score: pkgs.length > 0 ? 85 : 0,
-        pending_reviews: pkgs.filter((p: any) => p.status === 'pending' || p.status === 'draft').length,
-        recentAuditEvents: [],
-      };
-      } catch { return null; }
+        const pkgRes = await api.get('/audit-evidence/packages');
+        const pkgs = Array.isArray(pkgRes.data) ? pkgRes.data : (pkgRes.data?.items || []);
+        const active = pkgs.filter((p: any) => p.status !== 'approved' && p.status !== 'archived').length;
+        const withEv = pkgs.filter((p: any) => (p.evidenceCount ?? p.evidence_count ?? 0) > 0).length;
+        return {
+          auditEventsCount: 0,
+          evidenceItemsCount: pkgs.reduce((s: number, p: any) => s + (p.evidenceCount ?? p.evidence_count ?? 0), 0),
+          activePackagesCount: active,
+          readinessScore: pkgs.length > 0 ? Math.round((withEv / pkgs.length) * 100) : 0,
+          evidenceCoverage: {
+            withEvidence: withEv,
+            withoutEvidence: pkgs.length - withEv,
+          },
+          recentAuditEvents: [],
+        } as DashboardData;
+      } catch {
+        return {
+          auditEventsCount: 0,
+          evidenceItemsCount: 0,
+          activePackagesCount: 0,
+          readinessScore: 0,
+          evidenceCoverage: { withEvidence: 0, withoutEvidence: 0 },
+          recentAuditEvents: [],
+        } as DashboardData;
+      }
     },
   });
 
@@ -129,13 +181,15 @@ export default function AuditEvidence() {
   const { data: evidenceItems, isLoading: evidenceLoading } = useQuery<EvidenceItem[]>({
     queryKey: ['evidence-items', evidenceStatusFilter, evidenceTypeFilter],
     queryFn: async () => {
-      const params = new URLSearchParams();
-      if (evidenceStatusFilter !== 'all') params.append('status', evidenceStatusFilter);
-      if (evidenceTypeFilter !== 'all') params.append('type', evidenceTypeFilter);
       try {
-      const response = await api.get('/audit-evidence/evidence/list');
-      const d = response.data;
-      return Array.isArray(d) ? d : (d?.items || []);
+        const params: Record<string, string> = {};
+        if (evidenceStatusFilter !== 'all') params.status = evidenceStatusFilter;
+        if (evidenceTypeFilter !== 'all') params.evidence_type = evidenceTypeFilter;
+        const response = await api.get('/audit-evidence/evidence/list', { params });
+        const d = response.data;
+        if (Array.isArray(d)) return d;
+        if (d && Array.isArray(d.items)) return d.items;
+        return [];
       } catch { return []; }
     },
   });
@@ -154,9 +208,21 @@ export default function AuditEvidence() {
     queryKey: ['conmon-status'],
     queryFn: async () => {
       try {
-      const response = await api.get('/audit-evidence/conmon/status');
-      return response.data;
-      } catch { return null; }
+        const response = await api.get('/audit-evidence/conmon/status');
+        const d = response.data;
+        if (Array.isArray(d)) return d;
+        // Back-compat: older /conmon/status returned an object {status, checks, last_run}
+        if (d && typeof d === 'object' && d.checks && typeof d.checks === 'object') {
+          const now = d.last_run || new Date().toISOString();
+          return Object.entries(d.checks).map(([key, val]: [string, any]) => ({
+            id: key,
+            name: key.replace(/_/g, ' ').replace(/\b\w/g, (c: string) => c.toUpperCase()),
+            active: val?.status === 'compliant' || val?.status === 'on_track',
+            lastRun: now,
+          }));
+        }
+        return [];
+      } catch { return []; }
     },
   });
 
@@ -199,38 +265,7 @@ export default function AuditEvidence() {
     },
   });
 
-  const getEventTypeIcon = (type: string) => {
-    const icons: Record<string, React.ComponentType> = {
-      login: Shield,
-      access: FileText,
-      change: AlertCircle,
-      delete: Trash2,
-    };
-    return icons[type] || FileText;
-  };
-
-  const getStatusColor = (status: string) => {
-    const colors: Record<string, string> = {
-      success: 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400',
-      failure: 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400',
-      pending: 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-400',
-      reviewed: 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400',
-      approved: 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400',
-      draft: 'bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-400',
-      'in-review': 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400',
-      submitted: 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-400',
-    };
-    return colors[status] || 'bg-gray-100 text-gray-800';
-  };
-
-  const getRiskColor = (risk: string) => {
-    const colors: Record<string, string> = {
-      low: 'text-green-600 dark:text-green-400',
-      medium: 'text-yellow-600 dark:text-yellow-400',
-      high: 'text-red-600 dark:text-red-400',
-    };
-    return colors[risk] || 'text-gray-600';
-  };
+  // Helpers now live at module scope (statusColorMap/riskColorMap + getStatusColor/getRiskColor)
 
   return (
     <div className="space-y-6">
@@ -402,7 +437,7 @@ function DashboardTab({
                 stroke="currentColor"
                 strokeWidth="8"
                 strokeDasharray={`${
-                  (data?.evidenceCoverage.withEvidence || 0) * 3.4
+                  (data?.evidenceCoverage?.withEvidence || 0) * 3.4
                 } 340`}
                 className="text-green-500 transition-all duration-500"
               />
@@ -410,7 +445,7 @@ function DashboardTab({
             <div className="absolute inset-0 flex items-center justify-center">
               <div className="text-center">
                 <div className="text-2xl font-bold text-gray-900 dark:text-white">
-                  {data?.evidenceCoverage.withEvidence || 0}
+                  {data?.evidenceCoverage?.withEvidence || 0}
                 </div>
                 <div className="text-xs text-gray-500 dark:text-gray-400">
                   with evidence
@@ -426,7 +461,7 @@ function DashboardTab({
                     Controls with Evidence
                   </span>
                   <span className="text-sm font-semibold text-gray-900 dark:text-white">
-                    {data?.evidenceCoverage.withEvidence || 0}
+                    {data?.evidenceCoverage?.withEvidence || 0}
                   </span>
                 </div>
                 <div className="h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
@@ -439,7 +474,7 @@ function DashboardTab({
                     Controls without Evidence
                   </span>
                   <span className="text-sm font-semibold text-gray-900 dark:text-white">
-                    {data?.evidenceCoverage.withoutEvidence || 0}
+                    {data?.evidenceCoverage?.withoutEvidence || 0}
                   </span>
                 </div>
                 <div className="h-2 bg-gray-200 dark:bg-gray-700 rounded-full overflow-hidden">
@@ -663,8 +698,34 @@ function AuditTrailTab({
         </table>
       </div>
 
-      {/* Export Button */}
-      <button className="inline-flex items-center gap-2 px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium">
+      {/* Export Button — streams real CSV from /audit/export */}
+      <button
+        onClick={async () => {
+          try {
+            const response = await api.get('/audit/export?format=csv&days=90', {
+              responseType: 'blob',
+            });
+            const blob = response.data as Blob;
+            const cd = response.headers?.['content-disposition'];
+            let filename = `pysoar_audit_${new Date().toISOString().slice(0, 10)}.csv`;
+            if (cd && typeof cd === 'string') {
+              const m = cd.match(/filename="?([^"]+)"?/);
+              if (m) filename = m[1];
+            }
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+          } catch (err) {
+            console.error('Audit log export failed:', err);
+          }
+        }}
+        className="inline-flex items-center gap-2 px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium"
+      >
         <Download className="w-5 h-5" />
         Export Audit Log
       </button>
@@ -691,6 +752,32 @@ function EvidenceTab({
   onDeleteEvidence: (id: string) => void;
   onApproveEvidence: (id: string) => void;
 }) {
+  const queryClient = useQueryClient();
+  const [showUploadModal, setShowUploadModal] = useState(false);
+  const [uploadFile, setUploadFile] = useState<File | null>(null);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [uploading, setUploading] = useState(false);
+
+  // Load compliance controls so the upload form can attach evidence to a real control
+  const { data: controlsData } = useQuery<{ items?: any[] } | any[]>({
+    queryKey: ['compliance-controls-for-evidence'],
+    queryFn: async () => {
+      try {
+        const res = await api.get('/compliance/controls', { params: { limit: 500 } });
+        return res.data;
+      } catch {
+        return { items: [] };
+      }
+    },
+  });
+  const controlOptions: Array<{ value: string; label: string }> = (() => {
+    const list = Array.isArray(controlsData) ? controlsData : (controlsData as any)?.items || [];
+    return list.map((c: any) => ({
+      value: c.id,
+      label: `${c.control_id || c.code || c.id} — ${c.title || ''}`.slice(0, 120),
+    }));
+  })();
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
@@ -807,7 +894,12 @@ function EvidenceTab({
                     {item.source}
                   </td>
                   <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
-                    {new Date(item.collected || item.created_at || "").toLocaleDateString()}
+                    {(() => {
+                      const ts = item.collected || item.created_at;
+                      if (!ts) return '—';
+                      const d = new Date(ts);
+                      return isNaN(d.getTime()) ? '—' : d.toLocaleDateString();
+                    })()}
                   </td>
                   <td className="px-6 py-4 text-sm">
                     <span
@@ -854,15 +946,199 @@ function EvidenceTab({
 
       {/* Upload and Actions */}
       <div className="flex gap-4">
-        <button className="inline-flex items-center gap-2 px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium">
+        <button
+          onClick={() => {
+            setUploadFile(null);
+            setUploadError(null);
+            setShowUploadModal(true);
+          }}
+          className="inline-flex items-center gap-2 px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium"
+        >
           <Upload className="w-5 h-5" />
           Upload Evidence
         </button>
-        <button className="inline-flex items-center gap-2 px-6 py-3 bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-white rounded-lg hover:bg-gray-300 dark:hover:bg-gray-600 font-medium">
+        <button
+          onClick={async () => {
+            // Verify integrity for every displayed evidence item. The
+            // backend verifies the stored hash against the artifact and
+            // flags any tampered rows.
+            try {
+              await Promise.all(
+                items.map((it) =>
+                  api.post(`/audit-evidence/evidence/verify?evidence_id=${encodeURIComponent(it.id)}`)
+                )
+              );
+              queryClient.invalidateQueries({ queryKey: ['evidence-items'] });
+            } catch (err) {
+              console.error('Integrity verification failed:', err);
+            }
+          }}
+          className="inline-flex items-center gap-2 px-6 py-3 bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-white rounded-lg hover:bg-gray-300 dark:hover:bg-gray-600 font-medium"
+        >
           <Zap className="w-5 h-5" />
           Verify Integrity
         </button>
       </div>
+
+      {/* Upload Evidence modal — real multipart POST /audit-evidence/evidence/upload */}
+      {showUploadModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" role="dialog" aria-modal="true">
+          <div
+            className="absolute inset-0 bg-black/50 backdrop-blur-sm"
+            onClick={() => !uploading && setShowUploadModal(false)}
+          />
+          <div className="relative w-full max-w-lg bg-white dark:bg-gray-900 rounded-lg shadow-2xl border border-gray-200 dark:border-gray-700">
+            <div className="flex items-start justify-between px-6 py-4 border-b border-gray-200 dark:border-gray-700">
+              <div>
+                <h2 className="text-lg font-semibold text-gray-900 dark:text-white">Upload Evidence</h2>
+                <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
+                  Attach an evidence artifact to a specific compliance control. File is hashed (SHA-512) and stored for audit traceability.
+                </p>
+              </div>
+            </div>
+            <form
+              onSubmit={async (e) => {
+                e.preventDefault();
+                const formEl = e.currentTarget;
+                const control_id = (formEl.elements.namedItem('control_id') as HTMLSelectElement)?.value;
+                const title = (formEl.elements.namedItem('title') as HTMLInputElement)?.value.trim();
+                const evidence_type = (formEl.elements.namedItem('evidence_type') as HTMLSelectElement)?.value;
+                const description = (formEl.elements.namedItem('description') as HTMLTextAreaElement)?.value;
+                if (!uploadFile) {
+                  setUploadError('Please choose a file to upload');
+                  return;
+                }
+                if (!control_id) {
+                  setUploadError('Please select a compliance control');
+                  return;
+                }
+                if (!title) {
+                  setUploadError('Title is required');
+                  return;
+                }
+                setUploading(true);
+                setUploadError(null);
+                try {
+                  const form = new FormData();
+                  form.append('file', uploadFile);
+                  form.append('control_id', control_id);
+                  form.append('title', title);
+                  form.append('evidence_type', evidence_type || 'document');
+                  form.append('description', description || '');
+                  await api.post('/audit-evidence/evidence/upload', form, {
+                    headers: { 'Content-Type': 'multipart/form-data' },
+                  });
+                  queryClient.invalidateQueries({ queryKey: ['evidence-items'] });
+                  queryClient.invalidateQueries({ queryKey: ['audit-evidence-dashboard'] });
+                  setShowUploadModal(false);
+                  setUploadFile(null);
+                } catch (err: any) {
+                  setUploadError(err?.response?.data?.detail || err?.message || 'Upload failed');
+                } finally {
+                  setUploading(false);
+                }
+              }}
+            >
+              <div className="px-6 py-5 space-y-4 max-h-[60vh] overflow-y-auto">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                    File <span className="text-red-500">*</span>
+                  </label>
+                  <input
+                    type="file"
+                    onChange={(e) => setUploadFile(e.target.files?.[0] || null)}
+                    className="w-full text-sm text-gray-900 dark:text-gray-100 file:mr-3 file:py-2 file:px-4 file:border file:border-gray-300 file:rounded file:text-sm file:bg-white file:text-gray-700 hover:file:bg-gray-50"
+                  />
+                  {uploadFile && (
+                    <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                      {uploadFile.name} · {(uploadFile.size / 1024).toFixed(1)} KB
+                    </p>
+                  )}
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                    Compliance Control <span className="text-red-500">*</span>
+                  </label>
+                  <select
+                    name="control_id"
+                    className="w-full px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100"
+                    defaultValue=""
+                  >
+                    <option value="">— Select a control —</option>
+                    {controlOptions.map((o) => (
+                      <option key={o.value} value={o.value}>{o.label}</option>
+                    ))}
+                  </select>
+                  {controlOptions.length === 0 && (
+                    <p className="mt-1 text-xs text-yellow-700 dark:text-yellow-500">
+                      No compliance controls loaded. Create controls in the Compliance module first.
+                    </p>
+                  )}
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                    Title <span className="text-red-500">*</span>
+                  </label>
+                  <input
+                    name="title"
+                    type="text"
+                    className="w-full px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100"
+                    placeholder="Q1 2026 Access Review Screenshot"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Evidence Type</label>
+                  <select
+                    name="evidence_type"
+                    defaultValue="document"
+                    className="w-full px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100"
+                  >
+                    <option value="document">Document</option>
+                    <option value="screenshot">Screenshot</option>
+                    <option value="log">Log</option>
+                    <option value="configuration">Configuration</option>
+                    <option value="scan_result">Scan Result</option>
+                    <option value="policy">Policy</option>
+                    <option value="procedure">Procedure</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Description</label>
+                  <textarea
+                    name="description"
+                    rows={3}
+                    className="w-full px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100"
+                    placeholder="Context, source system, scope..."
+                  />
+                </div>
+                {uploadError && (
+                  <div className="px-3 py-2 rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 text-sm text-red-700 dark:text-red-300">
+                    {uploadError}
+                  </div>
+                )}
+              </div>
+              <div className="border-t border-gray-200 dark:border-gray-700 px-6 py-4 flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowUploadModal(false)}
+                  disabled={uploading}
+                  className="px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700 disabled:opacity-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={uploading}
+                  className="px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 disabled:opacity-50 flex items-center gap-2"
+                >
+                  {uploading && <Loader2 className="w-4 h-4 animate-spin" />}
+                  Upload
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -958,11 +1234,41 @@ function PackagesTab({
 
             <div className="flex gap-2">
               {pkg.status === 'draft' && (
-                <button className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium">
+                <button
+                  onClick={async () => {
+                    try {
+                      await api.post(`/audit-evidence/packages/${pkg.id}/submit`);
+                      queryClient.invalidateQueries({ queryKey: ['audit-packages'] });
+                    } catch (err) {
+                      console.error('Package submit failed:', err);
+                    }
+                  }}
+                  className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm font-medium"
+                >
                   Submit
                 </button>
               )}
-              <button className="flex-1 px-4 py-2 bg-gray-100 dark:bg-gray-700 text-gray-900 dark:text-white rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600 text-sm font-medium">
+              <button
+                onClick={async () => {
+                  try {
+                    const res = await api.get(`/audit-evidence/packages/${pkg.id}/report`, {
+                      responseType: 'blob',
+                    });
+                    const blob = res.data as Blob;
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement('a');
+                    a.href = url;
+                    a.download = `${(pkg.name || 'package').replace(/\s+/g, '_')}.json`;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
+                  } catch (err) {
+                    console.error('Package report download failed:', err);
+                  }
+                }}
+                className="flex-1 px-4 py-2 bg-gray-100 dark:bg-gray-700 text-gray-900 dark:text-white rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600 text-sm font-medium"
+              >
                 View Details
               </button>
             </div>
@@ -1012,13 +1318,25 @@ function ConMonTab({
 
             <div className="space-y-2 text-sm text-gray-600 dark:text-gray-400">
               <div>
-                Status: <span className="font-medium text-gray-900 dark:text-white">
-                  {status.active ? 'Active' : 'Inactive'}
+                Status: <span className="font-medium text-gray-900 dark:text-white capitalize">
+                  {status.status || (status.active ? 'Active' : 'Inactive')}
                 </span>
               </div>
+              {status.compliance_percentage != null && (
+                <div>
+                  Compliance: <span className="font-medium text-gray-900 dark:text-white">
+                    {status.compliance_percentage.toFixed(1)}%
+                  </span>
+                </div>
+              )}
               <div>
                 Last Run: <span className="font-medium text-gray-900 dark:text-white">
-                  {new Date(status.lastRun || status.last_run || "").toLocaleString()}
+                  {(() => {
+                    const ts = status.lastRun || status.last_run;
+                    if (!ts) return '—';
+                    const d = new Date(ts);
+                    return isNaN(d.getTime()) ? '—' : d.toLocaleString();
+                  })()}
                 </span>
               </div>
             </div>
@@ -1035,8 +1353,34 @@ function ConMonTab({
         Run ConMon Cycle
       </button>
 
-      {/* Generate Report */}
-      <button className="inline-flex items-center gap-2 px-6 py-3 bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-white rounded-lg hover:bg-gray-300 dark:hover:bg-gray-600 font-medium">
+      {/* Generate Monthly Report — streams real FedRAMP ConMon monthly JSON report from backend */}
+      <button
+        onClick={async () => {
+          try {
+            const response = await api.get('/audit-evidence/reports/monthly', {
+              responseType: 'blob',
+            });
+            const blob = response.data as Blob;
+            const cd = response.headers?.['content-disposition'];
+            let filename = `pysoar_conmon_monthly_${new Date().toISOString().slice(0, 7)}.json`;
+            if (cd && typeof cd === 'string') {
+              const m = cd.match(/filename="?([^"]+)"?/);
+              if (m) filename = m[1];
+            }
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+          } catch (err) {
+            console.error('Monthly report download failed:', err);
+          }
+        }}
+        className="inline-flex items-center gap-2 px-6 py-3 bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-white rounded-lg hover:bg-gray-300 dark:hover:bg-gray-600 font-medium"
+      >
         <Download className="w-5 h-5" />
         Generate Monthly Report
       </button>

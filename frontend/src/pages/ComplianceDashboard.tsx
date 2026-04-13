@@ -20,6 +20,7 @@ import {
 } from 'lucide-react';
 import { api } from '../lib/api';
 import clsx from 'clsx';
+import FormModal from '../components/FormModal';
 
 type TabType = 'overview' | 'controls' | 'poams' | 'cui' | 'cisa';
 
@@ -762,6 +763,9 @@ function POAMsTab({
   onDeletePOAM: (id: string) => void;
   overduePOAMs: number;
 }) {
+  const queryClient = useQueryClient();
+  const [showCreatePOAM, setShowCreatePOAM] = useState(false);
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
@@ -970,10 +974,78 @@ function POAMsTab({
       </div>
 
       {/* Create POA&M Button */}
-      <button className="inline-flex items-center gap-2 px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium">
+      <button
+        onClick={() => setShowCreatePOAM(true)}
+        className="inline-flex items-center gap-2 px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium"
+      >
         <Plus className="w-5 h-5" />
         Create POA&M
       </button>
+
+      <FormModal
+        open={showCreatePOAM}
+        onClose={() => setShowCreatePOAM(false)}
+        title="Create POA&M Item"
+        description="Plan of Action & Milestones — document an identified weakness and track remediation."
+        submitLabel="Create POA&M"
+        fields={[
+          {
+            name: 'title',
+            label: 'Title',
+            required: true,
+            placeholder: 'Short summary of the weakness',
+          },
+          {
+            name: 'weakness_description',
+            label: 'Weakness Description',
+            type: 'textarea',
+            required: true,
+            placeholder: 'Detailed description of the control deficiency',
+          },
+          {
+            name: 'control_id',
+            label: 'Control ID',
+            required: true,
+            placeholder: 'e.g. AC-2, SI-4, IA-5(1)',
+            help: 'NIST 800-53 / FedRAMP control identifier',
+          },
+          {
+            name: 'severity',
+            label: 'Severity',
+            type: 'select',
+            required: true,
+            defaultValue: 'medium',
+            options: [
+              { value: 'low', label: 'Low' },
+              { value: 'medium', label: 'Medium' },
+              { value: 'high', label: 'High' },
+              { value: 'critical', label: 'Critical' },
+            ],
+          },
+          {
+            name: 'scheduled_completion_date',
+            label: 'Scheduled Completion Date',
+            type: 'date',
+          },
+          {
+            name: 'responsible_party',
+            label: 'Responsible Party',
+            placeholder: 'Team or individual accountable',
+          },
+        ]}
+        onSubmit={async (values) => {
+          await api.post('/compliance/poams', {
+            title: values.title,
+            weakness_description: values.weakness_description,
+            control_id: values.control_id,
+            severity: values.severity,
+            status: 'open',
+            scheduled_completion_date: values.scheduled_completion_date || undefined,
+            responsible_party: values.responsible_party || undefined,
+          });
+          queryClient.invalidateQueries({ queryKey: ['compliance-poams'] });
+        }}
+      />
     </div>
   );
 }

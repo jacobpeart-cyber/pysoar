@@ -1,18 +1,14 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { Link } from 'react-router-dom';
 import { alertsApi, incidentsApi, iocsApi, playbooksApi } from '../lib/api';
 import {
   AlertTriangle,
   FileWarning,
   Shield,
-  Activity,
-  TrendingUp,
-  Clock,
-  CheckCircle,
-  XCircle,
   Crosshair,
   Zap,
-  Server,
+  CheckCircle,
+  RefreshCw,
 } from 'lucide-react';
 import clsx from 'clsx';
 import {
@@ -27,10 +23,6 @@ import {
   Tooltip,
   ResponsiveContainer,
   Legend,
-  LineChart,
-  Line,
-  Area,
-  AreaChart,
 } from 'recharts';
 
 interface Stats {
@@ -41,6 +33,7 @@ interface Stats {
     by_source: Record<string, number>;
     new_today: number;
     new_this_week: number;
+    resolved_today: number;
   };
   incidents: {
     total: number;
@@ -78,7 +71,28 @@ const incidentStatusColors: Record<string, string> = {
   closed: '#6b7280',
 };
 
-const COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#ec4899'];
+// Dashboard auto-refresh cadence. Every other page uses TanStack Query, but
+// Dashboard predates that migration — hand-rolled polling keeps this page
+// behaving like "real-time metrics" without a full rewrite.
+const REFRESH_INTERVAL_MS = 30_000;
+
+const EMPTY_ALERT_STATS = {
+  total: 0,
+  by_severity: {},
+  by_status: {},
+  by_source: {},
+  new_today: 0,
+  new_this_week: 0,
+  resolved_today: 0,
+};
+const EMPTY_INCIDENT_STATS = {
+  total: 0,
+  by_severity: {},
+  by_status: {},
+  by_type: {},
+  open_count: 0,
+  mttr_hours: null,
+};
 
 export default function Dashboard() {
   const [stats, setStats] = useState<Stats | null>(null);
@@ -87,46 +101,51 @@ export default function Dashboard() {
   const [iocCount, setIocCount] = useState(0);
   const [playbookCount, setPlaybookCount] = useState(0);
   const [isLoading, setIsLoading] = useState(true);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+
+  const fetchData = useCallback(async (showSpinner: boolean) => {
+    if (showSpinner) setIsLoading(true);
+    else setIsRefreshing(true);
+
+    try {
+      const [alertStats, incidentStats, alertsList, incidentsList, iocsList, playbooksList] = await Promise.all([
+        alertsApi.getStats().catch(() => EMPTY_ALERT_STATS),
+        incidentsApi.getStats().catch(() => EMPTY_INCIDENT_STATS),
+        alertsApi.list({ size: 5 }).catch(() => ({ items: [], total: 0 })),
+        incidentsApi.list({ size: 5 }).catch(() => ({ items: [], total: 0 })),
+        iocsApi.list({ size: 1 }).catch(() => ({ total: 0 })),
+        playbooksApi.list({ size: 1 }).catch(() => ({ total: 0 })),
+      ]);
+
+      setStats({ alerts: alertStats, incidents: incidentStats });
+      setRecentAlerts(alertsList.items || []);
+      setRecentIncidents(incidentsList.items || []);
+      setIocCount(iocsList.total || 0);
+      setPlaybookCount(playbooksList.total || 0);
+      setLastUpdated(new Date());
+    } catch (error) {
+      console.error('Failed to fetch dashboard data:', error);
+    } finally {
+      setIsLoading(false);
+      setIsRefreshing(false);
+    }
+  }, []);
 
   useEffect(() => {
-    const fetchData = async () => {
-      try {
-        const [alertStats, incidentStats, alertsList, incidentsList, iocsList, playbooksList] = await Promise.all([
-          alertsApi.getStats().catch(() => ({ total: 0, by_severity: {}, by_status: {}, by_source: {}, new_today: 0, new_this_week: 0 })),
-          incidentsApi.getStats().catch(() => ({ total: 0, by_severity: {}, by_status: {}, by_type: {}, open_count: 0, mttr_hours: null })),
-          alertsApi.list({ size: 5 }),
-          incidentsApi.list({ size: 5 }),
-          iocsApi.list({ size: 1 }).catch(() => ({ total: 0 })),
-          playbooksApi.list({ size: 1 }).catch(() => ({ total: 0 })),
-        ]);
-
-        setStats({
-          alerts: alertStats,
-          incidents: incidentStats,
-        });
-        setRecentAlerts(alertsList.items || []);
-        setRecentIncidents(incidentsList.items || []);
-        setIocCount(iocsList.total || 0);
-        setPlaybookCount(playbooksList.total || 0);
-      } catch (error) {
-        console.error('Failed to fetch dashboard data:', error);
-      } finally {
-        setIsLoading(false);
-      }
-    };
-
-    fetchData();
-  }, []);
+    fetchData(true);
+    const interval = setInterval(() => fetchData(false), REFRESH_INTERVAL_MS);
+    return () => clearInterval(interval);
+  }, [fetchData]);
 
   if (isLoading) {
     return (
       <div className="flex items-center justify-center h-64">
-        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600"></div>
+        <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600 dark:border-blue-400"></div>
       </div>
     );
   }
 
-  // Prepare chart data
   const severityData = Object.entries(stats?.alerts.by_severity || {}).map(([name, value]) => ({
     name: name.charAt(0).toUpperCase() + name.slice(1),
     value,
@@ -155,11 +174,35 @@ export default function Dashboard() {
     count: value,
   }));
 
+  const chartTooltipStyle = {
+    backgroundColor: 'rgba(31, 41, 55, 0.95)',
+    border: '1px solid rgba(75, 85, 99, 0.5)',
+    borderRadius: '8px',
+    color: '#f3f4f6',
+  };
+
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-bold text-gray-900">Dashboard</h1>
-        <p className="text-gray-500 mt-1">Security overview and real-time metrics</p>
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Dashboard</h1>
+          <p className="text-gray-500 dark:text-gray-400 mt-1">
+            Security overview and real-time metrics
+            {lastUpdated && (
+              <span className="ml-2 text-xs text-gray-400 dark:text-gray-500">
+                (updated {lastUpdated.toLocaleTimeString()})
+              </span>
+            )}
+          </p>
+        </div>
+        <button
+          onClick={() => fetchData(false)}
+          disabled={isRefreshing}
+          className="inline-flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium text-gray-700 dark:text-gray-200 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700 transition disabled:opacity-50"
+        >
+          <RefreshCw className={clsx('w-4 h-4', isRefreshing && 'animate-spin')} />
+          Refresh
+        </button>
       </div>
 
       {/* Stats Grid */}
@@ -194,7 +237,7 @@ export default function Dashboard() {
           icon={Crosshair}
           color="bg-blue-500"
           subtitle="Active indicators"
-          href="/iocs"
+          href="/threat-intel"
         />
         <StatCard
           title="Playbooks"
@@ -206,10 +249,14 @@ export default function Dashboard() {
         />
         <StatCard
           title="Resolved Today"
-          value={stats?.alerts.by_status?.closed || 0}
+          value={stats?.alerts.resolved_today || 0}
           icon={CheckCircle}
           color="bg-emerald-500"
-          subtitle="Alerts closed"
+          subtitle={
+            stats?.incidents.mttr_hours != null
+              ? `MTTR ${stats.incidents.mttr_hours.toFixed(1)}h`
+              : 'Alerts closed'
+          }
           href="/alerts?status=closed"
         />
       </div>
@@ -217,198 +264,123 @@ export default function Dashboard() {
       {/* Charts Row 1 */}
       <div className="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-6">
         {/* Alert Severity Pie Chart */}
-        <div className="bg-white rounded-xl border border-gray-200 p-6">
-          <h2 className="text-lg font-semibold text-gray-900 mb-4">Alerts by Severity</h2>
-          {severityData.length === 0 ? (
-            <div className="flex items-center justify-center h-48 text-gray-500">
-              <p>No alert data available</p>
-            </div>
-          ) : (
-            <ResponsiveContainer width="100%" height={200}>
-              <PieChart>
-                <Pie
-                  data={severityData}
-                  cx="50%"
-                  cy="50%"
-                  innerRadius={50}
-                  outerRadius={80}
-                  paddingAngle={2}
-                  dataKey="value"
-                >
-                  {severityData.map((entry, index) => (
-                    <Cell key={`cell-${index}`} fill={entry.color} />
-                  ))}
-                </Pie>
-                <Tooltip
-                  contentStyle={{
-                    backgroundColor: 'white',
-                    border: '1px solid #e5e7eb',
-                    borderRadius: '8px',
-                  }}
-                />
-                <Legend />
-              </PieChart>
-            </ResponsiveContainer>
-          )}
-        </div>
+        <ChartCard title="Alerts by Severity" empty={severityData.length === 0}>
+          <PieChart>
+            <Pie
+              data={severityData}
+              cx="50%"
+              cy="50%"
+              innerRadius={50}
+              outerRadius={80}
+              paddingAngle={2}
+              dataKey="value"
+            >
+              {severityData.map((entry, index) => (
+                <Cell key={`cell-${index}`} fill={entry.color} />
+              ))}
+            </Pie>
+            <Tooltip contentStyle={chartTooltipStyle} />
+            <Legend wrapperStyle={{ color: 'inherit' }} />
+          </PieChart>
+        </ChartCard>
 
         {/* Alert Status Distribution */}
-        <div className="bg-white rounded-xl border border-gray-200 p-6">
-          <h2 className="text-lg font-semibold text-gray-900 mb-4">Alert Status Distribution</h2>
-          {alertStatusData.length === 0 ? (
-            <div className="flex items-center justify-center h-48 text-gray-500">
-              <p>No status data available</p>
-            </div>
-          ) : (
-            <ResponsiveContainer width="100%" height={200}>
-              <BarChart data={alertStatusData} layout="vertical">
-                <CartesianGrid strokeDasharray="3 3" horizontal={true} vertical={false} />
-                <XAxis type="number" />
-                <YAxis type="category" dataKey="name" width={80} tick={{ fontSize: 12 }} />
-                <Tooltip
-                  contentStyle={{
-                    backgroundColor: 'white',
-                    border: '1px solid #e5e7eb',
-                    borderRadius: '8px',
-                  }}
-                />
-                <Bar dataKey="value" radius={[0, 4, 4, 0]}>
-                  {alertStatusData.map((entry, index) => (
-                    <Cell key={`cell-${index}`} fill={entry.color} />
-                  ))}
-                </Bar>
-              </BarChart>
-            </ResponsiveContainer>
-          )}
-        </div>
+        <ChartCard title="Alert Status Distribution" empty={alertStatusData.length === 0}>
+          <BarChart data={alertStatusData} layout="vertical">
+            <CartesianGrid strokeDasharray="3 3" horizontal={true} vertical={false} stroke="rgba(156,163,175,0.25)" />
+            <XAxis type="number" stroke="currentColor" tick={{ fill: 'currentColor', fontSize: 12 }} />
+            <YAxis type="category" dataKey="name" width={90} stroke="currentColor" tick={{ fill: 'currentColor', fontSize: 12 }} />
+            <Tooltip contentStyle={chartTooltipStyle} />
+            <Bar dataKey="value" radius={[0, 4, 4, 0]}>
+              {alertStatusData.map((entry, index) => (
+                <Cell key={`cell-${index}`} fill={entry.color} />
+              ))}
+            </Bar>
+          </BarChart>
+        </ChartCard>
 
         {/* Incident Status Pie Chart */}
-        <div className="bg-white rounded-xl border border-gray-200 p-6">
-          <h2 className="text-lg font-semibold text-gray-900 mb-4">Incident Status</h2>
-          {incidentStatusData.length === 0 ? (
-            <div className="flex items-center justify-center h-48 text-gray-500">
-              <p>No incident data available</p>
-            </div>
-          ) : (
-            <ResponsiveContainer width="100%" height={200}>
-              <PieChart>
-                <Pie
-                  data={incidentStatusData}
-                  cx="50%"
-                  cy="50%"
-                  innerRadius={50}
-                  outerRadius={80}
-                  paddingAngle={2}
-                  dataKey="value"
-                >
-                  {incidentStatusData.map((entry, index) => (
-                    <Cell key={`cell-${index}`} fill={entry.color} />
-                  ))}
-                </Pie>
-                <Tooltip
-                  contentStyle={{
-                    backgroundColor: 'white',
-                    border: '1px solid #e5e7eb',
-                    borderRadius: '8px',
-                  }}
-                />
-                <Legend />
-              </PieChart>
-            </ResponsiveContainer>
-          )}
-        </div>
+        <ChartCard title="Incident Status" empty={incidentStatusData.length === 0}>
+          <PieChart>
+            <Pie
+              data={incidentStatusData}
+              cx="50%"
+              cy="50%"
+              innerRadius={50}
+              outerRadius={80}
+              paddingAngle={2}
+              dataKey="value"
+            >
+              {incidentStatusData.map((entry, index) => (
+                <Cell key={`cell-${index}`} fill={entry.color} />
+              ))}
+            </Pie>
+            <Tooltip contentStyle={chartTooltipStyle} />
+            <Legend wrapperStyle={{ color: 'inherit' }} />
+          </PieChart>
+        </ChartCard>
       </div>
 
       {/* Charts Row 2 */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Alerts by Source */}
-        <div className="bg-white rounded-xl border border-gray-200 p-6">
-          <h2 className="text-lg font-semibold text-gray-900 mb-4">Alerts by Source</h2>
-          {sourceData.length === 0 ? (
-            <div className="flex items-center justify-center h-48 text-gray-500">
-              <p>No source data available</p>
-            </div>
-          ) : (
-            <ResponsiveContainer width="100%" height={200}>
-              <BarChart data={sourceData}>
-                <CartesianGrid strokeDasharray="3 3" vertical={false} />
-                <XAxis dataKey="name" tick={{ fontSize: 12 }} />
-                <YAxis />
-                <Tooltip
-                  contentStyle={{
-                    backgroundColor: 'white',
-                    border: '1px solid #e5e7eb',
-                    borderRadius: '8px',
-                  }}
-                />
-                <Bar dataKey="alerts" fill="#3b82f6" radius={[4, 4, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-          )}
-        </div>
+        <ChartCard title="Alerts by Source" empty={sourceData.length === 0}>
+          <BarChart data={sourceData}>
+            <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="rgba(156,163,175,0.25)" />
+            <XAxis dataKey="name" stroke="currentColor" tick={{ fill: 'currentColor', fontSize: 12 }} />
+            <YAxis stroke="currentColor" tick={{ fill: 'currentColor', fontSize: 12 }} />
+            <Tooltip contentStyle={chartTooltipStyle} />
+            <Bar dataKey="alerts" fill="#3b82f6" radius={[4, 4, 0, 0]} />
+          </BarChart>
+        </ChartCard>
 
         {/* Incidents by Type */}
-        <div className="bg-white rounded-xl border border-gray-200 p-6">
-          <h2 className="text-lg font-semibold text-gray-900 mb-4">Incidents by Type</h2>
-          {incidentTypeData.length === 0 ? (
-            <div className="flex items-center justify-center h-48 text-gray-500">
-              <p>No incident type data available</p>
-            </div>
-          ) : (
-            <ResponsiveContainer width="100%" height={200}>
-              <BarChart data={incidentTypeData}>
-                <CartesianGrid strokeDasharray="3 3" vertical={false} />
-                <XAxis dataKey="name" tick={{ fontSize: 12 }} />
-                <YAxis />
-                <Tooltip
-                  contentStyle={{
-                    backgroundColor: 'white',
-                    border: '1px solid #e5e7eb',
-                    borderRadius: '8px',
-                  }}
-                />
-                <Bar dataKey="count" fill="#10b981" radius={[4, 4, 0, 0]} />
-              </BarChart>
-            </ResponsiveContainer>
-          )}
-        </div>
+        <ChartCard title="Incidents by Type" empty={incidentTypeData.length === 0}>
+          <BarChart data={incidentTypeData}>
+            <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="rgba(156,163,175,0.25)" />
+            <XAxis dataKey="name" stroke="currentColor" tick={{ fill: 'currentColor', fontSize: 12 }} />
+            <YAxis stroke="currentColor" tick={{ fill: 'currentColor', fontSize: 12 }} />
+            <Tooltip contentStyle={chartTooltipStyle} />
+            <Bar dataKey="count" fill="#10b981" radius={[4, 4, 0, 0]} />
+          </BarChart>
+        </ChartCard>
       </div>
 
       {/* Recent Activity */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         {/* Recent Alerts */}
-        <div className="bg-white rounded-xl border border-gray-200">
-          <div className="px-6 py-4 border-b border-gray-200 flex items-center justify-between">
-            <h2 className="text-lg font-semibold text-gray-900">Recent Alerts</h2>
-            <Link to="/alerts" className="text-sm text-blue-600 hover:text-blue-700">
+        <div className="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700">
+          <div className="px-6 py-4 border-b border-gray-200 dark:border-gray-700 flex items-center justify-between">
+            <h2 className="text-lg font-semibold text-gray-900 dark:text-white">Recent Alerts</h2>
+            <Link to="/alerts" className="text-sm text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300">
               View all
             </Link>
           </div>
-          <div className="divide-y divide-gray-100">
+          <div className="divide-y divide-gray-100 dark:divide-gray-700">
             {recentAlerts.length === 0 ? (
-              <p className="px-6 py-8 text-center text-gray-500">No alerts yet</p>
+              <p className="px-6 py-8 text-center text-gray-500 dark:text-gray-400">No alerts yet</p>
             ) : (
               recentAlerts.map((alert) => (
-                <div key={alert.id} className="px-6 py-4 hover:bg-gray-50">
+                <div key={alert.id} className="px-6 py-4 hover:bg-gray-50 dark:hover:bg-gray-700/50">
                   <div className="flex items-start">
                     <div
-                      className="w-2 h-2 rounded-full mt-2 mr-3"
+                      className="w-2 h-2 rounded-full mt-2 mr-3 flex-shrink-0"
                       style={{ backgroundColor: severityColors[alert.severity] || '#6b7280' }}
                     />
                     <div className="flex-1 min-w-0">
-                      <p className="text-sm font-medium text-gray-900 truncate">{alert.title}</p>
-                      <p className="text-sm text-gray-500 mt-1">
-                        {alert.source} &middot; {new Date(alert.created_at || "").toLocaleString()}
+                      <p className="text-sm font-medium text-gray-900 dark:text-white truncate">{alert.title}</p>
+                      <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
+                        {alert.source} &middot; {alert.created_at ? new Date(alert.created_at).toLocaleString() : '—'}
                       </p>
                     </div>
                     <span
                       className={clsx(
-                        'ml-2 px-2 py-1 text-xs font-medium rounded-full',
+                        'ml-2 px-2 py-1 text-xs font-medium rounded-full whitespace-nowrap',
                         alert.status === 'new'
-                          ? 'bg-blue-100 text-blue-700'
+                          ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300'
                           : alert.status === 'closed'
-                          ? 'bg-gray-100 text-gray-700'
-                          : 'bg-yellow-100 text-yellow-700'
+                          ? 'bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300'
+                          : 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-300'
                       )}
                     >
                       {alert.status}
@@ -421,38 +393,38 @@ export default function Dashboard() {
         </div>
 
         {/* Recent Incidents */}
-        <div className="bg-white rounded-xl border border-gray-200">
-          <div className="px-6 py-4 border-b border-gray-200 flex items-center justify-between">
-            <h2 className="text-lg font-semibold text-gray-900">Recent Incidents</h2>
-            <Link to="/incidents" className="text-sm text-blue-600 hover:text-blue-700">
+        <div className="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700">
+          <div className="px-6 py-4 border-b border-gray-200 dark:border-gray-700 flex items-center justify-between">
+            <h2 className="text-lg font-semibold text-gray-900 dark:text-white">Recent Incidents</h2>
+            <Link to="/incidents" className="text-sm text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300">
               View all
             </Link>
           </div>
-          <div className="divide-y divide-gray-100">
+          <div className="divide-y divide-gray-100 dark:divide-gray-700">
             {recentIncidents.length === 0 ? (
-              <p className="px-6 py-8 text-center text-gray-500">No incidents yet</p>
+              <p className="px-6 py-8 text-center text-gray-500 dark:text-gray-400">No incidents yet</p>
             ) : (
               recentIncidents.map((incident) => (
-                <div key={incident.id} className="px-6 py-4 hover:bg-gray-50">
+                <div key={incident.id} className="px-6 py-4 hover:bg-gray-50 dark:hover:bg-gray-700/50">
                   <div className="flex items-start">
                     <div
-                      className="w-2 h-2 rounded-full mt-2 mr-3"
+                      className="w-2 h-2 rounded-full mt-2 mr-3 flex-shrink-0"
                       style={{ backgroundColor: severityColors[incident.severity] || '#6b7280' }}
                     />
                     <div className="flex-1 min-w-0">
-                      <p className="text-sm font-medium text-gray-900 truncate">{incident.title}</p>
-                      <p className="text-sm text-gray-500 mt-1">
-                        {incident.incident_type || 'Unknown'} &middot; {new Date(incident.created_at || "").toLocaleString()}
+                      <p className="text-sm font-medium text-gray-900 dark:text-white truncate">{incident.title}</p>
+                      <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">
+                        {incident.incident_type || 'Unknown'} &middot; {incident.created_at ? new Date(incident.created_at).toLocaleString() : '—'}
                       </p>
                     </div>
                     <span
                       className={clsx(
-                        'ml-2 px-2 py-1 text-xs font-medium rounded-full',
+                        'ml-2 px-2 py-1 text-xs font-medium rounded-full whitespace-nowrap',
                         incident.status === 'open'
-                          ? 'bg-red-100 text-red-700'
+                          ? 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300'
                           : incident.status === 'closed'
-                          ? 'bg-gray-100 text-gray-700'
-                          : 'bg-yellow-100 text-yellow-700'
+                          ? 'bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300'
+                          : 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-300'
                       )}
                     >
                       {incident.status}
@@ -464,6 +436,23 @@ export default function Dashboard() {
           </div>
         </div>
       </div>
+    </div>
+  );
+}
+
+function ChartCard({ title, empty, children }: { title: string; empty: boolean; children: React.ReactElement }) {
+  return (
+    <div className="bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-6 text-gray-700 dark:text-gray-300">
+      <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">{title}</h2>
+      {empty ? (
+        <div className="flex items-center justify-center h-48 text-gray-500 dark:text-gray-400">
+          <p>No data yet</p>
+        </div>
+      ) : (
+        <ResponsiveContainer width="100%" height={200}>
+          {children}
+        </ResponsiveContainer>
+      )}
     </div>
   );
 }
@@ -484,15 +473,20 @@ function StatCard({
   href?: string;
 }) {
   const content = (
-    <div className={clsx("bg-white rounded-xl border border-gray-200 p-6 transition-shadow", href && "hover:shadow-md cursor-pointer")}>
+    <div
+      className={clsx(
+        'bg-white dark:bg-gray-800 rounded-xl border border-gray-200 dark:border-gray-700 p-6 transition-shadow',
+        href && 'hover:shadow-md cursor-pointer',
+      )}
+    >
       <div className="flex items-center">
         <div className={clsx('p-3 rounded-lg', color)}>
           <Icon className="w-6 h-6 text-white" />
         </div>
-        <div className="ml-4">
-          <p className="text-sm font-medium text-gray-500">{title}</p>
-          <p className="text-2xl font-bold text-gray-900">{value}</p>
-          <p className="text-xs text-gray-400 mt-1">{subtitle}</p>
+        <div className="ml-4 min-w-0">
+          <p className="text-sm font-medium text-gray-500 dark:text-gray-400 truncate">{title}</p>
+          <p className="text-2xl font-bold text-gray-900 dark:text-white">{value}</p>
+          <p className="text-xs text-gray-400 dark:text-gray-500 mt-1 truncate">{subtitle}</p>
         </div>
       </div>
     </div>

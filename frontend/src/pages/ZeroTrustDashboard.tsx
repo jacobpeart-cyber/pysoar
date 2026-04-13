@@ -20,6 +20,7 @@ import {
 } from 'lucide-react';
 import { api } from '../lib/api';
 import clsx from 'clsx';
+import DetailDrawer, { DetailSection } from '../components/DetailDrawer';
 
 type TabType = 'overview' | 'access-control' | 'devices' | 'segmentation' | 'policies';
 
@@ -750,6 +751,9 @@ function DeviceTrustTab({
   setExpandedDevice: (id: string | null) => void;
   onAssessDevices: () => void;
 }) {
+  const [detailDevice, setDetailDevice] = useState<any | null>(null);
+  const [reassessedDevices, setReassessedDevices] = useState<Record<string, number>>({});
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
@@ -851,17 +855,83 @@ function DeviceTrustTab({
             {/* Expanded Details */}
             {expandedDevice === device.id && (
               <div className="mt-4 pt-4 border-t border-gray-200 dark:border-gray-700 space-y-2">
-                <button className="w-full px-3 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-xs font-medium">
+                <button
+                  onClick={async () => {
+                    try {
+                      const res = await api.get(`/zerotrust/devices/${device.id}`);
+                      setDetailDevice(res.data);
+                    } catch (err) {
+                      console.error('Device detail fetch failed:', err);
+                    }
+                  }}
+                  className="w-full px-3 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-xs font-medium"
+                >
                   View Details
                 </button>
-                <button className="w-full px-3 py-2 bg-gray-100 dark:bg-gray-700 text-gray-900 dark:text-white rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600 text-xs font-medium">
-                  Re-assess
+                <button
+                  onClick={async () => {
+                    try {
+                      await api.post('/zerotrust/assess-devices', { device_ids: [device.id] });
+                      setReassessedDevices((prev) => ({ ...prev, [device.id]: Date.now() }));
+                    } catch (err) {
+                      console.error('Re-assess failed:', err);
+                    }
+                  }}
+                  className="w-full px-3 py-2 bg-gray-100 dark:bg-gray-700 text-gray-900 dark:text-white rounded-lg hover:bg-gray-200 dark:hover:bg-gray-600 text-xs font-medium"
+                >
+                  {reassessedDevices[device.id]
+                    ? `Re-assessed ${new Date(reassessedDevices[device.id]).toLocaleTimeString()}`
+                    : 'Re-assess'}
                 </button>
               </div>
             )}
           </div>
         ))}
       </div>
+
+      <DetailDrawer
+        open={!!detailDevice}
+        onClose={() => setDetailDevice(null)}
+        title={detailDevice?.device_name || detailDevice?.hostname || 'Device Trust Profile'}
+        subtitle={detailDevice ? `${detailDevice.device_type || 'device'} · trust score ${detailDevice.trust_score ?? '—'}` : undefined}
+        sections={
+          detailDevice
+            ? ([
+                {
+                  title: 'Identity',
+                  fields: [
+                    { label: 'Device ID', value: detailDevice.id || detailDevice.device_id, mono: true, full: true },
+                    { label: 'Hostname', value: detailDevice.hostname || detailDevice.device_name },
+                    { label: 'Type', value: detailDevice.device_type },
+                    { label: 'Owner', value: detailDevice.user_id || detailDevice.owner },
+                    { label: 'OS', value: detailDevice.os || detailDevice.operating_system },
+                    { label: 'OS Version', value: detailDevice.os_version },
+                  ],
+                },
+                {
+                  title: 'Trust Posture',
+                  fields: [
+                    { label: 'Trust Score', value: detailDevice.trust_score },
+                    { label: 'Compliance', value: detailDevice.compliance_status || detailDevice.compliant },
+                    { label: 'MDM Enrolled', value: detailDevice.mdm_enrolled != null ? (detailDevice.mdm_enrolled ? 'Yes' : 'No') : null },
+                    { label: 'Encryption', value: detailDevice.disk_encrypted != null ? (detailDevice.disk_encrypted ? 'Enabled' : 'Disabled') : null },
+                    { label: 'EDR Agent', value: detailDevice.edr_agent || detailDevice.edr_installed },
+                    { label: 'Patch Level', value: detailDevice.patch_level },
+                  ],
+                },
+                {
+                  title: 'Network',
+                  fields: [
+                    { label: 'IP Address', value: detailDevice.ip_address, mono: true },
+                    { label: 'MAC Address', value: detailDevice.mac_address, mono: true },
+                    { label: 'Last Seen', value: detailDevice.last_seen ? new Date(detailDevice.last_seen).toLocaleString() : null },
+                    { label: 'Last Assessed', value: detailDevice.last_assessed ? new Date(detailDevice.last_assessed).toLocaleString() : null },
+                  ],
+                },
+              ] as DetailSection[])
+            : undefined
+        }
+      />
     </div>
   );
 }

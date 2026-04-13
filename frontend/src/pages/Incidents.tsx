@@ -1,279 +1,371 @@
-import { useState, useEffect } from 'react'
-import { incidentsApi, alertsApi } from '../lib/api'
-import type { Incident, Alert } from '../lib/types'
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { Link } from 'react-router-dom';
+import { incidentsApi, alertsApi } from '../lib/api';
+import type { Incident, Alert } from '../lib/types';
 import {
   Plus,
   Search,
-  Filter,
   Eye,
   Trash2,
   X,
   ChevronLeft,
   ChevronRight,
   AlertTriangle,
-  Link as LinkIcon
-} from 'lucide-react'
-import { format } from 'date-fns'
-import clsx from 'clsx'
+  RefreshCw,
+  CheckCircle,
+  FileWarning,
+} from 'lucide-react';
+import { format } from 'date-fns';
+import clsx from 'clsx';
 
 const statusColors: Record<string, string> = {
-  new: 'bg-blue-100 text-blue-800',
-  investigating: 'bg-yellow-100 text-yellow-800',
-  containment: 'bg-orange-100 text-orange-800',
-  eradication: 'bg-purple-100 text-purple-800',
-  recovery: 'bg-indigo-100 text-indigo-800',
-  closed: 'bg-green-100 text-green-800',
-}
+  open: 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-300',
+  investigating: 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-300',
+  containment: 'bg-orange-100 text-orange-800 dark:bg-orange-900/30 dark:text-orange-300',
+  eradication: 'bg-purple-100 text-purple-800 dark:bg-purple-900/30 dark:text-purple-300',
+  recovery: 'bg-indigo-100 text-indigo-800 dark:bg-indigo-900/30 dark:text-indigo-300',
+  closed: 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300',
+};
 
 const severityColors: Record<string, string> = {
-  critical: 'bg-red-100 text-red-800',
-  high: 'bg-orange-100 text-orange-800',
-  medium: 'bg-yellow-100 text-yellow-800',
-  low: 'bg-blue-100 text-blue-800',
-  informational: 'bg-gray-100 text-gray-800',
-}
+  critical: 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300',
+  high: 'bg-orange-100 text-orange-800 dark:bg-orange-900/30 dark:text-orange-300',
+  medium: 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-300',
+  low: 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-300',
+  informational: 'bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-300',
+};
+
+const PAGE_SIZES = [10, 25, 50, 100];
+const REFRESH_INTERVAL_MS = 30_000;
+
+type Toast = { type: 'success' | 'error'; text: string };
 
 export default function Incidents() {
-  const [incidents, setIncidents] = useState<Incident[]>([])
-  const [loading, setLoading] = useState(true)
-  const [page, setPage] = useState(1)
-  const [total, setTotal] = useState(0)
-  const [statusFilter, setStatusFilter] = useState('')
-  const [severityFilter, setSeverityFilter] = useState('')
-  const [search, setSearch] = useState('')
-  const [showCreateModal, setShowCreateModal] = useState(false)
-  const [showDetailsModal, setShowDetailsModal] = useState(false)
-  const [selectedIncident, setSelectedIncident] = useState<Incident | null>(null)
-  const [availableAlerts, setAvailableAlerts] = useState<Alert[]>([])
-  const pageSize = 10
+  const [incidents, setIncidents] = useState<Incident[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(10);
+  const [total, setTotal] = useState(0);
+  const [statusFilter, setStatusFilter] = useState('');
+  const [severityFilter, setSeverityFilter] = useState('');
+  const [typeFilter, setTypeFilter] = useState('');
+  const [searchInput, setSearchInput] = useState('');
+  const [search, setSearch] = useState('');
+  const [showCreateModal, setShowCreateModal] = useState(false);
+  const [availableAlerts, setAvailableAlerts] = useState<Alert[]>([]);
+  const [toast, setToast] = useState<Toast | null>(null);
+  const searchDebounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  const fetchIncidents = async () => {
-    setLoading(true)
-    try {
-      const params: Record<string, any> = { page, size: pageSize }
-      if (statusFilter) params.status = statusFilter
-      if (severityFilter) params.severity = severityFilter
-      if (search) params.search = search
-      const response = await incidentsApi.list(params)
-      setIncidents(response.items)
-      setTotal(response.total)
-    } catch (error) {
-      console.error('Failed to fetch incidents:', error)
-    } finally {
-      setLoading(false)
-    }
-  }
+  const showToast = useCallback((type: Toast['type'], text: string) => {
+    setToast({ type, text });
+    setTimeout(() => setToast(null), 4000);
+  }, []);
+
+  const fetchIncidents = useCallback(
+    async (showSpinner = true) => {
+      if (showSpinner) setLoading(true);
+      else setRefreshing(true);
+      try {
+        const params: Record<string, any> = { page, size: pageSize };
+        if (statusFilter) params.status = statusFilter;
+        if (severityFilter) params.severity = severityFilter;
+        if (typeFilter) params.incident_type = typeFilter;
+        if (search) params.search = search;
+        const response = await incidentsApi.list(params);
+        setIncidents(response.items || []);
+        setTotal(response.total || 0);
+      } catch (error) {
+        console.error('Failed to fetch incidents:', error);
+        showToast('error', 'Failed to load incidents');
+      } finally {
+        setLoading(false);
+        setRefreshing(false);
+      }
+    },
+    [page, pageSize, statusFilter, severityFilter, typeFilter, search, showToast],
+  );
 
   const fetchAvailableAlerts = async () => {
     try {
-      const response = await alertsApi.list({ size: 100 })
-      setAvailableAlerts(response.items)
+      const response = await alertsApi.list({ size: 100, status: 'new' });
+      setAvailableAlerts(response.items);
     } catch (error) {
-      console.error('Failed to fetch alerts:', error)
+      console.error('Failed to fetch alerts:', error);
     }
-  }
+  };
 
   useEffect(() => {
-    fetchIncidents()
-  }, [page, statusFilter, severityFilter, search])
+    fetchIncidents(true);
+  }, [fetchIncidents]);
 
   useEffect(() => {
-    if (showCreateModal) {
-      fetchAvailableAlerts()
-    }
-  }, [showCreateModal])
+    const interval = setInterval(() => fetchIncidents(false), REFRESH_INTERVAL_MS);
+    return () => clearInterval(interval);
+  }, [fetchIncidents]);
 
-  const handleDelete = async (id: string) => {
-    if (!confirm('Are you sure you want to delete this incident?')) return
+  // Debounced search
+  useEffect(() => {
+    if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
+    searchDebounceRef.current = setTimeout(() => {
+      setSearch(searchInput);
+      setPage(1);
+    }, 350);
+    return () => {
+      if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
+    };
+  }, [searchInput]);
+
+  useEffect(() => {
+    if (showCreateModal) fetchAvailableAlerts();
+  }, [showCreateModal]);
+
+  const handleDelete = async (id: string, e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!confirm('Delete this incident? Linked alerts will be unlinked.')) return;
     try {
-      await incidentsApi.delete(id)
-      fetchIncidents()
+      await incidentsApi.delete(id);
+      showToast('success', 'Incident deleted');
+      fetchIncidents(false);
     } catch (error) {
-      console.error('Failed to delete incident:', error)
+      console.error('Failed to delete incident:', error);
+      showToast('error', 'Failed to delete incident');
     }
-  }
+  };
 
-  const handleViewDetails = (incident: Incident) => {
-    setSelectedIncident(incident)
-    setShowDetailsModal(true)
-  }
-
-  const totalPages = Math.ceil(total / pageSize)
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
 
   return (
-    <div>
-      <div className="flex justify-between items-center mb-6">
-        <h1 className="text-2xl font-bold text-gray-900">Incidents</h1>
-        <button
-          onClick={() => setShowCreateModal(true)}
-          className="flex items-center gap-2 bg-primary-600 text-white px-4 py-2 rounded-lg hover:bg-primary-700 transition-colors"
+    <div className="space-y-6">
+      {/* Toast */}
+      {toast && (
+        <div
+          className={clsx(
+            'fixed top-4 right-4 z-50 px-4 py-3 rounded-lg shadow-lg border text-sm font-medium',
+            toast.type === 'success'
+              ? 'bg-green-50 dark:bg-green-900/30 text-green-700 dark:text-green-300 border-green-200 dark:border-green-900/50'
+              : 'bg-red-50 dark:bg-red-900/30 text-red-700 dark:text-red-300 border-red-200 dark:border-red-900/50',
+          )}
         >
-          <Plus className="w-5 h-5" />
-          New Incident
-        </button>
+          {toast.text}
+        </div>
+      )}
+
+      <div className="flex items-start justify-between gap-4 flex-wrap">
+        <div>
+          <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Incidents</h1>
+          <p className="text-gray-500 dark:text-gray-400 mt-1">
+            Coordinate investigation and response · {total.toLocaleString()} total
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => fetchIncidents(false)}
+            disabled={refreshing}
+            className="inline-flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium text-gray-700 dark:text-gray-200 bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700 disabled:opacity-50"
+          >
+            <RefreshCw className={clsx('w-4 h-4', refreshing && 'animate-spin')} />
+            Refresh
+          </button>
+          <button
+            onClick={() => setShowCreateModal(true)}
+            className="flex items-center gap-2 bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 transition-colors"
+          >
+            <Plus className="w-5 h-5" />
+            New Incident
+          </button>
+        </div>
       </div>
 
       {/* Filters */}
-      <div className="bg-white rounded-lg shadow-sm border border-gray-200 p-4 mb-6">
+      <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
         <div className="flex flex-wrap gap-4">
-          <div className="flex items-center gap-2 flex-1 min-w-[200px]">
-            <Search className="w-5 h-5 text-gray-400" />
-            <input
-              type="text"
-              placeholder="Search incidents..."
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              className="flex-1 border-0 focus:ring-0 text-sm"
-            />
+          <div className="flex-1 min-w-[220px]">
+            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Search</label>
+            <div className="relative">
+              <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400 pointer-events-none" />
+              <input
+                type="text"
+                value={searchInput}
+                onChange={(e) => setSearchInput(e.target.value)}
+                placeholder="Title or description…"
+                className="w-full pl-9 pr-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+              />
+            </div>
           </div>
-          <div className="flex items-center gap-2">
-            <Filter className="w-5 h-5 text-gray-400" />
-            <select
-              value={severityFilter}
-              onChange={(e) => setSeverityFilter(e.target.value)}
-              className="border border-gray-300 rounded-md text-sm px-3 py-1.5"
-            >
-              <option value="">All Severities</option>
-              <option value="critical">Critical</option>
-              <option value="high">High</option>
-              <option value="medium">Medium</option>
-              <option value="low">Low</option>
-              <option value="informational">Informational</option>
-            </select>
-            <select
-              value={statusFilter}
-              onChange={(e) => setStatusFilter(e.target.value)}
-              className="border border-gray-300 rounded-md text-sm px-3 py-1.5"
-            >
-              <option value="">All Statuses</option>
-              <option value="new">New</option>
-              <option value="investigating">Investigating</option>
-              <option value="containment">Containment</option>
-              <option value="eradication">Eradication</option>
-              <option value="recovery">Recovery</option>
-              <option value="closed">Closed</option>
-            </select>
-          </div>
+          <FilterSelect
+            label="Severity"
+            value={severityFilter}
+            onChange={(v) => {
+              setSeverityFilter(v);
+              setPage(1);
+            }}
+            options={[
+              { value: '', label: 'All severities' },
+              { value: 'critical', label: 'Critical' },
+              { value: 'high', label: 'High' },
+              { value: 'medium', label: 'Medium' },
+              { value: 'low', label: 'Low' },
+              { value: 'informational', label: 'Informational' },
+            ]}
+          />
+          <FilterSelect
+            label="Status"
+            value={statusFilter}
+            onChange={(v) => {
+              setStatusFilter(v);
+              setPage(1);
+            }}
+            options={[
+              { value: '', label: 'All statuses' },
+              { value: 'open', label: 'Open' },
+              { value: 'investigating', label: 'Investigating' },
+              { value: 'containment', label: 'Containment' },
+              { value: 'eradication', label: 'Eradication' },
+              { value: 'recovery', label: 'Recovery' },
+              { value: 'closed', label: 'Closed' },
+            ]}
+          />
+          <FilterSelect
+            label="Type"
+            value={typeFilter}
+            onChange={(v) => {
+              setTypeFilter(v);
+              setPage(1);
+            }}
+            options={[
+              { value: '', label: 'All types' },
+              { value: 'malware', label: 'Malware' },
+              { value: 'phishing', label: 'Phishing' },
+              { value: 'data_breach', label: 'Data Breach' },
+              { value: 'unauthorized_access', label: 'Unauthorized Access' },
+              { value: 'denial_of_service', label: 'DoS' },
+              { value: 'insider_threat', label: 'Insider Threat' },
+              { value: 'ransomware', label: 'Ransomware' },
+              { value: 'advanced_persistent_threat', label: 'APT' },
+              { value: 'other', label: 'Other' },
+            ]}
+          />
+          <FilterSelect
+            label="Per page"
+            value={String(pageSize)}
+            onChange={(v) => {
+              setPageSize(Number(v));
+              setPage(1);
+            }}
+            options={PAGE_SIZES.map((n) => ({ value: String(n), label: String(n) }))}
+            minWidth={100}
+          />
         </div>
       </div>
 
       {/* Table */}
-      <div className="bg-white rounded-lg shadow-sm border border-gray-200 overflow-hidden">
-        <table className="min-w-full divide-y divide-gray-200">
-          <thead className="bg-gray-50">
-            <tr>
-              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                Title
-              </th>
-              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                Severity
-              </th>
-              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                Status
-              </th>
-              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                Alerts
-              </th>
-              <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">
-                Created
-              </th>
-              <th className="px-6 py-3 text-right text-xs font-medium text-gray-500 uppercase tracking-wider">
-                Actions
-              </th>
-            </tr>
-          </thead>
-          <tbody className="bg-white divide-y divide-gray-200">
-            {loading ? (
-              <tr>
-                <td colSpan={6} className="px-6 py-12 text-center text-gray-500">
-                  Loading...
-                </td>
-              </tr>
-            ) : incidents.length === 0 ? (
-              <tr>
-                <td colSpan={6} className="px-6 py-12 text-center text-gray-500">
-                  No incidents found
-                </td>
-              </tr>
-            ) : (
-              incidents.map((incident) => (
-                <tr key={incident.id} className="hover:bg-gray-50">
-                  <td className="px-6 py-4">
-                    <div className="text-sm font-medium text-gray-900">
-                      {incident.title}
-                    </div>
-                    <div className="text-sm text-gray-500 truncate max-w-xs">
-                      {incident.description}
-                    </div>
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap">
-                    <span
-                      className={clsx(
-                        'inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium',
-                        severityColors[incident.severity]
-                      )}
-                    >
-                      {incident.severity}
-                    </span>
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap">
-                    <span
-                      className={clsx(
-                        'inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium',
-                        statusColors[incident.status]
-                      )}
-                    >
-                      {incident.status}
-                    </span>
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                    <div className="flex items-center gap-1">
-                      <AlertTriangle className="w-4 h-4" />
-                      {incident.alert_count || 0}
-                    </div>
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                    {format(new Date(incident.created_at || ""), 'MMM d, yyyy HH:mm')}
-                  </td>
-                  <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
-                    <button
-                      onClick={() => handleViewDetails(incident)}
-                      className="text-primary-600 hover:text-primary-900 mr-3"
-                    >
-                      <Eye className="w-5 h-5" />
-                    </button>
-                    <button
-                      onClick={() => handleDelete(incident.id)}
-                      className="text-red-600 hover:text-red-900"
-                    >
-                      <Trash2 className="w-5 h-5" />
-                    </button>
-                  </td>
+      <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
+        {loading ? (
+          <div className="flex items-center justify-center h-64">
+            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600 dark:border-blue-400"></div>
+          </div>
+        ) : incidents.length === 0 ? (
+          <div className="flex flex-col items-center justify-center h-64 text-gray-500 dark:text-gray-400">
+            <FileWarning className="w-12 h-12 mb-4 text-gray-300 dark:text-gray-600" />
+            <p>No incidents found</p>
+          </div>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full">
+              <thead className="bg-gray-50 dark:bg-gray-900/50 border-b border-gray-200 dark:border-gray-700">
+                <tr>
+                  <Th>Title</Th>
+                  <Th>Severity</Th>
+                  <Th>Status</Th>
+                  <Th>Type</Th>
+                  <Th>Alerts</Th>
+                  <Th>Created</Th>
+                  <Th align="right">Actions</Th>
                 </tr>
-              ))
-            )}
-          </tbody>
-        </table>
+              </thead>
+              <tbody className="divide-y divide-gray-100 dark:divide-gray-700">
+                {incidents.map((incident) => (
+                  <tr key={incident.id} className="hover:bg-gray-50 dark:hover:bg-gray-700/50">
+                    <td className="px-6 py-4">
+                      <Link to={`/incidents/${incident.id}`} className="block">
+                        <div className="text-sm font-medium text-gray-900 dark:text-white hover:text-blue-600 dark:hover:text-blue-400">
+                          {incident.title}
+                        </div>
+                        {incident.description && (
+                          <div className="text-sm text-gray-500 dark:text-gray-400 truncate max-w-md">
+                            {incident.description}
+                          </div>
+                        )}
+                      </Link>
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap">
+                      <span className={clsx('inline-flex px-2.5 py-0.5 rounded-full text-xs font-medium capitalize', severityColors[incident.severity] || severityColors.medium)}>
+                        {incident.severity}
+                      </span>
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap">
+                      <span className={clsx('inline-flex px-2.5 py-0.5 rounded-full text-xs font-medium capitalize', statusColors[incident.status] || statusColors.open)}>
+                        {(incident.status || '').replace(/_/g, ' ')}
+                      </span>
+                    </td>
+                    <td className="px-6 py-4 text-xs text-gray-500 dark:text-gray-400 whitespace-nowrap">
+                      {((incident as any).incident_type || '').replace(/_/g, ' ') || '—'}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
+                      <div className="flex items-center gap-1">
+                        <AlertTriangle className="w-4 h-4" />
+                        {incident.alert_count || 0}
+                      </div>
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500 dark:text-gray-400">
+                      {incident.created_at ? format(new Date(incident.created_at), 'MMM d, yyyy HH:mm') : '—'}
+                    </td>
+                    <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
+                      <Link
+                        to={`/incidents/${incident.id}`}
+                        className="inline-block p-1 text-gray-400 hover:text-blue-600 dark:hover:text-blue-400 mr-2"
+                        title="View details"
+                      >
+                        <Eye className="w-5 h-5" />
+                      </Link>
+                      <button
+                        onClick={(e) => handleDelete(incident.id, e)}
+                        className="p-1 text-gray-400 hover:text-red-600 dark:hover:text-red-400"
+                        title="Delete"
+                      >
+                        <Trash2 className="w-5 h-5" />
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
 
         {/* Pagination */}
         {totalPages > 1 && (
-          <div className="bg-white px-4 py-3 flex items-center justify-between border-t border-gray-200">
-            <div className="text-sm text-gray-700">
-              Showing {(page - 1) * pageSize + 1} to{' '}
-              {Math.min(page * pageSize, total)} of {total} results
+          <div className="bg-white dark:bg-gray-800 px-6 py-4 flex items-center justify-between border-t border-gray-200 dark:border-gray-700 flex-wrap gap-2">
+            <div className="text-sm text-gray-500 dark:text-gray-400">
+              Showing {(page - 1) * pageSize + 1}–{Math.min(page * pageSize, total)} of {total}
             </div>
             <div className="flex gap-2">
               <button
                 onClick={() => setPage(page - 1)}
                 disabled={page === 1}
-                className="px-3 py-1 border border-gray-300 rounded-md text-sm disabled:opacity-50 disabled:cursor-not-allowed hover:bg-gray-50"
+                className="p-2 border border-gray-300 dark:border-gray-600 rounded-lg disabled:opacity-50 disabled:cursor-not-allowed hover:bg-gray-50 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-300"
               >
                 <ChevronLeft className="w-5 h-5" />
               </button>
+              <span className="text-sm text-gray-700 dark:text-gray-300 px-2 self-center">
+                Page {page} of {totalPages}
+              </span>
               <button
                 onClick={() => setPage(page + 1)}
                 disabled={page === totalPages}
-                className="px-3 py-1 border border-gray-300 rounded-md text-sm disabled:opacity-50 disabled:cursor-not-allowed hover:bg-gray-50"
+                className="p-2 border border-gray-300 dark:border-gray-600 rounded-lg disabled:opacity-50 disabled:cursor-not-allowed hover:bg-gray-50 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-300"
               >
                 <ChevronRight className="w-5 h-5" />
               </button>
@@ -287,61 +379,95 @@ export default function Incidents() {
         <CreateIncidentModal
           onClose={() => setShowCreateModal(false)}
           onCreated={() => {
-            setShowCreateModal(false)
-            fetchIncidents()
+            setShowCreateModal(false);
+            showToast('success', 'Incident created');
+            fetchIncidents(false);
           }}
+          onError={() => showToast('error', 'Failed to create incident')}
           availableAlerts={availableAlerts}
         />
       )}
-
-      {/* Details Modal */}
-      {showDetailsModal && selectedIncident && (
-        <IncidentDetailsModal
-          incident={selectedIncident}
-          onClose={() => {
-            setShowDetailsModal(false)
-            setSelectedIncident(null)
-          }}
-          onUpdated={() => {
-            fetchIncidents()
-          }}
-        />
-      )}
     </div>
-  )
+  );
+}
+
+function Th({ children, align = 'left' }: { children: React.ReactNode; align?: 'left' | 'right' }) {
+  return (
+    <th
+      className={clsx(
+        'px-6 py-3 text-xs font-medium text-gray-500 dark:text-gray-400 uppercase tracking-wider',
+        align === 'right' ? 'text-right' : 'text-left',
+      )}
+    >
+      {children}
+    </th>
+  );
+}
+
+function FilterSelect({
+  label,
+  value,
+  onChange,
+  options,
+  minWidth = 180,
+}: {
+  label: string;
+  value: string;
+  onChange: (v: string) => void;
+  options: { value: string; label: string }[];
+  minWidth?: number;
+}) {
+  return (
+    <div className="flex-1" style={{ minWidth: `${minWidth}px` }}>
+      <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">{label}</label>
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+      >
+        {options.map((o) => (
+          <option key={o.value} value={o.value}>
+            {o.label}
+          </option>
+        ))}
+      </select>
+    </div>
+  );
 }
 
 function CreateIncidentModal({
   onClose,
   onCreated,
+  onError,
   availableAlerts,
 }: {
-  onClose: () => void
-  onCreated: () => void
-  availableAlerts: Alert[]
+  onClose: () => void;
+  onCreated: () => void;
+  onError: () => void;
+  availableAlerts: Alert[];
 }) {
   const [formData, setFormData] = useState({
     title: '',
     description: '',
     severity: 'medium',
+    incident_type: 'other',
     alert_ids: [] as string[],
-  })
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState('')
+  });
+  const [loading, setLoading] = useState(false);
 
   const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault()
-    setLoading(true)
-    setError('')
+    e.preventDefault();
+    setLoading(true);
     try {
-      await incidentsApi.create(formData)
-      onCreated()
-    } catch (err: any) {
-      setError(err.response?.data?.message || 'Failed to create incident')
+      await incidentsApi.create(formData);
+      onCreated();
+    } catch (err) {
+      console.error(err);
+      onError();
     } finally {
-      setLoading(false)
+      setLoading(false);
     }
-  }
+  };
 
   const toggleAlert = (alertId: string) => {
     setFormData((prev) => ({
@@ -349,242 +475,117 @@ function CreateIncidentModal({
       alert_ids: prev.alert_ids.includes(alertId)
         ? prev.alert_ids.filter((id) => id !== alertId)
         : [...prev.alert_ids, alertId],
-    }))
-  }
+    }));
+  };
 
   return (
-    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-      <div className="bg-white rounded-lg shadow-xl w-full max-w-2xl max-h-[90vh] overflow-y-auto">
-        <div className="flex items-center justify-between p-4 border-b">
-          <h2 className="text-lg font-semibold">Create New Incident</h2>
-          <button onClick={onClose} className="text-gray-400 hover:text-gray-600">
+    <div className="fixed inset-0 bg-black bg-opacity-50 dark:bg-opacity-70 flex items-center justify-center z-50 p-4">
+      <div className="bg-white dark:bg-gray-800 rounded-lg shadow-xl w-full max-w-2xl max-h-[90vh] overflow-y-auto">
+        <div className="flex items-center justify-between p-4 border-b border-gray-200 dark:border-gray-700">
+          <h2 className="text-lg font-semibold text-gray-900 dark:text-white">Create New Incident</h2>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300">
             <X className="w-5 h-5" />
           </button>
         </div>
-        <form onSubmit={handleSubmit} className="p-4 space-y-4">
-          {error && (
-            <div className="bg-red-50 text-red-700 p-3 rounded-lg text-sm">
-              {error}
-            </div>
-          )}
+        <form onSubmit={handleSubmit} className="p-6 space-y-4">
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">
-              Title
-            </label>
+            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Title *</label>
             <input
               type="text"
-              value={formData.title}
-              onChange={(e) =>
-                setFormData({ ...formData, title: e.target.value })
-              }
-              className="w-full border border-gray-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
               required
+              value={formData.title}
+              onChange={(e) => setFormData({ ...formData, title: e.target.value })}
+              className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
             />
           </div>
           <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">
-              Description
-            </label>
+            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Description</label>
             <textarea
-              value={formData.description}
-              onChange={(e) =>
-                setFormData({ ...formData, description: e.target.value })
-              }
               rows={3}
-              className="w-full border border-gray-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
+              value={formData.description}
+              onChange={(e) => setFormData({ ...formData, description: e.target.value })}
+              className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
             />
           </div>
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-1">
-              Severity
-            </label>
-            <select
-              value={formData.severity}
-              onChange={(e) =>
-                setFormData({ ...formData, severity: e.target.value })
-              }
-              className="w-full border border-gray-300 rounded-lg px-3 py-2 focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
-            >
-              <option value="critical">Critical</option>
-              <option value="high">High</option>
-              <option value="medium">Medium</option>
-              <option value="low">Low</option>
-              <option value="informational">Informational</option>
-            </select>
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Severity *</label>
+              <select
+                value={formData.severity}
+                onChange={(e) => setFormData({ ...formData, severity: e.target.value })}
+                className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+              >
+                <option value="critical">Critical</option>
+                <option value="high">High</option>
+                <option value="medium">Medium</option>
+                <option value="low">Low</option>
+                <option value="informational">Informational</option>
+              </select>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Type *</label>
+              <select
+                value={formData.incident_type}
+                onChange={(e) => setFormData({ ...formData, incident_type: e.target.value })}
+                className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+              >
+                <option value="malware">Malware</option>
+                <option value="phishing">Phishing</option>
+                <option value="data_breach">Data Breach</option>
+                <option value="unauthorized_access">Unauthorized Access</option>
+                <option value="denial_of_service">DoS</option>
+                <option value="insider_threat">Insider Threat</option>
+                <option value="ransomware">Ransomware</option>
+                <option value="advanced_persistent_threat">APT</option>
+                <option value="other">Other</option>
+              </select>
+            </div>
           </div>
-          <div>
-            <label className="block text-sm font-medium text-gray-700 mb-2">
-              Link Alerts (Optional)
-            </label>
-            <div className="border border-gray-300 rounded-lg max-h-48 overflow-y-auto">
-              {availableAlerts.length === 0 ? (
-                <div className="p-3 text-sm text-gray-500">No alerts available</div>
-              ) : (
-                availableAlerts.map((alert) => (
+          {availableAlerts.length > 0 && (
+            <div>
+              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                Link Alerts ({formData.alert_ids.length} selected)
+              </label>
+              <div className="max-h-40 overflow-y-auto border border-gray-200 dark:border-gray-700 rounded-lg p-2 space-y-1">
+                {availableAlerts.map((a) => (
                   <label
-                    key={alert.id}
-                    className="flex items-center gap-3 p-3 hover:bg-gray-50 cursor-pointer border-b last:border-b-0"
+                    key={a.id}
+                    className="flex items-center gap-2 p-2 rounded hover:bg-gray-50 dark:hover:bg-gray-700/50 cursor-pointer"
                   >
                     <input
                       type="checkbox"
-                      checked={formData.alert_ids.includes(alert.id)}
-                      onChange={() => toggleAlert(alert.id)}
-                      className="rounded border-gray-300 text-primary-600 focus:ring-primary-500"
+                      checked={formData.alert_ids.includes(a.id)}
+                      onChange={() => toggleAlert(a.id)}
+                      className="rounded border-gray-300"
                     />
-                    <div className="flex-1 min-w-0">
-                      <div className="text-sm font-medium text-gray-900 truncate">
-                        {alert.title}
-                      </div>
-                      <div className="text-xs text-gray-500">
-                        {alert.severity} - {alert.source}
-                      </div>
-                    </div>
+                    <span className="text-sm text-gray-700 dark:text-gray-200 truncate">{a.title}</span>
+                    <span className={clsx('ml-auto px-2 py-0.5 rounded text-xs capitalize', severityColors[a.severity] || severityColors.medium)}>
+                      {a.severity}
+                    </span>
                   </label>
-                ))
-              )}
+                ))}
+              </div>
             </div>
-          </div>
-          <div className="flex justify-end gap-3 pt-4">
+          )}
+          <div className="flex justify-end gap-3 pt-2">
             <button
               type="button"
               onClick={onClose}
-              className="px-4 py-2 text-gray-700 border border-gray-300 rounded-lg hover:bg-gray-50"
+              className="px-4 py-2 rounded-lg border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-200 hover:bg-gray-50 dark:hover:bg-gray-700"
             >
               Cancel
             </button>
             <button
               type="submit"
               disabled={loading}
-              className="px-4 py-2 bg-primary-600 text-white rounded-lg hover:bg-primary-700 disabled:opacity-50"
+              className="px-4 py-2 rounded-lg bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 inline-flex items-center gap-2"
             >
-              {loading ? 'Creating...' : 'Create Incident'}
+              {loading ? <RefreshCw className="w-4 h-4 animate-spin" /> : <CheckCircle className="w-4 h-4" />}
+              {loading ? 'Creating…' : 'Create'}
             </button>
           </div>
         </form>
       </div>
     </div>
-  )
-}
-
-function IncidentDetailsModal({
-  incident,
-  onClose,
-  onUpdated,
-}: {
-  incident: Incident
-  onClose: () => void
-  onUpdated: () => void
-}) {
-  const [status, setStatus] = useState(incident.status)
-  const [loading, setLoading] = useState(false)
-
-  const handleStatusChange = async (newStatus: string) => {
-    setLoading(true)
-    try {
-      await incidentsApi.update(incident.id, { status: newStatus })
-      setStatus(newStatus)
-      onUpdated()
-    } catch (error) {
-      console.error('Failed to update status:', error)
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  return (
-    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-      <div className="bg-white rounded-lg shadow-xl w-full max-w-2xl max-h-[90vh] overflow-y-auto">
-        <div className="flex items-center justify-between p-4 border-b">
-          <h2 className="text-lg font-semibold">Incident Details</h2>
-          <button onClick={onClose} className="text-gray-400 hover:text-gray-600">
-            <X className="w-5 h-5" />
-          </button>
-        </div>
-        <div className="p-4 space-y-4">
-          <div>
-            <h3 className="text-xl font-semibold text-gray-900">{incident.title}</h3>
-            <p className="text-gray-600 mt-1">{incident.description}</p>
-          </div>
-
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="block text-sm font-medium text-gray-500">Severity</label>
-              <span
-                className={clsx(
-                  'inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium mt-1',
-                  severityColors[incident.severity]
-                )}
-              >
-                {incident.severity}
-              </span>
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-gray-500 mb-1">Status</label>
-              <select
-                value={status}
-                onChange={(e) => handleStatusChange(e.target.value)}
-                disabled={loading}
-                className="border border-gray-300 rounded-md text-sm px-3 py-1.5 disabled:opacity-50"
-              >
-                <option value="new">New</option>
-                <option value="investigating">Investigating</option>
-                <option value="containment">Containment</option>
-                <option value="eradication">Eradication</option>
-                <option value="recovery">Recovery</option>
-                <option value="closed">Closed</option>
-              </select>
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-gray-500">Created</label>
-              <p className="text-sm text-gray-900">
-                {format(new Date(incident.created_at || ""), 'MMMM d, yyyy HH:mm')}
-              </p>
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-gray-500">Updated</label>
-              <p className="text-sm text-gray-900">
-                {format(new Date(incident.updated_at || ""), 'MMMM d, yyyy HH:mm')}
-              </p>
-            </div>
-          </div>
-
-          {incident.alerts && incident.alerts.length > 0 && (
-            <div>
-              <label className="block text-sm font-medium text-gray-500 mb-2">
-                <LinkIcon className="w-4 h-4 inline mr-1" />
-                Linked Alerts ({incident.alerts.length})
-              </label>
-              <div className="border border-gray-200 rounded-lg divide-y">
-                {incident.alerts.map((alert) => (
-                  <div key={alert.id} className="p-3 flex items-center justify-between">
-                    <div>
-                      <div className="text-sm font-medium text-gray-900">{alert.title}</div>
-                      <div className="text-xs text-gray-500">{alert.source}</div>
-                    </div>
-                    <span
-                      className={clsx(
-                        'inline-flex items-center px-2 py-0.5 rounded text-xs font-medium',
-                        severityColors[alert.severity]
-                      )}
-                    >
-                      {alert.severity}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
-
-          <div className="flex justify-end pt-4">
-            <button
-              onClick={onClose}
-              className="px-4 py-2 text-gray-700 border border-gray-300 rounded-lg hover:bg-gray-50"
-            >
-              Close
-            </button>
-          </div>
-        </div>
-      </div>
-    </div>
-  )
+  );
 }
