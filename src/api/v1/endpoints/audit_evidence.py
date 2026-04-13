@@ -604,23 +604,20 @@ async def create_evidence_package(
     current_user: CurrentUser = None,
 ):
     """Create evidence package"""
-    try:
-        package = EvidencePackage(
-            name=request.name,
-            description=request.description,
-            package_type=request.package_type,
-            framework_id=request.framework_id,
-            assessor=request.assessor,
-            due_date=request.due_date,
-            metadata=request.metadata or {},
-            organization_id=getattr(current_user, "organization_id", None),
-        )
-        db.add(package)
-        await db.commit()
-        return package
-    except Exception as e:
-        logger.error(f"Error creating evidence package: {str(e)}")
-        raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
+    package = EvidencePackage(
+        name=request.name,
+        description=request.description,
+        package_type=request.package_type,
+        framework_id=request.framework_id,
+        assessor=request.assessor,
+        due_date=request.due_date,
+        extra_metadata=request.metadata or {},
+        organization_id=getattr(current_user, "organization_id", None),
+    )
+    db.add(package)
+    await db.commit()
+    await db.refresh(package)
+    return package
 
 
 @router.get("/packages", response_model=list[EvidencePackageResponse])

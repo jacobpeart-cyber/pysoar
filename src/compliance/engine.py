@@ -5,7 +5,7 @@ Core compliance assessment, scoring, and reporting engine.
 Implements assessment logic, control mapping, and automated checks for all frameworks.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass, asdict
 import logging
@@ -95,7 +95,7 @@ class ComplianceEngine:
             framework_id=framework_id,
             assessment_type="self_assessment",
             assessor="system_automated",
-            assessment_date=datetime.utcnow(),
+            assessment_date=datetime.now(timezone.utc),
             status="completed",
             findings_count=len(controls) - satisfied,
             satisfied_count=satisfied,
@@ -224,7 +224,7 @@ class ComplianceEngine:
         ssp_doc = {
             "framework": framework.short_name,
             "baseline": framework.certification_level or "unknown",
-            "generated_at": datetime.utcnow().isoformat(),
+            "generated_at": datetime.now(timezone.utc).isoformat(),
             "control_families": {},
         }
 
@@ -286,7 +286,7 @@ class ComplianceEngine:
         result = await self.db.execute(stmt)
         poams = result.scalars().all()
 
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         overdue = [p for p in poams if p.scheduled_completion_date < now and p.status != "completed"]
         open_items = [p for p in poams if p.status in ["open", "in_progress"]]
 
@@ -433,7 +433,7 @@ class ComplianceEngine:
                     control.last_assessment_result = "unsatisfied"
                     control.implementation_status = 0.0
 
-                control.last_assessment_date = datetime.utcnow()
+                control.last_assessment_date = datetime.now(timezone.utc)
                 self.db.add(control)
 
         await self.db.commit()
@@ -557,7 +557,7 @@ class FedRAMPManager:
 
         return {
             "conmon_type": "FedRAMP",
-            "conmon_date": datetime.utcnow().isoformat(),
+            "conmon_date": datetime.now(timezone.utc).isoformat(),
             "frameworks_assessed": len(conmon_results),
             "results": conmon_results,
         }
@@ -623,7 +623,7 @@ class FedRAMPManager:
         — an auditor would reject any control that couldn't prove
         its own evidence.
         """
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         evidence_cutoff = now - timedelta(days=90)
 
         # Query recent evidence for this control, scoped to this tenant
@@ -766,7 +766,7 @@ class NISTManager:
         return {
             "control_id": control_id,
             "status": "no_automated_check",
-            "check_timestamp": datetime.utcnow().isoformat(),
+            "check_timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
     # ------------------------------------------------------------------
@@ -816,7 +816,7 @@ class NISTManager:
             "check_passed": len(findings) == 0,
             "findings": findings,
             "evidence": {"total_users": total, "inactive_users": inactive},
-            "check_timestamp": datetime.utcnow().isoformat(),
+            "check_timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
     async def _check_failed_login_attempts(self) -> Dict[str, Any]:
@@ -830,7 +830,7 @@ class NISTManager:
         findings: list[str] = []
         failed_logins_7d = 0
         if _AuditLog is not None:
-            cutoff = datetime.utcnow() - timedelta(days=7)
+            cutoff = datetime.now(timezone.utc) - timedelta(days=7)
             # AuditLog is typically scoped via users.organization_id through
             # the user_id FK. Scope by subquery to avoid leaking login
             # failures across tenants.
@@ -867,7 +867,7 @@ class NISTManager:
             "check_passed": len(findings) == 0,
             "findings": findings,
             "evidence": {"failed_logins_last_7d": failed_logins_7d},
-            "check_timestamp": datetime.utcnow().isoformat(),
+            "check_timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
     async def _check_audit_events(self) -> Dict[str, Any]:
@@ -882,7 +882,7 @@ class NISTManager:
         count_24h = 0
         if _AuditLog is not None:
             from src.models.user import User as _User
-            cutoff = datetime.utcnow() - timedelta(hours=24)
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
             try:
                 org_user_ids = select(_User.id).where(_User.organization_id == self.org_id)
                 q = await self.db.execute(
@@ -910,7 +910,7 @@ class NISTManager:
             "check_passed": len(findings) == 0,
             "findings": findings,
             "evidence": {"audit_events_last_24h": count_24h},
-            "check_timestamp": datetime.utcnow().isoformat(),
+            "check_timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
     async def _check_mfa(self) -> Dict[str, Any]:
@@ -960,7 +960,7 @@ class NISTManager:
                 "mfa_enrolled": mfa_enrolled,
                 "mfa_percentage": round((mfa_enrolled / active_total) * 100, 1) if active_total else 0.0,
             },
-            "check_timestamp": datetime.utcnow().isoformat(),
+            "check_timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
     async def _check_password_policy(self) -> Dict[str, Any]:
@@ -982,7 +982,7 @@ class NISTManager:
             "check_passed": len(findings) == 0,
             "findings": findings,
             "evidence": {"password_min_length": min_length},
-            "check_timestamp": datetime.utcnow().isoformat(),
+            "check_timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
     async def _check_vulnerability_scanning(self) -> Dict[str, Any]:
@@ -994,7 +994,7 @@ class NISTManager:
         open_vulns = 0
         try:
             from src.vulnmgmt.models import VulnScan, Vulnerability
-            cutoff = datetime.utcnow() - timedelta(days=30)
+            cutoff = datetime.now(timezone.utc) - timedelta(days=30)
             scans_q = await self.db.execute(
                 select(_func.count(VulnScan.id)).where(
                     and_(
@@ -1024,7 +1024,7 @@ class NISTManager:
             "check_passed": len(findings) == 0,
             "findings": findings,
             "evidence": {"scans_last_30d": scans_30d, "total_vulnerabilities": open_vulns},
-            "check_timestamp": datetime.utcnow().isoformat(),
+            "check_timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
     async def _check_boundary_protection(self) -> Dict[str, Any]:
@@ -1056,7 +1056,7 @@ class NISTManager:
             "check_passed": len(findings) == 0,
             "findings": findings,
             "evidence": {"zero_trust_policies": zt_policy_count},
-            "check_timestamp": datetime.utcnow().isoformat(),
+            "check_timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
     async def _check_data_encryption(self) -> Dict[str, Any]:
@@ -1082,7 +1082,7 @@ class NISTManager:
             "check_passed": len(findings) == 0,
             "findings": findings,
             "evidence": {"encryption_initialized": encryption_initialized},
-            "check_timestamp": datetime.utcnow().isoformat(),
+            "check_timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
     async def _check_patch_management(self) -> Dict[str, Any]:
@@ -1093,7 +1093,7 @@ class NISTManager:
         patches_30d = 0
         try:
             from src.vulnmgmt.models import PatchOperation
-            cutoff = datetime.utcnow() - timedelta(days=30)
+            cutoff = datetime.now(timezone.utc) - timedelta(days=30)
             q = await self.db.execute(
                 select(_func.count(PatchOperation.id)).where(
                     and_(
@@ -1118,7 +1118,7 @@ class NISTManager:
             "check_passed": len(findings) == 0,
             "findings": findings,
             "evidence": {"patches_last_30d": patches_30d},
-            "check_timestamp": datetime.utcnow().isoformat(),
+            "check_timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
     async def _check_system_monitoring(self) -> Dict[str, Any]:
@@ -1139,7 +1139,7 @@ class NISTManager:
                 )
             )
             active_rules = rules_q.scalar() or 0
-            cutoff = datetime.utcnow() - timedelta(hours=24)
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
             logs_q = await self.db.execute(
                 select(_func.count(LogEntry.id)).where(
                     and_(
@@ -1170,7 +1170,7 @@ class NISTManager:
                 "active_detection_rules": active_rules,
                 "log_entries_last_24h": logs_24h,
             },
-            "check_timestamp": datetime.utcnow().isoformat(),
+            "check_timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
 
@@ -1286,7 +1286,7 @@ class CMMCManager:
         """
         return {
             "target_level": level,
-            "assessment_date": datetime.utcnow().isoformat(),
+            "assessment_date": datetime.now(timezone.utc).isoformat(),
             "readiness_status": "in_progress",
         }
 

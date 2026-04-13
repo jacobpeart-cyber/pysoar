@@ -342,7 +342,7 @@ async def send_message(
         message_type=msg_data.message_type,
         attachments=msg_data.attachments,
         mentioned_users=msg_data.mentioned_users,
-        metadata=msg_data.metadata,
+        metadata=msg_data.extra_metadata,
     )
     await db.commit()
     return message
