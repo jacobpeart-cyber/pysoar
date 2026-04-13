@@ -584,8 +584,28 @@ class IOCMatcher:
 
         return list(set(matches))  # Remove duplicates
 
+    def _build_bloom_filter(self) -> None:
+        """Build a bloom filter from the current IOC cache for fast negative lookups"""
+        import hashlib
+        # Use a bit array approach: size = 2^17 = 131072 bits for reasonable false positive rate
+        filter_size = 131072
+        self.bloom_filter = bytearray(filter_size // 8)
+        num_hashes = 5
+
+        for ioc_type, type_cache in self.ioc_cache.items():
+            if isinstance(type_cache, dict):
+                for value in type_cache.keys():
+                    key = f"{ioc_type}:{value}"
+                    for i in range(num_hashes):
+                        h = int(hashlib.sha256(f"{key}:{i}".encode()).hexdigest(), 16) % filter_size
+                        self.bloom_filter[h // 8] |= (1 << (h % 8))
+
     def _check_bloom_filter(self, ioc_type: str, ioc_value: str) -> bool:
         """Check if IOC might exist in cache using bloom filter
+
+        Uses multiple hash functions to check bits in the filter. A negative
+        result definitively means the IOC is not in the cache. A positive
+        result means it might be (possible false positive).
 
         Args:
             ioc_type: Type of IOC
@@ -597,5 +617,14 @@ class IOCMatcher:
         if not self.bloom_filter:
             return True
 
-        # Placeholder bloom filter check
+        import hashlib
+        filter_size = len(self.bloom_filter) * 8
+        num_hashes = 5
+        key = f"{ioc_type}:{ioc_value}"
+
+        for i in range(num_hashes):
+            h = int(hashlib.sha256(f"{key}:{i}".encode()).hexdigest(), 16) % filter_size
+            if not (self.bloom_filter[h // 8] & (1 << (h % 8))):
+                return False
+
         return True

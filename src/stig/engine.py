@@ -1038,19 +1038,84 @@ class SCAPEngine:
         logger.info("Validating OVAL definitions")
 
         try:
-            # Simulated OVAL validation
             root = ET.fromstring(content)
-            tests = len(root.findall(".//test"))
-            objects = len(root.findall(".//object"))
-            states = len(root.findall(".//state"))
+
+            # Define OVAL namespace patterns for proper element searching
+            oval_ns = {
+                "oval": "http://oval.mitre.org/XMLSchema/oval-definitions-5",
+                "oval-def": "http://oval.mitre.org/XMLSchema/oval-definitions-5",
+                "ind-def": "http://oval.mitre.org/XMLSchema/oval-definitions-5#independent",
+                "win-def": "http://oval.mitre.org/XMLSchema/oval-definitions-5#windows",
+                "unix-def": "http://oval.mitre.org/XMLSchema/oval-definitions-5#unix",
+                "linux-def": "http://oval.mitre.org/XMLSchema/oval-definitions-5#linux",
+            }
+
+            errors = []
+            warnings = []
+
+            # Count elements with both namespaced and non-namespaced searches
+            tests = root.findall(".//{http://oval.mitre.org/XMLSchema/oval-definitions-5}test")
+            if not tests:
+                tests = root.findall(".//test")
+            objects = root.findall(".//{http://oval.mitre.org/XMLSchema/oval-definitions-5}object")
+            if not objects:
+                objects = root.findall(".//object")
+            states = root.findall(".//{http://oval.mitre.org/XMLSchema/oval-definitions-5}state")
+            if not states:
+                states = root.findall(".//state")
+            definitions = root.findall(".//{http://oval.mitre.org/XMLSchema/oval-definitions-5}definition")
+            if not definitions:
+                definitions = root.findall(".//definition")
+
+            # Validate that tests reference existing objects and states
+            test_count = len(tests)
+            object_count = len(objects)
+            state_count = len(states)
+            definition_count = len(definitions)
+
+            # Collect object and state IDs for cross-reference validation
+            object_ids = set()
+            for obj in objects:
+                obj_id = obj.get("id")
+                if obj_id:
+                    object_ids.add(obj_id)
+
+            state_ids = set()
+            for state in states:
+                state_id = state.get("id")
+                if state_id:
+                    state_ids.add(state_id)
+
+            # Validate test references
+            for test in tests:
+                test_id = test.get("id", "unknown")
+                # Check for object references in test
+                for child in test:
+                    obj_ref = child.get("object_ref")
+                    if obj_ref and obj_ref not in object_ids:
+                        errors.append(f"Test {test_id} references non-existent object {obj_ref}")
+                    state_ref = child.get("state_ref")
+                    if state_ref and state_ref not in state_ids:
+                        errors.append(f"Test {test_id} references non-existent state {state_ref}")
+
+            # Structural warnings
+            if test_count == 0:
+                warnings.append("No OVAL tests found in content")
+            if object_count == 0:
+                warnings.append("No OVAL objects found in content")
+            if definition_count == 0:
+                warnings.append("No OVAL definitions found in content")
+
+            is_valid = len(errors) == 0
 
             return {
-                "valid": True,
-                "tests_found": tests,
-                "objects_found": objects,
-                "states_found": states,
-                "errors": [],
-                "warnings": [],
+                "valid": is_valid,
+                "tests_found": test_count,
+                "objects_found": object_count,
+                "states_found": state_count,
+                "definitions_found": definition_count,
+                "errors": errors,
+                "warnings": warnings,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
 

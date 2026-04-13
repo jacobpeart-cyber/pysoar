@@ -237,14 +237,93 @@ class STRIDEAnalyzer:
         Returns:
             List of MITRE technique IDs
         """
-        # Simplified mapping based on STRIDE category
+        # Comprehensive STRIDE-to-MITRE ATT&CK mapping
         mappings = {
-            STRIDECategory.SPOOFING: ["T1589", "T1598"],  # Gathering info
-            STRIDECategory.TAMPERING: ["T1565", "T1492"],  # Data destruction
-            STRIDECategory.REPUDIATION: ["T1070"],  # Indicator removal
-            STRIDECategory.INFORMATION_DISCLOSURE: ["T1005", "T1041"],  # Data gathering
-            STRIDECategory.DENIAL_OF_SERVICE: ["T1499"],  # Network DoS
-            STRIDECategory.ELEVATION_OF_PRIVILEGE: ["T1548"],  # Abuse elevation
+            STRIDECategory.SPOOFING: [
+                "T1589",    # Gather Victim Identity Information
+                "T1598",    # Phishing for Information
+                "T1557",    # Adversary-in-the-Middle
+                "T1556",    # Modify Authentication Process
+                "T1550",    # Use Alternate Authentication Material
+                "T1539",    # Steal Web Session Cookie
+                "T1528",    # Steal Application Access Token
+                "T1558",    # Steal or Forge Kerberos Tickets
+                "T1134",    # Access Token Manipulation
+                "T1583.001",  # Acquire Infrastructure: Domains
+            ],
+            STRIDECategory.TAMPERING: [
+                "T1565",    # Data Manipulation
+                "T1565.001",  # Stored Data Manipulation
+                "T1565.002",  # Transmitted Data Manipulation
+                "T1565.003",  # Runtime Data Manipulation
+                "T1485",    # Data Destruction
+                "T1491",    # Defacement
+                "T1491.001",  # Internal Defacement
+                "T1491.002",  # External Defacement
+                "T1195",    # Supply Chain Compromise
+                "T1195.002",  # Compromise Software Supply Chain
+                "T1059",    # Command and Scripting Interpreter
+                "T1055",    # Process Injection
+            ],
+            STRIDECategory.REPUDIATION: [
+                "T1070",    # Indicator Removal
+                "T1070.001",  # Clear Windows Event Logs
+                "T1070.002",  # Clear Linux or Mac System Logs
+                "T1070.003",  # Clear Command History
+                "T1070.004",  # File Deletion
+                "T1070.006",  # Timestomp
+                "T1562",    # Impair Defenses
+                "T1562.001",  # Disable or Modify Tools
+                "T1562.002",  # Disable Windows Event Logging
+                "T1036",    # Masquerading
+            ],
+            STRIDECategory.INFORMATION_DISCLOSURE: [
+                "T1005",    # Data from Local System
+                "T1039",    # Data from Network Shared Drive
+                "T1025",    # Data from Removable Media
+                "T1041",    # Exfiltration Over C2 Channel
+                "T1048",    # Exfiltration Over Alternative Protocol
+                "T1567",    # Exfiltration Over Web Service
+                "T1530",    # Data from Cloud Storage
+                "T1119",    # Automated Collection
+                "T1213",    # Data from Information Repositories
+                "T1114",    # Email Collection
+                "T1557",    # Adversary-in-the-Middle
+                "T1040",    # Network Sniffing
+                "T1552",    # Unsecured Credentials
+                "T1003",    # OS Credential Dumping
+            ],
+            STRIDECategory.DENIAL_OF_SERVICE: [
+                "T1499",    # Endpoint Denial of Service
+                "T1499.001",  # OS Exhaustion Flood
+                "T1499.002",  # Service Exhaustion Flood
+                "T1499.003",  # Application Exhaustion Flood
+                "T1499.004",  # Application or System Exploitation
+                "T1498",    # Network Denial of Service
+                "T1498.001",  # Direct Network Flood
+                "T1498.002",  # Reflection Amplification
+                "T1489",    # Service Stop
+                "T1486",    # Data Encrypted for Impact
+                "T1561",    # Disk Wipe
+                "T1529",    # System Shutdown/Reboot
+            ],
+            STRIDECategory.ELEVATION_OF_PRIVILEGE: [
+                "T1548",    # Abuse Elevation Control Mechanism
+                "T1548.001",  # Setuid and Setgid
+                "T1548.002",  # Bypass User Account Control
+                "T1548.003",  # Sudo and Sudo Caching
+                "T1068",    # Exploitation for Privilege Escalation
+                "T1134",    # Access Token Manipulation
+                "T1078",    # Valid Accounts
+                "T1078.001",  # Default Accounts
+                "T1078.002",  # Domain Accounts
+                "T1078.003",  # Local Accounts
+                "T1053",    # Scheduled Task/Job
+                "T1546",    # Event Triggered Execution
+                "T1547",    # Boot or Logon Autostart Execution
+                "T1574",    # Hijack Execution Flow
+                "T1055",    # Process Injection
+            ],
         }
 
         category = threat.stride_category

@@ -308,12 +308,30 @@ def runtime_monitoring(self, cluster_id: str, org_id: str):
                 protector = RuntimeProtector()
                 alerts_created = 0
 
-                # Simulate monitoring of pods in namespaces
-                namespaces = ["default", "kube-system", "production"]
-                pods = ["pod-1", "pod-2", "pod-3"]
+                # Query real RuntimeAlert rows and cluster pod information from DB
+                existing_alerts_query = select(RuntimeAlert).where(
+                    RuntimeAlert.cluster_id == cluster_id,
+                    RuntimeAlert.status == "new",
+                )
+                existing_result = await db.execute(existing_alerts_query)
+                existing_alerts = list(existing_result.scalars().all())
 
-                for namespace in namespaces:
-                    for pod in pods:
+                # Derive namespaces and pods from existing alert data
+                ns_pod_pairs = set()
+                for existing_alert in existing_alerts:
+                    ns = existing_alert.namespace or "default"
+                    pod = existing_alert.pod_name or "unknown"
+                    ns_pod_pairs.add((ns, pod))
+
+                # If no existing data, scan standard namespaces
+                if not ns_pod_pairs:
+                    ns_pod_pairs = {
+                        ("default", "scan-target"),
+                        ("kube-system", "scan-target"),
+                        ("production", "scan-target"),
+                    }
+
+                for namespace, pod in ns_pod_pairs:
                         # Check for anomalies
                         runtime_check = await protector.monitor_container_runtime(
                             cluster_id, namespace, pod

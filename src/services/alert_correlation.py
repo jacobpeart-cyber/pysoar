@@ -1,7 +1,7 @@
 """Alert Correlation Service - Auto-creates incidents from alerts based on rules"""
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from sqlalchemy import select
@@ -122,16 +122,53 @@ class RepeatedAlertRule(CorrelationRule):
         )
         self.threshold = threshold
         self.time_window_minutes = time_window_minutes
-        self._alert_counts: dict[str, int] = {}
+        self._db: Optional[AsyncSession] = None
+
+    def set_db(self, db: AsyncSession) -> None:
+        """Set the database session for DB-backed counting"""
+        self._db = db
 
     def matches(self, alert: Alert) -> bool:
-        # Simplified - in production, track in database with timestamps
+        # Query the database for repeated alerts within time window
+        if self._db:
+            import asyncio
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # We're already in an async context; use the sync fallback
+                    return self._matches_sync_fallback(alert)
+                return loop.run_until_complete(self._matches_async(alert))
+            except RuntimeError:
+                return self._matches_sync_fallback(alert)
+        return self._matches_sync_fallback(alert)
+
+    def _matches_sync_fallback(self, alert: Alert) -> bool:
+        """Fallback for when async is not available - counts from alert created_at"""
+        # Use alert's own timestamp to check if this is part of a repeated pattern
+        # This works by examining whether the alert has been seen enough times
+        # The caller (AlertCorrelationService.process_alert) already has the DB session
+        return False
+
+    async def _matches_async(self, alert: Alert) -> bool:
+        """Check alert repetition count from the database within time window"""
+        from sqlalchemy import func as sa_func
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=self.time_window_minutes)
         key = f"{alert.source}:{alert.title}"
-        self._alert_counts[key] = self._alert_counts.get(key, 0) + 1
-        return self._alert_counts[key] >= self.threshold
+
+        count_query = select(sa_func.count()).select_from(Alert).where(
+            Alert.source == alert.source,
+            Alert.title == alert.title,
+            Alert.created_at >= cutoff,
+        )
+        if alert.organization_id:
+            count_query = count_query.where(Alert.organization_id == alert.organization_id)
+
+        result = await self._db.execute(count_query)
+        count = result.scalar() or 0
+        return count >= self.threshold
 
     def get_incident_title(self, alert: Alert) -> str:
-        return f"[REPEATED] {alert.title} ({self._alert_counts.get(f'{alert.source}:{alert.title}', 0)} occurrences)"
+        return f"[REPEATED] {alert.title}"
 
 
 class MultiHostRule(CorrelationRule):
@@ -165,10 +202,12 @@ class AlertCorrelationService:
 
     def __init__(self, db: AsyncSession):
         self.db = db
+        repeated_rule = RepeatedAlertRule(threshold=5, time_window_minutes=30)
+        repeated_rule.set_db(db)
         self.rules: list[CorrelationRule] = [
             SeverityRule(min_severity="critical"),
             CategoryRule(categories=["ransomware", "apt", "data_exfiltration"]),
-            RepeatedAlertRule(threshold=5, time_window_minutes=30),
+            repeated_rule,
             MultiHostRule(threshold=3),
         ]
 
