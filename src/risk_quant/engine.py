@@ -645,7 +645,7 @@ class ControlEffectivenessAnalyzer:
         self, baseline_ale: float, controls: list[dict]
     ) -> dict:
         """
-        Simulate impact of implementing multiple controls (what-if analysis).
+        What-if analysis: compute the impact of implementing multiple controls.
 
         Args:
             baseline_ale: Baseline ALE without any controls

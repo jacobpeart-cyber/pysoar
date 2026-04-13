@@ -195,7 +195,52 @@ async def test_integration(
             detail=f"Integration {integration_name} is not configured"
         )
 
-    return {"message": f"Successfully connected to {integration_name}", "status": "healthy"}
+    import httpx
+
+    test_endpoints = {
+        "virustotal": ("https://www.virustotal.com/api/v3/urls", {"x-apikey": app_settings.virustotal_api_key}),
+        "abuseipdb": ("https://api.abuseipdb.com/api/v2/check?ipAddress=8.8.8.8&maxAgeInDays=1", {"Key": app_settings.abuseipdb_api_key, "Accept": "application/json"}),
+        "shodan": (f"https://api.shodan.io/api-info?key={app_settings.shodan_api_key}", {}),
+        "greynoise": ("https://api.greynoise.io/v3/community/8.8.8.8", {"key": app_settings.greynoise_api_key}),
+        "elasticsearch": (app_settings.elasticsearch_url or "", {}),
+        "splunk": (f"https://{app_settings.splunk_host}:8089/services/server/info", {}),
+    }
+
+    url, headers = test_endpoints.get(integration_name, ("", {}))
+    if not url:
+        raise HTTPException(status_code=400, detail=f"No test endpoint for {integration_name}")
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0, verify=False) as client:
+            resp = await client.get(url, headers=headers)
+            if resp.status_code < 400:
+                return {
+                    "message": f"Successfully connected to {integration_name}",
+                    "status": "healthy",
+                    "http_status": resp.status_code,
+                }
+            else:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"{integration_name} returned HTTP {resp.status_code}: {resp.text[:200]}",
+                )
+    except httpx.TimeoutException:
+        raise HTTPException(
+            status_code=504,
+            detail=f"Connection to {integration_name} timed out after 10 seconds",
+        )
+    except httpx.ConnectError as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Cannot reach {integration_name}: {str(e)[:200]}",
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Integration test failed: {str(e)[:200]}",
+        )
 
 
 def _mask_secret(value: str | None) -> str | None:
