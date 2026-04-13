@@ -850,18 +850,50 @@ class FeedManager:
     ) -> Optional[ThreatIndicator]:
         """Check for existing indicator or create new one
 
+        Queries the database for an existing indicator with the same type and
+        value. If found, updates its last_seen timestamp. If not found, creates
+        a new ThreatIndicator record.
+
         Args:
             indicator_type: Type of indicator
             value: Indicator value
             feed_id: Source feed ID
 
         Returns:
-            ThreatIndicator instance (existing or new)
+            ThreatIndicator instance if new, None if already exists
         """
-        # This would query the database for existing indicator
-        # and either return it or create a new one
-        # Placeholder implementation
-        return None
+        from src.core.database import async_session_factory
+        from sqlalchemy import select
+
+        async with async_session_factory() as db:
+            # Check if indicator already exists
+            query = select(ThreatIndicator).where(
+                ThreatIndicator.indicator_type == indicator_type,
+                ThreatIndicator.value == value,
+            )
+            result = await db.execute(query)
+            existing = result.scalar_one_or_none()
+
+            if existing:
+                # Update last_seen on existing indicator
+                existing.last_seen = datetime.now(timezone.utc)
+                await db.commit()
+                return None  # Not new, return None
+
+            # Create new indicator
+            new_indicator = ThreatIndicator(
+                indicator_type=indicator_type,
+                value=value,
+                feed_id=feed_id,
+                source=f"feed:{feed_id}",
+                is_active=True,
+                first_seen=datetime.now(timezone.utc),
+                last_seen=datetime.now(timezone.utc),
+            )
+            db.add(new_indicator)
+            await db.commit()
+            await db.refresh(new_indicator)
+            return new_indicator
 
     async def enable_feed(self, feed_id: str) -> bool:
         """Enable a threat feed"""

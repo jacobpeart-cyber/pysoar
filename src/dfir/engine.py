@@ -1001,18 +1001,127 @@ class ArtifactAnalyzer:
                 "confidence_score": 0.0,
             }
 
-            # Simplified MITRE mapping based on artifact type
+            # Comprehensive MITRE ATT&CK mapping based on artifact type and evidence content
             artifact_mitre_map = {
-                "process": ["TA0002", "TA0003"],  # Execution, Persistence
-                "network_connection": ["TA0007", "TA0011"],  # Command & Control, Exfiltration
-                "file_system": ["TA0001"],  # Initial Access
-                "browser_history": ["TA0009"],  # Collection
-                "registry": ["TA0007", "TA0005"],  # Command & Control, Defense Evasion
+                "process": {
+                    "tactics": ["TA0002", "TA0003", "TA0005"],  # Execution, Persistence, Defense Evasion
+                    "techniques": {
+                        "powershell": ["T1059.001"],
+                        "cmd": ["T1059.003"],
+                        "wscript": ["T1059.005"],
+                        "cscript": ["T1059.005"],
+                        "rundll32": ["T1218.011"],
+                        "regsvr32": ["T1218.010"],
+                        "mshta": ["T1218.005"],
+                        "schtasks": ["T1053.005"],
+                        "at.exe": ["T1053.002"],
+                        "sc.exe": ["T1543.003"],
+                        "net.exe": ["T1087.001", "T1087.002"],
+                        "mimikatz": ["T1003.001"],
+                        "lsass": ["T1003.001"],
+                        "psexec": ["T1569.002", "T1021.002"],
+                        "wmic": ["T1047"],
+                        "certutil": ["T1140", "T1105"],
+                        "bitsadmin": ["T1197", "T1105"],
+                    },
+                },
+                "network_connection": {
+                    "tactics": ["TA0011", "TA0010", "TA0007"],  # C2, Exfiltration, Discovery
+                    "techniques": {
+                        "dns": ["T1071.004"],
+                        "http": ["T1071.001"],
+                        "https": ["T1071.001"],
+                        "smb": ["T1021.002"],
+                        "rdp": ["T1021.001"],
+                        "ssh": ["T1021.004"],
+                        "ftp": ["T1071.002"],
+                        "icmp": ["T1095"],
+                        "tor": ["T1090.003"],
+                        "vpn": ["T1090"],
+                    },
+                },
+                "file_system": {
+                    "tactics": ["TA0001", "TA0003", "TA0005", "TA0009"],  # Initial Access, Persistence, Defense Evasion, Collection
+                    "techniques": {
+                        "startup": ["T1547.001"],
+                        "temp": ["T1074.001"],
+                        "exe": ["T1204.002"],
+                        "dll": ["T1574.001"],
+                        "bat": ["T1059.003"],
+                        "ps1": ["T1059.001"],
+                        "doc": ["T1566.001"],
+                        "xls": ["T1566.001"],
+                        "pdf": ["T1566.001"],
+                        "zip": ["T1566.001"],
+                        "encrypted": ["T1027"],
+                        "hidden": ["T1564.001"],
+                    },
+                },
+                "browser_history": {
+                    "tactics": ["TA0009", "TA0001", "TA0042"],  # Collection, Initial Access, Resource Development
+                    "techniques": {
+                        "download": ["T1105"],
+                        "phish": ["T1566.002"],
+                        "drive-by": ["T1189"],
+                        "oauth": ["T1550.001"],
+                        "credential": ["T1539"],
+                        "webmail": ["T1114.003"],
+                    },
+                },
+                "registry": {
+                    "tactics": ["TA0003", "TA0005", "TA0004"],  # Persistence, Defense Evasion, Privilege Escalation
+                    "techniques": {
+                        "run": ["T1547.001"],
+                        "runonce": ["T1547.001"],
+                        "services": ["T1543.003"],
+                        "userinit": ["T1037.001"],
+                        "appinit": ["T1546.010"],
+                        "winlogon": ["T1547.004"],
+                        "image_file_execution": ["T1546.012"],
+                        "security": ["T1562.001"],
+                        "firewall": ["T1562.004"],
+                    },
+                },
+                "memory_dump": {
+                    "tactics": ["TA0006", "TA0004"],  # Credential Access, Privilege Escalation
+                    "techniques": {
+                        "lsass": ["T1003.001"],
+                        "sam": ["T1003.002"],
+                        "ntds": ["T1003.003"],
+                        "credential": ["T1003"],
+                    },
+                },
+                "email": {
+                    "tactics": ["TA0001", "TA0009"],  # Initial Access, Collection
+                    "techniques": {
+                        "attachment": ["T1566.001"],
+                        "link": ["T1566.002"],
+                        "forwarding": ["T1114.003"],
+                    },
+                },
             }
 
+            artifact_data_str = json.dumps(artifact_data, default=str).lower() if artifact_data else ""
+
             if artifact_type in artifact_mitre_map:
-                mappings["tactics"] = artifact_mitre_map[artifact_type]
-                mappings["confidence_score"] = 0.75
+                type_mapping = artifact_mitre_map[artifact_type]
+                mappings["tactics"] = type_mapping["tactics"]
+
+                # Match specific techniques based on artifact content evidence
+                matched_techniques = []
+                for keyword, techniques in type_mapping.get("techniques", {}).items():
+                    if keyword in artifact_data_str:
+                        matched_techniques.extend(techniques)
+
+                mappings["techniques"] = list(set(matched_techniques))
+                # Higher confidence if we matched specific techniques
+                if matched_techniques:
+                    mappings["confidence_score"] = 0.85
+                else:
+                    mappings["confidence_score"] = 0.60
+            else:
+                # Unknown artifact type - lower confidence general mapping
+                mappings["confidence_score"] = 0.30
 
             return {
                 "status": "success",

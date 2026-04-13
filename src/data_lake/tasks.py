@@ -52,10 +52,51 @@ def scheduled_ingestion(
 
         ingestion_engine = DataIngestionEngine()
 
-        # Simulate ingestion metrics
-        metrics = ingestion_engine.calculate_ingestion_metrics(
-            source_id, time_window_seconds=3600
-        )
+        # Query real DataSource and compute ingestion metrics from DB
+        import asyncio
+        from src.core.database import async_session_factory
+        from src.data_lake.models import DataSource, DataPartition
+        from sqlalchemy import select, func
+
+        async def _get_real_metrics():
+            async with async_session_factory() as db:
+                # Get the data source
+                source_query = select(DataSource).where(DataSource.id == source_id)
+                result = await db.execute(source_query)
+                source = result.scalar_one_or_none()
+
+                if not source:
+                    return {
+                        "total_events": 0,
+                        "events_per_second": 0,
+                        "success_rate": 0.0,
+                        "error": "data_source_not_found",
+                    }
+
+                # Count partitions and compute metrics
+                partition_query = select(
+                    func.count(DataPartition.id),
+                    func.sum(DataPartition.record_count),
+                    func.sum(DataPartition.size_bytes),
+                ).where(DataPartition.source_id == source_id)
+                part_result = await db.execute(partition_query)
+                part_row = part_result.one()
+
+                partition_count = part_row[0] or 0
+                total_records = int(part_row[1] or 0)
+                total_bytes = int(part_row[2] or 0)
+
+                return {
+                    "total_events": total_records,
+                    "events_per_second": total_records / 3600 if total_records > 0 else 0,
+                    "success_rate": 100.0 if partition_count > 0 else 0.0,
+                    "partition_count": partition_count,
+                    "total_bytes": total_bytes,
+                    "source_name": source.name,
+                    "source_type": source.source_type,
+                }
+
+        metrics = asyncio.run(_get_real_metrics())
 
         logger.info(
             f"Ingestion completed: {metrics.get('total_events'):,} events at "
@@ -277,14 +318,69 @@ def data_quality_check(
 
         catalog = DataCatalog()
 
-        # Simulate data quality check
-        sample_records = [
-            {"field1": "value1", "field2": 123, "field3": datetime.now(timezone.utc).isoformat()},
-            {"field1": "value2", "field2": 456, "field3": datetime.now(timezone.utc).isoformat()},
-            {"field1": "value3", "field2": 789, "field3": datetime.now(timezone.utc).isoformat()},
-        ]
+        # Query real DataPartition rows for quality assessment
+        import asyncio
+        from src.core.database import async_session_factory
+        from src.data_lake.models import DataPartition
+        from sqlalchemy import select, func
 
-        quality_report = catalog.validate_data_quality(dataset_id, sample_records)
+        async def _check_quality():
+            async with async_session_factory() as db:
+                # Get partitions for this dataset
+                partition_query = select(DataPartition).where(
+                    DataPartition.source_id == dataset_id,
+                ).order_by(DataPartition.created_at.desc()).limit(100)
+                result = await db.execute(partition_query)
+                partitions = list(result.scalars().all())
+
+                if not partitions:
+                    return {"quality_score": 0, "error": "no_partitions_found", "checks": {}}
+
+                total_partitions = len(partitions)
+                valid_partitions = 0
+                total_records = 0
+                null_count = 0
+                size_anomalies = 0
+
+                sizes = []
+                for p in partitions:
+                    record_count = p.record_count or 0
+                    size_bytes = p.size_bytes or 0
+                    total_records += record_count
+                    sizes.append(size_bytes)
+
+                    # Check for empty partitions
+                    if record_count > 0 and size_bytes > 0:
+                        valid_partitions += 1
+                    else:
+                        null_count += 1
+
+                # Check for size anomalies (partitions significantly different from mean)
+                if sizes:
+                    avg_size = sum(sizes) / len(sizes)
+                    if avg_size > 0:
+                        for s in sizes:
+                            if s > avg_size * 3 or (s < avg_size * 0.1 and s > 0):
+                                size_anomalies += 1
+
+                completeness = (valid_partitions / total_partitions * 100) if total_partitions > 0 else 0
+                consistency = ((total_partitions - size_anomalies) / total_partitions * 100) if total_partitions > 0 else 0
+                quality_score = (completeness * 0.6 + consistency * 0.4)
+
+                return {
+                    "quality_score": round(quality_score, 2),
+                    "checks": {
+                        "completeness": round(completeness, 2),
+                        "consistency": round(consistency, 2),
+                        "total_partitions": total_partitions,
+                        "valid_partitions": valid_partitions,
+                        "empty_partitions": null_count,
+                        "size_anomalies": size_anomalies,
+                        "total_records": total_records,
+                    },
+                }
+
+        quality_report = asyncio.run(_check_quality())
 
         quality_score = quality_report.get("quality_score", 0)
         status = "passed" if quality_score >= quality_threshold else "failed"

@@ -19,6 +19,7 @@ from src.integrations.models import (
     IntegrationConnector,
     IntegrationExecution,
     InstalledIntegration,
+    IntegrationStatus,
     WebhookEndpoint,
 )
 
@@ -596,8 +597,26 @@ class IntegrationManager:
         config: dict[str, Any],
         credentials: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        """Update configuration of installed integration"""
-        # Simulate configuration update
+        """Update configuration of installed integration by persisting to DB"""
+        from src.core.database import async_session_factory
+        from sqlalchemy import select, update
+
+        async with async_session_factory() as db:
+            query = select(InstalledIntegration).where(InstalledIntegration.id == installation_id)
+            result = await db.execute(query)
+            integration = result.scalar_one_or_none()
+
+            if not integration:
+                return {"status": "error", "installation_id": installation_id, "error": "not_found"}
+
+            integration.config_encrypted = json.dumps(config)
+            if credentials:
+                from src.core.security import get_password_hash
+                integration.auth_credentials_encrypted = get_password_hash(json.dumps(credentials))
+
+            integration.status = IntegrationStatus.ACTIVE.value
+            await db.commit()
+
         logger.info(f"Configured integration {installation_id}")
 
         return {
@@ -609,10 +628,46 @@ class IntegrationManager:
         self,
         installation_id: str,
     ) -> dict[str, Any]:
-        """Test health of installed integration"""
-        # Simulate health check
-        health_status = "healthy"
+        """Test health of installed integration by verifying DB record and configuration"""
+        from src.core.database import async_session_factory
+        from sqlalchemy import select
+
+        health_status = HealthStatus.UNKNOWN.value
         error_message = None
+
+        try:
+            async with async_session_factory() as db:
+                query = select(InstalledIntegration).where(InstalledIntegration.id == installation_id)
+                result = await db.execute(query)
+                integration = result.scalar_one_or_none()
+
+                if not integration:
+                    health_status = HealthStatus.UNHEALTHY.value
+                    error_message = "Integration not found in database"
+                elif integration.status == IntegrationStatus.ERROR.value:
+                    health_status = HealthStatus.UNHEALTHY.value
+                    error_message = "Integration is in error state"
+                elif not integration.config_encrypted:
+                    health_status = HealthStatus.DEGRADED.value
+                    error_message = "Integration has no configuration"
+                else:
+                    # Verify the config is valid JSON
+                    try:
+                        json.loads(integration.config_encrypted)
+                        health_status = HealthStatus.HEALTHY.value
+                    except (json.JSONDecodeError, TypeError):
+                        health_status = HealthStatus.DEGRADED.value
+                        error_message = "Integration configuration is invalid"
+
+                # Update health status in DB
+                if integration:
+                    integration.health_status = health_status
+                    integration.last_health_check = datetime.now(timezone.utc).isoformat()
+                    await db.commit()
+
+        except Exception as e:
+            health_status = HealthStatus.UNHEALTHY.value
+            error_message = f"Health check failed: {str(e)}"
 
         logger.info(f"Health check for {installation_id}: {health_status}")
 
@@ -672,14 +727,31 @@ class IntegrationManager:
         self,
         installation_id: str,
     ) -> dict[str, Any]:
-        """Get detailed status of integration"""
-        # Simulate status retrieval
-        return {
-            "installation_id": installation_id,
-            "status": "active",
-            "health": "healthy",
-            "last_check": datetime.now(timezone.utc).isoformat(),
-        }
+        """Get detailed status of integration from DB"""
+        from src.core.database import async_session_factory
+        from sqlalchemy import select
+
+        async with async_session_factory() as db:
+            query = select(InstalledIntegration).where(InstalledIntegration.id == installation_id)
+            result = await db.execute(query)
+            integration = result.scalar_one_or_none()
+
+            if not integration:
+                return {
+                    "installation_id": installation_id,
+                    "status": "not_found",
+                    "health": HealthStatus.UNKNOWN.value,
+                    "last_check": None,
+                }
+
+            return {
+                "installation_id": installation_id,
+                "status": integration.status,
+                "health": integration.health_status,
+                "display_name": integration.display_name,
+                "connector_id": integration.connector_id,
+                "last_check": integration.last_health_check,
+            }
 
 
 class ActionExecutor:

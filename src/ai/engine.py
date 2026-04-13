@@ -1378,22 +1378,65 @@ class ThreatPredictor:
         """
         self.logger.info(f"Predicting exfiltration risk for user")
 
-        # Simulate risk calculation
         risk_factors = []
+        weights = []
 
-        # Unusual access patterns
+        # Volume-based risk: data accessed relative to baseline
+        gb_accessed = data_access.get("gb_accessed_today", 0)
+        baseline_gb = user_behavior.get("avg_daily_gb", 1.0) or 1.0
+        if baseline_gb > 0 and gb_accessed > 0:
+            volume_ratio = gb_accessed / baseline_gb
+            volume_risk = min(1.0, (volume_ratio - 1.0) / 5.0) if volume_ratio > 1.0 else 0.0
+            risk_factors.append(volume_risk)
+            weights.append(0.25)
+
+        # After-hours access pattern
         if data_access.get("after_hours_access"):
-            risk_factors.append(0.3)
+            risk_factors.append(0.8)
+            weights.append(0.15)
 
-        # High data access volume
-        if data_access.get("gb_accessed_today", 0) > 10:
-            risk_factors.append(0.25)
+        # High data access volume (absolute threshold)
+        if gb_accessed > 10:
+            risk_factors.append(min(1.0, gb_accessed / 50.0))
+            weights.append(0.2)
 
-        # New data access
-        if data_access.get("days_since_first_access", 999) < 7:
-            risk_factors.append(0.2)
+        # New data access (new user accessing sensitive data)
+        days_since_first = data_access.get("days_since_first_access", 999)
+        if days_since_first < 30:
+            recency_risk = max(0.0, 1.0 - (days_since_first / 30.0))
+            risk_factors.append(recency_risk)
+            weights.append(0.15)
 
-        risk_score = min(1.0, sum(risk_factors) / max(1, len(risk_factors)))
+        # Behavioral anomalies from user_behavior
+        anomaly_score = user_behavior.get("anomaly_score", 0.0)
+        if anomaly_score > 0:
+            risk_factors.append(min(1.0, anomaly_score))
+            weights.append(0.15)
+
+        # Sensitive data access
+        sensitive_files = data_access.get("sensitive_files_accessed", 0)
+        if sensitive_files > 0:
+            risk_factors.append(min(1.0, sensitive_files / 20.0))
+            weights.append(0.2)
+
+        # USB/external transfer activity
+        if data_access.get("external_transfer") or data_access.get("usb_activity"):
+            risk_factors.append(0.9)
+            weights.append(0.2)
+
+        # Failed access attempts (probing behavior)
+        failed_attempts = data_access.get("failed_access_attempts", 0)
+        if failed_attempts > 0:
+            risk_factors.append(min(1.0, failed_attempts / 10.0))
+            weights.append(0.1)
+
+        # Compute weighted risk score
+        if not risk_factors:
+            risk_score = 0.0
+        else:
+            total_weight = sum(weights)
+            risk_score = sum(f * w for f, w in zip(risk_factors, weights)) / total_weight if total_weight > 0 else 0.0
+            risk_score = min(1.0, risk_score)
         self.logger.info(f"Calculated exfiltration risk: {risk_score:.2f}")
 
         return risk_score
