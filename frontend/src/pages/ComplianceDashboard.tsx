@@ -80,6 +80,12 @@ interface CISADirective {
   actions_taken: string[];
 }
 
+const getScoreColor = (score: number) => {
+  if (score >= 80) return 'text-green-600 dark:text-green-400';
+  if (score >= 60) return 'text-yellow-600 dark:text-yellow-400';
+  return 'text-red-600 dark:text-red-400';
+};
+
 export default function ComplianceDashboard() {
   const [activeTab, setActiveTab] = useState<TabType>('overview');
   const [expandedControl, setExpandedControl] = useState<string | null>(null);
@@ -173,12 +179,6 @@ export default function ComplianceDashboard() {
       queryClient.invalidateQueries({ queryKey: ['compliance-poams'] });
     },
   });
-
-  const getScoreColor = (score: number) => {
-    if (score >= 80) return 'text-green-600 dark:text-green-400';
-    if (score >= 60) return 'text-yellow-600 dark:text-yellow-400';
-    return 'text-red-600 dark:text-red-400';
-  };
 
   const getStatusBadgeColor = (status: string) => {
     const colors: Record<string, string> = {
