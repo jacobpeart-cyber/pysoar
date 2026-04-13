@@ -9,7 +9,6 @@ import Alerts from './pages/Alerts'
 import AlertDetail from './pages/AlertDetail'
 import Incidents from './pages/Incidents'
 import IncidentDetail from './pages/IncidentDetail'
-import IOCs from './pages/IOCs'
 import Users from './pages/Users'
 import Playbooks from './pages/Playbooks'
 import Assets from './pages/Assets'
@@ -24,7 +23,6 @@ import ThreatIntel from './pages/ThreatIntel'
 import SIEMDashboard from './pages/SIEMDashboard'
 import ThreatHunting from './pages/ThreatHunting'
 import ExposureManagement from './pages/ExposureManagement'
-import AIEngine from './pages/AIEngine'
 import UEBADashboard from './pages/UEBADashboard'
 import AttackSimulation from './pages/AttackSimulation'
 import DeceptionTech from './pages/DeceptionTech'
@@ -53,6 +51,9 @@ import WarRoom from './pages/WarRoom'
 import PhishingSimulation from './pages/PhishingSimulation'
 import TicketHub from './pages/TicketHub'
 import FedRAMP from './pages/FedRAMP'
+import AgentManagement from './pages/AgentManagement'
+import LiveResponse from './pages/LiveResponse'
+import PurpleTeam from './pages/PurpleTeam'
 import NotFound from './pages/NotFound'
 
 import React from 'react'
@@ -151,7 +152,7 @@ function AppRoutes() {
         <Route path="alerts/:id" element={<AlertDetail />} />
         <Route path="incidents" element={<Incidents />} />
         <Route path="incidents/:id" element={<IncidentDetail />} />
-        <Route path="iocs" element={<IOCs />} />
+        <Route path="iocs" element={<Navigate to="/threat-intel" replace />} />
         <Route path="playbooks" element={<Playbooks />} />
         <Route path="assets" element={<Assets />} />
         <Route path="users" element={<Users />} />
@@ -166,7 +167,6 @@ function AppRoutes() {
         <Route path="siem" element={<SIEMDashboard />} />
         <Route path="hunting" element={<ThreatHunting />} />
         <Route path="exposure" element={<ExposureManagement />} />
-        <Route path="ai" element={<AIEngine />} />
         <Route path="ueba" element={<UEBADashboard />} />
         <Route path="simulation" element={<AttackSimulation />} />
         <Route path="deception" element={<DeceptionTech />} />
@@ -195,6 +195,9 @@ function AppRoutes() {
         <Route path="phishing" element={<PhishingSimulation />} />
         <Route path="ticket-hub" element={<TicketHub />} />
         <Route path="fedramp" element={<FedRAMP />} />
+        <Route path="agents" element={<AgentManagement />} />
+        <Route path="live-response" element={<LiveResponse />} />
+        <Route path="purple-team" element={<PurpleTeam />} />
       </Route>
       <Route path="*" element={<NotFound />} />
     </Routes>

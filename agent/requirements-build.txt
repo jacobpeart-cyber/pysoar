@@ -1,0 +1,5 @@
+# Build-time dependencies for bundling pysoar_agent into a single-file
+# binary. These are NOT runtime deps — the agent itself has zero third-
+# party requirements (stdlib only). Install these on a builder machine
+# that matches the target OS/arch (PyInstaller is not a cross-compiler).
+pyinstaller>=6.4.0

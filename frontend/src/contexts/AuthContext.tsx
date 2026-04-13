@@ -8,6 +8,7 @@ interface User {
   role: string;
   is_active: boolean;
   is_superuser: boolean;
+  organization_id: string | null;
 }
 
 interface AuthContextType {

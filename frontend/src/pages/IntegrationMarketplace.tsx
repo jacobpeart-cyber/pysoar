@@ -6,19 +6,15 @@ import {
   CheckCircle,
   Settings,
   Plus,
-  Edit,
   Eye,
   Trash2,
   Search,
-  Filter,
   Star,
-  AlertCircle,
-  TrendingUp,
-  Clock,
 } from 'lucide-react';
 import clsx from 'clsx';
 import { api } from '../lib/api';
 import { integrationsApi } from '../api/endpoints';
+import DetailDrawer, { DetailSection } from '../components/DetailDrawer';
 
 const getHealthColor = (health: string | null) => {
   switch (health) {
@@ -59,6 +55,7 @@ export default function IntegrationMarketplace() {
   const [categoryFilter, setCategoryFilter] = useState('all');
   const [showNewWebhookModal, setShowNewWebhookModal] = useState(false);
   const [selectedConnector, setSelectedConnector] = useState<any>(null);
+  const [detailExec, setDetailExec] = useState<any | null>(null);
 
   const loadData = async () => {
     setLoading(true);
@@ -324,7 +321,11 @@ export default function IntegrationMarketplace() {
                           <td className="px-6 py-4 text-sm">{exec.recordsProcessed.toLocaleString()}</td>
                           <td className="px-6 py-4 text-sm">{exec.duration}s</td>
                           <td className="px-6 py-4 text-sm">
-                            <button className="text-blue-600 dark:text-blue-400 hover:underline">
+                            <button
+                              onClick={() => setDetailExec(exec)}
+                              className="text-blue-600 dark:text-blue-400 hover:underline"
+                              title="View execution details"
+                            >
                               <Eye className="w-4 h-4" />
                             </button>
                           </td>
@@ -370,13 +371,47 @@ export default function IntegrationMarketplace() {
                         </div>
                       </div>
                       <div className="flex gap-2">
-                        <button className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                        <button
+                          onClick={async () => {
+                            const integrationId = (webhook as any).installation_id;
+                            if (!integrationId) {
+                              console.error('Webhook missing installation_id — cannot fire test.');
+                              return;
+                            }
+                            try {
+                              const res = await api.post(
+                                `/integrations/installed/${integrationId}/webhooks/${webhook.id}/test`
+                              );
+                              setDetailExec(res.data);
+                              loadData();
+                            } catch (err) {
+                              console.error('Webhook test failed:', err);
+                            }
+                          }}
+                          className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                          title="Fire a synthetic test event through the webhook pipeline"
+                        >
                           Test
                         </button>
-                        <button className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
-                          Edit
-                        </button>
-                        <button className="px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+                        <button
+                          onClick={async () => {
+                            if (!window.confirm(`Delete webhook ${webhook.name}?`)) return;
+                            const integrationId = (webhook as any).installation_id;
+                            if (!integrationId) {
+                              console.error('Webhook missing installation_id — cannot delete');
+                              return;
+                            }
+                            try {
+                              await api.delete(
+                                `/integrations/installed/${integrationId}/webhooks/${webhook.id}`
+                              );
+                              loadData();
+                            } catch (err) {
+                              console.error('Webhook delete failed:', err);
+                            }
+                          }}
+                          className="px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                        >
                           <Trash2 className="w-4 h-4" />
                         </button>
                       </div>
@@ -435,6 +470,39 @@ export default function IntegrationMarketplace() {
           </div>
         </div>
       )}
+
+      {/* Execution detail drawer */}
+      <DetailDrawer
+        open={!!detailExec}
+        onClose={() => setDetailExec(null)}
+        title={`Execution · ${detailExec?.integrationName || detailExec?.integration_name || 'Integration'}`}
+        subtitle={detailExec ? `${detailExec.status || 'unknown'} · ${detailExec.recordsProcessed ?? 0} records` : undefined}
+        sections={
+          detailExec
+            ? ([
+                {
+                  title: 'Execution',
+                  fields: [
+                    { label: 'Execution ID', value: detailExec.id, mono: true, full: true },
+                    { label: 'Integration', value: detailExec.integrationName || detailExec.integration_name },
+                    { label: 'Status', value: detailExec.status },
+                    { label: 'Records Processed', value: detailExec.recordsProcessed ?? detailExec.records_processed ?? 0 },
+                    { label: 'Duration', value: detailExec.duration != null ? `${detailExec.duration}s` : null },
+                    { label: 'Started', value: detailExec.startedAt || detailExec.started_at ? new Date(detailExec.startedAt || detailExec.started_at).toLocaleString() : null },
+                    { label: 'Completed', value: detailExec.completedAt || detailExec.completed_at ? new Date(detailExec.completedAt || detailExec.completed_at).toLocaleString() : null },
+                  ],
+                },
+                {
+                  title: 'Result',
+                  fields: [
+                    { label: 'Error', value: detailExec.error || detailExec.error_message, full: true, mono: true },
+                    { label: 'Summary', value: detailExec.summary, full: true },
+                  ],
+                },
+              ] as DetailSection[])
+            : undefined
+        }
+      />
     </div>
   );
 }

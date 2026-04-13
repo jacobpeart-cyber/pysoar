@@ -6,6 +6,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect
 from jose import JWTError, jwt
 
+from src.api.deps import CurrentUser
 from src.core.config import settings
 from src.core.logging import get_logger
 from src.core.websocket import manager
@@ -144,30 +145,57 @@ async def websocket_endpoint(
 
 
 @router.get("/ws/status")
-async def websocket_status():
+async def websocket_status(current_user: CurrentUser = None):
     """
     Get WebSocket connection status.
 
-    Returns:
-    - total_connections: Total connected users
-    - organizations: Dict with org_id -> user_count
-    - channels: Dict with channel -> subscriber_count
-    - active_channels: List of channels with subscribers
-    """
-    total_connections = sum(
-        len(users) for users in manager.active_connections.values()
-    )
+    **Auth**: JWT required. Previously this endpoint omitted the
+    ``current_user`` parameter, which means if it were ever mounted
+    in api/v1/router.py it would have leaked org_ids, per-channel
+    subscriber counts, and the full set of active subscription
+    channel names to anonymous callers — operational intelligence
+    an attacker would use to profile tenants.
 
-    org_stats = {
+    This file is currently orphaned (not imported by router.py) so
+    the endpoint returns 404 in production, but we're adding the
+    auth declaration defensively in case anyone wires it up later.
+    Non-superusers see only their own organization's stats.
+    """
+    org_stats_all = {
         org_id: len(users)
         for org_id, users in manager.active_connections.items()
     }
 
-    channel_stats = {
+    channel_stats_all = {
         channel: len(subscribers)
         for channel, subscribers in manager.channels.items()
         if subscribers
     }
+
+    is_super = bool(getattr(current_user, "is_superuser", False))
+    user_org_id = getattr(current_user, "organization_id", None)
+
+    if is_super:
+        org_stats = org_stats_all
+        channel_stats = channel_stats_all
+        total_connections = sum(org_stats_all.values())
+    else:
+        # Scope to caller's org only
+        org_stats = (
+            {user_org_id: org_stats_all[user_org_id]}
+            if user_org_id in org_stats_all
+            else {}
+        )
+        total_connections = sum(org_stats.values())
+        # Channels are global-namespace but we only surface ones
+        # this caller could plausibly see (filter hint: the caller's
+        # org id appears in the channel name — agents:<org>, etc.)
+        if user_org_id:
+            channel_stats = {
+                c: n for c, n in channel_stats_all.items() if user_org_id in c
+            }
+        else:
+            channel_stats = {}
 
     return {
         "status": "ok",

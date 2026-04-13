@@ -47,6 +47,7 @@ import {
 import { api } from '../lib/api';
 import clsx from 'clsx';
 import { remediationApi } from '../api/endpoints';
+import FormModal from '../components/FormModal';
 
 interface Tab {
   id: string;
@@ -160,6 +161,8 @@ export default function Remediation() {
   const [policyEnabledFilter, setPolicyEnabledFilter] = useState('');
   const [showCreatePolicyModal, setShowCreatePolicyModal] = useState(false);
   const [showAddIntegrationModal, setShowAddIntegrationModal] = useState(false);
+  const [rejectTarget, setRejectTarget] = useState<{ id: string; policy?: string } | null>(null);
+  const [integrationTestResults, setIntegrationTestResults] = useState<Record<string, { ok: boolean; message: string }>>({});
   const [executionStatusFilter, setExecutionStatusFilter] = useState('');
   const [executionTriggerFilter, setExecutionTriggerFilter] = useState('');
   const [blockIPValue, setBlockIPValue] = useState('');
@@ -658,7 +661,20 @@ export default function Remediation() {
                       {policy.trigger_type}
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap">
-                      <button className="flex items-center gap-2 px-3 py-1 rounded-lg transition">
+                      <button
+                        onClick={async () => {
+                          try {
+                            await api.put(`/remediation/policies/${policy.id}`, {
+                              is_enabled: !policy.is_enabled,
+                            });
+                            queryClient.invalidateQueries({ queryKey: ['remediation-policies'] });
+                          } catch (err) {
+                            console.error('Toggle policy failed:', err);
+                          }
+                        }}
+                        className="flex items-center gap-2 px-3 py-1 rounded-lg transition"
+                        title={policy.is_enabled ? 'Disable policy' : 'Enable policy'}
+                      >
                         {policy.is_enabled ? (
                           <>
                             <ToggleRight className="w-5 h-5 text-green-600" />
@@ -749,10 +765,32 @@ export default function Remediation() {
                     </p>
                   </div>
                   <div className="flex gap-2">
-                    <button className="px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg font-medium transition">
+                    <button
+                      onClick={async () => {
+                        try {
+                          await api.post(
+                            `/remediation/executions/${approval.id || approval.execution_id}/approve`,
+                            { approver_id: '' }
+                          );
+                          queryClient.invalidateQueries({ queryKey: ['remediation-pending-approvals'] });
+                          queryClient.invalidateQueries({ queryKey: ['remediation-executions'] });
+                        } catch (err) {
+                          console.error('Approve execution failed:', err);
+                        }
+                      }}
+                      className="px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg font-medium transition"
+                    >
                       Approve
                     </button>
-                    <button className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg font-medium transition">
+                    <button
+                      onClick={() =>
+                        setRejectTarget({
+                          id: approval.id || approval.execution_id,
+                          policy: approval.policy,
+                        })
+                      }
+                      className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg font-medium transition"
+                    >
                       Reject
                     </button>
                   </div>
@@ -1237,7 +1275,45 @@ export default function Remediation() {
                 </p>
               </div>
 
-              <button className="w-full px-3 py-2 bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 text-gray-900 dark:text-white rounded-lg font-medium transition text-sm">
+              {integrationTestResults[integration.id] && (
+                <div
+                  className={clsx(
+                    'mb-3 px-3 py-2 rounded-lg text-xs border',
+                    integrationTestResults[integration.id].ok
+                      ? 'bg-green-50 dark:bg-green-900/20 border-green-200 dark:border-green-800 text-green-700 dark:text-green-300'
+                      : 'bg-red-50 dark:bg-red-900/20 border-red-200 dark:border-red-800 text-red-700 dark:text-red-300'
+                  )}
+                >
+                  {integrationTestResults[integration.id].message}
+                </div>
+              )}
+
+              <button
+                onClick={async () => {
+                  try {
+                    const res = await api.post(
+                      `/integrations/installed/${integration.id}/test`,
+                      {}
+                    );
+                    setIntegrationTestResults((prev) => ({
+                      ...prev,
+                      [integration.id]: {
+                        ok: true,
+                        message: `Connection test: ${res.data?.status || 'completed'}`,
+                      },
+                    }));
+                  } catch (err: any) {
+                    setIntegrationTestResults((prev) => ({
+                      ...prev,
+                      [integration.id]: {
+                        ok: false,
+                        message: `Failed: ${err?.response?.data?.detail || err?.message || 'connection error'}`,
+                      },
+                    }));
+                  }
+                }}
+                className="w-full px-3 py-2 bg-gray-100 dark:bg-gray-700 hover:bg-gray-200 dark:hover:bg-gray-600 text-gray-900 dark:text-white rounded-lg font-medium transition text-sm"
+              >
                 Test Connection
               </button>
             </div>
@@ -1431,6 +1507,38 @@ export default function Remediation() {
           </div>
         </div>
       )}
+
+      <FormModal
+        open={!!rejectTarget}
+        onClose={() => setRejectTarget(null)}
+        title="Reject Remediation Execution"
+        description={
+          rejectTarget?.policy
+            ? `Rejecting: ${rejectTarget.policy}`
+            : 'Reject this pending remediation action. The rejection is recorded in the audit trail.'
+        }
+        submitLabel="Reject"
+        fields={[
+          {
+            name: 'reason',
+            label: 'Rejection Reason',
+            type: 'textarea',
+            required: true,
+            placeholder: 'Explain why this remediation is being rejected',
+            help: 'This reason is written to the audit log and visible to the requester.',
+          },
+        ]}
+        onSubmit={async (values) => {
+          if (!rejectTarget) return;
+          await api.post(
+            `/remediation/executions/${rejectTarget.id}/reject`,
+            { approver_id: '', reason: values.reason }
+          );
+          queryClient.invalidateQueries({ queryKey: ['remediation-pending-approvals'] });
+          queryClient.invalidateQueries({ queryKey: ['remediation-executions'] });
+          setRejectTarget(null);
+        }}
+      />
     </div>
   );
 }

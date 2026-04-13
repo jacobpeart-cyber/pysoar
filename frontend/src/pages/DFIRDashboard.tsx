@@ -20,6 +20,7 @@ import {
 } from 'lucide-react';
 import clsx from 'clsx';
 import { dfirApi } from '../api/endpoints';
+import { api } from '../lib/api';
 
 const getSeverityColor = (severity: string) => {
   switch (severity) {
@@ -305,11 +306,31 @@ export default function DFIRDashboard() {
     setViewDetailType('evidence');
   }, []);
 
-  const handleDownloadEvidence = useCallback((item: any) => {
-    if (item?.storage_location) {
-      window.open(item.storage_location, '_blank');
-    } else {
-      console.log('Download evidence:', item.id);
+  const handleDownloadEvidence = useCallback(async (item: any) => {
+    try {
+      const response = await api.get(`/dfir/evidence/${item.id}/download`, {
+        responseType: 'blob',
+      });
+      const blob = response.data as Blob;
+      const cd = response.headers?.['content-disposition'];
+      let filename = `evidence-${item.id}`;
+      if (cd && typeof cd === 'string') {
+        const m = cd.match(/filename="?([^"]+)"?/);
+        if (m) filename = m[1];
+      } else if (item.storage_location) {
+        const base = String(item.storage_location).split(/[\\/]/).pop();
+        if (base) filename = base;
+      }
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error('Evidence download failed:', err);
     }
   }, []);
 

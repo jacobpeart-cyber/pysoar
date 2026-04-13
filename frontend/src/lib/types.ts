@@ -16,6 +16,22 @@ export interface Alert {
   severity: string;
   status: string;
   source: string;
+  alert_type?: string | null;
+  category?: string | null;
+  priority?: number;
+  confidence?: number;
+  source_ip?: string | null;
+  destination_ip?: string | null;
+  hostname?: string | null;
+  username?: string | null;
+  file_hash?: string | null;
+  url?: string | null;
+  domain?: string | null;
+  assigned_to?: string | null;
+  incident_id?: string | null;
+  resolution_notes?: string | null;
+  resolved_at?: string | null;
+  tags?: string[] | string | null;
   created_at: string;
   updated_at: string;
 }

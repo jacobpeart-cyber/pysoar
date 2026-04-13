@@ -326,9 +326,6 @@ async def update_asset(
     asset = await get_asset_or_404(db, asset_id, getattr(current_user, "organization_id", None))
 
     update_data = asset_data.model_dump(exclude_unset=True, exclude_none=True)
-    # Map 'metadata' field to 'extra_metadata' column if present
-    if "metadata" in update_data:
-        update_data["extra_metadata"] = update_data.pop("metadata")
 
     for key, value in update_data.items():
         setattr(asset, key, value)
