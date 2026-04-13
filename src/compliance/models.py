@@ -176,9 +176,9 @@ class POAM(BaseModel):
         String(50), default="open", index=True
     )  # open, in_progress, delayed, completed, cancelled, accepted
     milestone_changes: Mapped[List[Dict[str, Any]]] = mapped_column(JSON, default=[])
-    scheduled_completion_date: Mapped[datetime] = mapped_column(DateTime, index=True)
+    scheduled_completion_date: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     actual_completion_date: Mapped[Optional[datetime]] = mapped_column(
-        DateTime, nullable=True
+        DateTime(timezone=True), nullable=True
     )
 
     milestones: Mapped[List[Dict[str, Any]]] = mapped_column(JSON, default=[])

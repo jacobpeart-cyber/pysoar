@@ -242,10 +242,11 @@ async def execute_playbook(playbook_id: str, execute_data: PlaybookExecuteReques
     )
 
     db.add(execution)
-    await db.flush()
+    await db.commit()
     await db.refresh(execution)
 
-    # Schedule background execution
+    # Schedule background execution — commit() above ensures the row is
+    # visible to the new session that run_playbook_execution creates.
     background_tasks.add_task(run_playbook_execution, execution.id)
 
     return PlaybookExecutionResponse(
