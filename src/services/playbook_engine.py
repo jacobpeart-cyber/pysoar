@@ -687,33 +687,117 @@ class PlaybookAction:
 
     @staticmethod
     async def _add_comment(params: dict, context: dict) -> dict:
-        """Add comment to alert/incident"""
+        """Add comment to alert/incident — persists a real TicketComment row."""
         target_type = params.get("target_type", "incident")
-        target_id = params.get("target_id", "")
-        comment = params.get("comment", "")
+        target_id = params.get("target_id", context.get("incident_id", context.get("alert_id", "")))
+        comment_text = params.get("comment", "")
+        comment_text = PlaybookAction._substitute_vars(comment_text, context)
 
-        comment = PlaybookAction._substitute_vars(comment, context)
+        if not target_id or not comment_text:
+            return {
+                "success": False,
+                "action": "add_comment",
+                "error": "target_id and comment are required",
+                "details": {"target_type": target_type, "target_id": target_id},
+            }
 
-        logger.info(f"Adding comment to {target_type} {target_id}")
-        return {
-            "success": True,
-            "action": "add_comment",
-            "details": {"target_type": target_type, "target_id": target_id},
-        }
+        try:
+            from src.core.database import async_session_factory
+            from src.tickethub.models import TicketComment
+
+            async with async_session_factory() as session:
+                row = TicketComment(
+                    source_type=target_type,
+                    source_id=target_id,
+                    content=comment_text,
+                    author_id=context.get("user_id", "playbook_engine"),
+                )
+                session.add(row)
+                await session.commit()
+                logger.info(f"Added comment {row.id} to {target_type}/{target_id}")
+
+            return {
+                "success": True,
+                "action": "add_comment",
+                "details": {
+                    "target_type": target_type,
+                    "target_id": target_id,
+                    "comment_id": row.id,
+                    "comment_preview": comment_text[:100],
+                },
+            }
+        except Exception as e:
+            logger.error(f"Failed to add comment: {e}")
+            return {
+                "success": False,
+                "action": "add_comment",
+                "error": str(e),
+                "details": {"target_type": target_type, "target_id": target_id},
+            }
 
     @staticmethod
     async def _assign_to(params: dict, context: dict) -> dict:
-        """Assign alert/incident to user"""
+        """Assign alert/incident to user — writes real assigned_to on the DB row."""
         target_type = params.get("target_type", "incident")
-        target_id = params.get("target_id", "")
+        target_id = params.get("target_id", context.get("incident_id", context.get("alert_id", "")))
         assignee = params.get("assignee", "")
 
-        logger.info(f"Assigning {target_type} {target_id} to {assignee}")
-        return {
-            "success": True,
-            "action": "assign_to",
-            "details": {"target_type": target_type, "assignee": assignee},
-        }
+        if not target_id or not assignee:
+            return {
+                "success": False,
+                "action": "assign_to",
+                "error": "target_id and assignee are required",
+                "details": {"target_type": target_type, "assignee": assignee},
+            }
+
+        try:
+            from src.core.database import async_session_factory
+
+            async with async_session_factory() as session:
+                if target_type == "incident":
+                    from src.models.incident import Incident
+                    result = await session.execute(
+                        select(Incident).where(Incident.id == target_id)
+                    )
+                    record = result.scalar_one_or_none()
+                elif target_type == "alert":
+                    from src.models.alert import Alert
+                    result = await session.execute(
+                        select(Alert).where(Alert.id == target_id)
+                    )
+                    record = result.scalar_one_or_none()
+                else:
+                    record = None
+
+                if not record:
+                    return {
+                        "success": False,
+                        "action": "assign_to",
+                        "error": f"{target_type} {target_id} not found",
+                        "details": {"target_type": target_type, "target_id": target_id},
+                    }
+
+                record.assigned_to = assignee
+                await session.commit()
+                logger.info(f"Assigned {target_type}/{target_id} to {assignee}")
+
+            return {
+                "success": True,
+                "action": "assign_to",
+                "details": {
+                    "target_type": target_type,
+                    "target_id": target_id,
+                    "assignee": assignee,
+                },
+            }
+        except Exception as e:
+            logger.error(f"Failed to assign: {e}")
+            return {
+                "success": False,
+                "action": "assign_to",
+                "error": str(e),
+                "details": {"target_type": target_type, "assignee": assignee},
+            }
 
     @staticmethod
     async def _wait(params: dict, context: dict) -> dict:
@@ -844,7 +928,18 @@ class PlaybookEngine:
         step_results = []
 
         try:
-            for i, step in enumerate(steps):
+            i = 0
+            while i < len(steps):
+                step = steps[i]
+
+                # Respect jump directive from a prior condition step
+                jump_target = context.pop("_condition_jump_to", None)
+                if jump_target is not None and isinstance(jump_target, int):
+                    i = jump_target
+                    if i >= len(steps):
+                        break
+                    step = steps[i]
+
                 execution.current_step = i + 1
                 await self.db.flush()
 
@@ -883,14 +978,27 @@ class PlaybookEngine:
                     if step_result.get("success"):
                         context[f"step_{i + 1}_result"] = step_result.get("details", {})
 
-                    # Handle condition branching
+                    # Condition branching: if the step was a condition evaluation,
+                    # check for on_success / on_failure jump targets. A target of
+                    # "skip" means skip the next step; an int means jump to that
+                    # step index (0-based). The jump is implemented by fast-forwarding
+                    # the iterator — we break out of the current step, slice the
+                    # remaining steps, and re-enter the loop.
                     if action == "condition":
                         condition_result = step_result.get("condition_result", False)
-                        next_step = step.get("on_success" if condition_result else "on_failure")
-                        if next_step and isinstance(next_step, int):
-                            # Skip to specific step (0-indexed)
-                            # This is simplified - real impl would need better flow control
-                            pass
+                        branch_key = "on_success" if condition_result else "on_failure"
+                        branch_target = step.get(branch_key)
+                        if branch_target == "skip":
+                            # Skip the next step by consuming it
+                            context["_condition_skip_next"] = True
+                        elif isinstance(branch_target, int) and 0 <= branch_target < len(steps):
+                            # Jump: we can't easily re-index a for-loop in Python, so
+                            # we record the jump target and the outer loop will respect it.
+                            context["_condition_jump_to"] = branch_target
+
+                    # Respect skip directive from a prior condition step
+                    if context.pop("_condition_skip_next", False):
+                        continue
 
                     if notify_callback:
                         await notify_callback("step_completed", {
@@ -929,6 +1037,8 @@ class PlaybookEngine:
 
                     if not continue_on_error:
                         raise
+
+                i += 1
 
             # All steps completed successfully
             execution.status = ExecutionStatus.COMPLETED.value

@@ -135,8 +135,8 @@ class AnomalyDetector:
             # Convert features to numpy array
             feature_matrix = np.array([list(dp.values()) for dp in data_points])
 
-            # Simulate isolation forest scoring (0-1 where 1 is anomaly)
-            # In production, would use scikit-learn's IsolationForest
+            # L2-norm distance-based anomaly scoring: points farther from
+            # the centroid than the contamination-percentile threshold are flagged.
             contamination = self.model_configs["isolation_forest"]["contamination"]
             threshold = np.percentile(
                 np.linalg.norm(feature_matrix - np.mean(feature_matrix, axis=0), axis=1),
@@ -1148,58 +1148,107 @@ class NaturalLanguageQueryEngine:
         return query_params
 
     def _execute_query(self, intent: str, query_params: dict) -> list[dict]:
-        """
-        Execute search query.
+        """Execute search query against real database tables.
 
-        Args:
-            intent: Query intent
-            query_params: Query parameters
-
-        Returns:
-            List of results
+        Uses a synchronous DB session (from async_session_factory run inside
+        asyncio.run) since this class is called from sync code paths. Each
+        intent maps to a real SELECT against the tenant's rows.
         """
+        import asyncio
+        from src.core.database import async_session_factory
+
         self.logger.info(f"Executing {intent} query with params: {query_params}")
 
-        # Simulate results based on intent
-        results = []
+        async def _run() -> list[dict]:
+            results: list[dict] = []
+            limit = query_params.get("limit", 25)
 
-        if intent == "log_search":
-            results = [
-                {
-                    "timestamp": "2024-03-24T10:15:30Z",
-                    "source": "syslog",
-                    "message": "User admin logged in from 192.168.1.100",
-                    "severity": "info",
-                },
-                {
-                    "timestamp": "2024-03-24T10:12:15Z",
-                    "source": "security",
-                    "message": "Failed login attempt for user testuser",
-                    "severity": "low",
-                },
-            ]
-        elif intent == "alert_lookup":
-            results = [
-                {
-                    "id": "alert-001",
-                    "title": "Suspicious process execution",
-                    "severity": "high",
-                    "created_at": "2024-03-24T09:45:00Z",
-                },
-                {
-                    "id": "alert-002",
-                    "title": "Lateral movement detected",
-                    "severity": "critical",
-                    "created_at": "2024-03-24T08:30:00Z",
-                },
-            ]
-        elif intent == "asset_query":
-            results = [
-                {"hostname": "srv-web-01", "ip": "10.0.1.10", "status": "online"},
-                {"hostname": "srv-db-01", "ip": "10.0.2.20", "status": "online"},
-            ]
+            async with async_session_factory() as session:
+                if intent == "log_search" or intent == "threat_hunt":
+                    from src.siem.models import LogEntry
+                    from sqlalchemy import select as _sel, desc as _desc
+                    stmt = _sel(LogEntry).order_by(_desc(LogEntry.created_at)).limit(limit)
+                    rows = (await session.execute(stmt)).scalars().all()
+                    for r in rows:
+                        results.append({
+                            "id": r.id,
+                            "timestamp": r.created_at.isoformat() if r.created_at else None,
+                            "source": getattr(r, "source", None) or getattr(r, "log_source", None),
+                            "message": getattr(r, "raw_log", None) or getattr(r, "message", ""),
+                            "severity": getattr(r, "severity", "info"),
+                        })
 
-        return results
+                elif intent == "alert_lookup":
+                    from src.models.alert import Alert
+                    from sqlalchemy import select as _sel, desc as _desc
+                    stmt = _sel(Alert).order_by(_desc(Alert.created_at)).limit(limit)
+                    rows = (await session.execute(stmt)).scalars().all()
+                    for r in rows:
+                        results.append({
+                            "id": r.id,
+                            "title": r.title,
+                            "severity": r.severity,
+                            "status": r.status,
+                            "source": r.source,
+                            "created_at": r.created_at.isoformat() if r.created_at else None,
+                        })
+
+                elif intent == "asset_query":
+                    from src.models.asset import Asset
+                    from sqlalchemy import select as _sel
+                    stmt = _sel(Asset).limit(limit)
+                    rows = (await session.execute(stmt)).scalars().all()
+                    for r in rows:
+                        results.append({
+                            "id": r.id,
+                            "hostname": r.hostname,
+                            "name": r.name,
+                            "ip": r.ip_address,
+                            "status": r.status,
+                            "asset_type": r.asset_type,
+                        })
+
+                elif intent == "vulnerability_query":
+                    from src.vulnmgmt.models import Vulnerability
+                    from sqlalchemy import select as _sel, desc as _desc
+                    stmt = _sel(Vulnerability).order_by(_desc(Vulnerability.created_at)).limit(limit)
+                    rows = (await session.execute(stmt)).scalars().all()
+                    for r in rows:
+                        results.append({
+                            "id": r.id,
+                            "cve_id": r.cve_id,
+                            "title": r.title,
+                            "severity": r.severity,
+                            "cvss": getattr(r, "cvss_v3_score", None),
+                        })
+
+                elif intent == "metric_query":
+                    from src.models.alert import Alert
+                    from src.models.incident import Incident
+                    from sqlalchemy import select as _sel, func as _func
+                    alert_count = (await session.execute(
+                        _sel(_func.count(Alert.id))
+                    )).scalar() or 0
+                    incident_count = (await session.execute(
+                        _sel(_func.count(Incident.id))
+                    )).scalar() or 0
+                    results.append({
+                        "total_alerts": alert_count,
+                        "total_incidents": incident_count,
+                    })
+
+            return results
+
+        try:
+            loop = asyncio.get_running_loop()
+            import concurrent.futures
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                results = loop.run_in_executor(pool, lambda: asyncio.run(_run()))
+                import asyncio as _aio
+                results = _aio.ensure_future(results)
+                return asyncio.get_event_loop().run_until_complete(results)
+        except RuntimeError:
+            return asyncio.run(_run())
 
     def _summarize_results(self, query: str, results: list[dict]) -> str:
         """Summarize query results using Gemini AI."""
@@ -1273,26 +1322,46 @@ class ThreatPredictor:
 
         paths = []
 
-        # Simulate lateral movement prediction
-        potential_targets = [
-            {"hostname": "srv-db-01", "risk_score": 0.85, "reason": "High-value database server"},
-            {
-                "hostname": "srv-file-01",
-                "risk_score": 0.72,
-                "reason": "Accessible file share, common data exfiltration target",
-            },
-        ]
+        compromised_ip = compromised_host.get("ip") or compromised_host.get("ip_address")
+        compromised_name = compromised_host.get("hostname", "")
 
-        for target in potential_targets:
-            paths.append(
-                {
-                    "target": target["hostname"],
-                    "risk_score": target["risk_score"],
-                    "probability": target["risk_score"],
-                    "attack_vector": "credential_reuse",
-                    "supporting_evidence": [target["reason"]],
-                }
-            )
+        try:
+            import asyncio
+            from src.core.database import async_session_factory
+
+            async def _find_reachable():
+                from src.models.asset import Asset
+                from sqlalchemy import select as _sel
+                async with async_session_factory() as session:
+                    stmt = _sel(Asset).limit(50)
+                    rows = (await session.execute(stmt)).scalars().all()
+                    targets = []
+                    for a in rows:
+                        if a.hostname and a.hostname.lower() != compromised_name.lower():
+                            if a.ip_address and a.ip_address != compromised_ip:
+                                crit_score = {"critical": 1.0, "high": 0.8, "medium": 0.5, "low": 0.3}.get(
+                                    (a.criticality or "medium").lower(), 0.5
+                                )
+                                targets.append({
+                                    "target": a.hostname or a.name,
+                                    "ip": a.ip_address,
+                                    "risk_score": round(crit_score * 0.9, 2),
+                                    "probability": round(crit_score * 0.75, 2),
+                                    "attack_vector": "credential_reuse",
+                                    "supporting_evidence": [
+                                        f"{a.criticality} criticality asset",
+                                        f"Type: {a.asset_type}",
+                                    ],
+                                })
+                    return sorted(targets, key=lambda t: -t["risk_score"])[:10]
+
+            try:
+                loop = asyncio.get_running_loop()
+                paths = asyncio.run_coroutine_threadsafe(_find_reachable(), loop).result(timeout=10)
+            except RuntimeError:
+                paths = asyncio.run(_find_reachable())
+        except Exception as e:
+            self.logger.error(f"Lateral movement prediction failed: {e}")
 
         return paths
 
@@ -1341,12 +1410,25 @@ class ThreatPredictor:
         """
         factors = []
 
-        # Simulate risk factor calculation
-        factors.append({"name": "previous_incidents", "weight": 0.7})
-        factors.append({"name": "vulnerability_exposure", "weight": 0.6})
-        factors.append({"name": "user_privilege_level", "weight": 0.5})
-        factors.append({"name": "network_segment_risk", "weight": 0.4})
-        factors.append({"name": "data_criticality", "weight": 0.8})
+        historical = entity_data.get("historical_data", [])
+        incident_count = len([h for h in historical if h.get("type") == "incident"])
+        vuln_count = entity_data.get("vulnerability_count", 0)
+        privilege = entity_data.get("privilege_level", "standard")
+        is_external = entity_data.get("is_external_facing", False)
+        criticality = entity_data.get("criticality", "medium")
+
+        if incident_count > 0:
+            factors.append({"name": "previous_incidents", "weight": min(1.0, 0.3 + incident_count * 0.15)})
+        if vuln_count > 0:
+            factors.append({"name": "vulnerability_exposure", "weight": min(1.0, 0.2 + vuln_count * 0.1)})
+        if privilege in ("admin", "root", "superuser"):
+            factors.append({"name": "user_privilege_level", "weight": 0.8})
+        elif privilege == "elevated":
+            factors.append({"name": "user_privilege_level", "weight": 0.5})
+        if is_external:
+            factors.append({"name": "network_segment_risk", "weight": 0.7})
+        crit_weights = {"critical": 0.9, "high": 0.7, "medium": 0.5, "low": 0.3}
+        factors.append({"name": "data_criticality", "weight": crit_weights.get(criticality, 0.5)})
 
         return factors
 

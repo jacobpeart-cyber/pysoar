@@ -484,9 +484,50 @@ class AssetDiscovery:
         """
         logger.info("Detecting shadow IT assets", organization_id=organization_id)
 
-        # Placeholder implementation
-        # Would compare log sources against official inventory
         shadow_assets = []
+        try:
+            from src.models.alert import Alert
+            from src.models.asset import Asset
+
+            known_ips = set()
+            known_hostnames = set()
+            assets = self.db.query(Asset).filter(
+                Asset.organization_id == organization_id
+            ).all()
+            for a in assets:
+                if a.ip_address:
+                    known_ips.add(a.ip_address)
+                if a.hostname:
+                    known_hostnames.add(a.hostname.lower())
+
+            alerts = self.db.query(Alert).filter(
+                Alert.organization_id == organization_id
+            ).order_by(Alert.created_at.desc()).limit(5000).all()
+
+            seen_unknown: dict[str, dict] = {}
+            for alert in alerts:
+                for ip_field in [alert.source_ip, alert.destination_ip]:
+                    if ip_field and ip_field not in known_ips and ip_field not in seen_unknown:
+                        seen_unknown[ip_field] = {
+                            "identifier": ip_field,
+                            "type": "ip",
+                            "first_seen": alert.created_at.isoformat() if alert.created_at else None,
+                            "source": "alert_log",
+                        }
+                if getattr(alert, "hostname", None):
+                    hn = alert.hostname.lower()
+                    if hn not in known_hostnames and hn not in seen_unknown:
+                        seen_unknown[hn] = {
+                            "identifier": hn,
+                            "type": "hostname",
+                            "first_seen": alert.created_at.isoformat() if alert.created_at else None,
+                            "source": "alert_log",
+                        }
+
+            shadow_assets = list(seen_unknown.values())
+            logger.info(f"Shadow IT detection found {len(shadow_assets)} unknown assets")
+        except Exception as e:
+            logger.error(f"Shadow IT detection failed: {e}")
 
         return shadow_assets
 
@@ -611,34 +652,58 @@ class VulnerabilityManager:
 
         return matching_assets
 
+    _kev_cache: dict | None = None
+    _kev_cache_ts: float = 0
+
     def check_kev_status(self, cve_id: str) -> bool:
-        """
-        Check if CVE is in CISA Known Exploited Vulnerabilities (KEV) catalog.
+        """Check if CVE is in CISA Known Exploited Vulnerabilities catalog.
 
-        Args:
-            cve_id: CVE ID to check
-
-        Returns:
-            True if in KEV catalog, False otherwise
+        Hits the real CISA KEV JSON feed (public, no key required), caches
+        the full CVE set for 6 hours so repeated lookups don't re-download.
         """
-        # Placeholder implementation
-        # Would call CISA KEV API
-        logger.debug("Checking KEV status", cve_id=cve_id)
-        return False
+        import time
+        import httpx as _httpx
+
+        now = time.time()
+        if VulnerabilityManager._kev_cache is None or (now - VulnerabilityManager._kev_cache_ts) > 21600:
+            try:
+                resp = _httpx.get(
+                    "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json",
+                    timeout=15.0,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    VulnerabilityManager._kev_cache = {
+                        v.get("cveID") for v in data.get("vulnerabilities", []) if v.get("cveID")
+                    }
+                    VulnerabilityManager._kev_cache_ts = now
+                    logger.info(f"KEV catalog loaded: {len(VulnerabilityManager._kev_cache)} CVEs")
+                else:
+                    logger.warning(f"KEV feed returned {resp.status_code}")
+            except Exception as e:
+                logger.warning(f"KEV fetch failed: {e}")
+                if VulnerabilityManager._kev_cache is None:
+                    VulnerabilityManager._kev_cache = set()
+
+        return cve_id in (VulnerabilityManager._kev_cache or set())
 
     def calculate_epss(self, cve_id: str) -> float:
-        """
-        Calculate or retrieve EPSS score for a vulnerability.
+        """Retrieve EPSS score from the real FIRST.org EPSS API (public, no key)."""
+        import httpx as _httpx
 
-        Args:
-            cve_id: CVE ID
+        try:
+            resp = _httpx.get(
+                f"https://api.first.org/data/v1/epss?cve={cve_id}",
+                timeout=10.0,
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                entries = data.get("data", [])
+                if entries:
+                    return float(entries[0].get("epss", 0.0))
+        except Exception as e:
+            logger.warning(f"EPSS lookup failed for {cve_id}: {e}")
 
-        Returns:
-            EPSS score between 0.0 and 1.0
-        """
-        # Placeholder implementation
-        # Would call EPSS API
-        logger.debug("Calculating EPSS", cve_id=cve_id)
         return 0.0
 
     def get_remediation_priority(self, organization_id: str) -> list[dict]:
@@ -763,12 +828,33 @@ class VulnerabilityManager:
         """
         logger.info("Retrieving vulnerability trends", organization_id=organization_id, days=days)
 
-        # Placeholder implementation
-        # Would query historical data
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        daily_trends = []
+        try:
+            from sqlalchemy import func as _func, cast, Date
+            rows = (
+                self.db.query(
+                    cast(AssetVulnerability.detected_at, Date).label("day"),
+                    _func.count(AssetVulnerability.id),
+                )
+                .filter(
+                    AssetVulnerability.organization_id == organization_id,
+                    AssetVulnerability.detected_at >= cutoff,
+                )
+                .group_by("day")
+                .order_by("day")
+                .all()
+            )
+            daily_trends = [
+                {"date": str(row[0]), "count": row[1]} for row in rows
+            ]
+        except Exception as e:
+            logger.error(f"Trend query failed: {e}")
+
         return {
             "organization_id": organization_id,
             "period_days": days,
-            "daily_trends": [],
+            "daily_trends": daily_trends,
         }
 
 
@@ -791,13 +877,28 @@ class ComplianceChecker:
         """
         logger.info("Checking CIS benchmarks", asset_id=asset_id)
 
-        # Placeholder implementation
+        passed = 0
+        failed = 0
+        try:
+            asset = self.db.query(ExposureAsset).filter(ExposureAsset.id == asset_id).first()
+            if asset:
+                has_edr = bool(getattr(asset, "agent_installed", False))
+                has_encryption = bool(getattr(asset, "disk_encrypted", False))
+                has_firewall = bool(getattr(asset, "firewall_enabled", False))
+                has_patching = bool(getattr(asset, "auto_update_enabled", False))
+                checks = [has_edr, has_encryption, has_firewall, has_patching]
+                passed = sum(checks)
+                failed = len(checks) - passed
+        except Exception as e:
+            logger.error(f"CIS benchmark check failed: {e}")
+
+        total = passed + failed
         return {
             "asset_id": asset_id,
             "framework": "CIS",
-            "checks_passed": 0,
-            "checks_failed": 0,
-            "compliance_percentage": 0.0,
+            "checks_passed": passed,
+            "checks_failed": failed,
+            "compliance_percentage": round((passed / total) * 100, 1) if total else 0.0,
         }
 
     def check_nist_controls(self, organization_id: str) -> dict:
@@ -812,12 +913,27 @@ class ComplianceChecker:
         """
         logger.info("Checking NIST controls", organization_id=organization_id)
 
-        # Placeholder implementation
+        satisfied = 0
+        unsatisfied = 0
+        try:
+            from src.compliance.models import ComplianceControl
+            controls = self.db.query(ComplianceControl).filter(
+                ComplianceControl.organization_id == organization_id,
+                ComplianceControl.framework.in_(["NIST 800-53", "NIST", "FedRAMP"]),
+            ).all()
+            for c in controls:
+                if c.status in ("implemented", "satisfied"):
+                    satisfied += 1
+                else:
+                    unsatisfied += 1
+        except Exception as e:
+            logger.error(f"NIST control check failed: {e}")
+
         return {
             "organization_id": organization_id,
             "framework": "NIST",
-            "controls_satisfied": 0,
-            "controls_unsatisfied": 0,
+            "controls_satisfied": satisfied,
+            "controls_unsatisfied": unsatisfied,
         }
 
     def get_compliance_summary(self, organization_id: str) -> dict:
@@ -832,11 +948,15 @@ class ComplianceChecker:
         """
         logger.info("Getting compliance summary", organization_id=organization_id)
 
+        nist = self.check_nist_controls(organization_id)
+        nist_total = nist["controls_satisfied"] + nist["controls_unsatisfied"]
+        nist_pct = round((nist["controls_satisfied"] / nist_total) * 100, 1) if nist_total else 0.0
+        nist_status = "compliant" if nist_pct >= 80 else ("partial" if nist_pct >= 50 else "non_compliant")
+
         return {
             "organization_id": organization_id,
             "frameworks": {
-                "cis": {"status": "compliant", "percentage": 0.0},
-                "nist": {"status": "partial", "percentage": 0.0},
+                "nist": {"status": nist_status, "percentage": nist_pct},
             },
         }
 

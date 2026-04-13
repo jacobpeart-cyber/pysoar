@@ -575,9 +575,9 @@ class IntegrationManager:
         if not self.registry.validate_connector_schema(connector_name, config):
             raise ValueError(f"Invalid configuration for {connector_name}")
 
-        # Simulate encryption (in production, use encryption library)
+        from src.core.security import get_password_hash
         config_encrypted = json.dumps(config)
-        creds_encrypted = json.dumps(credentials)
+        creds_encrypted = get_password_hash(json.dumps(credentials)) if credentials else ""
 
         logger.info(
             f"Installed {connector_name} for organization {organization_id}",

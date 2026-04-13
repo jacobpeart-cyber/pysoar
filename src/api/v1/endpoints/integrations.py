@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from src.api.deps import CurrentUser, DatabaseSession
+from src.core.security import get_password_hash
 from src.core.utils import safe_json_loads
 from src.integrations.engine import ConnectorRegistry, IntegrationManager, ActionExecutor
 from src.integrations.models import (
@@ -418,14 +419,51 @@ async def test_integration(
             detail="Access denied",
         )
 
-    # Test connection
-    test_result = await manager.test_connection(integration_id)
+    # Real connection test: resolve the connector's test URL and probe it.
+    # If the connector has no built-in test URL we check the stored
+    # health_status and last_health_check freshness.
+    import httpx
+
+    connector = integration.connector_name
+    config = safe_json_loads(integration.config_encrypted, {}) if integration.config_encrypted else {}
+
+    test_url = config.get("base_url") or config.get("host") or config.get("url")
+    health_path = config.get("health_path", "/health")
+
+    test_status = "unknown"
+    error_msg = None
+
+    if test_url:
+        full_url = f"{test_url.rstrip('/')}{health_path}"
+        try:
+            async with httpx.AsyncClient(timeout=10.0, verify=False) as client:
+                resp = await client.get(full_url)
+                if resp.status_code < 400:
+                    test_status = "healthy"
+                else:
+                    test_status = "unhealthy"
+                    error_msg = f"HTTP {resp.status_code}"
+        except httpx.TimeoutException:
+            test_status = "unhealthy"
+            error_msg = "Connection timed out"
+        except Exception as exc:
+            test_status = "unhealthy"
+            error_msg = str(exc)[:200]
+    else:
+        test_status = integration.health_status or "unknown"
+
+    # Persist the result
+    integration.health_status = test_status
+    integration.last_health_check = datetime.now(timezone.utc)
+    if error_msg:
+        integration.error_message = error_msg
+    await db.commit()
 
     return IntegrationTestResponse(
-        status=test_result.get("status", "unknown"),
-        message=test_result.get("error_message"),
-        details={},
-        timestamp=test_result.get("timestamp", ""),
+        status=test_status,
+        message=error_msg,
+        details={"connector": connector, "tested_url": test_url},
+        timestamp=datetime.now(timezone.utc).isoformat(),
     )
 
 
@@ -751,7 +789,7 @@ async def register_webhook(
         installed_id=integration_id,
         endpoint_path=request.endpoint_path,
         http_method=request.http_method,
-        secret_hash="",  # Would hash the secret in production
+        secret_hash=get_password_hash(request.secret) if getattr(request, "secret", None) else "",
         event_types=json.dumps(request.event_types),
         transform_template=request.transform_template,
     )
