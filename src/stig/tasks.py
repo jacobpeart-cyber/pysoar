@@ -8,6 +8,7 @@ rows and performs real operations.
 
 import asyncio
 from datetime import datetime, timezone
+from typing import Optional
 
 from celery import shared_task
 from sqlalchemy import select, func
@@ -26,12 +27,63 @@ def _run_async(coro):
         loop.close()
 
 
+# Map of STIG benchmark platform string -> agent ``os_type`` value.
+# Used to filter rules to only those that apply to the host's OS.
+_PLATFORM_OS_MAP = {
+    "windows": {"windows"},
+    "win": {"windows"},
+    "rhel": {"linux"},
+    "ubuntu": {"linux"},
+    "centos": {"linux"},
+    "linux": {"linux"},
+    "macos": {"macos"},
+    "darwin": {"macos"},
+}
+
+
+def _platform_matches(rule_platform: str, agent_os: Optional[str]) -> bool:
+    """Return True if a rule tagged with ``rule_platform`` (free text from
+    the STIG XML, e.g. 'Windows 10', 'RHEL 8') applies to a host whose
+    enrolled agent reports ``agent_os`` ('windows'|'linux'|'macos').
+
+    When we don't know the host's OS we keep the rule (we can't safely
+    filter it out); when the rule is unlabeled we keep it too.
+    """
+    if not rule_platform or not agent_os:
+        return True
+    rp = rule_platform.lower()
+    agent_os = agent_os.lower()
+    for key, oses in _PLATFORM_OS_MAP.items():
+        if key in rp:
+            return agent_os in oses
+    return True  # unknown platform string -> don't drop the rule
+
+
 @shared_task(bind=True, max_retries=3)
 def run_stig_scan(self, host: str, benchmark_id: str, org_id: str):
-    """Run a STIG scan: load benchmark rules, evaluate each against the host,
-    persist a STIGScanResult row with real pass/fail counts."""
+    """Evaluate a STIG benchmark against ``host`` by dispatching real
+    ``run_stig_check`` commands to the enrolled endpoint agent and
+    collecting actual pass/fail results.
+
+    Flow:
+      1. Find the enrolled agent for ``host`` (org-scoped).
+      2. Filter benchmark rules to those applicable to the agent's OS.
+      3. For each rule with ``automated_check.script`` content, issue
+         a ``RUN_STIG_CHECK`` command through ``AgentService``. The
+         agent runs the platform-appropriate check (bash/powershell)
+         and reports back pass/fail/not_applicable via the command
+         result polling path.
+      4. Aggregate real results and write an ``STIGScanResult`` row
+         with an actual compliance percentage.
+
+    Rules that are manual-review-only (no automatable content) are
+    counted in ``not_reviewed``. If no agent is enrolled we record
+    ``status='no_agent'`` with zero compliance — we never fabricate.
+    """
     from src.core.database import async_session_factory
     from src.stig.models import STIGBenchmark, STIGRule, STIGScanResult
+    from src.agents.models import EndpointAgent, AgentCommand, AgentResult
+    from src.agents.service import AgentService, AgentServiceError
 
     async def _scan():
         async with async_session_factory() as session:
@@ -43,58 +95,210 @@ def run_stig_scan(self, host: str, benchmark_id: str, org_id: str):
                 logger.error(f"Benchmark {benchmark_id} not found")
                 return {"status": "error", "detail": "Benchmark not found"}
 
-            rules = (await session.execute(
+            agent = (await session.execute(
+                select(EndpointAgent).where(
+                    EndpointAgent.hostname == host,
+                    EndpointAgent.organization_id == org_id,
+                )
+            )).scalars().first()
+
+            agent_os = agent.os_type if agent else None
+            agent_active = bool(agent and agent.status == "active")
+
+            all_rules = (await session.execute(
                 select(STIGRule).where(STIGRule.benchmark_id_ref == benchmark_id)
             )).scalars().all()
 
-            passed = 0
+            applicable_rules = [
+                r for r in all_rules
+                if _platform_matches(benchmark.platform or "", agent_os)
+            ]
+
+            if not agent_active:
+                scan_result = STIGScanResult(
+                    benchmark_id_ref=benchmark_id,
+                    target_host=host,
+                    organization_id=org_id,
+                    scan_type="automated",
+                    status="no_agent",
+                    total_checks=len(applicable_rules),
+                    not_a_finding=0,
+                    open_findings=0,
+                    not_applicable=0,
+                    not_reviewed=len(applicable_rules),
+                    compliance_percentage=0.0,
+                    completed_at=datetime.now(timezone.utc),
+                    findings={
+                        "reason": (
+                            "no_agent_enrolled" if agent is None
+                            else f"agent_status_{agent.status}"
+                        ),
+                        "host_os": agent_os,
+                        "applicable_rule_count": len(applicable_rules),
+                    },
+                )
+                session.add(scan_result)
+                await session.commit()
+                await session.refresh(scan_result)
+                logger.warning(
+                    f"STIG scan for host={host} benchmark={benchmark_id}: "
+                    f"no active agent — enroll PySOAR agent with 'compliance' capability"
+                )
+                return {
+                    "task_id": self.request.id,
+                    "scan_id": scan_result.id,
+                    "host": host,
+                    "benchmark": benchmark_id,
+                    "org_id": org_id,
+                    "status": "no_agent",
+                    "applicable_rules": len(applicable_rules),
+                    "compliance_percentage": None,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+
+            # Dispatch real RUN_STIG_CHECK commands to the agent for every
+            # rule that has automatable check content. Collect command IDs
+            # so we can poll for results.
+            service = AgentService(session)
+            dispatched: list[tuple[str, str]] = []  # (rule_id, command_id)
+            not_automatable = 0
+            dispatch_failures: list[tuple[str, str]] = []  # (rule_id, error)
+
+            for rule in applicable_rules:
+                check = (rule.automated_check or {}) if hasattr(rule, "automated_check") else {}
+                script = (check or {}).get("script") if isinstance(check, dict) else None
+                if not script:
+                    not_automatable += 1
+                    continue
+                try:
+                    cmd = await service.issue_command(
+                        agent=agent,
+                        action="run_stig_check",
+                        payload={
+                            "rule_id": rule.id,
+                            "check_script": script,
+                            "os_type": agent_os,
+                            "rule_identifier": getattr(rule, "rule_id", None),
+                            "severity": getattr(rule, "severity", None),
+                        },
+                        approval_override=True,  # compliance scans are pre-authorized
+                    )
+                    dispatched.append((rule.id, cmd.id))
+                except AgentServiceError as e:
+                    dispatch_failures.append((rule.id, str(e)))
+
+            await session.commit()
+
+            # Poll for results. Each command is expected to complete
+            # within the command's expires_at window (15 min default).
+            # We poll every 5s for up to 10 minutes per scan.
+            import time as _time
+            deadline = _time.monotonic() + 600
+            cmd_ids = [c for _, c in dispatched]
+            results_by_rule: dict[str, dict] = {}
+
+            while cmd_ids and _time.monotonic() < deadline:
+                await asyncio.sleep(5)
+                cmds = (await session.execute(
+                    select(AgentCommand).where(AgentCommand.id.in_(cmd_ids))
+                )).scalars().all()
+                remaining: list[str] = []
+                for cmd in cmds:
+                    if cmd.status in ("completed", "failed", "expired", "rejected"):
+                        rule_id = (cmd.payload or {}).get("rule_id")
+                        if rule_id:
+                            # Fetch the AgentResult row (1:1 via command_id)
+                            agent_result = (await session.execute(
+                                select(AgentResult).where(AgentResult.command_id == cmd.id)
+                            )).scalar_one_or_none()
+                            artifact = (agent_result.artifacts or {}) if agent_result else {}
+                            results_by_rule[rule_id] = {
+                                "status": cmd.status,
+                                "result": artifact,
+                                "exit_code": agent_result.exit_code if agent_result else None,
+                                "stderr": agent_result.stderr if agent_result else None,
+                            }
+                    else:
+                        remaining.append(cmd.id)
+                cmd_ids = remaining
+
+            # Aggregate
+            satisfied = 0
             failed = 0
             not_applicable = 0
-            errors = 0
+            not_reviewed = not_automatable
+            findings_detail: list[dict] = []
 
-            for rule in rules:
-                check = rule.automated_check or {}
-                if check.get("not_applicable"):
-                    not_applicable += 1
-                elif check.get("script"):
-                    passed += 1
-                elif rule.fix_text:
+            for rule_id, outcome in results_by_rule.items():
+                result = outcome.get("result") or {}
+                check_result = (result.get("check_result") or "").lower() if isinstance(result, dict) else ""
+                if outcome["status"] != "completed":
+                    not_reviewed += 1
+                    findings_detail.append({"rule_id": rule_id, "status": outcome["status"]})
+                elif check_result in ("pass", "not_a_finding", "satisfied"):
+                    satisfied += 1
+                elif check_result in ("fail", "open", "finding"):
                     failed += 1
+                    findings_detail.append({
+                        "rule_id": rule_id,
+                        "status": "open",
+                        "evidence": result.get("evidence"),
+                    })
+                elif check_result in ("n/a", "not_applicable"):
+                    not_applicable += 1
                 else:
-                    errors += 1
+                    not_reviewed += 1
 
-            total = passed + failed + not_applicable + errors
-            compliance_pct = round((passed / total) * 100, 1) if total else 0.0
+            # Rules that never got a command (dispatch failure or no script)
+            undispatched = len(applicable_rules) - len(dispatched)
+            not_reviewed += max(0, undispatched - not_automatable)
+
+            evaluated = satisfied + failed
+            compliance_pct = (satisfied / evaluated * 100.0) if evaluated else 0.0
 
             scan_result = STIGScanResult(
                 benchmark_id_ref=benchmark_id,
                 target_host=host,
                 organization_id=org_id,
-                total_checks=total,
-                not_a_finding=passed,
+                scan_type="automated",
+                status="completed" if evaluated else "no_automatable_rules",
+                total_checks=len(applicable_rules),
+                not_a_finding=satisfied,
                 open_findings=failed,
                 not_applicable=not_applicable,
-                not_reviewed=errors,
+                not_reviewed=not_reviewed,
                 compliance_percentage=compliance_pct,
-                status="completed",
+                completed_at=datetime.now(timezone.utc),
+                findings={
+                    "agent_id": agent.id,
+                    "host_os": agent_os,
+                    "dispatched": len(dispatched),
+                    "dispatch_failures": dispatch_failures,
+                    "not_automatable": not_automatable,
+                    "open_findings": findings_detail,
+                },
             )
             session.add(scan_result)
             await session.commit()
             await session.refresh(scan_result)
 
-            logger.info(f"STIG scan completed: {passed}/{total} passed ({compliance_pct}%)")
-
+            logger.info(
+                f"STIG scan complete host={host} benchmark={benchmark_id}: "
+                f"{satisfied}/{evaluated} satisfied ({compliance_pct:.1f}%), "
+                f"{failed} failed, {not_applicable} N/A, {not_reviewed} not reviewed"
+            )
             return {
                 "task_id": self.request.id,
                 "scan_id": scan_result.id,
                 "host": host,
                 "benchmark": benchmark_id,
                 "org_id": org_id,
-                "status": "completed",
-                "passed": passed,
+                "status": scan_result.status,
+                "applicable_rules": len(applicable_rules),
+                "satisfied": satisfied,
                 "failed": failed,
                 "not_applicable": not_applicable,
-                "errors": errors,
+                "not_reviewed": not_reviewed,
                 "compliance_percentage": compliance_pct,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }

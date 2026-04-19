@@ -7,13 +7,14 @@ classification, and incident response.
 
 import json
 import math
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Query, status
 from sqlalchemy import and_, case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DatabaseSession
+from src.core.logging import get_logger
 from src.dlp.models import (
     DLPIncident,
     DLPPolicy,
@@ -68,6 +69,8 @@ from src.schemas.dlp import (
 
 from src.services.automation import AutomationService
 from src.core.utils import safe_json_loads
+
+logger = get_logger(__name__)
 
 router = APIRouter(prefix="/dlp", tags=["DLP"])
 
@@ -1012,6 +1015,7 @@ async def get_dlp_dashboard(
     ]
 
     # Data risk map — real counts from SensitiveDataDiscovery scans
+    data_risk_map: dict[str, Any] = {}
     try:
         scan_rows = await db.execute(
             select(SensitiveDataDiscovery).where(
@@ -1019,24 +1023,32 @@ async def get_dlp_dashboard(
             )
         )
         scans = list(scan_rows.scalars().all())
-        high_risk_locations = sum(
-            1 for s in scans if (getattr(s, "risk_level", "") or "") == "high"
+        data_risk_map = {
+            "high_risk_locations": sum(
+                1 for s in scans if (getattr(s, "risk_level", "") or "") == "high"
+            ),
+            "medium_risk_locations": sum(
+                1 for s in scans if (getattr(s, "risk_level", "") or "") == "medium"
+            ),
+            "monitored_locations": len(scans),
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "DLP dashboard: data_risk_map computation failed for org %s",
+            org_id,
+            exc_info=True,
         )
-        medium_risk_locations = sum(
-            1 for s in scans if (getattr(s, "risk_level", "") or "") == "medium"
-        )
-        monitored_locations = len(scans)
-    except Exception:  # noqa: BLE001
-        high_risk_locations = medium_risk_locations = monitored_locations = 0
-
-    data_risk_map = {
-        "high_risk_locations": high_risk_locations,
-        "medium_risk_locations": medium_risk_locations,
-        "monitored_locations": monitored_locations,
-    }
+        # Schema requires dict[str, Any]; surface a clear error indicator
+        # instead of silent zeros that look like "no data".
+        data_risk_map = {
+            "high_risk_locations": None,
+            "medium_risk_locations": None,
+            "monitored_locations": None,
+            "error": f"computation failed: {type(exc).__name__}",
+        }
 
     # Real compliance_status — query ComplianceFramework like ITDR
-    compliance_status: dict[str, str] = {}
+    compliance_status: dict[str, Any] = {}
     try:
         fw_rows = await db.execute(
             select(ComplianceFramework).where(
@@ -1046,8 +1058,17 @@ async def get_dlp_dashboard(
         for fw in fw_rows.scalars().all():
             if fw.short_name:
                 compliance_status[fw.short_name] = fw.status or "unknown"
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "DLP dashboard: compliance_status query failed for org %s",
+            org_id,
+            exc_info=True,
+        )
+        # Schema requires dict[str, Any]; surface a clear error indicator
+        # instead of an empty dict that looks like "no frameworks".
+        compliance_status = {
+            "error": f"query failed: {type(exc).__name__}",
+        }
 
     # Real remediation rate = resolved / total
     resolved_result = await db.execute(

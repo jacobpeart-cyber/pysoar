@@ -17,12 +17,37 @@ Features:
 - Vulnerability assessment with ICS-CERT advisories
 """
 
+import asyncio
 import json
+import os
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional, Tuple
 from ipaddress import ip_network, ip_address
 
 from src.core.logging import get_logger
+
+# Ports we probe for OT/ICS protocol fingerprinting -> protocol name
+OT_PROBE_PORTS: Dict[int, str] = {
+    102:   "s7comm",          # Siemens S7 / ISO-TSAP
+    502:   "modbus_tcp",      # Modbus
+    20000: "dnp3",            # DNP3
+    44818: "ethernetip",      # EtherNet/IP (Allen-Bradley / Rockwell)
+    4840:  "opc_ua",          # OPC UA
+    47808: "bacnet",          # BACnet/IP
+}
+
+# Refuse to scan networks larger than this (anti-foot-gun: prevents an
+# operator from accidentally typing 0.0.0.0/0 and having us TCP-probe
+# every host on the internet).
+MAX_DISCOVERY_PREFIX = 22  # /22 = 1024 hosts
+
+# How many concurrent probes we'll have in flight at once. Tuned low so
+# we don't accidentally look like a port scanner to a customer's IDS.
+DISCOVERY_CONCURRENCY = 100
+
+# Per-port connect timeout. ICS gear is slow; 1s is a reasonable upper
+# bound for "reachable on the local segment".
+DISCOVERY_PORT_TIMEOUT_SECONDS = 1.0
 
 logger = get_logger(__name__)
 
@@ -98,94 +123,194 @@ class OTMonitor:
 
     async def discover_assets(self, network_range: str) -> List[Dict[str, Any]]:
         """
-        Discover OT assets through passive network monitoring simulation.
+        Actively discover OT assets in ``network_range`` by TCP-probing the
+        well-known ICS ports on every host in the CIDR.
 
-        In production, integrate with network sensors (Zeek, Suricata, packet captures).
-        Identifies devices by protocol fingerprinting, response patterns, and device behavior.
+        Each host that answers on at least one of the OT probe ports is
+        either upserted into ``ot_assets`` (new device) or has its
+        ``last_seen`` / ``is_online`` refreshed (known device). Protocol
+        is inferred from the responding port.
+
+        Safety rails:
+        - rejects CIDRs larger than ``MAX_DISCOVERY_PREFIX`` so an
+          accidental ``0.0.0.0/0`` doesn't sweep the public internet;
+        - honors ``PYSOAR_DISABLE_NETWORK_SCAN=1`` for environments where
+          active probing isn't permitted (audited customer LANs, CI);
+        - bounds concurrency with a semaphore so we look nothing like a
+          port scanner to a downstream IDS.
         """
-        discovered = []
+        discovered: List[Dict[str, Any]] = []
+        logger.info(f"Starting OT asset discovery for range {network_range}")
+
+        # Safety switch: customers in regulated networks can refuse all
+        # active scanning by setting this env var on the worker.
+        if os.environ.get("PYSOAR_DISABLE_NETWORK_SCAN") == "1":
+            logger.warning(
+                "Active OT discovery skipped: PYSOAR_DISABLE_NETWORK_SCAN=1"
+            )
+            return [{
+                "status": "skipped",
+                "reason": "network_scan_disabled",
+                "network_range": network_range,
+            }]
+
         try:
-            logger.info(f"Starting OT asset discovery for range {network_range}")
-
-            # Parse network CIDR
-            try:
-                network = ip_network(network_range, strict=False)
-            except ValueError:
-                logger.error(f"Invalid network range: {network_range}")
-                return discovered
-
-            # Query existing OT assets in the database that fall within this network range
-            from src.core.database import async_session_factory
-            from sqlalchemy import select
-            from src.ot_security.models import OTAsset
-
-            async with async_session_factory() as db:
-                query = select(OTAsset).where(
-                    OTAsset.organization_id == self.organization_id
-                )
-                result = await db.execute(query)
-                existing_assets = list(result.scalars().all())
-
-            # Filter assets whose IP falls within the target network range
-            for asset in existing_assets:
-                asset_ip = getattr(asset, 'ip_address', None)
-                if asset_ip:
-                    try:
-                        if ip_address(asset_ip) in network:
-                            discovered.append({
-                                "ip_address": asset_ip,
-                                "protocols_detected": [asset.protocol] if asset.protocol else [],
-                                "asset_type": asset.asset_type,
-                                "vendor": asset.vendor,
-                                "model": asset.model,
-                                "firmware_version": asset.firmware_version,
-                                "name": asset.name,
-                                "id": asset.id,
-                            })
-                    except (ValueError, TypeError):
-                        continue
-
-            logger.info(f"Discovered {len(discovered)} OT assets")
+            network = ip_network(network_range, strict=False)
+        except ValueError as exc:
+            logger.error(f"Invalid network range '{network_range}': {exc}")
             return discovered
 
-        except Exception as e:
-            logger.error(f"Asset discovery failed: {str(e)}")
+        if network.prefixlen < MAX_DISCOVERY_PREFIX:
+            logger.error(
+                f"Refusing to scan {network_range}: prefix /{network.prefixlen} "
+                f"exceeds safety cap of /{MAX_DISCOVERY_PREFIX}"
+            )
+            return [{
+                "status": "rejected",
+                "reason": "cidr_too_large",
+                "network_range": network_range,
+                "max_prefix": MAX_DISCOVERY_PREFIX,
+            }]
+
+        # Build the host list. ``hosts()`` excludes the network/broadcast
+        # addresses for IPv4; for /32 we still want the single host.
+        if network.num_addresses == 1:
+            host_iter = [network.network_address]
+        else:
+            host_iter = list(network.hosts())
+
+        sem = asyncio.Semaphore(DISCOVERY_CONCURRENCY)
+        probe_tasks = [
+            self._probe_device(str(host), sem) for host in host_iter
+        ]
+        probe_results = await asyncio.gather(*probe_tasks, return_exceptions=True)
+
+        # Filter to hosts that responded on at least one OT port.
+        live_hosts = [
+            r for r in probe_results
+            if isinstance(r, dict) and r.get("open_ports")
+        ]
+
+        if not live_hosts:
+            logger.info(f"OT discovery for {network_range} found no live hosts")
             return discovered
 
-    async def _probe_device(self, ip_address_str: str) -> Optional[Dict[str, Any]]:
-        """
-        Probe device by looking up known asset data from the database.
-
-        Derives protocol information from stored asset records.
-        """
+        # Persist findings: update existing rows or insert new ones.
         from src.core.database import async_session_factory
         from sqlalchemy import select
         from src.ot_security.models import OTAsset
 
         async with async_session_factory() as db:
-            query = select(OTAsset).where(
-                OTAsset.organization_id == self.organization_id,
-                OTAsset.ip_address == ip_address_str,
+            existing_q = await db.execute(
+                select(OTAsset).where(
+                    OTAsset.organization_id == self.organization_id,
+                    OTAsset.ip_address.in_([h["ip_address"] for h in live_hosts]),
+                )
             )
-            result = await db.execute(query)
-            asset = result.scalar_one_or_none()
+            by_ip = {a.ip_address: a for a in existing_q.scalars().all()}
 
-        if not asset:
+            now = datetime.now(timezone.utc)
+
+            for host in live_hosts:
+                ip = host["ip_address"]
+                primary_proto = host["protocols_detected"][0] if host["protocols_detected"] else None
+
+                asset = by_ip.get(ip)
+                if asset is None:
+                    # Newly observed device — create a minimal row. We
+                    # don't know the vendor/model from a port probe, so
+                    # those stay null and an enrichment step can fill
+                    # them in later (e.g. SNMP, NMAP -O, vendor MAC OUI).
+                    asset = OTAsset(
+                        organization_id=self.organization_id,
+                        name=f"discovered-{ip}",
+                        asset_type="unknown",
+                        protocol=primary_proto,
+                        ip_address=ip,
+                        purdue_level="level3_operations",
+                        criticality="supporting",
+                        last_seen=now,
+                        is_online=True,
+                    )
+                    db.add(asset)
+                else:
+                    asset.last_seen = now
+                    asset.is_online = True
+                    if not asset.protocol and primary_proto:
+                        asset.protocol = primary_proto
+
+                discovered.append({
+                    "ip_address": ip,
+                    "protocols_detected": host["protocols_detected"],
+                    "open_ports": host["open_ports"],
+                    "asset_type": asset.asset_type,
+                    "vendor": asset.vendor,
+                    "model": asset.model,
+                    "firmware_version": asset.firmware_version,
+                    "name": asset.name,
+                    "id": asset.id,
+                    "newly_discovered": ip not in by_ip,
+                })
+
+            await db.commit()
+
+        logger.info(
+            f"OT discovery for {network_range}: "
+            f"{len(discovered)} live hosts ({sum(1 for d in discovered if d['newly_discovered'])} new)"
+        )
+        return discovered
+
+    async def _probe_device(
+        self,
+        ip_address_str: str,
+        sem: Optional[asyncio.Semaphore] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Active TCP-connect probe of ``ip_address_str`` against every port
+        in ``OT_PROBE_PORTS``. Returns a dict describing which ports
+        answered and the protocol(s) inferred from those ports, or None
+        on outright failure.
+
+        This is a *real* network probe, not a database lookup — the only
+        signal it produces comes from the wire.
+        """
+        # Validate the address first so a typo doesn't trigger a DNS
+        # lookup or a misleading log line.
+        try:
+            ip_address(ip_address_str)
+        except ValueError:
+            logger.debug(f"_probe_device skipping invalid address {ip_address_str!r}")
             return None
 
-        protocols = []
-        if asset.protocol:
-            protocols.append(asset.protocol)
+        if sem is None:
+            sem = asyncio.Semaphore(DISCOVERY_CONCURRENCY)
+
+        async def _probe_port(port: int) -> Optional[int]:
+            async with sem:
+                try:
+                    fut = asyncio.open_connection(ip_address_str, port)
+                    reader, writer = await asyncio.wait_for(
+                        fut, timeout=DISCOVERY_PORT_TIMEOUT_SECONDS
+                    )
+                    writer.close()
+                    try:
+                        await writer.wait_closed()
+                    except Exception:  # pragma: no cover - best effort cleanup
+                        pass
+                    return port
+                except (asyncio.TimeoutError, OSError, ConnectionError):
+                    return None
+
+        port_results = await asyncio.gather(
+            *(_probe_port(p) for p in OT_PROBE_PORTS.keys())
+        )
+        open_ports = [p for p in port_results if p is not None]
+        protocols = [OT_PROBE_PORTS[p] for p in open_ports]
 
         return {
             "ip_address": ip_address_str,
+            "open_ports": open_ports,
             "protocols_detected": protocols,
-            "asset_type": asset.asset_type,
-            "vendor": asset.vendor,
-            "model": asset.model,
-            "firmware_version": asset.firmware_version,
-            "name": asset.name,
-            "id": asset.id,
         }
 
     def _check_modbus_tcp(self, ip: str) -> bool:

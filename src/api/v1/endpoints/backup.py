@@ -93,7 +93,9 @@ async def create_backup(current_user: CurrentUser = None):
 
         file_size = os.path.getsize(filepath) if os.path.exists(filepath) else 0
 
-        # Send notification
+        # Send notification — best-effort; the backup itself already succeeded
+        # by this point, so notification failures must NOT fail the request,
+        # but we MUST log them loudly instead of silently swallowing.
         try:
             from src.workers.tasks import send_notification_task
             send_notification_task.delay(
@@ -102,8 +104,18 @@ async def create_backup(current_user: CurrentUser = None):
                 subject="PySOAR Backup Completed",
                 message=f"Database backup completed successfully.\nFile: {filename}\nSize: {round(file_size / (1024*1024), 2)} MB",
             )
+        except ImportError:
+            logger.warning(
+                "Backup notification skipped: src.workers.tasks unavailable "
+                "(Celery workers not deployed in this environment)."
+            )
         except Exception:
-            pass
+            logger.error(
+                "Backup notification dispatch failed for %s; the backup file "
+                "itself was created successfully.",
+                filename,
+                exc_info=True,
+            )
 
         return {
             "status": "success",

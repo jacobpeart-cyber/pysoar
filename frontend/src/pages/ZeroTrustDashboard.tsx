@@ -21,6 +21,7 @@ import {
 import { api } from '../lib/api';
 import clsx from 'clsx';
 import DetailDrawer, { DetailSection } from '../components/DetailDrawer';
+import FormModal from '../components/FormModal';
 
 type TabType = 'overview' | 'access-control' | 'devices' | 'segmentation' | 'policies';
 
@@ -944,6 +945,8 @@ function SegmentationTab({
   loading: boolean;
 }) {
   const queryClient = useQueryClient();
+  const [showCreateModal, setShowCreateModal] = useState(false);
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
@@ -952,23 +955,77 @@ function SegmentationTab({
     );
   }
 
+  const createSegment = async (values: Record<string, string>) => {
+    const allowed_protocols = (values.allowed_protocols || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const cidr_ranges = (values.cidr_ranges || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    await api.post('/zerotrust/segments', {
+      name: values.name.trim(),
+      segment_type: values.segment_type || 'workload',
+      description: values.description?.trim() || '',
+      trust_level: values.trust_level || 'zero',
+      allowed_protocols,
+      cidr_ranges,
+      is_active: true,
+    });
+    queryClient.invalidateQueries({ queryKey: ['zerotrust-segments'] });
+    queryClient.invalidateQueries({ queryKey: ['zerotrust-dashboard'] });
+  };
+
   return (
     <div className="space-y-6">
       {/* Create Segment Button */}
       <button
-        onClick={async () => {
-          const name = window.prompt('Segment name:');
-          if (!name?.trim()) return;
-          try {
-            await api.post('/zerotrust/segments', { name: name.trim(), segment_type: 'workload', description: '' });
-            queryClient.invalidateQueries({ queryKey: ['zerotrust-segments'] });
-          } catch (err) { console.error('Create segment failed:', err); }
-        }}
+        onClick={() => setShowCreateModal(true)}
         className="inline-flex items-center gap-2 px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium"
       >
         <Plus className="w-5 h-5" />
         Create Segment
       </button>
+
+      <FormModal
+        open={showCreateModal}
+        onClose={() => setShowCreateModal(false)}
+        title="Create Micro-Segment"
+        description="Define an isolated network/workload zone for Zero Trust enforcement."
+        submitLabel="Create Segment"
+        fields={[
+          { name: 'name', label: 'Segment Name', required: true, placeholder: 'e.g. PCI Cardholder Zone' },
+          {
+            name: 'segment_type',
+            label: 'Segment Type',
+            type: 'select' as const,
+            required: true,
+            defaultValue: 'workload',
+            options: [
+              { value: 'network', label: 'Network' },
+              { value: 'application', label: 'Application' },
+              { value: 'data', label: 'Data' },
+              { value: 'workload', label: 'Workload' },
+            ],
+          },
+          { name: 'description', label: 'Description', type: 'textarea' as const, placeholder: 'Purpose, scope, owner' },
+          {
+            name: 'trust_level',
+            label: 'Trust Level',
+            type: 'select' as const,
+            defaultValue: 'zero',
+            options: [
+              { value: 'zero', label: 'Zero (deny by default)' },
+              { value: 'basic', label: 'Basic' },
+              { value: 'advanced', label: 'Advanced' },
+            ],
+          },
+          { name: 'cidr_ranges', label: 'CIDR Ranges', placeholder: '10.0.1.0/24, 10.0.2.0/24', help: 'Comma-separated. Optional.' },
+          { name: 'allowed_protocols', label: 'Allowed Protocols', placeholder: 'tcp, https, ssh', help: 'Comma-separated. Optional.' },
+        ]}
+        onSubmit={createSegment}
+      />
 
       {/* Segment Cards */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -1039,6 +1096,8 @@ function PoliciesTab({
   loading: boolean;
 }) {
   const queryClient = useQueryClient();
+  const [showCreateModal, setShowCreateModal] = useState(false);
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
@@ -1047,23 +1106,89 @@ function PoliciesTab({
     );
   }
 
+  const createPolicy = async (values: Record<string, string>) => {
+    const riskThreshold = Number(values.risk_threshold);
+    await api.post('/zerotrust/policies', {
+      name: values.name.trim(),
+      policy_type: values.policy_type || 'access',
+      description: values.description?.trim() || '',
+      risk_threshold: Number.isFinite(riskThreshold) ? riskThreshold : 50,
+      requires_mfa: values.requires_mfa === 'true',
+      requires_device_trust: values.requires_device_trust === 'true',
+      is_enabled: true,
+      conditions: [],
+      actions: [],
+    });
+    queryClient.invalidateQueries({ queryKey: ['zerotrust-policies'] });
+    queryClient.invalidateQueries({ queryKey: ['zerotrust-dashboard'] });
+  };
+
   return (
     <div className="space-y-6">
       {/* Create Policy Button */}
       <button
-        onClick={async () => {
-          const name = window.prompt('Policy name:');
-          if (!name?.trim()) return;
-          try {
-            await api.post('/zerotrust/policies', { name: name.trim(), description: '', policy_type: 'access', enforcement: 'block' });
-            queryClient.invalidateQueries({ queryKey: ['zerotrust-policies'] });
-          } catch (err) { console.error('Create policy failed:', err); }
-        }}
+        onClick={() => setShowCreateModal(true)}
         className="inline-flex items-center gap-2 px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium"
       >
         <Plus className="w-5 h-5" />
         Create Policy
       </button>
+
+      <FormModal
+        open={showCreateModal}
+        onClose={() => setShowCreateModal(false)}
+        title="Create Zero Trust Policy"
+        description="Define enforcement rules for access decisions. Add conditions/actions in the policy editor after create."
+        submitLabel="Create Policy"
+        fields={[
+          { name: 'name', label: 'Policy Name', required: true, placeholder: 'e.g. Enforce MFA for Finance Apps' },
+          {
+            name: 'policy_type',
+            label: 'Policy Type',
+            type: 'select' as const,
+            required: true,
+            defaultValue: 'access',
+            options: [
+              { value: 'access', label: 'Access' },
+              { value: 'network', label: 'Network' },
+              { value: 'identity', label: 'Identity' },
+              { value: 'device', label: 'Device' },
+              { value: 'data', label: 'Data' },
+              { value: 'workload', label: 'Workload' },
+              { value: 'visibility', label: 'Visibility' },
+            ],
+          },
+          { name: 'description', label: 'Description', type: 'textarea' as const, placeholder: 'What does this policy enforce?' },
+          {
+            name: 'risk_threshold',
+            label: 'Risk Threshold (0-100)',
+            type: 'number' as const,
+            defaultValue: 50,
+            help: 'Block when calculated risk exceeds this score.',
+          },
+          {
+            name: 'requires_mfa',
+            label: 'Require MFA',
+            type: 'select' as const,
+            defaultValue: 'true',
+            options: [
+              { value: 'true', label: 'Yes' },
+              { value: 'false', label: 'No' },
+            ],
+          },
+          {
+            name: 'requires_device_trust',
+            label: 'Require Device Trust',
+            type: 'select' as const,
+            defaultValue: 'true',
+            options: [
+              { value: 'true', label: 'Yes' },
+              { value: 'false', label: 'No' },
+            ],
+          },
+        ]}
+        onSubmit={createPolicy}
+      />
 
       {/* Policies Table */}
       <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">

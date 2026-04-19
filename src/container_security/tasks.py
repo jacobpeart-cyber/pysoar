@@ -5,9 +5,12 @@ Background tasks for image scanning, cluster auditing, runtime monitoring,
 compliance checking, and vulnerability reporting.
 """
 
+import os
+import re
 from datetime import datetime, timedelta
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional
 import asyncio
+import httpx
 from celery import shared_task
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
@@ -15,6 +18,78 @@ from sqlalchemy import select
 
 from src.core.logging import get_logger
 from src.core.config import settings
+
+
+def _cluster_auth(cluster) -> Optional[tuple[str, str]]:
+    """Resolve (api_url, bearer_token) for a KubernetesCluster row.
+
+    Precedence:
+      1. env var ``PYSOAR_KUBE_TOKEN_{NAME}`` (name uppercased, non-alnum → _)
+      2. env var ``PYSOAR_KUBE_TOKEN`` (single-cluster deployments)
+      3. in-cluster service account token at /var/run/secrets/kubernetes.io/serviceaccount/token
+    Returns None if no credentials found.
+    """
+    if not cluster or not cluster.endpoint:
+        return None
+    sanitized = re.sub(r"[^A-Z0-9]", "_", cluster.name.upper())
+    token = (
+        os.getenv(f"PYSOAR_KUBE_TOKEN_{sanitized}")
+        or os.getenv("PYSOAR_KUBE_TOKEN")
+    )
+    if not token:
+        sa_path = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+        if os.path.exists(sa_path):
+            try:
+                with open(sa_path) as f:
+                    token = f.read().strip()
+            except OSError:
+                token = None
+    if not token:
+        return None
+    return cluster.endpoint.rstrip("/"), token
+
+
+async def _list_cluster_pods(cluster) -> List[tuple[str, str]]:
+    """Query the cluster's Kubernetes API for running pods.
+
+    Returns list of (namespace, pod_name). Returns [] on failure; caller
+    must treat empty as 'no pods found / cluster unreachable' and not
+    fabricate targets.
+    """
+    auth = _cluster_auth(cluster)
+    if not auth:
+        logger.warning(
+            "KubernetesCluster %s has no bearer token configured "
+            "(set PYSOAR_KUBE_TOKEN_%s or PYSOAR_KUBE_TOKEN); skipping pod list",
+            cluster.name,
+            re.sub(r"[^A-Z0-9]", "_", cluster.name.upper()),
+        )
+        return []
+    api_url, token = auth
+    url = f"{api_url}/api/v1/pods?limit=500"
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    try:
+        async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
+            r = await client.get(url, headers=headers)
+        if r.status_code != 200:
+            logger.error(
+                "K8s API %s returned HTTP %d: %s",
+                cluster.name, r.status_code, r.text[:200],
+            )
+            return []
+        data = r.json()
+        pods: List[tuple[str, str]] = []
+        for item in data.get("items", []):
+            meta = item.get("metadata") or {}
+            ns = meta.get("namespace")
+            name = meta.get("name")
+            if ns and name:
+                pods.append((ns, name))
+        logger.info("Fetched %d pods from cluster %s", len(pods), cluster.name)
+        return pods
+    except (httpx.HTTPError, ValueError, KeyError) as e:
+        logger.error("K8s pod list failed for cluster %s: %s", cluster.name, e)
+        return []
 from src.container_security.models import (
     ContainerImage,
     ImageVulnerability,
@@ -323,13 +398,23 @@ def runtime_monitoring(self, cluster_id: str, org_id: str):
                     pod = existing_alert.pod_name or "unknown"
                     ns_pod_pairs.add((ns, pod))
 
-                # If no existing data, scan standard namespaces
+                # If no prior alerts exist, pull the live pod list from the
+                # cluster's Kubernetes API so we can monitor real workloads.
                 if not ns_pod_pairs:
-                    ns_pod_pairs = {
-                        ("default", "scan-target"),
-                        ("kube-system", "scan-target"),
-                        ("production", "scan-target"),
-                    }
+                    live = await _list_cluster_pods(cluster)
+                    ns_pod_pairs = set(live)
+                    if not ns_pod_pairs:
+                        # Cluster unreachable or no pods running — return
+                        # cleanly. We never fabricate monitoring targets.
+                        logger.info(
+                            "No pods retrievable from cluster %s; skipping this cycle",
+                            cluster_id,
+                        )
+                        return {
+                            "status": "skipped",
+                            "cluster_id": cluster_id,
+                            "reason": "no_pods_available",
+                        }
 
                 for namespace, pod in ns_pod_pairs:
                         # Check for anomalies

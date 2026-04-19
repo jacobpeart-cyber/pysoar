@@ -26,6 +26,7 @@ import {
 } from 'lucide-react';
 import clsx from 'clsx';
 import { api } from '../api/client';
+import FormModal from '../components/FormModal';
 
 const getStatusColor = (status: string) => {
   switch (status) {
@@ -116,6 +117,56 @@ export default function PlaybookBuilder() {
   const [showFilter, setShowFilter] = useState(false);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [notification, setNotification] = useState<{ type: string; text: string } | null>(null);
+  const [showCreateModal, setShowCreateModal] = useState(false);
+
+  const createPlaybook = async (values: Record<string, string>) => {
+    const payload: Record<string, any> = {
+      name: values.name.trim(),
+      description: values.description?.trim() || '',
+      category: values.category || 'custom',
+      trigger_type: values.trigger_type || 'manual',
+      status: 'draft',
+    };
+    const res = await api.post('/playbook-builder', payload);
+    setPlaybooks((prev) => [...prev, res.data]);
+    setNotification({ type: 'success', text: 'Playbook created' });
+  };
+
+  const newPlaybookFields = [
+    { name: 'name', label: 'Name', required: true, placeholder: 'e.g. Phishing Triage' },
+    { name: 'description', label: 'Description', type: 'textarea' as const, placeholder: 'What does this playbook automate?' },
+    {
+      name: 'category',
+      label: 'Category',
+      type: 'select' as const,
+      defaultValue: 'custom',
+      options: [
+        { value: 'incident_response', label: 'Incident Response' },
+        { value: 'threat_hunting', label: 'Threat Hunting' },
+        { value: 'compliance', label: 'Compliance' },
+        { value: 'enrichment', label: 'Enrichment' },
+        { value: 'remediation', label: 'Remediation' },
+        { value: 'notification', label: 'Notification' },
+        { value: 'custom', label: 'Custom' },
+      ],
+    },
+    {
+      name: 'trigger_type',
+      label: 'Trigger Type',
+      type: 'select' as const,
+      defaultValue: 'manual',
+      options: [
+        { value: 'manual', label: 'Manual' },
+        { value: 'alert', label: 'Alert-based' },
+        { value: 'schedule', label: 'Scheduled' },
+        { value: 'webhook', label: 'Webhook' },
+        { value: 'event', label: 'Event-driven' },
+        { value: 'threshold', label: 'Threshold' },
+        { value: 'api_call', label: 'API Call' },
+      ],
+      help: 'Defaults to Manual; configure scheduling later in the builder.',
+    },
+  ];
 
   useEffect(() => {
     const loadData = async () => {
@@ -185,26 +236,10 @@ export default function PlaybookBuilder() {
             </div>
           </div>
           <button
-            disabled={actionLoading === 'create'}
-            onClick={() => {
-              const name = window.prompt('Playbook name:');
-              if (!name?.trim()) return;
-              (async () => {
-                setActionLoading('create');
-                try {
-                  const res = await api.post('/playbook-builder', { name: name.trim(), description: '', status: 'draft' });
-                  setPlaybooks((prev) => [...prev, res.data]);
-                  setNotification({ type: 'success', text: 'Playbook created' });
-                } catch (err) {
-                  setNotification({ type: 'error', text: 'Failed to create playbook' });
-                } finally {
-                  setActionLoading(null);
-                }
-              })();
-            }}
+            onClick={() => setShowCreateModal(true)}
             className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg transition disabled:opacity-50"
           >
-            {actionLoading === 'create' ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
+            <Plus className="w-4 h-4" />
             New Playbook
           </button>
         </div>
@@ -319,24 +354,10 @@ export default function PlaybookBuilder() {
                       Create your first visual playbook to automate security workflows.
                     </p>
                     <button
-                      disabled={actionLoading === 'create-first'}
-                      onClick={async () => {
-                        const pbName = window.prompt('Playbook name:');
-                        if (!pbName?.trim()) return;
-                        setActionLoading('create-first');
-                        try {
-                          const res = await api.post('/playbook-builder', { name: pbName.trim(), description: '', status: 'draft' });
-                          setPlaybooks((prev) => [...prev, res.data]);
-                          setNotification({ type: 'success', text: 'Playbook created' });
-                        } catch (err) {
-                          setNotification({ type: 'error', text: 'Failed to create playbook' });
-                        } finally {
-                          setActionLoading(null);
-                        }
-                      }}
+                      onClick={() => setShowCreateModal(true)}
                       className="inline-flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white px-6 py-3 rounded-lg transition disabled:opacity-50"
                     >
-                      {actionLoading === 'create-first' ? <Loader2 className="w-5 h-5 animate-spin" /> : <Plus className="w-5 h-5" />}
+                      <Plus className="w-5 h-5" />
                       Create Your First Playbook
                     </button>
                   </div>
@@ -904,6 +925,17 @@ export default function PlaybookBuilder() {
           </div>
         </div>
       )}
+
+      {/* New Playbook Modal */}
+      <FormModal
+        open={showCreateModal}
+        onClose={() => setShowCreateModal(false)}
+        title="New Playbook"
+        description="Create a new automation playbook. You can wire up nodes after it is created."
+        submitLabel="Create Playbook"
+        fields={newPlaybookFields}
+        onSubmit={createPlaybook}
+      />
     </div>
   );
 }
