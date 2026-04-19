@@ -31,7 +31,14 @@ import clsx from 'clsx';
 
 type TabType = 'readiness' | 'controls' | 'poam' | 'evidence' | 'documents';
 
-type ImplementationStatus = 'implemented' | 'partial' | 'not_implemented' | 'planned';
+type ImplementationStatus =
+  | 'implemented'
+  | 'partial'
+  | 'partially_implemented'
+  | 'not_implemented'
+  | 'planned'
+  | 'alternative'
+  | 'not_applicable';
 type Priority = 'P1' | 'P2' | 'P3';
 type RiskLevel = 'critical' | 'high' | 'moderate' | 'low';
 type ReadinessBadge = 'Ready' | 'In Progress' | 'Not Ready';
@@ -166,18 +173,30 @@ const PRIORITY_OPTIONS: { value: Priority | ''; label: string }[] = [
 function statusColor(status: ImplementationStatus): string {
   switch (status) {
     case 'implemented': return 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400';
-    case 'partial': return 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-400';
+    case 'partial':
+    case 'partially_implemented':
+      return 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-400';
     case 'planned': return 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400';
-    case 'not_implemented': return 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400';
+    case 'alternative': return 'bg-purple-100 text-purple-800 dark:bg-purple-900/30 dark:text-purple-400';
+    case 'not_applicable': return 'bg-gray-100 text-gray-700 dark:bg-gray-700 dark:text-gray-300';
+    case 'not_implemented':
+    default:
+      return 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400';
   }
 }
 
 function statusLabel(status: ImplementationStatus): string {
   switch (status) {
     case 'implemented': return 'Implemented';
-    case 'partial': return 'Partial';
+    case 'partial':
+    case 'partially_implemented':
+      return 'Partial';
     case 'planned': return 'Planned';
-    case 'not_implemented': return 'Not Implemented';
+    case 'alternative': return 'Alternative';
+    case 'not_applicable': return 'Not Applicable';
+    case 'not_implemented':
+    default:
+      return 'Not Implemented';
   }
 }
 
@@ -503,8 +522,17 @@ function ControlsTab() {
   const controls: FedRAMPControl[] = Array.isArray(controlsRaw) ? controlsRaw : (controlsRaw?.controls || []);
 
   const updateStatus = useMutation({
-    mutationFn: ({ id, status }: { id: string; status: ImplementationStatus }) =>
-      api.post(`/fedramp/controls/${id}/update`, { status }),
+    // Backend expects implementation_status as a query parameter (not a JSON body).
+    // Map the UI's "partial" → backend "partially_implemented" so the value
+    // satisfies FedRAMPGenerator.IMPLEMENTATION_STATUSES validation.
+    mutationFn: ({ id, status }: { id: string; status: ImplementationStatus }) => {
+      const backendStatus = status === 'partial' ? 'partially_implemented' : status;
+      return api.post(
+        `/fedramp/controls/${id}/update`,
+        null,
+        { params: { implementation_status: backendStatus } }
+      );
+    },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['fedramp', 'controls'] });
       queryClient.invalidateQueries({ queryKey: ['fedramp', 'readiness'] });
@@ -720,10 +748,14 @@ function ControlRow({
                   className="text-xs border border-gray-300 dark:border-gray-600 rounded px-2 py-1 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100"
                 >
                   <option value="">Select...</option>
+                  {/* Values must match backend FedRAMPGenerator.IMPLEMENTATION_STATUSES.
+                      'partial' is locally remapped to 'partially_implemented' inside
+                      the updateStatus mutation. */}
                   <option value="implemented">Implemented</option>
                   <option value="partial">Partial</option>
                   <option value="planned">Planned</option>
-                  <option value="not_implemented">Not Implemented</option>
+                  <option value="alternative">Alternative</option>
+                  <option value="not_applicable">Not Applicable</option>
                 </select>
                 <button
                   disabled={!pendingStatus || isUpdating}
@@ -920,12 +952,22 @@ function EvidenceTab() {
 
   const collectEvidence = useMutation({
     mutationFn: async (family: string) => {
-      // Evidence collection endpoint is not yet implemented on the backend.
-      // Refresh the status view instead.
-      return { message: `Evidence collection for ${family} is not yet available.` };
+      // Trigger all enabled automated evidence collection rules.
+      // The backend routes by rule config; we pass the family tag as metadata
+      // so logs/audit events record which family triggered the run.
+      const res = await api.post('/audit-evidence/evidence/collect-all', { family });
+      return res.data;
     },
-    onSuccess: () => {
+    onSuccess: (data: any) => {
+      const count = Array.isArray(data?.results) ? data.results.length : 0;
+      // eslint-disable-next-line no-alert
+      alert(`Evidence collection completed. ${count} rule(s) run.`);
       queryClient.invalidateQueries({ queryKey: ['fedramp', 'evidence', 'status'] });
+    },
+    onError: (err: any) => {
+      const msg = err?.response?.data?.detail || err?.message || 'Evidence collection failed';
+      // eslint-disable-next-line no-alert
+      alert(msg);
     },
   });
 
@@ -1064,19 +1106,19 @@ const FEDRAMP_DOCUMENTS: { type: string; name: string; description: string; endp
     type: 'irp',
     name: 'Incident Response Plan',
     description: 'Defines incident detection, reporting, handling, and recovery procedures aligned with FedRAMP IR controls.',
-    endpoint: '/fedramp/ssp/generate',
+    endpoint: '/fedramp/irp/generate',
   },
   {
     type: 'cmp',
     name: 'Configuration Management Plan',
     description: 'Establishes policies and procedures for managing configuration baselines and changes for the system.',
-    endpoint: '/fedramp/ssp/generate',
+    endpoint: '/fedramp/cmp/generate',
   },
   {
     type: 'conmon',
     name: 'Continuous Monitoring Plan',
     description: 'Describes continuous monitoring strategy including vulnerability scanning, log review, and ongoing authorization activities.',
-    endpoint: '/fedramp/ssp/generate',
+    endpoint: '/fedramp/conmon-plan/generate',
   },
 ];
 

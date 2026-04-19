@@ -546,6 +546,67 @@ class ConnectorRegistry:
         """Get detailed information about a connector"""
         return self.connectors.get(name)
 
+    async def seed_connectors_to_db(self) -> int:
+        """Upsert every in-memory registry connector into integration_connectors.
+
+        The ``installed_integrations.connector_id`` FK references
+        ``integration_connectors.id``, so an install request that uses a
+        registry name (e.g. "splunk") only works if a row with that
+        id literally exists. Idempotent — safe to run every startup.
+
+        Returns the number of rows inserted (not updates).
+        """
+        from src.core.database import async_session_factory
+        from src.integrations.models import IntegrationConnector
+        from sqlalchemy import select as _select
+
+        created = 0
+        async with async_session_factory() as db:
+            for name, cfg in self.connectors.items():
+                existing = await db.execute(
+                    _select(IntegrationConnector).where(
+                        IntegrationConnector.id == name
+                    )
+                )
+                row = existing.scalar_one_or_none()
+                auth_value = cfg.get("auth_type")
+                auth_str = (
+                    auth_value.value if hasattr(auth_value, "value") else str(auth_value or "api_key")
+                )
+                cat_value = cfg.get("category")
+                cat_str = (
+                    cat_value.value if hasattr(cat_value, "value") else str(cat_value or "threat_intel")
+                )
+                if row is None:
+                    row = IntegrationConnector(
+                        id=name,  # use the canonical name as the PK
+                        name=name,
+                        display_name=cfg.get("display_name") or name,
+                        description=cfg.get("description") or None,
+                        vendor=cfg.get("vendor") or None,
+                        category=cat_str,
+                        version=cfg.get("version", "1.0.0"),
+                        supported_actions=json.dumps(cfg.get("supported_actions") or []),
+                        supported_triggers=json.dumps(cfg.get("supported_triggers") or []),
+                        auth_type=auth_str,
+                        config_schema=cfg.get("config_schema")
+                        if isinstance(cfg.get("config_schema"), str)
+                        else json.dumps(cfg.get("config_schema") or {"type": "object"}),
+                        is_builtin=True,
+                        is_community=False,
+                    )
+                    db.add(row)
+                    created += 1
+                else:
+                    # Keep metadata aligned with the registry
+                    row.display_name = cfg.get("display_name") or row.display_name
+                    row.description = cfg.get("description") or row.description
+                    row.vendor = cfg.get("vendor") or row.vendor
+                    row.category = cat_str
+                    row.auth_type = auth_str
+            await db.commit()
+        return created
+
     def validate_connector_schema(self, name: str, config: dict[str, Any]) -> bool:
         """Validate configuration against connector schema"""
         connector = self.get_connector_details(name)

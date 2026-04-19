@@ -102,6 +102,17 @@ export default function ThreatHunting() {
   const [editHypothesisDescription, setEditHypothesisDescription] = useState('');
   const [editHypothesisPriority, setEditHypothesisPriority] = useState(3);
 
+  // Error banner for mutation failures
+  const [actionError, setActionError] = useState<string | null>(null);
+  const showError = (err: any) => {
+    const msg =
+      err?.response?.data?.detail ||
+      (typeof err?.response?.data === 'string' ? err.response.data : null) ||
+      err?.message ||
+      'Action failed';
+    setActionError(typeof msg === 'string' ? msg : JSON.stringify(msg));
+  };
+
   // Fetch hunting stats
   const { data: stats, isLoading: statsLoading } = useQuery({
     queryKey: ['hunting-stats'],
@@ -195,38 +206,34 @@ export default function ThreatHunting() {
   // Pause/Resume hunt mutation
   const toggleHuntMutation = useMutation({
     mutationFn: async ({ huntId, action }: { huntId: string; action: string }) => {
-      try {
       const response = await api.post(`/hunting/sessions/${huntId}/${action}`);
       return response.data;
-      } catch { return null; }
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['hunting-sessions'] });
       queryClient.invalidateQueries({ queryKey: ['hunting-stats'] });
     },
+    onError: (err: any) => showError(err),
   });
 
   // Cancel hunt mutation
   const cancelHuntMutation = useMutation({
     mutationFn: async (huntId: string) => {
-      try {
       const response = await api.post(`/hunting/sessions/${huntId}/cancel`);
       return response.data;
-      } catch { return null; }
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['hunting-sessions'] });
       queryClient.invalidateQueries({ queryKey: ['hunting-stats'] });
     },
+    onError: (err: any) => showError(err),
   });
 
   // Create hunt session mutation
   const createHuntMutation = useMutation({
     mutationFn: async (hypothesisId: string) => {
-      try {
       const response = await api.post('/hunting/sessions', { hypothesis_id: hypothesisId });
       return response.data;
-      } catch { return null; }
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['hunting-sessions'] });
@@ -234,15 +241,14 @@ export default function ThreatHunting() {
       setShowNewHuntModal(false);
       setNewHuntHypothesisId('');
     },
+    onError: (err: any) => showError(err),
   });
 
   // Create hypothesis mutation
   const createHypothesisMutation = useMutation({
     mutationFn: async (data: { title: string; description: string; priority: number }) => {
-      try {
       const response = await api.post('/hunting/hypotheses', data);
       return response.data;
-      } catch { return null; }
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['hunting-hypotheses'] });
@@ -252,48 +258,46 @@ export default function ThreatHunting() {
       setNewHypothesisDescription('');
       setNewHypothesisPriority(3);
     },
+    onError: (err: any) => showError(err),
   });
 
   // Instantiate template mutation
   const instantiateTemplateMutation = useMutation({
     mutationFn: async (templateId: string) => {
-      try {
       const response = await api.post(`/hunting/templates/${templateId}/instantiate`, {});
       return response.data;
-      } catch { return null; }
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['hunting-hypotheses'] });
       queryClient.invalidateQueries({ queryKey: ['hunting-stats'] });
       setActiveTab('hypotheses');
     },
+    onError: (err: any) => showError(err),
   });
 
   // Escalate finding mutation
   const escalateFindingMutation = useMutation({
     mutationFn: async (findingId: string) => {
-      try {
       const response = await api.post(`/hunting/findings/${findingId}/escalate`);
       return response.data;
-      } catch { return null; }
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['hunting-findings'] });
     },
+    onError: (err: any) => showError(err),
   });
 
   // Update hypothesis mutation
   const updateHypothesisMutation = useMutation({
     mutationFn: async ({ id, data }: { id: string; data: { title: string; description: string; priority: number } }) => {
-      try {
       const response = await api.put(`/hunting/hypotheses/${id}`, data);
       return response.data;
-      } catch { return null; }
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['hunting-hypotheses'] });
       setEditingHypothesis(null);
     },
+    onError: (err: any) => showError(err),
   });
 
   // Delete hypothesis mutation
@@ -304,6 +308,7 @@ export default function ThreatHunting() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['hunting-hypotheses'] });
     },
+    onError: (err: any) => showError(err),
   });
 
   // Activate hypothesis mutation
@@ -315,15 +320,14 @@ export default function ThreatHunting() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['hunting-hypotheses'] });
     },
+    onError: (err: any) => showError(err),
   });
 
   // Create notebook mutation
   const createNotebookMutation = useMutation({
     mutationFn: async (data: { title: string; description: string; session_id: string }) => {
-      try {
       const response = await api.post('/hunting/notebooks', data);
       return response.data;
-      } catch { return null; }
     },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['hunting-notebooks'] });
@@ -332,6 +336,7 @@ export default function ThreatHunting() {
       setNewNotebookDescription('');
       setNewNotebookSessionId('');
     },
+    onError: (err: any) => showError(err),
   });
 
   // Duplicate notebook mutation
@@ -346,6 +351,7 @@ export default function ThreatHunting() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['hunting-notebooks'] });
     },
+    onError: (err: any) => showError(err),
   });
 
   const tabs = [
@@ -371,6 +377,26 @@ export default function ThreatHunting() {
           <p className="text-gray-500 mt-1">Proactive threat detection and investigation</p>
         </div>
       </div>
+
+      {/* Error banner */}
+      {actionError && (
+        <div className="flex items-start justify-between p-4 rounded-lg border border-red-200 bg-red-50 text-red-800">
+          <div className="flex items-start space-x-2">
+            <AlertCircle className="w-5 h-5 mt-0.5 flex-shrink-0" />
+            <div className="text-sm">
+              <div className="font-semibold">Action failed</div>
+              <div className="mt-0.5 break-words">{actionError}</div>
+            </div>
+          </div>
+          <button
+            onClick={() => setActionError(null)}
+            className="text-red-600 hover:text-red-800 ml-4"
+            aria-label="Dismiss error"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
 
       {/* Tab Navigation */}
       <div className="bg-white rounded-lg border border-gray-200">
@@ -1435,8 +1461,9 @@ export default function ThreatHunting() {
                           a.download = `notebook-${notebook.id.slice(0, 8)}.json`;
                           a.click();
                           URL.revokeObjectURL(url);
-                        } catch (err) {
+                        } catch (err: any) {
                           console.error('Export failed:', err);
+                          showError(err);
                         }
                       }}
                       className="px-3 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50"

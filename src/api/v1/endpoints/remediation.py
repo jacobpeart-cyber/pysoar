@@ -481,6 +481,12 @@ async def reject_execution(
     if not execution or execution.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
+    if execution.approval_status != "pending":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Execution not in pending approval state"
+        )
+
     engine = RemediationEngine(db)
     await engine.reject_execution(execution_id, request.approver_id, request.reason)
 

@@ -393,7 +393,15 @@ async def clone_playbook(
 
     db.add(cloned)
     await db.commit()
-    await db.refresh(cloned)
+
+    # Re-fetch with eager loading to avoid lazy-load greenlet crash
+    result = await db.execute(
+        select(VisualPlaybook).options(
+            selectinload(VisualPlaybook.nodes),
+            selectinload(VisualPlaybook.edges),
+        ).where(VisualPlaybook.id == cloned.id)
+    )
+    cloned = result.scalar_one()
 
     logger.info(f"Cloned playbook {playbook_id} to {cloned.id}")
     return _playbook_to_response(cloned)
@@ -753,7 +761,15 @@ async def create_from_template(
 
     db.add(playbook)
     await db.commit()
-    await db.refresh(playbook)
+
+    # Re-fetch with eager loading to avoid lazy-load greenlet crash
+    result = await db.execute(
+        select(VisualPlaybook).options(
+            selectinload(VisualPlaybook.nodes),
+            selectinload(VisualPlaybook.edges),
+        ).where(VisualPlaybook.id == playbook.id)
+    )
+    playbook = result.scalar_one()
 
     logger.info(f"Created playbook from template {template_id}")
     return _playbook_to_response(playbook)

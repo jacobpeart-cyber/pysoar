@@ -222,33 +222,45 @@ async def upload_evidence_file(
 
     hasher = hashlib.sha512()
     total_bytes = 0
-    with open(dest_path, "wb") as f:
-        while True:
-            chunk = await file.read(1024 * 1024)
-            if not chunk:
-                break
-            total_bytes += len(chunk)
-            hasher.update(chunk)
-            f.write(chunk)
+    file_written = False
+    try:
+        with open(dest_path, "wb") as f:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                total_bytes += len(chunk)
+                hasher.update(chunk)
+                f.write(chunk)
+        file_written = True
 
-    evidence = ComplianceEvidence(
-        control_id_ref=control_id,
-        evidence_type=evidence_type,
-        title=title,
-        description=description or None,
-        file_path=dest_path,
-        file_hash=hasher.hexdigest(),
-        collected_at=datetime.now(timezone.utc),
-        collected_by=getattr(current_user, "full_name", None) or getattr(current_user, "email", "unknown"),
-        is_automated=False,
-        is_valid=True,
-        review_status="pending",
-        tags=[],
-        organization_id=org_id,
-    )
-    db.add(evidence)
-    await db.flush()
-    await db.refresh(evidence)
+        evidence = ComplianceEvidence(
+            control_id_ref=control_id,
+            evidence_type=evidence_type,
+            title=title,
+            description=description or None,
+            file_path=dest_path,
+            file_hash=hasher.hexdigest(),
+            collected_at=datetime.now(timezone.utc),
+            collected_by=getattr(current_user, "full_name", None) or getattr(current_user, "email", "unknown"),
+            is_automated=False,
+            is_valid=True,
+            review_status="pending",
+            tags=[],
+            organization_id=org_id,
+        )
+        db.add(evidence)
+        await db.flush()
+        await db.refresh(evidence)
+    except Exception:
+        # Roll back the disk write if the DB insert (or anything else) fails
+        # so we don't leak an orphan file with no row referencing it.
+        if file_written:
+            try:
+                os.remove(dest_path)
+            except OSError:
+                logger.warning(f"Failed to remove orphan evidence file: {dest_path}")
+        raise
 
     return {
         "status": "uploaded",

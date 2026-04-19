@@ -198,6 +198,82 @@ async def export_ssp(
 
 
 # ============================================================================
+# IRP / CMP / ConMon Plan Generation
+# ============================================================================
+
+
+@router.get("/irp/generate")
+async def generate_irp(
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
+    org_name: str = Query("PySOAR Inc.", description="Organization name"),
+    system_name: str = Query("PySOAR", description="System name"),
+) -> Dict[str, Any]:
+    """Generate a FedRAMP Incident Response Plan (IR control family).
+
+    Returns a JSON document structured to meet NIST 800-61r2 and FedRAMP
+    IR control requirements. Content is sourced from the IR family of the
+    Moderate baseline with per-tenant implementation status.
+    """
+    try:
+        controls = await _generator.get_control_implementation_status(
+            db, organization_id=getattr(current_user, "organization_id", None)
+        )
+        doc = _generator.generate_irp(org_name, system_name, controls)
+        return doc
+    except Exception as exc:
+        logger.error(f"Error generating IRP: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate Incident Response Plan",
+        )
+
+
+@router.get("/cmp/generate")
+async def generate_cmp(
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
+    org_name: str = Query("PySOAR Inc.", description="Organization name"),
+    system_name: str = Query("PySOAR", description="System name"),
+) -> Dict[str, Any]:
+    """Generate a FedRAMP Configuration Management Plan (CM control family)."""
+    try:
+        controls = await _generator.get_control_implementation_status(
+            db, organization_id=getattr(current_user, "organization_id", None)
+        )
+        doc = _generator.generate_cmp(org_name, system_name, controls)
+        return doc
+    except Exception as exc:
+        logger.error(f"Error generating CMP: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate Configuration Management Plan",
+        )
+
+
+@router.get("/conmon-plan/generate")
+async def generate_conmon_plan(
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
+    org_name: str = Query("PySOAR Inc.", description="Organization name"),
+    system_name: str = Query("PySOAR", description="System name"),
+) -> Dict[str, Any]:
+    """Generate a FedRAMP Continuous Monitoring Plan (CA and SI control families)."""
+    try:
+        controls = await _generator.get_control_implementation_status(
+            db, organization_id=getattr(current_user, "organization_id", None)
+        )
+        doc = _generator.generate_conmon_plan(org_name, system_name, controls)
+        return doc
+    except Exception as exc:
+        logger.error(f"Error generating ConMon Plan: {exc}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate Continuous Monitoring Plan",
+        )
+
+
+# ============================================================================
 # POA&M
 # ============================================================================
 

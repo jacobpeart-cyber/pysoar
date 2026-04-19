@@ -417,6 +417,10 @@ async def update_hypothesis(
 
     update_data = hypothesis_data.model_dump(exclude_unset=True, exclude_none=True)
 
+    # Coerce priority to string (DB column is VARCHAR)
+    if "priority" in update_data and update_data["priority"] is not None:
+        update_data["priority"] = str(update_data["priority"])
+
     # Handle JSON serialization
     if "mitre_tactics" in update_data:
         update_data["mitre_tactics"] = json.dumps(update_data["mitre_tactics"])
@@ -935,7 +939,7 @@ async def instantiate_template(
         title=parameters.get("title", template.name),
         description=template.hypothesis_template,
         hunt_type=template.hunt_type,
-        priority=parameters.get("priority", 3),
+        priority=str(parameters.get("priority", 3)),
         mitre_tactics=template.mitre_tactics,
         mitre_techniques=template.mitre_techniques,
         tags=json.dumps(template.tags) if template.tags else None,

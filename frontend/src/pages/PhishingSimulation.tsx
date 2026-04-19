@@ -373,18 +373,47 @@ export default function PhishingSimulation() {
                         <h3 className="text-lg font-semibold text-white mb-2">{campaign.name}</h3>
                         <p className="text-sm text-gray-400">{campaign.campaign_type} | Sent: {(campaign.emails_sent || 0).toLocaleString()}</p>
                       </div>
-                      <span
-                        className={clsx(
-                          'px-3 py-1 rounded text-xs font-medium',
-                          campaign.status === 'active' || campaign.status === 'running'
-                            ? 'bg-green-900/40 text-green-300'
-                            : campaign.status === 'completed'
-                              ? 'bg-blue-900/40 text-blue-300'
-                              : 'bg-gray-900/40 text-gray-300'
+                      <div className="flex items-center gap-2">
+                        {(campaign.status === 'draft' || campaign.status === 'scheduled') && (
+                          <button
+                            onClick={async (e) => {
+                              e.stopPropagation();
+                              try {
+                                // Resolve total_targets — either from the campaign's
+                                // linked target group, a prior field, or prompt the user.
+                                let totalTargets = (campaign as any).total_targets || 0;
+                                if (!totalTargets) {
+                                  const entered = window.prompt('How many targets to include in this launch?', '10');
+                                  totalTargets = parseInt(entered || '0', 10);
+                                }
+                                if (!totalTargets || totalTargets < 1) return;
+                                await api.post(`/phishing_sim/campaigns/${campaign.id}/launch`, {
+                                  total_targets: totalTargets,
+                                });
+                                queryClient.invalidateQueries({ queryKey: ['phishing-campaigns'] });
+                              } catch (err: any) {
+                                const msg = err?.response?.data?.detail || err?.message || 'Failed to launch campaign';
+                                alert(msg);
+                              }
+                            }}
+                            className="px-3 py-1 rounded text-xs font-medium bg-green-600 hover:bg-green-700 text-white transition-colors"
+                          >
+                            Launch
+                          </button>
                         )}
-                      >
-                        {campaign.status}
-                      </span>
+                        <span
+                          className={clsx(
+                            'px-3 py-1 rounded text-xs font-medium',
+                            campaign.status === 'active' || campaign.status === 'running'
+                              ? 'bg-green-900/40 text-green-300'
+                              : campaign.status === 'completed'
+                                ? 'bg-blue-900/40 text-blue-300'
+                                : 'bg-gray-900/40 text-gray-300'
+                          )}
+                        >
+                          {campaign.status}
+                        </span>
+                      </div>
                     </div>
 
                     <div className="grid grid-cols-5 gap-4">

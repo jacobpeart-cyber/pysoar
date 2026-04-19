@@ -1151,6 +1151,16 @@ function PackagesTab({
   loading: boolean;
 }) {
   const queryClient = useQueryClient();
+  const [showCreatePkg, setShowCreatePkg] = useState(false);
+  const [pkgName, setPkgName] = useState('');
+  const [pkgDescription, setPkgDescription] = useState('');
+  const [pkgType, setPkgType] = useState<string>('custom');
+  const [pkgFrameworkId, setPkgFrameworkId] = useState('');
+  const [pkgAssessor, setPkgAssessor] = useState('');
+  const [pkgDueDate, setPkgDueDate] = useState('');
+  const [pkgError, setPkgError] = useState<string | null>(null);
+  const [creatingPkg, setCreatingPkg] = useState(false);
+
   if (loading) {
     return (
       <div className="flex items-center justify-center h-64">
@@ -1159,25 +1169,170 @@ function PackagesTab({
     );
   }
 
+  const isUuid = (s: string) =>
+    /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(s);
+
   return (
     <div className="space-y-6">
       {/* Create Package Button */}
       <button
-        onClick={async () => {
-          try {
-            await api.post('/audit-evidence/packages/create', {
-              name: `Evidence Package ${new Date().toLocaleDateString()}`,
-              description: 'Audit evidence package',
-              framework: 'NIST 800-53',
-            });
-            queryClient.invalidateQueries({ queryKey: ['audit-packages'] });
-          } catch (err) { console.error('Create package failed:', err); }
+        onClick={() => {
+          setPkgName(`Evidence Package ${new Date().toLocaleDateString()}`);
+          setPkgDescription('');
+          setPkgType('custom');
+          setPkgFrameworkId('');
+          setPkgAssessor('');
+          setPkgDueDate('');
+          setPkgError(null);
+          setShowCreatePkg(true);
         }}
         className="inline-flex items-center gap-2 px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium"
       >
         <Plus className="w-5 h-5" />
         Create Package
       </button>
+
+      {showCreatePkg && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4" role="dialog" aria-modal="true">
+          <div
+            className="absolute inset-0 bg-black/50 backdrop-blur-sm"
+            onClick={() => !creatingPkg && setShowCreatePkg(false)}
+          />
+          <div className="relative w-full max-w-lg bg-white dark:bg-gray-900 rounded-lg shadow-2xl border border-gray-200 dark:border-gray-700">
+            <div className="px-6 py-4 border-b border-gray-200 dark:border-gray-700">
+              <h2 className="text-lg font-semibold text-gray-900 dark:text-white">Create Evidence Package</h2>
+              <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                Bundle evidence artifacts for an audit, ConMon cycle, or assessment.
+              </p>
+            </div>
+            <form
+              onSubmit={async (e) => {
+                e.preventDefault();
+                if (!pkgName.trim()) {
+                  setPkgError('Name is required');
+                  return;
+                }
+                setCreatingPkg(true);
+                setPkgError(null);
+                try {
+                  const payload: Record<string, any> = {
+                    name: pkgName.trim(),
+                    description: pkgDescription || undefined,
+                    package_type: pkgType,
+                  };
+                  if (pkgFrameworkId && isUuid(pkgFrameworkId.trim())) {
+                    payload.framework_id = pkgFrameworkId.trim();
+                  }
+                  if (pkgAssessor.trim()) payload.assessor = pkgAssessor.trim();
+                  if (pkgDueDate) payload.due_date = new Date(pkgDueDate).toISOString();
+                  await api.post('/audit-evidence/packages/create', payload);
+                  queryClient.invalidateQueries({ queryKey: ['audit-packages'] });
+                  setShowCreatePkg(false);
+                } catch (err: any) {
+                  setPkgError(err?.response?.data?.detail || err?.message || 'Failed to create package');
+                } finally {
+                  setCreatingPkg(false);
+                }
+              }}
+            >
+              <div className="px-6 py-5 space-y-4 max-h-[60vh] overflow-y-auto">
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                    Name <span className="text-red-500">*</span>
+                  </label>
+                  <input
+                    type="text"
+                    value={pkgName}
+                    onChange={(e) => setPkgName(e.target.value)}
+                    className="w-full px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100"
+                    required
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Description</label>
+                  <textarea
+                    rows={2}
+                    value={pkgDescription}
+                    onChange={(e) => setPkgDescription(e.target.value)}
+                    className="w-full px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                    Package Type <span className="text-red-500">*</span>
+                  </label>
+                  <select
+                    value={pkgType}
+                    onChange={(e) => setPkgType(e.target.value)}
+                    className="w-full px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100"
+                  >
+                    <option value="fedramp_conmon">FedRAMP ConMon</option>
+                    <option value="cmmc_assessment">CMMC Assessment</option>
+                    <option value="soc2_audit">SOC 2 Audit</option>
+                    <option value="hipaa_audit">HIPAA Audit</option>
+                    <option value="pci_audit">PCI Audit</option>
+                    <option value="custom">Custom</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Framework ID (optional)</label>
+                  <input
+                    type="text"
+                    value={pkgFrameworkId}
+                    onChange={(e) => setPkgFrameworkId(e.target.value)}
+                    placeholder="UUID of compliance framework (only sent if valid UUID)"
+                    className="w-full px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100"
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Assessor</label>
+                    <input
+                      type="text"
+                      value={pkgAssessor}
+                      onChange={(e) => setPkgAssessor(e.target.value)}
+                      placeholder="Optional"
+                      className="w-full px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Due Date</label>
+                    <input
+                      type="date"
+                      value={pkgDueDate}
+                      onChange={(e) => setPkgDueDate(e.target.value)}
+                      className="w-full px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100"
+                    />
+                  </div>
+                </div>
+                {pkgError && (
+                  <div className="px-3 py-2 rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 text-sm text-red-700 dark:text-red-300">
+                    {pkgError}
+                  </div>
+                )}
+              </div>
+              <div className="border-t border-gray-200 dark:border-gray-700 px-6 py-4 flex items-center justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowCreatePkg(false)}
+                  disabled={creatingPkg}
+                  className="px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-300 bg-white dark:bg-gray-800 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700 disabled:opacity-50"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={creatingPkg}
+                  className="px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg hover:bg-blue-700 disabled:opacity-50 flex items-center gap-2"
+                >
+                  {creatingPkg && <Loader2 className="w-4 h-4 animate-spin" />}
+                  Create Package
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
 
       {/* Package Cards */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">

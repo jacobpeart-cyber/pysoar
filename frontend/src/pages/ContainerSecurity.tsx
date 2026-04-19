@@ -133,8 +133,12 @@ export default function ContainerSecurity() {
   });
 
   const auditClusterMutation = useMutation({
+    // Backend audit_cluster expects a ClusterAuditRequest body. Send the minimal
+    // valid payload so the request validates and the audit kicks off.
     mutationFn: async (clusterId: string) => {
-      const res = await api.post(`/container-security/clusters/${clusterId}/audit`);
+      const res = await api.post(`/container-security/clusters/${clusterId}/audit`, {
+        audit_type: 'full',
+      });
       return res.data;
     },
     onSuccess: () => {
@@ -143,8 +147,9 @@ export default function ContainerSecurity() {
   });
 
   const remediateFindingMutation = useMutation({
+    // Endpoint requires a JSON body even when empty — sending no body causes a 422.
     mutationFn: async (findingId: string) => {
-      const res = await api.post(`/container-security/findings/${findingId}/remediate`);
+      const res = await api.post(`/container-security/findings/${findingId}/remediate`, {});
       return res.data;
     },
     onSuccess: () => {

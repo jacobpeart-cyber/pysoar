@@ -2,10 +2,10 @@
 
 import json
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, Union
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -33,19 +33,21 @@ class APIKeyResponse(BaseModel):
 
     id: str
     name: str
-    description: Optional[str]
+    description: Optional[str] = None
     key_prefix: str
     permissions: list[str]
-    allowed_ips: Optional[list[str]]
+    allowed_ips: Optional[list[str]] = None
     rate_limit: int
     is_active: bool
-    expires_at: Optional[str]
-    last_used_at: Optional[str]
+    # expires_at / last_used_at columns are stored as ISO strings in the DB;
+    # created_at is a real datetime column. Accept both for robustness and
+    # let Pydantic serialize.
+    expires_at: Optional[Union[datetime, str]] = None
+    last_used_at: Optional[Union[datetime, str]] = None
     usage_count: int
-    created_at: str
+    created_at: Union[datetime, str]
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class APIKeyCreatedResponse(APIKeyResponse):

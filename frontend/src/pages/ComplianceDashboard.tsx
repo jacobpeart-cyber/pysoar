@@ -1034,14 +1034,20 @@ function POAMsTab({
           },
         ]}
         onSubmit={async (values) => {
+          // Map UI fields → backend POAMCreateRequest schema
+          //  title                → weakness_name
+          //  control_id           → control_id_ref
+          //  severity             → risk_level
+          // weakness_source defaults to 'self_identified' (assessment, audit,
+          // self_identified, vulnerability_scan, etc.)
           await api.post('/compliance/poams', {
-            title: values.title,
+            weakness_name: values.title,
             weakness_description: values.weakness_description,
-            control_id: values.control_id,
-            severity: values.severity,
-            status: 'open',
+            control_id_ref: values.control_id,
+            weakness_source: 'self_identified',
+            risk_level: values.severity,
             scheduled_completion_date: values.scheduled_completion_date || undefined,
-            responsible_party: values.responsible_party || undefined,
+            assigned_to: values.responsible_party || undefined,
           });
           queryClient.invalidateQueries({ queryKey: ['compliance-poams'] });
         }}

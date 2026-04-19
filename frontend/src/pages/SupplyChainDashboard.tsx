@@ -58,6 +58,8 @@ export default function SupplyChainDashboard() {
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
   const [showNewComponentModal, setShowNewComponentModal] = useState(false);
+  const [showGenerateSBOMModal, setShowGenerateSBOMModal] = useState(false);
+  const [editingSBOM, setEditingSBOM] = useState<any | null>(null);
   const [selectedSBOM, setSelectedSBOM] = useState<any | null>(null);
   const [selectedComponent, setSelectedComponent] = useState<any | null>(null);
   const [selectedVendor, setSelectedVendor] = useState<any | null>(null);
@@ -191,6 +193,20 @@ export default function SupplyChainDashboard() {
             {/* SBOMs Tab */}
             {activeTab === 'sboms' && (
               <div className="space-y-6">
+                <div className="flex justify-end">
+                  <button
+                    onClick={() => setShowGenerateSBOMModal(true)}
+                    className="flex items-center gap-2 bg-purple-600 hover:bg-purple-700 text-white px-4 py-2 rounded-lg transition"
+                  >
+                    <Plus className="w-4 h-4" />
+                    Generate SBOM
+                  </button>
+                </div>
+                {sboms.length === 0 && (
+                  <div className="text-center text-gray-500 dark:text-gray-400 py-6 border border-dashed border-gray-300 dark:border-gray-700 rounded-lg">
+                    No SBOMs yet. Click "Generate SBOM" to create one.
+                  </div>
+                )}
                 <div className="grid grid-cols-1 gap-4">
                   {sboms.map((sbom) => (
                     <div key={sbom.id} className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4 hover:shadow-lg transition">
@@ -258,7 +274,7 @@ export default function SupplyChainDashboard() {
                           Download
                         </button>
                         <button
-                          onClick={() => setSelectedSBOM(sbom)}
+                          onClick={() => setEditingSBOM(sbom)}
                           className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition"
                         >
                           Edit
@@ -500,6 +516,103 @@ export default function SupplyChainDashboard() {
               <div className="flex gap-2 mt-6">
                 <button type="button" onClick={() => setShowNewComponentModal(false)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
                 <button type="submit" className="flex-1 px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg transition">Add</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Generate SBOM Modal */}
+      {showGenerateSBOMModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" onClick={() => setShowGenerateSBOMModal(false)}>
+          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-96 max-h-screen overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+            <h2 className="text-xl font-bold mb-4">Generate SBOM</h2>
+            <form className="space-y-4" onSubmit={async (e) => {
+              e.preventDefault();
+              const fd = new FormData(e.currentTarget);
+              try {
+                await api.post('/supplychain/sboms/generate', {
+                  name: fd.get('name'),
+                  application_name: fd.get('application_name'),
+                  application_version: fd.get('application_version') || '1.0',
+                  sbom_format: fd.get('sbom_format') || 'cyclonedx_json',
+                  spec_version: fd.get('spec_version') || '1.5',
+                });
+                setShowGenerateSBOMModal(false);
+                loadData();
+              } catch (err: any) {
+                console.error('Generate SBOM failed:', err);
+                alert(err?.response?.data?.detail || 'Failed to generate SBOM');
+              }
+            }}>
+              <div>
+                <label className="block text-sm font-medium mb-1">SBOM Name</label>
+                <input name="name" required type="text" placeholder="PySOAR Production SBOM" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Application Name</label>
+                <input name="application_name" required type="text" placeholder="PySOAR" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Version</label>
+                <input name="application_version" type="text" placeholder="1.0" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Format</label>
+                <select name="sbom_format" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700">
+                  <option value="cyclonedx_json">CycloneDX JSON</option>
+                  <option value="spdx_json">SPDX JSON</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Spec Version</label>
+                <input name="spec_version" type="text" defaultValue="1.5" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700" />
+              </div>
+              <div className="flex gap-2 mt-6">
+                <button type="button" onClick={() => setShowGenerateSBOMModal(false)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
+                <button type="submit" className="flex-1 px-4 py-2 bg-purple-600 hover:bg-purple-700 text-white rounded-lg transition">Generate</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Edit SBOM Modal */}
+      {editingSBOM && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" onClick={() => setEditingSBOM(null)}>
+          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-96 max-h-screen overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+            <h2 className="text-xl font-bold mb-4">Edit SBOM</h2>
+            <form className="space-y-4" onSubmit={async (e) => {
+              e.preventDefault();
+              const fd = new FormData(e.currentTarget);
+              try {
+                await api.patch(`/supplychain/sboms/${editingSBOM.id}`, {
+                  name: fd.get('name'),
+                  compliance_status: fd.get('compliance_status') || undefined,
+                });
+                setEditingSBOM(null);
+                loadData();
+              } catch (err: any) {
+                console.error('Edit SBOM failed:', err);
+                alert(err?.response?.data?.detail || 'Failed to update SBOM');
+              }
+            }}>
+              <div>
+                <label className="block text-sm font-medium mb-1">Name</label>
+                <input name="name" required type="text" defaultValue={editingSBOM.name || ''} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Compliance Status</label>
+                <select name="compliance_status" defaultValue={editingSBOM.compliance_status || 'compliant'} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700">
+                  <option value="compliant">compliant</option>
+                  <option value="non_compliant">non_compliant</option>
+                  <option value="unknown">unknown</option>
+                </select>
+              </div>
+              <p className="text-xs text-gray-500 dark:text-gray-400">Only name and compliance_status are updatable. Version/format changes require regenerating the SBOM.</p>
+              <div className="flex gap-2 mt-6">
+                <button type="button" onClick={() => setEditingSBOM(null)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
+                <button type="submit" className="flex-1 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition">Save</button>
               </div>
             </form>
           </div>

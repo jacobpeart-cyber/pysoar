@@ -1381,3 +1381,114 @@ async def get_risk_overview(
         ],
         compliance_status=compliance_status,
     )
+
+
+# ============================================================================
+# Edit endpoints for exposure / anomaly / privileged-access
+# (threat update already exists at PUT /threats/{threat_id})
+# ============================================================================
+
+
+@router.put(
+    "/credential-exposures/{exposure_id}",
+    response_model=CredentialExposureResponse,
+)
+async def update_credential_exposure(
+    exposure_id: str,
+    data: CredentialExposureUpdate,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+):
+    """Update a single credential exposure record (tenant-scoped).
+
+    Backs the ITDR dashboard's "Edit" modal so analysts can flip
+    ``is_remediated``, set a ``remediation_action`` string, or adjust
+    the ``remediation_date`` without going through the bulk
+    remediate endpoint.
+    """
+    org_id = getattr(current_user, "organization_id", None)
+    result = await db.execute(
+        select(CredentialExposure).where(
+            and_(
+                CredentialExposure.id == exposure_id,
+                CredentialExposure.organization_id == org_id,
+            )
+        )
+    )
+    exposure = result.scalar_one_or_none()
+    if not exposure:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Credential exposure not found",
+        )
+    for field, value in data.dict(exclude_unset=True).items():
+        setattr(exposure, field, value)
+    await db.commit()
+    await db.refresh(exposure)
+    logger.info(f"Credential exposure updated: {exposure_id}")
+    return CredentialExposureResponse.model_validate(exposure)
+
+
+@router.put("/anomalies/{anomaly_id}", response_model=AccessAnomalyResponse)
+async def update_access_anomaly(
+    anomaly_id: str,
+    data: AccessAnomalyUpdate,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+):
+    """Update an access anomaly record (tenant-scoped)."""
+    org_id = getattr(current_user, "organization_id", None)
+    result = await db.execute(
+        select(AccessAnomaly).where(
+            and_(
+                AccessAnomaly.id == anomaly_id,
+                AccessAnomaly.organization_id == org_id,
+            )
+        )
+    )
+    anomaly = result.scalar_one_or_none()
+    if not anomaly:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Access anomaly not found",
+        )
+    for field, value in data.dict(exclude_unset=True).items():
+        setattr(anomaly, field, value)
+    await db.commit()
+    await db.refresh(anomaly)
+    logger.info(f"Access anomaly updated: {anomaly_id}")
+    return AccessAnomalyResponse.model_validate(anomaly)
+
+
+@router.put(
+    "/privileged-access/{event_id}",
+    response_model=PrivilegedAccessEventResponse,
+)
+async def update_privileged_access_event(
+    event_id: str,
+    data: PrivilegedAccessEventUpdate,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+):
+    """Update a privileged access event (tenant-scoped)."""
+    org_id = getattr(current_user, "organization_id", None)
+    result = await db.execute(
+        select(PrivilegedAccessEvent).where(
+            and_(
+                PrivilegedAccessEvent.id == event_id,
+                PrivilegedAccessEvent.organization_id == org_id,
+            )
+        )
+    )
+    event = result.scalar_one_or_none()
+    if not event:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Privileged access event not found",
+        )
+    for field, value in data.dict(exclude_unset=True).items():
+        setattr(event, field, value)
+    await db.commit()
+    await db.refresh(event)
+    logger.info(f"Privileged access event updated: {event_id}")
+    return PrivilegedAccessEventResponse.model_validate(event)
