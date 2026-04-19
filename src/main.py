@@ -148,7 +148,12 @@ from src.core.rate_limiter import InMemoryRateLimiter
 _global_limiter = InMemoryRateLimiter()
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
-    """Global API rate limiting - 100 requests per minute per IP."""
+    """Global API rate limiting. SOC dashboards load many widgets in
+    parallel on every page switch, so the per-IP cap has to be generous
+    enough that a single operator browsing doesn't get throttled —
+    600/min ≈ 10/s, which still blunts a runaway client or scraper.
+    Authenticated per-endpoint throttles tighten down the sensitive ops
+    (see @rate_limit decorators in src/core/rate_limiter.py)."""
     async def dispatch(self, request, call_next):
         # Skip WebSocket connections — BaseHTTPMiddleware breaks them
         if request.url.path.endswith("/ws"):
@@ -156,13 +161,13 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if request.url.path.startswith("/api/"):
             client_ip = request.client.host if request.client else "unknown"
             key = f"global:{client_ip}"
-            allowed, info = _global_limiter.check_rate_limit(key, max_requests=100, window_seconds=60)
+            allowed, retry_after = _global_limiter.check_rate_limit(key, max_requests=600, window_seconds=60)
             if not allowed:
                 from fastapi.responses import JSONResponse
                 return JSONResponse(
                     status_code=429,
                     content={"detail": "Rate limit exceeded. Please slow down."},
-                    headers={"Retry-After": str(info.get("retry_after", 60))},
+                    headers={"Retry-After": str(retry_after or 60)},
                 )
         return await call_next(request)
 

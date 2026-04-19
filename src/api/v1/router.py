@@ -7,6 +7,7 @@ from src.api.v1.endpoints import (
     agents,
     ai,
     alerts,
+    aliases,
     api_keys,
     api_security,
     assets,
@@ -129,3 +130,8 @@ api_router.include_router(websocket.router, tags=["websocket"])
 
 # --- Agent Platform (unified BAS execution + Live Response + Purple Team) ---
 api_router.include_router(agents.router, tags=["agents"])
+
+# --- Frontend-compat route aliases (flat lists + dash/underscore mirrors) ---
+# Must be mounted LAST so canonical routes win when both match. See
+# `src/api/v1/endpoints/aliases.py` for the route list and rationale.
+api_router.include_router(aliases.router, tags=["aliases"])

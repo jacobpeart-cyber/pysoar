@@ -221,6 +221,23 @@ async def list_threat_models(
     )
 
 
+@router.get("/models", response_model=ThreatModelListResponse)
+async def list_threat_models_alias(
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+    page: int = Query(1, ge=1),
+    size: int = Query(20, ge=1, le=100),
+):
+    """Alias for `GET /threat-modeling` — some frontend callers use
+    `/threat-modeling/models`. Must be declared before `/{model_id}` so
+    FastAPI doesn't treat the literal string "models" as a UUID."""
+    return await list_threat_models(
+        current_user=current_user, db=db, page=page, size=size,
+        search=None, status=None, methodology=None,
+        sort_by="created_at", sort_order="desc",
+    )
+
+
 @router.get("/{model_id}", response_model=ThreatModelResponse)
 async def get_threat_model(
     current_user: CurrentUser = None,
