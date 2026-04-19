@@ -223,15 +223,26 @@ async def scan_image(
     if not image:
         raise HTTPException(status_code=404, detail="Image not found")
 
-    # Run the actual scanner
+    # Run the actual scanner. If the scanner itself blows up, mark the scan
+    # as failed on the row rather than pretending it succeeded.
     scanner = ImageScanner()
-    scan_result = await scanner.scan_image(
-        registry=image.registry or "docker.io",
-        repository=image.repository or "",
-        tag=image.tag or "latest",
-        digest=image.digest_sha256 or "",
-        db=db,
-    )
+    try:
+        scan_result = await scanner.scan_image(
+            registry=image.registry or "docker.io",
+            repository=image.repository or "",
+            tag=image.tag or "latest",
+            digest=image.digest_sha256 or "",
+            db=db,
+        )
+    except Exception as scan_exc:
+        logger.error(f"Image scan failed for {image_id}: {scan_exc}")
+        image.scanned_at = datetime.now(timezone.utc)
+        image.compliance_status = "scan_failed"
+        await db.commit()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Image scan failed: {scan_exc}",
+        )
 
     # Persist new vulnerabilities that aren't already in the DB (defense in depth)
     existing_stmt = select(ImageVulnerability.cve_id).where(
@@ -258,18 +269,31 @@ async def scan_image(
                 organization_id=org_id,
             ))
 
-    # Update image record with scan results
-    image.critical_count = scan_result["vulnerability_count_critical"]
-    image.high_count = scan_result["vulnerability_count_high"]
-    image.medium_count = scan_result["vulnerability_count_medium"]
-    image.low_count = scan_result["vulnerability_count_low"]
+    # Recompute severity counts from the authoritative vuln list (scanner
+    # returns same data, but this guards against any scanner bug where the
+    # aggregate counters and the per-vuln list disagree).
+    vulns_list = scan_result.get("vulnerabilities", [])
+    critical_n = sum(1 for v in vulns_list if v.get("severity") == "critical")
+    high_n = sum(1 for v in vulns_list if v.get("severity") == "high")
+    medium_n = sum(1 for v in vulns_list if v.get("severity") == "medium")
+    low_n = sum(1 for v in vulns_list if v.get("severity") == "low")
+
+    # Persist counts onto the ACTUAL columns on ContainerImage (see
+    # src/container_security/models.py). Previously these were being
+    # assigned to `critical_count` / `high_count` / etc. which are not
+    # mapped columns, so SQLAlchemy silently dropped them on commit and
+    # the dashboard always read zeros.
+    image.vulnerability_count_critical = critical_n
+    image.vulnerability_count_high = high_n
+    image.vulnerability_count_medium = medium_n
+    image.vulnerability_count_low = low_n
     image.scanned_at = scan_result["scanned_at"]
     image.risk_score = scanner.calculate_image_risk_score(
-        image.critical_count, image.high_count, image.medium_count,
+        critical_n, high_n, medium_n,
         bool(image.is_signed), bool(image.sbom_generated),
     )
     image.compliance_status = (
-        "compliant" if image.critical_count == 0 and image.high_count == 0
+        "compliant" if critical_n == 0 and high_n == 0
         else "non_compliant"
     )
 

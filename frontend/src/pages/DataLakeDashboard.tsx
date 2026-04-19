@@ -29,10 +29,30 @@ export default function DataLakeDashboard() {
   const [queryInput, setQueryInput] = useState('');
   const [queryResult, setQueryResult] = useState<string | null>(null);
   const [queryRunning, setQueryRunning] = useState(false);
+  const [catalogSearch, setCatalogSearch] = useState('');
 
   const { data: sources = [] } = useQuery({ queryKey: ['dataSources'], queryFn: datalakeApi.getDataSources });
   const { data: pipelines = [] } = useQuery({ queryKey: ['pipelines'], queryFn: datalakeApi.getPipelines });
   const { data: catalog = [] } = useQuery({ queryKey: ['dataCatalog'], queryFn: datalakeApi.getCatalog });
+
+  const filteredCatalog = useMemo(() => {
+    const q = catalogSearch.trim().toLowerCase();
+    if (!q) return catalog;
+    return (catalog as any[]).filter((item: any) => {
+      const fields = [
+        item?.name,
+        item?.description,
+        item?.source_type,
+        item?.schema,
+        item?.owner,
+        item?.type,
+        item?.entity_type,
+      ];
+      return fields.some(
+        (f) => typeof f === 'string' && f.toLowerCase().includes(q),
+      );
+    });
+  }, [catalog, catalogSearch]);
 
   const stats = useMemo(() => {
     const activeSources = sources.filter((s: DataSource) => s.health === 'Healthy').length;
@@ -430,8 +450,15 @@ export default function DataLakeDashboard() {
               <input
                 type="text"
                 placeholder="Search data catalog..."
+                value={catalogSearch}
+                onChange={(e) => setCatalogSearch(e.target.value)}
                 className="w-full bg-gray-800 border border-gray-700 rounded px-4 py-3 text-white placeholder-gray-500 dark:bg-gray-800 dark:border-gray-700"
               />
+              {catalogSearch && (
+                <div className="mt-2 text-xs text-gray-400">
+                  {filteredCatalog.length} of {(catalog as any[]).length} matching "{catalogSearch}"
+                </div>
+              )}
             </div>
 
             <div className="bg-gray-800 border border-gray-700 rounded-lg overflow-hidden dark:bg-gray-800 dark:border-gray-700">
@@ -446,7 +473,7 @@ export default function DataLakeDashboard() {
                   </tr>
                 </thead>
                 <tbody>
-                  {catalog.map((item: CatalogItem) => (
+                  {filteredCatalog.map((item: CatalogItem) => (
                     <tr key={item.id} className="border-t border-gray-700 hover:bg-gray-700/50">
                       <td className="px-6 py-4 text-sm font-medium text-white">{item.name}</td>
                       <td className="px-6 py-4 text-sm">

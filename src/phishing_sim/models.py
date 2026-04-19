@@ -112,6 +112,37 @@ class PhishingCampaign(BaseModel):
     )
 
 
+class PhishingTarget(BaseModel):
+    """A single recipient of a phishing campaign send.
+
+    One row per (campaign, recipient) pair. Status tracks the lifecycle
+    from 'pending' (about to be queued) → 'queued' (Celery task dispatched)
+    → 'sent' / 'failed'. 'awaiting_smtp_config' is an honest stand-in for
+    "we have no SMTP creds, the row is real but no email went out."
+    """
+
+    __tablename__ = "phishing_targets"
+
+    campaign_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("phishing_campaigns.id"), nullable=False, index=True
+    )
+    recipient_email: Mapped[str] = mapped_column(String(255), nullable=False)
+    recipient_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    recipient_department: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(50), default="pending", nullable=False, index=True
+    )  # pending, queued, sent, failed, awaiting_smtp_config, opened, clicked, reported
+    tracking_id: Mapped[str] = mapped_column(
+        String(36), nullable=False, unique=True, index=True
+    )
+    sent_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    celery_task_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    organization_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("organizations.id"), nullable=False
+    )
+
+
 class CampaignEvent(BaseModel):
     """Record of user interaction with phishing campaign."""
 

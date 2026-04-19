@@ -11,10 +11,17 @@ organization. If the underlying table is empty the response is an honest
 empty list — no hardcoded data.
 """
 
-from datetime import datetime, timedelta
+import csv
+import io
+import json
+import os
+from datetime import datetime, timedelta, timezone
+from ipaddress import ip_network
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Body, HTTPException, Query, status
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
 from sqlalchemy import and_, desc, func, select
 
 from src.api.deps import CurrentUser, DatabaseSession
@@ -855,4 +862,299 @@ async def integrations_webhooks_flat(
 
     return await _safe_list(
         db, WebhookEndpoint, org_id=_org_id(current_user), page=page, size=size
+    )
+
+
+# --------------------------------------------------------------------------
+# OT Security bulk discover + server-side export
+# --------------------------------------------------------------------------
+
+
+class OTDiscoverRequest(BaseModel):
+    """Bulk network discovery request body for /ot-security/discover."""
+
+    cidr: str = Field(..., description="CIDR network range to probe (e.g. 10.0.1.0/24)")
+    probe_ports: Optional[List[int]] = Field(
+        default=None,
+        description=(
+            "Optional list of TCP ports to probe. If omitted the engine's "
+            "standard OT/ICS protocol port set is used."
+        ),
+    )
+
+
+@router.post("/ot-security/discover")
+async def ot_security_bulk_discover(
+    payload: OTDiscoverRequest = Body(...),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
+):
+    """
+    Bulk discover OT assets across an entire CIDR.
+
+    Dispatches to the real TCP-probe discovery implemented in
+    `src.ot_security.engine.OTMonitor.discover_assets()`. Returns the list
+    of OTAsset rows (newly inserted or refreshed) that responded on at
+    least one OT/ICS port.
+
+    Safety gates:
+      * CIDRs larger than /22 are refused (same cap the engine enforces).
+      * If ``PYSOAR_DISABLE_NETWORK_SCAN=1`` is set, no sockets are opened
+        and the endpoint returns a skipped-result payload.
+    """
+    from src.ot_security.engine import (
+        MAX_DISCOVERY_PREFIX,
+        OT_PROBE_PORTS,
+        OTMonitor,
+    )
+    from src.ot_security.models import OTAsset
+
+    org_id = _org_id(current_user)
+    if not org_id:
+        raise HTTPException(status_code=401, detail="organization_id required")
+
+    # Early safety check so we return a clean 400 instead of relying on
+    # the engine to log and silently return an empty list.
+    try:
+        net = ip_network(payload.cidr, strict=False)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid CIDR: {exc}")
+
+    if net.prefixlen < MAX_DISCOVERY_PREFIX:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"CIDR /{net.prefixlen} exceeds safety cap /{MAX_DISCOVERY_PREFIX}. "
+                "Refusing bulk scan of networks larger than /22."
+            ),
+        )
+
+    if os.environ.get("PYSOAR_DISABLE_NETWORK_SCAN") == "1":
+        return {
+            "status": "skipped",
+            "reason": "network_scan_disabled",
+            "cidr": payload.cidr,
+            "discovered": [],
+            "count": 0,
+        }
+
+    # Optionally narrow the probe set. The engine's module-level dict is
+    # the source of truth for supported ports; we temporarily swap it for
+    # the duration of the probe if the caller specified a subset.
+    monitor = OTMonitor(org_id)
+    original_ports = None
+    if payload.probe_ports:
+        import src.ot_security.engine as ot_engine
+
+        bad = [p for p in payload.probe_ports if not (0 < p < 65536)]
+        if bad:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid TCP port(s): {bad}",
+            )
+        original_ports = dict(ot_engine.OT_PROBE_PORTS)
+        ot_engine.OT_PROBE_PORTS = {
+            p: OT_PROBE_PORTS.get(p, "unknown") for p in payload.probe_ports
+        }
+
+    try:
+        discovered = await monitor.discover_assets(payload.cidr)
+    finally:
+        if original_ports is not None:
+            import src.ot_security.engine as ot_engine
+
+            ot_engine.OT_PROBE_PORTS = original_ports
+
+    # If the engine returned a status-only envelope (rejected / skipped),
+    # propagate it as-is. Otherwise refetch the canonical OTAsset rows so
+    # we return real DB state (with IDs and any enrichment that may have
+    # already been applied by earlier runs).
+    if discovered and isinstance(discovered[0], dict) and discovered[0].get("status") in {
+        "rejected",
+        "skipped",
+    }:
+        return {
+            "status": discovered[0]["status"],
+            "reason": discovered[0].get("reason"),
+            "cidr": payload.cidr,
+            "discovered": [],
+            "count": 0,
+        }
+
+    ips = [d.get("ip_address") for d in discovered if d.get("ip_address")]
+    rows: List[Dict[str, Any]] = []
+    if ips:
+        res = await db.execute(
+            select(OTAsset).where(
+                and_(
+                    OTAsset.organization_id == org_id,
+                    OTAsset.ip_address.in_(ips),
+                )
+            )
+        )
+        rows = [_row_to_dict(a) for a in res.scalars().all()]
+
+    return {
+        "status": "completed",
+        "cidr": payload.cidr,
+        "count": len(rows),
+        "discovered": rows,
+    }
+
+
+def _asset_last_seen_iso(asset: Any) -> str:
+    ls = getattr(asset, "last_seen", None)
+    if isinstance(ls, datetime):
+        return ls.isoformat()
+    return ""
+
+
+@router.get("/ot-security/export")
+async def ot_security_export(
+    format: str = Query("json", regex="^(json|csv)$"),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
+):
+    """
+    Server-side OT security report download.
+
+    `format=json` returns the full inventory, alerts, zones, purdue map,
+    summary KPIs and generated_at metadata. `format=csv` returns one row
+    per asset with hostname, ip, vendor, protocol, zone, purdue_level,
+    criticality, last_seen, open_alerts.
+
+    Sends `Content-Disposition: attachment` so the browser downloads
+    the payload instead of rendering it.
+    """
+    from src.ot_security.models import OTAlert, OTAsset, OTZone
+
+    org_id = _org_id(current_user)
+    now = datetime.now(timezone.utc)
+    generated_at = now.isoformat()
+
+    assets_res = await db.execute(
+        select(OTAsset).where(OTAsset.organization_id == org_id)
+        if org_id
+        else select(OTAsset)
+    )
+    assets = list(assets_res.scalars().all())
+
+    alerts_res = await db.execute(
+        select(OTAlert).where(OTAlert.organization_id == org_id)
+        if org_id
+        else select(OTAlert)
+    )
+    alerts = list(alerts_res.scalars().all())
+
+    zones_res = await db.execute(
+        select(OTZone).where(OTZone.organization_id == org_id)
+        if org_id
+        else select(OTZone)
+    )
+    zones = list(zones_res.scalars().all())
+
+    # Compute per-asset open-alert counts once so the CSV branch is
+    # a single O(N) pass rather than N*M.
+    open_alert_states = {"new", "investigating", "confirmed"}
+    open_alert_counts: Dict[str, int] = {}
+    for a in alerts:
+        if a.status in open_alert_states:
+            open_alert_counts[a.asset_id] = open_alert_counts.get(a.asset_id, 0) + 1
+
+    if format == "csv":
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow([
+            "hostname",
+            "ip",
+            "vendor",
+            "protocol",
+            "zone",
+            "purdue_level",
+            "criticality",
+            "last_seen",
+            "open_alerts",
+        ])
+        for a in assets:
+            writer.writerow([
+                a.name or "",
+                a.ip_address or "",
+                a.vendor or "",
+                a.protocol or "",
+                a.zone or "",
+                a.purdue_level or "",
+                a.criticality or "",
+                _asset_last_seen_iso(a),
+                open_alert_counts.get(a.id, 0),
+            ])
+        buf.seek(0)
+        filename = f"ot-security-report-{now.strftime('%Y%m%d-%H%M%S')}.csv"
+        return StreamingResponse(
+            iter([buf.getvalue()]),
+            media_type="text/csv",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+            },
+        )
+
+    # -------- JSON branch --------
+    # Build purdue map grouped by numeric level (mirrors the dashboard
+    # endpoint's layout so the UI can reuse the same renderer).
+    purdue_numeric = {
+        "level0_process": 0,
+        "level1_control": 1,
+        "level2_supervisory": 2,
+        "level3_operations": 3,
+        "level3_5_dmz": 3,
+        "level4_enterprise": 4,
+        "level5_internet": 5,
+    }
+    buckets: Dict[int, List[Dict[str, Any]]] = {lvl: [] for lvl in range(6)}
+    for a in assets:
+        lvl = purdue_numeric.get(a.purdue_level, 3)
+        buckets[lvl].append(_row_to_dict(a))
+
+    purdue_map = {
+        "levels": [
+            {"level": lvl, "devices": buckets[lvl], "device_count": len(buckets[lvl])}
+            for lvl in sorted(buckets.keys())
+        ],
+        "total_devices": sum(len(v) for v in buckets.values()),
+        "segmentation_complete": sum(1 for v in buckets.values() if v) >= 4,
+    }
+
+    total_assets = len(assets)
+    online_assets = sum(1 for a in assets if a.is_online)
+    active_alerts = sum(
+        1 for a in alerts
+        if a.status not in ("resolved", "contained", "false_positive")
+    )
+    critical_alerts = sum(1 for a in alerts if a.severity == "critical")
+
+    report: Dict[str, Any] = {
+        "org_id": org_id,
+        "generated_at": generated_at,
+        "summary": {
+            "total_assets": total_assets,
+            "online_assets": online_assets,
+            "offline_assets": total_assets - online_assets,
+            "total_alerts": len(alerts),
+            "active_alerts": active_alerts,
+            "critical_alerts": critical_alerts,
+            "total_zones": len(zones),
+        },
+        "assets": [_row_to_dict(a) for a in assets],
+        "alerts": [_row_to_dict(a) for a in alerts],
+        "zones": [_row_to_dict(z) for z in zones],
+        "purdue_map": purdue_map,
+    }
+
+    payload = json.dumps(report, default=str, indent=2)
+    filename = f"ot-security-report-{now.strftime('%Y%m%d-%H%M%S')}.json"
+    return StreamingResponse(
+        iter([payload]),
+        media_type="application/json",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+        },
     )

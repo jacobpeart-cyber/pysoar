@@ -223,9 +223,14 @@ class CampaignDetailResponse(PhishingCampaignResponse):
 
 
 class CampaignLaunchRequest(BaseModel):
-    """Request schema for launching a campaign."""
+    """Request schema for launching a campaign.
 
-    total_targets: int = Field(..., ge=1)
+    ``total_targets`` is accepted for backward compatibility but is
+    ignored — the server derives the real count from the target group
+    rows it materializes. Clients may send ``{}``.
+    """
+
+    total_targets: int | None = Field(default=None, ge=0)
 
 
 class CampaignScheduleRequest(BaseModel):

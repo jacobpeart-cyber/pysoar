@@ -10,6 +10,7 @@ import {
   Zap,
   AlertTriangle,
   ChevronDown,
+  Pencil,
 } from 'lucide-react';
 import { api } from '../lib/api';
 
@@ -97,6 +98,27 @@ const MODEL_STATUSES: Record<string, string> = {
   archived: 'bg-gray-900/40 text-gray-400',
 };
 
+const COMPONENT_TYPES = [
+  { value: 'process', label: 'Process' },
+  { value: 'data_store', label: 'Data Store' },
+  { value: 'external_entity', label: 'External Entity' },
+  { value: 'data_flow', label: 'Data Flow' },
+  { value: 'trust_boundary', label: 'Trust Boundary' },
+  { value: 'api_endpoint', label: 'API Endpoint' },
+  { value: 'service', label: 'Service' },
+  { value: 'database', label: 'Database' },
+  { value: 'message_queue', label: 'Message Queue' },
+  { value: 'cache', label: 'Cache' },
+  { value: 'cdn', label: 'CDN' },
+  { value: 'load_balancer', label: 'Load Balancer' },
+];
+
+const TRUST_LEVELS = [
+  { value: 'untrusted', label: 'Untrusted' },
+  { value: 'authenticated', label: 'Authenticated' },
+  { value: 'privileged', label: 'Privileged' },
+];
+
 const STRIDE_CATEGORIES = [
   { value: 'spoofing', label: 'Spoofing' },
   { value: 'tampering', label: 'Tampering' },
@@ -161,8 +183,23 @@ export default function ThreatModeling() {
   const [selectedThreatId, setSelectedThreatId] = useState<string | null>(null);
   const [showCreateModel, setShowCreateModel] = useState(false);
   const [showAddThreat, setShowAddThreat] = useState(false);
+  const [showComponentModal, setShowComponentModal] = useState(false);
+  const [editingComponentId, setEditingComponentId] = useState<string | null>(null);
   const [page, setPage] = useState(1);
   const pageSize = 20;
+
+  // --- Component form state ---
+  const emptyComponentForm = {
+    name: '',
+    component_type: 'process',
+    description: '',
+    trust_level: 'untrusted',
+    technology_stack: '',
+    data_classification: '',
+    position_x: '',
+    position_y: '',
+  };
+  const [componentForm, setComponentForm] = useState(emptyComponentForm);
 
   // --- Create Model form state ---
   const [modelForm, setModelForm] = useState({
@@ -295,6 +332,87 @@ export default function ThreatModeling() {
       queryClient.invalidateQueries({ queryKey: ['threat-model-threats', selectedModelId] });
       queryClient.invalidateQueries({ queryKey: ['threat-model-dashboard', selectedModelId] });
     },
+    onError: (err: any) => {
+      // eslint-disable-next-line no-console
+      console.error('Run STRIDE failed:', err?.response?.data ?? err?.message ?? err);
+    },
+  });
+
+  // Build a backend-compatible payload from the component form
+  function buildComponentPayload(form: typeof emptyComponentForm, isUpdate = false) {
+    const payload: Record<string, any> = {
+      name: form.name,
+      description: form.description || null,
+      trust_level: form.trust_level || 'untrusted',
+    };
+    if (!isUpdate) {
+      // create requires component_type & model_id
+      payload.component_type = form.component_type;
+      payload.model_id = selectedModelId;
+    } else if (form.component_type) {
+      // ComponentUpdate schema does not accept component_type; skip it
+    }
+    if (form.technology_stack) payload.technology_stack = form.technology_stack;
+    if (form.data_classification) payload.data_classification = form.data_classification;
+    const x = form.position_x !== '' ? parseInt(form.position_x, 10) : null;
+    const y = form.position_y !== '' ? parseInt(form.position_y, 10) : null;
+    if (x !== null && !Number.isNaN(x) && y !== null && !Number.isNaN(y)) {
+      payload.position = { x, y };
+    }
+    return payload;
+  }
+
+  const createComponentMutation = useMutation({
+    mutationFn: async (form: typeof emptyComponentForm) => {
+      const res = await api.post(
+        `/threat-modeling/${selectedModelId}/components`,
+        buildComponentPayload(form, false)
+      );
+      return res.data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['threat-model-components', selectedModelId] });
+      setShowComponentModal(false);
+      setEditingComponentId(null);
+      setComponentForm(emptyComponentForm);
+    },
+    onError: (err: any) => {
+      // eslint-disable-next-line no-console
+      console.error('Create component failed:', err?.response?.data ?? err?.message ?? err);
+    },
+  });
+
+  const updateComponentMutation = useMutation({
+    mutationFn: async (args: { id: string; form: typeof emptyComponentForm }) => {
+      const res = await api.put(
+        `/threat-modeling/${selectedModelId}/components/${args.id}`,
+        buildComponentPayload(args.form, true)
+      );
+      return res.data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['threat-model-components', selectedModelId] });
+      setShowComponentModal(false);
+      setEditingComponentId(null);
+      setComponentForm(emptyComponentForm);
+    },
+    onError: (err: any) => {
+      // eslint-disable-next-line no-console
+      console.error('Update component failed:', err?.response?.data ?? err?.message ?? err);
+    },
+  });
+
+  const deleteComponentMutation = useMutation({
+    mutationFn: async (componentId: string) => {
+      await api.delete(`/threat-modeling/${selectedModelId}/components/${componentId}`);
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['threat-model-components', selectedModelId] });
+    },
+    onError: (err: any) => {
+      // eslint-disable-next-line no-console
+      console.error('Delete component failed:', err?.response?.data ?? err?.message ?? err);
+    },
   });
 
   // ====== Handlers ======
@@ -303,6 +421,36 @@ export default function ThreatModeling() {
     setSelectedModelId(id);
     setSelectedThreatId(null);
     setActiveTab('detail');
+  }
+
+  function openAddComponent() {
+    setEditingComponentId(null);
+    setComponentForm(emptyComponentForm);
+    setShowComponentModal(true);
+  }
+
+  function openEditComponent(c: Component) {
+    setEditingComponentId(c.id);
+    const pos = (c.position && typeof c.position === 'object') ? c.position : {};
+    setComponentForm({
+      name: c.name ?? '',
+      component_type: c.component_type ?? 'process',
+      description: c.description ?? '',
+      trust_level: c.trust_level ?? 'untrusted',
+      technology_stack: (c as any).technology_stack ?? '',
+      data_classification: (c as any).data_classification ?? '',
+      position_x: pos.x != null ? String(pos.x) : '',
+      position_y: pos.y != null ? String(pos.y) : '',
+    });
+    setShowComponentModal(true);
+  }
+
+  function submitComponentForm() {
+    if (editingComponentId) {
+      updateComponentMutation.mutate({ id: editingComponentId, form: componentForm });
+    } else {
+      createComponentMutation.mutate(componentForm);
+    }
   }
 
   // ====== Derived data ======
@@ -514,8 +662,13 @@ export default function ThreatModeling() {
               </button>
               <button
                 onClick={() => runStrideMutation.mutate()}
-                disabled={runStrideMutation.isPending}
-                className="bg-purple-600 hover:bg-purple-700 text-white px-4 py-2 rounded flex items-center gap-2 text-sm transition-colors disabled:opacity-50"
+                disabled={runStrideMutation.isPending || components.length === 0}
+                title={
+                  components.length === 0
+                    ? 'Add at least one component first.'
+                    : 'Run STRIDE analysis on all components'
+                }
+                className="bg-purple-600 hover:bg-purple-700 text-white px-4 py-2 rounded flex items-center gap-2 text-sm transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 <Zap className="w-4 h-4" />
                 {runStrideMutation.isPending ? 'Running...' : 'Run STRIDE Analysis'}
@@ -525,28 +678,76 @@ export default function ThreatModeling() {
                   Generated {(runStrideMutation.data as any)?.threats_generated ?? 0} threats
                 </span>
               )}
+              {runStrideMutation.isError && (
+                <span className="text-red-400 text-sm self-center">
+                  STRIDE failed: {(runStrideMutation.error as any)?.response?.data?.detail ?? (runStrideMutation.error as any)?.message ?? 'Unknown error'}
+                </span>
+              )}
             </div>
 
             {/* Components section */}
             <div className="mb-6">
-              <h2 className="text-lg font-semibold mb-3">Components</h2>
-              {components.length === 0 ? (
-                <p className="text-gray-500 text-sm">No components found.</p>
+              <div className="flex items-center justify-between mb-3">
+                <h2 className="text-lg font-semibold">Components</h2>
+                <button
+                  onClick={openAddComponent}
+                  className="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1.5 rounded flex items-center gap-1.5 text-xs transition-colors"
+                >
+                  <Plus className="w-3.5 h-3.5" /> Add Component
+                </button>
+              </div>
+              {componentsQuery.isLoading ? (
+                <p className="text-gray-500 text-sm">Loading components...</p>
+              ) : components.length === 0 ? (
+                <p className="text-gray-500 text-sm">
+                  No components found. Add a component so STRIDE has something to analyse.
+                </p>
               ) : (
                 <div className="grid grid-cols-2 lg:grid-cols-3 gap-3">
                   {components.map((c) => (
-                    <div key={c.id} className="bg-gray-800 border border-gray-700 rounded-lg p-4">
-                      <p className="font-medium text-white text-sm">{c.name ?? '-'}</p>
-                      <p className="text-xs text-gray-400 mt-1">Type: {capitalize(c.component_type)}</p>
-                      {c.trust_level && (
-                        <p className="text-xs text-gray-400">Trust: {c.trust_level}</p>
-                      )}
-                      {c.description && (
-                        <p className="text-xs text-gray-500 mt-1 line-clamp-2">{c.description}</p>
-                      )}
+                    <div key={c.id} className="bg-gray-800 border border-gray-700 rounded-lg p-4 relative group">
+                      <div className="flex items-start justify-between">
+                        <div className="flex-1 min-w-0">
+                          <p className="font-medium text-white text-sm truncate">{c.name ?? '-'}</p>
+                          <p className="text-xs text-gray-400 mt-1">Type: {capitalize(c.component_type)}</p>
+                          {c.trust_level && (
+                            <p className="text-xs text-gray-400">Trust: {capitalize(c.trust_level)}</p>
+                          )}
+                          {c.description && (
+                            <p className="text-xs text-gray-500 mt-1 line-clamp-2">{c.description}</p>
+                          )}
+                        </div>
+                        <div className="flex flex-col gap-1 ml-2">
+                          <button
+                            onClick={(e) => { e.stopPropagation(); openEditComponent(c); }}
+                            className="text-blue-400 hover:text-blue-300 p-1"
+                            title="Edit component"
+                          >
+                            <Pencil className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              if (confirm(`Delete component "${c.name}"?`)) {
+                                deleteComponentMutation.mutate(c.id);
+                              }
+                            }}
+                            className="text-red-400 hover:text-red-300 p-1"
+                            title="Delete component"
+                            disabled={deleteComponentMutation.isPending}
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </div>
                     </div>
                   ))}
                 </div>
+              )}
+              {deleteComponentMutation.isError && (
+                <p className="text-red-400 text-xs mt-2">
+                  Delete failed: {(deleteComponentMutation.error as any)?.response?.data?.detail ?? (deleteComponentMutation.error as any)?.message ?? 'Unknown error'}
+                </p>
               )}
             </div>
 
@@ -852,6 +1053,153 @@ export default function ThreatModeling() {
                 {addThreatMutation.isError && (
                   <p className="text-red-400 text-xs">
                     Failed: {(addThreatMutation.error as any)?.message ?? 'Unknown error'}
+                  </p>
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ==================== ADD / EDIT COMPONENT MODAL ==================== */}
+        {showComponentModal && (
+          <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
+            <div className="bg-gray-800 border border-gray-700 rounded-lg p-6 w-full max-w-md">
+              <div className="flex justify-between items-center mb-5">
+                <h2 className="text-lg font-bold">
+                  {editingComponentId ? 'Edit Component' : 'Add Component'}
+                </h2>
+                <button
+                  onClick={() => {
+                    setShowComponentModal(false);
+                    setEditingComponentId(null);
+                    setComponentForm(emptyComponentForm);
+                  }}
+                  className="text-gray-400 hover:text-white"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+              <div className="space-y-4">
+                <div>
+                  <label className="block text-sm text-gray-300 mb-1">Name *</label>
+                  <input
+                    value={componentForm.name}
+                    onChange={(e) => setComponentForm({ ...componentForm, name: e.target.value })}
+                    className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white text-sm"
+                    placeholder="e.g., Auth Service"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm text-gray-300 mb-1">
+                    Component Type {editingComponentId ? '(immutable)' : '*'}
+                  </label>
+                  <select
+                    value={componentForm.component_type}
+                    onChange={(e) => setComponentForm({ ...componentForm, component_type: e.target.value })}
+                    disabled={!!editingComponentId}
+                    className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white text-sm disabled:opacity-60"
+                  >
+                    {COMPONENT_TYPES.map((t) => (
+                      <option key={t.value} value={t.value}>{t.label}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-sm text-gray-300 mb-1">Trust Level</label>
+                  <select
+                    value={componentForm.trust_level}
+                    onChange={(e) => setComponentForm({ ...componentForm, trust_level: e.target.value })}
+                    className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white text-sm"
+                  >
+                    {TRUST_LEVELS.map((t) => (
+                      <option key={t.value} value={t.value}>{t.label}</option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-sm text-gray-300 mb-1">Description</label>
+                  <textarea
+                    value={componentForm.description}
+                    onChange={(e) => setComponentForm({ ...componentForm, description: e.target.value })}
+                    className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white text-sm"
+                    rows={2}
+                    placeholder="Optional description..."
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-sm text-gray-300 mb-1">Technology Stack</label>
+                    <input
+                      value={componentForm.technology_stack}
+                      onChange={(e) => setComponentForm({ ...componentForm, technology_stack: e.target.value })}
+                      className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white text-sm"
+                      placeholder="e.g., Node.js + Postgres"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm text-gray-300 mb-1">Data Classification</label>
+                    <input
+                      value={componentForm.data_classification}
+                      onChange={(e) => setComponentForm({ ...componentForm, data_classification: e.target.value })}
+                      className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white text-sm"
+                      placeholder="e.g., PII, PCI"
+                    />
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-sm text-gray-300 mb-1">Position X (optional)</label>
+                    <input
+                      type="number"
+                      value={componentForm.position_x}
+                      onChange={(e) => setComponentForm({ ...componentForm, position_x: e.target.value })}
+                      className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white text-sm"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-sm text-gray-300 mb-1">Position Y (optional)</label>
+                    <input
+                      type="number"
+                      value={componentForm.position_y}
+                      onChange={(e) => setComponentForm({ ...componentForm, position_y: e.target.value })}
+                      className="w-full bg-gray-700 border border-gray-600 rounded px-3 py-2 text-white text-sm"
+                    />
+                  </div>
+                </div>
+                <div className="flex gap-3 pt-2">
+                  <button
+                    onClick={() => {
+                      setShowComponentModal(false);
+                      setEditingComponentId(null);
+                      setComponentForm(emptyComponentForm);
+                    }}
+                    className="flex-1 bg-gray-700 hover:bg-gray-600 text-white px-4 py-2 rounded text-sm transition-colors"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={submitComponentForm}
+                    disabled={
+                      !componentForm.name ||
+                      createComponentMutation.isPending ||
+                      updateComponentMutation.isPending
+                    }
+                    className="flex-1 bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded text-sm transition-colors disabled:opacity-50"
+                  >
+                    {editingComponentId
+                      ? (updateComponentMutation.isPending ? 'Saving...' : 'Save')
+                      : (createComponentMutation.isPending ? 'Adding...' : 'Add')}
+                  </button>
+                </div>
+                {(createComponentMutation.isError || updateComponentMutation.isError) && (
+                  <p className="text-red-400 text-xs">
+                    Failed: {
+                      (createComponentMutation.error as any)?.response?.data?.detail ??
+                      (updateComponentMutation.error as any)?.response?.data?.detail ??
+                      (createComponentMutation.error as any)?.message ??
+                      (updateComponentMutation.error as any)?.message ??
+                      'Unknown error'
+                    }
                   </p>
                 )}
               </div>

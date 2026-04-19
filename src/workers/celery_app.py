@@ -15,6 +15,7 @@ celery_app = Celery(
         "src.workers.tasks",
         "src.tasks.automation_tasks",
         "src.intel.tasks",
+        "src.phishing_sim.tasks",
     ],
 )
 

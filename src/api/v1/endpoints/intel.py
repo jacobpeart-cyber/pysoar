@@ -1,10 +1,16 @@
 """Threat Intelligence Platform API endpoints"""
 
+import asyncio
+import json
+import logging
 import math
+import re
+import time
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
+import httpx
 from fastapi import APIRouter, Path, HTTPException, Query, status
 from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,6 +24,296 @@ from src.intel.models import (
     ThreatFeed,
     ThreatIndicator,
 )
+from src.integrations.models import InstalledIntegration, IntegrationConnector
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# In-process TTL cache for external IOC enrichment
+# ---------------------------------------------------------------------------
+# External intel APIs (VirusTotal free tier = 4 req/min, AbuseIPDB daily caps)
+# rate-limit us aggressively, so we cache lookups for 1 hour per
+# (provider, indicator_type, value) tuple. This keeps the UI snappy on repeat
+# lookups and avoids burning quota on the same indicator.
+_IOC_CACHE_TTL_SECONDS = 3600
+_ioc_lookup_cache: dict[tuple[str, str, str], tuple[float, dict[str, Any]]] = {}
+
+
+def _cache_get(key: tuple[str, str, str]) -> Optional[dict[str, Any]]:
+    entry = _ioc_lookup_cache.get(key)
+    if not entry:
+        return None
+    expires_at, value = entry
+    if expires_at < time.time():
+        _ioc_lookup_cache.pop(key, None)
+        return None
+    return value
+
+
+def _cache_set(key: tuple[str, str, str], value: dict[str, Any]) -> None:
+    _ioc_lookup_cache[key] = (time.time() + _IOC_CACHE_TTL_SECONDS, value)
+
+
+def _detect_indicator_type(value: str) -> str:
+    """Best-effort IOC type detection when the caller passes type='auto'."""
+    v = value.strip()
+    # URL
+    if v.lower().startswith(("http://", "https://")):
+        return "url"
+    # Hash — length-based heuristic
+    if re.fullmatch(r"[a-fA-F0-9]{32}", v):
+        return "md5"
+    if re.fullmatch(r"[a-fA-F0-9]{40}", v):
+        return "sha1"
+    if re.fullmatch(r"[a-fA-F0-9]{64}", v):
+        return "sha256"
+    # IPv4
+    if re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", v):
+        return "ip"
+    # IPv6 (very loose)
+    if ":" in v and re.fullmatch(r"[0-9a-fA-F:]+", v):
+        return "ip"
+    # Domain
+    if re.fullmatch(r"[a-zA-Z0-9._-]+\.[a-zA-Z]{2,}", v):
+        return "domain"
+    return "unknown"
+
+
+def _normalize_type(t: str) -> str:
+    """Collapse fine-grained IOC types to a dispatch bucket."""
+    t = (t or "").lower()
+    if t in ("ipv4", "ipv6", "ip"):
+        return "ip"
+    if t in ("md5", "sha1", "sha256", "hash"):
+        return "hash"
+    if t == "url":
+        return "url"
+    if t == "domain":
+        return "domain"
+    return t
+
+
+async def _load_intel_integrations(
+    db: AsyncSession,
+) -> dict[str, dict[str, Any]]:
+    """Load installed VirusTotal / AbuseIPDB integration credentials.
+
+    Returns a mapping ``{connector_name: credentials_dict}`` for any active
+    installation. Credentials for these connectors are stored as plaintext
+    JSON in ``auth_credentials_encrypted`` (name is historical — see
+    ``src/integrations/engine.py`` ``test_connection``).
+    """
+    q = (
+        select(InstalledIntegration, IntegrationConnector)
+        .join(
+            IntegrationConnector,
+            IntegrationConnector.id == InstalledIntegration.connector_id,
+        )
+        .where(IntegrationConnector.name.in_(("virustotal", "abuseipdb")))
+    )
+    result = await db.execute(q)
+    integrations: dict[str, dict[str, Any]] = {}
+    for inst, conn in result.all():
+        try:
+            creds = json.loads(inst.auth_credentials_encrypted or "{}")
+        except (json.JSONDecodeError, TypeError):
+            creds = {}
+        if not isinstance(creds, dict):
+            continue
+        # Only surface integrations that have a usable key.
+        if conn.name.lower() in ("virustotal", "abuseipdb") and (
+            creds.get("api_key") or creds.get("apikey") or creds.get("key")
+        ):
+            integrations[conn.name.lower()] = creds
+    return integrations
+
+
+def _vt_verdict(stats: dict[str, Any]) -> tuple[str, int]:
+    """Map VT last_analysis_stats -> (verdict, confidence[0-100])."""
+    malicious = int(stats.get("malicious") or 0)
+    suspicious = int(stats.get("suspicious") or 0)
+    harmless = int(stats.get("harmless") or 0)
+    undetected = int(stats.get("undetected") or 0)
+    total = malicious + suspicious + harmless + undetected
+    if malicious >= 3:
+        verdict = "malicious"
+    elif malicious >= 1 or suspicious >= 3:
+        verdict = "suspicious"
+    elif total > 0 and harmless > 0:
+        verdict = "clean"
+    else:
+        verdict = "unknown"
+    confidence = 0
+    if total > 0:
+        confidence = min(100, int(((malicious + suspicious) / total) * 100))
+    return verdict, confidence
+
+
+async def _vt_lookup(
+    client: httpx.AsyncClient,
+    api_key: str,
+    ioc_type: str,
+    value: str,
+) -> dict[str, Any]:
+    """Call VirusTotal v3 directly. Returns an ``external_sources`` entry."""
+    import base64 as _b64
+
+    headers = {"x-apikey": api_key, "Accept": "application/json"}
+    if ioc_type == "ip":
+        endpoint = f"https://www.virustotal.com/api/v3/ip_addresses/{value}"
+    elif ioc_type == "domain":
+        endpoint = f"https://www.virustotal.com/api/v3/domains/{value}"
+    elif ioc_type == "hash":
+        endpoint = f"https://www.virustotal.com/api/v3/files/{value}"
+    elif ioc_type == "url":
+        url_id = _b64.urlsafe_b64encode(value.encode()).decode().strip("=")
+        endpoint = f"https://www.virustotal.com/api/v3/urls/{url_id}"
+    else:
+        return {
+            "name": "virustotal",
+            "verdict": "unsupported",
+            "confidence": 0,
+            "error": f"VirusTotal does not support type '{ioc_type}'",
+        }
+
+    resp = await client.get(endpoint, headers=headers)
+    if resp.status_code == 404:
+        return {
+            "name": "virustotal",
+            "verdict": "unknown",
+            "confidence": 0,
+            "raw": {"not_found": True, "status": 404},
+        }
+    resp.raise_for_status()
+    body = resp.json() or {}
+    attributes = (body.get("data") or {}).get("attributes") or {}
+    stats = attributes.get("last_analysis_stats") or {}
+    verdict, confidence = _vt_verdict(stats)
+    return {
+        "name": "virustotal",
+        "verdict": verdict,
+        "confidence": confidence,
+        "raw": {
+            "last_analysis_stats": stats,
+            "reputation": attributes.get("reputation"),
+            "country": attributes.get("country"),
+            "as_owner": attributes.get("as_owner"),
+            "asn": attributes.get("asn"),
+            "tags": attributes.get("tags", []),
+            "last_analysis_date": attributes.get("last_analysis_date"),
+        },
+    }
+
+
+async def _abuseipdb_lookup(
+    client: httpx.AsyncClient,
+    api_key: str,
+    value: str,
+) -> dict[str, Any]:
+    """Call AbuseIPDB /check directly."""
+    headers = {"Key": api_key, "Accept": "application/json"}
+    params = {"ipAddress": value, "maxAgeInDays": 90, "verbose": True}
+    resp = await client.get(
+        "https://api.abuseipdb.com/api/v2/check",
+        headers=headers,
+        params=params,
+    )
+    resp.raise_for_status()
+    body = resp.json() or {}
+    data = body.get("data") or {}
+    score = int(data.get("abuseConfidenceScore") or 0)
+    if score >= 75:
+        verdict = "malicious"
+    elif score >= 25:
+        verdict = "suspicious"
+    elif score > 0:
+        verdict = "low_risk"
+    else:
+        verdict = "clean"
+    return {
+        "name": "abuseipdb",
+        "verdict": verdict,
+        "confidence": score,
+        "raw": {
+            "abuse_confidence_score": score,
+            "total_reports": data.get("totalReports"),
+            "country_code": data.get("countryCode"),
+            "usage_type": data.get("usageType"),
+            "isp": data.get("isp"),
+            "domain": data.get("domain"),
+            "is_public": data.get("isPublic"),
+            "is_whitelisted": data.get("isWhitelisted"),
+            "last_reported_at": data.get("lastReportedAt"),
+        },
+    }
+
+
+async def _enrich_external(
+    ioc_type: str,
+    value: str,
+    integrations: dict[str, dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Call configured external providers in parallel.
+
+    Returns ``(sources, errors)`` where ``sources`` matches the
+    ``external_sources`` schema and ``errors`` is a list of free-form
+    strings describing any per-provider failures.
+    """
+    tasks: list[tuple[str, asyncio.Task]] = []
+    errors: list[str] = []
+
+    def _get_key(creds: dict[str, Any]) -> Optional[str]:
+        return creds.get("api_key") or creds.get("apikey") or creds.get("key")
+
+    # Build per-provider task list from the type dispatcher.
+    timeout = httpx.Timeout(8.0, connect=5.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        if ioc_type == "ip":
+            if "abuseipdb" in integrations:
+                key = _get_key(integrations["abuseipdb"])
+                if key:
+                    tasks.append((
+                        "abuseipdb",
+                        asyncio.create_task(_abuseipdb_lookup(client, key, value)),
+                    ))
+            if "virustotal" in integrations:
+                key = _get_key(integrations["virustotal"])
+                if key:
+                    tasks.append((
+                        "virustotal",
+                        asyncio.create_task(_vt_lookup(client, key, "ip", value)),
+                    ))
+        elif ioc_type in ("domain", "url", "hash"):
+            if "virustotal" in integrations:
+                key = _get_key(integrations["virustotal"])
+                if key:
+                    tasks.append((
+                        "virustotal",
+                        asyncio.create_task(_vt_lookup(client, key, ioc_type, value)),
+                    ))
+
+        if not tasks:
+            return [], errors
+
+        results = await asyncio.gather(
+            *(t for _, t in tasks), return_exceptions=True
+        )
+
+    sources: list[dict[str, Any]] = []
+    for (name, _task), result in zip(tasks, results):
+        if isinstance(result, Exception):
+            err_msg = f"{name}: {type(result).__name__}: {result}"
+            errors.append(err_msg)
+            logger.warning("IOC enrichment failed: %s", err_msg)
+            sources.append({
+                "name": name,
+                "verdict": "error",
+                "confidence": 0,
+                "error": str(result)[:200],
+            })
+            continue
+        sources.append(result)
+    return sources, errors
 from src.schemas.intel import (
     BulkIndicatorImport,
     IntelDashboardStats,
@@ -146,11 +442,25 @@ async def lookup_ioc(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ) -> dict:
+    """Look up an IOC and enrich with external feeds.
+
+    Order of operations:
+      1. Query the local ``threat_indicators`` table for a match (fast
+         path, returns local reputation + tags).
+      2. Detect IOC type if caller passed ``type='auto'``.
+      3. Enrich via installed VirusTotal / AbuseIPDB integrations:
+         - ``ip``     -> AbuseIPDB + VirusTotal (parallel)
+         - ``domain`` -> VirusTotal
+         - ``url``    -> VirusTotal
+         - ``hash``   -> VirusTotal
+      4. Merge: local reputation is kept if set, but external results
+         are appended under ``external_sources``. If no integrations are
+         installed, ``external_enrichment = "no_integrations_configured"``
+         makes that explicit — we never silently drop the enrichment.
+
+    Frontend POSTs ``{ indicator: string, type: string }``.
     """
-    Look up an IOC indicator and return reputation information.
-    Frontend POSTs { indicator: string, type: string }.
-    """
-    indicator_value = payload.get("indicator", "")
+    indicator_value = (payload.get("indicator") or "").strip()
     indicator_type = payload.get("type", "auto")
 
     if not indicator_value:
@@ -159,9 +469,7 @@ async def lookup_ioc(
             detail="indicator is required",
         )
 
-    org_id = getattr(current_user, "organization_id", None)
-
-    # Query matching indicators
+    # Query matching indicators in the local DB
     org_clause = True
     query = select(ThreatIndicator).where(
         and_(
@@ -175,19 +483,6 @@ async def lookup_ioc(
     result = await db.execute(query.order_by(desc(ThreatIndicator.last_seen)))
     indicators = result.scalars().all()
 
-    if not indicators:
-        return {
-            "indicator": indicator_value,
-            "type": indicator_type,
-            "reputation": "unknown",
-            "confidence": 0,
-            "sources": [],
-            "tags": [],
-            "first_seen": None,
-            "last_seen": None,
-        }
-
-    # Determine overall reputation from severity of matching indicators
     severity_to_reputation = {
         "critical": "malicious",
         "high": "malicious",
@@ -196,39 +491,140 @@ async def lookup_ioc(
         "informational": "clean",
     }
 
-    best = indicators[0]
-    reputation = severity_to_reputation.get(best.severity or "", "unknown")
-    confidence = best.confidence or 0
-    resolved_type = best.indicator_type or indicator_type
+    # --- Local result -------------------------------------------------------
+    if indicators:
+        best = indicators[0]
+        local_reputation = severity_to_reputation.get(best.severity or "", "unknown")
+        local_confidence = best.confidence or 0
+        resolved_type = best.indicator_type or indicator_type
+        local_sources = [
+            {
+                "name": ind.source or "Internal",
+                "verdict": severity_to_reputation.get(ind.severity or "", "unknown"),
+                "last_seen": (
+                    ind.last_seen.isoformat()
+                    if ind.last_seen
+                    else datetime.now(timezone.utc).isoformat()
+                ),
+            }
+            for ind in indicators
+        ]
+        all_tags: list[str] = []
+        for ind in indicators:
+            all_tags.extend(ind.tags or [])
+        unique_tags = list(dict.fromkeys(all_tags))
+        first_seens = [ind.first_seen for ind in indicators if ind.first_seen]
+        last_seens = [ind.last_seen for ind in indicators if ind.last_seen]
+        first_seen_iso = min(first_seens).isoformat() if first_seens else None
+        last_seen_iso = max(last_seens).isoformat() if last_seens else None
+    else:
+        local_reputation = "unknown"
+        local_confidence = 0
+        resolved_type = indicator_type
+        local_sources = []
+        unique_tags = []
+        first_seen_iso = None
+        last_seen_iso = None
 
-    # Build sources list
-    sources = []
-    for ind in indicators:
-        sources.append({
-            "name": ind.source or "Internal",
-            "verdict": severity_to_reputation.get(ind.severity or "", "unknown"),
-            "last_seen": ind.last_seen.isoformat() if ind.last_seen else datetime.now(timezone.utc).isoformat(),
-        })
+    # --- External enrichment -----------------------------------------------
+    # Resolve dispatch type (ip/domain/url/hash) — either user-supplied or
+    # best-effort detected from the value itself.
+    dispatch_type = _normalize_type(
+        resolved_type if resolved_type and resolved_type != "auto" else indicator_type
+    )
+    if dispatch_type in ("", "auto", "unknown"):
+        dispatch_type = _normalize_type(_detect_indicator_type(indicator_value))
+    if dispatch_type in ("", "unknown"):
+        # still resolve as-is; skip external if unclassifiable
+        dispatch_type = _normalize_type(indicator_type)
 
-    # Aggregate tags
-    all_tags = []
-    for ind in indicators:
-        all_tags.extend(ind.tags or [])
-    unique_tags = list(dict.fromkeys(all_tags))
+    external_sources: list[dict[str, Any]] = []
+    external_errors: list[str] = []
+    external_status = "ok"
 
-    # Earliest first_seen and latest last_seen
-    first_seens = [ind.first_seen for ind in indicators if ind.first_seen]
-    last_seens = [ind.last_seen for ind in indicators if ind.last_seen]
+    try:
+        integrations = await _load_intel_integrations(db)
+    except Exception as e:
+        logger.warning("Failed to load intel integrations: %s", e)
+        integrations = {}
+
+    if not integrations:
+        external_status = "no_integrations_configured"
+    elif dispatch_type not in ("ip", "domain", "url", "hash"):
+        external_status = "unsupported_indicator_type"
+    else:
+        # Pull providers that will actually be called so we can check cache
+        # first and only hit the network for cache misses.
+        providers_for_type = {
+            "ip": ["abuseipdb", "virustotal"],
+            "domain": ["virustotal"],
+            "url": ["virustotal"],
+            "hash": ["virustotal"],
+        }[dispatch_type]
+        providers_to_call = [p for p in providers_for_type if p in integrations]
+
+        cached_hits: list[dict[str, Any]] = []
+        missing: list[str] = []
+        for provider in providers_to_call:
+            cache_key = (provider, dispatch_type, indicator_value)
+            cached = _cache_get(cache_key)
+            if cached is not None:
+                cached_hits.append(cached)
+            else:
+                missing.append(provider)
+
+        # Call only missing providers
+        fresh_sources: list[dict[str, Any]] = []
+        if missing:
+            sub_integrations = {k: v for k, v in integrations.items() if k in missing}
+            try:
+                fresh_sources, external_errors = await _enrich_external(
+                    dispatch_type, indicator_value, sub_integrations
+                )
+            except Exception as e:
+                logger.exception("External IOC enrichment crashed: %s", e)
+                external_errors.append(f"enrichment_crashed: {e}")
+                fresh_sources = []
+                external_status = "enrichment_failed"
+            # Populate cache for successful results only
+            for src in fresh_sources:
+                if src.get("verdict") not in ("error",):
+                    _cache_set((src["name"], dispatch_type, indicator_value), src)
+
+        external_sources = cached_hits + fresh_sources
+        if not external_sources and external_status == "ok":
+            external_status = "no_results"
+
+    # --- Merge: prefer local reputation; escalate if external is worse -----
+    verdict_rank = {
+        "malicious": 4,
+        "suspicious": 3,
+        "low_risk": 2,
+        "clean": 1,
+        "unknown": 0,
+        "unsupported": 0,
+        "error": 0,
+    }
+    merged_reputation = local_reputation
+    merged_confidence = local_confidence
+    for src in external_sources:
+        v = src.get("verdict", "unknown")
+        if verdict_rank.get(v, 0) > verdict_rank.get(merged_reputation, 0):
+            merged_reputation = v
+            merged_confidence = max(merged_confidence, int(src.get("confidence") or 0))
 
     return {
         "indicator": indicator_value,
-        "type": resolved_type,
-        "reputation": reputation,
-        "confidence": confidence,
-        "sources": sources,
+        "type": resolved_type if resolved_type not in (None, "", "auto") else dispatch_type,
+        "reputation": merged_reputation,
+        "confidence": merged_confidence,
+        "sources": local_sources,
+        "external_sources": external_sources,
+        "external_enrichment": external_status,
+        "external_errors": external_errors,
         "tags": unique_tags,
-        "first_seen": min(first_seens).isoformat() if first_seens else None,
-        "last_seen": max(last_seens).isoformat() if last_seens else None,
+        "first_seen": first_seen_iso,
+        "last_seen": last_seen_iso,
     }
 
 

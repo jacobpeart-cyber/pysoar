@@ -985,9 +985,22 @@ async def import_rule_yaml(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Import a detection rule from YAML"""
+    """Import a detection rule from Sigma YAML.
+
+    Per the Sigma spec (https://github.com/SigmaHQ/sigma-specification):
+      * ``title:`` is the human-readable rule name and is what we persist
+        to ``detection_rules.name``.
+      * ``id:`` is a stable UUID identifier for the rule across Sigma
+        repos — we preserve it as a ``sigma_id:<uuid>`` tag so it's
+        queryable without a schema change.
+
+    Previously this handler wrote the Sigma ``id`` (a UUID) into
+    ``name`` and used the title only for ``title``. That meant the UI
+    rule list showed raw UUIDs as names.
+    """
     import uuid
     import yaml
+    from sqlalchemy.exc import IntegrityError
 
     yaml_content = data.get("yaml", "")
     if not yaml_content:
@@ -998,26 +1011,106 @@ async def import_rule_yaml(
     except yaml.YAMLError as e:
         raise HTTPException(status_code=400, detail=f"Invalid YAML: {e}")
 
+    if not isinstance(parsed, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="Sigma YAML must be a mapping (object) at the top level",
+        )
+
+    # Required Sigma fields
+    title = parsed.get("title")
+    if not title or not isinstance(title, str) or not title.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="Sigma rule is missing required 'title' field",
+        )
+    title = title.strip()
+
+    sigma_id = parsed.get("id")  # UUID identifier — NOT the name
+    if sigma_id is not None and not isinstance(sigma_id, str):
+        sigma_id = str(sigma_id)
+
+    detection = parsed.get("detection", {}) or {}
+    if not isinstance(detection, dict):
+        detection = {}
+
+    # Build tags: preserve author-supplied tags and add a stable sigma_id
+    # tag so the original UUID is queryable even though it's not the
+    # primary `name`.
+    sigma_tags = parsed.get("tags") or []
+    if not isinstance(sigma_tags, list):
+        sigma_tags = [str(sigma_tags)]
+    if sigma_id:
+        sigma_tags = list(sigma_tags) + [f"sigma_id:{sigma_id}"]
+
+    # Extract MITRE tactics/techniques from Sigma `tags` (attack.* prefixed)
+    mitre_tactics: list[str] = []
+    mitre_techniques: list[str] = []
+    for tag in sigma_tags:
+        if not isinstance(tag, str):
+            continue
+        if tag.startswith("attack.t"):
+            mitre_techniques.append(tag.replace("attack.", ""))
+        elif tag.startswith("attack."):
+            mitre_tactics.append(tag.replace("attack.", ""))
+
+    logsource = parsed.get("logsource", {}) or {}
+    log_types = []
+    if isinstance(logsource, dict):
+        for key in ("product", "service", "category"):
+            v = logsource.get(key)
+            if v:
+                log_types.append(str(v))
+
+    # If `name` collides (unique constraint) we append a short suffix
+    # derived from the sigma id so the import still succeeds but the
+    # user-facing title remains intact.
+    primary_name = title
+    if sigma_id:
+        # leave primary_name == title; fall back only on conflict below
+        pass
+
     rule = DetectionRule(
         id=str(uuid.uuid4()),
-        name=parsed.get("id", str(uuid.uuid4())),
-        title=parsed.get("title", "Imported Rule"),
-        description=parsed.get("description", ""),
-        severity=parsed.get("level", "medium"),
-        detection_logic=json.dumps(parsed.get("detection", {})),
-        condition=parsed.get("detection", {}).get("condition", "selection"),
+        name=primary_name,
+        title=title,
+        description=parsed.get("description", "") or "",
+        author=parsed.get("author") or None,
+        severity=parsed.get("level", "medium") or "medium",
+        status="active" if parsed.get("status", "stable") != "deprecated" else "disabled",
+        log_types=json.dumps(log_types) if log_types else None,
+        detection_logic=json.dumps(detection),
+        condition=detection.get("condition", "selection") if isinstance(detection, dict) else "selection",
+        tags=json.dumps(sigma_tags) if sigma_tags else None,
+        mitre_tactics=json.dumps(mitre_tactics) if mitre_tactics else None,
+        mitre_techniques=json.dumps(mitre_techniques) if mitre_techniques else None,
+        references=json.dumps(parsed.get("references", []) or []) if parsed.get("references") else None,
         rule_yaml=yaml_content,
         enabled=True,
-        mitre_tactics=json.dumps(parsed.get("tags", [])),
     )
     db.add(rule)
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError:
+        # Name collision on the unique index — fall back to title + short
+        # sigma-id suffix (still title-based, never a bare UUID).
+        await db.rollback()
+        suffix = (sigma_id[:8] if sigma_id else uuid.uuid4().hex[:8])
+        rule.name = f"{title} ({suffix})"
+        db.add(rule)
+        await db.flush()
     await db.refresh(rule)
 
     from src.siem.engine_manager import reload_rules
     await reload_rules(db)
 
-    return {"id": rule.id, "title": rule.title, "status": "imported"}
+    return {
+        "id": rule.id,
+        "name": rule.name,
+        "title": rule.title,
+        "sigma_id": sigma_id,
+        "status": "imported",
+    }
 
 
 @router.get("/rules/{rule_id}/export", response_model=None)
