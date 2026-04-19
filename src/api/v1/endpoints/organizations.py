@@ -64,7 +64,9 @@ class MemberResponse(BaseModel):
 
 
 class AddMemberRequest(BaseModel):
-    user_id: str
+    # Accept either user_id OR email. Frontend typically sends email.
+    user_id: Optional[str] = None
+    email: Optional[str] = None
     role: str = Field(default="member")
 
 
@@ -298,8 +300,27 @@ async def add_organization_member(
     """Add a member to an organization"""
     await _get_organization(org_id, current_user, db, require_admin=True)
 
+    # Resolve user_id from email if not provided directly
+    target_user_id = data.user_id
+    if not target_user_id and data.email:
+        by_email = await db.execute(
+            select(User).where(User.email == data.email.lower().strip())
+        )
+        user_row = by_email.scalar_one_or_none()
+        if not user_row:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No user found with email {data.email}",
+            )
+        target_user_id = user_row.id
+    if not target_user_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Either user_id or email must be provided",
+        )
+
     # Check if user exists
-    user_result = await db.execute(select(User).where(User.id == data.user_id))
+    user_result = await db.execute(select(User).where(User.id == target_user_id))
     if not user_result.scalar_one_or_none():
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -310,7 +331,7 @@ async def add_organization_member(
     existing = await db.execute(
         select(OrganizationMember).where(
             OrganizationMember.organization_id == org_id,
-            OrganizationMember.user_id == data.user_id,
+            OrganizationMember.user_id == target_user_id,
         )
     )
     if existing.scalar_one_or_none():
@@ -321,13 +342,13 @@ async def add_organization_member(
 
     member = OrganizationMember(
         organization_id=org_id,
-        user_id=data.user_id,
+        user_id=target_user_id,
         role=data.role,
     )
     db.add(member)
     await db.commit()
 
-    return {"status": "success", "message": "Member added"}
+    return {"status": "success", "message": "Member added", "user_id": target_user_id}
 
 
 @router.delete("/organizations/{org_id}/members/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -540,11 +561,30 @@ async def add_team_member(
     """Add a member to a team"""
     await _get_team(db, team_id, current_user)
 
+    # Resolve user_id from email if not provided
+    target_user_id = data.user_id
+    if not target_user_id and data.email:
+        by_email = await db.execute(
+            select(User).where(User.email == data.email.lower().strip())
+        )
+        user_row = by_email.scalar_one_or_none()
+        if not user_row:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No user found with email {data.email}",
+            )
+        target_user_id = user_row.id
+    if not target_user_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Either user_id or email must be provided",
+        )
+
     # Check if already a member
     existing = await db.execute(
         select(TeamMember).where(
             TeamMember.team_id == team_id,
-            TeamMember.user_id == data.user_id,
+            TeamMember.user_id == target_user_id,
         )
     )
     if existing.scalar_one_or_none():
@@ -555,7 +595,7 @@ async def add_team_member(
 
     member = TeamMember(
         team_id=team_id,
-        user_id=data.user_id,
+        user_id=target_user_id,
         role=data.role,
     )
     db.add(member)

@@ -107,10 +107,12 @@ export default function PrivacyDashboard() {
   });
 
   // --- PIA Form State ---
+  // assessment_type must match backend PIAAssessmentType enum:
+  //   'dpia' | 'pia' | 'tia' | 'legitimate_interest'
   const [piaForm, setPiaForm] = useState({
     name: '',
     project_name: '',
-    assessment_type: 'full',
+    assessment_type: 'pia',
     data_types_processed: '',
     processing_purposes: '',
     legal_basis: 'consent',
@@ -199,7 +201,7 @@ export default function PrivacyDashboard() {
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['privacy-pias'] });
       setShowCreatePIA(false);
-      setPiaForm({ name: '', project_name: '', assessment_type: 'full', data_types_processed: '', processing_purposes: '', legal_basis: 'consent' });
+      setPiaForm({ name: '', project_name: '', assessment_type: 'pia', data_types_processed: '', processing_purposes: '', legal_basis: 'consent' });
     },
   });
 
@@ -763,7 +765,12 @@ export default function PrivacyDashboard() {
                 <div className="grid grid-cols-2 gap-3">
                   <div>
                     <label className="block text-xs font-medium text-gray-600 mb-1">Assessment Type</label>
-                    <input type="text" value={piaForm.assessment_type} onChange={(e) => setPiaForm({ ...piaForm, assessment_type: e.target.value })} className="w-full border border-gray-300 rounded px-3 py-2 text-sm" placeholder="full, targeted, etc." />
+                    <select value={piaForm.assessment_type} onChange={(e) => setPiaForm({ ...piaForm, assessment_type: e.target.value })} className="w-full border border-gray-300 rounded px-3 py-2 text-sm">
+                      <option value="pia">PIA (Privacy Impact Assessment)</option>
+                      <option value="dpia">DPIA (Data Protection Impact Assessment)</option>
+                      <option value="tia">TIA (Transfer Impact Assessment)</option>
+                      <option value="legitimate_interest">Legitimate Interest Assessment</option>
+                    </select>
                   </div>
                   <div>
                     <label className="block text-xs font-medium text-gray-600 mb-1">Legal Basis</label>
@@ -904,12 +911,27 @@ export default function PrivacyDashboard() {
               <div className="flex gap-3 mt-5">
                 <button onClick={() => setShowCreateROPA(false)} className="flex-1 border border-gray-300 text-gray-700 px-4 py-2 rounded-lg text-sm hover:bg-gray-50">Cancel</button>
                 <button
-                  onClick={() => createROPA.mutate({
-                    ...ropaForm,
-                    data_categories: ropaForm.data_categories.split(',').map((s) => s.trim()).filter(Boolean),
-                    data_subjects: ropaForm.data_subjects.split(',').map((s) => s.trim()).filter(Boolean),
-                    recipients: ropaForm.recipients.split(',').map((s) => s.trim()).filter(Boolean),
-                  })}
+                  onClick={() => {
+                    // Backend DataProcessingRecordCreate expects:
+                    //   data_categories / data_subjects / recipients : Optional[List[str]]
+                    //   retention_period_days : Optional[int]
+                    // Split free-text comma fields into lists; coerce retention to int.
+                    const dataCategories = ropaForm.data_categories.split(',').map((s) => s.trim()).filter(Boolean);
+                    const dataSubjects = ropaForm.data_subjects.split(',').map((s) => s.trim()).filter(Boolean);
+                    const recipients = ropaForm.recipients.split(',').map((s) => s.trim()).filter(Boolean);
+                    const retentionDays = Number.isFinite(ropaForm.retention_period_days)
+                      ? Math.max(0, Math.trunc(ropaForm.retention_period_days))
+                      : null;
+                    createROPA.mutate({
+                      name: ropaForm.name,
+                      purpose: ropaForm.purpose,
+                      legal_basis: ropaForm.legal_basis,
+                      data_categories: dataCategories.length > 0 ? dataCategories : undefined,
+                      data_subjects: dataSubjects.length > 0 ? dataSubjects : undefined,
+                      recipients: recipients.length > 0 ? recipients : undefined,
+                      retention_period_days: retentionDays !== null ? retentionDays : undefined,
+                    });
+                  }}
                   disabled={createROPA.isPending || !ropaForm.name || !ropaForm.purpose}
                   className="flex-1 bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-300 text-white px-4 py-2 rounded-lg text-sm"
                 >

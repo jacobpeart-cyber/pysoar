@@ -1039,8 +1039,12 @@ export default function ExposureManagement() {
               const form = e.target as HTMLFormElement;
               const formData = new FormData(form);
               try {
+                // Backend ScannerImportRequest expects scanner_name + scan_format,
+                // not scanner_type. scan_format is the parser id (nessus, qualys,
+                // tenable, openvas, custom).
                 await api.post('/exposure/scans/import', {
-                  scanner_type: formData.get('scanner_type'),
+                  scanner_name: formData.get('scanner_name'),
+                  scan_format: formData.get('scan_format'),
                   scan_data: formData.get('scan_data'),
                 });
                 setShowImportModal(false);
@@ -1050,8 +1054,17 @@ export default function ExposureManagement() {
               }
             }} className="p-6 space-y-4">
               <div>
-                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Scanner Type *</label>
-                <select name="scanner_type" required className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white">
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Scanner Name *</label>
+                <input
+                  name="scanner_name"
+                  required
+                  placeholder="e.g. corporate-nessus-01"
+                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Scan Format *</label>
+                <select name="scan_format" required defaultValue="nessus" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white">
                   <option value="nessus">Nessus</option>
                   <option value="qualys">Qualys</option>
                   <option value="rapid7">Rapid7</option>

@@ -993,26 +993,58 @@ async def analyze_scenarios(
     """
     org_id = getattr(current_user, "organization_id", None)
     scenario_ids = request.get("scenario_ids") or []
-
-    # Load FAIR analyses either by scenario or for the whole org
-    if scenario_ids:
-        fa_query = select(FAIRAnalysis).where(
-            and_(
-                FAIRAnalysis.organization_id == org_id,
-                FAIRAnalysis.scenario_id.in_(scenario_ids),
-            )
-        )
-    else:
-        fa_query = select(FAIRAnalysis).where(
-            FAIRAnalysis.organization_id == org_id
-        )
-    analyses = list((await db.execute(fa_query)).scalars().all())
+    iterations = int(request.get("iterations") or 10000)
 
     engine = FAIREngine()
     ale_samples: list[list[float]] = []
     per_scenario: list[dict] = []
 
-    for analysis in analyses:
+    def _default_fair_inputs_from_scenario(scenario: RiskScenario) -> dict:
+        """Derive sensible FAIR PERT inputs from a RiskScenario.
+
+        The Scenario captures asset value + confidence + threat actor;
+        from those we pick a TEF/vuln/loss envelope. Real deployments
+        customize these via the FAIRAnalysisCreate form, but the
+        Analyze button needs to produce real numbers even when no
+        FAIR row has been authored yet.
+        """
+        asset_value = max(1.0, float(scenario.asset_value_usd or 10000.0))
+        # Confidence level narrows or widens the uncertainty bands
+        confidence = max(0.05, min(0.95, float(scenario.confidence_level or 0.5)))
+        spread = 1.0 - confidence  # higher confidence -> tighter bands
+
+        # Threat event frequency: default 1/year mode, envelope widens on low confidence
+        tef_mode = 1.0
+        tef_min = max(0.05, tef_mode * (1 - spread))
+        tef_max = tef_mode * (1 + 3 * spread)
+
+        # Vulnerability (how often a threat event becomes a loss event)
+        vuln_mode = 0.3
+        vuln_min = max(0.01, vuln_mode * (1 - spread))
+        vuln_max = min(0.99, vuln_mode * (1 + spread))
+
+        # Primary loss centered on the asset value, widen with spread
+        pl_mode = asset_value * 0.25
+        pl_min = pl_mode * 0.5
+        pl_max = pl_mode * (1 + 2 * spread)
+
+        sl_mode = asset_value * 0.1
+        sl_min = sl_mode * 0.25
+        sl_max = sl_mode * (1 + 2 * spread)
+
+        return dict(
+            tef_min=tef_min, tef_mode=tef_mode, tef_max=tef_max,
+            vuln_min=vuln_min, vuln_mode=vuln_mode, vuln_max=vuln_max,
+            tcap_min=0.3, tcap_mode=0.5, tcap_max=0.8,
+            rs_min=0.3, rs_mode=0.5, rs_max=0.8,
+            lm_min=pl_min, lm_mode=pl_mode, lm_max=pl_max,
+            primary_loss_min=pl_min, primary_loss_mode=pl_mode, primary_loss_max=pl_max,
+            secondary_loss_min=sl_min, secondary_loss_mode=sl_mode, secondary_loss_max=sl_max,
+            secondary_loss_event_frequency=0.3,
+        )
+
+    # Helper: run sim + persist for a given FAIRAnalysis row
+    async def _simulate_and_record(analysis: FAIRAnalysis) -> None:
         payload = {
             "tef_min": analysis.tef_min,
             "tef_mode": analysis.tef_mode,
@@ -1031,29 +1063,81 @@ async def analyze_scenarios(
             "secondary_loss_max": analysis.secondary_loss_max,
             "secondary_loss_event_frequency": analysis.secondary_loss_event_frequency,
         }
-        try:
-            result = engine.run_simulation(
-                payload, analysis.simulation_iterations or 10000
+        result = engine.run_simulation(
+            payload, analysis.simulation_iterations or iterations
+        )
+        ale_samples.append(result.ale_distribution)
+        per_scenario.append({
+            "analysis_id": analysis.id,
+            "scenario_id": analysis.scenario_id,
+            "ale_mean": result.ale_mean,
+            "ale_p50": result.ale_p50,
+            "ale_p90": result.ale_p90,
+            "ale_p99": result.ale_p99,
+        })
+        analysis.ale_mean = result.ale_mean
+        analysis.ale_p10 = result.ale_p10
+        analysis.ale_p50 = result.ale_p50
+        analysis.ale_p90 = result.ale_p90
+        analysis.ale_p99 = result.ale_p99
+        analysis.loss_exceedance_curve = json.dumps(result.loss_exceedance_curve)
+        analysis.completed_at = datetime.now(timezone.utc)
+
+    # Determine target scenario set. If scenario_ids given, process each
+    # scenario (creating a default FAIRAnalysis row if none exists). If
+    # no scenario_ids given, process every existing FAIRAnalysis row
+    # for the org.
+    if scenario_ids:
+        for sid in scenario_ids:
+            # Look up an existing analysis for this scenario
+            fa_res = await db.execute(
+                select(FAIRAnalysis).where(
+                    and_(
+                        FAIRAnalysis.organization_id == org_id,
+                        FAIRAnalysis.scenario_id == sid,
+                    )
+                )
             )
-            ale_samples.append(result.ale_distribution)
-            per_scenario.append({
-                "analysis_id": analysis.id,
-                "scenario_id": analysis.scenario_id,
-                "ale_mean": result.ale_mean,
-                "ale_p50": result.ale_p50,
-                "ale_p90": result.ale_p90,
-                "ale_p99": result.ale_p99,
-            })
-            # Persist the updated simulation results
-            analysis.ale_mean = result.ale_mean
-            analysis.ale_p10 = result.ale_p10
-            analysis.ale_p50 = result.ale_p50
-            analysis.ale_p90 = result.ale_p90
-            analysis.ale_p99 = result.ale_p99
-            analysis.loss_exceedance_curve = json.dumps(result.loss_exceedance_curve)
-            analysis.completed_at = datetime.now(timezone.utc)
-        except Exception as exc:  # noqa: BLE001
-            logger.error(f"FAIR analyze failed for {analysis.id}: {exc}")
+            analysis = fa_res.scalar_one_or_none()
+            if analysis is None:
+                # Derive inputs from the RiskScenario so the Analyze
+                # action actually produces real numbers
+                scen_res = await db.execute(
+                    select(RiskScenario).where(
+                        and_(
+                            RiskScenario.organization_id == org_id,
+                            RiskScenario.id == sid,
+                        )
+                    )
+                )
+                scenario = scen_res.scalar_one_or_none()
+                if scenario is None:
+                    logger.warning(f"Skipping unknown scenario {sid}")
+                    continue
+                defaults = _default_fair_inputs_from_scenario(scenario)
+                analysis = FAIRAnalysis(
+                    organization_id=org_id,
+                    scenario_id=sid,
+                    simulation_iterations=iterations,
+                    **defaults,
+                )
+                db.add(analysis)
+                await db.flush()
+                await db.refresh(analysis)
+            try:
+                await _simulate_and_record(analysis)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(f"FAIR analyze failed for {analysis.id}: {exc}")
+    else:
+        fa_query = select(FAIRAnalysis).where(
+            FAIRAnalysis.organization_id == org_id
+        )
+        analyses = list((await db.execute(fa_query)).scalars().all())
+        for analysis in analyses:
+            try:
+                await _simulate_and_record(analysis)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(f"FAIR analyze failed for {analysis.id}: {exc}")
 
     await db.flush()
 

@@ -1,6 +1,9 @@
 """Settings endpoints for managing application configuration"""
 
-from fastapi import APIRouter, Depends, HTTPException
+from typing import Any, Dict, Optional
+
+from fastapi import APIRouter, Body, Depends, HTTPException
+from pydantic import BaseModel
 
 from src.api.deps import get_current_superuser
 from src.core.config import settings as app_settings
@@ -13,6 +16,15 @@ from src.schemas.settings import (
     NotificationConfig,
     AlertCorrelationConfig,
 )
+
+
+class SecurityConfig(BaseModel):
+    """Subset of security-related tunables exposed via PATCH /settings/security"""
+    max_login_attempts: Optional[int] = None
+    lockout_duration_minutes: Optional[int] = None
+    session_timeout_minutes: Optional[int] = None
+    password_min_length: Optional[int] = None
+    require_mfa: Optional[bool] = None
 
 router = APIRouter(prefix="/settings", tags=["settings"])
 
@@ -128,6 +140,172 @@ async def update_settings(
             app_settings.access_token_expire_minutes = gen.session_timeout_minutes
 
     return await get_settings(current_user)
+
+
+@router.patch("/general", response_model=GeneralSettings)
+async def update_general_settings(
+    updates: Dict[str, Any] = Body(...),
+    current_user: User = Depends(get_current_superuser),
+) -> GeneralSettings:
+    """Update general settings. Accepts a dict of fields to update."""
+    if "app_name" in updates and updates["app_name"] is not None:
+        app_settings.app_name = str(updates["app_name"])
+    if "session_timeout_minutes" in updates and updates["session_timeout_minutes"] is not None:
+        try:
+            app_settings.access_token_expire_minutes = int(updates["session_timeout_minutes"])
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="session_timeout_minutes must be int")
+    # These fields are not currently bound to app_settings; keep them as
+    # echo-through so the UI can render the saved value during the process.
+    for key in ("timezone", "date_format", "time_format",
+                "max_login_attempts", "lockout_duration_minutes"):
+        if key in updates and updates[key] is not None:
+            setattr(app_settings, f"_runtime_{key}", updates[key])
+
+    return GeneralSettings(
+        app_name=app_settings.app_name,
+        timezone=getattr(app_settings, "_runtime_timezone", "UTC"),
+        date_format=getattr(app_settings, "_runtime_date_format", "YYYY-MM-DD"),
+        time_format=getattr(app_settings, "_runtime_time_format", "HH:mm:ss"),
+        session_timeout_minutes=app_settings.access_token_expire_minutes,
+        max_login_attempts=getattr(app_settings, "_runtime_max_login_attempts", 5),
+        lockout_duration_minutes=getattr(app_settings, "_runtime_lockout_duration_minutes", 15),
+    )
+
+
+@router.patch("/smtp", response_model=SMTPConfig)
+async def update_smtp_settings(
+    updates: Dict[str, Any] = Body(...),
+    current_user: User = Depends(get_current_superuser),
+) -> SMTPConfig:
+    """Update SMTP settings. Accepts a dict of fields to update."""
+    mapping = {
+        "host": "smtp_host",
+        "port": "smtp_port",
+        "username": "smtp_user",
+        "password": "smtp_password",
+        "from_address": "smtp_from",
+        "use_tls": "smtp_tls",
+    }
+    for in_key, attr in mapping.items():
+        if in_key in updates and updates[in_key] is not None:
+            value = updates[in_key]
+            if in_key == "port":
+                try:
+                    value = int(value)
+                except (TypeError, ValueError):
+                    raise HTTPException(status_code=400, detail="port must be int")
+            if in_key == "use_tls":
+                value = bool(value)
+            setattr(app_settings, attr, value)
+
+    return SMTPConfig(
+        host=app_settings.smtp_host,
+        port=app_settings.smtp_port,
+        username=app_settings.smtp_user,
+        from_address=app_settings.smtp_from,
+        use_tls=app_settings.smtp_tls,
+    )
+
+
+@router.patch("/notifications", response_model=NotificationConfig)
+async def update_notification_settings(
+    updates: Dict[str, Any] = Body(...),
+    current_user: User = Depends(get_current_superuser),
+) -> NotificationConfig:
+    """Update notification settings. Accepts a dict of fields to update."""
+    if "slack_webhook_url" in updates:
+        app_settings.slack_webhook_url = updates["slack_webhook_url"] or ""
+    if "teams_webhook_url" in updates:
+        app_settings.teams_webhook_url = updates["teams_webhook_url"] or ""
+    # Booleans like email_enabled are derived in GET; store an override flag
+    for key in ("email_enabled", "slack_enabled", "teams_enabled"):
+        if key in updates and updates[key] is not None:
+            setattr(app_settings, f"_runtime_{key}", bool(updates[key]))
+
+    return NotificationConfig(
+        email_enabled=getattr(app_settings, "_runtime_email_enabled", bool(app_settings.smtp_user)),
+        slack_enabled=getattr(app_settings, "_runtime_slack_enabled", bool(app_settings.slack_webhook_url)),
+        teams_enabled=getattr(app_settings, "_runtime_teams_enabled", bool(app_settings.teams_webhook_url)),
+        slack_webhook_url=_mask_secret(app_settings.slack_webhook_url),
+        teams_webhook_url=_mask_secret(app_settings.teams_webhook_url),
+    )
+
+
+@router.patch("/security", response_model=SecurityConfig)
+async def update_security_settings(
+    updates: Dict[str, Any] = Body(...),
+    current_user: User = Depends(get_current_superuser),
+) -> SecurityConfig:
+    """Update security settings. Accepts a dict of fields to update."""
+    if "session_timeout_minutes" in updates and updates["session_timeout_minutes"] is not None:
+        try:
+            app_settings.access_token_expire_minutes = int(updates["session_timeout_minutes"])
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="session_timeout_minutes must be int")
+    for key in ("max_login_attempts", "lockout_duration_minutes",
+                "password_min_length", "require_mfa"):
+        if key in updates and updates[key] is not None:
+            setattr(app_settings, f"_runtime_{key}", updates[key])
+
+    return SecurityConfig(
+        max_login_attempts=getattr(app_settings, "_runtime_max_login_attempts", 5),
+        lockout_duration_minutes=getattr(app_settings, "_runtime_lockout_duration_minutes", 15),
+        session_timeout_minutes=app_settings.access_token_expire_minutes,
+        password_min_length=getattr(app_settings, "_runtime_password_min_length", 8),
+        require_mfa=getattr(app_settings, "_runtime_require_mfa", False),
+    )
+
+
+# Per-integration config keyed by canonical integration id (e.g. "virustotal",
+# "abuseipdb", "shodan", "greynoise", "elasticsearch", "splunk"). The GET path
+# reads `bool(app_settings.<id>_api_key)` for most of these, so mirroring the
+# write path means setting those same attributes on app_settings.
+_INTEGRATION_KEY_ATTR = {
+    "virustotal": "virustotal_api_key",
+    "abuseipdb": "abuseipdb_api_key",
+    "shodan": "shodan_api_key",
+    "greynoise": "greynoise_api_key",
+    "elasticsearch": "elasticsearch_url",
+    "splunk": "splunk_host",
+}
+
+
+@router.post("/integrations/{integration_id}")
+async def save_integration_config(
+    integration_id: str,
+    config: Dict[str, Any] = Body(...),
+    current_user: User = Depends(get_current_superuser),
+) -> dict:
+    """Save configuration for a specific integration."""
+    if integration_id not in _INTEGRATION_KEY_ATTR:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown integration: {integration_id}",
+        )
+
+    attr = _INTEGRATION_KEY_ATTR[integration_id]
+    # The frontend typically sends {api_key, enabled, ...} OR for splunk/elasticsearch
+    # it sends {host/url, ...}. Accept the common shapes.
+    primary_value = (
+        config.get("api_key")
+        or config.get("url")
+        or config.get("host")
+        or config.get("token")
+    )
+    if primary_value is not None:
+        setattr(app_settings, attr, str(primary_value))
+
+    # Stash the full config for retrieval/enabled flag
+    setattr(app_settings, f"_runtime_integration_{integration_id}", config)
+
+    configured = bool(getattr(app_settings, attr, None))
+    enabled = bool(config.get("enabled", configured))
+    return {
+        "integration_id": integration_id,
+        "enabled": enabled,
+        "configured": configured,
+    }
 
 
 @router.post("/test-email")

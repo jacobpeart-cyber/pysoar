@@ -77,10 +77,17 @@ class DarkWebFindingBase(BaseModel):
     source_platform: str = Field(default="paste_site")
     title: Optional[str] = None
     description: Optional[str] = None
-    affected_assets: Optional[dict[str, Any]] = None
-    affected_count: int = Field(default=1, ge=1)
+    # `affected_assets` is stored as JSON — different code paths write it as
+    # a dict, a list, or None. Accept Any so the response model doesn't 500
+    # on perfectly valid rows with a list payload.
+    affected_assets: Optional[Any] = None
+    # Scan tasks historically persisted affected_count=0 for generic findings,
+    # so relax the `ge=1` lower bound that the legacy schema required.
+    affected_count: int = Field(default=1, ge=0)
     severity: str = Field(default="medium")
-    confidence_score: int = Field(default=50, ge=0, le=100)
+    # Same story for confidence_score — some rows were written as floats or
+    # 0 or values outside the strict 0-100 band.
+    confidence_score: int = Field(default=50)
 
 
 class DarkWebFindingCreate(DarkWebFindingBase):

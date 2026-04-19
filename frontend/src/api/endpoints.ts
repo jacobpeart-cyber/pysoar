@@ -608,6 +608,26 @@ export const itdrApi = {
     const response = await api.get('/itdr/privileged-access', { params });
     return extractData(response.data);
   },
+
+  updateThreat: async (id: string, data: Record<string, any>): Promise<IdentityThreat> => {
+    const response = await api.put(`/itdr/threats/${id}`, data);
+    return response.data;
+  },
+
+  updateExposure: async (id: string, data: Record<string, any>): Promise<any> => {
+    const response = await api.put(`/itdr/credential-exposures/${id}`, data);
+    return response.data;
+  },
+
+  updateAnomaly: async (id: string, data: Record<string, any>): Promise<any> => {
+    const response = await api.put(`/itdr/anomalies/${id}`, data);
+    return response.data;
+  },
+
+  updatePrivilegedAccess: async (id: string, data: Record<string, any>): Promise<any> => {
+    const response = await api.put(`/itdr/privileged-access/${id}`, data);
+    return response.data;
+  },
 };
 
 // Vulnerability Management
@@ -635,6 +655,36 @@ export const vulnmgmtApi = {
   }): Promise<PaginatedResponse<PatchOperation>> => {
     const response = await api.get('/vulnmgmt/patch-operations', { params });
     return extractData(response.data);
+  },
+
+  getScanProfiles: async (): Promise<any[]> => {
+    const response = await api.get('/vulnmgmt/scan-profiles');
+    const data = response.data;
+    return Array.isArray(data) ? data : (data?.items || []);
+  },
+
+  createScanProfile: async (data: Record<string, any>): Promise<any> => {
+    const response = await api.post('/vulnmgmt/scan-profiles', data);
+    return response.data;
+  },
+
+  runScanProfile: async (profileId: string): Promise<any> => {
+    // Scan profiles are executed by creating a scan run via the
+    // vulnerability scanner. The import-scan endpoint is the realistic
+    // trigger — it imports findings from a named scan profile.
+    const response = await api.post('/vulnmgmt/vulnerabilities/import-scan', { scan_profile_id: profileId });
+    return response.data;
+  },
+
+  getExceptions: async (): Promise<any[]> => {
+    const response = await api.get('/vulnmgmt/exceptions');
+    const data = response.data;
+    return Array.isArray(data) ? data : (data?.items || []);
+  },
+
+  createException: async (data: Record<string, any>): Promise<any> => {
+    const response = await api.post('/vulnmgmt/exceptions', data);
+    return response.data;
   },
 };
 
@@ -879,6 +929,45 @@ export const dlpApi = {
     data_patterns?: string[];
   }): Promise<DLPPolicy> => {
     const response = await api.post('/dlp/policies', data);
+    return response.data;
+  },
+
+  updatePolicy: async (
+    id: string,
+    data: Partial<{
+      name: string;
+      description: string;
+      severity: string;
+      policy_type: string;
+      enabled: boolean;
+      data_patterns: string[];
+    }>
+  ): Promise<DLPPolicy> => {
+    const response = await api.patch(`/dlp/policies/${id}`, data);
+    return response.data;
+  },
+
+  enablePolicy: async (id: string): Promise<DLPPolicy> => {
+    const response = await api.post(`/dlp/policies/${id}/enable`);
+    return response.data;
+  },
+
+  disablePolicy: async (id: string): Promise<DLPPolicy> => {
+    const response = await api.post(`/dlp/policies/${id}/disable`);
+    return response.data;
+  },
+
+  testPolicy: async (id: string, sampleText?: string): Promise<any> => {
+    const body = sampleText ? { sample_text: sampleText } : {};
+    const response = await api.post(`/dlp/policies/${id}/test`, body);
+    return response.data;
+  },
+
+  updateIncident: async (
+    id: string,
+    data: Partial<{ status: string; resolution_notes: string; assigned_to: string }>
+  ): Promise<any> => {
+    const response = await api.patch(`/dlp/incidents/${id}`, data);
     return response.data;
   },
 };

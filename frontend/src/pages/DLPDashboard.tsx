@@ -14,6 +14,9 @@ import {
   XCircle,
   FileText,
   Activity,
+  Play,
+  Pause,
+  Zap,
 } from 'lucide-react';
 import clsx from 'clsx';
 import { dlpApi } from '../api/endpoints';
@@ -65,9 +68,130 @@ export default function DLPDashboard() {
   const [searchQuery, setSearchQuery] = useState('');
   const [showNewPolicyModal, setShowNewPolicyModal] = useState(false);
   const [selectedPolicy, setSelectedPolicy] = useState<any | null>(null);
+  const [editingPolicy, setEditingPolicy] = useState<any | null>(null);
+  const [testingPolicy, setTestingPolicy] = useState<any | null>(null);
+  const [testSampleText, setTestSampleText] = useState('');
+  const [testResult, setTestResult] = useState<any | null>(null);
+  const [testError, setTestError] = useState<string | null>(null);
   const [selectedIncident, setSelectedIncident] = useState<any | null>(null);
+  const [incidentStatusUpdate, setIncidentStatusUpdate] = useState<string>('');
+  const [incidentNotes, setIncidentNotes] = useState<string>('');
   const [selectedClassification, setSelectedClassification] = useState<string | null>(null);
   const [showFilter, setShowFilter] = useState(false);
+  const [actionBusy, setActionBusy] = useState<string | null>(null);
+  const [actionMessage, setActionMessage] = useState<string | null>(null);
+
+  const refreshPolicies = async () => {
+    const policiesData = await dlpApi.getPolicies();
+    setPolicies(Array.isArray(policiesData) ? policiesData : ((policiesData as any)?.items || []));
+  };
+
+  const refreshIncidents = async () => {
+    const incidentsData: any = await dlpApi.getIncidents();
+    setIncidents(Array.isArray(incidentsData) ? incidentsData : (incidentsData?.items || incidentsData?.data || []));
+  };
+
+  const handleEnablePolicy = async (policyId: string) => {
+    setActionBusy(`enable-${policyId}`);
+    try {
+      await dlpApi.enablePolicy(policyId);
+      await refreshPolicies();
+      setActionMessage('Policy enabled');
+    } catch (err: any) {
+      setError(err?.response?.data?.detail || 'Failed to enable policy');
+    } finally {
+      setActionBusy(null);
+    }
+  };
+
+  const handleDisablePolicy = async (policyId: string) => {
+    setActionBusy(`disable-${policyId}`);
+    try {
+      await dlpApi.disablePolicy(policyId);
+      await refreshPolicies();
+      setActionMessage('Policy disabled');
+    } catch (err: any) {
+      setError(err?.response?.data?.detail || 'Failed to disable policy');
+    } finally {
+      setActionBusy(null);
+    }
+  };
+
+  const openTestPolicy = (policy: any) => {
+    setTestingPolicy(policy);
+    setTestSampleText('');
+    setTestResult(null);
+    setTestError(null);
+  };
+
+  const runTestPolicy = async () => {
+    if (!testingPolicy) return;
+    setActionBusy(`test-${testingPolicy.id}`);
+    setTestError(null);
+    try {
+      const result = await dlpApi.testPolicy(testingPolicy.id, testSampleText || undefined);
+      setTestResult(result);
+    } catch (err: any) {
+      setTestError(err?.response?.data?.detail || err?.message || 'Test failed');
+    } finally {
+      setActionBusy(null);
+    }
+  };
+
+  const openEditPolicy = (policy: any) => {
+    setEditingPolicy({
+      id: policy.id,
+      name: policy.name || '',
+      description: policy.description || '',
+      severity: policy.severity || 'medium',
+      enabled: policy.enabled !== false,
+    });
+  };
+
+  const submitEditPolicy = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingPolicy) return;
+    setActionBusy(`edit-${editingPolicy.id}`);
+    try {
+      await dlpApi.updatePolicy(editingPolicy.id, {
+        name: editingPolicy.name,
+        description: editingPolicy.description || undefined,
+        severity: editingPolicy.severity,
+        enabled: editingPolicy.enabled,
+      });
+      await refreshPolicies();
+      setEditingPolicy(null);
+      setActionMessage('Policy updated');
+    } catch (err: any) {
+      setError(err?.response?.data?.detail || 'Failed to update policy');
+    } finally {
+      setActionBusy(null);
+    }
+  };
+
+  const submitIncidentStatus = async () => {
+    if (!selectedIncident) return;
+    setActionBusy(`incident-${selectedIncident.id}`);
+    try {
+      const payload: Record<string, any> = {};
+      if (incidentStatusUpdate) payload.status = incidentStatusUpdate;
+      if (incidentNotes) payload.resolution_notes = incidentNotes;
+      if (Object.keys(payload).length === 0) {
+        setActionMessage('Nothing to update');
+        return;
+      }
+      await dlpApi.updateIncident(selectedIncident.id, payload);
+      await refreshIncidents();
+      setSelectedIncident(null);
+      setIncidentStatusUpdate('');
+      setIncidentNotes('');
+      setActionMessage('Incident updated');
+    } catch (err: any) {
+      setError(err?.response?.data?.detail || 'Failed to update incident');
+    } finally {
+      setActionBusy(null);
+    }
+  };
 
   React.useEffect(() => {
     const loadData = async () => {
@@ -308,19 +432,49 @@ export default function DLPDashboard() {
                                 ? new Date(policy.last_triggered || "").toLocaleDateString()
                                 : 'Never'}
                             </td>
-                            <td className="px-6 py-4 text-sm flex gap-2">
-                              <button
-                                onClick={() => setSelectedPolicy(policy)}
-                                className="text-blue-600 dark:text-blue-400 hover:underline"
-                              >
-                                <Eye className="w-4 h-4" />
-                              </button>
-                              <button
-                                onClick={() => setSelectedPolicy(policy)}
-                                className="text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100"
-                              >
-                                <Edit className="w-4 h-4" />
-                              </button>
+                            <td className="px-6 py-4 text-sm">
+                              <div className="flex gap-2 items-center">
+                                <button
+                                  onClick={() => setSelectedPolicy(policy)}
+                                  title="View details"
+                                  className="text-blue-600 dark:text-blue-400 hover:underline"
+                                >
+                                  <Eye className="w-4 h-4" />
+                                </button>
+                                <button
+                                  onClick={() => openEditPolicy(policy)}
+                                  title="Edit policy"
+                                  className="text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100"
+                                >
+                                  <Edit className="w-4 h-4" />
+                                </button>
+                                {policy.enabled !== false ? (
+                                  <button
+                                    onClick={() => handleDisablePolicy(policy.id)}
+                                    disabled={actionBusy === `disable-${policy.id}`}
+                                    title="Disable policy"
+                                    className="text-yellow-600 dark:text-yellow-400 hover:text-yellow-700 disabled:opacity-50"
+                                  >
+                                    <Pause className="w-4 h-4" />
+                                  </button>
+                                ) : (
+                                  <button
+                                    onClick={() => handleEnablePolicy(policy.id)}
+                                    disabled={actionBusy === `enable-${policy.id}`}
+                                    title="Enable policy"
+                                    className="text-green-600 dark:text-green-400 hover:text-green-700 disabled:opacity-50"
+                                  >
+                                    <Play className="w-4 h-4" />
+                                  </button>
+                                )}
+                                <button
+                                  onClick={() => openTestPolicy(policy)}
+                                  title="Test policy"
+                                  className="text-indigo-600 dark:text-indigo-400 hover:text-indigo-700"
+                                >
+                                  <Zap className="w-4 h-4" />
+                                </button>
+                              </div>
                             </td>
                           </tr>
                         ))}
@@ -649,7 +803,7 @@ export default function DLPDashboard() {
 
       {/* Incident Detail Modal */}
       {selectedIncident && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" onClick={() => setSelectedIncident(null)}>
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" onClick={() => { setSelectedIncident(null); setIncidentStatusUpdate(''); setIncidentNotes(''); }}>
           <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-[32rem] max-h-[80vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
             <h2 className="text-xl font-bold mb-4">Incident Details</h2>
             <div className="space-y-3 text-sm">
@@ -660,13 +814,181 @@ export default function DLPDashboard() {
               <div><span className="font-medium text-gray-600 dark:text-gray-400">Severity:</span> <span className="ml-2">{(selectedIncident.severity || 'medium').toUpperCase()}</span></div>
               <div><span className="font-medium text-gray-600 dark:text-gray-400">Status:</span> <span className="ml-2">{selectedIncident.status || 'open'}</span></div>
             </div>
-            <pre className="text-xs bg-gray-100 dark:bg-gray-900 rounded p-4 overflow-auto max-h-48 mt-4">
+            <div className="mt-4 border-t border-gray-200 dark:border-gray-700 pt-4 space-y-3">
+              <h3 className="text-sm font-semibold">Update Status</h3>
+              <div>
+                <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">New Status</label>
+                <select
+                  value={incidentStatusUpdate}
+                  onChange={(e) => setIncidentStatusUpdate(e.target.value)}
+                  className="w-full px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+                >
+                  <option value="">— No change —</option>
+                  <option value="open">Open</option>
+                  <option value="investigating">Investigating</option>
+                  <option value="resolved">Resolved</option>
+                  <option value="closed">Closed</option>
+                  <option value="false_positive">False Positive</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-xs font-medium text-gray-600 dark:text-gray-400 mb-1">Resolution Notes</label>
+                <textarea
+                  value={incidentNotes}
+                  onChange={(e) => setIncidentNotes(e.target.value)}
+                  rows={2}
+                  className="w-full px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+                  placeholder="Optional context for the status change"
+                />
+              </div>
+            </div>
+            <pre className="text-xs bg-gray-100 dark:bg-gray-900 rounded p-4 overflow-auto max-h-32 mt-4">
               {JSON.stringify(selectedIncident, null, 2)}
             </pre>
-            <div className="mt-4 flex justify-end">
-              <button onClick={() => setSelectedIncident(null)} className="px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Close</button>
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                onClick={() => { setSelectedIncident(null); setIncidentStatusUpdate(''); setIncidentNotes(''); }}
+                className="px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+              >
+                Close
+              </button>
+              <button
+                onClick={submitIncidentStatus}
+                disabled={actionBusy === `incident-${selectedIncident.id}` || (!incidentStatusUpdate && !incidentNotes)}
+                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition disabled:opacity-50"
+              >
+                Update Incident
+              </button>
             </div>
           </div>
+        </div>
+      )}
+
+      {/* Edit Policy Modal */}
+      {editingPolicy && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" onClick={() => setEditingPolicy(null)}>
+          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-96 max-h-screen overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+            <h2 className="text-xl font-bold mb-4">Edit DLP Policy</h2>
+            <form onSubmit={submitEditPolicy} className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium mb-1">Policy Name</label>
+                <input
+                  type="text"
+                  value={editingPolicy.name}
+                  onChange={(e) => setEditingPolicy({ ...editingPolicy, name: e.target.value })}
+                  required
+                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Description</label>
+                <textarea
+                  value={editingPolicy.description}
+                  onChange={(e) => setEditingPolicy({ ...editingPolicy, description: e.target.value })}
+                  rows={3}
+                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Severity</label>
+                <select
+                  value={editingPolicy.severity}
+                  onChange={(e) => setEditingPolicy({ ...editingPolicy, severity: e.target.value })}
+                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+                >
+                  <option value="low">Low</option>
+                  <option value="medium">Medium</option>
+                  <option value="high">High</option>
+                  <option value="critical">Critical</option>
+                </select>
+              </div>
+              <div className="flex items-center gap-2">
+                <input
+                  id="edit-enabled"
+                  type="checkbox"
+                  checked={editingPolicy.enabled}
+                  onChange={(e) => setEditingPolicy({ ...editingPolicy, enabled: e.target.checked })}
+                />
+                <label htmlFor="edit-enabled" className="text-sm">Enabled</label>
+              </div>
+              <div className="flex gap-2 mt-6">
+                <button
+                  type="button"
+                  onClick={() => setEditingPolicy(null)}
+                  className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={actionBusy === `edit-${editingPolicy.id}`}
+                  className="flex-1 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition disabled:opacity-50"
+                >
+                  Save
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Test Policy Modal */}
+      {testingPolicy && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" onClick={() => setTestingPolicy(null)}>
+          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-[32rem] max-h-[80vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+            <h2 className="text-xl font-bold mb-4">Test Policy: {testingPolicy.name}</h2>
+            <div className="space-y-3">
+              <div>
+                <label className="block text-sm font-medium mb-1">Sample Text (optional)</label>
+                <textarea
+                  value={testSampleText}
+                  onChange={(e) => setTestSampleText(e.target.value)}
+                  rows={5}
+                  placeholder="Paste content to evaluate against this policy. Leave blank to run with backend defaults."
+                  className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100 font-mono text-sm"
+                />
+              </div>
+              {testError && (
+                <div className="px-3 py-2 rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 text-red-700 text-sm">
+                  {testError}
+                </div>
+              )}
+              {testResult && (
+                <div>
+                  <h3 className="text-sm font-semibold mb-2">Result</h3>
+                  <pre className="text-xs bg-gray-100 dark:bg-gray-900 rounded p-3 overflow-auto max-h-64">
+                    {JSON.stringify(testResult, null, 2)}
+                  </pre>
+                </div>
+              )}
+            </div>
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                onClick={() => setTestingPolicy(null)}
+                className="px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+              >
+                Close
+              </button>
+              <button
+                onClick={runTestPolicy}
+                disabled={actionBusy === `test-${testingPolicy.id}`}
+                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition disabled:opacity-50"
+              >
+                Run Test
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Action Toast */}
+      {actionMessage && (
+        <div className="fixed bottom-6 right-6 bg-green-600 text-white px-4 py-2 rounded-lg shadow-lg z-50 flex items-center gap-2">
+          <CheckCircle className="w-4 h-4" />
+          <span className="text-sm">{actionMessage}</span>
+          <button onClick={() => setActionMessage(null)} className="ml-2 text-white/80 hover:text-white">
+            <XCircle className="w-4 h-4" />
+          </button>
         </div>
       )}
 

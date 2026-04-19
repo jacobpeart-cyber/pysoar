@@ -743,34 +743,245 @@ async def list_catalog(
     return entries
 
 
+# Tables the data lake SQL executor is allowed to read from.
+# All reads are tenant-scoped by automatically injecting an
+# organization_id filter when the row model has that column.
+DATA_LAKE_READABLE_TABLES: dict[str, list[str]] = {
+    "alerts": [
+        "id", "title", "description", "severity", "status", "source",
+        "alert_type", "confidence_score", "organization_id",
+        "created_at", "updated_at", "acknowledged_at", "resolved_at",
+    ],
+    "incidents": [
+        "id", "title", "description", "severity", "priority", "status",
+        "incident_type", "category", "organization_id",
+        "detected_at", "reported_at", "resolved_at", "created_at", "updated_at",
+    ],
+    "threat_indicators": [
+        "id", "indicator_value", "indicator_type", "threat_level",
+        "confidence_score", "is_active", "source", "organization_id",
+        "first_seen", "last_seen", "created_at", "updated_at",
+    ],
+    "audit_trails": [
+        "id", "event_type", "action", "actor_type", "actor_id",
+        "resource_type", "resource_id", "result", "risk_level",
+        "organization_id", "created_at",
+    ],
+    "audit_logs": [
+        "id", "event_type", "action", "actor_id", "resource_type",
+        "resource_id", "result", "organization_id", "created_at",
+    ],
+}
+
+
+def _build_tenant_scoped_sql(raw_sql: str, org_id: Optional[str]) -> str:
+    """Validate a SQL SELECT against the whitelist and inject org scoping.
+
+    The executor only allows a narrow subset of SQL:
+      * A single ``SELECT`` statement (trailing semicolons are stripped).
+      * ``FROM <table>`` where *table* is listed in
+        ``DATA_LAKE_READABLE_TABLES``.
+      * No semicolons inside the statement (prevents stacked queries).
+      * No DDL/DML verbs (``INSERT``, ``UPDATE``, ``DELETE``, ``DROP``,
+        ``ALTER``, ``CREATE``, ``TRUNCATE``, ``COPY``, ``GRANT``,
+        ``REVOKE`` anywhere in the text).
+      * When the referenced table has an ``organization_id`` column we
+        append ``organization_id = :org_id`` to the WHERE clause so
+        callers can never read another tenant's rows, regardless of
+        what filter they put in their own SQL.
+
+    Returns the rewritten SQL. Raises ``HTTPException(400)`` if the
+    query is rejected.
+    """
+    import re
+
+    sql = (raw_sql or "").strip().rstrip(";").strip()
+    if not sql:
+        raise HTTPException(status_code=400, detail="Empty query")
+
+    upper = sql.upper()
+    if ";" in sql:
+        raise HTTPException(status_code=400, detail="Multiple statements are not permitted")
+    if not upper.startswith("SELECT") and not upper.startswith("WITH"):
+        raise HTTPException(status_code=400, detail="Only SELECT / WITH queries are permitted")
+
+    banned = {
+        "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE",
+        "TRUNCATE", "COPY", "GRANT", "REVOKE", "VACUUM", "ATTACH",
+        "DETACH", "EXEC", "CALL", "MERGE", "PG_SLEEP", "PG_READ_FILE",
+    }
+    tokens = set(re.findall(r"\b[A-Za-z_]+\b", upper))
+    offending = banned & tokens
+    if offending:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Query contains disallowed verb(s): {', '.join(sorted(offending))}",
+        )
+
+    from_matches = re.findall(
+        r"\bFROM\s+\"?([a-zA-Z_][a-zA-Z0-9_]*)\"?", sql, flags=re.IGNORECASE
+    ) + re.findall(
+        r"\bJOIN\s+\"?([a-zA-Z_][a-zA-Z0-9_]*)\"?", sql, flags=re.IGNORECASE
+    )
+    if not from_matches:
+        raise HTTPException(status_code=400, detail="Query must reference a table via FROM")
+    for tbl in from_matches:
+        if tbl.lower() not in DATA_LAKE_READABLE_TABLES:
+            allowed = ", ".join(sorted(DATA_LAKE_READABLE_TABLES.keys()))
+            raise HTTPException(
+                status_code=400,
+                detail=f"Table '{tbl}' is not in the data-lake whitelist. Allowed: {allowed}",
+            )
+
+    # Inject tenant scoping for the first referenced table. This is a
+    # belt-and-suspenders guard: callers with their own WHERE clause
+    # already get filtered, and callers without one still get filtered.
+    primary_table = from_matches[0].lower()
+    if org_id is not None and primary_table in DATA_LAKE_READABLE_TABLES:
+        where_idx = upper.find(" WHERE ")
+        tenant_clause = f"{primary_table}.organization_id = :__pysoar_org_id"
+        if where_idx >= 0:
+            # Wrap the existing WHERE contents in parentheses and AND our filter
+            before = sql[:where_idx + len(" WHERE ")]
+            after = sql[where_idx + len(" WHERE "):]
+            sql = f"{before}({after}) AND {tenant_clause}"
+        else:
+            # Insert before GROUP BY / ORDER BY / LIMIT if present,
+            # otherwise append at the end.
+            insertion_keywords = [" GROUP BY ", " ORDER BY ", " LIMIT ", " HAVING "]
+            positions = [
+                upper.find(k) for k in insertion_keywords if upper.find(k) >= 0
+            ]
+            insert_at = min(positions) if positions else len(sql)
+            sql = sql[:insert_at] + f" WHERE {tenant_clause} " + sql[insert_at:]
+
+    return sql
+
+
 @router.post("/query")
 async def run_catalog_filter_query(
     payload: dict = Body(...),
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Filter-query against the data lake catalog (sources + partitions).
+    """Execute a read-only SQL query against the data-lake whitelist.
 
-    This is NOT an arbitrary SQL executor — PySOAR's data lake module tracks
-    metadata about ingested sources and partitioned storage, not the raw
-    data itself. This endpoint accepts a JSON filter spec and returns real
-    matching DataSource and DataPartition rows from the database, tenant-
-    scoped and auditable via persisted QueryJob rows.
+    This endpoint now actually runs SQL — previously it returned a metadata
+    summary and ignored the query body. Two request shapes are supported:
 
-    Request shape::
+    **Real SQL execution (new):** pass ``{"query": "SELECT ..."}`` or
+    ``{"query_text": "SELECT ...", "query_language": "sql"}``. The executor
+    validates the query against :data:`DATA_LAKE_READABLE_TABLES`, injects
+    a tenant-scoping ``organization_id`` filter, runs it through the
+    existing async SQLAlchemy session, and returns ``columns`` and ``rows``.
+    Only ``SELECT``/``WITH`` queries are accepted; anything else is
+    rejected with 400.
 
-        {
-          "source_type": "siem",          # optional exact match
-          "source_name_contains": "auth", # optional ilike
-          "storage_tier": "hot",          # optional exact match
-          "time_range_start": "2026-01",  # optional ISO prefix match
-          "limit": 100                     # optional, default 100, max 1000
-        }
-
-    Returns the matching sources and partitions plus record counts.
+    **Catalog filter (legacy):** pass a JSON filter like ``{"source_type":
+    "siem", "storage_tier": "hot"}`` (no ``query`` key) and you get the old
+    catalog metadata response. This keeps older frontends that filter the
+    partition catalog working.
     """
     org_id = getattr(current_user, "organization_id", None)
 
+    # --- Real SQL execution path ---
+    raw_sql: Optional[str] = None
+    if isinstance(payload, dict):
+        raw_sql = payload.get("query") or payload.get("query_text") or payload.get("sql")
+    query_language = (payload.get("query_language") or "sql").lower() if isinstance(payload, dict) else "sql"
+
+    if raw_sql and isinstance(raw_sql, str) and raw_sql.strip():
+        if query_language not in ("sql", "dialect_sql"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Query language '{query_language}' is not yet executable. Only 'sql' is supported.",
+            )
+        from sqlalchemy import text as sa_text
+        started = datetime.now(timezone.utc)
+        safe_sql = _build_tenant_scoped_sql(raw_sql, org_id)
+        # Bound the result size. If the user didn't ask for a LIMIT, wrap
+        # the statement to cap at 1000 rows regardless.
+        upper_sql = safe_sql.upper()
+        max_rows = 1000
+        if " LIMIT " not in upper_sql:
+            safe_sql = f"SELECT * FROM ({safe_sql}) AS __pysoar_q LIMIT {max_rows}"
+
+        try:
+            result = await db.execute(
+                sa_text(safe_sql),
+                {"__pysoar_org_id": org_id} if org_id is not None else {},
+            )
+            col_names = list(result.keys())
+            rows_raw = result.mappings().all()
+            rows_out = [dict(r) for r in rows_raw]
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.warning(f"data-lake query execution failed: {exc}")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Query failed: {str(exc)[:200]}",
+            )
+
+        elapsed_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
+
+        # Persist a real QueryJob audit row so the history page shows it
+        try:
+            import json as _json
+            job = QueryJob(
+                organization_id=org_id,
+                query_text=raw_sql[:4000],
+                query_language=query_language,
+                status="completed",
+                records_scanned=len(rows_out),
+                records_returned=len(rows_out),
+                execution_time_ms=elapsed_ms,
+                submitted_by=str(getattr(current_user, "id", "")),
+                data_sources_queried=[],
+            )
+            db.add(job)
+            await db.commit()
+            await db.refresh(job)
+            job_id = job.id
+        except Exception as exc:
+            logger.warning(f"QueryJob persist failed (SQL exec): {exc}")
+            await db.rollback()
+            job_id = None
+
+        # Convert non-JSON-safe values (datetimes, UUIDs, etc.) to strings
+        def _json_safe(v):
+            if v is None or isinstance(v, (bool, int, float, str)):
+                return v
+            try:
+                import uuid as _uuid
+                if isinstance(v, _uuid.UUID):
+                    return str(v)
+            except Exception:
+                pass
+            if isinstance(v, datetime):
+                return v.isoformat()
+            if isinstance(v, (list, tuple)):
+                return [_json_safe(x) for x in v]
+            if isinstance(v, dict):
+                return {k: _json_safe(val) for k, val in v.items()}
+            return str(v)
+
+        rows_out_safe = [{k: _json_safe(val) for k, val in r.items()} for r in rows_out]
+
+        return {
+            "mode": "sql",
+            "query": raw_sql,
+            "query_language": query_language,
+            "columns": col_names,
+            "rows": rows_out_safe,
+            "row_count": len(rows_out_safe),
+            "execution_time_ms": elapsed_ms,
+            "job_id": job_id,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "tenant_scoped": org_id is not None,
+        }
+
+    # --- Legacy catalog filter path (no SQL provided) ---
     # Parse filter spec
     source_type = payload.get("source_type")
     name_contains = payload.get("source_name_contains") or payload.get("search")

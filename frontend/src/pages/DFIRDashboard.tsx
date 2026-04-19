@@ -120,6 +120,14 @@ export default function DFIRDashboard() {
   const [editHoldCustodians, setEditHoldCustodians] = useState('');
   const [editHoldError, setEditHoldError] = useState('');
 
+  // New Evidence modal state
+  const [showNewEvidenceModal, setShowNewEvidenceModal] = useState(false);
+  const [newEvidenceError, setNewEvidenceError] = useState('');
+
+  // New Legal Hold modal state
+  const [showNewHoldModal, setShowNewHoldModal] = useState(false);
+  const [newHoldError, setNewHoldError] = useState('');
+
   // Data queries
   const { data: casesData, isLoading: casesLoading, error: casesError } = useQuery({
     queryKey: ['dfir-cases'],
@@ -570,6 +578,17 @@ export default function DFIRDashboard() {
                     Select a case from the Cases tab to view its evidence.
                   </div>
                 )}
+                {activeCaseId && (
+                  <div className="flex justify-end">
+                    <button
+                      onClick={() => { setNewEvidenceError(''); setShowNewEvidenceModal(true); }}
+                      className="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg transition"
+                    >
+                      <Plus className="w-4 h-4" />
+                      Upload Evidence
+                    </button>
+                  </div>
+                )}
                 <div className="flex gap-4">
                   <div className="flex-1 relative">
                     <Search className="absolute left-3 top-3 w-4 h-4 text-gray-400" />
@@ -778,6 +797,17 @@ export default function DFIRDashboard() {
                 {!activeCaseId && (
                   <div className="bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-800 rounded-lg p-4 text-sm text-yellow-800 dark:text-yellow-200">
                     Select a case from the Cases tab to view its legal holds.
+                  </div>
+                )}
+                {activeCaseId && (
+                  <div className="flex justify-end">
+                    <button
+                      onClick={() => { setNewHoldError(''); setShowNewHoldModal(true); }}
+                      className="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg transition"
+                    >
+                      <Plus className="w-4 h-4" />
+                      New Legal Hold
+                    </button>
                   </div>
                 )}
                 {holdsLoading ? (
@@ -1126,6 +1156,148 @@ export default function DFIRDashboard() {
                 </button>
               </div>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* New Evidence Modal */}
+      {showNewEvidenceModal && activeCaseId && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" onClick={() => setShowNewEvidenceModal(false)}>
+          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-[28rem] max-h-screen overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+            <h2 className="text-xl font-bold mb-4">Upload Evidence</h2>
+            <form className="space-y-3" onSubmit={async (e) => {
+              e.preventDefault();
+              setNewEvidenceError('');
+              const fd = new FormData(e.currentTarget);
+              try {
+                await api.post('/dfir/evidence', {
+                  case_id: activeCaseId,
+                  evidence_type: fd.get('evidence_type') || 'file',
+                  source_device: fd.get('source_device') || null,
+                  source_ip: fd.get('source_ip') || null,
+                  acquisition_method: fd.get('acquisition_method') || 'upload',
+                  original_hash_sha256: fd.get('original_hash_sha256') || null,
+                  original_hash_md5: fd.get('original_hash_md5') || null,
+                  storage_location: fd.get('storage_location') || 'evidence_vault',
+                  file_size_bytes: parseInt((fd.get('file_size_bytes') as string) || '0', 10) || 0,
+                  handling_notes: fd.get('handling_notes') || '',
+                });
+                setShowNewEvidenceModal(false);
+                queryClient.invalidateQueries({ queryKey: ['dfir-evidence'] });
+              } catch (err: any) {
+                setNewEvidenceError(err?.response?.data?.detail || err?.message || 'Failed to create evidence');
+              }
+            }}>
+              <div>
+                <label className="block text-sm font-medium mb-1">Evidence Type</label>
+                <select name="evidence_type" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700">
+                  <option value="disk_image">disk_image</option>
+                  <option value="memory_dump">memory_dump</option>
+                  <option value="network_pcap">network_pcap</option>
+                  <option value="log_file">log_file</option>
+                  <option value="file">file</option>
+                  <option value="email">email</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Source Device</label>
+                <input name="source_device" type="text" placeholder="workstation-042" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Source IP</label>
+                <input name="source_ip" type="text" placeholder="10.0.0.42" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Acquisition Method</label>
+                <input name="acquisition_method" type="text" defaultValue="upload" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">SHA-256 Hash</label>
+                <input name="original_hash_sha256" type="text" placeholder="64 hex characters" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 font-mono text-xs" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">MD5 Hash (optional)</label>
+                <input name="original_hash_md5" type="text" placeholder="32 hex characters" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 font-mono text-xs" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Storage Location</label>
+                <input name="storage_location" type="text" defaultValue="evidence_vault" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">File Size (bytes)</label>
+                <input name="file_size_bytes" type="number" min="0" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Handling Notes</label>
+                <textarea name="handling_notes" rows={2} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700" />
+              </div>
+              <p className="text-xs text-gray-500 dark:text-gray-400">Registers evidence metadata and chain of custody. Raw file bytes are uploaded separately via the evidence vault.</p>
+              {newEvidenceError && <p className="text-sm text-red-600 dark:text-red-400">{newEvidenceError}</p>}
+              <div className="flex gap-2 mt-5">
+                <button type="button" onClick={() => setShowNewEvidenceModal(false)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
+                <button type="submit" className="flex-1 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition">Register</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* New Legal Hold Modal */}
+      {showNewHoldModal && activeCaseId && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" onClick={() => setShowNewHoldModal(false)}>
+          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-[28rem] max-h-screen overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+            <h2 className="text-xl font-bold mb-4">New Legal Hold</h2>
+            <form className="space-y-3" onSubmit={async (e) => {
+              e.preventDefault();
+              setNewHoldError('');
+              const fd = new FormData(e.currentTarget);
+              const custodiansStr = (fd.get('custodians') as string) || '';
+              const custodians = custodiansStr
+                .split(',')
+                .map((c) => c.trim())
+                .filter((c) => c.length > 0);
+              try {
+                await api.post(`/dfir/cases/${activeCaseId}/legal-holds`, {
+                  case_id: activeCaseId,
+                  hold_type: fd.get('hold_type') || 'preservation',
+                  scope: fd.get('scope') || '',
+                  custodians,
+                  status: 'active',
+                  reason: fd.get('reason') || '',
+                });
+                setShowNewHoldModal(false);
+                queryClient.invalidateQueries({ queryKey: ['dfir-legal-holds'] });
+              } catch (err: any) {
+                setNewHoldError(err?.response?.data?.detail || err?.message || 'Failed to create legal hold');
+              }
+            }}>
+              <div>
+                <label className="block text-sm font-medium mb-1">Hold Type</label>
+                <select name="hold_type" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700">
+                  <option value="preservation">preservation</option>
+                  <option value="litigation">litigation</option>
+                  <option value="regulatory">regulatory</option>
+                  <option value="internal_investigation">internal_investigation</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Custodians (comma separated)</label>
+                <input name="custodians" required type="text" placeholder="alice@acme.com, bob@acme.com" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Scope</label>
+                <textarea name="scope" rows={2} placeholder="Email, documents, chat history from Q1 2026" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Reason</label>
+                <textarea name="reason" rows={2} placeholder="Reason for the hold" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700" />
+              </div>
+              {newHoldError && <p className="text-sm text-red-600 dark:text-red-400">{newHoldError}</p>}
+              <div className="flex gap-2 mt-5">
+                <button type="button" onClick={() => setShowNewHoldModal(false)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
+                <button type="submit" className="flex-1 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition">Create</button>
+              </div>
+            </form>
           </div>
         </div>
       )}

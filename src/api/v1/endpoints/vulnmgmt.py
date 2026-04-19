@@ -769,6 +769,47 @@ async def rollback_patch(
 
 
 # Exception and Risk Acceptance Endpoints
+@router.get("/exceptions")
+async def list_exceptions(
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+    page: int = Query(1, ge=1),
+    size: int = Query(50, ge=1, le=200),
+    status: Optional[str] = Query(None, description="Filter by exception status"),
+):
+    """List vulnerability exceptions for the caller's tenant.
+
+    Backs the VulnManagement "Exceptions" tab. Returns a simple paginated
+    payload shaped like the other list endpoints: ``{items, total, page,
+    size, pages}``. Tenant-scoped on ``organization_id`` so one org can
+    never see another org's exceptions.
+    """
+    org_id = getattr(current_user, "organization_id", None)
+    query = select(VulnerabilityException)
+    if org_id is not None and hasattr(VulnerabilityException, "organization_id"):
+        query = query.where(VulnerabilityException.organization_id == org_id)
+    if status and hasattr(VulnerabilityException, "status"):
+        query = query.where(VulnerabilityException.status == status)
+
+    count_result = await db.execute(select(func.count()).select_from(query.subquery()))
+    total = count_result.scalar() or 0
+
+    offset = (page - 1) * size
+    result = await db.execute(
+        query.order_by(VulnerabilityException.created_at.desc()).limit(size).offset(offset)
+    )
+    rows = result.scalars().all()
+    items = [VulnerabilityExceptionResponse.model_validate(r).model_dump() for r in rows]
+
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "size": size,
+        "pages": math.ceil(total / size) if total else 0,
+    }
+
+
 @router.post("/exceptions", response_model=VulnerabilityExceptionResponse, status_code=status.HTTP_201_CREATED)
 async def create_exception(
     exception_data: VulnerabilityExceptionCreate,

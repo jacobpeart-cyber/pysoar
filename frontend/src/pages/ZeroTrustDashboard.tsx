@@ -206,18 +206,28 @@ export default function ZeroTrustDashboard() {
   });
 
   const evaluateAccessMutation = useMutation({
+    // Backend AccessRequestSchema requires:
+    //   subject_type, subject_id, resource_type, resource_id, context (dict)
+    // Do NOT swallow errors here — surface them so users see the failure.
     mutationFn: async (data: {
-      subject: string;
-      resource: string;
-      context?: string;
+      subject_type: string;
+      subject_id: string;
+      resource_type: string;
+      resource_id: string;
+      context: Record<string, any>;
     }) => {
-      try {
       const response = await api.post('/zerotrust/evaluate-access', data);
       return response.data;
-      } catch { return null; }
     },
     onSuccess: () => {
+      setActionError(null);
       queryClient.invalidateQueries({ queryKey: ['zerotrust-dashboard'] });
+    },
+    onError: (err: any) => {
+      console.error('Access evaluation failed:', err);
+      setActionError(
+        err?.response?.data?.detail || err?.message || 'Failed to evaluate access'
+      );
     },
   });
 
@@ -532,14 +542,19 @@ function AccessControlTab({
   decisionFilter: string;
   setDecisionFilter: (value: string) => void;
   onEvaluateAccess: (data: {
-    subject: string;
-    resource: string;
-    context?: string;
+    subject_type: string;
+    subject_id: string;
+    resource_type: string;
+    resource_id: string;
+    context: Record<string, any>;
   }) => void;
 }) {
-  const [evalSubject, setEvalSubject] = useState('');
-  const [evalResource, setEvalResource] = useState('');
-  const [evalContext, setEvalContext] = useState('');
+  const [evalSubjectType, setEvalSubjectType] = useState('user');
+  const [evalSubjectId, setEvalSubjectId] = useState('');
+  const [evalResourceType, setEvalResourceType] = useState('application');
+  const [evalResourceId, setEvalResourceId] = useState('');
+  const [evalContext, setEvalContext] = useState('{}');
+  const [evalContextError, setEvalContextError] = useState<string | null>(null);
 
   if (loading) {
     return (
@@ -556,52 +571,109 @@ function AccessControlTab({
         <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">
           Real-Time Access Evaluation
         </h2>
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-4">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
           <div>
             <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-              Subject (User/Service)
+              Subject Type
+            </label>
+            <select
+              value={evalSubjectType}
+              onChange={(e) => setEvalSubjectType(e.target.value)}
+              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm"
+            >
+              <option value="user">User</option>
+              <option value="service">Service</option>
+              <option value="device">Device</option>
+              <option value="application">Application</option>
+            </select>
+          </div>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+              Subject ID
             </label>
             <input
               type="text"
-              value={evalSubject}
-              onChange={(e) => setEvalSubject(e.target.value)}
-              placeholder="user@domain.com"
+              value={evalSubjectId}
+              onChange={(e) => setEvalSubjectId(e.target.value)}
+              placeholder="user@domain.com or service-account-1"
               className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm"
             />
           </div>
           <div>
             <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-              Resource
+              Resource Type
             </label>
-            <input
-              type="text"
-              value={evalResource}
-              onChange={(e) => setEvalResource(e.target.value)}
-              placeholder="api/secrets"
+            <select
+              value={evalResourceType}
+              onChange={(e) => setEvalResourceType(e.target.value)}
               className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm"
-            />
+            >
+              <option value="application">Application</option>
+              <option value="data">Data</option>
+              <option value="network_segment">Network Segment</option>
+              <option value="api">API</option>
+              <option value="file">File</option>
+              <option value="database">Database</option>
+            </select>
           </div>
           <div>
             <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
-              Context (Optional)
+              Resource ID
             </label>
             <input
               type="text"
-              value={evalContext}
-              onChange={(e) => setEvalContext(e.target.value)}
-              placeholder="remote, high-risk-ip"
+              value={evalResourceId}
+              onChange={(e) => setEvalResourceId(e.target.value)}
+              placeholder="api/secrets or finance-db"
               className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm"
             />
           </div>
         </div>
+        <div className="mb-4">
+          <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">
+            Context (JSON)
+          </label>
+          <textarea
+            value={evalContext}
+            onChange={(e) => {
+              setEvalContext(e.target.value);
+              setEvalContextError(null);
+            }}
+            rows={4}
+            placeholder='{"location": "remote", "device_trust": "high", "behavior_score": 0.2}'
+            className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white text-sm font-mono"
+          />
+          {evalContextError && (
+            <p className="mt-1 text-xs text-red-600 dark:text-red-400">{evalContextError}</p>
+          )}
+        </div>
         <button
-          onClick={() =>
+          onClick={() => {
+            let parsedContext: Record<string, any> = {};
+            const trimmed = (evalContext || '').trim();
+            if (trimmed.length > 0) {
+              try {
+                const parsed = JSON.parse(trimmed);
+                if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                  parsedContext = parsed;
+                } else {
+                  setEvalContextError('Context must be a JSON object (e.g. {"key": "value"})');
+                  return;
+                }
+              } catch {
+                setEvalContextError('Context is not valid JSON');
+                return;
+              }
+            }
+            setEvalContextError(null);
             onEvaluateAccess({
-              subject: evalSubject,
-              resource: evalResource,
-              context: evalContext,
-            })
-          }
+              subject_type: evalSubjectType,
+              subject_id: evalSubjectId,
+              resource_type: evalResourceType,
+              resource_id: evalResourceId,
+              context: parsedContext,
+            });
+          }}
           className="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 font-medium text-sm"
         >
           Evaluate Access

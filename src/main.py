@@ -80,6 +80,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     except Exception as e:  # noqa: BLE001
         logger.warning("Built-in feed registration failed", error=str(e))
 
+    # Seed the integration_connectors table from the in-memory builtin
+    # registry so POST /integrations/install doesn't fail the FK constraint.
+    try:
+        from src.integrations.engine import ConnectorRegistry
+        created = await ConnectorRegistry().seed_connectors_to_db()
+        if created:
+            logger.info("Seeded integration connectors", count=created)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Integration connector seeding failed", error=str(e))
+
     # Seed compliance frameworks (idempotent). Populates FedRAMP Moderate
     # w/ 191 NIST 800-53 Rev 5 controls, plus NIST 800-171, CMMC 2 L2,
     # PCI DSS v4, HIPAA, SOC 2, and ISO 27001:2022 for every organization.

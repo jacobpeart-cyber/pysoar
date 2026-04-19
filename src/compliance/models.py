@@ -221,19 +221,19 @@ class ComplianceEvidence(BaseModel):
     content: Mapped[Optional[str]] = mapped_column(Text)
     source_system: Mapped[Optional[str]] = mapped_column(String(255))
 
-    collected_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now)
+    collected_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
     collected_by: Mapped[str] = mapped_column(String(255))
     is_automated: Mapped[bool] = mapped_column(Boolean, default=False)
     is_valid: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
     expires_at: Mapped[Optional[datetime]] = mapped_column(
-        DateTime, nullable=True, index=True
+        DateTime(timezone=True), nullable=True, index=True
     )
 
     review_status: Mapped[str] = mapped_column(
         String(50), default="pending"
     )  # pending, reviewed, approved, rejected
     reviewed_by: Mapped[Optional[str]] = mapped_column(String(255))
-    reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
     tags: Mapped[List[str]] = mapped_column(JSON, default=[])
     organization_id: Mapped[str] = mapped_column(

@@ -551,11 +551,15 @@ async def audit_cluster(
     # Persist new findings to DB
     org_id = getattr(current_user, "organization_id", None)
     for finding in audit_result.get("findings", []):
+        # Cluster-level findings (e.g. RBAC, CIS benchmark misses) don't map to
+        # a specific namespace, but the column is NOT NULL. Fall back to a
+        # sentinel value so the INSERT doesn't blow up.
         db.add(K8sSecurityFinding(
             cluster_id=cluster_id,
             finding_type=finding["type"],
             severity=finding["severity"],
             description=finding.get("message", ""),
+            namespace=finding.get("namespace") or "_cluster",
             status="open",
             detected_at=datetime.now(timezone.utc),
             organization_id=org_id,

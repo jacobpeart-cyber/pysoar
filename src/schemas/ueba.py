@@ -4,9 +4,9 @@ Request/response schemas for UEBA API endpoints.
 """
 
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 from src.schemas.base import DBModel
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 # ============================================================================
@@ -146,8 +146,23 @@ class UEBARiskAlertBase(BaseModel):
     alert_type: str = ""
     severity: str = Field(..., description="Severity: critical, high, medium, low")
     description: str = ""
+    # `evidence` is stored as JSON and older rows sometimes persisted an empty
+    # dict {} instead of an empty list. Coerce so the response model doesn't
+    # 500 on those rows.
     evidence: list = Field(default_factory=list)
     mitre_techniques: list = Field(default_factory=list)
+
+    @field_validator("evidence", "mitre_techniques", mode="before")
+    @classmethod
+    def _coerce_empty_dict_to_list(cls, v: Any) -> Any:
+        if v is None:
+            return []
+        if isinstance(v, dict):
+            # Empty dict {} from legacy rows, or a dict that should have been a list
+            if not v:
+                return []
+            return list(v.values())
+        return v
 
 
 class UEBARiskAlertCreate(UEBARiskAlertBase):
@@ -171,12 +186,23 @@ class UEBARiskAlertResponse(UEBARiskAlertBase, DBModel):
     id: str = ""
     entity_profile_id: str = ""
     risk_score_delta: float = 0.0
-    contributing_events: list
+    contributing_events: list = Field(default_factory=list)
     status: str = ""
     analyst_notes: Optional[str] = None
     escalated_to_incident: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+
+    @field_validator("contributing_events", mode="before")
+    @classmethod
+    def _coerce_contributing_events(cls, v: Any) -> Any:
+        if v is None:
+            return []
+        if isinstance(v, dict):
+            if not v:
+                return []
+            return list(v.values())
+        return v
 
     class Config:
         from_attributes = True

@@ -53,6 +53,195 @@ const getStatusColor = (status: string) => {
   }
 };
 
+type ITDRRecordKind = 'threat' | 'exposure' | 'anomaly' | 'access';
+
+interface ITDRDetailModalProps {
+  threat: any | null;
+  exposure: any | null;
+  anomaly: any | null;
+  access: any | null;
+  mode: 'view' | 'edit';
+  onClose: () => void;
+  onSaved: (kind: ITDRRecordKind, updated: any) => void;
+}
+
+function ITDRDetailModal({ threat, exposure, anomaly, access, mode, onClose, onSaved }: ITDRDetailModalProps) {
+  const record = threat || exposure || anomaly || access;
+  const kind: ITDRRecordKind = threat ? 'threat' : exposure ? 'exposure' : anomaly ? 'anomaly' : 'access';
+
+  const [form, setForm] = useState<any>(() => ({
+    // threat fields
+    severity: record?.severity ?? '',
+    status: record?.status ?? '',
+    confidence_score: record?.confidence_score ?? 0,
+    analyst_notes: record?.analyst_notes ?? '',
+    // exposure fields
+    is_remediated: Boolean(record?.is_remediated),
+    remediation_action: record?.remediation_action ?? '',
+    // anomaly fields
+    is_reviewed: Boolean(record?.is_reviewed),
+    reviewer_notes: record?.reviewer_notes ?? '',
+    // privileged-access fields
+    justification: record?.justification ?? '',
+    was_revoked: Boolean(record?.was_revoked),
+    revocation_reason: record?.revocation_reason ?? '',
+  }));
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const isEdit = mode === 'edit';
+
+  const handleSave = async () => {
+    if (!record?.id) return;
+    setSaving(true);
+    setError(null);
+    try {
+      let payload: Record<string, any> = {};
+      let updated: any;
+      if (kind === 'threat') {
+        payload = {
+          severity: form.severity,
+          status: form.status,
+          confidence_score: Number(form.confidence_score) || 0,
+        };
+        updated = await itdrApi.updateThreat(record.id, payload);
+      } else if (kind === 'exposure') {
+        payload = {
+          is_remediated: Boolean(form.is_remediated),
+          remediation_action: form.remediation_action || null,
+        };
+        updated = await itdrApi.updateExposure(record.id, payload);
+      } else if (kind === 'anomaly') {
+        payload = {
+          is_reviewed: Boolean(form.is_reviewed),
+          reviewer_notes: form.reviewer_notes || null,
+        };
+        updated = await itdrApi.updateAnomaly(record.id, payload);
+      } else if (kind === 'access') {
+        payload = {
+          justification: form.justification || null,
+          was_revoked: Boolean(form.was_revoked),
+          revocation_reason: form.revocation_reason || null,
+        };
+        updated = await itdrApi.updatePrivilegedAccess(record.id, payload);
+      }
+      onSaved(kind, updated);
+    } catch (e: any) {
+      setError(e?.response?.data?.detail || e?.message || 'Save failed');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const title =
+    kind === 'threat' ? (isEdit ? 'Edit Threat' : 'Threat Details')
+    : kind === 'exposure' ? (isEdit ? 'Edit Credential Exposure' : 'Credential Exposure Details')
+    : kind === 'anomaly' ? (isEdit ? 'Edit Access Anomaly' : 'Access Anomaly Details')
+    : (isEdit ? 'Edit Privileged Access' : 'Privileged Access Details');
+
+  return (
+    <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" onClick={onClose}>
+      <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-[36rem] max-h-[85vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+        <h2 className="text-xl font-bold mb-4">{title}</h2>
+
+        {!isEdit && (
+          <pre className="text-xs bg-gray-100 dark:bg-gray-900 rounded p-4 overflow-auto max-h-96">
+            {JSON.stringify(record, null, 2)}
+          </pre>
+        )}
+
+        {isEdit && kind === 'threat' && (
+          <div className="space-y-3">
+            <div>
+              <label className="block text-sm font-medium mb-1">Severity</label>
+              <select value={form.severity} onChange={(e) => setForm((f: any) => ({ ...f, severity: e.target.value }))} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700">
+                <option value="critical">critical</option>
+                <option value="high">high</option>
+                <option value="medium">medium</option>
+                <option value="low">low</option>
+              </select>
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1">Status</label>
+              <select value={form.status} onChange={(e) => setForm((f: any) => ({ ...f, status: e.target.value }))} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700">
+                <option value="pending">pending</option>
+                <option value="investigating">investigating</option>
+                <option value="resolved">resolved</option>
+                <option value="dismissed">dismissed</option>
+              </select>
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1">Confidence Score (0-100)</label>
+              <input type="number" min={0} max={100} value={form.confidence_score} onChange={(e) => setForm((f: any) => ({ ...f, confidence_score: e.target.value }))} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700" />
+            </div>
+          </div>
+        )}
+
+        {isEdit && kind === 'exposure' && (
+          <div className="space-y-3">
+            <div className="flex items-center gap-2">
+              <input id="is_remediated" type="checkbox" checked={form.is_remediated} onChange={(e) => setForm((f: any) => ({ ...f, is_remediated: e.target.checked }))} />
+              <label htmlFor="is_remediated" className="text-sm font-medium">Mark as remediated</label>
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1">Remediation Action</label>
+              <select value={form.remediation_action || ''} onChange={(e) => setForm((f: any) => ({ ...f, remediation_action: e.target.value }))} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700">
+                <option value="">(none)</option>
+                <option value="password_reset">password_reset</option>
+                <option value="token_revoke">token_revoke</option>
+                <option value="key_rotation">key_rotation</option>
+              </select>
+            </div>
+          </div>
+        )}
+
+        {isEdit && kind === 'anomaly' && (
+          <div className="space-y-3">
+            <div className="flex items-center gap-2">
+              <input id="is_reviewed" type="checkbox" checked={form.is_reviewed} onChange={(e) => setForm((f: any) => ({ ...f, is_reviewed: e.target.checked }))} />
+              <label htmlFor="is_reviewed" className="text-sm font-medium">Mark as reviewed</label>
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1">Reviewer Notes</label>
+              <textarea value={form.reviewer_notes || ''} onChange={(e) => setForm((f: any) => ({ ...f, reviewer_notes: e.target.value }))} rows={4} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700" />
+            </div>
+          </div>
+        )}
+
+        {isEdit && kind === 'access' && (
+          <div className="space-y-3">
+            <div>
+              <label className="block text-sm font-medium mb-1">Justification</label>
+              <textarea value={form.justification || ''} onChange={(e) => setForm((f: any) => ({ ...f, justification: e.target.value }))} rows={3} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700" />
+            </div>
+            <div className="flex items-center gap-2">
+              <input id="was_revoked" type="checkbox" checked={form.was_revoked} onChange={(e) => setForm((f: any) => ({ ...f, was_revoked: e.target.checked }))} />
+              <label htmlFor="was_revoked" className="text-sm font-medium">Was revoked</label>
+            </div>
+            <div>
+              <label className="block text-sm font-medium mb-1">Revocation Reason</label>
+              <input type="text" value={form.revocation_reason || ''} onChange={(e) => setForm((f: any) => ({ ...f, revocation_reason: e.target.value }))} className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700" />
+            </div>
+          </div>
+        )}
+
+        {error && <p className="mt-3 text-sm text-red-600 dark:text-red-400">{error}</p>}
+
+        <div className="mt-5 flex justify-end gap-2">
+          <button onClick={onClose} className="px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">
+            {isEdit ? 'Cancel' : 'Close'}
+          </button>
+          {isEdit && (
+            <button onClick={handleSave} disabled={saving} className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition">
+              {saving ? 'Saving...' : 'Save'}
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 export default function ITDRDashboard() {
   const [activeTab, setActiveTab] = useState('identity-threats');
   const [identityThreats, setIdentityThreats] = useState<any[]>([]);
@@ -130,12 +319,22 @@ export default function ITDRDashboard() {
 
   const handleViewExposure = (exposureId: string) => {
     const exposure = credentialExposures.find(c => c.id === exposureId);
-    if (exposure) { setSelectedExposure(exposure); }
+    if (exposure) { setSelectedExposure(exposure); setDetailMode('view'); }
+  };
+
+  const handleEditExposure = (exposureId: string) => {
+    const exposure = credentialExposures.find(c => c.id === exposureId);
+    if (exposure) { setSelectedExposure(exposure); setDetailMode('edit'); }
   };
 
   const handleViewAnomaly = (anomalyId: string) => {
     const anomaly = accessAnomalies.find(a => a.id === anomalyId);
-    if (anomaly) { setSelectedAnomaly(anomaly); }
+    if (anomaly) { setSelectedAnomaly(anomaly); setDetailMode('view'); }
+  };
+
+  const handleEditAnomaly = (anomalyId: string) => {
+    const anomaly = accessAnomalies.find(a => a.id === anomalyId);
+    if (anomaly) { setSelectedAnomaly(anomaly); setDetailMode('edit'); }
   };
 
   const handleViewAccess = (accessId: string) => {
@@ -436,6 +635,13 @@ export default function ITDRDashboard() {
                               >
                                 <Eye className="w-4 h-4" />
                               </button>
+                              <button
+                                onClick={() => handleEditExposure(credential.id)}
+                                className="text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100"
+                                title="Edit exposure"
+                              >
+                                <Edit className="w-4 h-4" />
+                              </button>
                             </td>
                           </tr>
                         ))}
@@ -495,13 +701,22 @@ export default function ITDRDashboard() {
                               {anomaly.created_at ? new Date(anomaly.created_at || "").toLocaleString() : 'N/A'}
                             </p>
                           </div>
-                          <button
-                            onClick={() => handleViewAnomaly(anomaly.id)}
-                            className="text-blue-600 dark:text-blue-400 hover:underline ml-4"
-                            title="View details"
-                          >
-                            <Eye className="w-4 h-4" />
-                          </button>
+                          <div className="flex gap-2 ml-4">
+                            <button
+                              onClick={() => handleViewAnomaly(anomaly.id)}
+                              className="text-blue-600 dark:text-blue-400 hover:underline"
+                              title="View details"
+                            >
+                              <Eye className="w-4 h-4" />
+                            </button>
+                            <button
+                              onClick={() => handleEditAnomaly(anomaly.id)}
+                              className="text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100"
+                              title="Edit anomaly"
+                            >
+                              <Edit className="w-4 h-4" />
+                            </button>
+                          </div>
                         </div>
                       </div>
                     ))}
@@ -581,29 +796,23 @@ export default function ITDRDashboard() {
         )}
       </div>
 
-      {/* Detail Modal */}
+      {/* Detail/Edit Modal */}
       {(selectedThreat || selectedExposure || selectedAnomaly || selectedAccess) && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" onClick={() => { setSelectedThreat(null); setSelectedExposure(null); setSelectedAnomaly(null); setSelectedAccess(null); }}>
-          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-[32rem] max-h-[80vh] overflow-y-auto" onClick={(e) => e.stopPropagation()}>
-            <h2 className="text-xl font-bold mb-4">
-              {selectedThreat ? `${detailMode === 'edit' ? 'Edit' : 'View'} Threat` : ''}
-              {selectedExposure ? 'Credential Exposure Details' : ''}
-              {selectedAnomaly ? 'Access Anomaly Details' : ''}
-              {selectedAccess ? `${detailMode === 'edit' ? 'Edit' : 'View'} Privileged Access` : ''}
-            </h2>
-            <pre className="text-xs bg-gray-100 dark:bg-gray-900 rounded p-4 overflow-auto max-h-96">
-              {JSON.stringify(selectedThreat || selectedExposure || selectedAnomaly || selectedAccess, null, 2)}
-            </pre>
-            <div className="mt-4 flex justify-end">
-              <button
-                onClick={() => { setSelectedThreat(null); setSelectedExposure(null); setSelectedAnomaly(null); setSelectedAccess(null); }}
-                className="px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
-              >
-                Close
-              </button>
-            </div>
-          </div>
-        </div>
+        <ITDRDetailModal
+          threat={selectedThreat}
+          exposure={selectedExposure}
+          anomaly={selectedAnomaly}
+          access={selectedAccess}
+          mode={detailMode}
+          onClose={() => { setSelectedThreat(null); setSelectedExposure(null); setSelectedAnomaly(null); setSelectedAccess(null); }}
+          onSaved={(kind, updated) => {
+            if (kind === 'threat') setIdentityThreats(prev => prev.map(x => x.id === updated.id ? updated : x));
+            if (kind === 'exposure') setCredentialExposures(prev => prev.map(x => x.id === updated.id ? updated : x));
+            if (kind === 'anomaly') setAccessAnomalies(prev => prev.map(x => x.id === updated.id ? updated : x));
+            if (kind === 'access') setPrivilegedAccess(prev => prev.map(x => x.id === updated.id ? updated : x));
+            setSelectedThreat(null); setSelectedExposure(null); setSelectedAnomaly(null); setSelectedAccess(null);
+          }}
+        />
       )}
 
       {/* New Threat Modal */}

@@ -493,3 +493,279 @@ class FedRAMPGenerator:
             enriched.append(entry)
 
         return enriched
+
+    # ---------------------------------------------------------- IRP / CMP / ConMon
+
+    def _family_controls_from_data(
+        self,
+        controls_data: List[Dict[str, Any]],
+        family_codes: List[str],
+    ) -> List[Dict[str, Any]]:
+        """Filter controls_data down to those in the supplied family codes."""
+        return [
+            {
+                "control_id": c["id"],
+                "title": c.get("title", ""),
+                "description": c.get("description", ""),
+                "family": c.get("family", ""),
+                "implementation_status": c.get("implementation_status", "planned"),
+                "pysoar_mapping": c.get("pysoar_mapping", ""),
+                "responsible_role": c.get("responsible_role", "System Administrator"),
+                "evidence_artifacts": c.get("evidence_artifacts", []),
+            }
+            for c in controls_data
+            if any(c["id"].startswith(f + "-") for f in family_codes)
+        ]
+
+    def generate_irp(
+        self,
+        org_name: str,
+        system_name: str,
+        controls_data: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Generate a FedRAMP Incident Response Plan (IR family)."""
+        if controls_data is None:
+            controls_data = FEDRAMP_MODERATE_CONTROLS
+        now = datetime.utcnow().isoformat() + "Z"
+        today = date.today().isoformat()
+        ir_controls = self._family_controls_from_data(controls_data, ["IR"])
+
+        return {
+            "document_metadata": {
+                "title": f"Incident Response Plan — {system_name}",
+                "version": "1.0",
+                "date_prepared": today,
+                "last_updated": now,
+                "prepared_by": org_name,
+                "fedramp_baseline": "Moderate",
+                "nist_revision": "Rev 5",
+                "document_status": "Draft",
+                "control_family_scope": ["IR - Incident Response"],
+            },
+            "purpose": (
+                f"This Incident Response Plan establishes {org_name}'s process for "
+                f"preparing for, detecting, analyzing, containing, eradicating, and "
+                f"recovering from security incidents affecting {system_name}, in "
+                "alignment with NIST 800-61r2 and FedRAMP IR controls."
+            ),
+            "scope": {
+                "system": system_name,
+                "covered_events": [
+                    "Unauthorized access or account compromise",
+                    "Malware / ransomware detection",
+                    "Data exfiltration or suspected data breach",
+                    "Denial of service / availability disruption",
+                    "Insider misuse or policy violation",
+                    "Supply chain / third-party compromise",
+                ],
+            },
+            "roles_and_responsibilities": [
+                {"role": "Incident Commander", "responsibility": "Overall incident coordination, stakeholder communication, declaration of severity."},
+                {"role": "Security Operations Center (SOC)", "responsibility": "24/7 detection, triage, and initial containment through PySOAR SIEM and playbooks."},
+                {"role": "Incident Response Team", "responsibility": "Deep analysis, forensic evidence collection, eradication and recovery actions."},
+                {"role": "ISSO", "responsibility": "Ensures FedRAMP reporting obligations (US-CERT / FedRAMP PMO) are met within required timelines."},
+                {"role": "Legal & Privacy", "responsibility": "Regulatory notification obligations, breach determination, evidence preservation instructions."},
+            ],
+            "incident_lifecycle": {
+                "preparation": [
+                    "Maintain PySOAR playbooks for each incident category.",
+                    "Quarterly tabletop exercises validating escalation paths.",
+                    "Annual IR training for all privileged users (IR-2).",
+                ],
+                "detection_and_analysis": [
+                    "PySOAR SIEM ingests logs from all in-boundary components.",
+                    "UEBA, ITDR, and Deception modules generate enriched alerts.",
+                    "Analysts triage with the Incident Workbench; IR-4 is the governing control.",
+                ],
+                "containment_eradication_recovery": [
+                    "Automated containment playbooks (host isolation, credential disable).",
+                    "Malware eradication via EDR integrations.",
+                    "Recovery validated against known-good baselines (CM-2).",
+                ],
+                "post_incident": [
+                    "Root cause analysis and lessons-learned review within 10 business days.",
+                    "POA&M entries created for any exposed control gaps.",
+                    "Playbook updates pushed through version control.",
+                ],
+            },
+            "reporting_obligations": {
+                "us_cert": "Report within 1 hour of confirmed incident per OMB M-20-04.",
+                "fedramp_pmo": "Notify FedRAMP PMO within 1 hour of high-severity incidents.",
+                "agency_customers": "Notify authorizing officials per ATO terms.",
+            },
+            "severity_matrix": [
+                {"severity": "Critical", "examples": ["Confirmed data breach of federal data", "Loss of system availability > 2h"], "response_sla": "Immediate; IC engaged within 15m."},
+                {"severity": "High", "examples": ["Active unauthorized access", "Ransomware detected in boundary"], "response_sla": "Within 30 minutes."},
+                {"severity": "Moderate", "examples": ["Suspicious privilege escalation", "Phishing hit on privileged user"], "response_sla": "Within 2 hours."},
+                {"severity": "Low", "examples": ["Failed brute force", "Non-sensitive policy violation"], "response_sla": "Within 1 business day."},
+            ],
+            "control_implementation": {
+                "family": "IR - Incident Response",
+                "controls": ir_controls,
+                "total_controls": len(ir_controls),
+            },
+            "testing_and_exercises": {
+                "frequency": "At least annually (IR-3).",
+                "last_test_date": None,
+                "next_scheduled": None,
+                "tabletop_templates": [
+                    "Ransomware in production environment",
+                    "Insider data exfiltration",
+                    "Supply chain dependency compromise",
+                ],
+            },
+        }
+
+    def generate_cmp(
+        self,
+        org_name: str,
+        system_name: str,
+        controls_data: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Generate a FedRAMP Configuration Management Plan (CM family)."""
+        if controls_data is None:
+            controls_data = FEDRAMP_MODERATE_CONTROLS
+        now = datetime.utcnow().isoformat() + "Z"
+        today = date.today().isoformat()
+        cm_controls = self._family_controls_from_data(controls_data, ["CM"])
+
+        return {
+            "document_metadata": {
+                "title": f"Configuration Management Plan — {system_name}",
+                "version": "1.0",
+                "date_prepared": today,
+                "last_updated": now,
+                "prepared_by": org_name,
+                "fedramp_baseline": "Moderate",
+                "nist_revision": "Rev 5",
+                "document_status": "Draft",
+                "control_family_scope": ["CM - Configuration Management"],
+            },
+            "purpose": (
+                f"This Configuration Management Plan defines how {org_name} establishes, "
+                f"maintains, and documents secure baseline configurations for {system_name} "
+                "in accordance with NIST 800-128 and FedRAMP CM controls."
+            ),
+            "configuration_baselines": [
+                {"component": "Application server (Docker image)", "baseline": "CIS-hardened Debian 12 + pinned Python 3.12 deps"},
+                {"component": "PostgreSQL", "baseline": "CIS PostgreSQL 16 benchmark; encrypted at rest; role-based access"},
+                {"component": "Redis", "baseline": "CIS Redis benchmark; TLS enabled; no unauthenticated access"},
+                {"component": "Nginx reverse proxy", "baseline": "CIS Nginx benchmark; TLS 1.2+; security headers"},
+                {"component": "Infrastructure (Terraform)", "baseline": "Reviewed modules; no public S3/security groups; KMS encryption"},
+            ],
+            "change_control_process": {
+                "request": "All changes originate from a tracked ticket in Jira / Ticket Hub.",
+                "review": "Peer review + security review on every infrastructure or dependency change.",
+                "approval": "CAB approval required for production changes (CM-3).",
+                "testing": "Automated tests + staging deployment before production promotion.",
+                "deployment": "Deployments are logged and signed through the CI/CD pipeline.",
+                "rollback": "Versioned container images and Terraform state allow point-in-time rollback.",
+            },
+            "configuration_monitoring": {
+                "tooling": ["PySOAR Compliance & Evidence engine", "Container Security scanner", "IaC drift detector"],
+                "frequency": "Continuous; drift alerts within 1 hour of deviation.",
+                "baseline_review": "Quarterly (CM-6), annually signed off by ISSO.",
+            },
+            "least_functionality": {
+                "policy": "Disable or uninstall non-essential ports, protocols, and services (CM-7).",
+                "hardening_guides": [
+                    "DISA STIGs for underlying OS",
+                    "CIS Benchmarks for application components",
+                    "FedRAMP hardening addendum where required",
+                ],
+            },
+            "inventory_management": {
+                "scope": "All assets within the authorization boundary (CM-8).",
+                "inventory_source": "PySOAR Asset Inventory (automatic discovery + manual reconciliation).",
+                "review_frequency": "Monthly",
+            },
+            "control_implementation": {
+                "family": "CM - Configuration Management",
+                "controls": cm_controls,
+                "total_controls": len(cm_controls),
+            },
+            "software_usage_restrictions": [
+                "Only approved software from the PySOAR-approved software list may be installed.",
+                "Open source components tracked in the SBOM and scanned for vulnerabilities.",
+                "All production workloads run pinned, signed container images.",
+            ],
+        }
+
+    def generate_conmon_plan(
+        self,
+        org_name: str,
+        system_name: str,
+        controls_data: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        """Generate a FedRAMP Continuous Monitoring Plan (CA / SI families)."""
+        if controls_data is None:
+            controls_data = FEDRAMP_MODERATE_CONTROLS
+        now = datetime.utcnow().isoformat() + "Z"
+        today = date.today().isoformat()
+        conmon_controls = self._family_controls_from_data(controls_data, ["CA", "SI"])
+
+        return {
+            "document_metadata": {
+                "title": f"Continuous Monitoring Plan — {system_name}",
+                "version": "1.0",
+                "date_prepared": today,
+                "last_updated": now,
+                "prepared_by": org_name,
+                "fedramp_baseline": "Moderate",
+                "nist_revision": "Rev 5",
+                "document_status": "Draft",
+                "control_family_scope": [
+                    "CA - Security Assessment and Authorization",
+                    "SI - System and Information Integrity",
+                ],
+            },
+            "purpose": (
+                f"This Continuous Monitoring Plan describes {org_name}'s strategy for "
+                f"maintaining ongoing authorization of {system_name}, aligned with NIST "
+                "800-137 and the FedRAMP Continuous Monitoring Strategy & Guide."
+            ),
+            "monitoring_strategy": {
+                "objectives": [
+                    "Maintain situational awareness of the system's security posture.",
+                    "Detect deviations from the authorized baseline.",
+                    "Provide timely, accurate, and relevant data to risk-based decision making.",
+                ],
+                "frequency": {
+                    "vulnerability_scanning": "Weekly authenticated scans; monthly external scans (SI-2, RA-5).",
+                    "configuration_monitoring": "Continuous drift detection (CM-6).",
+                    "log_review": "Continuous SIEM correlation; daily analyst review (AU-6).",
+                    "control_assessments": "Annually for 1/3 of controls (CA-7 cycle).",
+                    "poam_reporting": "Monthly ConMon deliverable to FedRAMP PMO.",
+                },
+            },
+            "deliverables": [
+                {"name": "Monthly ConMon Report", "description": "Control check summary, POA&M progress, vulnerability trends.", "recipient": "FedRAMP PMO / Agency AO"},
+                {"name": "Quarterly POA&M Update", "description": "Status of remediations, new weaknesses, schedule changes.", "recipient": "FedRAMP PMO"},
+                {"name": "Annual Assessment", "description": "Third-party annual security assessment (CA-2).", "recipient": "3PAO / FedRAMP PMO"},
+                {"name": "Significant Change Requests", "description": "Notification + re-authorization request for any significant change.", "recipient": "FedRAMP PMO"},
+            ],
+            "metrics_and_indicators": [
+                {"metric": "Critical vulnerability remediation time", "target": "Within 30 days of discovery (SI-2)."},
+                {"metric": "High vulnerability remediation time", "target": "Within 90 days of discovery."},
+                {"metric": "Moderate vulnerability remediation time", "target": "Within 180 days of discovery."},
+                {"metric": "Mean time to detect (MTTD)", "target": "< 1 hour for high-severity events."},
+                {"metric": "Control check compliance rate", "target": ">= 95% per reporting period."},
+            ],
+            "tooling": [
+                "PySOAR Continuous Monitoring engine (runs control checks on schedule).",
+                "PySOAR Vulnerability Management (ingests scanner output; drives POA&M).",
+                "PySOAR SIEM (log collection, correlation, alerting).",
+                "PySOAR Audit & Evidence engine (automated evidence collection for controls).",
+            ],
+            "significant_change_criteria": [
+                "Addition or removal of a major system component.",
+                "Change in authorization boundary.",
+                "Change in hosting provider or service model.",
+                "Material change to authentication or encryption.",
+            ],
+            "control_implementation": {
+                "families": ["CA - Security Assessment and Authorization", "SI - System and Information Integrity"],
+                "controls": conmon_controls,
+                "total_controls": len(conmon_controls),
+            },
+        }

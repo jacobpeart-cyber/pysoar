@@ -384,8 +384,23 @@ export default function DataLakeDashboard() {
                     setQueryRunning(true);
                     setQueryResult(null);
                     try {
-                      const res = await api.post('/data-lake/query', { query: queryInput });
-                      setQueryResult(JSON.stringify(res.data, null, 2));
+                      const res = await api.post('/data-lake/query', {
+                        query: queryInput,
+                        query_language: queryLanguage,
+                      });
+                      const d = res.data || {};
+                      if (d.mode === 'sql' && Array.isArray(d.columns)) {
+                        const header = d.columns.join(' | ');
+                        const sep = d.columns.map(() => '---').join(' | ');
+                        const body = (d.rows || [])
+                          .map((r: any) => d.columns.map((c: string) => String(r[c] ?? '')).join(' | '))
+                          .join('\n');
+                        setQueryResult(
+                          `${d.row_count} row(s) in ${d.execution_time_ms}ms\n\n${header}\n${sep}\n${body}`
+                        );
+                      } else {
+                        setQueryResult(JSON.stringify(d, null, 2));
+                      }
                     } catch (err: any) {
                       setQueryResult('Error: ' + (err?.response?.data?.detail || err.message || 'Query failed'));
                     } finally {

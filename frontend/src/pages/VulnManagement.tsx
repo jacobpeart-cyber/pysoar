@@ -67,17 +67,22 @@ export default function VulnManagement() {
   const [showFilterPanel, setShowFilterPanel] = useState(false);
   const [remediatingVuln, setRemediatingVuln] = useState<any | null>(null);
 
+  const [showNewScanProfileModal, setShowNewScanProfileModal] = useState(false);
+  const [showNewExceptionModal, setShowNewExceptionModal] = useState(false);
+
   const loadData = async () => {
     setLoading(true);
     try {
-      const [vulnsData, patchData] = await Promise.all([
+      const [vulnsData, patchData, profilesData, exceptionsData] = await Promise.all([
         vulnmgmtApi.getVulnerabilities(),
         vulnmgmtApi.getPatchOperations(),
+        vulnmgmtApi.getScanProfiles().catch(() => []),
+        vulnmgmtApi.getExceptions().catch(() => []),
       ]);
       setVulnerabilities(Array.isArray(vulnsData) ? vulnsData : (vulnsData?.items || []));
-      setScanProfiles([]);
+      setScanProfiles(Array.isArray(profilesData) ? profilesData : []);
       setPatchOps(Array.isArray(patchData) ? patchData : (patchData?.items || []));
-      setExceptions([]);
+      setExceptions(Array.isArray(exceptionsData) ? exceptionsData : []);
     } catch (error) {
       console.error('Error loading vulnerability data:', error);
     } finally {
@@ -303,6 +308,20 @@ export default function VulnManagement() {
             {/* Scan Profiles Tab */}
             {activeTab === 'scan-profiles' && (
               <div className="space-y-6">
+                <div className="flex justify-end">
+                  <button
+                    onClick={() => setShowNewScanProfileModal(true)}
+                    className="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg transition"
+                  >
+                    <Plus className="w-4 h-4" />
+                    New Scan Profile
+                  </button>
+                </div>
+                {scanProfiles.length === 0 && (
+                  <div className="text-center text-gray-500 dark:text-gray-400 py-6 border border-dashed border-gray-300 dark:border-gray-700 rounded-lg">
+                    No scan profiles defined.
+                  </div>
+                )}
                 <div className="grid grid-cols-1 gap-4">
                   {scanProfiles.map((profile) => (
                     <div key={profile.id} className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4 hover:shadow-lg transition">
@@ -333,7 +352,7 @@ export default function VulnManagement() {
                         <button
                           onClick={async () => {
                             try {
-                              await vulnmgmtApi.runScan(profile.id);
+                              await vulnmgmtApi.runScanProfile(profile.id);
                               loadData();
                             } catch (error) {
                               console.error('Error running scan:', error);
@@ -410,6 +429,15 @@ export default function VulnManagement() {
             {/* Exceptions Tab */}
             {activeTab === 'exceptions' && (
               <div className="space-y-6">
+                <div className="flex justify-end">
+                  <button
+                    onClick={() => setShowNewExceptionModal(true)}
+                    className="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg transition"
+                  >
+                    <Plus className="w-4 h-4" />
+                    New Exception
+                  </button>
+                </div>
                 <div className="bg-white dark:bg-gray-800 rounded-lg overflow-hidden border border-gray-200 dark:border-gray-700">
                   <table className="w-full">
                     <thead>
@@ -650,7 +678,23 @@ export default function VulnManagement() {
             <h2 className="text-xl font-bold mb-4">Remediate: {remediatingVuln.cveId}</h2>
             <div className="space-y-3">
               <p className="text-sm text-gray-600 dark:text-gray-400">{remediatingVuln.title}</p>
-              <button onClick={async () => { try { await vulnmgmtApi.runScan(remediatingVuln.id); setRemediatingVuln(null); loadData(); } catch (e) { console.error(e); } }} className="w-full px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition">Apply Patch</button>
+              <button onClick={async () => {
+                try {
+                  // Create a real patch plan for this vulnerability's instance.
+                  // The backend expects vulnerability_instance_ids, not a vuln id.
+                  const instanceIds = Array.isArray(remediatingVuln.instance_ids) && remediatingVuln.instance_ids.length
+                    ? remediatingVuln.instance_ids
+                    : [remediatingVuln.id];
+                  await api.post('/vulnmgmt/patch-operations/create-plan', {
+                    vulnerability_instance_ids: instanceIds,
+                  });
+                  setRemediatingVuln(null);
+                  loadData();
+                } catch (e: any) {
+                  console.error('Apply patch failed:', e);
+                  alert(e?.response?.data?.detail || 'Failed to create patch plan');
+                }
+              }} className="w-full px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition">Apply Patch</button>
               <button onClick={async () => { try { await api.post('/vulnmgmt/instances/bulk-action', { instance_ids: [remediatingVuln.id], action: 'update_status', value: 'mitigated' }); setRemediatingVuln(null); loadData(); } catch (e) { console.error('Apply compensating control failed:', e); } }} className="w-full px-4 py-2 bg-orange-600 hover:bg-orange-700 text-white rounded-lg transition">Apply Compensating Control</button>
               <button onClick={() => setRemediatingVuln(null)} className="w-full px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
             </div>
@@ -717,6 +761,111 @@ export default function VulnManagement() {
                 >
                   Create
                 </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* New Scan Profile Modal */}
+      {showNewScanProfileModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" onClick={() => setShowNewScanProfileModal(false)}>
+          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-96 max-h-screen overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+            <h2 className="text-xl font-bold mb-4">Create Scan Profile</h2>
+            <form className="space-y-4" onSubmit={async (e) => {
+              e.preventDefault();
+              const fd = new FormData(e.currentTarget);
+              try {
+                await vulnmgmtApi.createScanProfile({
+                  name: fd.get('name'),
+                  scan_type: fd.get('scan_type') || 'authenticated',
+                  target_filters: {},
+                  schedule: fd.get('schedule') || '',
+                  is_active: true,
+                });
+                setShowNewScanProfileModal(false);
+                loadData();
+              } catch (err: any) {
+                console.error('Create scan profile failed:', err);
+                alert(err?.response?.data?.detail || 'Failed to create scan profile');
+              }
+            }}>
+              <div>
+                <label className="block text-sm font-medium mb-1">Name</label>
+                <input name="name" required type="text" placeholder="Weekly authenticated scan" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Scan Type</label>
+                <select name="scan_type" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
+                  <option value="authenticated">Authenticated</option>
+                  <option value="unauthenticated">Unauthenticated</option>
+                  <option value="compliance">Compliance</option>
+                  <option value="web_app">Web App</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Schedule (cron)</label>
+                <input name="schedule" type="text" placeholder="0 2 * * 0" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+              </div>
+              <div className="flex gap-2 mt-6">
+                <button type="button" onClick={() => setShowNewScanProfileModal(false)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
+                <button type="submit" className="flex-1 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition">Create</button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* New Exception Modal */}
+      {showNewExceptionModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50" onClick={() => setShowNewExceptionModal(false)}>
+          <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-96 max-h-screen overflow-y-auto" onClick={(e) => e.stopPropagation()}>
+            <h2 className="text-xl font-bold mb-4">Create Vulnerability Exception</h2>
+            <form className="space-y-4" onSubmit={async (e) => {
+              e.preventDefault();
+              const fd = new FormData(e.currentTarget);
+              try {
+                await vulnmgmtApi.createException({
+                  vulnerability_id: fd.get('vulnerability_id'),
+                  justification: fd.get('justification'),
+                  exception_type: fd.get('exception_type') || 'risk_accepted',
+                  approved_by: fd.get('approved_by') || null,
+                  expiry_date: fd.get('expiry_date') || null,
+                });
+                setShowNewExceptionModal(false);
+                loadData();
+              } catch (err: any) {
+                console.error('Create exception failed:', err);
+                alert(err?.response?.data?.detail || 'Failed to create exception');
+              }
+            }}>
+              <div>
+                <label className="block text-sm font-medium mb-1">Vulnerability ID</label>
+                <input name="vulnerability_id" required type="text" placeholder="vuln UUID" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Exception Type</label>
+                <select name="exception_type" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
+                  <option value="risk_accepted">Risk Accepted</option>
+                  <option value="false_positive">False Positive</option>
+                  <option value="compensating_control">Compensating Control</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Justification</label>
+                <textarea name="justification" required rows={3} placeholder="Business justification" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Approved By</label>
+                <input name="approved_by" type="text" placeholder="user id / name" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Expiry Date (ISO)</label>
+                <input name="expiry_date" type="date" className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100" />
+              </div>
+              <div className="flex gap-2 mt-6">
+                <button type="button" onClick={() => setShowNewExceptionModal(false)} className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
+                <button type="submit" className="flex-1 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition">Create</button>
               </div>
             </form>
           </div>
