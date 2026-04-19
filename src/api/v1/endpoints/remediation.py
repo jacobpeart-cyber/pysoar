@@ -592,8 +592,12 @@ async def mark_execution_complete(
         action="remediation.execution.mark_complete",
         resource_type="remediation_execution",
         resource_id=execution_id,
-        description=(body.notes or "")[:1000] or f"Marked complete from {prev_status}",
-        new_value=json.dumps({"status": "completed", "prev_status": prev_status}),
+        description=(body.notes or None) or f"Marked complete from {prev_status}",
+        new_value=json.dumps({
+            "status": "completed",
+            "prev_status": prev_status,
+            "notes": body.notes,
+        }, default=str),
         success=True,
     ))
 
@@ -657,10 +661,11 @@ async def mark_execution_failed(
     execution.status = "failed"
     execution.overall_result = "failure"
     execution.completed_at = now
-    execution.error_message = body.reason.strip()[:2000]
+    reason = body.reason.strip()
+    execution.error_message = reason
     metrics = dict(execution.metrics or {})
     metrics.update({
-        "failure_reason": body.reason.strip()[:2000],
+        "failure_reason": reason,
         "failed_by": str(current_user.id) if current_user else None,
         "failed_by_email": getattr(current_user, "email", None),
         "manual_lifecycle": "mark_failed",
@@ -674,8 +679,12 @@ async def mark_execution_failed(
         action="remediation.execution.mark_failed",
         resource_type="remediation_execution",
         resource_id=execution_id,
-        description=body.reason.strip()[:1000],
-        new_value=json.dumps({"status": "failed", "prev_status": prev_status, "reason": body.reason.strip()[:500]}),
+        description=reason,
+        new_value=json.dumps({
+            "status": "failed",
+            "prev_status": prev_status,
+            "reason": reason,
+        }, default=str),
         success=True,
     ))
 

@@ -335,16 +335,22 @@ async def trigger_monitor_scan(
         severity: str = "medium",
         raw: Optional[dict] = None,
     ) -> None:
-        raw_str = json.dumps(raw or {}, sort_keys=True)[:2000]
+        # Hash the canonical JSON of the raw payload — the full payload,
+        # not a truncated sample. A truncated hash would collide across
+        # otherwise-distinct findings whose first 2000 bytes happen to match.
+        raw_str = json.dumps(raw or {}, sort_keys=True, default=str)
         raw_hash = _hashlib.sha256(raw_str.encode("utf-8")).hexdigest()
 
+        # `title` column is VARCHAR(500) — cap matches the schema.
+        # `description` is TEXT (unbounded) — persist in full.
+        # `source_url_hash` is VARCHAR(64) to match SHA-256 hex length.
         finding = DarkWebFinding(
             organization_id=org_id,
             monitor_id=monitor_id,
             finding_type=finding_type,
             source_platform=source_platform,
             title=title[:500],
-            description=description[:2000],
+            description=description,
             affected_assets=None,
             affected_count=0,
             severity=severity,

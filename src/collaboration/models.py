@@ -106,7 +106,10 @@ class WarRoom(BaseModel):
 
     # Core fields
     organization_id: Mapped[str] = mapped_column(String(36), index=True, nullable=False)
-    name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    # War rooms are auto-named from incident titles (up to 500 chars) plus
+    # prefixes — VARCHAR(255) was too narrow. Stored as TEXT with a functional
+    # left(name, 64) index so lookups by name prefix stay fast.
+    name: Mapped[str] = mapped_column(Text, nullable=False)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     # Linking
@@ -294,7 +297,7 @@ class ActionItem(BaseModel):
     )
 
     # Task details
-    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    title: Mapped[str] = mapped_column(Text, nullable=False)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     # Assignment
