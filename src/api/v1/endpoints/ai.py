@@ -5,7 +5,10 @@ Provides REST API for natural language queries, anomaly detection, threat
 predictions, incident analysis, and ML model management.
 """
 
+import asyncio
+import json
 import math
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
 
@@ -15,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DatabaseSession
 from src.core.logging import get_logger
+from src.ai.engine import AIAnalyzer, AnomalyDetector, ThreatPredictor
 from src.ai.models import MLModel, AnomalyDetection, AIAnalysis, ThreatPrediction, NLQuery
 from src.schemas.ai import (
     NLQueryRequest,
@@ -91,63 +95,365 @@ def _compute_triage_priority(severity: str, source: str) -> dict[str, Any]:
     }
 
 
-def _compute_incident_analysis(incident_id: str, include_related: bool) -> dict[str, Any]:
-    """Heuristic incident analysis."""
+def _llm_available() -> bool:
+    """Check whether an LLM provider key is configured."""
+    return bool(os.environ.get("GEMINI_API_KEY"))
+
+
+def _parse_json_field(raw: Any) -> Any:
+    """Parse a TEXT/JSON-string column safely. Returns [] / {} / None on failure."""
+    if raw is None:
+        return None
+    if isinstance(raw, (list, dict)):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return None
+    return None
+
+
+async def _load_incident_context(db: AsyncSession, incident_id: str) -> dict[str, Any]:
+    """
+    Load an incident plus its linked alerts and derived facts from the DB.
+
+    Returns a dict with: incident (ORM object or None), alerts (list of Alert),
+    affected_systems (list[str]), affected_users (list[str]), tags (list[str]),
+    mitre_techniques (list[str]), mitre_tactics (list[str]),
+    earliest_alert_at (datetime|None), dwell_time_days (int|None).
+    """
+    from src.models.alert import Alert
+    from src.models.incident import Incident
+
+    inc_result = await db.execute(select(Incident).where(Incident.id == incident_id))
+    incident = inc_result.scalar_one_or_none()
+
+    alerts: list[Any] = []
+    if incident is not None:
+        alert_q = (
+            select(Alert)
+            .where(Alert.incident_id == incident_id)
+            .order_by(Alert.created_at.asc())
+        )
+        alerts = list((await db.execute(alert_q)).scalars().all())
+
+    affected_systems: list[str] = []
+    affected_users: list[str] = []
+    tags: list[str] = []
+    mitre_techniques: list[str] = []
+    mitre_tactics: list[str] = []
+    earliest_alert_at: datetime | None = None
+
+    if incident is not None:
+        affected_systems = _parse_json_field(incident.affected_systems) or []
+        affected_users = _parse_json_field(incident.affected_users) or []
+        tags = _parse_json_field(incident.tags) or []
+        mitre_techniques = _parse_json_field(incident.mitre_techniques) or []
+        mitre_tactics = _parse_json_field(incident.mitre_tactics) or []
+
+    # Augment from linked alerts
+    for a in alerts:
+        if a.hostname and a.hostname not in affected_systems:
+            affected_systems.append(a.hostname)
+        if a.username and a.username not in affected_users:
+            affected_users.append(a.username)
+        if a.created_at and (earliest_alert_at is None or a.created_at < earliest_alert_at):
+            earliest_alert_at = a.created_at
+
+    dwell_time_days: int | None = None
+    if incident is not None and incident.created_at and earliest_alert_at:
+        # Dwell time = time between first observed alert and incident creation.
+        delta = incident.created_at - earliest_alert_at
+        dwell_time_days = max(0, int(delta.total_seconds() // 86400))
+
     return {
-        "executive_summary": (
-            f"Incident {incident_id} involves suspicious activity requiring investigation. "
-            "Initial analysis suggests targeted intrusion attempt."
-        ),
-        "technical_details": (
-            f"Analysis of incident {incident_id} identified indicators of compromise across "
-            "multiple hosts. Network traffic analysis shows anomalous outbound connections."
-        ),
-        "impact_assessment": {
-            "affected_systems": [],
-            "data_exposed": [],
-            "users_affected": 0,
-            "severity": "medium",
-        },
-        "recommendations": [
-            "Isolate affected systems from network",
-            "Collect memory dumps from compromised hosts",
-            "Review authentication logs for lateral movement",
-            "Update detection rules based on observed TTPs",
-        ],
-        "confidence": 0.82,
+        "incident": incident,
+        "alerts": alerts,
+        "affected_systems": affected_systems,
+        "affected_users": affected_users,
+        "tags": tags,
+        "mitre_techniques": mitre_techniques,
+        "mitre_tactics": mitre_tactics,
+        "earliest_alert_at": earliest_alert_at,
+        "dwell_time_days": dwell_time_days,
     }
 
 
-def _compute_root_cause(incident_id: str) -> dict[str, Any]:
-    """Heuristic root cause analysis."""
+def _serialize_incident(incident: Any) -> dict[str, Any]:
+    """Serialize an Incident ORM row for LLM consumption."""
     return {
-        "root_cause": "Phishing email leading to credential compromise",
-        "attack_chain": [
-            "Phishing email delivered to user",
-            "User clicked malicious link",
-            "Credential harvesting page accessed",
-            "Stolen credentials used for VPN access",
-            "Lateral movement to internal servers",
-        ],
-        "entry_point": "Email gateway",
-        "dwell_time_days": 3,
-        "confidence": 0.78,
+        "id": incident.id,
+        "title": incident.title,
+        "description": incident.description or "",
+        "severity": incident.severity,
+        "status": incident.status,
+        "incident_type": incident.incident_type,
+        "priority": incident.priority,
+        "created_at": incident.created_at.isoformat() if incident.created_at else None,
+        "detected_at": incident.detected_at,
+        "tags": _parse_json_field(incident.tags) or [],
+        "mitre_techniques": _parse_json_field(incident.mitre_techniques) or [],
     }
 
 
-def _compute_response_recommendations(incident_type: str, severity: str) -> dict[str, Any]:
-    """Heuristic response recommendations."""
-    immediate = ["Activate incident response team", "Preserve evidence"]
-    containment = ["Isolate affected systems", "Block malicious IPs at firewall"]
-    investigation = ["Analyze logs for scope", "Interview affected users"]
-    recovery = ["Reset compromised credentials", "Patch exploited vulnerabilities"]
+def _serialize_alert(alert: Any) -> dict[str, Any]:
+    """Serialize an Alert ORM row for LLM consumption."""
+    return {
+        "id": alert.id,
+        "title": alert.title,
+        "description": (alert.description or "")[:500],
+        "severity": alert.severity,
+        "status": alert.status,
+        "source": alert.source,
+        "category": alert.category,
+        "hostname": alert.hostname,
+        "username": alert.username,
+        "source_ip": alert.source_ip,
+        "destination_ip": alert.destination_ip,
+        "created_at": alert.created_at.isoformat() if alert.created_at else None,
+    }
 
+
+def _build_incident_timeline(ctx: dict[str, Any]) -> list[dict[str, Any]]:
+    """Construct a chronological timeline from incident + linked alerts."""
+    timeline: list[dict[str, Any]] = []
+    incident = ctx.get("incident")
+    if incident is not None and incident.created_at:
+        timeline.append({
+            "timestamp": incident.created_at.isoformat(),
+            "event": "incident_created",
+            "detail": incident.title,
+        })
+    for a in ctx.get("alerts", []) or []:
+        if a.created_at:
+            timeline.append({
+                "timestamp": a.created_at.isoformat(),
+                "event": "alert_observed",
+                "detail": f"{a.severity}: {a.title}",
+            })
+    timeline.sort(key=lambda x: x.get("timestamp") or "")
+    return timeline
+
+
+def _heuristic_incident_analysis(ctx: dict[str, Any]) -> dict[str, Any]:
+    """Derive an incident analysis from real DB context — no LLM, no canned strings."""
+    incident = ctx.get("incident")
+    alerts = ctx.get("alerts", []) or []
+    affected_systems = ctx.get("affected_systems", []) or []
+    affected_users = ctx.get("affected_users", []) or []
+    tags = ctx.get("tags", []) or []
+    mitre = ctx.get("mitre_techniques", []) or []
+    dwell = ctx.get("dwell_time_days")
+
+    if incident is None:
+        return {
+            "executive_summary": "Incident not found in database; no analysis possible.",
+            "technical_details": "",
+            "impact_assessment": {
+                "affected_systems": [],
+                "data_exposed": [],
+                "users_affected": 0,
+                "severity": "unknown",
+            },
+            "recommendations": [],
+            "confidence": 0.0,
+            "derivation": "rule_based",
+        }
+
+    severity = (incident.severity or "medium").lower()
+    inc_type = incident.incident_type or "incident"
+    title = incident.title or "(untitled)"
+    n_alerts = len(alerts)
+
+    sev_counts: dict[str, int] = {}
+    sources: set[str] = set()
+    for a in alerts:
+        sev_counts[a.severity] = sev_counts.get(a.severity, 0) + 1
+        if a.source:
+            sources.add(a.source)
+
+    sev_breakdown = ", ".join(f"{c} {s}" for s, c in sorted(sev_counts.items())) or "none"
+    sources_str = ", ".join(sorted(sources)) or "no recorded sources"
+
+    exec_summary = (
+        f"{severity.capitalize()}-severity {inc_type} incident '{title}' "
+        f"correlates {n_alerts} alert(s) ({sev_breakdown}) across "
+        f"{len(affected_systems)} host(s) and {len(affected_users)} user account(s)."
+    )
+
+    tech_lines = [
+        f"Incident {incident.id} (status={incident.status}, priority={incident.priority}) "
+        f"was opened on {incident.created_at.isoformat() if incident.created_at else 'unknown'}.",
+        f"Linked telemetry: {n_alerts} alert(s) from sources [{sources_str}].",
+    ]
+    if affected_systems:
+        tech_lines.append("Affected systems: " + ", ".join(affected_systems[:10]))
+    if affected_users:
+        tech_lines.append("Affected users: " + ", ".join(affected_users[:10]))
+    if mitre:
+        tech_lines.append("Mapped MITRE techniques: " + ", ".join(mitre[:10]))
+    if tags:
+        tech_lines.append("Tags: " + ", ".join(tags[:10]))
+    if dwell is not None:
+        tech_lines.append(
+            f"Approximate dwell time (first alert -> incident creation): {dwell} day(s)."
+        )
+    if alerts:
+        sample_titles = [a.title for a in alerts[:3] if a.title]
+        if sample_titles:
+            tech_lines.append("Earliest alert titles: " + " | ".join(sample_titles))
+    tech = "\n".join(tech_lines)
+
+    recs: list[str] = []
     if severity in ("critical", "high"):
-        immediate.append("Notify executive leadership")
-        containment.append("Disable compromised accounts")
-        hours = 48 if severity == "critical" else 72
+        recs.append("Activate incident response team and notify SOC leadership")
+    if affected_systems:
+        recs.append(f"Isolate or contain affected systems: {', '.join(affected_systems[:5])}")
+    if affected_users:
+        recs.append(
+            f"Reset credentials and review session activity for: {', '.join(affected_users[:5])}"
+        )
+    if "phishing" in (inc_type or "").lower() or any(
+        "phish" in (a.title or "").lower() for a in alerts
+    ):
+        recs.append("Block sender domains and quarantine related emails at the gateway")
+    if mitre:
+        recs.append(
+            f"Hunt for related TTPs in SIEM logs (techniques: {', '.join(mitre[:5])})"
+        )
+    if not recs:
+        recs.append("Triage the linked alerts and confirm the scope before further action")
+
+    confidence = 0.55 if n_alerts == 0 else min(0.85, 0.55 + 0.05 * min(n_alerts, 6))
+
+    return {
+        "executive_summary": exec_summary,
+        "technical_details": tech,
+        "impact_assessment": {
+            "affected_systems": affected_systems,
+            "data_exposed": [],  # not tracked structurally
+            "users_affected": len(affected_users),
+            "severity": severity,
+        },
+        "recommendations": recs,
+        "confidence": round(confidence, 2),
+        "derivation": "rule_based",
+    }
+
+
+def _heuristic_root_cause(ctx: dict[str, Any]) -> dict[str, Any]:
+    """Derive a root-cause sketch from real DB fields; no canned narrative."""
+    incident = ctx.get("incident")
+    alerts = ctx.get("alerts", []) or []
+    dwell = ctx.get("dwell_time_days")
+
+    if incident is None:
+        return {
+            "root_cause": "Incident not found in database; root cause cannot be determined.",
+            "attack_chain": [],
+            "entry_point": "unknown",
+            "dwell_time_days": 0,
+            "confidence": 0.0,
+            "derivation": "rule_based",
+        }
+
+    # Use Incident.root_cause column if analysts populated it.
+    declared_root = (incident.root_cause or "").strip()
+
+    # Otherwise derive from earliest alert source/category.
+    earliest = alerts[0] if alerts else None
+    inferred_root = ""
+    entry_point = "unknown"
+    if earliest is not None:
+        src = earliest.source or "unknown source"
+        cat = earliest.category or earliest.alert_type or "unknown category"
+        inferred_root = (
+            f"Earliest observed alert '{earliest.title}' from {src} "
+            f"(category: {cat}) suggests initial vector of compromise."
+        )
+        entry_point = src
+
+    root_cause = declared_root or inferred_root or (
+        f"No root cause has been recorded for incident '{incident.title}' "
+        f"and no linked alerts are available to infer one."
+    )
+
+    # Build attack chain from alert ordering.
+    chain: list[str] = []
+    for a in alerts[:8]:
+        ts = a.created_at.isoformat() if a.created_at else "unknown time"
+        chain.append(f"[{ts}] {a.severity} alert from {a.source or 'unknown'}: {a.title}")
+    if not chain:
+        chain.append(
+            f"No linked alerts; chain reconstruction unavailable for incident {incident.id}."
+        )
+
+    confidence = 0.7 if declared_root else (0.5 if alerts else 0.2)
+
+    return {
+        "root_cause": root_cause,
+        "attack_chain": chain,
+        "entry_point": entry_point,
+        "dwell_time_days": int(dwell) if dwell is not None else 0,
+        "confidence": confidence,
+        "derivation": "rule_based",
+    }
+
+
+def _heuristic_response_recommendations(
+    ctx: dict[str, Any], incident_type: str, severity: str
+) -> dict[str, Any]:
+    """Derive response steps that reference real affected systems/users where present."""
+    incident = ctx.get("incident")
+    affected_systems = ctx.get("affected_systems", []) or []
+    affected_users = ctx.get("affected_users", []) or []
+    n_alerts = len(ctx.get("alerts", []) or [])
+
+    # Build action lists that reference real entities when available.
+    immediate: list[str] = ["Activate incident response team", "Preserve volatile evidence"]
+    containment: list[str] = []
+    investigation: list[str] = [
+        f"Review the {n_alerts} linked alert(s) and pivot on shared indicators"
+        if n_alerts
+        else "Search SIEM for additional indicators related to this incident"
+    ]
+    recovery: list[str] = []
+
+    if affected_systems:
+        sys_str = ", ".join(affected_systems[:5])
+        containment.append(f"Network-isolate affected hosts: {sys_str}")
+        investigation.append(f"Pull EDR forensics from: {sys_str}")
+        recovery.append(f"Re-image or restore from clean baseline: {sys_str}")
+    else:
+        containment.append("Identify affected hosts via SIEM/EDR before isolation")
+
+    if affected_users:
+        u_str = ", ".join(affected_users[:5])
+        containment.append(f"Disable or force re-auth for accounts: {u_str}")
+        recovery.append(f"Reset credentials and revoke active sessions for: {u_str}")
+    else:
+        containment.append("Identify and lock any compromised user accounts")
+
+    if not recovery:
+        recovery.append("Patch any exploited vulnerabilities and verify hardening")
+
+    sev = (severity or "").lower()
+    if sev in ("critical", "high"):
+        immediate.append("Notify executive leadership and legal/compliance")
+        hours = 48 if sev == "critical" else 72
     else:
         hours = 120
+
+    # Type-specific tweaks based on real incident_type.
+    itype = (incident_type or (incident.incident_type if incident is not None else "") or "").lower()
+    if "phish" in itype:
+        containment.append("Quarantine the malicious email and block sender at the gateway")
+    if "ransom" in itype:
+        immediate.append("Engage backup/restore team; preserve encrypted samples")
+    if "data_breach" in itype or "exfil" in itype:
+        investigation.append("Quantify data egress volume from network/proxy logs")
+        recovery.append("Notify affected data subjects per regulatory obligations")
 
     return {
         "immediate_actions": immediate,
@@ -155,24 +461,161 @@ def _compute_response_recommendations(incident_type: str, severity: str) -> dict
         "investigation_steps": investigation,
         "recovery_plan": recovery,
         "timeline_estimate_hours": hours,
+        "derivation": "rule_based",
     }
 
 
-def _compute_threat_prediction(entity_type: str, entity_id: str, time_horizon: int) -> dict[str, Any]:
-    """Heuristic threat prediction for an entity."""
-    # Simple deterministic score based on entity_id hash
-    hash_val = abs(hash(entity_id)) % 100
-    risk_score = min(100.0, max(10.0, float(hash_val)))
+async def _load_entity_risk_signals(
+    db: AsyncSession, entity_type: str, entity_id: str, org_id: str | None
+) -> dict[str, Any]:
+    """
+    Pull real risk signals for an entity:
+      - UEBA EntityProfile.risk_score, anomaly_count_30d
+      - Count of recent AnomalyDetection rows for this entity
+      - Count of recent UEBARiskAlert rows
+      - For host entities: Asset.criticality, security_score
+    """
+    from src.ueba.models import EntityProfile, UEBARiskAlert
+    from src.models.asset import Asset
+
+    signals: dict[str, Any] = {
+        "ueba_risk_score": None,
+        "anomaly_count_30d": 0,
+        "recent_anomalies": 0,
+        "recent_ueba_alerts": 0,
+        "asset_criticality": None,
+        "asset_security_score": None,
+        "peer_deviation": None,
+    }
+
+    # UEBA profile
+    profile_q = select(EntityProfile).where(
+        EntityProfile.entity_type == entity_type,
+        EntityProfile.entity_id == entity_id,
+    )
+    if org_id:
+        profile_q = profile_q.where(EntityProfile.organization_id == org_id)
+    profile = (await db.execute(profile_q)).scalar_one_or_none()
+    if profile is not None:
+        signals["ueba_risk_score"] = float(profile.risk_score or 0.0)
+        signals["anomaly_count_30d"] = int(profile.anomaly_count_30d or 0)
+        # Peer deviation if baseline_data carries peer comparison
+        baseline = profile.baseline_data or {}
+        peer = baseline.get("peer_comparison") if isinstance(baseline, dict) else None
+        if isinstance(peer, dict) and "deviation" in peer:
+            try:
+                signals["peer_deviation"] = float(peer["deviation"])
+            except (TypeError, ValueError):
+                pass
+
+        # Recent UEBA alerts for this profile
+        recent_cutoff = _utc_now() - timedelta(days=30)
+        ueba_alert_q = select(func.count(UEBARiskAlert.id)).where(
+            UEBARiskAlert.entity_profile_id == profile.id,
+            UEBARiskAlert.created_at >= recent_cutoff,
+        )
+        signals["recent_ueba_alerts"] = int((await db.execute(ueba_alert_q)).scalar() or 0)
+
+    # Anomaly detections for this entity
+    recent_cutoff = _utc_now() - timedelta(days=30)
+    anom_q = select(func.count(AnomalyDetection.id)).where(
+        AnomalyDetection.entity_type == entity_type,
+        AnomalyDetection.entity_id == entity_id,
+        AnomalyDetection.created_at >= recent_cutoff,
+    )
+    if org_id:
+        anom_q = anom_q.where(AnomalyDetection.organization_id == org_id)
+    signals["recent_anomalies"] = int((await db.execute(anom_q)).scalar() or 0)
+
+    # Asset metadata if entity is a host
+    if entity_type in ("host", "asset"):
+        from sqlalchemy import or_ as _or
+        asset_q = select(Asset).where(
+            _or(
+                Asset.id == entity_id,
+                Asset.hostname == entity_id,
+                Asset.name == entity_id,
+            )
+        )
+        if org_id:
+            asset_q = asset_q.where(Asset.organization_id == org_id)
+        asset = (await db.execute(asset_q)).scalars().first()
+        if asset is not None:
+            signals["asset_criticality"] = asset.criticality
+            signals["asset_security_score"] = asset.security_score
+
+    return signals
+
+
+def _compute_threat_prediction_from_signals(
+    entity_type: str, entity_id: str, signals: dict[str, Any]
+) -> dict[str, Any]:
+    """
+    Compute risk score (0-100) from real signals — NOT hash(entity_id).
+    Weighted blend:
+      - UEBA risk_score (0-100)        : weight 0.40
+      - anomaly_count_30d (cap 20)     : weight 0.20
+      - recent anomaly detections (cap 10): weight 0.15
+      - recent UEBA alerts (cap 10)    : weight 0.10
+      - asset criticality              : weight 0.10
+      - peer deviation (cap 1.0)       : weight 0.05
+    Falls back to 0 (with low confidence factors) when no signals are present.
+    """
+    components: list[tuple[float, float, str]] = []  # (value_0_100, weight, factor_name)
+
+    ueba = signals.get("ueba_risk_score")
+    if ueba is not None:
+        components.append((max(0.0, min(100.0, float(ueba))), 0.40, "ueba_risk_score"))
+
+    anom_30d = signals.get("anomaly_count_30d") or 0
+    if anom_30d > 0:
+        components.append((min(20, anom_30d) / 20.0 * 100.0, 0.20, "ueba_anomaly_count_30d"))
+
+    recent_anom = signals.get("recent_anomalies") or 0
+    if recent_anom > 0:
+        components.append((min(10, recent_anom) / 10.0 * 100.0, 0.15, "recent_anomaly_detections"))
+
+    recent_ueba = signals.get("recent_ueba_alerts") or 0
+    if recent_ueba > 0:
+        components.append((min(10, recent_ueba) / 10.0 * 100.0, 0.10, "recent_ueba_alerts"))
+
+    crit = (signals.get("asset_criticality") or "").lower()
+    crit_map = {"critical": 100.0, "high": 80.0, "medium": 50.0, "low": 25.0}
+    if crit in crit_map:
+        components.append((crit_map[crit], 0.10, f"asset_criticality:{crit}"))
+
+    peer_dev = signals.get("peer_deviation")
+    if peer_dev is not None:
+        components.append((max(0.0, min(1.0, float(peer_dev))) * 100.0, 0.05, "peer_deviation"))
+
+    if not components:
+        risk_score = 0.0
+        factors = ["no_risk_signals_available"]
+    else:
+        total_w = sum(w for _, w, _ in components)
+        risk_score = sum(v * w for v, w, _ in components) / total_w if total_w > 0 else 0.0
+        factors = [name for _, _, name in components]
+
+    risk_score = round(max(0.0, min(100.0, risk_score)), 2)
     probability = round(risk_score / 100.0, 2)
 
-    factors = ["historical_alert_patterns"]
-    actions = ["increase_monitoring"]
-    if risk_score > 70:
-        factors.extend(["unpatched_vulnerabilities", "previous_incidents"])
-        actions.extend(["patch_critical_systems", "restrict_network_access"])
-    elif risk_score > 40:
-        factors.append("anomalous_network_traffic")
-        actions.append("review_firewall_rules")
+    actions: list[str] = []
+    if risk_score >= 70:
+        actions.extend([
+            "increase_monitoring_for_entity",
+            "review_recent_authentications_and_privileges",
+            "preempt_with_credential_rotation_or_isolation",
+        ])
+    elif risk_score >= 40:
+        actions.extend([
+            "increase_monitoring_for_entity",
+            "review_anomalies_for_this_entity",
+        ])
+    else:
+        actions.append("continue_baseline_monitoring")
+
+    if (signals.get("asset_security_score") or 100) < 60:
+        actions.append("remediate_open_vulnerabilities_on_asset")
 
     return {
         "prediction_type": "attack_probability",
@@ -180,6 +623,8 @@ def _compute_threat_prediction(entity_type: str, entity_id: str, time_horizon: i
         "probability": probability,
         "contributing_factors": factors,
         "recommended_actions": actions,
+        "derivation": "rule_based",
+        "raw_signals": signals,
     }
 
 
@@ -744,52 +1189,117 @@ async def analyze_incident(
     """
     Full AI analysis of an incident.
 
-    Computes analysis via heuristics and persists to the database.
+    Loads the incident and its linked alerts, then either calls the LLM via
+    AIAnalyzer.summarize_incident or derives a summary from real DB fields
+    when no LLM is configured. Persists the result to AIAnalysis.
     """
-    try:
-        logger.info(f"Analyzing incident {incident_id}")
+    logger.info(f"Analyzing incident {incident_id}")
 
-        result_data = _compute_incident_analysis(incident_id, request.include_related)
-
-        # Persist analysis
-        analysis = AIAnalysis(
-            analysis_type="incident_summary",
-            source_type="incident",
-            source_id=incident_id,
-            input_data={"incident_id": incident_id, "include_related": request.include_related},
-            ai_response=result_data["executive_summary"],
-            structured_output=result_data,
-            confidence=result_data["confidence"],
-            model_used="heuristic-v1",
-            tokens_used=0,
-            latency_ms=0,
-            organization_id=getattr(current_user, "organization_id", None),
-        )
-        db.add(analysis)
-        await db.flush()
-        await db.refresh(analysis)
-
-        impact = result_data["impact_assessment"]
-
-        return IncidentAnalysisResponse(
-            incident_id=incident_id,
-            executive_summary=result_data["executive_summary"],
-            technical_details=result_data["technical_details"],
-            impact_assessment=ImpactAssessment(
-                affected_systems=impact["affected_systems"],
-                data_exposed=impact["data_exposed"],
-                users_affected=impact["users_affected"],
-                severity=impact["severity"],
-            ),
-            recommendations=result_data["recommendations"],
-            analysis_complete=True,
+    ctx = await _load_incident_context(db, incident_id)
+    incident = ctx["incident"]
+    if incident is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Incident {incident_id} not found",
         )
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Incident analysis error: {e}")
-        raise HTTPException(status_code=500, detail="Analysis failed")
+    timeline = _build_incident_timeline(ctx) if request.include_related else []
+    related_alerts_serialized: list[dict[str, Any]] = (
+        [_serialize_alert(a) for a in ctx["alerts"]] if request.include_related else []
+    )
+
+    derivation = "rule_based"
+    model_used = "heuristic-v1"
+    result_data: dict[str, Any]
+
+    if _llm_available():
+        try:
+            analyzer = AIAnalyzer()
+            llm_out = await asyncio.to_thread(
+                analyzer.summarize_incident,
+                _serialize_incident(incident),
+                related_alerts_serialized,
+                timeline,
+            )
+            # Merge LLM output with our DB-derived impact when LLM omits fields.
+            heuristic = _heuristic_incident_analysis(ctx)
+            impact = llm_out.get("impact_assessment") or {}
+            result_data = {
+                "executive_summary": llm_out.get("executive_summary")
+                or heuristic["executive_summary"],
+                "technical_details": llm_out.get("technical_details")
+                or heuristic["technical_details"],
+                "impact_assessment": {
+                    "affected_systems": impact.get("affected_systems")
+                    or heuristic["impact_assessment"]["affected_systems"],
+                    "data_exposed": impact.get("data_exposed")
+                    or heuristic["impact_assessment"]["data_exposed"],
+                    "users_affected": int(
+                        impact.get("users_affected")
+                        or heuristic["impact_assessment"]["users_affected"]
+                    ),
+                    "severity": impact.get("severity")
+                    or heuristic["impact_assessment"]["severity"],
+                },
+                "recommendations": llm_out.get("recommendations")
+                or heuristic["recommendations"],
+                "confidence": 0.85,
+                "derivation": "llm",
+            }
+            derivation = "llm"
+            model_used = "gemini-2.5-flash"
+        except HTTPException:
+            raise
+        except Exception as e:  # network/parse — fall back, surface in derivation
+            logger.warning(
+                f"LLM incident analysis failed for {incident_id}: {e}; "
+                f"falling back to rule-based derivation"
+            )
+            result_data = _heuristic_incident_analysis(ctx)
+    else:
+        logger.warning(
+            f"LLM not configured (GEMINI_API_KEY unset); using rule-based "
+            f"incident analysis for {incident_id}"
+        )
+        result_data = _heuristic_incident_analysis(ctx)
+
+    # Persist analysis with REAL content
+    analysis = AIAnalysis(
+        analysis_type="incident_summary",
+        source_type="incident",
+        source_id=incident_id,
+        input_data={
+            "incident_id": incident_id,
+            "include_related": request.include_related,
+            "alert_count": len(ctx["alerts"]),
+        },
+        ai_response=result_data["executive_summary"],
+        structured_output=result_data,
+        confidence=result_data["confidence"],
+        model_used=model_used,
+        tokens_used=0,
+        latency_ms=0,
+        organization_id=getattr(current_user, "organization_id", None),
+    )
+    db.add(analysis)
+    await db.flush()
+    await db.refresh(analysis)
+
+    impact = result_data["impact_assessment"]
+
+    return IncidentAnalysisResponse(
+        incident_id=incident_id,
+        executive_summary=result_data["executive_summary"],
+        technical_details=result_data["technical_details"],
+        impact_assessment=ImpactAssessment(
+            affected_systems=impact["affected_systems"],
+            data_exposed=impact["data_exposed"],
+            users_affected=impact["users_affected"],
+            severity=impact["severity"],
+        ),
+        recommendations=result_data["recommendations"],
+        analysis_complete=True,
+    )
 
 
 @router.post("/analyze/root-cause/{incident_id}", response_model=RootCauseAnalysis, summary="Root cause analysis")
@@ -799,46 +1309,100 @@ async def analyze_root_cause(
     db: DatabaseSession = None,
 ):
     """
-    Determine root cause of incident using evidence analysis.
+    Determine root cause of incident using real linked-alert evidence.
+
+    Routes through AIAnalyzer.analyze_root_cause when an LLM is configured;
+    otherwise derives a chain from the alerts attached to the incident and
+    computes dwell time as (incident.created_at - earliest_alert.created_at).
     """
-    try:
-        logger.info(f"Analyzing root cause for incident {incident_id}")
+    logger.info(f"Analyzing root cause for incident {incident_id}")
 
-        rca = _compute_root_cause(incident_id)
-
-        # Persist analysis
-        analysis = AIAnalysis(
-            analysis_type="root_cause",
-            source_type="incident",
-            source_id=incident_id,
-            input_data={"incident_id": incident_id},
-            ai_response=rca["root_cause"],
-            structured_output=rca,
-            confidence=rca["confidence"],
-            model_used="heuristic-v1",
-            tokens_used=0,
-            latency_ms=0,
-            organization_id=getattr(current_user, "organization_id", None),
-        )
-        db.add(analysis)
-        await db.flush()
-        await db.refresh(analysis)
-
-        return RootCauseAnalysis(
-            incident_id=incident_id,
-            root_cause=rca["root_cause"],
-            attack_chain=rca["attack_chain"],
-            entry_point=rca["entry_point"],
-            dwell_time_days=rca["dwell_time_days"],
-            confidence=rca["confidence"],
-            evidence=[],
+    ctx = await _load_incident_context(db, incident_id)
+    incident = ctx["incident"]
+    if incident is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Incident {incident_id} not found",
         )
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Root cause analysis error: {e}")
-        raise HTTPException(status_code=500, detail="Root cause analysis failed")
+    timeline = _build_incident_timeline(ctx)
+    log_evidence: list[str] = []
+    for a in ctx["alerts"][:10]:
+        log_evidence.append(
+            f"{a.created_at.isoformat() if a.created_at else 'unknown'} "
+            f"[{a.severity}] {a.source}: {a.title}"
+        )
+
+    derivation = "rule_based"
+    model_used = "heuristic-v1"
+    rca: dict[str, Any]
+
+    if _llm_available():
+        try:
+            analyzer = AIAnalyzer()
+            llm_out = await asyncio.to_thread(
+                analyzer.analyze_root_cause,
+                _serialize_incident(incident),
+                log_evidence,
+                timeline,
+            )
+            heuristic = _heuristic_root_cause(ctx)
+            # Always trust REAL dwell time computed from DB over LLM guess.
+            real_dwell = heuristic["dwell_time_days"]
+            rca = {
+                "root_cause": llm_out.get("root_cause") or heuristic["root_cause"],
+                "attack_chain": llm_out.get("attack_chain") or heuristic["attack_chain"],
+                "entry_point": llm_out.get("entry_point") or heuristic["entry_point"],
+                "dwell_time_days": int(real_dwell),
+                "confidence": float(llm_out.get("confidence") or heuristic["confidence"]),
+                "derivation": "llm",
+            }
+            derivation = "llm"
+            model_used = "gemini-2.5-flash"
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning(
+                f"LLM root cause analysis failed for {incident_id}: {e}; "
+                f"falling back to rule-based derivation"
+            )
+            rca = _heuristic_root_cause(ctx)
+    else:
+        logger.warning(
+            f"LLM not configured (GEMINI_API_KEY unset); deriving root cause for "
+            f"{incident_id} from linked alerts"
+        )
+        rca = _heuristic_root_cause(ctx)
+
+    analysis = AIAnalysis(
+        analysis_type="root_cause",
+        source_type="incident",
+        source_id=incident_id,
+        input_data={
+            "incident_id": incident_id,
+            "alert_count": len(ctx["alerts"]),
+        },
+        ai_response=rca["root_cause"],
+        structured_output=rca,
+        confidence=rca["confidence"],
+        model_used=model_used,
+        tokens_used=0,
+        latency_ms=0,
+        organization_id=getattr(current_user, "organization_id", None),
+    )
+    db.add(analysis)
+    await db.flush()
+    await db.refresh(analysis)
+
+    return RootCauseAnalysis(
+        incident_id=incident_id,
+        root_cause=rca["root_cause"],
+        attack_chain=rca["attack_chain"],
+        entry_point=rca["entry_point"],
+        dwell_time_days=rca["dwell_time_days"],
+        confidence=rca["confidence"],
+        evidence=log_evidence,
+    )
 
 
 @router.post("/recommend/response/{incident_id}", response_model=ResponseRecommendation, summary="Response recommendations")
@@ -850,46 +1414,106 @@ async def recommend_response(
 ):
     """
     Get incident response recommendations.
+
+    Loads the incident + linked alerts so suggestions reference real
+    affected systems and users. Uses AIAnalyzer.recommend_response when
+    an LLM is configured; otherwise derives action lists from real DB
+    fields (no canned text).
     """
-    try:
-        logger.info(f"Generating response recommendations for incident {incident_id}")
+    logger.info(f"Generating response recommendations for incident {incident_id}")
 
-        rec = _compute_response_recommendations(request.incident_type, request.severity)
-
-        # Persist analysis
-        analysis = AIAnalysis(
-            analysis_type="response_recommendation",
-            source_type="incident",
-            source_id=incident_id,
-            input_data={
-                "incident_id": incident_id,
-                "incident_type": request.incident_type,
-                "severity": request.severity,
-            },
-            ai_response="; ".join(rec["immediate_actions"]),
-            structured_output=rec,
-            confidence=0.85,
-            model_used="heuristic-v1",
-            tokens_used=0,
-            latency_ms=0,
-            organization_id=getattr(current_user, "organization_id", None),
-        )
-        db.add(analysis)
-        await db.flush()
-
-        return ResponseRecommendation(
-            immediate_actions=rec["immediate_actions"],
-            containment_steps=rec["containment_steps"],
-            investigation_steps=rec["investigation_steps"],
-            recovery_plan=rec["recovery_plan"],
-            timeline_estimate_hours=rec["timeline_estimate_hours"],
+    ctx = await _load_incident_context(db, incident_id)
+    incident = ctx["incident"]
+    if incident is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Incident {incident_id} not found",
         )
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Response recommendation error: {e}")
-        raise HTTPException(status_code=500, detail="Recommendation generation failed")
+    derivation = "rule_based"
+    model_used = "heuristic-v1"
+    rec: dict[str, Any]
+
+    if _llm_available():
+        try:
+            analyzer = AIAnalyzer()
+            llm_context = {
+                "incident": _serialize_incident(incident),
+                "affected_systems": ctx["affected_systems"],
+                "affected_users": ctx["affected_users"],
+                "alert_count": len(ctx["alerts"]),
+                "mitre_techniques": ctx["mitre_techniques"],
+            }
+            llm_out = await asyncio.to_thread(
+                analyzer.recommend_response,
+                request.incident_type or incident.incident_type,
+                request.severity or incident.severity,
+                llm_context,
+            )
+            heuristic = _heuristic_response_recommendations(
+                ctx, request.incident_type, request.severity
+            )
+            rec = {
+                "immediate_actions": llm_out.get("immediate_actions") or heuristic["immediate_actions"],
+                "containment_steps": llm_out.get("containment_steps") or heuristic["containment_steps"],
+                "investigation_steps": llm_out.get("investigation_steps") or heuristic["investigation_steps"],
+                "recovery_plan": llm_out.get("recovery_plan") or heuristic["recovery_plan"],
+                "timeline_estimate_hours": int(
+                    llm_out.get("timeline_estimate_hours") or heuristic["timeline_estimate_hours"]
+                ),
+                "derivation": "llm",
+            }
+            derivation = "llm"
+            model_used = "gemini-2.5-flash"
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning(
+                f"LLM response recommendation failed for {incident_id}: {e}; "
+                f"falling back to rule-based derivation"
+            )
+            rec = _heuristic_response_recommendations(
+                ctx, request.incident_type, request.severity
+            )
+    else:
+        logger.warning(
+            f"LLM not configured (GEMINI_API_KEY unset); deriving response "
+            f"recommendations for {incident_id} from incident DB fields"
+        )
+        rec = _heuristic_response_recommendations(
+            ctx, request.incident_type, request.severity
+        )
+
+    confidence = 0.85 if derivation == "llm" else 0.6
+    analysis = AIAnalysis(
+        analysis_type="response_recommendation",
+        source_type="incident",
+        source_id=incident_id,
+        input_data={
+            "incident_id": incident_id,
+            "incident_type": request.incident_type,
+            "severity": request.severity,
+            "affected_systems": ctx["affected_systems"],
+            "affected_users": ctx["affected_users"],
+        },
+        ai_response="; ".join(rec["immediate_actions"]),
+        structured_output=rec,
+        confidence=confidence,
+        model_used=model_used,
+        tokens_used=0,
+        latency_ms=0,
+        organization_id=getattr(current_user, "organization_id", None),
+    )
+    db.add(analysis)
+    await db.flush()
+
+    return ResponseRecommendation(
+        immediate_actions=rec["immediate_actions"],
+        containment_steps=rec["containment_steps"],
+        investigation_steps=rec["investigation_steps"],
+        recovery_plan=rec["recovery_plan"],
+        timeline_estimate_hours=rec["timeline_estimate_hours"],
+    )
 
 
 @router.post("/generate/playbook", response_model=None, summary="Generate playbook")
@@ -901,49 +1525,186 @@ async def generate_playbook(
 ):
     """
     Generate incident response playbook from pattern.
+
+    Uses AIAnalyzer.generate_playbook with real historical incident
+    summaries when an LLM is configured. Otherwise, derives a step list
+    from prior incidents in the DB whose type/title match the pattern,
+    rather than returning an identical 5-step canned playbook.
     """
-    try:
-        logger.info(f"Generating playbook for pattern: {incident_pattern}")
+    logger.info(f"Generating playbook for pattern: {incident_pattern}")
 
-        steps = [
-            {"step": 1, "action": "Identify affected systems", "automated": False},
-            {"step": 2, "action": "Isolate compromised hosts", "automated": True},
-            {"step": 3, "action": "Collect forensic evidence", "automated": False},
-            {"step": 4, "action": "Eradicate threat", "automated": False},
-            {"step": 5, "action": "Restore from clean backups", "automated": True},
-        ][:limit]
+    from src.models.incident import Incident
 
-        playbook_data = {
-            "playbook_name": f"Response playbook for {incident_pattern}",
-            "steps": steps,
-            "conditions": [f"Trigger on {incident_pattern} pattern detection"],
-            "automations": ["host_isolation", "evidence_collection"],
-        }
+    org_id = getattr(current_user, "organization_id", None)
+    pattern_lower = (incident_pattern or "").lower().strip()
 
-        # Persist analysis
-        analysis = AIAnalysis(
-            analysis_type="playbook_generation",
-            source_type="incident",
-            source_id=None,
-            input_data={"incident_pattern": incident_pattern, "limit": limit},
-            ai_response=playbook_data["playbook_name"],
-            structured_output=playbook_data,
-            confidence=0.80,
-            model_used="heuristic-v1",
-            tokens_used=0,
-            latency_ms=0,
-            organization_id=getattr(current_user, "organization_id", None),
+    # Pull up to 10 prior incidents matching the pattern to ground the playbook.
+    history_q = (
+        select(Incident)
+        .where(
+            Incident.organization_id == org_id,
+            (
+                Incident.incident_type.ilike(f"%{pattern_lower}%")
+                | Incident.title.ilike(f"%{pattern_lower}%")
+                | Incident.description.ilike(f"%{pattern_lower}%")
+            ),
         )
-        db.add(analysis)
-        await db.flush()
+        .order_by(Incident.created_at.desc())
+        .limit(10)
+    )
+    historical_rows = list((await db.execute(history_q)).scalars().all())
+    historical_responses: list[dict[str, Any]] = []
+    for inc in historical_rows:
+        historical_responses.append({
+            "id": inc.id,
+            "title": inc.title,
+            "incident_type": inc.incident_type,
+            "severity": inc.severity,
+            "status": inc.status,
+            "resolution": (inc.resolution or "")[:400],
+            "lessons_learned": (inc.lessons_learned or "")[:400],
+            "recommendations": (inc.recommendations or "")[:400],
+        })
 
-        return playbook_data
+    derivation = "rule_based"
+    model_used = "heuristic-v1"
+    confidence = 0.6
+    playbook_data: dict[str, Any]
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Playbook generation error: {e}")
-        raise HTTPException(status_code=500, detail="Playbook generation failed")
+    if _llm_available():
+        try:
+            analyzer = AIAnalyzer()
+            llm_out = await asyncio.to_thread(
+                analyzer.generate_playbook, incident_pattern, historical_responses
+            )
+            steps_raw = llm_out.get("steps") or []
+            # Normalize step shape and apply limit.
+            steps: list[dict[str, Any]] = []
+            for i, s in enumerate(steps_raw[:limit], start=1):
+                if isinstance(s, dict):
+                    steps.append({
+                        "step": s.get("step", i),
+                        "action": s.get("action") or s.get("description") or str(s),
+                        "automated": bool(s.get("automated", False)),
+                    })
+                else:
+                    steps.append({"step": i, "action": str(s), "automated": False})
+            playbook_data = {
+                "playbook_name": llm_out.get("playbook_name")
+                or f"Response playbook for {incident_pattern}",
+                "steps": steps,
+                "conditions": llm_out.get("conditions")
+                or [f"Trigger on {incident_pattern} pattern detection"],
+                "automations": llm_out.get("automations") or [],
+                "historical_basis": [h["id"] for h in historical_responses],
+                "derivation": "llm",
+            }
+            derivation = "llm"
+            model_used = "gemini-2.5-flash"
+            confidence = 0.8
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.warning(
+                f"LLM playbook generation failed for pattern '{incident_pattern}': {e}; "
+                f"falling back to history-derived playbook"
+            )
+            playbook_data = _derive_playbook_from_history(
+                incident_pattern, historical_responses, limit
+            )
+    else:
+        logger.warning(
+            f"LLM not configured (GEMINI_API_KEY unset); deriving playbook for "
+            f"'{incident_pattern}' from {len(historical_responses)} historical incidents"
+        )
+        playbook_data = _derive_playbook_from_history(
+            incident_pattern, historical_responses, limit
+        )
+
+    analysis = AIAnalysis(
+        analysis_type="playbook_generation",
+        source_type="incident",
+        source_id=None,
+        input_data={
+            "incident_pattern": incident_pattern,
+            "limit": limit,
+            "historical_count": len(historical_responses),
+        },
+        ai_response=playbook_data["playbook_name"],
+        structured_output=playbook_data,
+        confidence=confidence,
+        model_used=model_used,
+        tokens_used=0,
+        latency_ms=0,
+        organization_id=org_id,
+    )
+    db.add(analysis)
+    await db.flush()
+
+    return playbook_data
+
+
+def _derive_playbook_from_history(
+    pattern: str, historical: list[dict[str, Any]], limit: int
+) -> dict[str, Any]:
+    """
+    Build a step list derived from real historical incident resolutions.
+
+    Each historical resolution / recommendation entry becomes a step. If we
+    have no history at all, we fall back to a generic IR cycle, but the
+    playbook name still references the requested pattern.
+    """
+    steps: list[dict[str, Any]] = []
+    automations: set[str] = set()
+
+    for inc in historical:
+        for field, automated_hint in (
+            ("resolution", False),
+            ("recommendations", False),
+            ("lessons_learned", False),
+        ):
+            text = (inc.get(field) or "").strip()
+            if not text:
+                continue
+            for line in [ln.strip(" -*\t") for ln in text.splitlines() if ln.strip()]:
+                if len(steps) >= limit:
+                    break
+                steps.append({
+                    "step": len(steps) + 1,
+                    "action": line[:240],
+                    "automated": False,
+                    "source_incident": inc.get("id"),
+                })
+            if "isolate" in text.lower():
+                automations.add("host_isolation")
+            if "block" in text.lower() and "ip" in text.lower():
+                automations.add("ip_block")
+            if "evidence" in text.lower() or "forensic" in text.lower():
+                automations.add("evidence_collection")
+
+    if not steps:
+        # Truly nothing in history — build a phase-based fallback that still
+        # explicitly says it's not history-derived.
+        for i, action in enumerate(
+            [
+                "Identify affected systems and users from SIEM/EDR",
+                "Contain by isolating affected hosts and disabling accounts",
+                "Collect forensic evidence (memory, disk, logs)",
+                "Eradicate the threat (remove malware, close access paths)",
+                "Recover from clean backups and restore service",
+            ][:limit],
+            start=1,
+        ):
+            steps.append({"step": i, "action": action, "automated": False})
+
+    return {
+        "playbook_name": f"Response playbook for {pattern}",
+        "steps": steps,
+        "conditions": [f"Trigger on {pattern} pattern detection"],
+        "automations": sorted(automations) if automations else [],
+        "historical_basis": [h.get("id") for h in historical],
+        "derivation": "rule_based",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1235,55 +1996,91 @@ async def predict_entity_threat(
     db: DatabaseSession = None,
 ):
     """
-    Predict threat probability for entity.
+    Predict threat probability for entity using REAL UEBA/anomaly signals.
 
-    Uses heuristics and persists the prediction to the database.
+    Score is a weighted blend of:
+      - UEBA EntityProfile.risk_score (when available)
+      - EntityProfile.anomaly_count_30d
+      - Recent AnomalyDetection rows for this entity
+      - Recent UEBARiskAlert rows
+      - Asset criticality (for host entities)
+      - Peer-group deviation (when present in baseline_data)
+
+    No hash-of-id fakery.
     """
-    try:
-        logger.info(f"Generating threat prediction for {request.entity_type}/{entity_id}")
+    logger.info(f"Generating threat prediction for {request.entity_type}/{entity_id}")
 
-        pred = _compute_threat_prediction(request.entity_type, entity_id, request.time_horizon_hours)
+    org_id = getattr(current_user, "organization_id", None)
+    signals = await _load_entity_risk_signals(db, request.entity_type, entity_id, org_id)
+    pred = _compute_threat_prediction_from_signals(request.entity_type, entity_id, signals)
 
-        prediction = ThreatPrediction(
-            prediction_type=pred["prediction_type"],
-            entity_type=request.entity_type,
-            entity_id=entity_id,
-            risk_score=pred["risk_score"],
-            probability=pred["probability"],
-            time_horizon_hours=request.time_horizon_hours,
-            contributing_factors=pred["contributing_factors"],
-            recommended_actions=pred["recommended_actions"],
-            mitre_techniques=[],
-            model_id=None,
-            expires_at=_utc_now() + timedelta(hours=request.time_horizon_hours),
-            was_accurate=None,
-            organization_id=getattr(current_user, "organization_id", None),
-        )
-        db.add(prediction)
-        await db.flush()
-        await db.refresh(prediction)
-
-        return ThreatPredictionResponse(
-            id=prediction.id,
-            entity_type=prediction.entity_type,
-            entity_id=prediction.entity_id,
-            prediction_type=prediction.prediction_type,
-            risk_score=prediction.risk_score,
-            probability=prediction.probability,
-            time_horizon_hours=prediction.time_horizon_hours,
-            contributing_factors=prediction.contributing_factors,
-            recommended_actions=prediction.recommended_actions,
-            mitre_techniques=prediction.mitre_techniques,
-            expires_at=prediction.expires_at,
-            was_accurate=prediction.was_accurate,
-            created_at=prediction.created_at,
+    if pred["contributing_factors"] == ["no_risk_signals_available"]:
+        logger.warning(
+            f"No risk signals found for {request.entity_type}/{entity_id}; "
+            f"returning 0 risk score with derivation=rule_based"
         )
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Threat prediction error: {e}")
-        raise HTTPException(status_code=500, detail="Prediction failed")
+    # Don't persist raw_signals into the DB row (not part of schema).
+    raw_signals = pred.pop("raw_signals", {})
+
+    prediction = ThreatPrediction(
+        prediction_type=pred["prediction_type"],
+        entity_type=request.entity_type,
+        entity_id=entity_id,
+        risk_score=pred["risk_score"],
+        probability=pred["probability"],
+        time_horizon_hours=request.time_horizon_hours,
+        contributing_factors=pred["contributing_factors"],
+        recommended_actions=pred["recommended_actions"],
+        mitre_techniques=[],
+        model_id=None,
+        expires_at=_utc_now() + timedelta(hours=request.time_horizon_hours),
+        was_accurate=None,
+        organization_id=org_id,
+    )
+    db.add(prediction)
+    await db.flush()
+    await db.refresh(prediction)
+
+    # Also persist the derivation breakdown as an AIAnalysis for traceability.
+    db.add(AIAnalysis(
+        analysis_type="threat_assessment",
+        source_type="query",
+        source_id=prediction.id,
+        input_data={
+            "entity_type": request.entity_type,
+            "entity_id": entity_id,
+            "time_horizon_hours": request.time_horizon_hours,
+            "raw_signals": raw_signals,
+        },
+        ai_response=(
+            f"{request.entity_type}/{entity_id} risk score {pred['risk_score']} "
+            f"derived from {len(pred['contributing_factors'])} signals"
+        ),
+        structured_output={**pred, "raw_signals": raw_signals},
+        confidence=0.7 if signals.get("ueba_risk_score") is not None else 0.4,
+        model_used="rule_based-v1",
+        tokens_used=0,
+        latency_ms=0,
+        organization_id=org_id,
+    ))
+    await db.flush()
+
+    return ThreatPredictionResponse(
+        id=prediction.id,
+        entity_type=prediction.entity_type,
+        entity_id=prediction.entity_id,
+        prediction_type=prediction.prediction_type,
+        risk_score=prediction.risk_score,
+        probability=prediction.probability,
+        time_horizon_hours=prediction.time_horizon_hours,
+        contributing_factors=prediction.contributing_factors,
+        recommended_actions=prediction.recommended_actions,
+        mitre_techniques=prediction.mitre_techniques,
+        expires_at=prediction.expires_at,
+        was_accurate=prediction.was_accurate,
+        created_at=prediction.created_at,
+    )
 
 
 @router.get("/predictions/dashboard", response_model=PredictionDashboard, summary="Prediction dashboard")
@@ -1415,51 +2212,76 @@ async def train_model(
     db: DatabaseSession = None,
 ):
     """
-    Trigger ML model training.
+    Register or train an ML model.
 
-    Creates a new model record in the database with initial training metrics.
+    Behavior:
+      - If ``trigger_retraining`` is True: a real training backend is required.
+        We currently have no async training pipeline that can ingest a
+        labelled dataset from this endpoint, so we return 503 rather than
+        fabricating metrics like {accuracy: 0.90}.
+      - Otherwise: register the model record with status=``pending_data`` and
+        an empty metrics dict so the frontend can list it without showing
+        invented performance numbers. Real metrics are populated only after
+        an actual training job runs (e.g. via ``AnomalyDetector.train_model``
+        in src/ai/engine.py, called from a background task with real data).
     """
-    try:
-        logger.info(f"Training {request.model_type} model")
+    logger.info(
+        f"Train-model request: type={request.model_type} algo={request.algorithm} "
+        f"trigger_retraining={request.trigger_retraining}"
+    )
 
-        version = request.version or "1.0.0"
-        name = f"{request.model_type}_{request.algorithm}_{version}"
-
-        model = MLModel(
-            name=name,
-            model_type=request.model_type,
-            algorithm=request.algorithm,
-            version=version,
-            status="ready",
-            description=request.description,
-            feature_columns=[],
-            hyperparameters=request.hyperparameters or {},
-            training_metrics={"accuracy": 0.90, "precision": 0.87, "recall": 0.92, "f1": 0.89},
-            training_data_size=0,
-            last_trained_at=_utc_now(),
-            prediction_count=0,
-            drift_score=0.0,
-            tags=request.tags or [],
-            organization_id=getattr(current_user, "organization_id", None),
+    if request.trigger_retraining:
+        # No training data was supplied by the request schema and there is
+        # no in-process training service that pulls labelled data on demand.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=(
+                "training backend not configured: no labelled dataset is available "
+                "via this endpoint and no async training service is wired up. "
+                "Register the model without trigger_retraining and run training "
+                "out-of-band (e.g. via src/ai/engine.py AnomalyDetector.train_model)."
+            ),
         )
-        db.add(model)
-        await db.flush()
-        await db.refresh(model)
 
-        return {
-            "status": "success",
-            "model_id": model.id,
-            "model_type": model.model_type,
-            "algorithm": model.algorithm,
-            "metrics": model.training_metrics,
-            "training_data_size": model.training_data_size,
-        }
+    version = request.version or "1.0.0"
+    name = f"{request.model_type}_{request.algorithm}_{version}"
 
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Model training error: {e}")
-        raise HTTPException(status_code=500, detail="Training failed")
+    model = MLModel(
+        name=name,
+        model_type=request.model_type,
+        algorithm=request.algorithm,
+        version=version,
+        status="pending_data",
+        description=request.description,
+        feature_columns=[],
+        hyperparameters=request.hyperparameters or {},
+        # Empty metrics — DO NOT insert fake numbers. Real metrics get
+        # written once an actual training job finishes.
+        training_metrics={},
+        training_data_size=0,
+        last_trained_at=None,
+        prediction_count=0,
+        drift_score=0.0,
+        tags=request.tags or [],
+        organization_id=getattr(current_user, "organization_id", None),
+    )
+    db.add(model)
+    await db.flush()
+    await db.refresh(model)
+
+    return {
+        "status": "registered",
+        "model_id": model.id,
+        "model_type": model.model_type,
+        "algorithm": model.algorithm,
+        "metrics": model.training_metrics,
+        "training_data_size": model.training_data_size,
+        "note": (
+            "Model registered without training. Run "
+            "src/ai/engine.py AnomalyDetector.train_model with real data to "
+            "populate training_metrics and set status=ready."
+        ),
+    }
 
 
 @router.get("/models/{model_id}", response_model=MLModelResponse, summary="Get model details")

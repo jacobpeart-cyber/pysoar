@@ -35,6 +35,7 @@ class AgentCapability(str, Enum):
     BAS = "bas"              # Runs MITRE ATT&CK atomic tests
     LIVE_RESPONSE = "ir"     # Incident response actions: kill/isolate/collect
     PURPLE_TEAM = "purple"   # Orchestrated red+blue live correlation
+    COMPLIANCE = "compliance"  # DISA STIG / CIS benchmark checks
 
 
 class AgentAction(str, Enum):
@@ -65,6 +66,10 @@ class AgentAction(str, Enum):
     # --- Purple Team ---
     PURPLE_FIRE_TECHNIQUE = "purple_fire_technique"  # BAS test + live SIEM watch
 
+    # --- Compliance ---
+    RUN_STIG_CHECK = "run_stig_check"   # payload = {rule_id, check_content, os_type}
+    RUN_CIS_CHECK = "run_cis_check"     # payload = {rule_id, check_content, os_type}
+
 
 # Which actions each capability unlocks
 CAPABILITY_ACTIONS: dict[AgentCapability, set[AgentAction]] = {
@@ -87,6 +92,10 @@ CAPABILITY_ACTIONS: dict[AgentCapability, set[AgentAction]] = {
         AgentAction.RUN_ATOMIC_TEST,
         AgentAction.PURPLE_FIRE_TECHNIQUE,
         AgentAction.COLLECT_PROCESS_LIST,
+    },
+    AgentCapability.COMPLIANCE: {
+        AgentAction.RUN_STIG_CHECK,
+        AgentAction.RUN_CIS_CHECK,
     },
 }
 

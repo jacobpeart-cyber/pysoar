@@ -478,23 +478,90 @@ class SimulationOrchestrator:
 
     async def _run_cleanup(self, test: SimulationTest, cleanup_command: str) -> bool:
         """
-        Run cleanup command after test completes.
+        Dispatch the cleanup command to the endpoint agent that ran the
+        test, using the same capability-gated RUN_ATOMIC_TEST action the
+        simulation itself used. Polls the AgentCommand record for
+        completion and returns True iff the agent reports success.
 
-        Args:
-            test: SimulationTest being cleaned up
-            cleanup_command: Command to execute for cleanup
-
-        Returns:
-            True if cleanup succeeded, False otherwise
+        If no connected agent exists for the target, records the command
+        on the row with cleanup_status='pending_agent' and returns False
+        — we don't claim success for work that didn't happen.
         """
-        try:
-            # Simulate cleanup execution
-            test.cleanup_command = cleanup_command
-            logger.info(f"Running cleanup for test {test.id}")
-            return True
-        except Exception as e:
-            logger.error(f"Cleanup failed for test {test.id}: {str(e)}")
+        from src.agents.models import EndpointAgent, AgentCommand, AgentResult
+        from src.agents.service import AgentService, AgentServiceError
+        import asyncio as _asyncio
+        import time as _time
+
+        test.cleanup_command = cleanup_command
+        target = getattr(test, "target_host", None) or getattr(test, "target", None)
+
+        if not target:
+            logger.warning(
+                "Simulation test %s has no target host; cleanup command "
+                "recorded but not dispatched", test.id,
+            )
+            test.cleanup_status = "no_target"
             return False
+
+        result = await self.db.execute(
+            select(EndpointAgent).where(
+                EndpointAgent.hostname == target,
+                EndpointAgent.status == "active",
+            )
+        )
+        agent = result.scalar_one_or_none()
+
+        if not agent:
+            logger.warning(
+                "No active agent for target %s; cleanup for test %s deferred",
+                target, test.id,
+            )
+            test.cleanup_status = "pending_agent"
+            return False
+
+        service = AgentService(self.db)
+        try:
+            cmd = await service.issue_command(
+                agent=agent,
+                action="run_atomic_test",
+                payload={
+                    "command": cleanup_command,
+                    "is_cleanup": True,
+                    "simulation_test_id": test.id,
+                },
+                simulation_id=getattr(test, "simulation_id", None),
+                approval_override=True,
+            )
+            await self.db.commit()
+        except AgentServiceError as e:
+            logger.error("Cleanup dispatch failed for test %s: %s", test.id, e)
+            test.cleanup_status = "dispatch_failed"
+            return False
+
+        # Poll for completion — cleanup should return within the command's
+        # 15-minute expiry window. We wait up to 5 minutes here.
+        deadline = _time.monotonic() + 300
+        while _time.monotonic() < deadline:
+            await _asyncio.sleep(5)
+            refreshed = (await self.db.execute(
+                select(AgentCommand).where(AgentCommand.id == cmd.id)
+            )).scalar_one_or_none()
+            if not refreshed:
+                break
+            if refreshed.status == "completed":
+                test.cleanup_status = "completed"
+                logger.info("Cleanup completed for test %s on agent %s", test.id, agent.id)
+                return True
+            if refreshed.status in ("failed", "expired", "rejected"):
+                test.cleanup_status = refreshed.status
+                logger.warning(
+                    "Cleanup %s for test %s on agent %s", refreshed.status, test.id, agent.id,
+                )
+                return False
+
+        test.cleanup_status = "timeout"
+        logger.warning("Cleanup timed out for test %s on agent %s", test.id, agent.id)
+        return False
 
     async def _validate_scope(self, scope: Dict[str, Any]) -> bool:
         """

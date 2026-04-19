@@ -526,8 +526,17 @@ class AssetDiscovery:
 
             shadow_assets = list(seen_unknown.values())
             logger.info(f"Shadow IT detection found {len(shadow_assets)} unknown assets")
-        except Exception as e:
-            logger.error(f"Shadow IT detection failed: {e}")
+        except Exception:
+            # Previously this swallowed every error and returned [], which is
+            # indistinguishable from "no shadow IT was detected" — a dangerous
+            # silent-failure mode for a security control. Log loud and re-raise
+            # so the caller can decide how to surface the failure.
+            logger.error(
+                "Shadow IT detection failed for organization %s",
+                organization_id,
+                exc_info=True,
+            )
+            raise
 
         return shadow_assets
 

@@ -55,8 +55,12 @@ class CorrelationRule:
         self.incident_type = incident_type
 
     def matches(self, alert: Alert) -> bool:
-        """Check if alert matches this rule"""
+        """Check if alert matches this rule (sync path — stateless rules)"""
         raise NotImplementedError
+
+    async def matches_async(self, alert: Alert) -> bool:
+        """Async check for rules that need DB access. Defaults to sync matches()."""
+        return self.matches(alert)
 
     def get_incident_title(self, alert: Alert) -> str:
         """Generate incident title from alert"""
@@ -129,25 +133,20 @@ class RepeatedAlertRule(CorrelationRule):
         self._db = db
 
     def matches(self, alert: Alert) -> bool:
-        # Query the database for repeated alerts within time window
-        if self._db:
-            import asyncio
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    # We're already in an async context; use the sync fallback
-                    return self._matches_sync_fallback(alert)
-                return loop.run_until_complete(self._matches_async(alert))
-            except RuntimeError:
-                return self._matches_sync_fallback(alert)
-        return self._matches_sync_fallback(alert)
-
-    def _matches_sync_fallback(self, alert: Alert) -> bool:
-        """Fallback for when async is not available - counts from alert created_at"""
-        # Use alert's own timestamp to check if this is part of a repeated pattern
-        # This works by examining whether the alert has been seen enough times
-        # The caller (AlertCorrelationService.process_alert) already has the DB session
+        # Sync path cannot query the async DB; callers should always use
+        # matches_async() for this rule. Return False here so a misbehaving
+        # sync caller doesn't fire incidents without evidence.
+        logger.warning(
+            "RepeatedAlertRule.matches() called synchronously — rule only "
+            "functions via matches_async() with an AsyncSession",
+        )
         return False
+
+    async def matches_async(self, alert: Alert) -> bool:
+        """Check alert repetition count from the DB within the time window."""
+        if not self._db:
+            return False
+        return await self._matches_async(alert)
 
     async def _matches_async(self, alert: Alert) -> bool:
         """Check alert repetition count from the database within time window"""
@@ -227,9 +226,9 @@ class AlertCorrelationService:
             logger.debug(f"Alert {alert.id} already linked to incident {alert.incident_id}")
             return None
 
-        # Check each rule
+        # Check each rule (async so DB-backed rules like RepeatedAlertRule work)
         for rule in self.rules:
-            if rule.matches(alert):
+            if await rule.matches_async(alert):
                 logger.info(f"Alert {alert.id} matched rule: {rule.name}")
 
                 if rule.auto_create_incident:

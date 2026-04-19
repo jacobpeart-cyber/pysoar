@@ -26,6 +26,20 @@ from src.integrations.models import (
 logger = get_logger(__name__)
 
 
+def _classify_response(resp: Any) -> tuple[str, Optional[str]]:
+    """Translate an httpx ``Response`` into ``(health_status, error)``.
+
+    2xx -> HEALTHY. 401/403 -> UNHEALTHY (auth problem). Any other 4xx
+    or 5xx -> UNHEALTHY with the status code in the error message.
+    """
+    code = getattr(resp, "status_code", 0)
+    if 200 <= code < 300:
+        return HealthStatus.HEALTHY.value, None
+    if code in (401, 403):
+        return HealthStatus.UNHEALTHY.value, f"Authentication rejected (HTTP {code})"
+    return HealthStatus.UNHEALTHY.value, f"Probe returned HTTP {code}"
+
+
 # Built-in connector definitions
 BUILTIN_CONNECTORS = {
     # SIEM
@@ -628,55 +642,213 @@ class IntegrationManager:
         self,
         installation_id: str,
     ) -> dict[str, Any]:
-        """Test health of installed integration by verifying DB record and configuration"""
+        """Test health of an installed integration by actually contacting the
+        third-party endpoint and inspecting the response.
+
+        Resolves the ``connector`` row (so we know the connector type),
+        decodes the stored config + credentials JSON, and dispatches to a
+        per-connector probe. Each probe issues a *real* HTTP request with
+        a 5-second timeout and reports HEALTHY / DEGRADED / UNHEALTHY
+        / UNKNOWN based on the answer. The DB row's ``health_status``
+        and ``last_health_check`` are updated to match.
+
+        Unknown connector types are honestly reported as ``unknown`` —
+        we never claim ``healthy`` without a successful probe.
+        """
         from src.core.database import async_session_factory
         from sqlalchemy import select
 
         health_status = HealthStatus.UNKNOWN.value
-        error_message = None
+        error_message: Optional[str] = None
 
-        try:
-            async with async_session_factory() as db:
-                query = select(InstalledIntegration).where(InstalledIntegration.id == installation_id)
-                result = await db.execute(query)
-                integration = result.scalar_one_or_none()
+        async with async_session_factory() as db:
+            query = select(InstalledIntegration).where(
+                InstalledIntegration.id == installation_id
+            )
+            integration = (await db.execute(query)).scalar_one_or_none()
 
-                if not integration:
+            if not integration:
+                logger.info(f"Health check for {installation_id}: not_found")
+                return {
+                    "installation_id": installation_id,
+                    "status": HealthStatus.UNHEALTHY.value,
+                    "error_message": "Integration not found in database",
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                }
+
+            # Resolve the connector so we know which third-party API to
+            # probe. Without it we can only honestly report unknown.
+            connector = (await db.execute(
+                select(IntegrationConnector).where(
+                    IntegrationConnector.id == integration.connector_id
+                )
+            )).scalar_one_or_none()
+
+            connector_type = (connector.name if connector else "").lower()
+
+            try:
+                config = json.loads(integration.config_encrypted or "{}")
+            except (json.JSONDecodeError, TypeError):
+                config = {}
+                error_message = "Stored config is not valid JSON"
+                health_status = HealthStatus.DEGRADED.value
+
+            try:
+                # Note: in real deployments this is decrypted; we round-
+                # trip through json so the probe gets a dict either way.
+                credentials = json.loads(integration.auth_credentials_encrypted or "{}")
+            except (json.JSONDecodeError, TypeError):
+                credentials = {}
+
+            if health_status != HealthStatus.DEGRADED.value:
+                try:
+                    health_status, error_message = await self._probe_connector(
+                        connector_type, config, credentials
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    # Surface the failure verbatim — callers need the truth.
                     health_status = HealthStatus.UNHEALTHY.value
-                    error_message = "Integration not found in database"
-                elif integration.status == IntegrationStatus.ERROR.value:
-                    health_status = HealthStatus.UNHEALTHY.value
-                    error_message = "Integration is in error state"
-                elif not integration.config_encrypted:
-                    health_status = HealthStatus.DEGRADED.value
-                    error_message = "Integration has no configuration"
-                else:
-                    # Verify the config is valid JSON
-                    try:
-                        json.loads(integration.config_encrypted)
-                        health_status = HealthStatus.HEALTHY.value
-                    except (json.JSONDecodeError, TypeError):
-                        health_status = HealthStatus.DEGRADED.value
-                        error_message = "Integration configuration is invalid"
+                    error_message = f"Probe raised: {exc}"
 
-                # Update health status in DB
-                if integration:
-                    integration.health_status = health_status
-                    integration.last_health_check = datetime.now(timezone.utc).isoformat()
-                    await db.commit()
+            integration.health_status = health_status
+            integration.last_health_check = datetime.now(timezone.utc).isoformat()
+            if health_status == HealthStatus.UNHEALTHY.value and error_message:
+                integration.error_message = error_message
+            await db.commit()
 
-        except Exception as e:
-            health_status = HealthStatus.UNHEALTHY.value
-            error_message = f"Health check failed: {str(e)}"
-
-        logger.info(f"Health check for {installation_id}: {health_status}")
+        logger.info(
+            f"Health check for {installation_id} ({connector_type or 'unknown'}): "
+            f"{health_status} {('- ' + error_message) if error_message else ''}"
+        )
 
         return {
             "installation_id": installation_id,
+            "connector_type": connector_type or None,
             "status": health_status,
             "error_message": error_message,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
+
+    async def _probe_connector(
+        self,
+        connector_type: str,
+        config: dict[str, Any],
+        credentials: dict[str, Any],
+    ) -> tuple[str, Optional[str]]:
+        """Issue a real network probe against the third-party API.
+
+        Returns ``(health_status, error_message)``. ``error_message`` is
+        None on success. Unknown connector types deliberately return
+        ``unknown`` rather than ``healthy`` — silently passing on
+        connectors we don't know how to verify is exactly the kind of
+        green-checkmark theater this code is replacing.
+        """
+        import httpx
+
+        base_url = (config.get("base_url") or config.get("url") or "").rstrip("/")
+        timeout = httpx.Timeout(5.0, connect=5.0)
+
+        # Bearer/API-key/HTTP-basic helpers
+        api_key = credentials.get("api_key") or credentials.get("token")
+        bearer = credentials.get("bearer_token") or credentials.get("access_token")
+        username = credentials.get("username")
+        password = credentials.get("password")
+
+        def _bearer_headers() -> dict[str, str]:
+            return {"Authorization": f"Bearer {bearer or api_key}"} if (bearer or api_key) else {}
+
+        async with httpx.AsyncClient(timeout=timeout, verify=config.get("verify_tls", True)) as client:
+            try:
+                if connector_type == "splunk":
+                    if not base_url:
+                        return HealthStatus.UNHEALTHY.value, "Splunk base_url not configured"
+                    auth = None
+                    headers = _bearer_headers()
+                    if not headers and username and password:
+                        auth = (username, password)
+                    resp = await client.get(
+                        f"{base_url}/services/server/info?output_mode=json",
+                        headers=headers, auth=auth,
+                    )
+                    return _classify_response(resp)
+
+                if connector_type in ("elastic", "opensearch"):
+                    if not base_url:
+                        return HealthStatus.UNHEALTHY.value, f"{connector_type} base_url not configured"
+                    auth = (username, password) if username and password else None
+                    headers = _bearer_headers() if not auth else {}
+                    resp = await client.get(f"{base_url}/", headers=headers, auth=auth)
+                    return _classify_response(resp)
+
+                if connector_type == "qradar":
+                    if not base_url:
+                        return HealthStatus.UNHEALTHY.value, "QRadar base_url not configured"
+                    headers = {"SEC": api_key} if api_key else {}
+                    resp = await client.get(f"{base_url}/api/system/about", headers=headers)
+                    return _classify_response(resp)
+
+                if connector_type == "slack":
+                    if not (bearer or api_key):
+                        return HealthStatus.UNHEALTHY.value, "Slack token not configured"
+                    resp = await client.post(
+                        "https://slack.com/api/auth.test",
+                        headers={"Authorization": f"Bearer {bearer or api_key}"},
+                    )
+                    if resp.status_code != 200:
+                        return HealthStatus.UNHEALTHY.value, f"Slack HTTP {resp.status_code}"
+                    body = resp.json() if resp.content else {}
+                    if body.get("ok") is True:
+                        return HealthStatus.HEALTHY.value, None
+                    return HealthStatus.UNHEALTHY.value, f"Slack auth.test: {body.get('error', 'unknown')}"
+
+                if connector_type == "virustotal":
+                    if not api_key:
+                        return HealthStatus.UNHEALTHY.value, "VirusTotal x-apikey not configured"
+                    resp = await client.get(
+                        "https://www.virustotal.com/api/v3/users/current",
+                        headers={"x-apikey": api_key},
+                    )
+                    return _classify_response(resp)
+
+                if connector_type == "misp":
+                    if not base_url or not api_key:
+                        return HealthStatus.UNHEALTHY.value, "MISP base_url or api_key missing"
+                    resp = await client.get(
+                        f"{base_url}/users/view/me",
+                        headers={"Authorization": api_key, "Accept": "application/json"},
+                    )
+                    return _classify_response(resp)
+
+                if connector_type == "cortex":
+                    if not base_url or not (bearer or api_key):
+                        return HealthStatus.UNHEALTHY.value, "Cortex base_url or token missing"
+                    resp = await client.get(
+                        f"{base_url}/api/analyzer",
+                        headers={"Authorization": f"Bearer {bearer or api_key}"},
+                    )
+                    return _classify_response(resp)
+
+                if connector_type in ("webhook", "generic_webhook", "http_webhook"):
+                    url = config.get("webhook_url") or base_url
+                    if not url:
+                        return HealthStatus.UNHEALTHY.value, "Webhook URL not configured"
+                    resp = await client.head(url)
+                    # Webhooks frequently return 405 to HEAD — that's
+                    # still a sign the endpoint is reachable.
+                    if resp.status_code in (200, 201, 202, 204, 405):
+                        return HealthStatus.HEALTHY.value, None
+                    return HealthStatus.UNHEALTHY.value, f"Webhook HEAD HTTP {resp.status_code}"
+
+            except httpx.TimeoutException:
+                return HealthStatus.UNHEALTHY.value, "Probe timed out after 5s"
+            except httpx.HTTPError as exc:
+                return HealthStatus.UNHEALTHY.value, f"Probe HTTP error: {exc}"
+
+        # Connector type not in the verifiable set — don't lie about it.
+        return (
+            HealthStatus.UNKNOWN.value,
+            f"No active health probe implemented for connector type '{connector_type or 'unspecified'}'",
+        )
 
     async def enable_integration(
         self,

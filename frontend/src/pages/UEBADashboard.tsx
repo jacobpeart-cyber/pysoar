@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, FormEvent } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../lib/api';
 import {
@@ -9,6 +9,9 @@ import {
   Search,
   Clock,
   BarChart3,
+  X,
+  Loader2,
+  ArrowUpRight,
 } from 'lucide-react';
 import { XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, BarChart, Bar } from 'recharts';
 import clsx from 'clsx';
@@ -104,6 +107,7 @@ export default function UEBADashboard() {
   const [riskLevelFilter, setRiskLevelFilter] = useState('all');
   const [selectedEntity, setSelectedEntity] = useState<Entity | null>(null);
   const [expandedEntity, setExpandedEntity] = useState<string | null>(null);
+  const [escalateAlert, setEscalateAlert] = useState<RiskAlert | null>(null);
 
   // Fetch UEBA dashboard
   const { data: dashboard } = useQuery({
@@ -457,17 +461,7 @@ export default function UEBADashboard() {
                       Investigate
                     </button>
                     <button
-                      onClick={async () => {
-                        const incidentId = prompt('Enter incident ID to escalate to:');
-                        if (incidentId) {
-                          try {
-                            await api.post(`/ueba/alerts/${alert.id}/escalate?incident_id=${encodeURIComponent(incidentId)}`);
-                            queryClient.invalidateQueries({ queryKey: ['ueba-alerts'] });
-                          } catch (err) {
-                            console.error('Failed to escalate alert:', err);
-                          }
-                        }
-                      }}
+                      onClick={() => setEscalateAlert(alert)}
                       className="text-xs px-2 py-1 rounded bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400 hover:bg-red-100 dark:hover:bg-red-900/40 transition-colors"
                     >
                       Escalate
@@ -593,6 +587,257 @@ export default function UEBADashboard() {
           )}
         </div>
       )}
+
+      {/* Escalate-to-Incident modal */}
+      {escalateAlert && (
+        <EscalateAlertModal
+          alert={escalateAlert}
+          onClose={() => setEscalateAlert(null)}
+          onEscalated={() => {
+            setEscalateAlert(null);
+            queryClient.invalidateQueries({ queryKey: ['ueba-alerts'] });
+            queryClient.invalidateQueries({ queryKey: ['incidents'] });
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+interface IncidentSummary {
+  id: string;
+  title: string;
+  severity: string;
+  status: string;
+  created_at: string;
+}
+
+function EscalateAlertModal({
+  alert,
+  onClose,
+  onEscalated,
+}: {
+  alert: RiskAlert;
+  onClose: () => void;
+  onEscalated: () => void;
+}) {
+  const [mode, setMode] = useState<'existing' | 'new'>('existing');
+  const [selectedIncidentId, setSelectedIncidentId] = useState<string>('');
+  const [newTitle, setNewTitle] = useState<string>(
+    `UEBA: ${alert.alert_type || 'risk alert'} (${alert.severity || 'medium'})`
+  );
+  const [newSeverity, setNewSeverity] = useState<string>(alert.severity || 'medium');
+  const [newDescription, setNewDescription] = useState<string>(
+    alert.description || `Escalated from UEBA alert ${alert.id}`
+  );
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  // Fetch open incidents (size=50, status=open) so the user can pick from a dropdown.
+  const { data: incidentsResp, isLoading: incidentsLoading } = useQuery({
+    queryKey: ['incidents', 'open-for-escalate'],
+    queryFn: async () => {
+      try {
+        const response = await api.get('/incidents', {
+          params: { status: 'open', size: 50, sort_by: 'created_at', sort_order: 'desc' },
+        });
+        return response.data;
+      } catch {
+        return null;
+      }
+    },
+  });
+  const incidents: IncidentSummary[] = Array.isArray(incidentsResp?.items)
+    ? incidentsResp.items
+    : Array.isArray(incidentsResp)
+      ? incidentsResp
+      : [];
+
+  const handleSubmit = async (e: FormEvent) => {
+    e.preventDefault();
+    setError(null);
+
+    let incidentId = selectedIncidentId;
+    setSubmitting(true);
+    try {
+      if (mode === 'new') {
+        if (!newTitle.trim()) {
+          setError('Title is required');
+          setSubmitting(false);
+          return;
+        }
+        const created = await api.post('/incidents', {
+          title: newTitle.trim(),
+          description: newDescription.trim() || undefined,
+          severity: newSeverity,
+          incident_type: 'insider_threat',
+          priority: newSeverity === 'critical' ? 1 : newSeverity === 'high' ? 2 : 3,
+        });
+        incidentId = created.data?.id;
+        if (!incidentId) throw new Error('Incident creation returned no id');
+      } else if (!incidentId) {
+        setError('Please select an incident or switch to "Create new"');
+        setSubmitting(false);
+        return;
+      }
+
+      await api.post(
+        `/ueba/alerts/${alert.id}/escalate?incident_id=${encodeURIComponent(incidentId)}`
+      );
+      onEscalated();
+    } catch (err: any) {
+      setError(err?.response?.data?.detail || err?.message || 'Failed to escalate alert');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4" role="dialog" aria-modal="true">
+      <div
+        className="absolute inset-0 bg-black/50 backdrop-blur-sm"
+        onClick={() => !submitting && onClose()}
+      />
+      <div className="relative w-full max-w-lg bg-white dark:bg-gray-800 rounded-xl shadow-2xl border border-gray-200 dark:border-gray-700">
+        <div className="flex items-center justify-between px-6 py-4 border-b border-gray-200 dark:border-gray-700">
+          <div className="flex items-center gap-2">
+            <ArrowUpRight className="w-5 h-5 text-red-500" />
+            <h2 className="text-lg font-semibold text-gray-900 dark:text-white">Escalate to Incident</h2>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            disabled={submitting}
+            className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-200 disabled:opacity-50"
+          >
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        <form onSubmit={handleSubmit} className="p-6 space-y-4">
+          <div className="text-sm text-gray-600 dark:text-gray-400 bg-gray-50 dark:bg-gray-700/50 rounded p-3">
+            <div className="font-medium text-gray-900 dark:text-white">
+              {alert.alert_type || 'Risk alert'} ({alert.severity || 'medium'})
+            </div>
+            <div className="text-xs mt-1 truncate">{alert.description || alert.id}</div>
+          </div>
+
+          <div className="flex items-center gap-2 text-sm">
+            <button
+              type="button"
+              onClick={() => setMode('existing')}
+              className={clsx(
+                'px-3 py-1.5 rounded-lg border transition-colors',
+                mode === 'existing'
+                  ? 'bg-purple-600 text-white border-purple-600'
+                  : 'border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700'
+              )}
+            >
+              Use existing incident
+            </button>
+            <button
+              type="button"
+              onClick={() => setMode('new')}
+              className={clsx(
+                'px-3 py-1.5 rounded-lg border transition-colors',
+                mode === 'new'
+                  ? 'bg-purple-600 text-white border-purple-600'
+                  : 'border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700'
+              )}
+            >
+              Create new incident
+            </button>
+          </div>
+
+          {mode === 'existing' ? (
+            <div>
+              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                Open incidents <span className="text-red-500">*</span>
+              </label>
+              <select
+                value={selectedIncidentId}
+                onChange={(e) => setSelectedIncidentId(e.target.value)}
+                disabled={incidentsLoading}
+                className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+              >
+                <option value="">{incidentsLoading ? 'Loading…' : 'Select an incident…'}</option>
+                {incidents.map((inc) => (
+                  <option key={inc.id} value={inc.id}>
+                    [{inc.severity || '?'}] {inc.title || inc.id} — {inc.id.slice(0, 8)}
+                  </option>
+                ))}
+              </select>
+              {!incidentsLoading && incidents.length === 0 && (
+                <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                  No open incidents found. Switch to "Create new incident".
+                </p>
+              )}
+            </div>
+          ) : (
+            <div className="space-y-3">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+                  Title <span className="text-red-500">*</span>
+                </label>
+                <input
+                  type="text"
+                  required
+                  value={newTitle}
+                  onChange={(e) => setNewTitle(e.target.value)}
+                  className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Severity</label>
+                <select
+                  value={newSeverity}
+                  onChange={(e) => setNewSeverity(e.target.value)}
+                  className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+                >
+                  <option value="critical">Critical</option>
+                  <option value="high">High</option>
+                  <option value="medium">Medium</option>
+                  <option value="low">Low</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Description</label>
+                <textarea
+                  rows={3}
+                  value={newDescription}
+                  onChange={(e) => setNewDescription(e.target.value)}
+                  className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+                />
+              </div>
+            </div>
+          )}
+
+          {error && (
+            <div className="px-3 py-2 rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 text-sm text-red-700 dark:text-red-300">
+              {error}
+            </div>
+          )}
+
+          <div className="flex justify-end gap-2 pt-2 border-t border-gray-200 dark:border-gray-700">
+            <button
+              type="button"
+              onClick={onClose}
+              disabled={submitting}
+              className="px-4 py-2 text-sm font-medium text-gray-700 dark:text-gray-200 bg-white dark:bg-gray-700 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-600 disabled:opacity-50"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              disabled={submitting}
+              className="px-4 py-2 text-sm font-medium text-white bg-red-600 hover:bg-red-700 rounded-lg disabled:opacity-50 inline-flex items-center gap-2"
+            >
+              {submitting && <Loader2 className="w-4 h-4 animate-spin" />}
+              Escalate
+            </button>
+          </div>
+        </form>
+      </div>
     </div>
   );
 }

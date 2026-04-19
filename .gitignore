@@ -111,3 +111,4 @@ site/
 
 # Jupyter Notebooks
 .ipynb_checkpoints/
+.playwright-mcp/
