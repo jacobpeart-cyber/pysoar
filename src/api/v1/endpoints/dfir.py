@@ -1,11 +1,15 @@
 """DFIR API endpoints for forensic case management, evidence handling, and timeline reconstruction"""
 
+import hashlib
 import json
 import math
+import os
+import re
+import uuid as uuid_mod
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -438,6 +442,177 @@ async def collect_evidence(
     db.add(evidence)
     await db.flush()
     await db.refresh(evidence)
+
+    return ForensicEvidenceResponse.model_validate(evidence)
+
+
+DFIR_UPLOAD_ROOT = os.environ.get("DFIR_UPLOAD_ROOT", "/app/uploads/dfir")
+
+# Filenames with any of these fragments or separators are rejected
+_FILENAME_SANITIZE_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _sanitize_filename(filename: str) -> str:
+    """Return a safe basename for on-disk storage.
+
+    - Strips any directory component (defends against path traversal).
+    - Collapses unsafe characters to underscores.
+    - Caps length at 200 chars so the final path stays within OS limits.
+    """
+    base = os.path.basename(filename or "").strip() or "evidence.bin"
+    base = _FILENAME_SANITIZE_RE.sub("_", base).strip("._") or "evidence.bin"
+    return base[:200]
+
+
+@router.post(
+    "/cases/{case_id}/evidence/upload",
+    response_model=ForensicEvidenceResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def upload_evidence_file(
+    case_id: str,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+    file: UploadFile = File(...),
+    title: Optional[str] = Form(None),
+    evidence_type: str = Form("file"),
+    description: Optional[str] = Form(None),
+    source_device: Optional[str] = Form(None),
+    source_ip: Optional[str] = Form(None),
+    acquisition_method: str = Form("manual_upload"),
+    collector: Optional[str] = Form(None),
+    handling_notes: Optional[str] = Form(None),
+):
+    """Stream-upload forensic evidence file, hash it, and register a ForensicEvidence row.
+
+    - Streams the multipart body into ``/app/uploads/dfir/<org>/<case>/<uuid>_<name>``.
+    - Computes SHA-256 and SHA-512 over the bytes while writing (no double pass).
+    - Captures the collector + timestamp as the first chain-of-custody entry.
+    - Transactional: if the DB insert fails the on-disk file is deleted so we
+      never leave an orphan.
+    """
+    case = await get_case_or_404(db, case_id)
+    org_id = getattr(current_user, "organization_id", None) or case.organization_id or "default"
+
+    # Determine final storage path
+    target_dir = os.path.join(DFIR_UPLOAD_ROOT, str(org_id), str(case_id))
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+    except OSError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Unable to create evidence storage directory: {exc}",
+        )
+
+    sanitized = _sanitize_filename(file.filename or "evidence.bin")
+    unique_prefix = uuid_mod.uuid4().hex
+    final_path = os.path.join(target_dir, f"{unique_prefix}_{sanitized}")
+
+    # Stream the file to disk while hashing
+    sha256 = hashlib.sha256()
+    sha512 = hashlib.sha512()
+    total_bytes = 0
+    CHUNK = 1024 * 1024  # 1 MiB
+
+    try:
+        with open(final_path, "wb") as out_fh:
+            while True:
+                chunk = await file.read(CHUNK)
+                if not chunk:
+                    break
+                sha256.update(chunk)
+                sha512.update(chunk)
+                out_fh.write(chunk)
+                total_bytes += len(chunk)
+    except Exception as exc:
+        # Any IO failure during streaming — remove whatever we wrote
+        try:
+            if os.path.exists(final_path):
+                os.remove(final_path)
+        except OSError:
+            pass
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to write evidence file: {exc}",
+        )
+    finally:
+        await file.close()
+
+    if total_bytes == 0:
+        # Refuse to register an empty upload
+        try:
+            os.remove(final_path)
+        except OSError:
+            pass
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Uploaded file is empty",
+        )
+
+    sha256_hex = sha256.hexdigest()
+    sha512_hex = sha512.hexdigest()
+
+    # Build chain-of-custody entry
+    actor = (
+        collector
+        or getattr(current_user, "full_name", None)
+        or getattr(current_user, "email", None)
+        or "unknown"
+    )
+    now_iso = datetime.now(timezone.utc).isoformat()
+    handling_suffix = []
+    if title:
+        handling_suffix.append(f"title={title}")
+    if description:
+        handling_suffix.append(f"description={description}")
+    merged_notes = handling_notes or ""
+    if handling_suffix:
+        merged_notes = (merged_notes + "\n" if merged_notes else "") + " | ".join(handling_suffix)
+
+    evidence = ForensicEvidence(
+        case_id=case_id,
+        evidence_type=evidence_type,
+        source_device=source_device or sanitized,
+        source_ip=source_ip,
+        acquisition_method=acquisition_method,
+        original_hash_sha256=sha256_hex,
+        original_hash_md5=None,
+        storage_location=final_path,
+        file_size_bytes=total_bytes,
+        handling_notes=merged_notes or None,
+        organization_id=org_id,
+        chain_of_custody_log={
+            "entries": [
+                {
+                    "timestamp": now_iso,
+                    "actor": actor,
+                    "action": "collected",
+                    "hash": sha256_hex,
+                    "hash_sha512": sha512_hex,
+                    "size_bytes": total_bytes,
+                    "original_filename": file.filename or sanitized,
+                    "details": description,
+                }
+            ],
+            "sha512": sha512_hex,
+        },
+    )
+
+    # Transactional insert — if DB fails, delete the file
+    try:
+        db.add(evidence)
+        await db.flush()
+        await db.refresh(evidence)
+    except Exception as exc:
+        try:
+            if os.path.exists(final_path):
+                os.remove(final_path)
+        except OSError:
+            pass
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to register evidence record: {exc}",
+        )
 
     return ForensicEvidenceResponse.model_validate(evidence)
 

@@ -130,6 +130,8 @@ const statusColors: Record<string, string> = {
   completed: 'bg-green-100 text-green-700',
   running: 'bg-blue-100 text-blue-700',
   awaiting_approval: 'bg-yellow-100 text-yellow-700',
+  awaiting_manual: 'bg-amber-100 text-amber-700',
+  awaiting_integration: 'bg-amber-100 text-amber-700',
   failed: 'bg-red-100 text-red-700',
   rolled_back: 'bg-purple-100 text-purple-700',
 };
@@ -162,6 +164,8 @@ export default function Remediation() {
   const [showCreatePolicyModal, setShowCreatePolicyModal] = useState(false);
   const [showAddIntegrationModal, setShowAddIntegrationModal] = useState(false);
   const [rejectTarget, setRejectTarget] = useState<{ id: string; policy?: string } | null>(null);
+  const [markCompleteTarget, setMarkCompleteTarget] = useState<{ id: string; target?: string } | null>(null);
+  const [markFailedTarget, setMarkFailedTarget] = useState<{ id: string; target?: string } | null>(null);
   const [integrationTestResults, setIntegrationTestResults] = useState<Record<string, { ok: boolean; message: string }>>({});
   const [executionStatusFilter, setExecutionStatusFilter] = useState('');
   const [executionTriggerFilter, setExecutionTriggerFilter] = useState('');
@@ -250,6 +254,22 @@ export default function Remediation() {
       } catch { return null; }
     },
     enabled: activeTab === 'integrations',
+  });
+
+  // Fetch available connectors from marketplace (for Add Integration modal)
+  const { data: connectorsData } = useQuery({
+    queryKey: ['integrations-connectors'],
+    queryFn: async () => {
+      try {
+        const response = await api.get('/integrations/connectors', {
+          params: { size: 100 },
+        });
+        return response.data;
+      } catch {
+        return null;
+      }
+    },
+    enabled: showAddIntegrationModal,
   });
 
   // Mutations
@@ -912,13 +932,39 @@ export default function Remediation() {
                       <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
                         {execution.created_by || 'System'}
                       </td>
-                      <td className="px-6 py-4 text-right">
-                        <ChevronRight
-                          className={clsx(
-                            'w-5 h-5 text-gray-400 transition',
-                            expandedExecution === execution.id && 'rotate-90'
+                      <td className="px-6 py-4 whitespace-nowrap text-right">
+                        <div className="flex items-center justify-end gap-2">
+                          {(execution.status === 'awaiting_manual' || execution.status === 'awaiting_integration') && (
+                            <>
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setMarkCompleteTarget({ id: execution.id, target: execution.target_entity });
+                                }}
+                                className="px-2 py-1 text-xs font-medium rounded bg-green-600 hover:bg-green-700 text-white transition"
+                                title="Confirm this remediation was completed out of band"
+                              >
+                                Mark Complete
+                              </button>
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setMarkFailedTarget({ id: execution.id, target: execution.target_entity });
+                                }}
+                                className="px-2 py-1 text-xs font-medium rounded bg-red-600 hover:bg-red-700 text-white transition"
+                                title="Confirm this remediation won't happen"
+                              >
+                                Mark Failed
+                              </button>
+                            </>
                           )}
-                        />
+                          <ChevronRight
+                            className={clsx(
+                              'w-5 h-5 text-gray-400 transition',
+                              expandedExecution === execution.id && 'rotate-90'
+                            )}
+                          />
+                        </div>
                       </td>
                     </tr>
                     {expandedExecution === execution.id && (
@@ -1470,7 +1516,8 @@ export default function Remediation() {
               const fd = new FormData(e.currentTarget);
               try {
                 await api.post('/integrations/install', {
-                  connector_name: fd.get('connector'),
+                  connector_id: fd.get('connector_id'),
+                  display_name: fd.get('display_name'),
                   config: { api_key: fd.get('api_key'), endpoint: fd.get('endpoint') },
                 });
                 setShowAddIntegrationModal(false);
@@ -1479,17 +1526,41 @@ export default function Remediation() {
             }}>
               <div>
                 <label className="block text-sm font-medium mb-1">Integration Type</label>
-                <select name="connector" required className="w-full border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100">
-                  <option value="crowdstrike">CrowdStrike</option>
-                  <option value="sentinelone">SentinelOne</option>
-                  <option value="palo_alto">Palo Alto</option>
-                  <option value="fortinet">Fortinet</option>
-                  <option value="aws_security_hub">AWS Security Hub</option>
-                  <option value="azure_sentinel">Azure Sentinel</option>
-                  <option value="slack">Slack</option>
-                  <option value="jira">Jira</option>
-                  <option value="servicenow">ServiceNow</option>
-                </select>
+                {(() => {
+                  const connectors: Array<{ id: string; name?: string; display_name?: string; vendor?: string | null; category?: string }> =
+                    Array.isArray(connectorsData)
+                      ? connectorsData
+                      : (connectorsData?.items || connectorsData?.connectors || []);
+                  return (
+                    <select
+                      name="connector_id"
+                      required
+                      defaultValue=""
+                      className="w-full border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+                    >
+                      <option value="" disabled>
+                        {connectors.length === 0 ? 'No connectors available' : 'Select a connector'}
+                      </option>
+                      {connectors.map((c) => (
+                        <option key={c.id} value={c.id}>
+                          {c.display_name || c.name || c.id}
+                          {c.vendor ? ` (${c.vendor})` : ''}
+                        </option>
+                      ))}
+                    </select>
+                  );
+                })()}
+              </div>
+              <div>
+                <label className="block text-sm font-medium mb-1">Display Name</label>
+                <input
+                  name="display_name"
+                  required
+                  minLength={1}
+                  maxLength={255}
+                  className="w-full border border-gray-300 dark:border-gray-600 rounded-lg px-3 py-2 bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+                  placeholder="e.g., Production Splunk"
+                />
               </div>
               <div>
                 <label className="block text-sm font-medium mb-1">API Endpoint</label>
@@ -1537,6 +1608,71 @@ export default function Remediation() {
           queryClient.invalidateQueries({ queryKey: ['remediation-pending-approvals'] });
           queryClient.invalidateQueries({ queryKey: ['remediation-executions'] });
           setRejectTarget(null);
+        }}
+      />
+
+      <FormModal
+        open={!!markCompleteTarget}
+        onClose={() => setMarkCompleteTarget(null)}
+        title="Mark Execution Complete"
+        description={
+          markCompleteTarget?.target
+            ? `Confirm that remediation on ${markCompleteTarget.target} was completed out of band.`
+            : 'Confirm this awaiting_manual / awaiting_integration execution was completed out of band.'
+        }
+        submitLabel="Mark Complete"
+        fields={[
+          {
+            name: 'notes',
+            label: 'Notes (optional)',
+            type: 'textarea',
+            required: false,
+            placeholder: 'e.g. "Blocked on Palo Alto manually — ticket FW-1423"',
+            help: 'Notes are recorded on the execution and in the audit log.',
+          },
+        ]}
+        onSubmit={async (values) => {
+          if (!markCompleteTarget) return;
+          await api.post(
+            `/remediation/executions/${markCompleteTarget.id}/mark-complete`,
+            { notes: values.notes || null }
+          );
+          queryClient.invalidateQueries({ queryKey: ['remediation-executions'] });
+          queryClient.invalidateQueries({ queryKey: ['remediation-dashboard'] });
+          setMarkCompleteTarget(null);
+        }}
+      />
+
+      <FormModal
+        open={!!markFailedTarget}
+        onClose={() => setMarkFailedTarget(null)}
+        title="Mark Execution Failed"
+        description={
+          markFailedTarget?.target
+            ? `Confirm that remediation on ${markFailedTarget.target} will not be completed.`
+            : 'Confirm this awaiting_manual / awaiting_integration execution will not be completed.'
+        }
+        submitLabel="Mark Failed"
+        fields={[
+          {
+            name: 'reason',
+            label: 'Failure Reason',
+            type: 'textarea',
+            required: true,
+            placeholder: 'Explain why this remediation cannot or will not happen',
+            help: 'Required. Written to the execution\'s failure_reason and to the audit log.',
+          },
+        ]}
+        onSubmit={async (values) => {
+          if (!markFailedTarget) return;
+          if (!values.reason || !String(values.reason).trim()) return;
+          await api.post(
+            `/remediation/executions/${markFailedTarget.id}/mark-failed`,
+            { reason: values.reason }
+          );
+          queryClient.invalidateQueries({ queryKey: ['remediation-executions'] });
+          queryClient.invalidateQueries({ queryKey: ['remediation-dashboard'] });
+          setMarkFailedTarget(null);
         }}
       />
     </div>

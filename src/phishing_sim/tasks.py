@@ -111,6 +111,124 @@ def launch_scheduled_campaign(self, campaign_id: str, organization_id: str):
         raise self.retry(exc=e, countdown=60 * (2 ** self.request.retries))
 
 
+@shared_task(bind=True, max_retries=3, name="phishing_sim.tasks.send_phishing_email")
+def send_phishing_email(self, target_id: str, organization_id: str):
+    """Render the campaign template and send one phishing email.
+
+    Loads the PhishingTarget + PhishingCampaign + PhishingTemplate,
+    renders {{name}} / {{email}} / {{tracking_id}} placeholders, and
+    sends via EmailService. Writes the outcome back onto the target
+    row (status='sent' or 'failed' + error_message) and emits a
+    CampaignEvent. No fake successes: if SMTP isn't configured,
+    raises so Celery retries — but the caller normally gates on
+    is_configured before queueing.
+    """
+    import asyncio
+    from src.core.database import async_session_factory
+    from src.phishing_sim.models import (
+        PhishingCampaign,
+        PhishingTarget,
+        PhishingTemplate,
+        CampaignEvent,
+    )
+    from src.services.email_service import EmailService
+
+    async def _run():
+        async with async_session_factory() as session:
+            target = (await session.execute(
+                select(PhishingTarget).where(PhishingTarget.id == target_id)
+            )).scalar_one_or_none()
+            if not target:
+                return {"status": "error", "detail": f"Target {target_id} not found"}
+
+            campaign = (await session.execute(
+                select(PhishingCampaign).where(PhishingCampaign.id == target.campaign_id)
+            )).scalar_one_or_none()
+            if not campaign:
+                target.status = "failed"
+                target.error_message = "campaign not found"
+                await session.commit()
+                return {"status": "error", "detail": "Campaign not found"}
+
+            # Don't send if campaign was paused/ended before this task ran
+            if campaign.status not in ("active", "scheduled"):
+                target.status = "failed"
+                target.error_message = f"campaign status={campaign.status}"
+                await session.commit()
+                return {"status": "skipped", "detail": f"campaign {campaign.status}"}
+
+            template_html = None
+            template_text = "You have a new notification. Click here to review."
+            template_subject = "Action Required"
+            if campaign.template_id:
+                tmpl = (await session.execute(
+                    select(PhishingTemplate).where(PhishingTemplate.id == campaign.template_id)
+                )).scalar_one_or_none()
+                if tmpl:
+                    template_html = tmpl.html_body
+                    template_text = tmpl.text_body or tmpl.html_body or template_text
+                    template_subject = tmpl.subject_line or template_subject
+
+            def _render(body: str | None) -> str | None:
+                if body is None:
+                    return None
+                return (
+                    body.replace("{{name}}", target.recipient_name or "")
+                        .replace("{{email}}", target.recipient_email)
+                        .replace("{{tracking_id}}", target.tracking_id)
+                )
+
+            email = EmailService()
+            if not email.is_configured:
+                target.status = "awaiting_smtp_config"
+                target.error_message = "SMTP not configured at send time"
+                await session.commit()
+                return {"status": "awaiting_smtp", "detail": "SMTP not configured"}
+
+            try:
+                sent = await email.send_email(
+                    to=[target.recipient_email],
+                    subject=_render(template_subject) or template_subject,
+                    body=_render(template_text) or "",
+                    html_body=_render(template_html),
+                )
+            except Exception as exc:  # noqa: BLE001
+                target.status = "failed"
+                target.error_message = f"smtp error: {exc}"[:500]
+                await session.commit()
+                raise self.retry(exc=exc, countdown=60 * (2 ** self.request.retries))
+
+            if sent:
+                target.status = "sent"
+                target.sent_at = datetime.now(timezone.utc)
+                target.error_message = None
+                campaign.emails_sent = (campaign.emails_sent or 0) + 1
+                session.add(CampaignEvent(
+                    campaign_id=campaign.id,
+                    target_email=target.recipient_email,
+                    target_name=target.recipient_name,
+                    event_type="email_sent",
+                    organization_id=organization_id,
+                ))
+                await session.commit()
+                return {"status": "sent", "target_id": target_id}
+            else:
+                target.status = "failed"
+                target.error_message = "EmailService.send_email returned False"
+                await session.commit()
+                return {"status": "failed", "target_id": target_id}
+
+    try:
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(_run())
+        finally:
+            loop.close()
+    except Exception as e:
+        logger.error(f"send_phishing_email failed for target {target_id}: {e}")
+        raise self.retry(exc=e, countdown=60 * (2 ** self.request.retries))
+
+
 @shared_task(bind=True, max_retries=3)
 def send_campaign_batch(
     self,

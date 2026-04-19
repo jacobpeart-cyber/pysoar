@@ -13,6 +13,7 @@ from src.models.audit import AuditLog
 from src.models.case import CaseNote, CaseAttachment, CaseTimeline, Task
 from src.models.organization import Organization, OrganizationMember, Team, TeamMember
 from src.models.api_key import APIKey
+from src.models.settings import AppSetting
 
 __all__ = [
     "Base",
@@ -32,4 +33,5 @@ __all__ = [
     "Team",
     "TeamMember",
     "APIKey",
+    "AppSetting",
 ]

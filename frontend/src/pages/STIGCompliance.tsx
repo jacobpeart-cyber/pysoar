@@ -88,11 +88,19 @@ interface Remediation {
   dueDate: string;
 }
 
+interface ComplianceAgent {
+  id: string;
+  hostname: string;
+  capabilities?: string[];
+  status?: string;
+}
+
 export default function STIGCompliance() {
   const [activeTab, setActiveTab] = useState<TabType>('dashboard');
   const [expandedScan, setExpandedScan] = useState<string | null>(null);
   const [platformFilter, setPlatformFilter] = useState<string>('all');
   const [severityFilter, setSeverityFilter] = useState<string>('all');
+  const [launchScanFor, setLaunchScanFor] = useState<string | null>(null);
   const queryClient = useQueryClient();
 
   const { data: dashboardData, isLoading: dashboardLoading } = useQuery<DashboardData>({
@@ -154,9 +162,9 @@ export default function STIGCompliance() {
   });
 
   const runScanMutation = useMutation({
-    mutationFn: async (benchmarkId: string) => {
+    mutationFn: async (params: { host: string; benchmark_id: string }) => {
       try {
-      const response = await api.post('/stig/scans/launch', { benchmark_id: benchmarkId });
+      const response = await api.post('/stig/scans/launch', params);
       return response.data;
       } catch { return null; }
     },
@@ -167,9 +175,9 @@ export default function STIGCompliance() {
   });
 
   const autoRemediateMutation = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (params: { scan_result_id: string; categories: string[] }) => {
       try {
-      const response = await api.post('/stig/remediate/auto', { categories: ['CAT I'] });
+      const response = await api.post('/stig/remediate/auto', params);
       return response.data;
       } catch { return null; }
     },
@@ -245,7 +253,20 @@ export default function STIGCompliance() {
           loading={benchmarksLoading}
           platformFilter={platformFilter}
           setPlatformFilter={setPlatformFilter}
-          onRunScan={(id) => runScanMutation.mutate(id)}
+          onRunScan={(id) => setLaunchScanFor(id)}
+        />
+      )}
+
+      {/* Launch Scan Modal */}
+      {launchScanFor && (
+        <LaunchScanModal
+          benchmarkId={launchScanFor}
+          onClose={() => setLaunchScanFor(null)}
+          onSubmit={(host) => {
+            runScanMutation.mutate({ host, benchmark_id: launchScanFor });
+            setLaunchScanFor(null);
+          }}
+          submitting={runScanMutation.isPending}
         />
       )}
 
@@ -268,8 +289,10 @@ export default function STIGCompliance() {
           loading={remediationsLoading}
           severityFilter={severityFilter}
           setSeverityFilter={setSeverityFilter}
-          onAutoRemediate={() => autoRemediateMutation.mutate()}
-          catIFindings={dashboardData?.critical_findings || 0}
+          onAutoRemediate={(scanId, categories) =>
+            autoRemediateMutation.mutate({ scan_result_id: scanId, categories })
+          }
+          autoRemediatePending={autoRemediateMutation.isPending}
         />
       )}
     </div>
@@ -739,14 +762,14 @@ function RemediationTab({
   severityFilter,
   setSeverityFilter,
   onAutoRemediate,
-  catIFindings,
+  autoRemediatePending,
 }: {
   remediations: Remediation[];
   loading: boolean;
   severityFilter: string;
   setSeverityFilter: (value: string) => void;
-  onAutoRemediate: () => void;
-  catIFindings: number;
+  onAutoRemediate: (scanId: string, categories: string[]) => void;
+  autoRemediatePending: boolean;
 }) {
   const [selectedRemediation, setSelectedRemediation] = useState<Remediation | null>(null);
 
@@ -778,7 +801,7 @@ function RemediationTab({
         </div>
       )}
 
-      {/* Filter and Action Buttons */}
+      {/* Filter */}
       <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
         <div className="flex items-center justify-between gap-4">
           <div className="flex items-center gap-2">
@@ -794,16 +817,9 @@ function RemediationTab({
               <option value="CAT III">CAT III</option>
             </select>
           </div>
-
-          {catIFindings > 0 && (
-            <button
-              onClick={onAutoRemediate}
-              className="inline-flex items-center gap-2 px-6 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 font-medium text-sm"
-            >
-              <Zap className="w-4 h-4" />
-              Auto-Remediate CAT I
-            </button>
-          )}
+          <div className="text-xs text-gray-500 dark:text-gray-400">
+            Use <span className="font-medium">Auto-Remediate</span> per scan result to queue automatic fixes.
+          </div>
         </div>
       </div>
 
@@ -875,12 +891,23 @@ function RemediationTab({
                   {new Date(remediation.dueDate || "").toLocaleDateString()}
                 </td>
                 <td className="px-6 py-4 text-center">
-                  <button
-                    onClick={() => setSelectedRemediation(remediation)}
-                    className="text-blue-600 dark:text-blue-400 hover:underline text-sm"
-                  >
-                    Details
-                  </button>
+                  <div className="flex items-center justify-center gap-3">
+                    <button
+                      onClick={() => setSelectedRemediation(remediation)}
+                      className="text-blue-600 dark:text-blue-400 hover:underline text-sm"
+                    >
+                      Details
+                    </button>
+                    <button
+                      onClick={() => onAutoRemediate(remediation.id, [remediation.severity])}
+                      disabled={autoRemediatePending}
+                      title={`Auto-remediate ${remediation.severity} findings for this scan`}
+                      className="inline-flex items-center gap-1 px-3 py-1 bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:bg-gray-400 text-xs font-medium"
+                    >
+                      <Zap className="w-3 h-3" />
+                      Auto-Remediate
+                    </button>
+                  </div>
                 </td>
               </tr>
             ))}
@@ -966,4 +993,170 @@ function getStatusColor(status: string) {
     'Not Reviewed': 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-400',
   };
   return colors[status] || 'bg-gray-100 text-gray-800';
+}
+
+function LaunchScanModal({
+  benchmarkId,
+  onClose,
+  onSubmit,
+  submitting,
+}: {
+  benchmarkId: string;
+  onClose: () => void;
+  onSubmit: (host: string) => void;
+  submitting: boolean;
+}) {
+  const [selectedHost, setSelectedHost] = useState<string>('');
+  const [manualHost, setManualHost] = useState<string>('');
+  const [useManual, setUseManual] = useState<boolean>(false);
+
+  const { data: agentsData, isLoading: agentsLoading } = useQuery<{
+    total: number;
+    agents: ComplianceAgent[];
+  }>({
+    queryKey: ['compliance-agents'],
+    queryFn: async () => {
+      try {
+        // Backend supports `capability` filter (singular).
+        const response = await api.get('/agents', {
+          params: { capability: 'compliance' },
+        });
+        const data = response.data;
+        // Defensive parse for either {agents:[]} or array
+        if (Array.isArray(data)) {
+          return { total: data.length, agents: data };
+        }
+        return {
+          total: data?.total ?? (data?.agents?.length || 0),
+          agents: data?.agents || [],
+        };
+      } catch {
+        return { total: 0, agents: [] };
+      }
+    },
+  });
+
+  const agents = agentsData?.agents || [];
+  const hasAgents = agents.length > 0;
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const host = useManual || !hasAgents ? manualHost.trim() : selectedHost.trim();
+    if (!host) return;
+    onSubmit(host);
+  };
+
+  return (
+    <div
+      className="fixed inset-0 bg-black/50 flex items-center justify-center z-50"
+      onClick={onClose}
+    >
+      <div
+        className="bg-white dark:bg-gray-800 rounded-lg shadow-xl w-full max-w-md p-6"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-xl font-semibold text-gray-900 dark:text-white">
+            Launch STIG Scan
+          </h2>
+          <button
+            onClick={onClose}
+            className="text-gray-400 hover:text-gray-600"
+            aria-label="Close"
+          >
+            ✕
+          </button>
+        </div>
+        <p className="text-sm text-gray-500 dark:text-gray-400 mb-4">
+          Benchmark: <span className="font-mono">{benchmarkId}</span>
+        </p>
+
+        <form onSubmit={handleSubmit} className="space-y-4">
+          {agentsLoading ? (
+            <div className="flex items-center gap-2 text-sm text-gray-500">
+              <Loader2 className="w-4 h-4 animate-spin" /> Loading agents...
+            </div>
+          ) : hasAgents && !useManual ? (
+            <div>
+              <label className="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
+                Target Host
+              </label>
+              <select
+                value={selectedHost}
+                onChange={(e) => setSelectedHost(e.target.value)}
+                required
+                className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white"
+              >
+                <option value="">Select a compliance-capable host</option>
+                {agents.map((a) => (
+                  <option key={a.id} value={a.hostname}>
+                    {a.hostname}
+                    {a.status ? ` (${a.status})` : ''}
+                  </option>
+                ))}
+              </select>
+              <button
+                type="button"
+                onClick={() => setUseManual(true)}
+                className="mt-2 text-xs text-blue-600 dark:text-blue-400 hover:underline"
+              >
+                Enter hostname manually
+              </button>
+            </div>
+          ) : (
+            <div>
+              {!hasAgents && (
+                <div className="mb-3 p-3 rounded-lg bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-800 text-yellow-800 dark:text-yellow-300 text-xs">
+                  No compliance-capable agent enrolled; scan will record{' '}
+                  <code className="font-mono">status='no_agent'</code>.
+                </div>
+              )}
+              <label className="block text-sm font-medium mb-1 text-gray-700 dark:text-gray-300">
+                Target Hostname
+              </label>
+              <input
+                type="text"
+                value={manualHost}
+                onChange={(e) => setManualHost(e.target.value)}
+                placeholder="host.example.com"
+                required
+                className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white font-mono text-sm"
+              />
+              {hasAgents && (
+                <button
+                  type="button"
+                  onClick={() => setUseManual(false)}
+                  className="mt-2 text-xs text-blue-600 dark:text-blue-400 hover:underline"
+                >
+                  Pick from enrolled agents instead
+                </button>
+              )}
+            </div>
+          )}
+
+          <div className="flex gap-3 pt-2">
+            <button
+              type="button"
+              onClick={onClose}
+              className="flex-1 px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700 text-gray-700 dark:text-gray-300"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              disabled={
+                submitting ||
+                (useManual || !hasAgents
+                  ? !manualHost.trim()
+                  : !selectedHost.trim())
+              }
+              className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:bg-gray-400"
+            >
+              {submitting ? 'Launching...' : 'Launch Scan'}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
 }

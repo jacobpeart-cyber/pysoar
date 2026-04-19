@@ -1,12 +1,25 @@
-"""Settings endpoints for managing application configuration"""
+"""Settings endpoints for managing application configuration.
+
+Settings are persisted in the ``app_settings`` DB table, keyed by
+``(organization_id, section)``. The GET endpoint unions the env-derived
+defaults with any per-org override rows — org values win. Each PATCH
+endpoint upserts the row via ``INSERT ... ON CONFLICT DO UPDATE`` so
+changes survive container restarts.
+"""
+
+from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel
+from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import get_current_superuser
+from src.api.deps import DatabaseSession, get_current_superuser
 from src.core.config import settings as app_settings
+from src.models.settings import AppSetting
 from src.models.user import User
 from src.schemas.settings import (
     SettingsResponse,
@@ -26,37 +39,204 @@ class SecurityConfig(BaseModel):
     password_min_length: Optional[int] = None
     require_mfa: Optional[bool] = None
 
+
 router = APIRouter(prefix="/settings", tags=["settings"])
 
 
+# ---------------------------------------------------------------------------
+# Persistence helpers
+# ---------------------------------------------------------------------------
+
+async def _load_section(
+    db: AsyncSession, organization_id: Optional[str], section: str
+) -> Dict[str, Any]:
+    """Return the stored value for (org, section), or {} if no row exists."""
+    stmt = select(AppSetting).where(AppSetting.section == section)
+    if organization_id is not None:
+        stmt = stmt.where(AppSetting.organization_id == organization_id)
+    else:
+        stmt = stmt.where(AppSetting.organization_id.is_(None))
+    row = (await db.execute(stmt)).scalar_one_or_none()
+    if row and isinstance(row.value, dict):
+        return row.value
+    return {}
+
+
+async def _upsert_section(
+    db: AsyncSession,
+    organization_id: Optional[str],
+    section: str,
+    value: Dict[str, Any],
+    updated_by: Optional[str],
+) -> Dict[str, Any]:
+    """Upsert the stored value, merging with any pre-existing keys."""
+    existing = await _load_section(db, organization_id, section)
+    merged = {**existing, **{k: v for k, v in value.items() if v is not None}}
+
+    dialect = db.bind.dialect.name if db.bind is not None else "postgresql"
+
+    if dialect == "postgresql":
+        stmt = pg_insert(AppSetting.__table__).values(
+            organization_id=organization_id,
+            section=section,
+            value=merged,
+            updated_by=updated_by,
+        )
+        stmt = stmt.on_conflict_do_update(
+            constraint="uq_app_settings_org_section",
+            set_={
+                "value": merged,
+                "updated_by": updated_by,
+                "updated_at": stmt.excluded.updated_at,
+            },
+        )
+        await db.execute(stmt)
+    else:
+        # SQLite/test fallback: manual upsert
+        stmt = select(AppSetting).where(AppSetting.section == section)
+        if organization_id is None:
+            stmt = stmt.where(AppSetting.organization_id.is_(None))
+        else:
+            stmt = stmt.where(AppSetting.organization_id == organization_id)
+        existing_row = (await db.execute(stmt)).scalar_one_or_none()
+        if existing_row is None:
+            db.add(
+                AppSetting(
+                    organization_id=organization_id,
+                    section=section,
+                    value=merged,
+                    updated_by=updated_by,
+                )
+            )
+        else:
+            existing_row.value = merged
+            existing_row.updated_by = updated_by
+
+    await db.commit()
+    return merged
+
+
+def _user_org(user: User) -> Optional[str]:
+    return getattr(user, "organization_id", None)
+
+
+# ---------------------------------------------------------------------------
+# GET /settings
+# ---------------------------------------------------------------------------
+
 @router.get("", response_model=SettingsResponse)
 async def get_settings(
+    db: DatabaseSession = None,
     current_user: User = Depends(get_current_superuser),
 ) -> SettingsResponse:
-    """Get current application settings (admin only)"""
+    """Get current application settings (admin only).
+
+    Union of env-derived defaults with any stored per-org overrides.
+    """
+    org_id = _user_org(current_user)
+
+    general_override = await _load_section(db, org_id, "general")
+    smtp_override = await _load_section(db, org_id, "smtp")
+    notif_override = await _load_section(db, org_id, "notifications")
+    security_override = await _load_section(db, org_id, "security")
+
+    def pick(ovr: Dict[str, Any], key: str, default: Any) -> Any:
+        return ovr.get(key, default) if ovr else default
+
+    integrations: dict = {
+        "virustotal": {
+            "enabled": bool(app_settings.virustotal_api_key),
+            "configured": bool(app_settings.virustotal_api_key),
+        },
+        "abuseipdb": {
+            "enabled": bool(app_settings.abuseipdb_api_key),
+            "configured": bool(app_settings.abuseipdb_api_key),
+        },
+        "shodan": {
+            "enabled": bool(app_settings.shodan_api_key),
+            "configured": bool(app_settings.shodan_api_key),
+        },
+        "greynoise": {
+            "enabled": bool(app_settings.greynoise_api_key),
+            "configured": bool(app_settings.greynoise_api_key),
+        },
+        "elasticsearch": {
+            "enabled": bool(app_settings.elasticsearch_url),
+            "configured": bool(app_settings.elasticsearch_url),
+        },
+        "splunk": {
+            "enabled": bool(app_settings.splunk_host),
+            "configured": bool(app_settings.splunk_host),
+        },
+    }
+
+    # Merge integration overrides: any section "integration:<id>"
+    for integ_id in list(integrations.keys()):
+        ovr = await _load_section(db, org_id, f"integration:{integ_id}")
+        if ovr:
+            configured = bool(
+                ovr.get("api_key") or ovr.get("url") or ovr.get("host") or ovr.get("token")
+            ) or integrations[integ_id]["configured"]
+            integrations[integ_id] = {
+                "enabled": bool(ovr.get("enabled", integrations[integ_id]["enabled"])),
+                "configured": configured,
+            }
+
     return SettingsResponse(
         general=GeneralSettings(
-            app_name=app_settings.app_name,
-            timezone="UTC",
-            date_format="YYYY-MM-DD",
-            time_format="HH:mm:ss",
-            session_timeout_minutes=app_settings.access_token_expire_minutes,
-            max_login_attempts=5,
-            lockout_duration_minutes=15,
+            app_name=pick(general_override, "app_name", app_settings.app_name),
+            timezone=pick(general_override, "timezone", "UTC"),
+            date_format=pick(general_override, "date_format", "YYYY-MM-DD"),
+            time_format=pick(general_override, "time_format", "HH:mm:ss"),
+            session_timeout_minutes=pick(
+                general_override,
+                "session_timeout_minutes",
+                app_settings.access_token_expire_minutes,
+            ),
+            max_login_attempts=pick(
+                security_override,
+                "max_login_attempts",
+                pick(general_override, "max_login_attempts", 5),
+            ),
+            lockout_duration_minutes=pick(
+                security_override,
+                "lockout_duration_minutes",
+                pick(general_override, "lockout_duration_minutes", 15),
+            ),
         ),
         smtp=SMTPConfig(
-            host=app_settings.smtp_host,
-            port=app_settings.smtp_port,
-            username=app_settings.smtp_user,
-            from_address=app_settings.smtp_from,
-            use_tls=app_settings.smtp_tls,
+            host=pick(smtp_override, "host", app_settings.smtp_host),
+            port=pick(smtp_override, "port", app_settings.smtp_port),
+            username=pick(smtp_override, "username", app_settings.smtp_user),
+            from_address=pick(smtp_override, "from_address", app_settings.smtp_from),
+            use_tls=pick(smtp_override, "use_tls", app_settings.smtp_tls),
         ),
         notifications=NotificationConfig(
-            email_enabled=bool(app_settings.smtp_user),
-            slack_enabled=bool(app_settings.slack_webhook_url),
-            teams_enabled=bool(app_settings.teams_webhook_url),
-            slack_webhook_url=_mask_secret(app_settings.slack_webhook_url),
-            teams_webhook_url=_mask_secret(app_settings.teams_webhook_url),
+            email_enabled=pick(
+                notif_override,
+                "email_enabled",
+                bool(app_settings.smtp_user),
+            ),
+            slack_enabled=pick(
+                notif_override,
+                "slack_enabled",
+                bool(app_settings.slack_webhook_url),
+            ),
+            teams_enabled=pick(
+                notif_override,
+                "teams_enabled",
+                bool(app_settings.teams_webhook_url),
+            ),
+            slack_webhook_url=_mask_secret(
+                pick(
+                    notif_override, "slack_webhook_url", app_settings.slack_webhook_url
+                )
+            ),
+            teams_webhook_url=_mask_secret(
+                pick(
+                    notif_override, "teams_webhook_url", app_settings.teams_webhook_url
+                )
+            ),
         ),
         alert_correlation=AlertCorrelationConfig(
             enabled=True,
@@ -65,120 +245,117 @@ async def get_settings(
             auto_create_incident=True,
             min_alerts_for_incident=3,
         ),
-        integrations={
-            "virustotal": {
-                "enabled": bool(app_settings.virustotal_api_key),
-                "configured": bool(app_settings.virustotal_api_key),
-            },
-            "abuseipdb": {
-                "enabled": bool(app_settings.abuseipdb_api_key),
-                "configured": bool(app_settings.abuseipdb_api_key),
-            },
-            "shodan": {
-                "enabled": bool(app_settings.shodan_api_key),
-                "configured": bool(app_settings.shodan_api_key),
-            },
-            "greynoise": {
-                "enabled": bool(app_settings.greynoise_api_key),
-                "configured": bool(app_settings.greynoise_api_key),
-            },
-            "elasticsearch": {
-                "enabled": bool(app_settings.elasticsearch_url),
-                "configured": bool(app_settings.elasticsearch_url),
-            },
-            "splunk": {
-                "enabled": bool(app_settings.splunk_host),
-                "configured": bool(app_settings.splunk_host),
-            },
-        },
+        integrations=integrations,
     )
 
+
+# ---------------------------------------------------------------------------
+# PATCH /settings (combined)
+# ---------------------------------------------------------------------------
 
 @router.patch("", response_model=SettingsResponse)
 async def update_settings(
     settings_update: SettingsUpdate,
+    db: DatabaseSession = None,
     current_user: User = Depends(get_current_superuser),
 ) -> SettingsResponse:
-    """Update application settings (admin only)
+    """Update application settings (admin only) — persists to DB."""
+    org_id = _user_org(current_user)
+    uid = getattr(current_user, "id", None)
 
-    Persists settings by updating the runtime config object.
-    Changes take effect immediately but do not survive a restart
-    unless also written to environment or .env file.
-    """
-    update_data = settings_update.model_dump(exclude_unset=True, exclude_none=True)
-
-    # Apply SMTP settings
     if settings_update.smtp:
         smtp = settings_update.smtp
-        if smtp.host is not None:
-            app_settings.smtp_host = smtp.host
-        if smtp.port is not None:
-            app_settings.smtp_port = smtp.port
-        if smtp.username is not None:
-            app_settings.smtp_user = smtp.username
-        if smtp.password is not None:
-            app_settings.smtp_password = smtp.password
-        if smtp.from_address is not None:
-            app_settings.smtp_from = smtp.from_address
-        if smtp.use_tls is not None:
-            app_settings.smtp_tls = smtp.use_tls
+        value = smtp.model_dump(exclude_unset=True, exclude_none=True)
+        await _upsert_section(db, org_id, "smtp", value, uid)
+        # Mirror to runtime so the rest of this process sees the change
+        for k, attr in (
+            ("host", "smtp_host"),
+            ("port", "smtp_port"),
+            ("username", "smtp_user"),
+            ("password", "smtp_password"),
+            ("from_address", "smtp_from"),
+            ("use_tls", "smtp_tls"),
+        ):
+            if k in value and value[k] is not None:
+                setattr(app_settings, attr, value[k])
 
-    # Apply notification settings
     if settings_update.notifications:
         notif = settings_update.notifications
-        if notif.slack_webhook_url is not None:
-            app_settings.slack_webhook_url = notif.slack_webhook_url
-        if notif.teams_webhook_url is not None:
-            app_settings.teams_webhook_url = notif.teams_webhook_url
+        value = notif.model_dump(exclude_unset=True, exclude_none=True)
+        await _upsert_section(db, org_id, "notifications", value, uid)
+        if "slack_webhook_url" in value:
+            app_settings.slack_webhook_url = value["slack_webhook_url"] or ""
+        if "teams_webhook_url" in value:
+            app_settings.teams_webhook_url = value["teams_webhook_url"] or ""
 
-    # Apply general settings
     if settings_update.general:
         gen = settings_update.general
-        if gen.app_name is not None:
-            app_settings.app_name = gen.app_name
-        if gen.session_timeout_minutes is not None:
-            app_settings.access_token_expire_minutes = gen.session_timeout_minutes
+        value = gen.model_dump(exclude_unset=True, exclude_none=True)
+        await _upsert_section(db, org_id, "general", value, uid)
+        if "app_name" in value and value["app_name"] is not None:
+            app_settings.app_name = value["app_name"]
+        if "session_timeout_minutes" in value and value["session_timeout_minutes"] is not None:
+            app_settings.access_token_expire_minutes = int(value["session_timeout_minutes"])
 
-    return await get_settings(current_user)
+    return await get_settings(db, current_user)
 
+
+# ---------------------------------------------------------------------------
+# PATCH /settings/general
+# ---------------------------------------------------------------------------
 
 @router.patch("/general", response_model=GeneralSettings)
 async def update_general_settings(
     updates: Dict[str, Any] = Body(...),
+    db: DatabaseSession = None,
     current_user: User = Depends(get_current_superuser),
 ) -> GeneralSettings:
     """Update general settings. Accepts a dict of fields to update."""
-    if "app_name" in updates and updates["app_name"] is not None:
-        app_settings.app_name = str(updates["app_name"])
+    org_id = _user_org(current_user)
+    uid = getattr(current_user, "id", None)
+
     if "session_timeout_minutes" in updates and updates["session_timeout_minutes"] is not None:
         try:
-            app_settings.access_token_expire_minutes = int(updates["session_timeout_minutes"])
+            updates["session_timeout_minutes"] = int(updates["session_timeout_minutes"])
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="session_timeout_minutes must be int")
-    # These fields are not currently bound to app_settings; keep them as
-    # echo-through so the UI can render the saved value during the process.
-    for key in ("timezone", "date_format", "time_format",
-                "max_login_attempts", "lockout_duration_minutes"):
-        if key in updates and updates[key] is not None:
-            setattr(app_settings, f"_runtime_{key}", updates[key])
+
+    merged = await _upsert_section(db, org_id, "general", updates, uid)
+
+    # Mirror to runtime for in-process effect
+    if "app_name" in merged and merged["app_name"] is not None:
+        app_settings.app_name = str(merged["app_name"])
+    if "session_timeout_minutes" in merged and merged["session_timeout_minutes"] is not None:
+        app_settings.access_token_expire_minutes = int(merged["session_timeout_minutes"])
 
     return GeneralSettings(
-        app_name=app_settings.app_name,
-        timezone=getattr(app_settings, "_runtime_timezone", "UTC"),
-        date_format=getattr(app_settings, "_runtime_date_format", "YYYY-MM-DD"),
-        time_format=getattr(app_settings, "_runtime_time_format", "HH:mm:ss"),
-        session_timeout_minutes=app_settings.access_token_expire_minutes,
-        max_login_attempts=getattr(app_settings, "_runtime_max_login_attempts", 5),
-        lockout_duration_minutes=getattr(app_settings, "_runtime_lockout_duration_minutes", 15),
+        app_name=merged.get("app_name", app_settings.app_name),
+        timezone=merged.get("timezone", "UTC"),
+        date_format=merged.get("date_format", "YYYY-MM-DD"),
+        time_format=merged.get("time_format", "HH:mm:ss"),
+        session_timeout_minutes=int(
+            merged.get("session_timeout_minutes", app_settings.access_token_expire_minutes)
+        ),
+        max_login_attempts=int(merged.get("max_login_attempts", 5)),
+        lockout_duration_minutes=int(merged.get("lockout_duration_minutes", 15)),
     )
 
+
+# ---------------------------------------------------------------------------
+# PATCH /settings/smtp
+# ---------------------------------------------------------------------------
 
 @router.patch("/smtp", response_model=SMTPConfig)
 async def update_smtp_settings(
     updates: Dict[str, Any] = Body(...),
+    db: DatabaseSession = None,
     current_user: User = Depends(get_current_superuser),
 ) -> SMTPConfig:
     """Update SMTP settings. Accepts a dict of fields to update."""
+    org_id = _user_org(current_user)
+    uid = getattr(current_user, "id", None)
+
+    clean: Dict[str, Any] = {}
     mapping = {
         "host": "smtp_host",
         "port": "smtp_port",
@@ -197,70 +374,107 @@ async def update_smtp_settings(
                     raise HTTPException(status_code=400, detail="port must be int")
             if in_key == "use_tls":
                 value = bool(value)
+            clean[in_key] = value
             setattr(app_settings, attr, value)
 
+    merged = await _upsert_section(db, org_id, "smtp", clean, uid)
+
     return SMTPConfig(
-        host=app_settings.smtp_host,
-        port=app_settings.smtp_port,
-        username=app_settings.smtp_user,
-        from_address=app_settings.smtp_from,
-        use_tls=app_settings.smtp_tls,
+        host=merged.get("host", app_settings.smtp_host),
+        port=int(merged.get("port", app_settings.smtp_port)),
+        username=merged.get("username", app_settings.smtp_user),
+        from_address=merged.get("from_address", app_settings.smtp_from),
+        use_tls=bool(merged.get("use_tls", app_settings.smtp_tls)),
     )
 
+
+# ---------------------------------------------------------------------------
+# PATCH /settings/notifications
+# ---------------------------------------------------------------------------
 
 @router.patch("/notifications", response_model=NotificationConfig)
 async def update_notification_settings(
     updates: Dict[str, Any] = Body(...),
+    db: DatabaseSession = None,
     current_user: User = Depends(get_current_superuser),
 ) -> NotificationConfig:
     """Update notification settings. Accepts a dict of fields to update."""
+    org_id = _user_org(current_user)
+    uid = getattr(current_user, "id", None)
+
+    clean: Dict[str, Any] = {}
     if "slack_webhook_url" in updates:
-        app_settings.slack_webhook_url = updates["slack_webhook_url"] or ""
+        clean["slack_webhook_url"] = updates["slack_webhook_url"] or ""
+        app_settings.slack_webhook_url = clean["slack_webhook_url"]
     if "teams_webhook_url" in updates:
-        app_settings.teams_webhook_url = updates["teams_webhook_url"] or ""
-    # Booleans like email_enabled are derived in GET; store an override flag
+        clean["teams_webhook_url"] = updates["teams_webhook_url"] or ""
+        app_settings.teams_webhook_url = clean["teams_webhook_url"]
     for key in ("email_enabled", "slack_enabled", "teams_enabled"):
         if key in updates and updates[key] is not None:
-            setattr(app_settings, f"_runtime_{key}", bool(updates[key]))
+            clean[key] = bool(updates[key])
+
+    merged = await _upsert_section(db, org_id, "notifications", clean, uid)
 
     return NotificationConfig(
-        email_enabled=getattr(app_settings, "_runtime_email_enabled", bool(app_settings.smtp_user)),
-        slack_enabled=getattr(app_settings, "_runtime_slack_enabled", bool(app_settings.slack_webhook_url)),
-        teams_enabled=getattr(app_settings, "_runtime_teams_enabled", bool(app_settings.teams_webhook_url)),
-        slack_webhook_url=_mask_secret(app_settings.slack_webhook_url),
-        teams_webhook_url=_mask_secret(app_settings.teams_webhook_url),
+        email_enabled=bool(merged.get("email_enabled", bool(app_settings.smtp_user))),
+        slack_enabled=bool(
+            merged.get("slack_enabled", bool(app_settings.slack_webhook_url))
+        ),
+        teams_enabled=bool(
+            merged.get("teams_enabled", bool(app_settings.teams_webhook_url))
+        ),
+        slack_webhook_url=_mask_secret(
+            merged.get("slack_webhook_url", app_settings.slack_webhook_url)
+        ),
+        teams_webhook_url=_mask_secret(
+            merged.get("teams_webhook_url", app_settings.teams_webhook_url)
+        ),
     )
 
+
+# ---------------------------------------------------------------------------
+# PATCH /settings/security
+# ---------------------------------------------------------------------------
 
 @router.patch("/security", response_model=SecurityConfig)
 async def update_security_settings(
     updates: Dict[str, Any] = Body(...),
+    db: DatabaseSession = None,
     current_user: User = Depends(get_current_superuser),
 ) -> SecurityConfig:
     """Update security settings. Accepts a dict of fields to update."""
+    org_id = _user_org(current_user)
+    uid = getattr(current_user, "id", None)
+
+    clean: Dict[str, Any] = {}
     if "session_timeout_minutes" in updates and updates["session_timeout_minutes"] is not None:
         try:
-            app_settings.access_token_expire_minutes = int(updates["session_timeout_minutes"])
+            clean["session_timeout_minutes"] = int(updates["session_timeout_minutes"])
+            app_settings.access_token_expire_minutes = clean["session_timeout_minutes"]
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="session_timeout_minutes must be int")
     for key in ("max_login_attempts", "lockout_duration_minutes",
                 "password_min_length", "require_mfa"):
         if key in updates and updates[key] is not None:
-            setattr(app_settings, f"_runtime_{key}", updates[key])
+            clean[key] = updates[key]
+
+    merged = await _upsert_section(db, org_id, "security", clean, uid)
 
     return SecurityConfig(
-        max_login_attempts=getattr(app_settings, "_runtime_max_login_attempts", 5),
-        lockout_duration_minutes=getattr(app_settings, "_runtime_lockout_duration_minutes", 15),
-        session_timeout_minutes=app_settings.access_token_expire_minutes,
-        password_min_length=getattr(app_settings, "_runtime_password_min_length", 8),
-        require_mfa=getattr(app_settings, "_runtime_require_mfa", False),
+        max_login_attempts=int(merged.get("max_login_attempts", 5)),
+        lockout_duration_minutes=int(merged.get("lockout_duration_minutes", 15)),
+        session_timeout_minutes=int(
+            merged.get("session_timeout_minutes", app_settings.access_token_expire_minutes)
+        ),
+        password_min_length=int(merged.get("password_min_length", 8)),
+        require_mfa=bool(merged.get("require_mfa", False)),
     )
 
 
-# Per-integration config keyed by canonical integration id (e.g. "virustotal",
-# "abuseipdb", "shodan", "greynoise", "elasticsearch", "splunk"). The GET path
-# reads `bool(app_settings.<id>_api_key)` for most of these, so mirroring the
-# write path means setting those same attributes on app_settings.
+# ---------------------------------------------------------------------------
+# POST /settings/integrations/{id}
+# ---------------------------------------------------------------------------
+
 _INTEGRATION_KEY_ATTR = {
     "virustotal": "virustotal_api_key",
     "abuseipdb": "abuseipdb_api_key",
@@ -275,18 +489,20 @@ _INTEGRATION_KEY_ATTR = {
 async def save_integration_config(
     integration_id: str,
     config: Dict[str, Any] = Body(...),
+    db: DatabaseSession = None,
     current_user: User = Depends(get_current_superuser),
 ) -> dict:
-    """Save configuration for a specific integration."""
+    """Save configuration for a specific integration (persisted)."""
     if integration_id not in _INTEGRATION_KEY_ATTR:
         raise HTTPException(
             status_code=400,
             detail=f"Unknown integration: {integration_id}",
         )
 
+    org_id = _user_org(current_user)
+    uid = getattr(current_user, "id", None)
     attr = _INTEGRATION_KEY_ATTR[integration_id]
-    # The frontend typically sends {api_key, enabled, ...} OR for splunk/elasticsearch
-    # it sends {host/url, ...}. Accept the common shapes.
+
     primary_value = (
         config.get("api_key")
         or config.get("url")
@@ -296,17 +512,29 @@ async def save_integration_config(
     if primary_value is not None:
         setattr(app_settings, attr, str(primary_value))
 
-    # Stash the full config for retrieval/enabled flag
-    setattr(app_settings, f"_runtime_integration_{integration_id}", config)
+    merged = await _upsert_section(
+        db, org_id, f"integration:{integration_id}", config, uid
+    )
 
-    configured = bool(getattr(app_settings, attr, None))
-    enabled = bool(config.get("enabled", configured))
+    configured = bool(
+        merged.get("api_key")
+        or merged.get("url")
+        or merged.get("host")
+        or merged.get("token")
+        or getattr(app_settings, attr, None)
+    )
+    enabled = bool(merged.get("enabled", configured))
     return {
         "integration_id": integration_id,
         "enabled": enabled,
         "configured": configured,
     }
 
+
+# ---------------------------------------------------------------------------
+# POST /settings/test-email and /settings/test-integration/{name}
+# (unchanged — operational tests, no persistence)
+# ---------------------------------------------------------------------------
 
 @router.post("/test-email")
 async def test_email_settings(
@@ -357,7 +585,6 @@ async def test_integration(
             detail=f"Unknown integration: {integration_name}"
         )
 
-    # Check if integration is configured
     api_key_map = {
         "virustotal": app_settings.virustotal_api_key,
         "abuseipdb": app_settings.abuseipdb_api_key,
@@ -421,7 +648,7 @@ async def test_integration(
         )
 
 
-def _mask_secret(value: str | None) -> str | None:
+def _mask_secret(value: Optional[str]) -> Optional[str]:
     """Mask sensitive values for display"""
     if not value:
         return None

@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Path, BackgroundTasks, HTTPException, Query, status
+from fastapi.responses import StreamingResponse
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -1200,4 +1201,173 @@ async def get_dashboard(
         monitored_items=monitored_items,
         active_monitors=active_monitors,
         scan_frequency=scan_frequency,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Report export
+# ---------------------------------------------------------------------------
+
+
+@router.get("/report/export")
+async def export_darkweb_report(
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+    format: str = Query("csv", pattern="^(csv|pdf)$"),
+):
+    """Export a real dark-web findings report for the caller's organization.
+
+    Replaces the "Print Report" button that used to call
+    ``window.print()`` in the frontend. Streams a CSV via
+    ``StreamingResponse`` so arbitrarily large tenant reports don't
+    materialize in memory. PDF is only available when ``reportlab`` is
+    installed in the container — otherwise we fall through to CSV so
+    the client still gets a real file.
+    """
+    import csv
+    import io
+    from datetime import datetime as _dt
+
+    org_id = getattr(current_user, "organization_id", None)
+
+    # Pull findings + their matched monitor name in a single query.
+    stmt = (
+        select(DarkWebFinding, DarkWebMonitor.name)
+        .join(
+            DarkWebMonitor,
+            DarkWebMonitor.id == DarkWebFinding.monitor_id,
+            isouter=True,
+        )
+        .where(DarkWebFinding.organization_id == org_id)
+        .order_by(DarkWebFinding.created_at.desc())
+    )
+    rows = (await db.execute(stmt)).all()
+
+    date_str = _dt.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # Attempt PDF only if reportlab is actually installed.
+    use_pdf = False
+    if format == "pdf":
+        try:
+            import reportlab  # noqa: F401
+            use_pdf = True
+        except ImportError:
+            use_pdf = False
+
+    if use_pdf:
+        from reportlab.lib.pagesizes import letter
+        from reportlab.lib import colors
+        from reportlab.platypus import (
+            SimpleDocTemplate,
+            Table,
+            TableStyle,
+            Paragraph,
+            Spacer,
+        )
+        from reportlab.lib.styles import getSampleStyleSheet
+
+        buf = io.BytesIO()
+        doc = SimpleDocTemplate(buf, pagesize=letter)
+        styles = getSampleStyleSheet()
+        elements: list = [
+            Paragraph("PySOAR Dark Web Findings Report", styles["Title"]),
+            Paragraph(f"Generated: {date_str}", styles["Normal"]),
+            Spacer(1, 12),
+        ]
+        data = [
+            [
+                "Finding ID",
+                "Title",
+                "Source",
+                "Severity",
+                "Status",
+                "Created",
+                "Monitor",
+            ]
+        ]
+        for finding, monitor_name in rows:
+            data.append(
+                [
+                    str(finding.id)[:36],
+                    (finding.title or "")[:60],
+                    finding.source_platform or "",
+                    finding.severity or "",
+                    finding.status or "",
+                    finding.created_at.isoformat()
+                    if finding.created_at
+                    else "",
+                    (monitor_name or "")[:40],
+                ]
+            )
+        table = Table(data, repeatRows=1)
+        table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.grey),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), colors.whitesmoke),
+                    ("GRID", (0, 0), (-1, -1), 0.25, colors.grey),
+                    ("FONTSIZE", (0, 0), (-1, -1), 7),
+                ]
+            )
+        )
+        elements.append(table)
+        doc.build(elements)
+        buf.seek(0)
+        return StreamingResponse(
+            buf,
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": (
+                    f"attachment; filename=pysoar_darkweb_report_{date_str}.pdf"
+                )
+            },
+        )
+
+    # CSV path (preferred, always available)
+    def _iter_csv():
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(
+            [
+                "finding_id",
+                "title",
+                "source",
+                "severity",
+                "status",
+                "created_at",
+                "matched_monitor",
+                "excerpt",
+            ]
+        )
+        yield buf.getvalue()
+        buf.seek(0)
+        buf.truncate(0)
+
+        for finding, monitor_name in rows:
+            excerpt = (finding.description or "").replace("\r", " ").replace("\n", " ")
+            if len(excerpt) > 300:
+                excerpt = excerpt[:297] + "..."
+            writer.writerow(
+                [
+                    str(finding.id),
+                    finding.title or "",
+                    finding.source_platform or "",
+                    finding.severity or "",
+                    finding.status or "",
+                    finding.created_at.isoformat()
+                    if finding.created_at
+                    else "",
+                    monitor_name or "",
+                    excerpt,
+                ]
+            )
+            yield buf.getvalue()
+            buf.seek(0)
+            buf.truncate(0)
+
+    filename = f"pysoar_darkweb_report_{date_str}.csv"
+    return StreamingResponse(
+        _iter_csv(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
     )

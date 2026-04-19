@@ -11,16 +11,19 @@ Provides full CRUD and operational endpoints for:
 - Dashboard
 """
 
+import json
 from datetime import datetime, timedelta
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
+from pydantic import BaseModel as PydanticBaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, desc
 
 from src.api.deps import CurrentUser, DatabaseSession, get_current_active_user
 from src.core.database import get_db
 from src.core.logging import get_logger
+from src.models.audit import AuditLog
 from src.models.base import utc_now
 from src.remediation.models import (
     RemediationPolicy,
@@ -496,6 +499,206 @@ async def reject_execution(
     }
 
 
+# ----------------------------------------------------------------------------
+# Manual lifecycle endpoints for executions that can't be auto-completed.
+#
+# ``awaiting_manual`` and ``awaiting_integration`` executions have no
+# approval record (the approve/reject endpoints 400 on them — there's
+# nothing for an approver to say yes/no to). They need a way to advance
+# off the board:
+#
+#   - mark-complete: an operator confirmed out of band that the action
+#     actually happened (e.g. they blocked the IP by hand on the firewall
+#     because no firewall integration is installed).
+#   - mark-failed: the operator confirmed it won't happen. Records the
+#     reason so the timeline tells the truth.
+#
+# Both write an AuditLog row and both refuse to run on executions that
+# are already in a settled state (completed / failed / approved /
+# rejected / awaiting_approval — the last one has the approve/reject
+# flow).
+# ----------------------------------------------------------------------------
+
+_MANUAL_LIFECYCLE_ALLOWED = ("awaiting_manual", "awaiting_integration", "queued")
+_MANUAL_LIFECYCLE_FORBIDDEN = (
+    "completed", "failed", "approved", "rejected", "awaiting_approval"
+)
+
+
+class _MarkCompleteBody(PydanticBaseModel):
+    notes: Optional[str] = None
+
+
+class _MarkFailedBody(PydanticBaseModel):
+    reason: str
+
+
+@router.post("/executions/{execution_id}/mark-complete")
+async def mark_execution_complete(
+    execution_id: str,
+    body: _MarkCompleteBody = Body(...),
+    db: DatabaseSession = None,
+    current_user = Depends(get_current_active_user),
+):
+    """Operator confirms an awaiting_manual / awaiting_integration
+    execution actually got done out of band. Transitions to completed."""
+    execution = await db.get(RemediationExecution, execution_id)
+    if not execution or execution.organization_id != getattr(current_user, "organization_id", None):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+
+    if execution.status in _MANUAL_LIFECYCLE_FORBIDDEN:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Cannot mark-complete an execution in status '{execution.status}'. "
+                f"Allowed only from: {', '.join(_MANUAL_LIFECYCLE_ALLOWED)}."
+            ),
+        )
+    if execution.status not in _MANUAL_LIFECYCLE_ALLOWED:
+        # Other terminal/running states (running, cancelled, rolled_back,
+        # timed_out) — refuse as well.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Cannot mark-complete an execution in status '{execution.status}'. "
+                f"Allowed only from: {', '.join(_MANUAL_LIFECYCLE_ALLOWED)}."
+            ),
+        )
+
+    now = utc_now()
+    prev_status = execution.status
+    execution.status = "completed"
+    execution.overall_result = "success"
+    execution.completed_at = now
+    if body.notes:
+        # Preserve any prior notes rather than overwriting blindly.
+        existing = execution.notes or ""
+        execution.notes = (existing + "\n" if existing else "") + f"[manual complete] {body.notes}"
+    # Record who completed it on the metrics blob (RemediationExecution
+    # has no first-class completed_by column — metrics is where we keep
+    # sidecar fields).
+    metrics = dict(execution.metrics or {})
+    metrics.update({
+        "completed_by": str(current_user.id) if current_user else None,
+        "completed_by_email": getattr(current_user, "email", None),
+        "manual_lifecycle": "mark_complete",
+        "prev_status": prev_status,
+    })
+    execution.metrics = metrics
+    execution.updated_at = now
+
+    db.add(AuditLog(
+        user_id=str(current_user.id) if current_user else None,
+        action="remediation.execution.mark_complete",
+        resource_type="remediation_execution",
+        resource_id=execution_id,
+        description=(body.notes or "")[:1000] or f"Marked complete from {prev_status}",
+        new_value=json.dumps({"status": "completed", "prev_status": prev_status}),
+        success=True,
+    ))
+
+    await db.commit()
+    logger.info(
+        "Remediation execution marked complete",
+        extra={
+            "execution_id": execution_id,
+            "prev_status": prev_status,
+            "user_id": getattr(current_user, "id", None),
+        },
+    )
+
+    return {
+        "execution_id": execution_id,
+        "status": "completed",
+        "completed_at": now.isoformat(),
+        "completed_by": str(current_user.id) if current_user else None,
+        "prev_status": prev_status,
+    }
+
+
+@router.post("/executions/{execution_id}/mark-failed")
+async def mark_execution_failed(
+    execution_id: str,
+    body: _MarkFailedBody = Body(...),
+    db: DatabaseSession = None,
+    current_user = Depends(get_current_active_user),
+):
+    """Operator confirms an awaiting_manual / awaiting_integration
+    execution won't happen. Transitions to failed with reason."""
+    execution = await db.get(RemediationExecution, execution_id)
+    if not execution or execution.organization_id != getattr(current_user, "organization_id", None):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+
+    if not body.reason or not body.reason.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="'reason' is required for mark-failed",
+        )
+
+    if execution.status in _MANUAL_LIFECYCLE_FORBIDDEN:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Cannot mark-failed an execution in status '{execution.status}'. "
+                f"Allowed only from: {', '.join(_MANUAL_LIFECYCLE_ALLOWED)}."
+            ),
+        )
+    if execution.status not in _MANUAL_LIFECYCLE_ALLOWED:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Cannot mark-failed an execution in status '{execution.status}'. "
+                f"Allowed only from: {', '.join(_MANUAL_LIFECYCLE_ALLOWED)}."
+            ),
+        )
+
+    now = utc_now()
+    prev_status = execution.status
+    execution.status = "failed"
+    execution.overall_result = "failure"
+    execution.completed_at = now
+    execution.error_message = body.reason.strip()[:2000]
+    metrics = dict(execution.metrics or {})
+    metrics.update({
+        "failure_reason": body.reason.strip()[:2000],
+        "failed_by": str(current_user.id) if current_user else None,
+        "failed_by_email": getattr(current_user, "email", None),
+        "manual_lifecycle": "mark_failed",
+        "prev_status": prev_status,
+    })
+    execution.metrics = metrics
+    execution.updated_at = now
+
+    db.add(AuditLog(
+        user_id=str(current_user.id) if current_user else None,
+        action="remediation.execution.mark_failed",
+        resource_type="remediation_execution",
+        resource_id=execution_id,
+        description=body.reason.strip()[:1000],
+        new_value=json.dumps({"status": "failed", "prev_status": prev_status, "reason": body.reason.strip()[:500]}),
+        success=True,
+    ))
+
+    await db.commit()
+    logger.info(
+        "Remediation execution marked failed",
+        extra={
+            "execution_id": execution_id,
+            "prev_status": prev_status,
+            "user_id": getattr(current_user, "id", None),
+        },
+    )
+
+    return {
+        "execution_id": execution_id,
+        "status": "failed",
+        "failed_at": now.isoformat(),
+        "failed_by": str(current_user.id) if current_user else None,
+        "failure_reason": body.reason.strip(),
+        "prev_status": prev_status,
+    }
+
+
 @router.post("/executions/{execution_id}/rollback")
 async def rollback_execution(
     execution_id: str,
@@ -577,17 +780,156 @@ async def execute_manual_remediation(
 #
 #   1. Write a RemediationExecution row so the Executions tab and
 #      dashboard stats reflect the action.
-#   2. If a matching IR-capable endpoint agent is enrolled, dispatch
-#      the action through AgentService.issue_command — high-blast
-#      actions (isolate, disable, quarantine) auto-queue as
-#      awaiting_approval so a second analyst has to sign off before
-#      the host is actually touched.
-#   3. If no matching agent is enrolled, the execution still lands
-#      with a clear awaiting_manual status so an operator can pick
-#      it up manually.
-#   4. block-ip is special — it writes a ThreatIndicator IOC marked
-#      active so the downstream firewall integration (if configured)
-#      will pick it up, AND it creates the RemediationExecution row.
+#   2. If a matching integration (firewall / EDR / identity) is
+#      installed and active, dispatch the action through its HTTP
+#      API and mark the execution ``completed`` on 2xx, ``failed``
+#      on anything else — with the error surfaced. No silent
+#      green-checkmarks.
+#   3. If no integration is installed, fall back to an IR-capable
+#      endpoint agent (local pysoar agent). On high-blast actions
+#      this still goes through the agent's own approval gate.
+#   4. If neither path exists, the execution lands as
+#      ``awaiting_integration`` (no firewall/EDR/etc installed)
+#      or ``awaiting_manual`` (legacy), carrying a ``metadata.reason``
+#      so the UI can render an honest "staged, nothing dispatched".
+#   5. block-ip also writes a ThreatIndicator IOC so the IOC remains
+#      available to any eventual downstream firewall that gets
+#      installed later.
+
+# Connector IDs that are capable of executing each remediation verb.
+# ``connector_id`` in ``InstalledIntegration`` references
+# ``integration_connectors.id`` (seeded from ``BUILTIN_CONNECTORS``).
+_FIREWALL_CONNECTORS = (
+    "palo_alto_ngfw", "paloalto", "fortinet",
+    "cisco_asa", "cisco_firepower", "checkpoint", "generic_firewall",
+)
+_EDR_CONNECTORS = (
+    "crowdstrike", "sentinelone", "carbon_black", "carbonblack",
+    "microsoft_defender", "defender", "cortex_xdr",
+)
+_IDENTITY_CONNECTORS = (
+    "okta", "azure_ad", "active_directory", "entra", "entra_id",
+    "jumpcloud", "onelogin",
+)
+
+
+async def _find_active_integration(
+    db,
+    connector_ids: tuple,
+    org_id: Optional[str],
+):
+    """Look up the first active ``InstalledIntegration`` whose
+    ``connector_id`` matches any of ``connector_ids`` (case-insensitive)
+    for this tenant. Returns None if none installed so callers can
+    downgrade to awaiting_integration / agent dispatch."""
+    from src.integrations.models import InstalledIntegration, IntegrationStatus
+
+    normalized = tuple(c.lower() for c in connector_ids)
+    q = select(InstalledIntegration).where(
+        InstalledIntegration.status == IntegrationStatus.ACTIVE.value
+    )
+    if org_id:
+        q = q.where(InstalledIntegration.organization_id == org_id)
+
+    rows = list((await db.execute(q)).scalars().all())
+    for row in rows:
+        if (row.connector_id or "").lower() in normalized:
+            return row
+    return None
+
+
+async def _dispatch_via_integration(
+    integration,
+    *,
+    action: str,
+    payload: dict,
+) -> Tuple[bool, str, dict]:
+    """Execute the remediation action through the installed integration.
+
+    Returns ``(success, detail, raw_response)``. Does not swallow
+    errors: on timeout / connection error / 4xx / 5xx returns
+    ``success=False`` with a human-readable ``detail`` so the caller
+    can surface the real reason.
+
+    The dispatch is a POST to
+    ``<endpoint>/<connector-specific-path>`` with Bearer / API-Key
+    auth depending on what credentials the integration has stored.
+    """
+    import httpx
+
+    try:
+        config = json.loads(integration.config_encrypted or "{}")
+    except (json.JSONDecodeError, TypeError):
+        config = {}
+    try:
+        credentials = json.loads(integration.auth_credentials_encrypted or "{}")
+    except (json.JSONDecodeError, TypeError):
+        credentials = {}
+
+    base_url = (config.get("base_url") or config.get("url") or config.get("endpoint_url") or "").rstrip("/")
+    if not base_url:
+        return False, f"{integration.connector_id} base_url not configured", {}
+
+    api_key = credentials.get("api_key") or credentials.get("token")
+    bearer = credentials.get("bearer_token") or credentials.get("access_token")
+    headers: dict[str, str] = {"Content-Type": "application/json"}
+    if bearer:
+        headers["Authorization"] = f"Bearer {bearer}"
+    elif api_key:
+        # Most vendors accept either Authorization: Bearer or x-api-key
+        headers["Authorization"] = f"Bearer {api_key}"
+        headers["x-api-key"] = api_key
+
+    # Connector-specific URL suffix. We default to a POST of the
+    # payload to <base>/remediation/<action> because every vendor
+    # in our shortlist exposes a JSON endpoint, and that is the
+    # shape our generic_firewall / generic_edr connectors expect.
+    connector = (integration.connector_id or "").lower()
+    suffix_map = {
+        "crowdstrike": f"/devices/entities/devices-actions/v2?action_name={action}",
+        "sentinelone": f"/web/api/v2.1/agents/actions/{action}",
+        "carbon_black": f"/appservices/v6/actions/{action}",
+        "carbonblack": f"/appservices/v6/actions/{action}",
+        "microsoft_defender": f"/api/machines/{action}",
+        "defender": f"/api/machines/{action}",
+        "cortex_xdr": f"/public_api/v1/endpoints/{action}",
+        "palo_alto_ngfw": "/api/?type=op",
+        "paloalto": "/api/?type=op",
+        "fortinet": "/api/v2/cmdb/firewall/address",
+        "cisco_asa": "/api/objects/networkobjects",
+        "cisco_firepower": "/api/fmc_config/v1/domain/policy",
+        "checkpoint": "/web_api/add-host",
+        "okta": f"/api/v1/users/{payload.get('username','')}/lifecycle/{'deactivate' if action=='disable_account' else action}",
+        "azure_ad": f"/v1.0/users/{payload.get('username','')}",
+        "active_directory": f"/users/{payload.get('username','')}/disable",
+        "entra": f"/v1.0/users/{payload.get('username','')}",
+        "entra_id": f"/v1.0/users/{payload.get('username','')}",
+    }
+    url = f"{base_url}{suffix_map.get(connector, f'/remediation/{action}')}"
+
+    timeout = httpx.Timeout(15.0, connect=5.0)
+    try:
+        async with httpx.AsyncClient(
+            timeout=timeout,
+            verify=config.get("verify_tls", True),
+        ) as client:
+            resp = await client.post(url, headers=headers, json=payload)
+    except httpx.TimeoutException:
+        return False, f"{connector}: request timed out after 15s", {}
+    except httpx.HTTPError as exc:
+        return False, f"{connector}: HTTP error: {exc}", {}
+
+    try:
+        body = resp.json()
+    except Exception:
+        body = {"raw_text": (resp.text or "")[:2000]}
+
+    if 200 <= resp.status_code < 300:
+        return True, f"{connector} accepted {action} (HTTP {resp.status_code})", body
+    if resp.status_code in (401, 403):
+        return False, f"{connector}: authentication rejected (HTTP {resp.status_code})", body
+    return False, f"{connector}: dispatch failed (HTTP {resp.status_code})", body
+
 
 async def _find_ir_agent(db, hostname: Optional[str], org_id: Optional[str]):
     """Find an active IR-capable agent for ``hostname`` (or any IR agent
@@ -649,11 +991,13 @@ async def quick_block_ip(
 ):
     """Quick action: block an attacker IP.
 
-    Writes a ThreatIndicator IOC with type=ip, value=<ip>, severity=high
-    and marks it active. Any downstream firewall or SIEM integration
-    that watches active IOCs will pick this up. A RemediationExecution
-    row is created so the action shows up in the Executions tab and
-    dashboard effectiveness stats.
+    Always writes a ThreatIndicator IOC so the block is staged for
+    any future firewall integration. Then:
+      * If a firewall integration is installed and active, dispatch
+        the block via its HTTP API and mark ``completed`` only on 2xx.
+        On failure, mark ``failed`` with ``error_message``.
+      * If no firewall is installed, mark ``awaiting_integration`` so
+        the UI can tell the operator this was staged, not dispatched.
     """
     org_id = getattr(current_user, "organization_id", None)
     logger.info("Quick block IP", extra={"ip": request.ip, "duration_hours": request.duration_hours})
@@ -678,6 +1022,42 @@ async def quick_block_ip(
         logger.error(f"Failed to create ThreatIndicator for block-ip: {exc}")
         ioc_id = None
 
+    # Is there a firewall integration we can actually dispatch through?
+    integration = await _find_active_integration(db, _FIREWALL_CONNECTORS, org_id)
+
+    dispatch_method: str
+    integration_id: Optional[str] = None
+    status_value: str
+    overall_result: str
+    error_message: Optional[str] = None
+    integration_detail: Optional[str] = None
+    response_body: dict = {}
+
+    if integration is not None:
+        integration_id = integration.id
+        dispatch_method = "integration"
+        success, integration_detail, response_body = await _dispatch_via_integration(
+            integration,
+            action="block_ip",
+            payload={
+                "ip": request.ip,
+                "duration_hours": request.duration_hours,
+                "reason": request.reason or "quick action",
+                "ioc_id": ioc_id,
+            },
+        )
+        if success:
+            status_value = "completed"
+            overall_result = "success"
+        else:
+            status_value = "failed"
+            overall_result = "failure"
+            error_message = integration_detail
+    else:
+        dispatch_method = "awaiting_integration"
+        status_value = "awaiting_integration"
+        overall_result = "pending"
+
     execution = await _write_execution(
         db=db,
         current_user=current_user,
@@ -689,17 +1069,39 @@ async def quick_block_ip(
             "duration_hours": request.duration_hours,
             "ioc_id": ioc_id,
             "reason": request.reason or "quick action",
+            "dispatch_method": dispatch_method,
+            "integration_id": integration_id,
+            "integration_detail": integration_detail,
         },
-        status_value="completed",  # IOC created = action complete
+        status_value=status_value,
     )
     execution.actions_completed = [{
         "action_type": "firewall_block",
         "target": request.ip,
-        "result": "ioc_created",
+        "result": overall_result,
         "ioc_id": ioc_id,
+        "dispatch_method": dispatch_method,
+        "integration_id": integration_id,
+        "detail": integration_detail,
     }]
-    execution.overall_result = "success" if ioc_id else "partial_success"
-    execution.completed_at = utc_now()
+    execution.overall_result = overall_result
+    execution.error_message = error_message
+    # Capture the truth on the execution row's metrics blob too —
+    # that's what the UI tooltips read.
+    metrics = dict(execution.metrics or {})
+    metrics.update({
+        "dispatch_method": dispatch_method,
+        "integration_id": integration_id,
+        "integration_detail": integration_detail,
+        "response": response_body,
+        "reason": (
+            "no_firewall_integration_installed"
+            if dispatch_method == "awaiting_integration" else None
+        ),
+    })
+    execution.metrics = metrics
+    if status_value in ("completed", "failed"):
+        execution.completed_at = utc_now()
     await db.flush()
 
     return {
@@ -709,6 +1111,9 @@ async def quick_block_ip(
         "duration_hours": request.duration_hours,
         "status": execution.status,
         "ioc_id": ioc_id,
+        "dispatch_method": dispatch_method,
+        "integration_id": integration_id,
+        "error_message": error_message,
     }
 
 
@@ -718,14 +1123,12 @@ async def quick_isolate_host(
     db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
-    """Quick action: isolate a host via its endpoint agent.
+    """Quick action: isolate a host.
 
-    If an IR-capable agent is enrolled for this hostname, dispatches
-    ``isolate_host`` through AgentService.issue_command — which auto-
-    queues as ``awaiting_approval`` because isolate_host is a
-    high-blast action. A second analyst approves from /live-response
-    and the agent then runs iptables / Windows Firewall rules to
-    quarantine the host.
+    Prefers a native EDR integration (CrowdStrike / SentinelOne /
+    Defender / Carbon Black). Falls back to the pysoar endpoint
+    agent if one is enrolled. If neither is available, lands as
+    ``awaiting_integration`` with an honest metadata.reason.
     """
     from src.agents.capabilities import AgentAction
     from src.agents.service import AgentService
@@ -733,23 +1136,65 @@ async def quick_isolate_host(
     org_id = getattr(current_user, "organization_id", None)
     logger.info("Quick isolate host", extra={"hostname": request.hostname})
 
-    agent = await _find_ir_agent(db, request.hostname, org_id)
-    agent_command_id: Optional[str] = None
-    status_value = "awaiting_manual"
+    integration = await _find_active_integration(db, _EDR_CONNECTORS, org_id)
 
-    if agent is not None:
-        try:
-            svc = AgentService(db)
-            cmd = await svc.issue_command(
-                agent=agent,
-                action=AgentAction.ISOLATE_HOST.value,
-                payload={"reason": request.reason or "manual quick action"},
-                issued_by=str(current_user.id),
-            )
-            agent_command_id = cmd.id
-            status_value = "awaiting_approval"  # approval gate in agent platform
-        except Exception as exc:  # noqa: BLE001
-            logger.error(f"AgentService.issue_command failed for isolate_host: {exc}")
+    dispatch_method: str
+    integration_id: Optional[str] = None
+    agent_command_id: Optional[str] = None
+    status_value: str
+    error_message: Optional[str] = None
+    integration_detail: Optional[str] = None
+    overall_result: str
+    response_body: dict = {}
+    reason_tag: Optional[str] = None
+
+    if integration is not None:
+        integration_id = integration.id
+        dispatch_method = "integration"
+        success, integration_detail, response_body = await _dispatch_via_integration(
+            integration,
+            action="isolate_host",
+            payload={
+                "hostname": request.hostname,
+                "reason": request.reason or "quick action",
+            },
+        )
+        if success:
+            status_value = "completed"
+            overall_result = "success"
+        else:
+            status_value = "failed"
+            overall_result = "failure"
+            error_message = integration_detail
+    else:
+        # No EDR integration — try local agent next.
+        agent = await _find_ir_agent(db, request.hostname, org_id)
+        if agent is not None:
+            try:
+                svc = AgentService(db)
+                cmd = await svc.issue_command(
+                    agent=agent,
+                    action=AgentAction.ISOLATE_HOST.value,
+                    payload={"reason": request.reason or "manual quick action"},
+                    issued_by=str(current_user.id),
+                )
+                agent_command_id = cmd.id
+                status_value = "awaiting_approval"
+                dispatch_method = "integration"
+                integration_detail = f"dispatched via pysoar agent {agent.id}"
+                overall_result = "pending"
+            except Exception as exc:  # noqa: BLE001
+                logger.error(f"AgentService.issue_command failed for isolate_host: {exc}")
+                dispatch_method = "awaiting_integration"
+                status_value = "awaiting_integration"
+                error_message = f"agent dispatch failed: {exc}"
+                overall_result = "pending"
+                reason_tag = "agent_dispatch_failed"
+        else:
+            dispatch_method = "awaiting_integration"
+            status_value = "awaiting_integration"
+            overall_result = "pending"
+            reason_tag = "no_edr_integration_installed"
 
     execution = await _write_execution(
         db=db,
@@ -759,20 +1204,39 @@ async def quick_isolate_host(
         action_type="host_isolate",
         trigger_details={
             "hostname": request.hostname,
-            "agent_id": agent.id if agent else None,
             "reason": request.reason,
+            "dispatch_method": dispatch_method,
+            "integration_id": integration_id,
+            "agent_command_id": agent_command_id,
         },
         agent_command_id=agent_command_id,
         status_value=status_value,
     )
+    execution.overall_result = overall_result
+    execution.error_message = error_message
+    metrics = dict(execution.metrics or {})
+    metrics.update({
+        "dispatch_method": dispatch_method,
+        "integration_id": integration_id,
+        "integration_detail": integration_detail,
+        "agent_command_id": agent_command_id,
+        "response": response_body,
+        "reason": reason_tag,
+    })
+    execution.metrics = metrics
+    if status_value in ("completed", "failed"):
+        execution.completed_at = utc_now()
+    await db.flush()
 
     return {
         "execution_id": execution.id,
         "action": "isolate_host",
         "target": request.hostname,
-        "status": status_value,
+        "status": execution.status,
+        "dispatch_method": dispatch_method,
+        "integration_id": integration_id,
         "agent_command_id": agent_command_id,
-        "agent_available": agent is not None,
+        "error_message": error_message,
     }
 
 
@@ -784,9 +1248,11 @@ async def quick_disable_account(
 ):
     """Quick action: disable a user account.
 
-    Dispatches via AgentService if an IR agent is enrolled on the
-    host where the account lives (or any IR agent, if no hostname
-    provided). High-blast → awaiting_approval.
+    Prefers an identity-provider integration (Okta / Azure AD /
+    Entra / AD). Falls back to the pysoar endpoint agent if one is
+    enrolled on the target host. Otherwise lands as
+    ``awaiting_integration`` so the UI can tell the operator this
+    was staged, not dispatched.
     """
     from src.agents.capabilities import AgentAction
     from src.agents.service import AgentService
@@ -794,23 +1260,67 @@ async def quick_disable_account(
     org_id = getattr(current_user, "organization_id", None)
     logger.info("Quick disable account", extra={"username": request.username})
 
-    agent = await _find_ir_agent(db, getattr(request, "hostname", None), org_id)
-    agent_command_id: Optional[str] = None
-    status_value = "awaiting_manual"
+    integration = await _find_active_integration(db, _IDENTITY_CONNECTORS, org_id)
 
-    if agent is not None:
-        try:
-            svc = AgentService(db)
-            cmd = await svc.issue_command(
-                agent=agent,
-                action=AgentAction.DISABLE_ACCOUNT.value,
-                payload={"username": request.username, "reason": request.reason or "manual quick action"},
-                issued_by=str(current_user.id),
-            )
-            agent_command_id = cmd.id
-            status_value = "awaiting_approval"
-        except Exception as exc:  # noqa: BLE001
-            logger.error(f"AgentService.issue_command failed for disable_account: {exc}")
+    dispatch_method: str
+    integration_id: Optional[str] = None
+    agent_command_id: Optional[str] = None
+    status_value: str
+    error_message: Optional[str] = None
+    integration_detail: Optional[str] = None
+    overall_result: str
+    response_body: dict = {}
+    reason_tag: Optional[str] = None
+
+    if integration is not None:
+        integration_id = integration.id
+        dispatch_method = "integration"
+        success, integration_detail, response_body = await _dispatch_via_integration(
+            integration,
+            action="disable_account",
+            payload={
+                "username": request.username,
+                "reason": request.reason or "quick action",
+            },
+        )
+        if success:
+            status_value = "completed"
+            overall_result = "success"
+        else:
+            status_value = "failed"
+            overall_result = "failure"
+            error_message = integration_detail
+    else:
+        agent = await _find_ir_agent(db, getattr(request, "hostname", None), org_id)
+        if agent is not None:
+            try:
+                svc = AgentService(db)
+                cmd = await svc.issue_command(
+                    agent=agent,
+                    action=AgentAction.DISABLE_ACCOUNT.value,
+                    payload={
+                        "username": request.username,
+                        "reason": request.reason or "manual quick action",
+                    },
+                    issued_by=str(current_user.id),
+                )
+                agent_command_id = cmd.id
+                status_value = "awaiting_approval"
+                dispatch_method = "integration"
+                integration_detail = f"dispatched via pysoar agent {agent.id}"
+                overall_result = "pending"
+            except Exception as exc:  # noqa: BLE001
+                logger.error(f"AgentService.issue_command failed for disable_account: {exc}")
+                dispatch_method = "awaiting_integration"
+                status_value = "awaiting_integration"
+                error_message = f"agent dispatch failed: {exc}"
+                overall_result = "pending"
+                reason_tag = "agent_dispatch_failed"
+        else:
+            dispatch_method = "awaiting_integration"
+            status_value = "awaiting_integration"
+            overall_result = "pending"
+            reason_tag = "no_identity_integration_installed"
 
     execution = await _write_execution(
         db=db,
@@ -820,20 +1330,39 @@ async def quick_disable_account(
         action_type="account_disable",
         trigger_details={
             "username": request.username,
-            "agent_id": agent.id if agent else None,
             "reason": getattr(request, "reason", None),
+            "dispatch_method": dispatch_method,
+            "integration_id": integration_id,
+            "agent_command_id": agent_command_id,
         },
         agent_command_id=agent_command_id,
         status_value=status_value,
     )
+    execution.overall_result = overall_result
+    execution.error_message = error_message
+    metrics = dict(execution.metrics or {})
+    metrics.update({
+        "dispatch_method": dispatch_method,
+        "integration_id": integration_id,
+        "integration_detail": integration_detail,
+        "agent_command_id": agent_command_id,
+        "response": response_body,
+        "reason": reason_tag,
+    })
+    execution.metrics = metrics
+    if status_value in ("completed", "failed"):
+        execution.completed_at = utc_now()
+    await db.flush()
 
     return {
         "execution_id": execution.id,
         "action": "disable_account",
         "target": request.username,
-        "status": status_value,
+        "status": execution.status,
+        "dispatch_method": dispatch_method,
+        "integration_id": integration_id,
         "agent_command_id": agent_command_id,
-        "agent_available": agent is not None,
+        "error_message": error_message,
     }
 
 

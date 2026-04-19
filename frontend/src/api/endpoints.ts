@@ -799,6 +799,36 @@ export const darkwebApi = {
     const response = await api.post(`/darkweb/brand-threats/${threatId}/initiate-takedown`);
     return response.data;
   },
+
+  exportReport: async (format: 'csv' | 'pdf' = 'csv'): Promise<void> => {
+    // Stream the report as a blob so the browser triggers a real download
+    // (replaces the old window.print() hack).
+    const response = await api.get('/darkweb/report/export', {
+      params: { format },
+      responseType: 'blob',
+    });
+    const contentType =
+      (response.headers && (response.headers['content-type'] as string)) || 'text/csv';
+    const blob = new Blob([response.data], { type: contentType });
+    const url = window.URL.createObjectURL(blob);
+
+    // Extract the server-provided filename when present, else build one.
+    let filename = `pysoar_darkweb_report.${format}`;
+    const disposition =
+      response.headers && (response.headers['content-disposition'] as string);
+    if (disposition) {
+      const match = disposition.match(/filename\s*=\s*"?([^";]+)"?/i);
+      if (match) filename = match[1];
+    }
+
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    window.URL.revokeObjectURL(url);
+  },
 };
 
 // Integrations

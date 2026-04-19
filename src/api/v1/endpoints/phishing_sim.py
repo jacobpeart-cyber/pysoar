@@ -18,9 +18,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.deps import CurrentUser, DatabaseSession, get_current_active_user
 from src.core.database import get_db
 from src.core.logging import get_logger
+from src.core.config import settings
 from src.phishing_sim.models import (
     CampaignEvent,
     PhishingCampaign,
+    PhishingTarget,
     PhishingTemplate,
     SecurityAwarenessScore,
     TargetGroup,
@@ -732,11 +734,27 @@ async def launch_campaign(
     db: DatabaseSession,
     current_user: CurrentUser,
 ):
-    """Launch a campaign - begin email distribution."""
+    """Launch a campaign - materialize target rows and queue email sends.
+
+    Previously this only flipped ``status='active'`` and returned — no
+    emails, no target rows, no Celery queue. This version:
+
+    1. Expands the campaign's TargetGroup members list into
+       PhishingTarget rows (one per recipient) with unique tracking_ids.
+    2. Checks SMTP configuration via ``settings.smtp_user``/``smtp_password``
+       (same gate EmailService uses). If not configured, every target
+       lands as ``awaiting_smtp_config`` and nothing is queued — honest.
+    3. If SMTP is configured, queues one ``send_phishing_email`` Celery
+       task per target and marks rows ``queued``.
+    4. Sets ``total_targets`` to the real count (request.total_targets
+       is ignored, as documented on the schema).
+    """
+    org_id = getattr(current_user, "organization_id", None)
+
     result = await db.execute(
         select(PhishingCampaign).where(
             PhishingCampaign.id == str(campaign_id),
-            PhishingCampaign.organization_id == getattr(current_user, "organization_id", None),
+            PhishingCampaign.organization_id == org_id,
         )
     )
     campaign = result.scalar_one_or_none()
@@ -753,15 +771,132 @@ async def launch_campaign(
             detail=f"Cannot launch campaign in {campaign.status} status",
         )
 
+    # 1. Load the target group + its members
+    if not campaign.target_group_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Campaign has no target_group_id; attach a target group before launch",
+        )
+
+    tg_result = await db.execute(
+        select(TargetGroup).where(
+            TargetGroup.id == campaign.target_group_id,
+            TargetGroup.organization_id == org_id,
+        )
+    )
+    target_group = tg_result.scalar_one_or_none()
+    if not target_group:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Campaign's target_group not found",
+        )
+
+    members = target_group.members if isinstance(target_group.members, list) else []
+    # De-duplicate by email — TargetGroup.members is a JSON blob and may
+    # contain dupes from manual edits.
+    seen_emails: set[str] = set()
+    clean_members: list[dict[str, Any]] = []
+    for m in members:
+        if not isinstance(m, dict):
+            continue
+        email = (m.get("email") or "").strip().lower()
+        if not email or email in seen_emails:
+            continue
+        seen_emails.add(email)
+        clean_members.append(m)
+
+    if not clean_members:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Target group has no usable members (need at least one with an email)",
+        )
+
+    # 2. Check SMTP configuration — same gate as EmailService.is_configured
+    smtp_configured = bool(
+        getattr(settings, "smtp_user", None) and getattr(settings, "smtp_password", None)
+    )
+    target_status = "pending" if smtp_configured else "awaiting_smtp_config"
+
+    # 3. Create PhishingTarget rows
+    created_targets: list[PhishingTarget] = []
+    for m in clean_members:
+        pt = PhishingTarget(
+            id=str(uuid_mod.uuid4()),
+            campaign_id=str(campaign.id),
+            recipient_email=m.get("email", "").strip(),
+            recipient_name=m.get("name"),
+            recipient_department=m.get("department") or target_group.department,
+            status=target_status,
+            tracking_id=str(uuid_mod.uuid4()),
+            organization_id=org_id or "",
+        )
+        db.add(pt)
+        created_targets.append(pt)
+
+    await db.flush()
+
+    # 4. Activate campaign with the real count (ignore request.total_targets)
     campaign.status = "active"
-    campaign.total_targets = request.total_targets
+    campaign.total_targets = len(created_targets)
     campaign.start_date = datetime.now(timezone.utc)
     await db.flush()
 
+    # 5. Queue Celery sends if SMTP is configured; otherwise be honest
+    queued_for_send = 0
+    if not smtp_configured:
+        logger.warning(
+            f"Campaign {campaign_id} launched without SMTP configured — "
+            f"{len(created_targets)} targets staged as awaiting_smtp_config",
+            extra={"campaign_id": str(campaign_id), "user_id": current_user.id},
+        )
+        await db.commit()
+        return {
+            "status": "active",
+            "campaign_id": str(campaign_id),
+            "targets_created": len(created_targets),
+            "queued_for_send": 0,
+            "awaiting_smtp": len(created_targets),
+            "smtp_configured": False,
+        }
+
+    # Commit the targets before queuing — Celery workers in a different
+    # process need to see the rows.
+    await db.commit()
+
+    try:
+        from src.phishing_sim.tasks import send_phishing_email
+        for pt in created_targets:
+            try:
+                async_result = send_phishing_email.delay(
+                    target_id=pt.id,
+                    organization_id=org_id or "",
+                )
+                pt.celery_task_id = async_result.id if async_result else None
+                pt.status = "queued"
+                queued_for_send += 1
+            except Exception as exc:  # noqa: BLE001 — we want to know which ones failed
+                logger.error(
+                    f"Failed to queue send task for target {pt.id}: {exc}",
+                    extra={"campaign_id": str(campaign_id)},
+                )
+                pt.status = "failed"
+                pt.error_message = f"celery enqueue failed: {exc}"[:500]
+        await db.commit()
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            f"Celery dispatch failed entirely for campaign {campaign_id}: {exc}",
+            extra={"campaign_id": str(campaign_id)},
+        )
+        # Targets are already in DB as 'pending' — leave them that way so
+        # a later retry can pick them up. Don't lie about queued count.
+
     logger.info(
-        f"Launched campaign {campaign_id}",
+        f"Launched campaign {campaign_id}: {len(created_targets)} targets, "
+        f"{queued_for_send} queued for send",
         extra={
-            "total_targets": request.total_targets,
+            "campaign_id": str(campaign_id),
+            "targets_created": len(created_targets),
+            "queued_for_send": queued_for_send,
             "user_id": current_user.id,
         },
     )
@@ -769,7 +904,10 @@ async def launch_campaign(
     return {
         "status": "active",
         "campaign_id": str(campaign_id),
-        "total_targets": request.total_targets,
+        "targets_created": len(created_targets),
+        "queued_for_send": queued_for_send,
+        "awaiting_smtp": 0,
+        "smtp_configured": True,
     }
 
 
