@@ -71,7 +71,7 @@ class RemediationPolicy(BaseModel):
 
     # Metrics
     execution_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
-    last_executed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    last_executed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     success_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
 
     # Metadata

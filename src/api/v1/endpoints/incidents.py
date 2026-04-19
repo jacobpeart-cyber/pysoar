@@ -5,13 +5,14 @@ import math
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, HTTPException, Query, Request, status
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from src.api.deps import CurrentUser, DatabaseSession
 from src.models.alert import Alert
+from src.models.audit import AuditLog
 from src.models.incident import Incident, IncidentStatus
 from src.schemas.incident import (
     IncidentCreate,
@@ -131,6 +132,7 @@ async def create_incident(
     incident_data: IncidentCreate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
+    request: Request = None,
 ):
     """Create a new incident and fire cross-module automation.
 
@@ -179,6 +181,23 @@ async def create_incident(
 
     await db.flush()
     await db.refresh(incident)
+
+    # Audit: one row per incident create
+    try:
+        db.add(AuditLog(
+            user_id=str(current_user.id) if current_user else None,
+            action="incident_create",
+            resource_type="incident",
+            resource_id=str(incident.id),
+            description=f"Created incident: {incident.title[:200]}",
+            ip_address=(request.client.host if request and request.client else None),
+            user_agent=(request.headers.get("user-agent") if request else None),
+            success=True,
+        ))
+        await db.flush()
+    except Exception as _e:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(f"Failed to write audit_log for incident_create {incident.id}: {_e}")
 
     # Fire cross-module automation (best-effort — never fail the request
     # if the war-room creation hits a snag)
@@ -305,11 +324,15 @@ async def update_incident(
     incident_data: IncidentUpdate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
+    request: Request = None,
 ):
     """Update an incident"""
     incident = await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
 
     update_data = incident_data.model_dump(exclude_unset=True, exclude_none=True)
+
+    # Snapshot before-state of just the fields we're about to mutate.
+    pre_state = {k: getattr(incident, k, None) for k in update_data.keys()}
 
     # Handle JSON fields
     json_fields = ["affected_systems", "affected_users", "tags"]
@@ -329,6 +352,25 @@ async def update_incident(
     await db.flush()
     await db.refresh(incident)
 
+    # Audit: one row per incident update
+    try:
+        db.add(AuditLog(
+            user_id=str(current_user.id) if current_user else None,
+            action="incident_update",
+            resource_type="incident",
+            resource_id=str(incident.id),
+            description=f"Updated incident fields: {sorted(list(update_data.keys()))[:10]}"[:500],
+            old_value=json.dumps({k: (str(v)[:200] if v is not None else None) for k, v in pre_state.items()}),
+            new_value=json.dumps({k: (str(v)[:200] if v is not None else None) for k, v in update_data.items()}),
+            ip_address=(request.client.host if request and request.client else None),
+            user_agent=(request.headers.get("user-agent") if request else None),
+            success=True,
+        ))
+        await db.flush()
+    except Exception as _e:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(f"Failed to write audit_log for incident_update {incident.id}: {_e}")
+
     response = IncidentResponse.model_validate(incident)
     response.alert_count = len(incident.alerts)
     return response
@@ -339,6 +381,7 @@ async def delete_incident(
     incident_id: str,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
+    request: Request = None,
 ):
     """Delete an incident and detach all FK references.
 
@@ -365,8 +408,29 @@ async def delete_incident(
         war_room.incident_id = None
 
     await db.flush()
+    # Capture metadata BEFORE delete so the audit row still has the title.
+    _audit_title = getattr(incident, "title", "") or ""
+    _audit_severity = getattr(incident, "severity", None)
     await db.delete(incident)
     await db.flush()
+
+    # Audit: one row per incident delete
+    try:
+        db.add(AuditLog(
+            user_id=str(current_user.id) if current_user else None,
+            action="incident_delete",
+            resource_type="incident",
+            resource_id=str(incident_id),
+            description=f"Deleted incident: {_audit_title[:200]}"[:500],
+            old_value=json.dumps({"title": _audit_title[:200], "severity": _audit_severity}),
+            ip_address=(request.client.host if request and request.client else None),
+            user_agent=(request.headers.get("user-agent") if request else None),
+            success=True,
+        ))
+        await db.flush()
+    except Exception as _e:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(f"Failed to write audit_log for incident_delete {incident_id}: {_e}")
 
 
 @router.post("/{incident_id}/alerts/{alert_id}")

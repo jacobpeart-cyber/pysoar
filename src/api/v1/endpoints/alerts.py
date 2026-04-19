@@ -5,13 +5,14 @@ import math
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request, status
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DatabaseSession
 from src.core.database import async_session_factory
 from src.models.alert import Alert, AlertSeverity, AlertStatus
+from src.models.audit import AuditLog
 from src.schemas.alert import (
     AlertBulkAction,
     AlertCreate,
@@ -135,7 +136,13 @@ async def list_alerts(
 
 
 @router.post("", response_model=AlertResponse, status_code=status.HTTP_201_CREATED)
-async def create_alert(alert_data: AlertCreate, current_user: CurrentUser = None, db: DatabaseSession = None, background_tasks: BackgroundTasks = None):
+async def create_alert(
+    alert_data: AlertCreate,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+    background_tasks: BackgroundTasks = None,
+    request: Request = None,
+):
     """Create a new alert"""
     alert = Alert(
         organization_id=getattr(current_user, "organization_id", None) if current_user else None,
@@ -164,6 +171,23 @@ async def create_alert(alert_data: AlertCreate, current_user: CurrentUser = None
     db.add(alert)
     await db.flush()
     await db.refresh(alert)
+
+    # Audit: one row per alert create
+    try:
+        db.add(AuditLog(
+            user_id=str(current_user.id) if current_user else None,
+            action="alert_create",
+            resource_type="alert",
+            resource_id=str(alert.id),
+            description=f"Created alert: {alert.title[:200]}",
+            ip_address=(request.client.host if request and request.client else None),
+            user_agent=(request.headers.get("user-agent") if request else None),
+            success=True,
+        ))
+        await db.flush()
+    except Exception as _e:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(f"Failed to write audit_log for alert_create {alert.id}: {_e}")
 
     response = AlertResponse.model_validate(alert)
 
@@ -286,11 +310,18 @@ async def update_alert(
     alert_data: AlertUpdate,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
+    request: Request = None,
 ):
     """Update an alert"""
     alert = await get_alert_or_404(db, alert_id, getattr(current_user, "organization_id", None))
 
     update_data = alert_data.model_dump(exclude_unset=True, exclude_none=True)
+
+    # Capture a shallow snapshot of the fields we're about to change so the
+    # audit row can record the before/after for forensic purposes. We don't
+    # snapshot every column because alert rows can carry large raw_data JSON
+    # and the audit log is supposed to be lightweight.
+    pre_state = {k: getattr(alert, k, None) for k in update_data.keys()}
 
     # Handle tags serialization
     if "tags" in update_data:
@@ -305,6 +336,25 @@ async def update_alert(
 
     await db.flush()
     await db.refresh(alert)
+
+    # Audit: one row per alert update
+    try:
+        db.add(AuditLog(
+            user_id=str(current_user.id) if current_user else None,
+            action="alert_update",
+            resource_type="alert",
+            resource_id=str(alert.id),
+            description=f"Updated alert fields: {sorted(list(update_data.keys()))[:10]}"[:500],
+            old_value=json.dumps({k: (str(v)[:200] if v is not None else None) for k, v in pre_state.items()}),
+            new_value=json.dumps({k: (str(v)[:200] if v is not None else None) for k, v in update_data.items()}),
+            ip_address=(request.client.host if request and request.client else None),
+            user_agent=(request.headers.get("user-agent") if request else None),
+            success=True,
+        ))
+        await db.flush()
+    except Exception as _e:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(f"Failed to write audit_log for alert_update {alert.id}: {_e}")
 
     return AlertResponse.model_validate(alert)
 
@@ -329,6 +379,7 @@ async def bulk_action(
     action_data: AlertBulkAction,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
+    request: Request = None,
 ):
     """Perform bulk action on alerts.
 
@@ -396,6 +447,36 @@ async def bulk_action(
             failures.append({"id": alert_id, "error": str(e)[:200]})
 
     await db.flush()
+
+    # Audit: one summary row per bulk action. Recording one row per
+    # touched alert would blow up the audit_logs table on big bulk
+    # ops (N up to 500), so we keep the fan-out small by writing one
+    # row describing the action and the full ID list.
+    try:
+        db.add(AuditLog(
+            user_id=str(current_user.id) if current_user else None,
+            action=f"alert_bulk_{action_data.action}",
+            resource_type="alert",
+            resource_id=None,
+            description=(
+                f"Bulk {action_data.action} on {success_count}/{len(action_data.alert_ids)} alerts"
+                + (f" (value={action_data.value})" if action_data.value else "")
+            )[:500],
+            new_value=json.dumps({
+                "action": action_data.action,
+                "value": action_data.value,
+                "alert_ids": action_data.alert_ids[:500],
+                "success_count": success_count,
+                "failure_count": len(failures),
+            })[:5000],
+            ip_address=(request.client.host if request and request.client else None),
+            user_agent=(request.headers.get("user-agent") if request else None),
+            success=(len(failures) == 0),
+        ))
+        await db.flush()
+    except Exception as _e:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(f"Failed to write audit_log for alert_bulk: {_e}")
 
     return {
         "success_count": success_count,

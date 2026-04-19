@@ -5,6 +5,7 @@ Complete API for managing compliance frameworks, controls, assessments, and evid
 Supports FedRAMP, NIST, CMMC, SOC 2, HIPAA, PCI-DSS, DFARS, and CISA compliance.
 """
 
+import json
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Dict, Any
 
@@ -48,6 +49,7 @@ from src.compliance.models import (
     CUIMarking,
     CISADirective,
 )
+from src.tickethub.models import TicketActivity
 from src.compliance.engine import (
     ComplianceEngine,
     FedRAMPManager,
@@ -410,6 +412,9 @@ async def update_control(
     if not control:
         raise HTTPException(status_code=404, detail="Control not found")
 
+    prev_status = control.status
+    prev_impl = control.implementation_status
+
     control.status = req.status
     if req.implementation_status is not None:
         control.implementation_status = req.implementation_status
@@ -420,6 +425,105 @@ async def update_control(
 
     await db.commit()
     await db.refresh(control)
+
+    # -------------------------------------------------------------
+    # Cross-module fan-out: if the control just moved into a non-
+    # compliant state, auto-create a POAM so the weakness lands on
+    # somebody's remediation queue. Skip if an open POAM for this
+    # control already exists so re-saving the same status doesn't
+    # spam the POAM list. Prior status is captured above BEFORE the
+    # commit so we can compare old vs new and only fire on a real
+    # transition.
+    # -------------------------------------------------------------
+    non_compliant_states = {"not_implemented", "non_compliant"}
+    is_partial_low = (
+        req.status == "partially_implemented"
+        and (req.implementation_status is not None and req.implementation_status < 40.0)
+    )
+    should_create_poam = (
+        (req.status in non_compliant_states and prev_status not in non_compliant_states)
+        or is_partial_low
+    )
+    if should_create_poam:
+        try:
+            # Skip if an open POAM already exists for this control
+            existing_q = select(POAM).where(
+                and_(
+                    POAM.control_id_ref == control.id,
+                    POAM.status.in_(("open", "in_progress", "delayed")),
+                )
+            )
+            existing_res = await db.execute(existing_q)
+            existing_poam = existing_res.scalars().first()
+            if existing_poam is None:
+                # Map control.priority (p1/p2/p3) and risk_if_not_implemented
+                # to POAM risk_level.
+                risk_map = {
+                    "critical": "very_high",
+                    "high": "high",
+                    "medium": "moderate",
+                    "low": "low",
+                }
+                risk_source = (
+                    getattr(control, "risk_if_not_implemented", None)
+                    or {"p1": "critical", "p2": "high", "p3": "medium"}.get(
+                        (control.priority or "p2").lower(), "high"
+                    )
+                )
+                poam_risk = risk_map.get(str(risk_source).lower(), "high")
+
+                weakness_desc = (
+                    control.description
+                    or getattr(control, "remediation_guidance", None)
+                    or f"Control {control.control_id} marked {req.status}"
+                )
+                new_poam = POAM(
+                    control_id_ref=control.id,
+                    weakness_name=f"Control {control.control_id} not implemented: {control.title}",
+                    weakness_description=weakness_desc,
+                    weakness_source="internal_assessment",
+                    risk_level=poam_risk,
+                    status="open",
+                    scheduled_completion_date=datetime.now(timezone.utc) + timedelta(days=90),
+                    organization_id=control.organization_id,
+                )
+                db.add(new_poam)
+                await db.commit()
+                await db.refresh(new_poam)
+
+                # Back-link the control to the newly created POAM
+                try:
+                    control.poam_id = new_poam.id
+                    await db.commit()
+                except Exception as exc:
+                    logger.warning(f"Failed to back-link control {control.id} to POAM {new_poam.id}: {exc}")
+
+                # Log the auto-creation via TicketActivity for traceability
+                try:
+                    activity = TicketActivity(
+                        source_type="poam",
+                        source_id=str(new_poam.id),
+                        activity_type="poam_auto_created",
+                        actor_id=str(current_user.id) if current_user else None,
+                        description=(
+                            f"Auto-created POAM for control {control.control_id} "
+                            f"({prev_status} -> {req.status})"
+                        )[:500],
+                        new_value=json.dumps({
+                            "control_id": control.id,
+                            "control_ref": control.control_id,
+                            "prev_status": prev_status,
+                            "new_status": req.status,
+                            "risk_level": poam_risk,
+                        }),
+                        organization_id=control.organization_id,
+                    )
+                    db.add(activity)
+                    await db.commit()
+                except Exception as exc:
+                    logger.warning(f"Failed to log POAM auto-creation activity: {exc}")
+        except Exception as e:
+            logger.error(f"Auto-POAM creation failed for control {control.id}: {e}", exc_info=True)
 
     # Trigger automation if control is non-compliant or not implemented
     if req.status in ("non_compliant", "not_implemented"):
