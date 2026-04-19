@@ -61,8 +61,10 @@ class Incident(BaseModel):
         index=True,
     )
 
-    # Core fields
-    title: Mapped[str] = mapped_column(String(500), nullable=False, index=True)
+    # Core fields. Stored as TEXT because auto-promoted incidents carry
+    # the originating alert's title (up to 500 chars) plus a prefix, and
+    # older VARCHAR(500) truncated those on the fanout path.
+    title: Mapped[str] = mapped_column(Text, nullable=False, index=True)
     description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     severity: Mapped[str] = mapped_column(
         String(50),

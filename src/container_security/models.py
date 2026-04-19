@@ -216,7 +216,10 @@ class K8sSecurityFinding(BaseModel):
     # secret_in_env, image_pull_always, no_liveness_probe, no_readiness_probe,
     # host_path_mount, capability_added, run_as_root
 
-    namespace: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    # Cluster-level findings (RBAC config, encryption-at-rest, etc.) are
+    # not namespaced — namespace is nullable so these store honestly as
+    # NULL instead of with a magic sentinel.
+    namespace: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
     resource_type: Mapped[str] = mapped_column(String(100), nullable=False)
     resource_name: Mapped[str] = mapped_column(String(255), nullable=False)
 

@@ -179,7 +179,7 @@ async def create_alert(
             action="alert_create",
             resource_type="alert",
             resource_id=str(alert.id),
-            description=f"Created alert: {alert.title[:200]}",
+            description=f"Created alert: {alert.title}",
             ip_address=(request.client.host if request and request.client else None),
             user_agent=(request.headers.get("user-agent") if request else None),
             success=True,
@@ -344,9 +344,9 @@ async def update_alert(
             action="alert_update",
             resource_type="alert",
             resource_id=str(alert.id),
-            description=f"Updated alert fields: {sorted(list(update_data.keys()))[:10]}"[:500],
-            old_value=json.dumps({k: (str(v)[:200] if v is not None else None) for k, v in pre_state.items()}),
-            new_value=json.dumps({k: (str(v)[:200] if v is not None else None) for k, v in update_data.items()}),
+            description=f"Updated alert fields: {sorted(list(update_data.keys()))}",
+            old_value=json.dumps({k: (str(v) if v is not None else None) for k, v in pre_state.items()}, default=str),
+            new_value=json.dumps({k: (str(v) if v is not None else None) for k, v in update_data.items()}, default=str),
             ip_address=(request.client.host if request and request.client else None),
             user_agent=(request.headers.get("user-agent") if request else None),
             success=True,
@@ -444,7 +444,7 @@ async def bulk_action(
             success_count += 1
 
         except Exception as e:
-            failures.append({"id": alert_id, "error": str(e)[:200]})
+            failures.append({"id": alert_id, "error": str(e)})
 
     await db.flush()
 
@@ -461,14 +461,15 @@ async def bulk_action(
             description=(
                 f"Bulk {action_data.action} on {success_count}/{len(action_data.alert_ids)} alerts"
                 + (f" (value={action_data.value})" if action_data.value else "")
-            )[:500],
+            ),
             new_value=json.dumps({
                 "action": action_data.action,
                 "value": action_data.value,
-                "alert_ids": action_data.alert_ids[:500],
+                "alert_ids": action_data.alert_ids,
                 "success_count": success_count,
                 "failure_count": len(failures),
-            })[:5000],
+                "failures": failures,
+            }, default=str),
             ip_address=(request.client.host if request and request.client else None),
             user_agent=(request.headers.get("user-agent") if request else None),
             success=(len(failures) == 0),

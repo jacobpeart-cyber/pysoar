@@ -508,7 +508,7 @@ async def update_control(
                         description=(
                             f"Auto-created POAM for control {control.control_id} "
                             f"({prev_status} -> {req.status})"
-                        )[:500],
+                        ),
                         new_value=json.dumps({
                             "control_id": control.id,
                             "control_ref": control.control_id,

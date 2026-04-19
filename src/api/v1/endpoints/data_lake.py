@@ -920,17 +920,19 @@ async def run_catalog_filter_query(
             logger.warning(f"data-lake query execution failed: {exc}")
             raise HTTPException(
                 status_code=400,
-                detail=f"Query failed: {str(exc)[:200]}",
+                detail=f"Query failed: {exc}",
             )
 
         elapsed_ms = int((datetime.now(timezone.utc) - started).total_seconds() * 1000)
 
-        # Persist a real QueryJob audit row so the history page shows it
+        # Persist a real QueryJob audit row so the history page shows it.
+        # `query_text` is a TEXT column — persist the full SQL (minus the
+        # tenant scope suffix we auto-added) so the history is auditable.
         try:
             import json as _json
             job = QueryJob(
                 organization_id=org_id,
-                query_text=raw_sql[:4000],
+                query_text=raw_sql,
                 query_language=query_language,
                 status="completed",
                 records_scanned=len(rows_out),

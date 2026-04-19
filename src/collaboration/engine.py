@@ -80,14 +80,14 @@ class WarRoomManager:
                 action="war_room_create",
                 resource_type="war_room",
                 resource_id=str(room.id),
-                description=f"Created war room '{name[:180]}' (type={room_type}, severity={severity_level})"[:500],
+                description=f"Created war room '{name}' (type={room_type}, severity={severity_level})",
                 new_value=json.dumps({
-                    "name": name[:200],
+                    "name": name,
                     "room_type": room_type,
                     "severity_level": severity_level,
                     "incident_id": incident_id,
                     "organization_id": organization_id,
-                })[:2000],
+                }, default=str),
                 success=True,
             ))
             await self.db.flush()

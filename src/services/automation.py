@@ -84,7 +84,7 @@ class AutomationService:
                 logger.info(f"Alert {alert.id} matched {len(ioc_matches)} IOCs - escalated to critical")
         except Exception as e:
             logger.error(f"IOC matching failed for alert {alert.id}: {e}")
-            failures.append({"step": "ioc_matching", "error": str(e)[:300]})
+            failures.append({"step": "ioc_matching", "error": str(e)})
 
         # Step 1b: Extract + store any new IOCs surfaced by the alert's
         # text fields. Matching-only (_check_ioc_matches) cannot find IOCs
@@ -99,7 +99,7 @@ class AutomationService:
                 )
         except Exception as e:
             logger.error(f"IOC extraction failed for alert {alert.id}: {e}")
-            failures.append({"step": "ioc_extraction", "error": str(e)[:300]})
+            failures.append({"step": "ioc_extraction", "error": str(e)})
 
         # Step 2: Auto-create incident for critical/high severity or repeated patterns
         try:
@@ -116,7 +116,7 @@ class AutomationService:
                         logger.info(f"Auto-created war room {war_room.id} for critical incident {incident.id}")
         except Exception as e:
             logger.error(f"Auto-incident creation failed for alert {alert.id}: {e}")
-            failures.append({"step": "auto_incident", "error": str(e)[:300]})
+            failures.append({"step": "auto_incident", "error": str(e)})
 
         # Step 4: Auto-trigger playbooks
         try:
@@ -124,7 +124,7 @@ class AutomationService:
             results["playbooks_triggered"] = triggered
         except Exception as e:
             logger.error(f"Playbook auto-trigger failed for alert {alert.id}: {e}")
-            failures.append({"step": "playbook_trigger", "error": str(e)[:300]})
+            failures.append({"step": "playbook_trigger", "error": str(e)})
 
         # Step 5: Evaluate remediation policies against this alert.
         # Any enabled RemediationPolicy whose trigger_type matches and
@@ -141,10 +141,13 @@ class AutomationService:
             results["remediations_triggered"] = remediations
         except Exception as e:  # noqa: BLE001
             logger.error(f"Remediation policy evaluation failed for alert {alert.id}: {e}")
-            failures.append({"step": "remediation_eval", "error": str(e)[:300]})
+            failures.append({"step": "remediation_eval", "error": str(e)})
 
         # Dead-letter trail: record any pipeline failures as an activity so
-        # operators can retry them later. (scheduled retry task can query this.)
+        # operators can retry them later. A scheduled retry task can query this.
+        # If the DLQ write itself fails we DON'T swallow silently — log it
+        # loudly, because that's an observability failure the operator needs
+        # to know about.
         if failures:
             results["failures"] = failures
             try:
@@ -152,25 +155,37 @@ class AutomationService:
                     source_type="alert",
                     source_id=str(alert.id),
                     activity_type="automation_pipeline_failure",
-                    description=f"DLQ: {json.dumps(failures)[:800]}",
+                    description=f"DLQ: {json.dumps(failures, default=str)}",
                     organization_id=org_id,
                 )
                 self.db.add(dlq)
-            except Exception:
-                pass
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    f"Failed to write DLQ TicketActivity for alert {alert.id}: {exc}",
+                    exc_info=True,
+                )
 
-        # Log activity
+        # Log successful pipeline activity
         try:
             activity = TicketActivity(
                 source_type="alert",
                 source_id=str(alert.id),
                 activity_type="automation_pipeline",
-                description=f"Automation: {len(results['ioc_matches'])} IOC matches, {results.get('iocs_extracted', 0)} IOCs extracted, incident={'yes' if results['incident_created'] else 'no'}, war_room={'yes' if results['war_room_created'] else 'no'}, {len(results['playbooks_triggered'])} playbooks",
+                description=(
+                    f"Automation: {len(results['ioc_matches'])} IOC matches, "
+                    f"{results.get('iocs_extracted', 0)} IOCs extracted, "
+                    f"incident={'yes' if results['incident_created'] else 'no'}, "
+                    f"war_room={'yes' if results['war_room_created'] else 'no'}, "
+                    f"{len(results['playbooks_triggered'])} playbooks"
+                ),
                 organization_id=org_id,
             )
             self.db.add(activity)
-        except Exception:
-            pass
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                f"Failed to write automation_pipeline TicketActivity for alert {alert.id}: {exc}",
+                exc_info=True,
+            )
 
         return results
 
@@ -949,10 +964,18 @@ class AutomationService:
         alert_sev = (getattr(alert, "severity", None) or "").lower()
         ioc_sev = "high" if alert_sev in ("critical", "high") else "low"
 
-        candidates: list[tuple[str, str]] = []  # (indicator_type, value)
+        # Each candidate carries its provenance so the DB confidence column
+        # reflects how the IOC was discovered:
+        #   * structured    — typed alert field (source_ip, file_hash, etc.).
+        #                     The source pipeline already classified it.
+        #   * regex_text    — extracted from the alert's free-text title
+        #                     or description; heuristic, lower confidence.
+        # The stored confidence value later rolls up into threat-intel
+        # feed dashboards and remediation policy gating, so these two
+        # paths must be distinguishable.
+        candidates: list[tuple[str, str, str]] = []  # (indicator_type, value, provenance)
 
-        # 1) Structured alert fields — these already carry typed semantics,
-        # so we can trust them more than text-regex matches.
+        # 1) Structured alert fields — high provenance.
         structured = [
             ("ip", getattr(alert, "source_ip", None)),
             ("ip", getattr(alert, "destination_ip", None)),
@@ -968,33 +991,34 @@ class AutomationService:
                 continue
             if itype == "ip" and self._is_private_or_reserved_ipv4(val):
                 continue
-            candidates.append((itype, val))
+            candidates.append((itype, val, "structured"))
 
-        # file_hash: detect by length
+        # file_hash: detect by length (still structured — the source
+        # pipeline put it in the file_hash column for a reason).
         fh = getattr(alert, "file_hash", None)
         if fh:
             fh = str(fh).strip()
             if len(fh) in (32, 40, 64) and re.fullmatch(r"[a-fA-F0-9]+", fh):
-                candidates.append(("hash", fh))
+                candidates.append(("hash", fh, "structured"))
 
-        # 2) Regex harvest from free-text fields
+        # 2) Regex harvest from free-text fields — lower-confidence path.
         if text_blob:
             # Hash detection — longer hashes first so a SHA256 isn't
             # truncated into a SHA1/MD5 match by the shorter regexes.
             found_hashes: set[str] = set()
             for m in self._IOC_SHA256_RE.findall(text_blob):
                 found_hashes.add(m)
-                candidates.append(("hash", m))
+                candidates.append(("hash", m, "regex_text"))
             for m in self._IOC_SHA1_RE.findall(text_blob):
                 if m in found_hashes or any(m in h for h in found_hashes):
                     continue
                 found_hashes.add(m)
-                candidates.append(("hash", m))
+                candidates.append(("hash", m, "regex_text"))
             for m in self._IOC_MD5_RE.findall(text_blob):
                 if m in found_hashes or any(m in h for h in found_hashes):
                     continue
                 found_hashes.add(m)
-                candidates.append(("hash", m))
+                candidates.append(("hash", m, "regex_text"))
 
             # URLs
             urls_found: set[str] = set()
@@ -1002,13 +1026,13 @@ class AutomationService:
                 # Trim trailing punctuation commonly attached to URLs in prose
                 u = m.rstrip(".,);]")
                 urls_found.add(u)
-                candidates.append(("url", u))
+                candidates.append(("url", u, "regex_text"))
 
             # Emails
             emails_found: set[str] = set()
             for m in self._IOC_EMAIL_RE.findall(text_blob):
                 emails_found.add(m.lower())
-                candidates.append(("email", m.lower()))
+                candidates.append(("email", m.lower(), "regex_text"))
 
             # IPv4 — skip private/reserved
             ipv4_found: set[str] = set()
@@ -1016,35 +1040,31 @@ class AutomationService:
                 if self._is_private_or_reserved_ipv4(m):
                     continue
                 ipv4_found.add(m)
-                candidates.append(("ip", m))
+                candidates.append(("ip", m, "regex_text"))
 
-            # Domains — filter anything already captured as email, URL, or IP,
-            # and require a non-numeric TLD-ish shape (already in regex).
+            # Domains — filter anything already captured as email, URL, or IP.
             for m in self._IOC_DOMAIN_RE.findall(text_blob):
-                # Skip the domain-half of an email we already captured
                 if any(m in e for e in emails_found):
                     continue
-                # Skip anything that looks like an IPv4
                 if self._IOC_IPV4_RE.fullmatch(m):
                     continue
-                # Skip domains that are actually hostnames inside URLs we captured
                 if any(m in u for u in urls_found):
                     continue
-                # Skip hash-like strings (all-hex) that happen to slip into the
-                # domain pattern (very rare but possible)
                 if re.fullmatch(r"[a-fA-F0-9.]+", m):
                     continue
-                candidates.append(("domain", m.lower()))
+                candidates.append(("domain", m.lower(), "regex_text"))
 
-        # De-duplicate candidates before hitting the DB
-        deduped: dict[tuple[str, str], None] = {}
-        for itype, val in candidates:
+        # De-duplicate candidates, preferring "structured" provenance on
+        # collisions (a regex hit that overlaps with a structured field
+        # should score high, not low).
+        deduped: dict[tuple[str, str], str] = {}
+        for itype, val, prov in candidates:
             if not val:
                 continue
             key = (itype, val)
-            if key in deduped:
-                continue
-            deduped[key] = None
+            if key in deduped and deduped[key] == "structured":
+                continue  # keep the higher-trust provenance
+            deduped[key] = prov
 
         if not deduped:
             return []
@@ -1052,10 +1072,7 @@ class AutomationService:
         now = datetime.now(timezone.utc)
         stored_ids: list[str] = []
 
-        # For each candidate, check if it already exists for this org;
-        # if not, insert. We query one at a time to keep the logic
-        # simple and tenant-scoped — the volume per alert is small.
-        for (itype, val) in deduped.keys():
+        for (itype, val), provenance in deduped.items():
             try:
                 existing_q = select(IOC).where(
                     and_(
@@ -1071,11 +1088,17 @@ class AutomationService:
                     existing.last_seen = now
                     continue
 
+                # Confidence reflects provenance. Structured-field IOCs
+                # (source_ip / file_hash etc.) score higher than regex-
+                # harvested ones — downstream enrichment or a feed match
+                # can raise either further.
+                base_confidence = 70 if provenance == "structured" else 30
+
                 ind = IOC(
                     indicator_type=itype,
                     value=val,
-                    source=f"alert:{alert.id}",
-                    confidence=30,
+                    source=f"alert:{alert.id}:{provenance}",
+                    confidence=base_confidence,
                     severity=ioc_sev,
                     first_seen=now,
                     last_seen=now,
@@ -1088,7 +1111,7 @@ class AutomationService:
                 stored_ids.append(ind.id)
             except Exception as exc:  # noqa: BLE001
                 logger.warning(
-                    f"Failed to store extracted IOC {itype}:{val[:80]} "
+                    f"Failed to store extracted IOC {itype}:{val} "
                     f"for alert {alert.id}: {exc}"
                 )
 
@@ -1148,12 +1171,12 @@ class AutomationService:
                 action="incident_auto_create",
                 resource_type="incident",
                 resource_id=str(incident.id),
-                description=f"Auto-created incident from alert {alert.id}: {incident.title[:200]}"[:500],
+                description=f"Auto-created incident from alert {alert.id}: {incident.title}",
                 new_value=json.dumps({
                     "source_alert_id": str(alert.id),
                     "severity": severity,
                     "incident_type": category or "other",
-                })[:2000],
+                }, default=str),
                 success=True,
             ))
             await self.db.flush()
@@ -1174,7 +1197,7 @@ class AutomationService:
         severity = getattr(incident, "severity", "medium")
         war_room = WarRoom(
             organization_id=org_id or "",
-            name=f"IR: {incident.title[:100]}",
+            name=f"IR: {incident.title}",
             description=f"Auto-created for incident {incident.id}: {incident.title}",
             room_type="incident_response",
             severity_level=severity,
@@ -1192,12 +1215,12 @@ class AutomationService:
                 action="war_room_auto_create",
                 resource_type="war_room",
                 resource_id=str(war_room.id),
-                description=f"Auto-created war room for incident {incident.id}: {war_room.name[:180]}"[:500],
+                description=f"Auto-created war room for incident {incident.id}: {war_room.name}",
                 new_value=json.dumps({
                     "incident_id": str(incident.id),
                     "severity_level": severity,
                     "room_type": "incident_response",
-                })[:2000],
+                }, default=str),
                 success=True,
             ))
             await self.db.flush()
