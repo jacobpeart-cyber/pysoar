@@ -311,9 +311,17 @@ export default function ThreatModeling() {
   const totalModels = modelsQuery.data?.total ?? 0;
   const totalPages = Math.ceil(totalModels / pageSize);
 
-  const components = componentsQuery.data ?? [];
-  const threats = threatsQuery.data?.items ?? [];
-  const mitigations = mitigationsQuery.data ?? [];
+  // Defensive unwrapping: some backend endpoints return paginated
+  // {items: [...], total: N} objects while the frontend types expected
+  // raw arrays. Normalise to an array in all cases so `.map()` is safe.
+  const asArray = <T,>(v: any): T[] => {
+    if (Array.isArray(v)) return v;
+    if (v && Array.isArray(v.items)) return v.items;
+    return [];
+  };
+  const components = asArray<Component>(componentsQuery.data);
+  const threats = asArray<Threat>(threatsQuery.data);
+  const mitigations = asArray<Mitigation>(mitigationsQuery.data);
   const dashboard = dashboardQuery.data;
 
   // ====== Render ======
