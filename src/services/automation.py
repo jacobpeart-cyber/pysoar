@@ -23,13 +23,15 @@ Automation flows:
 
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from sqlalchemy import select, func
+from sqlalchemy import and_, select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.models.alert import Alert
+from src.models.audit import AuditLog
 from src.models.incident import Incident
 from src.intel.models import ThreatIndicator as IOC
 from src.collaboration.models import WarRoom, ActionItem
@@ -65,6 +67,7 @@ class AutomationService:
         results: dict[str, Any] = {
             "alert_id": alert.id,
             "ioc_matches": [],
+            "iocs_extracted": 0,
             "incident_created": None,
             "war_room_created": None,
             "playbooks_triggered": [],
@@ -82,6 +85,21 @@ class AutomationService:
         except Exception as e:
             logger.error(f"IOC matching failed for alert {alert.id}: {e}")
             failures.append({"step": "ioc_matching", "error": str(e)[:300]})
+
+        # Step 1b: Extract + store any new IOCs surfaced by the alert's
+        # text fields. Matching-only (_check_ioc_matches) cannot find IOCs
+        # that haven't been seeded into the TI DB yet, so we harvest them
+        # here with low confidence and let feed enrichment raise it later.
+        try:
+            extracted = await self._extract_and_store_iocs(alert, org_id)
+            results["iocs_extracted"] = len(extracted)
+            if extracted:
+                logger.info(
+                    f"Alert {alert.id} extracted {len(extracted)} new IOCs into threat_indicators"
+                )
+        except Exception as e:
+            logger.error(f"IOC extraction failed for alert {alert.id}: {e}")
+            failures.append({"step": "ioc_extraction", "error": str(e)[:300]})
 
         # Step 2: Auto-create incident for critical/high severity or repeated patterns
         try:
@@ -147,7 +165,7 @@ class AutomationService:
                 source_type="alert",
                 source_id=str(alert.id),
                 activity_type="automation_pipeline",
-                description=f"Automation: {len(results['ioc_matches'])} IOC matches, incident={'yes' if results['incident_created'] else 'no'}, war_room={'yes' if results['war_room_created'] else 'no'}, {len(results['playbooks_triggered'])} playbooks",
+                description=f"Automation: {len(results['ioc_matches'])} IOC matches, {results.get('iocs_extracted', 0)} IOCs extracted, incident={'yes' if results['incident_created'] else 'no'}, war_room={'yes' if results['war_room_created'] else 'no'}, {len(results['playbooks_triggered'])} playbooks",
                 organization_id=org_id,
             )
             self.db.add(activity)
@@ -853,6 +871,229 @@ class AutomationService:
             for m in matches
         ]
 
+    # -----------------------------------------------------------------
+    # IOC extraction regexes — compiled once at class definition time
+    # to avoid re-parsing them on every alert.
+    # -----------------------------------------------------------------
+    _IOC_IPV4_RE = re.compile(
+        r"\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}"
+        r"(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b"
+    )
+    _IOC_IPV6_RE = re.compile(
+        r"\b(?:[0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}\b"
+        r"|\b(?:[0-9a-fA-F]{1,4}:){1,7}:\b"
+        r"|\b(?:[0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}\b"
+    )
+    _IOC_MD5_RE = re.compile(r"\b[a-fA-F0-9]{32}\b")
+    _IOC_SHA1_RE = re.compile(r"\b[a-fA-F0-9]{40}\b")
+    _IOC_SHA256_RE = re.compile(r"\b[a-fA-F0-9]{64}\b")
+    _IOC_URL_RE = re.compile(r"https?://[^\s<>\"{}|\\^`\[\]]+")
+    _IOC_EMAIL_RE = re.compile(
+        r"\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}\b"
+    )
+    _IOC_DOMAIN_RE = re.compile(
+        r"\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}\b"
+    )
+
+    @staticmethod
+    def _is_private_or_reserved_ipv4(value: str) -> bool:
+        """Return True if the IPv4 falls in a private/loopback/link-local
+        range we deliberately skip when extracting IOCs from alert text,
+        so the TI DB doesn't fill up with 10.x / 192.168.x internal hosts.
+        """
+        try:
+            parts = [int(p) for p in value.split(".")]
+            if len(parts) != 4 or any(p < 0 or p > 255 for p in parts):
+                return True
+        except (ValueError, AttributeError):
+            return True
+        a, b, _, _ = parts
+        if value in ("0.0.0.0", "127.0.0.1", "255.255.255.255"):
+            return True
+        if a == 10:
+            return True
+        if a == 127:
+            return True
+        if a == 192 and b == 168:
+            return True
+        if a == 172 and 16 <= b <= 31:
+            return True
+        if a == 169 and b == 254:  # link-local
+            return True
+        if a >= 224:  # multicast & reserved
+            return True
+        return False
+
+    async def _extract_and_store_iocs(
+        self, alert: Alert, org_id: Optional[str]
+    ) -> list[str]:
+        """Scan the alert's text + indicator fields for IOCs and insert
+        any novel ones into ``threat_indicators``.
+
+        Duplicate-safe: before inserting we query for
+        (indicator_type, value, organization_id) and skip if present.
+        All auto-extracted IOCs are saved with confidence=30 (low) so
+        feed enrichment or manual curation can raise it later.
+
+        Returns the list of IDs of newly stored indicators.
+        """
+        # Assemble the text corpus we'll scan with regex
+        text_parts: list[str] = []
+        for field in ("title", "description"):
+            v = getattr(alert, field, None)
+            if v:
+                text_parts.append(str(v))
+        text_blob = "\n".join(text_parts)
+
+        # Severity mapping: high-severity alerts produce high-severity IOCs.
+        alert_sev = (getattr(alert, "severity", None) or "").lower()
+        ioc_sev = "high" if alert_sev in ("critical", "high") else "low"
+
+        candidates: list[tuple[str, str]] = []  # (indicator_type, value)
+
+        # 1) Structured alert fields — these already carry typed semantics,
+        # so we can trust them more than text-regex matches.
+        structured = [
+            ("ip", getattr(alert, "source_ip", None)),
+            ("ip", getattr(alert, "destination_ip", None)),
+            ("domain", getattr(alert, "domain", None)),
+            ("url", getattr(alert, "url", None)),
+            ("hostname", getattr(alert, "hostname", None)),
+        ]
+        for itype, val in structured:
+            if not val:
+                continue
+            val = str(val).strip()
+            if not val:
+                continue
+            if itype == "ip" and self._is_private_or_reserved_ipv4(val):
+                continue
+            candidates.append((itype, val))
+
+        # file_hash: detect by length
+        fh = getattr(alert, "file_hash", None)
+        if fh:
+            fh = str(fh).strip()
+            if len(fh) in (32, 40, 64) and re.fullmatch(r"[a-fA-F0-9]+", fh):
+                candidates.append(("hash", fh))
+
+        # 2) Regex harvest from free-text fields
+        if text_blob:
+            # Hash detection — longer hashes first so a SHA256 isn't
+            # truncated into a SHA1/MD5 match by the shorter regexes.
+            found_hashes: set[str] = set()
+            for m in self._IOC_SHA256_RE.findall(text_blob):
+                found_hashes.add(m)
+                candidates.append(("hash", m))
+            for m in self._IOC_SHA1_RE.findall(text_blob):
+                if m in found_hashes or any(m in h for h in found_hashes):
+                    continue
+                found_hashes.add(m)
+                candidates.append(("hash", m))
+            for m in self._IOC_MD5_RE.findall(text_blob):
+                if m in found_hashes or any(m in h for h in found_hashes):
+                    continue
+                found_hashes.add(m)
+                candidates.append(("hash", m))
+
+            # URLs
+            urls_found: set[str] = set()
+            for m in self._IOC_URL_RE.findall(text_blob):
+                # Trim trailing punctuation commonly attached to URLs in prose
+                u = m.rstrip(".,);]")
+                urls_found.add(u)
+                candidates.append(("url", u))
+
+            # Emails
+            emails_found: set[str] = set()
+            for m in self._IOC_EMAIL_RE.findall(text_blob):
+                emails_found.add(m.lower())
+                candidates.append(("email", m.lower()))
+
+            # IPv4 — skip private/reserved
+            ipv4_found: set[str] = set()
+            for m in self._IOC_IPV4_RE.findall(text_blob):
+                if self._is_private_or_reserved_ipv4(m):
+                    continue
+                ipv4_found.add(m)
+                candidates.append(("ip", m))
+
+            # Domains — filter anything already captured as email, URL, or IP,
+            # and require a non-numeric TLD-ish shape (already in regex).
+            for m in self._IOC_DOMAIN_RE.findall(text_blob):
+                # Skip the domain-half of an email we already captured
+                if any(m in e for e in emails_found):
+                    continue
+                # Skip anything that looks like an IPv4
+                if self._IOC_IPV4_RE.fullmatch(m):
+                    continue
+                # Skip domains that are actually hostnames inside URLs we captured
+                if any(m in u for u in urls_found):
+                    continue
+                # Skip hash-like strings (all-hex) that happen to slip into the
+                # domain pattern (very rare but possible)
+                if re.fullmatch(r"[a-fA-F0-9.]+", m):
+                    continue
+                candidates.append(("domain", m.lower()))
+
+        # De-duplicate candidates before hitting the DB
+        deduped: dict[tuple[str, str], None] = {}
+        for itype, val in candidates:
+            if not val:
+                continue
+            key = (itype, val)
+            if key in deduped:
+                continue
+            deduped[key] = None
+
+        if not deduped:
+            return []
+
+        now = datetime.now(timezone.utc)
+        stored_ids: list[str] = []
+
+        # For each candidate, check if it already exists for this org;
+        # if not, insert. We query one at a time to keep the logic
+        # simple and tenant-scoped — the volume per alert is small.
+        for (itype, val) in deduped.keys():
+            try:
+                existing_q = select(IOC).where(
+                    and_(
+                        IOC.indicator_type == itype,
+                        IOC.value == val,
+                        IOC.organization_id == org_id,
+                    )
+                )
+                existing_res = await self.db.execute(existing_q)
+                existing = existing_res.scalar_one_or_none()
+                if existing is not None:
+                    # Bump last_seen but don't count as newly stored
+                    existing.last_seen = now
+                    continue
+
+                ind = IOC(
+                    indicator_type=itype,
+                    value=val,
+                    source=f"alert:{alert.id}",
+                    confidence=30,
+                    severity=ioc_sev,
+                    first_seen=now,
+                    last_seen=now,
+                    is_active=True,
+                    is_whitelisted=False,
+                    organization_id=org_id,
+                )
+                self.db.add(ind)
+                await self.db.flush()
+                stored_ids.append(ind.id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    f"Failed to store extracted IOC {itype}:{val[:80]} "
+                    f"for alert {alert.id}: {exc}"
+                )
+
+        return stored_ids
+
     async def _auto_create_incident(
         self, alert: Alert, org_id: Optional[str], created_by: Optional[str]
     ) -> Optional[Incident]:
@@ -899,12 +1140,37 @@ class AutomationService:
             alert.incident_id = incident.id
             await self.db.flush()
 
+        # Audit: the automation engine just created this incident. No
+        # human user_id — this is a system-driven mutation.
+        try:
+            self.db.add(AuditLog(
+                user_id=created_by if created_by else None,
+                action="incident_auto_create",
+                resource_type="incident",
+                resource_id=str(incident.id),
+                description=f"Auto-created incident from alert {alert.id}: {incident.title[:200]}"[:500],
+                new_value=json.dumps({
+                    "source_alert_id": str(alert.id),
+                    "severity": severity,
+                    "incident_type": category or "other",
+                })[:2000],
+                success=True,
+            ))
+            await self.db.flush()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Failed to write audit_log for incident_auto_create {incident.id}: {exc}")
+
         return incident
 
     async def _auto_create_war_room(
         self, incident: Incident, alert: Optional[Alert], org_id: Optional[str], created_by: Optional[str]
     ) -> Optional[WarRoom]:
-        """Create war room for critical incidents."""
+        """Create war room for critical incidents.
+
+        Seeds the room with a 6-item default IR checklist so responders
+        land on a populated board. Action items are left unassigned —
+        the incident commander picks them up from the war room UI.
+        """
         severity = getattr(incident, "severity", "medium")
         war_room = WarRoom(
             organization_id=org_id or "",
@@ -918,6 +1184,62 @@ class AutomationService:
         )
         self.db.add(war_room)
         await self.db.flush()
+
+        # Audit: war room auto-created by the automation engine.
+        try:
+            self.db.add(AuditLog(
+                user_id=created_by if created_by else None,
+                action="war_room_auto_create",
+                resource_type="war_room",
+                resource_id=str(war_room.id),
+                description=f"Auto-created war room for incident {incident.id}: {war_room.name[:180]}"[:500],
+                new_value=json.dumps({
+                    "incident_id": str(incident.id),
+                    "severity_level": severity,
+                    "room_type": "incident_response",
+                })[:2000],
+                success=True,
+            ))
+            await self.db.flush()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Failed to write audit_log for war_room_auto_create {war_room.id}: {exc}")
+
+        # Seed the war room with default IR action items. These are
+        # generic enough to apply to any critical incident and give
+        # responders an immediate board to work from.
+        default_actions = [
+            ("Identify initial entry vector", "high"),
+            ("Collect relevant logs from affected hosts", "high"),
+            ("Determine blast radius / lateral movement", "high"),
+            ("Isolate affected systems", "critical"),
+            ("Document findings + preserve evidence", "medium"),
+            ("Brief stakeholders", "medium"),
+        ]
+        assigned_by_val = created_by or "automation_engine"
+        for title, priority in default_actions:
+            try:
+                item = ActionItem(
+                    organization_id=org_id or "",
+                    room_id=war_room.id,
+                    title=title,
+                    assigned_by=assigned_by_val,
+                    assigned_to=None,
+                    priority=priority,
+                    status="pending",
+                    linked_incident_id=str(incident.id) if incident.id else None,
+                )
+                self.db.add(item)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    f"Failed to seed default action item '{title}' for war room {war_room.id}: {exc}"
+                )
+        try:
+            await self.db.flush()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"Flush failed while seeding action items for war room {war_room.id}: {exc}"
+            )
+
         return war_room
 
     async def _auto_trigger_playbooks(self, alert: Alert) -> list[str]:

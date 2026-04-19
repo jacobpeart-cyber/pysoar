@@ -231,12 +231,27 @@ async def execute_playbook(playbook_id: str, execute_data: PlaybookExecuteReques
 
     steps = safe_json_loads(playbook.steps, [])
 
+    # Fold alert_id / incident_id from the request into input_data so
+    # step executors (update_alert, add_comment, isolate_host, etc.) can
+    # resolve the target entity without needing a separate lookup. The
+    # PlaybookExecuteRequest schema accepts both optional fields but
+    # previously we only persisted incident_id on the execution row,
+    # leaving alert-driven playbooks unable to mutate their source alert.
+    input_data = dict(execute_data.input_data or {})
+    if execute_data.alert_id:
+        input_data["alert_id"] = execute_data.alert_id
+        # Fall back to alert_id as the generic target if none set
+        input_data.setdefault("target_id", execute_data.alert_id)
+    if execute_data.incident_id:
+        input_data["incident_id"] = execute_data.incident_id
+        input_data["target_id"] = input_data.get("target_id") or execute_data.incident_id
+
     execution = PlaybookExecution(
         playbook_id=playbook.id,
         incident_id=execute_data.incident_id,
         status=ExecutionStatus.PENDING.value,
         total_steps=len(steps),
-        input_data=json.dumps(execute_data.input_data) if execute_data.input_data else None,
+        input_data=json.dumps(input_data) if input_data else None,
         triggered_by=current_user.id,
         trigger_source="manual",
     )

@@ -68,6 +68,32 @@ class WarRoomManager:
         self.db.add(room)
         await self.db.flush()
         logger.info(f"Created war room {room.id} for incident {incident_id}")
+
+        # Audit trail — record war room creation in the generic audit_logs
+        # table. `created_by` is the actor here; when automation kicks this
+        # off there may not be a human user, so we fall back to `None` which
+        # the AuditLog schema tolerates (nullable user_id).
+        try:
+            from src.models.audit import AuditLog
+            self.db.add(AuditLog(
+                user_id=created_by if created_by and created_by != "system" else None,
+                action="war_room_create",
+                resource_type="war_room",
+                resource_id=str(room.id),
+                description=f"Created war room '{name[:180]}' (type={room_type}, severity={severity_level})"[:500],
+                new_value=json.dumps({
+                    "name": name[:200],
+                    "room_type": room_type,
+                    "severity_level": severity_level,
+                    "incident_id": incident_id,
+                    "organization_id": organization_id,
+                })[:2000],
+                success=True,
+            ))
+            await self.db.flush()
+        except Exception as exc:
+            logger.warning(f"Failed to write audit_log for war_room_create {room.id}: {exc}")
+
         return room
 
     async def join_room(self, room_id: str, user_id: str) -> bool:
