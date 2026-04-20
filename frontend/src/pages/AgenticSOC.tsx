@@ -140,33 +140,26 @@ const AgenticSOC: React.FC = () => {
           try {
             const stepsRes = await api.get(`/agentic/investigations/${invList[0].id}/reasoning-chain`);
             const steps = stepsRes?.data?.steps || [];
-            if (steps.length > 0) {
-              setReasoningChain(
-                steps.map((s: any, idx: number) => ({
-                  step: s.step_number || idx + 1,
-                  stage: s.step_type || 'Analysis',
-                  description: s.thought_process || s.observation || 'Processing',
-                  confidence: s.confidence_delta != null ? Math.max(0, Math.min(100, 80 + (s.confidence_delta || 0))) : 80,
-                }))
-              );
-            } else {
-              // Fallback: derive from investigation data
-              const inv = invList[0];
-              setReasoningChain([
-                { step: 1, stage: 'Observation', description: inv.title || 'Initial detection', confidence: inv.confidence_score || 80 },
-                { step: 2, stage: 'Orientation', description: 'Correlating with threat intelligence and asset data', confidence: 85 },
-                { step: 3, stage: 'Decision', description: 'Recommending containment action based on analysis', confidence: 85 },
-                { step: 4, stage: 'Action', description: 'Awaiting approval to implement recommended actions', confidence: inv.confidence_score || 80 },
-              ]);
-            }
+            // Only render real recorded reasoning steps. Previously the
+            // frontend fabricated a four-step OODA chain with canned
+            // strings ("Correlating with threat intelligence…") and a
+            // fixed +80 confidence floor whenever the backend returned
+            // no steps — customer-facing lie about the agent's actual
+            // reasoning. Show empty-state instead.
+            setReasoningChain(
+              steps.map((s: any, idx: number) => ({
+                step: s.step_number || idx + 1,
+                stage: s.step_type || 'Analysis',
+                description: s.thought_process || s.observation || 'Processing',
+                confidence: typeof s.confidence === 'number'
+                  ? s.confidence
+                  : (typeof s.confidence_delta === 'number'
+                      ? Math.max(0, Math.min(100, s.confidence_delta))
+                      : null),
+              }))
+            );
           } catch {
-            const inv = invList[0];
-            setReasoningChain([
-              { step: 1, stage: 'Observation', description: inv.title || 'Initial detection', confidence: inv.confidence_score || 80 },
-              { step: 2, stage: 'Orientation', description: 'Correlating with threat intelligence and asset data', confidence: 85 },
-              { step: 3, stage: 'Decision', description: 'Recommending containment action based on analysis', confidence: 85 },
-              { step: 4, stage: 'Action', description: 'Awaiting approval to implement recommended actions', confidence: inv.confidence_score || 80 },
-            ]);
+            setReasoningChain([]);
           }
         }
       } catch (err) {
@@ -989,7 +982,14 @@ const AgenticSOC: React.FC = () => {
                           </span>
                         </td>
                         <td className="py-3 px-4 font-medium text-gray-900 dark:text-white">
-                          {approval.confidence_score ?? 'N/A'}
+                          {/* Risk score — falls back to "—" rather than
+                              duplicating Confidence. Previous column
+                              rendered confidence_score in both cells,
+                              labelled Confidence and Risk Score — one
+                              was a lie. */}
+                          {typeof approval.risk_score === 'number'
+                            ? `${approval.risk_score}`
+                            : '—'}
                         </td>
                         <td className="py-3 px-4 text-right">
                           <button

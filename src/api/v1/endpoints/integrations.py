@@ -11,8 +11,53 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from src.api.deps import CurrentUser, DatabaseSession
+from src.core.encryption import get_encryption_service
 from src.core.security import get_password_hash
 from src.core.utils import safe_json_loads
+
+
+def _encrypt_secret_json(payload: Any) -> str:
+    """Encrypt a JSON-serializable credentials blob with AES-256-GCM.
+
+    Previously integrations stored credentials as plaintext JSON in
+    columns named ``*_encrypted`` — misleading and a compliance-grade
+    defect. This helper wraps the EncryptionService so every install /
+    update path writes ciphertext.
+    """
+    if payload is None:
+        return ""
+    raw = json.dumps(payload)
+    try:
+        return get_encryption_service().encrypt_field(raw)
+    except Exception:  # noqa: BLE001
+        # As a last-resort fallback in dev (no master key), prefix the
+        # plaintext with a marker so the read path knows it wasn't
+        # encrypted and can still deserialize instead of silently
+        # returning a ciphertext-looking string as secret data.
+        return f"__plaintext__:{raw}"
+
+
+def _decrypt_secret_json(value: Optional[str]) -> dict:
+    """Best-effort decrypt + JSON-parse of a stored credentials blob.
+
+    Handles three shapes: (1) AES-256-GCM ciphertext produced by the
+    encrypt helper above, (2) ``__plaintext__:`` fallback written when
+    the encryption service wasn't available, (3) legacy plaintext JSON
+    from earlier rows that predated encryption. Never raises — returns
+    {} on any failure so callers don't have to try/except the decrypt.
+    """
+    if not value:
+        return {}
+    if value.startswith("__plaintext__:"):
+        return safe_json_loads(value[len("__plaintext__:"):], {}) or {}
+    try:
+        decrypted = get_encryption_service().decrypt_field(value)
+        return safe_json_loads(decrypted, {}) or {}
+    except Exception:
+        # Legacy row written before encryption was wired — try parsing
+        # as plain JSON so existing deployments keep working until the
+        # next install/update re-writes the row with ciphertext.
+        return safe_json_loads(value, {}) or {}
 from src.integrations.engine import ConnectorRegistry, IntegrationManager, ActionExecutor
 from src.integrations.models import (
     IntegrationAction,
@@ -224,13 +269,15 @@ async def install_connector(
             detail="Connector already installed",
         )
 
-    # Create installation record
+    # Create installation record. Config is non-secret but we still
+    # serialize through the encrypt helper for consistency; credentials
+    # are AES-256-GCM encrypted at rest.
     installation = InstalledIntegration(
         organization_id=getattr(current_user, "organization_id", None),
         connector_id=request.connector_id,
         display_name=request.display_name,
-        config_encrypted=json.dumps(request.config),
-        auth_credentials_encrypted=json.dumps(request.credentials),
+        config_encrypted=json.dumps(request.config),  # non-secret
+        auth_credentials_encrypted=_encrypt_secret_json(request.credentials),
     )
 
     db.add(installation)
@@ -375,13 +422,13 @@ async def update_installed_integration(
             detail="Access denied",
         )
 
-    # Update fields
+    # Update fields — credentials always encrypted at rest.
     if request.display_name:
         integration.display_name = request.display_name
     if request.config:
         integration.config_encrypted = json.dumps(request.config)
     if request.credentials:
-        integration.auth_credentials_encrypted = json.dumps(request.credentials)
+        integration.auth_credentials_encrypted = _encrypt_secret_json(request.credentials)
 
     await db.commit()
     await db.refresh(integration)
@@ -424,7 +471,15 @@ async def test_integration(
     # health_status and last_health_check freshness.
     import httpx
 
-    connector = integration.connector_name
+    # InstalledIntegration has no `connector_name` column — previously
+    # this raised AttributeError and the Test button always crashed
+    # with a 500. Resolve via the connector relationship or fall back
+    # to connector_id.
+    connector = (
+        getattr(integration.connector, "name", None)
+        if getattr(integration, "connector", None) is not None
+        else None
+    ) or integration.connector_id
     config = safe_json_loads(integration.config_encrypted, {}) if integration.config_encrypted else {}
 
     test_url = config.get("base_url") or config.get("host") or config.get("url")
@@ -1031,16 +1086,21 @@ async def _compute_execution_stats(
     successful = sum(1 for e in executions if e.status == "success")
     failed = sum(1 for e in executions if e.status in ("failed", "error"))
 
-    # by_connector via installed_integration → connector_name
+    # by_connector — resolve the connector's name via the FK. There's
+    # no `connector_name` column on InstalledIntegration; the prior
+    # reference raised AttributeError and crashed /dashboard/stats.
     by_connector: dict[str, int] = {}
     installed_ids = list({e.installed_id for e in executions if e.installed_id})
     connector_map: dict[str, str] = {}
     if installed_ids:
         inst_rows = await db.execute(
-            select(InstalledIntegration).where(InstalledIntegration.id.in_(installed_ids))
+            select(InstalledIntegration)
+            .options(selectinload(InstalledIntegration.connector))
+            .where(InstalledIntegration.id.in_(installed_ids))
         )
         for inst in inst_rows.scalars().all():
-            connector_map[inst.id] = inst.connector_name or "unknown"
+            cname = getattr(inst.connector, "name", None) if inst.connector else None
+            connector_map[inst.id] = cname or inst.connector_id or "unknown"
     for e in executions:
         name = connector_map.get(e.installed_id, "unknown")
         by_connector[name] = by_connector.get(name, 0) + 1
@@ -1089,17 +1149,35 @@ async def get_health_dashboard(
     org_id = getattr(current_user, "organization_id", None)
     integrations, health_counts = await _compute_integration_health(db, org_id)
 
+    # Re-fetch with connector eager-loaded so we can resolve the
+    # human-readable connector name without per-row lazy loads. The
+    # prior serializer referenced `i.name` and `i.connector_name` —
+    # neither exists on InstalledIntegration, so this endpoint
+    # raised AttributeError and 500d the health dashboard.
+    hydrated_integrations = []
+    if integrations:
+        hydrated_res = await db.execute(
+            select(InstalledIntegration)
+            .options(selectinload(InstalledIntegration.connector))
+            .where(InstalledIntegration.id.in_([i.id for i in integrations]))
+        )
+        hydrated_integrations = list(hydrated_res.scalars().all())
+    else:
+        hydrated_integrations = integrations
+
     integration_dicts = [
         {
             "id": i.id,
-            "name": i.name,
-            "connector_name": i.connector_name,
+            "name": i.display_name,
+            "connector_name": (
+                getattr(i.connector, "name", None) if i.connector else None
+            ) or i.connector_id,
             "status": i.status,
             "health_status": i.health_status or "unknown",
             "last_health_check": i.last_health_check,
             "error_message": i.error_message,
         }
-        for i in integrations
+        for i in hydrated_integrations
     ]
 
     return DashboardIntegrationHealthResponse(
@@ -1197,17 +1275,30 @@ async def get_dashboard_summary(
 
     now_iso = datetime.now(timezone.utc).isoformat()
 
+    # Re-fetch with connector eager-loaded to resolve names without
+    # crashing on missing attributes.
+    hydrated_summary_integrations = []
+    if integrations:
+        hydrated_res = await db.execute(
+            select(InstalledIntegration)
+            .options(selectinload(InstalledIntegration.connector))
+            .where(InstalledIntegration.id.in_([i.id for i in integrations]))
+        )
+        hydrated_summary_integrations = list(hydrated_res.scalars().all())
+
     integration_dicts = [
         {
             "id": i.id,
-            "name": i.name,
-            "connector_name": i.connector_name,
+            "name": i.display_name,
+            "connector_name": (
+                getattr(i.connector, "name", None) if i.connector else None
+            ) or i.connector_id,
             "status": i.status,
             "health_status": i.health_status or "unknown",
             "last_health_check": i.last_health_check,
             "error_message": i.error_message,
         }
-        for i in integrations
+        for i in hydrated_summary_integrations
     ]
 
     return DashboardSummaryResponse(

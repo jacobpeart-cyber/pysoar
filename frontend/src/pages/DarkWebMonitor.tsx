@@ -78,10 +78,43 @@ export default function DarkWebMonitor() {
         ]);
         const alerts: any = alertsData;
         const creds: any = credentialsData;
-        setMonitors(Array.isArray(monitorsData) ? monitorsData : []);
-        setFindings(Array.isArray(alerts) ? alerts : (alerts?.items || []));
-        setCredentials(Array.isArray(creds) ? creds : (creds?.items || []));
-        setThreats(Array.isArray(brandData) ? brandData : []);
+        // Normalize backend snake_case fields to the camelCase shape
+        // this page uses. Previously every finding, monitor, and
+        // credential rendered fields like `discoveryDate`, `platform`,
+        // `email`, `source` that don't exist on the response — so the
+        // "New Findings" card always showed 0, tables rendered blank
+        // columns, and filters matched nothing.
+        const normMonitor = (m: any) => ({
+          ...m,
+          keyword: m.keyword ?? (Array.isArray(m.search_terms) ? m.search_terms.join(', ') : ''),
+          lastScan: m.lastScan ?? m.last_scanned_at ?? m.last_scan_at ?? null,
+          findingsCount: m.findingsCount ?? m.findings_count ?? 0,
+          darkWebSources: m.darkWebSources ?? m.sources ?? m.platforms ?? [],
+          createdDate: m.createdDate ?? m.created_at ?? null,
+        });
+        const normFinding = (f: any) => ({
+          ...f,
+          discoveryDate: f.discoveryDate ?? f.discovered_date ?? f.discovered_at ?? null,
+          title: f.title ?? f.name ?? f.finding_type ?? '—',
+          platform: f.platform ?? f.source_platform ?? f.source ?? '—',
+        });
+        const normCred = (c: any) => ({
+          ...c,
+          email: c.email ?? c.username ?? c.identifier ?? '—',
+          source: c.source ?? c.source_platform ?? c.breach_source ?? '—',
+        });
+        const normThreat = (t: any) => ({
+          ...t,
+          threat: t.threat ?? t.target_brand ?? t.finding ?? '—',
+          status: t.status ?? t.takedown_status ?? 'active',
+          discoveryDate: t.discoveryDate ?? t.discovered_date ?? t.discovered_at ?? null,
+          takedownAttempts: t.takedownAttempts ?? t.takedown_attempts ?? 0,
+          resolutionDate: t.resolutionDate ?? t.resolved_at ?? null,
+        });
+        setMonitors(Array.isArray(monitorsData) ? monitorsData.map(normMonitor) : []);
+        setFindings((Array.isArray(alerts) ? alerts : (alerts?.items || [])).map(normFinding));
+        setCredentials((Array.isArray(creds) ? creds : (creds?.items || [])).map(normCred));
+        setThreats(Array.isArray(brandData) ? brandData.map(normThreat) : []);
       } catch (error) {
         console.error('Error loading dark web data:', error);
       } finally {
@@ -92,9 +125,17 @@ export default function DarkWebMonitor() {
   }, []);
 
   const activeMonitors = monitors.filter(m => m.status === 'active').length;
-  const newFindings = findings.filter(f => new Date(f.discoveryDate || "") > new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)).length;
+  const newFindings = findings.filter(f => {
+    const when = f.discoveryDate ?? f.discovered_date ?? f.discovered_at;
+    if (!when) return false;
+    const t = new Date(when).getTime();
+    return Number.isFinite(t) && t > Date.now() - 7 * 24 * 60 * 60 * 1000;
+  }).length;
   const exposedCredentials = credentials.length;
-  const brandThreats = threats.filter(t => t.status === 'active').length;
+  const brandThreats = threats.filter(t => {
+    const s = t.status ?? t.takedown_status;
+    return s === 'active' || s === 'pending';
+  }).length;
 
   const tabs = [
     { id: 'monitors', label: 'Monitors', icon: Eye },
@@ -103,24 +144,12 @@ export default function DarkWebMonitor() {
     { id: 'brand-threats', label: 'Brand Threats', icon: Shield },
   ];
 
-  const filteredMonitors = monitors.filter(m =>
-    m.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-    m.keyword.toLowerCase().includes(searchQuery.toLowerCase())
-  );
-
-  const filteredFindings = findings.filter(f =>
-    f.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
-    f.platform.toLowerCase().includes(searchQuery.toLowerCase())
-  );
-
-  const filteredCredentials = credentials.filter(c =>
-    c.email.toLowerCase().includes(searchQuery.toLowerCase()) ||
-    c.source.toLowerCase().includes(searchQuery.toLowerCase())
-  );
-
-  const filteredThreats = threats.filter(t =>
-    t.threat.toLowerCase().includes(searchQuery.toLowerCase())
-  );
+  const q = searchQuery.toLowerCase();
+  const match = (v: any) => (v ?? '').toString().toLowerCase().includes(q);
+  const filteredMonitors = monitors.filter(m => match(m.name) || match(m.keyword));
+  const filteredFindings = findings.filter(f => match(f.title) || match(f.platform));
+  const filteredCredentials = credentials.filter(c => match(c.email) || match(c.source));
+  const filteredThreats = threats.filter(t => match(t.threat));
 
   return (
     <div className="min-h-screen bg-gray-50 dark:bg-gray-900 text-gray-900 dark:text-gray-100">
