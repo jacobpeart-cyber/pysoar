@@ -134,6 +134,27 @@ export default function Incidents() {
     }
   };
 
+  // Move an incident through the IR lifecycle: open -> investigating ->
+  // containment -> eradication -> recovery -> closed. The backend auto-
+  // stamps contained_at / resolved_at when the status flips. Previously
+  // there was no way to change status from the list view — analysts had
+  // to hit the API directly, which defeats the purpose of a SOC UI.
+  const handleStatusChange = async (id: string, nextStatus: string) => {
+    // Optimistic local update so the badge snaps immediately.
+    setIncidents((prev) =>
+      prev.map((i) => (i.id === id ? { ...i, status: nextStatus } : i)),
+    );
+    try {
+      await incidentsApi.update(id, { status: nextStatus });
+      showToast('success', `Status → ${nextStatus.replace(/_/g, ' ')}`);
+    } catch (error) {
+      console.error('Failed to update incident status:', error);
+      showToast('error', 'Failed to update status');
+      // Rollback on failure.
+      fetchIncidents(false);
+    }
+  };
+
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
 
   return (
@@ -306,9 +327,27 @@ export default function Incidents() {
                       </span>
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap">
-                      <span className={clsx('inline-flex px-2.5 py-0.5 rounded-full text-xs font-medium capitalize', statusColors[incident.status] || statusColors.open)}>
-                        {(incident.status || '').replace(/_/g, ' ')}
-                      </span>
+                      <select
+                        value={incident.status || 'open'}
+                        onChange={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          handleStatusChange(incident.id, e.target.value);
+                        }}
+                        onClick={(e) => e.stopPropagation()}
+                        className={clsx(
+                          'text-xs font-medium rounded-full capitalize px-2.5 py-1 border-0 focus:ring-2 focus:ring-blue-500 cursor-pointer',
+                          statusColors[incident.status] || statusColors.open,
+                        )}
+                        title="Change incident status"
+                      >
+                        <option value="open">Open</option>
+                        <option value="investigating">Investigating</option>
+                        <option value="containment">Containment</option>
+                        <option value="eradication">Eradication</option>
+                        <option value="recovery">Recovery</option>
+                        <option value="closed">Closed</option>
+                      </select>
                     </td>
                     <td className="px-6 py-4 text-xs text-gray-500 dark:text-gray-400 whitespace-nowrap">
                       {((incident as any).incident_type || '').replace(/_/g, ' ') || '—'}

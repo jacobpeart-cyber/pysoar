@@ -14,7 +14,6 @@ import {
   CheckCircle,
   CheckSquare,
   Square,
-  MoreVertical,
 } from 'lucide-react';
 import clsx from 'clsx';
 

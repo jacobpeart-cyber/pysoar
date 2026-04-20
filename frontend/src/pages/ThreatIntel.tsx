@@ -34,17 +34,25 @@ interface ThreatFeed {
   status: 'active' | 'error' | 'disabled';
 }
 
+interface LookupSource {
+  name: string;
+  verdict: string;
+  last_seen: string;
+  details: Record<string, unknown>;
+}
+
 interface IOCLookupResult {
   indicator: string;
   type: string;
   reputation: 'malicious' | 'suspicious' | 'clean' | 'unknown';
   confidence: number;
-  sources: Array<{
-    name: string;
-    verdict: string;
-    last_seen: string;
-    details: Record<string, unknown>;
-  }>;
+  sources: LookupSource[];
+  // Real enrichment hits from VirusTotal / AbuseIPDB when integrations
+  // are installed. The backend returns these under external_sources —
+  // they were previously declared but never rendered, so free VT data
+  // was silently dropped.
+  external_sources?: LookupSource[];
+  external_errors?: Array<{ source: string; error: string }>;
   tags: string[];
   first_seen: string | null;
   last_seen: string | null;
@@ -219,15 +227,25 @@ export default function ThreatIntel() {
 
   const iocQueryParams = useMemo(() => {
     const params: Record<string, string | number> = { page: iocPage, size: 50 };
-    if (iocTypeFilter !== 'all') params.indicator_type = iocTypeFilter;
-    // Reputation -> backend severity: malicious maps to high OR critical,
-    // suspicious to medium, clean to low/informational. The backend only
-    // supports a single severity value filter, so pick the most common one.
+    // Backend accepts CSV for indicator_type and severity so each UI
+    // choice covers all matching DB values (ipv4+ipv6+ip, high+critical
+    // for "malicious" etc.) — previously the filter excluded large
+    // portions of rows because it did strict equality.
+    if (iocTypeFilter !== 'all') {
+      const typeMap: Record<string, string> = {
+        ip: 'ip,ipv4,ipv6',
+        domain: 'domain',
+        url: 'url',
+        hash: 'md5,sha1,sha256,hash',
+        email: 'email',
+      };
+      params.indicator_type = typeMap[iocTypeFilter] ?? iocTypeFilter;
+    }
     if (iocReputationFilter !== 'all') {
       params.severity =
-        iocReputationFilter === 'malicious' ? 'high'
+        iocReputationFilter === 'malicious' ? 'critical,high'
         : iocReputationFilter === 'suspicious' ? 'medium'
-        : 'low';
+        : 'low,informational';
     }
     return params;
   }, [iocPage, iocTypeFilter, iocReputationFilter]);
@@ -577,6 +595,59 @@ export default function ThreatIntel() {
                   ))}
                 </div>
               </div>
+
+              {/* External enrichment (VirusTotal, AbuseIPDB, etc.) —
+                  only rendered when the installed integrations actually
+                  returned data, so the panel is honest about coverage. */}
+              {((lookupMutation.data?.external_sources?.length ?? 0) > 0 ||
+                (lookupMutation.data?.external_errors?.length ?? 0) > 0) && (
+                <div className="p-6 border-t border-gray-200 dark:border-gray-700">
+                  <h4 className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-4">
+                    External Enrichment ({lookupMutation.data?.external_sources?.length ?? 0})
+                  </h4>
+                  <div className="space-y-3">
+                    {lookupMutation.data?.external_sources?.map((source, idx) => (
+                      <div
+                        key={`ext-${idx}`}
+                        className="p-3 bg-blue-50 dark:bg-blue-900/20 border border-blue-100 dark:border-blue-900 rounded-lg"
+                      >
+                        <div className="flex items-center justify-between">
+                          <p className="text-sm font-medium text-gray-900 dark:text-white">
+                            {source.name}
+                          </p>
+                          <span
+                            className={clsx(
+                              'px-2 py-1 text-xs font-medium rounded',
+                              source.verdict === 'malicious'
+                                ? 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400'
+                                : source.verdict === 'suspicious'
+                                ? 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400'
+                                : source.verdict === 'clean'
+                                ? 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400'
+                                : 'bg-gray-100 text-gray-700 dark:bg-gray-600 dark:text-gray-300'
+                            )}
+                          >
+                            {source.verdict}
+                          </span>
+                        </div>
+                        {source.details && Object.keys(source.details).length > 0 && (
+                          <pre className="mt-2 text-xs text-gray-600 dark:text-gray-400 whitespace-pre-wrap break-all">
+                            {JSON.stringify(source.details, null, 2)}
+                          </pre>
+                        )}
+                      </div>
+                    ))}
+                    {lookupMutation.data?.external_errors?.map((err, idx) => (
+                      <div
+                        key={`err-${idx}`}
+                        className="p-3 bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-100 dark:border-yellow-900 rounded-lg text-xs text-yellow-800 dark:text-yellow-300"
+                      >
+                        <strong>{err.source}:</strong> {err.error}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           )}
 

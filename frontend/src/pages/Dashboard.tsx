@@ -103,19 +103,32 @@ export default function Dashboard() {
   const [isLoading, setIsLoading] = useState(true);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+  // Track which data sources failed so the dashboard shows a visible
+  // degraded state rather than silently rendering zeros. Previously
+  // every data call used .catch(() => EMPTY_STATS) which made a backend
+  // outage look identical to a green, empty platform.
+  const [fetchErrors, setFetchErrors] = useState<string[]>([]);
 
   const fetchData = useCallback(async (showSpinner: boolean) => {
     if (showSpinner) setIsLoading(true);
     else setIsRefreshing(true);
 
+    const errors: string[] = [];
+    const capture = <T,>(label: string, fallback: T) =>
+      (p: Promise<T>) =>
+        p.catch((err) => {
+          errors.push(`${label}: ${err?.message || 'request failed'}`);
+          return fallback;
+        });
+
     try {
       const [alertStats, incidentStats, alertsList, incidentsList, iocsList, playbooksList] = await Promise.all([
-        alertsApi.getStats().catch(() => EMPTY_ALERT_STATS),
-        incidentsApi.getStats().catch(() => EMPTY_INCIDENT_STATS),
-        alertsApi.list({ size: 5 }).catch(() => ({ items: [], total: 0 })),
-        incidentsApi.list({ size: 5 }).catch(() => ({ items: [], total: 0 })),
-        iocsApi.list({ size: 1 }).catch(() => ({ total: 0 })),
-        playbooksApi.list({ size: 1 }).catch(() => ({ total: 0 })),
+        capture('Alert stats', EMPTY_ALERT_STATS)(alertsApi.getStats()),
+        capture('Incident stats', EMPTY_INCIDENT_STATS)(incidentsApi.getStats()),
+        capture('Recent alerts', { items: [], total: 0 })(alertsApi.list({ size: 5 })),
+        capture('Recent incidents', { items: [], total: 0 })(incidentsApi.list({ size: 5 })),
+        capture('IOC count', { total: 0 })(iocsApi.list({ size: 1 })),
+        capture('Playbook count', { total: 0 })(playbooksApi.list({ size: 1 })),
       ]);
 
       setStats({ alerts: alertStats, incidents: incidentStats });
@@ -124,8 +137,10 @@ export default function Dashboard() {
       setIocCount(iocsList.total || 0);
       setPlaybookCount(playbooksList.total || 0);
       setLastUpdated(new Date());
+      setFetchErrors(errors);
     } catch (error) {
       console.error('Failed to fetch dashboard data:', error);
+      setFetchErrors([`Dashboard fetch: ${(error as Error)?.message || 'unknown error'}`]);
     } finally {
       setIsLoading(false);
       setIsRefreshing(false);
@@ -183,6 +198,21 @@ export default function Dashboard() {
 
   return (
     <div className="space-y-6">
+      {fetchErrors.length > 0 && (
+        <div className="rounded-lg border border-red-300 bg-red-50 dark:bg-red-900/20 dark:border-red-800 p-3 flex items-start gap-3">
+          <AlertTriangle className="w-5 h-5 text-red-600 dark:text-red-400 flex-shrink-0 mt-0.5" />
+          <div className="flex-1 text-sm">
+            <p className="font-medium text-red-800 dark:text-red-300">
+              Dashboard data partially unavailable — {fetchErrors.length} source{fetchErrors.length === 1 ? '' : 's'} failed
+            </p>
+            <ul className="mt-1 text-red-700 dark:text-red-400 list-disc list-inside">
+              {fetchErrors.map((e, i) => (
+                <li key={i}>{e}</li>
+              ))}
+            </ul>
+          </div>
+        </div>
+      )}
       <div className="flex items-start justify-between gap-4">
         <div>
           <h1 className="text-2xl font-bold text-gray-900 dark:text-white">Dashboard</h1>

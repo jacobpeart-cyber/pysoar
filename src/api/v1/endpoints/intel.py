@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 import httpx
-from fastapi import APIRouter, Path, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Path, HTTPException, Query, status
 from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -690,7 +690,26 @@ async def list_threat_feeds(
 
     query = query.offset((page - 1) * size).limit(size).order_by(desc(ThreatFeed.created_at))
     result = await db.execute(query)
-    items = result.scalars().all()
+    items = list(result.scalars().all())
+
+    # Overlay the live indicator count from the join table so the Feeds
+    # tab shows real numbers even when the counter column drifted (it
+    # only gets incremented inside FeedManager.poll_feed — if rows were
+    # bulk-imported by a different path the counter was stale). We
+    # expunge first so the override doesn't flush back on commit.
+    if items:
+        feed_ids = [f.id for f in items]
+        live_counts_res = await db.execute(
+            select(ThreatIndicator.feed_id, func.count(ThreatIndicator.id))
+            .where(ThreatIndicator.feed_id.in_(feed_ids))
+            .group_by(ThreatIndicator.feed_id)
+        )
+        live_counts = {row[0]: row[1] for row in live_counts_res.all()}
+        for feed in items:
+            live = live_counts.get(feed.id, 0)
+            if live != (feed.total_indicators or 0):
+                db.expunge(feed)
+                feed.total_indicators = live
 
     return ThreatFeedListResponse(items=items, total=total, page=page, size=size, pages=pages)
 
@@ -774,44 +793,79 @@ async def delete_threat_feed(
 
 @router.post("/feeds/{feed_id}/poll", response_model=None, operation_id="poll_threat_feed")
 async def poll_threat_feed(
+    background_tasks: BackgroundTasks,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     feed_id: str = Path(...),
 ) -> dict:
-    """
-    Trigger a manual poll of a threat feed.
+    """Trigger a real poll of a threat feed.
 
-    Requires admin privileges.
+    Previously this only stamped ``last_poll_at`` without actually
+    fetching. The frontend Sync button was a no-op; ``total_indicators``
+    never grew. This now dispatches ``FeedManager.poll_feed(feed_id)``
+    as a background task so the HTTP response returns immediately while
+    the ingestion runs against its own session and writes real rows
+    into ``threat_indicators``.
     """
-    # Use current_user directly (admin check handled by dependency injection)
-
     result = await db.execute(
-        select(ThreatFeed).where(
-            ThreatFeed.id == feed_id
-        )
+        select(ThreatFeed).where(ThreatFeed.id == feed_id)
     )
     feed = result.scalars().first()
     if not feed:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Feed not found")
+    if not feed.is_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Feed is disabled — enable before polling",
+        )
 
+    # Snapshot trigger timestamp on the request's session so the UI
+    # reflects the click even before the background job finishes.
     feed.last_poll_at = datetime.now(timezone.utc)
     await db.flush()
-    await db.refresh(feed)
 
-    return {"status": "poll_scheduled", "feed_id": feed_id}
+    async def _run_poll(fid: str) -> None:
+        try:
+            from src.intel.feeds import FeedManager
+            count = await FeedManager().poll_feed(fid)
+            import logging
+            logging.getLogger(__name__).info(
+                "Threat feed poll completed", extra={"feed_id": fid, "new_indicators": count}
+            )
+        except Exception as exc:  # noqa: BLE001
+            import logging
+            logging.getLogger(__name__).error(
+                "Threat feed poll failed: %s", exc, extra={"feed_id": fid}, exc_info=True
+            )
+
+    background_tasks.add_task(_run_poll, feed_id)
+
+    return {
+        "status": "poll_started",
+        "feed_id": feed_id,
+        "feed_name": feed.name,
+        "message": (
+            "Feed ingestion dispatched. Indicators will appear within "
+            "seconds for small feeds, minutes for large ones. Re-check "
+            "total_indicators or the IOC DB tab after the job finishes."
+        ),
+    }
 
 
 @router.post("/feeds/{feed_id}/sync", response_model=None, operation_id="sync_threat_feed")
 async def sync_threat_feed(
+    background_tasks: BackgroundTasks,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     feed_id: str = Path(...),
 ) -> dict:
-    """
-    Trigger a sync (alias for poll) of a threat feed.
-    The frontend calls /feeds/{feed_id}/sync.
-    """
-    return await poll_threat_feed(current_user=current_user, db=db, feed_id=feed_id)
+    """Sync is an alias of poll. Wired through the same real ingestion path."""
+    return await poll_threat_feed(
+        background_tasks=background_tasks,
+        current_user=current_user,
+        db=db,
+        feed_id=feed_id,
+    )
 
 
 @router.post("/feeds/register-builtins", response_model=None, operation_id="register_builtin_feeds")
@@ -1010,15 +1064,28 @@ async def list_indicators(
     sort_by: str = "created_at",
     sort_order: str = "desc",
 ) -> ThreatIndicatorListResponse:
-    """
-    List threat indicators with advanced filtering and pagination.
+    """List threat indicators with advanced filtering and pagination.
+
+    ``indicator_type`` and ``severity`` accept a CSV of values so one
+    UI filter can cover IP family variations (``ip,ipv4,ipv6``) and
+    severity bands (``high,critical`` for "malicious"). Previously
+    these were strict equality, which left ipv6 + critical rows
+    unreachable from the Reputation filter.
     """
     query = select(ThreatIndicator)
 
     if indicator_type:
-        query = query.where(ThreatIndicator.indicator_type == indicator_type)
+        type_values = [t.strip() for t in indicator_type.split(",") if t.strip()]
+        if len(type_values) == 1:
+            query = query.where(ThreatIndicator.indicator_type == type_values[0])
+        elif type_values:
+            query = query.where(ThreatIndicator.indicator_type.in_(type_values))
     if severity:
-        query = query.where(ThreatIndicator.severity == severity)
+        sev_values = [s.strip() for s in severity.split(",") if s.strip()]
+        if len(sev_values) == 1:
+            query = query.where(ThreatIndicator.severity == sev_values[0])
+        elif sev_values:
+            query = query.where(ThreatIndicator.severity.in_(sev_values))
     if tlp:
         query = query.where(ThreatIndicator.tlp == tlp)
     if is_active is not None:
