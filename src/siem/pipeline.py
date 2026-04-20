@@ -68,7 +68,13 @@ async def process_log(
     parsed_fields = parsed.get("parsed_fields", {})
     detected_type = parsed.get("source_type", source_type or "unknown")
     message = parsed.get("message", raw_log[:500])
-    timestamp = parsed.get("timestamp", datetime.now(timezone.utc).isoformat())
+    # Some parsers explicitly set timestamp=None when the source line
+    # had no parseable date (e.g. syslog header without a year). dict.get
+    # only substitutes the default when the key is *missing*, so we need
+    # an explicit None-check to avoid `None.isoformat()` later.
+    timestamp = parsed.get("timestamp")
+    if not timestamp:
+        timestamp = datetime.now(timezone.utc).isoformat()
 
     # --- Step 2: Normalize ---
     try:
@@ -97,7 +103,10 @@ async def process_log(
         source_type=detected_type,
         source_name=source_name or "unknown",
         source_ip=source_ip or "0.0.0.0",
-        timestamp=timestamp if isinstance(timestamp, str) else timestamp.isoformat(),
+        timestamp=(
+            timestamp if isinstance(timestamp, str)
+            else (timestamp.isoformat() if timestamp is not None else datetime.now(timezone.utc).isoformat())
+        ),
         received_at=datetime.now(timezone.utc).isoformat(),
         log_type=log_type,
         severity=severity,
