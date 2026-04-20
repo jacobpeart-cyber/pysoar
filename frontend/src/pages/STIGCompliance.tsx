@@ -119,9 +119,31 @@ export default function STIGCompliance() {
       const params = new URLSearchParams();
       if (platformFilter !== 'all') params.append('platform', platformFilter);
       try {
-      const response = await api.get(`/stig/benchmarks?${params}`);
-      return response.data;
-      } catch { return null; }
+        const response = await api.get(`/stig/benchmarks?${params}`);
+        // Backend emits snake_case (`total_rules`, `category_1_count`,
+        // `last_scanned_at`). The UI interface uses camelCase and a
+        // nested `findings` map keyed by "CAT I/II/III". Normalize
+        // here so benchmark cards render real numbers instead of
+        // `undefined` placeholders.
+        const raw = response.data;
+        const list = Array.isArray(raw) ? raw : (raw?.items ?? raw?.benchmarks ?? []);
+        return list.map((b: any) => ({
+          id: b.id ?? '',
+          name: b.name ?? 'Unknown Benchmark',
+          platform: b.platform ?? b.os ?? '',
+          version: b.version ?? '',
+          totalRules: b.total_rules ?? b.totalRules ?? 0,
+          findings: {
+            'CAT I': b.category_1_count ?? b.findings?.['CAT I'] ?? 0,
+            'CAT II': b.category_2_count ?? b.findings?.['CAT II'] ?? 0,
+            'CAT III': b.category_3_count ?? b.findings?.['CAT III'] ?? 0,
+          },
+          lastScanDate: b.last_scanned_at ?? b.last_scan_date ?? b.lastScanDate ?? '',
+        }));
+      } catch (err) {
+        console.error('Failed to load benchmarks:', err);
+        return null;
+      }
     },
   });
 
@@ -176,14 +198,37 @@ export default function STIGCompliance() {
 
   const autoRemediateMutation = useMutation({
     mutationFn: async (params: { scan_result_id: string; categories: string[] }) => {
+      // Backend remediator matches on severity = high/medium/low (or
+      // critical). Frontend uses STIG CAT I/II/III labels. Translate
+      // before dispatch — previously we sent "CAT I" and matched zero
+      // rules, so Auto-Remediate always reported "remediated: 0".
+      const catMap: Record<string, string> = {
+        'CAT I': 'high',
+        'CAT II': 'medium',
+        'CAT III': 'low',
+      };
+      const severities = (params.categories || [])
+        .map((c) => catMap[c] ?? c.toLowerCase())
+        .filter(Boolean);
       try {
-      const response = await api.post('/stig/remediate/auto', params);
-      return response.data;
-      } catch { return null; }
+        const response = await api.post('/stig/remediate/auto', {
+          scan_result_id: params.scan_result_id,
+          categories: severities,
+        });
+        return response.data;
+      } catch (err) {
+        console.error('Auto-remediate failed:', err);
+        return null;
+      }
     },
-    onSuccess: () => {
+    onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ['stig-remediations'] });
       queryClient.invalidateQueries({ queryKey: ['stig-dashboard'] });
+      if (data && typeof data === 'object') {
+        const remediated = (data as any).remediated ?? 0;
+        const awaiting = (data as any).awaiting_integration ?? 0;
+        alert(`Auto-remediate dispatched: ${remediated} rules submitted, ${awaiting} awaiting integration.`);
+      }
     },
   });
 
