@@ -373,37 +373,49 @@ export default function Remediation() {
       return <LoadingState />;
     }
 
+    // All values come from the backend aggregate query. Previously the
+    // `||` fallbacks substituted fabricated numbers like '1,247' / '94.2'
+    // on a cold system — customers saw fake operational metrics before
+    // any real remediation had ever run. Show honest zeros or '—'.
+    const fmt = (v: unknown, fallback: string = '0') =>
+      v === undefined || v === null ? fallback : String(v);
+
+    const pendingApprovalsNum = typeof dashboardData?.pending_approvals === 'number'
+      ? dashboardData.pending_approvals
+      : 0;
+    const successRate = dashboardData?.overall_success_rate ?? dashboardData?.success_rate;
+    const avgMinutes = dashboardData?.avg_execution_minutes ?? dashboardData?.avg_remediation_time;
+
     const stats: StatCard[] = [
       {
         label: 'Total Executions',
-        value: dashboardData?.total_executions || '1,247',
+        value: fmt(dashboardData?.total_executions),
         icon: <Activity className="w-6 h-6 text-blue-500" />,
-        trend: '+12.5%',
       },
       {
         label: 'Success Rate',
-        value: `${dashboardData?.overall_success_rate ?? dashboardData?.success_rate ?? '94.2'}%`,
+        value: successRate !== undefined && successRate !== null ? `${successRate}%` : '—',
         icon: <CheckCircle2 className="w-6 h-6 text-green-500" />,
       },
       {
         label: 'Pending Approvals',
-        value: dashboardData?.pending_approvals || '3',
+        value: fmt(pendingApprovalsNum),
         icon: <AlertCircle className="w-6 h-6 text-yellow-500" />,
-        badge: dashboardData?.pending_approvals || 3,
+        badge: pendingApprovalsNum || undefined,
       },
       {
         label: 'Avg Remediation Time',
-        value: `${dashboardData?.avg_execution_minutes ?? dashboardData?.avg_remediation_time ?? '2.4'}m`,
+        value: avgMinutes !== undefined && avgMinutes !== null ? `${avgMinutes}m` : '—',
         icon: <Clock className="w-6 h-6 text-orange-500" />,
       },
       {
         label: 'Active Policies',
-        value: dashboardData?.active_policies || '28',
+        value: fmt(dashboardData?.active_policies),
         icon: <Shield className="w-6 h-6 text-purple-500" />,
       },
       {
         label: 'Actions Today',
-        value: dashboardData?.actions_today || '47',
+        value: fmt(dashboardData?.actions_today),
         icon: <Zap className="w-6 h-6 text-amber-500" />,
       },
     ];
@@ -974,26 +986,47 @@ export default function Remediation() {
                             <h4 className="font-semibold text-gray-900 dark:text-white">
                               Action Results
                             </h4>
-                            <div className="space-y-2">
-                              <div className="flex items-center gap-2">
-                                <CheckSquare className="w-4 h-4 text-green-600" />
-                                <span className="text-sm text-gray-700 dark:text-gray-300">
-                                  Block IP: 192.168.1.100
-                                </span>
-                              </div>
-                              <div className="flex items-center gap-2">
-                                <CheckSquare className="w-4 h-4 text-green-600" />
-                                <span className="text-sm text-gray-700 dark:text-gray-300">
-                                  Update Firewall Rules
-                                </span>
-                              </div>
-                              <div className="flex items-center gap-2">
-                                <XSquare className="w-4 h-4 text-red-600" />
-                                <span className="text-sm text-gray-700 dark:text-gray-300">
-                                  Notify SOC Team
-                                </span>
-                              </div>
-                            </div>
+                            {/* Render the actual actions_completed /
+                                actions_failed arrays from the execution
+                                record. Previously this rendered a
+                                hardcoded "Block IP: 192.168.1.100 /
+                                Update Firewall Rules / Notify SOC
+                                Team" trio for every expanded row,
+                                regardless of what the playbook actually
+                                ran — a decorative demo display. */}
+                            {(() => {
+                              const completed = Array.isArray(execution.actions_completed) ? execution.actions_completed : [];
+                              const failed = Array.isArray((execution as any).actions_failed) ? (execution as any).actions_failed : [];
+                              if (completed.length === 0 && failed.length === 0) {
+                                return (
+                                  <p className="text-sm text-gray-500 dark:text-gray-400">
+                                    No action results recorded for this execution.
+                                  </p>
+                                );
+                              }
+                              const renderItem = (entry: any, ok: boolean, idx: number) => {
+                                const label =
+                                  typeof entry === 'string'
+                                    ? entry
+                                    : entry?.action || entry?.name || entry?.title || JSON.stringify(entry);
+                                return (
+                                  <div key={`${ok ? 'ok' : 'err'}-${idx}`} className="flex items-center gap-2">
+                                    {ok ? (
+                                      <CheckSquare className="w-4 h-4 text-green-600" />
+                                    ) : (
+                                      <XSquare className="w-4 h-4 text-red-600" />
+                                    )}
+                                    <span className="text-sm text-gray-700 dark:text-gray-300">{label}</span>
+                                  </div>
+                                );
+                              };
+                              return (
+                                <div className="space-y-2">
+                                  {completed.map((e, i) => renderItem(e, true, i))}
+                                  {failed.map((e, i) => renderItem(e, false, i))}
+                                </div>
+                              );
+                            })()}
                           </div>
                         </td>
                       </tr>
@@ -1436,21 +1469,31 @@ export default function Remediation() {
               e.preventDefault();
               const fd = new FormData(e.currentTarget);
               try {
+                // Previous payload sent `enabled` (backend expects
+                // `is_enabled`) and `action_type`+`action_config` keys
+                // that the schema drops, leaving the new policy with
+                // an empty actions list — created but non-functional.
+                // Send matching field names + a single concrete action
+                // derived from policy_type so the policy actually runs.
+                const policyType = String(fd.get('policy_type') || 'auto_block');
+                const severity = String(fd.get('severity') || 'critical');
                 await api.post('/remediation/policies', {
                   name: fd.get('name'),
                   description: fd.get('description'),
-                  policy_type: fd.get('policy_type'),
+                  policy_type: policyType,
                   trigger_type: fd.get('trigger_type'),
-                  trigger_conditions: { severity: fd.get('severity') || 'critical' },
-                  action_type: fd.get('policy_type'),
-                  action_config: {},
-                  enabled: true,
+                  trigger_conditions: { severity },
+                  actions: [{ type: policyType, params: {} }],
+                  is_enabled: true,
                   priority: 50,
                   cooldown_minutes: 15,
                 });
                 setShowCreatePolicyModal(false);
                 queryClient.invalidateQueries({ queryKey: ['remediation-policies'] });
-              } catch (err: any) { console.error('Create policy failed:', err); }
+              } catch (err: any) {
+                console.error('Create policy failed:', err);
+                alert(`Create policy failed: ${err?.response?.data?.detail || err?.message || 'unknown error'}`);
+              }
             }}>
               <div>
                 <label className="block text-sm font-medium mb-1">Policy Name</label>

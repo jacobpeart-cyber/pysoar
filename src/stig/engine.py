@@ -372,7 +372,14 @@ class STIGRemediator:
             )
             rules = await self.session.scalars(stmt)
 
-            remediated = 0
+            # Count "remediated" honestly — _apply_fix only logs an
+            # attempt to TicketActivity; it does not actually execute a
+            # fix on the target host. Split the counter into "attempted"
+            # (fix_text exists, attempt logged) and "awaiting_integration"
+            # (no fix_text, so nothing to dispatch) so the UI stops
+            # reporting real remediations that didn't happen.
+            attempted = 0
+            awaiting_integration = 0
             failed = 0
             actions = []
 
@@ -381,24 +388,38 @@ class STIGRemediator:
                     finding = scan.findings[rule.rule_id]
                     if finding.get("status") == "open":
                         result = await self._apply_fix(rule, scan.target_host)
-                        if result.get("success"):
-                            remediated += 1
+                        status_ = result.get("status")
+                        if status_ == "attempted":
+                            attempted += 1
+                        elif status_ == "skipped_no_fix":
+                            awaiting_integration += 1
                         else:
                             failed += 1
                         actions.append(result)
 
             logger.info(
-                f"Auto-remediation complete: {remediated} fixed, {failed} failed"
+                f"Auto-remediation complete: attempted={attempted} "
+                f"awaiting_integration={awaiting_integration} failed={failed}"
             )
 
             return {
                 "scan_id": scan_result_id,
                 "host": scan.target_host,
                 "total_findings": len(scan.findings),
-                "remediated": remediated,
+                # `remediated` kept for UI compatibility — represents
+                # rules whose fix_text was logged to the ticket activity
+                # and is ready for an orchestrator to dispatch.
+                "remediated": attempted,
+                "attempted": attempted,
+                "awaiting_integration": awaiting_integration,
                 "failed": failed,
-                "actions": actions[:20],  # Top 20
+                "actions": actions[:20],
                 "status": "completed",
+                "note": (
+                    "Fix attempts are logged; actual host-side execution "
+                    "requires an external orchestrator or agent to apply "
+                    "the recorded fix_text."
+                ),
             }
 
         except Exception as e:

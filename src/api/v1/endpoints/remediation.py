@@ -1535,15 +1535,163 @@ async def execute_playbook(
     db: DatabaseSession = None,
     current_user = Depends(get_current_active_user),
 ):
-    """Execute a playbook."""
+    """Execute a playbook against a real target and persist the run.
+
+    Previously returned ``{"status": "queued"}`` with no execution row
+    ever written. The playbook appeared to run but no side effect was
+    captured, no actions dispatched, no audit trail. This now creates
+    a ``RemediationExecution`` for the playbook's action set, fans out
+    to ``_execute_remediation_action`` for each step, and records
+    ``actions_completed`` / ``actions_failed`` on the row.
+    """
     playbook = await db.get(RemediationPlaybook, playbook_id)
     if not playbook or playbook.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    if not playbook.is_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Playbook is disabled",
+        )
+
+    target_entity = str(
+        trigger_data.get("target_entity")
+        or trigger_data.get("target")
+        or trigger_data.get("ip_address")
+        or trigger_data.get("hostname")
+        or "unspecified"
+    )
+    target_type = str(trigger_data.get("target_type") or "host")
+
+    execution = RemediationExecution(
+        policy_id=None,
+        trigger_source=str(trigger_data.get("trigger_source") or "manual"),
+        trigger_id=trigger_data.get("trigger_id"),
+        trigger_details={"playbook_id": playbook_id, **(trigger_data or {})},
+        status="running",
+        started_at=utc_now(),
+        target_entity=target_entity,
+        target_type=target_type,
+        actions_planned=list(playbook.steps or []),
+        actions_completed=[],
+        current_action_index=0,
+        metrics={},
+        created_by=str(current_user.id),
+        organization_id=getattr(current_user, "organization_id", None),
+    )
+    db.add(execution)
+    await db.flush()
+
+    # Map playbook step types to an integration_type we look up on the
+    # RemediationIntegration table. Action types we can't map fall
+    # through to 'awaiting_integration' so the execution row carries
+    # honest state.
+    _ACTION_TO_INT_TYPE: dict[str, str] = {
+        "auto_block": "firewall",
+        "block_ip": "firewall",
+        "block_domain": "firewall",
+        "auto_isolate": "edr",
+        "isolate_host": "edr",
+        "auto_quarantine": "edr",
+        "quarantine_file": "edr",
+        "auto_disable": "idp",
+        "disable_account": "idp",
+        "reset_password": "idp",
+        "revoke_token": "idp",
+    }
+
+    async def _pick_integration(action_key: str):
+        int_type = _ACTION_TO_INT_TYPE.get(action_key)
+        if not int_type:
+            return None
+        from src.remediation.models import RemediationIntegration
+        res = await db.execute(
+            select(RemediationIntegration).where(
+                RemediationIntegration.integration_type == int_type,
+                RemediationIntegration.is_enabled == True,
+                RemediationIntegration.organization_id == getattr(current_user, "organization_id", None),
+            ).limit(1)
+        )
+        return res.scalars().first()
+
+    actions_completed: list[dict] = []
+    actions_failed: list[dict] = []
+    for idx, step in enumerate(playbook.steps or []):
+        if not isinstance(step, dict):
+            actions_failed.append({"index": idx, "error": "malformed step", "step": step})
+            continue
+        step_type = str(step.get("action_type") or step.get("type") or playbook.playbook_type or "custom")
+        params = step.get("params") or step.get("action_config") or {}
+        try:
+            integration = await _pick_integration(step_type)
+            if integration is None:
+                actions_completed.append({
+                    "index": idx,
+                    "action": step_type,
+                    "status": "awaiting_integration",
+                    "details": f"No enabled integration installed for action type '{step_type}'.",
+                })
+            else:
+                success, detail, response_body = await _dispatch_via_integration(
+                    integration,
+                    action=step_type,
+                    payload={"target": target_entity, "target_type": target_type, **params},
+                )
+                (actions_completed if success else actions_failed).append({
+                    "index": idx,
+                    "action": step_type,
+                    "status": "success" if success else "failed",
+                    "integration": integration.name,
+                    "detail": detail,
+                    "response": response_body,
+                })
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"Playbook step {idx} failed: {exc}", exc_info=True)
+            actions_failed.append({
+                "index": idx,
+                "action": step_type,
+                "error": str(exc),
+            })
+        execution.current_action_index = idx + 1
+
+    execution.actions_completed = actions_completed
+    if actions_failed:
+        execution.metrics = {"actions_failed": actions_failed}
+    execution.completed_at = utc_now()
+    if actions_failed and actions_completed:
+        execution.status = "completed"
+        execution.overall_result = "partial_success"
+    elif actions_failed:
+        execution.status = "failed"
+        execution.overall_result = "failure"
+        execution.error_message = "; ".join(
+            f"{a.get('action', '?')}: {a.get('error', '?')}" for a in actions_failed
+        )[:2000]
+    else:
+        execution.status = "completed"
+        execution.overall_result = "success"
+
+    # Playbook-level metrics so the Playbooks tab shows honest counters.
+    try:
+        if execution.overall_result == "success":
+            playbook.success_count = (playbook.success_count or 0) + 1
+        elif execution.overall_result == "failure":
+            playbook.failure_count = (playbook.failure_count or 0) + 1
+        playbook.last_executed_at = utc_now()
+    except Exception:  # noqa: BLE001
+        pass
+
+    await db.flush()
+    await db.refresh(execution)
 
     return {
         "playbook_id": playbook_id,
-        "status": "queued",
-        "triggered_at": utc_now().isoformat(),
+        "execution_id": execution.id,
+        "status": execution.status,
+        "overall_result": execution.overall_result,
+        "actions_completed": len(actions_completed),
+        "actions_failed": len(actions_failed),
+        "started_at": execution.started_at.isoformat() if execution.started_at else None,
+        "completed_at": execution.completed_at.isoformat() if execution.completed_at else None,
     }
 
 

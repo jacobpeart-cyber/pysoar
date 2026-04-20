@@ -1218,16 +1218,22 @@ async def get_score_history(
     result = await db.execute(stmt)
     assessments = result.scalars().all()
 
-    history = [
-        {
-            "date": a.assessment_date.isoformat(),
+    # Previous formula used `satisfied_count / findings_count` where
+    # findings_count is typically the failure count — that produced
+    # inverted scores (more failures = higher score). Use control_count
+    # when available, else satisfied+failed as the denominator.
+    history = []
+    for a in assessments:
+        denom = (a.control_count or 0) or ((a.satisfied_count or 0) + (a.findings_count or 0))
+        score = round((a.satisfied_count or 0) / denom * 100, 2) if denom > 0 else 0.0
+        history.append({
+            "date": a.assessment_date.isoformat() if a.assessment_date else None,
             "framework_id": a.framework_id,
-            "score": (a.satisfied_count / a.findings_count * 100)
-            if a.findings_count > 0
-            else 0,
-        }
-        for a in assessments
-    ]
+            "score": score,
+            "satisfied": a.satisfied_count or 0,
+            "failed": a.findings_count or 0,
+            "controls": a.control_count or denom,
+        })
 
     return {
         "history": history,

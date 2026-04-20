@@ -166,6 +166,25 @@ export default function ZeroTrustDashboard() {
   });
   const devices: Device[] = Array.isArray(devicesRaw) ? devicesRaw : (devicesRaw?.devices || devicesRaw?.items || []);
 
+  // Real access decisions feed — previously the Access Control tab
+  // received a hardcoded `[]` for recentDecisions so the live decisions
+  // table was always empty despite /zerotrust/decisions returning real
+  // rows.
+  const { data: accessDecisionsRaw, isLoading: accessDecisionsLoading } = useQuery<any>({
+    queryKey: ['zerotrust-decisions', 'access-control'],
+    queryFn: async () => {
+      try {
+        const response = await api.get('/zerotrust/decisions', { params: { size: 50 } });
+        return response.data;
+      } catch {
+        return null;
+      }
+    },
+  });
+  const accessDecisions: AccessDecision[] = Array.isArray(accessDecisionsRaw)
+    ? accessDecisionsRaw
+    : (accessDecisionsRaw?.decisions || accessDecisionsRaw?.items || []);
+
   const { data: segmentsRaw, isLoading: segmentsLoading } = useQuery<any>({
     queryKey: ['zerotrust-segments'],
     queryFn: async () => {
@@ -310,9 +329,9 @@ export default function ZeroTrustDashboard() {
       {/* Access Control Tab */}
       {activeTab === 'access-control' && (
         <AccessControlTab
-          recentDecisions={[]}
+          recentDecisions={accessDecisions}
           accessDecisions24h={{ allowed: dashboardData?.allowed_decisions || 0, denied: dashboardData?.denied_decisions || 0, challenged: dashboardData?.challenged_decisions || 0 }}
-          loading={dashboardLoading}
+          loading={dashboardLoading || accessDecisionsLoading}
           decisionFilter={decisionFilter}
           setDecisionFilter={setDecisionFilter}
           onEvaluateAccess={(data) => evaluateAccessMutation.mutate(data)}

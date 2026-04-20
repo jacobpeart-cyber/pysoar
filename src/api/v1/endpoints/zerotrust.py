@@ -4,7 +4,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, Response, status
+from fastapi import APIRouter, Body, HTTPException, Query, Response, status
 from sqlalchemy import and_, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -527,19 +527,31 @@ async def get_device_stats(
 
 @router.post("/assess-devices", response_model=None)
 async def assess_all_devices(
+    payload: dict = Body(default_factory=dict),
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
 ) -> dict[str, Any]:
-    """Trigger assessment of all devices"""
+    """Trigger assessment of devices.
+
+    Accepts an optional ``device_ids`` filter in the body; when
+    provided, only those devices are reassessed. Previously the body
+    was ignored, so the UI's "Re-assess" button on a single device
+    actually kicked off a full org-wide assessment — misleading and
+    potentially expensive.
+    """
     org_id = getattr(current_user, "organization_id", None)
     assessor = DeviceTrustAssessor(db, org_id)
 
-    result = await db.execute(
-        select(DeviceTrustProfile.device_id).where(
-            DeviceTrustProfile.organization_id == org_id
+    requested_ids = payload.get("device_ids") if isinstance(payload, dict) else None
+    if isinstance(requested_ids, list) and requested_ids:
+        device_ids = [str(d) for d in requested_ids if d]
+    else:
+        result = await db.execute(
+            select(DeviceTrustProfile.device_id).where(
+                DeviceTrustProfile.organization_id == org_id
+            )
         )
-    )
-    device_ids = [row[0] for row in result.all()]
+        device_ids = [row[0] for row in result.all()]
 
     assessed = 0
     failed = 0
@@ -554,6 +566,7 @@ async def assess_all_devices(
         "assessed": assessed,
         "failed": failed,
         "total": len(device_ids),
+        "filtered": bool(requested_ids),
     }
 
 
