@@ -866,18 +866,28 @@ async def _dispatch_via_integration(
     """
     import httpx
 
+    # RemediationIntegration stores connection info in `endpoint_url`
+    # and credentials in `auth_config`. The previous code referenced
+    # nonexistent `config_encrypted`/`auth_credentials_encrypted`
+    # columns (those live on InstalledIntegration) so every remediation
+    # dispatch silently fell through to the "base_url not configured"
+    # branch regardless of what the admin had saved.
     try:
-        config = json.loads(integration.config_encrypted or "{}")
-    except (json.JSONDecodeError, TypeError):
+        config = dict(integration.auth_config) if integration.auth_config else {}
+    except Exception:
         config = {}
-    try:
-        credentials = json.loads(integration.auth_credentials_encrypted or "{}")
-    except (json.JSONDecodeError, TypeError):
-        credentials = {}
-
-    base_url = (config.get("base_url") or config.get("url") or config.get("endpoint_url") or "").rstrip("/")
+    credentials = config  # auth_config holds both endpoint metadata and creds
+    endpoint_url = (
+        integration.endpoint_url
+        or config.get("endpoint_url")
+        or config.get("base_url")
+        or config.get("url")
+        or ""
+    )
+    base_url = endpoint_url.rstrip("/") if endpoint_url else ""
     if not base_url:
-        return False, f"{integration.connector_id} base_url not configured", {}
+        integration_label = integration.vendor or integration.integration_type or "integration"
+        return False, f"{integration_label} base_url not configured", {}
 
     api_key = credentials.get("api_key") or credentials.get("token")
     bearer = credentials.get("bearer_token") or credentials.get("access_token")
@@ -893,7 +903,7 @@ async def _dispatch_via_integration(
     # payload to <base>/remediation/<action> because every vendor
     # in our shortlist exposes a JSON endpoint, and that is the
     # shape our generic_firewall / generic_edr connectors expect.
-    connector = (integration.connector_id or "").lower()
+    connector = ((integration.vendor or integration.integration_type or "integration") or "").lower()
     suffix_map = {
         "crowdstrike": f"/devices/entities/devices-actions/v2?action_name={action}",
         "sentinelone": f"/web/api/v2.1/agents/actions/{action}",
