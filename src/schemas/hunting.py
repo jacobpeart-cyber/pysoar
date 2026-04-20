@@ -64,17 +64,43 @@ class HuntHypothesisCreate(HuntHypothesisBase):
 
 
 class HuntHypothesisUpdate(BaseModel):
-    """Schema for updating a hunt hypothesis"""
+    """Schema for updating a hunt hypothesis.
+
+    The Base schema coerces string priority labels ('critical', 'high',
+    'medium', 'low', 'info') into 1..5 ints, but Update used a stricter
+    `int` field which rejected the labels the frontend actually sends.
+    Accept `Any` here and reuse the same validator so UI buttons like
+    "Raise priority to Critical" work.
+    """
 
     title: Optional[str] = Field(None, min_length=1, max_length=500)
     description: Optional[str] = None
-    priority: Optional[int] = Field(None, ge=1, le=5)
+    priority: Optional[Any] = None
     hunt_type: Optional[str] = None
     mitre_tactics: Optional[list[str]] = None
     mitre_techniques: Optional[list[str]] = None
     data_sources: Optional[list[str]] = None
     expected_evidence: Optional[list[str]] = None
     tags: Optional[list[str]] = None
+
+    @field_validator("priority", mode="before")
+    @classmethod
+    def parse_priority(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, int):
+            if 1 <= v <= 5:
+                return v
+            return 3
+        if isinstance(v, str):
+            mapping = {"CRITICAL": 1, "HIGH": 2, "MEDIUM": 3, "LOW": 4, "INFO": 5}
+            if v.upper() in mapping:
+                return mapping[v.upper()]
+            try:
+                return int(v)
+            except ValueError:
+                return 3
+        return 3
 
 
 class HuntHypothesisResponse(HuntHypothesisBase, DBModel):

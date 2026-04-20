@@ -676,7 +676,10 @@ async def run_stride_analysis(
                 likelihood=threat_data["likelihood"],
                 impact=threat_data["impact"],
                 risk_score=risk_score,
+                # Both CWE and MITRE ATT&CK IDs persist so analysts can
+                # pivot from a threat to detection rules / hunts.
                 cwe_ids=threat_data.get("cwe_ids", []),
+                mitre_technique_ids=threat_data.get("mitre_techniques", []),
                 status=ThreatStatus.IDENTIFIED.value,
             )
             db.add(threat_record)

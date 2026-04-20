@@ -82,7 +82,8 @@ class STRIDEAnalyzer:
         ],
     }
 
-    # Generic threat descriptions
+    # Generic fallback descriptions (used only when no component-specific
+    # text is available; see COMPONENT_THREAT_TEXTS below).
     THREAT_DESCRIPTIONS = {
         STRIDECategory.SPOOFING: "Attacker impersonates a user, service, or system component",
         STRIDECategory.TAMPERING: "Attacker modifies data or code during transmission or at rest",
@@ -90,6 +91,124 @@ class STRIDEAnalyzer:
         STRIDECategory.INFORMATION_DISCLOSURE: "Sensitive information is exposed to unauthorized parties",
         STRIDECategory.DENIAL_OF_SERVICE: "System unavailability or performance degradation due to attack",
         STRIDECategory.ELEVATION_OF_PRIVILEGE: "Low-privilege user gains higher-level access",
+    }
+
+    # Component-specific threat (description, attack_vectors) by (component_type, STRIDE category).
+    # These replace the generic THREAT_DESCRIPTIONS so a threat generated
+    # against an `api_endpoint` differs from one generated against a
+    # `database` — which is the whole point of component-driven STRIDE.
+    COMPONENT_THREAT_TEXTS = {
+        # ------- API endpoint -------
+        (ComponentType.API_ENDPOINT.value, STRIDECategory.SPOOFING): (
+            "Attacker forges or steals an API token (JWT, session cookie, API key) and "
+            "invokes {name} as a legitimate caller.",
+            ["JWT/session token theft", "API key leak from client code", "OAuth refresh-token replay", "Host header spoofing to bypass SSO"],
+        ),
+        (ComponentType.API_ENDPOINT.value, STRIDECategory.TAMPERING): (
+            "Attacker tampers with request parameters, body, or headers against {name} "
+            "to change its behavior (IDOR, parameter pollution, request smuggling).",
+            ["Parameter pollution", "HTTP request smuggling", "IDOR on resource IDs", "Unsigned payload tampering"],
+        ),
+        (ComponentType.API_ENDPOINT.value, STRIDECategory.REPUDIATION): (
+            "Requests to {name} are not attributable to an authenticated caller, "
+            "or access logs can be altered after the fact.",
+            ["Missing caller identity in access log", "Log tampering via service account", "No request_id correlation"],
+        ),
+        (ComponentType.API_ENDPOINT.value, STRIDECategory.INFORMATION_DISCLOSURE): (
+            "{name} leaks sensitive data in responses, error stacks, or side channels.",
+            ["Verbose error messages leaking stack traces", "Unauthorized data in response body", "Timing side-channel on auth checks"],
+        ),
+        (ComponentType.API_ENDPOINT.value, STRIDECategory.DENIAL_OF_SERVICE): (
+            "{name} is exhausted by unbounded request volume or expensive queries.",
+            ["Unbounded request volume / no rate limit", "Expensive query with attacker-controlled filter", "Slowloris/keepalive exhaustion"],
+        ),
+        (ComponentType.API_ENDPOINT.value, STRIDECategory.ELEVATION_OF_PRIVILEGE): (
+            "Calls to {name} bypass role checks and execute privileged actions as a lower-privilege user.",
+            ["Missing authorization on admin routes", "Role check only on frontend", "Parameter-based privilege granting"],
+        ),
+        # ------- Database / data store -------
+        (ComponentType.DATABASE.value, STRIDECategory.TAMPERING): (
+            "Attacker injects SQL or writes unauthorized rows into {name}, corrupting data.",
+            ["SQL injection through unsanitized input", "Unauthorized DML via overly-broad grants", "Schema tampering via ALTER privileges"],
+        ),
+        (ComponentType.DATABASE.value, STRIDECategory.INFORMATION_DISCLOSURE): (
+            "Attacker extracts sensitive rows from {name} through unauthorized queries or backup theft.",
+            ["Blind SQL injection data exfiltration", "Stolen DB backup / snapshot", "Shared read-only credentials leak"],
+        ),
+        (ComponentType.DATABASE.value, STRIDECategory.DENIAL_OF_SERVICE): (
+            "Attacker runs expensive queries or fills {name} to exhaustion.",
+            ["Cartesian join / pathological query", "Unbounded insert volume", "Table-space exhaustion"],
+        ),
+        (ComponentType.DATA_STORE.value, STRIDECategory.TAMPERING): (
+            "Attacker modifies objects in {name} (S3 bucket / NFS share / config store).",
+            ["Bucket policy misconfiguration", "Writable config store", "Stored file overwrite via signed-URL replay"],
+        ),
+        (ComponentType.DATA_STORE.value, STRIDECategory.INFORMATION_DISCLOSURE): (
+            "{name} exposes stored objects publicly or to overly-broad principals.",
+            ["Public bucket / open ACL", "Over-permissioned IAM role", "Missing server-side encryption"],
+        ),
+        (ComponentType.DATA_STORE.value, STRIDECategory.DENIAL_OF_SERVICE): (
+            "{name} is exhausted by unbounded writes or cost-amplifying requests.",
+            ["Cost-amplifying request pattern", "Unbounded log ingestion", "Object-count quota exhaustion"],
+        ),
+        # ------- Data flow (network leg) -------
+        (ComponentType.DATA_FLOW.value, STRIDECategory.TAMPERING): (
+            "Data on {name} is modified in transit by an on-path attacker.",
+            ["Missing/invalid TLS", "TLS downgrade", "Cert pinning bypass", "Network MitM on unprotected leg"],
+        ),
+        (ComponentType.DATA_FLOW.value, STRIDECategory.INFORMATION_DISCLOSURE): (
+            "Traffic on {name} is intercepted and decoded.",
+            ["Plaintext transport", "Weak cipher suite", "Traffic capture at ISP / lateral network"],
+        ),
+        (ComponentType.DATA_FLOW.value, STRIDECategory.REPUDIATION): (
+            "Messages on {name} lack signatures or provenance, so origin can't be proven.",
+            ["No mTLS", "No message signature", "No sequence numbers / replay-protection"],
+        ),
+        # ------- External entity -------
+        (ComponentType.EXTERNAL_ENTITY.value, STRIDECategory.SPOOFING): (
+            "An attacker impersonates the external party {name} (partner / third-party service).",
+            ["Domain spoofing / typosquatting partner", "Forged webhook signature", "Stolen vendor API key"],
+        ),
+        (ComponentType.EXTERNAL_ENTITY.value, STRIDECategory.REPUDIATION): (
+            "Actions taken by or on behalf of {name} cannot be linked back to the real external party.",
+            ["No webhook signing", "Shared service account across vendors", "Anonymous email from external domain"],
+        ),
+        # ------- Trust boundary -------
+        (ComponentType.TRUST_BOUNDARY.value, STRIDECategory.SPOOFING): (
+            "An attacker crosses {name} by presenting a trust token the boundary accepts without revalidation.",
+            ["Over-broad service-account trust", "Replayed internal JWT past boundary", "SSRF into trusted network"],
+        ),
+        (ComponentType.TRUST_BOUNDARY.value, STRIDECategory.ELEVATION_OF_PRIVILEGE): (
+            "An attacker inside the lower-trust zone of {name} escalates into the higher-trust zone.",
+            ["Network pivot via misconfigured firewall rule", "Shared database role across zones", "Internal endpoint exposed without auth"],
+        ),
+        # ------- Service (generic backend) -------
+        (ComponentType.SERVICE.value, STRIDECategory.ELEVATION_OF_PRIVILEGE): (
+            "A caller of {name} exploits a missing role check to perform privileged actions.",
+            ["Missing RBAC", "Privileged action behind same endpoint as read", "Deserialization RCE"],
+        ),
+        (ComponentType.SERVICE.value, STRIDECategory.DENIAL_OF_SERVICE): (
+            "{name} is saturated by unbounded requests, memory leaks, or slow downstream calls.",
+            ["Unbounded queue / no backpressure", "Amplification via expensive downstream call", "Memory leak under sustained load"],
+        ),
+        # ------- Process -------
+        (ComponentType.PROCESS.value, STRIDECategory.TAMPERING): (
+            "An attacker modifies the running {name} process binary or its in-memory state.",
+            ["Code injection", "DLL side-loading / LD_PRELOAD", "Process hollowing"],
+        ),
+        (ComponentType.PROCESS.value, STRIDECategory.ELEVATION_OF_PRIVILEGE): (
+            "{name} runs with more privilege than it needs; a compromise escalates access.",
+            ["Running as root/SYSTEM unnecessarily", "Setuid / capability over-grant", "Container escape via shared kernel"],
+        ),
+        # ------- Message queue -------
+        (ComponentType.MESSAGE_QUEUE.value, STRIDECategory.TAMPERING): (
+            "Messages in {name} are modified or replayed by an attacker who reaches the broker.",
+            ["Unsigned message bodies", "Replay of captured messages", "Queue poisoning with malformed body"],
+        ),
+        (ComponentType.MESSAGE_QUEUE.value, STRIDECategory.INFORMATION_DISCLOSURE): (
+            "Messages in {name} are readable by principals that shouldn't see them.",
+            ["Over-broad queue read ACL", "Plaintext messages with PII", "Dead-letter queue exposure"],
+        ),
     }
 
     # Common CWE mappings for STRIDE categories
@@ -108,70 +227,140 @@ class STRIDEAnalyzer:
 
     def analyze_component(self, component: ThreatModelComponent) -> list[dict]:
         """
-        Analyze single component for STRIDE threats
-
-        Args:
-            component: Component to analyze
-
-        Returns:
-            List of threat dictionaries
+        Analyze a single component for STRIDE threats. Threats are
+        component-type-specific (an api_endpoint's Spoofing threat is
+        "JWT/session theft" — not the same generic text as every other
+        component). Likelihood / impact are computed from the component's
+        `trust_level` and `data_classification`.
         """
-        threats = []
+        threats: list[dict] = []
         component_type = component.component_type
+        component_name = getattr(component, "name", None) or component_type
 
-        # Get applicable STRIDE categories for this component type
+        # Only the STRIDE categories that actually apply to this component
+        # type are used — the THREAT_PATTERNS table encodes Microsoft's
+        # standard mapping (a data store legitimately has no "Spoofing"
+        # threat in STRIDE).
         stride_categories = self.THREAT_PATTERNS.get(
             component_type,
             list(STRIDECategory),
         )
 
-        for category in stride_categories:
-            # Derive likelihood from trust_level
-            trust_level = getattr(component, "trust_level", None) or ""
-            if trust_level.lower() in ("external", "untrusted"):
-                likelihood = LikelihoodLevel.HIGH.value
-            else:
-                likelihood = LikelihoodLevel.MEDIUM.value
+        trust_level = (getattr(component, "trust_level", None) or "").lower()
+        classification = (getattr(component, "data_classification", None) or "").lower()
 
-            # Derive impact from component_type
-            if component_type in (ComponentType.DATABASE.value, ComponentType.DATA_STORE.value):
-                impact = ImpactLevel.HIGH.value
-            else:
-                impact = ImpactLevel.MEDIUM.value
+        # Likelihood rises when the component sits at an untrusted boundary
+        # (user-facing APIs, external entities) and falls for internal
+        # authenticated code paths.
+        if trust_level in ("external", "untrusted", "public"):
+            likelihood = LikelihoodLevel.HIGH.value
+        elif trust_level in ("authenticated", "internal"):
+            likelihood = LikelihoodLevel.MEDIUM.value
+        elif trust_level in ("privileged", "admin"):
+            likelihood = LikelihoodLevel.LOW.value
+        else:
+            likelihood = LikelihoodLevel.MEDIUM.value
+
+        # Base impact is HIGH for data stores / databases — a compromise
+        # there tends to mean data breach. Everything else starts MEDIUM.
+        if component_type in (ComponentType.DATABASE.value, ComponentType.DATA_STORE.value):
+            base_impact = ImpactLevel.HIGH.value
+        else:
+            base_impact = ImpactLevel.MEDIUM.value
+
+        # Data classification escalates impact — a PUBLIC-labelled component
+        # drops one tier, CONFIDENTIAL/RESTRICTED/PII rises one tier.
+        def _bump_impact(current: str, direction: int) -> str:
+            ladder = [
+                ImpactLevel.VERY_LOW.value,
+                ImpactLevel.LOW.value,
+                ImpactLevel.MEDIUM.value,
+                ImpactLevel.HIGH.value,
+                ImpactLevel.VERY_HIGH.value,
+            ]
+            if current not in ladder:
+                return current
+            idx = max(0, min(len(ladder) - 1, ladder.index(current) + direction))
+            return ladder[idx]
+
+        if any(tag in classification for tag in ("public",)):
+            base_impact = _bump_impact(base_impact, -1)
+        elif any(tag in classification for tag in ("confidential", "restricted", "pii", "phi", "secret")):
+            base_impact = _bump_impact(base_impact, +1)
+
+        for category in stride_categories:
+            # Information disclosure threats always scale with data classification.
+            impact = base_impact
+            if category == STRIDECategory.INFORMATION_DISCLOSURE and any(
+                tag in classification for tag in ("confidential", "restricted", "pii", "phi", "secret")
+            ):
+                impact = _bump_impact(impact, +1)
+
+            # Resolve component-specific text + attack vectors if available,
+            # otherwise fall back to generic vectors. Description is
+            # .format()'d with the component name so every row is anchored
+            # to a real target, not a nameless abstraction.
+            key = (component_type, category)
+            template_text, template_vectors = self.COMPONENT_THREAT_TEXTS.get(
+                key,
+                (self.THREAT_DESCRIPTIONS[category], self._generic_vectors(category)),
+            )
+            description = template_text.format(name=component_name)
 
             threat = {
                 "category": category.value,
-                "description": self.THREAT_DESCRIPTIONS[category],
+                "description": description,
                 "component_id": component.id,
                 "component_type": component_type,
+                "component_name": component_name,
                 "technology": component.technology_stack,
                 "likelihood": likelihood,
                 "impact": impact,
                 "cwe_ids": self.CWE_MAPPINGS.get(category, []),
-                "attack_vectors": self._get_attack_vectors(component_type, category),
+                "attack_vectors": template_vectors,
+                # First three MITRE techniques for the STRIDE category,
+                # pulled from the main map_to_mitre_attack mappings. This
+                # gives the analyst a concrete hunt/detection starting
+                # point per threat.
+                "mitre_techniques": self._top_mitre_for_category(category, limit=3),
             }
             threats.append(threat)
 
         return threats
 
-    def _get_attack_vectors(self, component_type: str, category: str) -> list[str]:
-        """Get common attack vectors for component and category"""
-        vectors = []
-
+    def _generic_vectors(self, category: "STRIDECategory") -> list[str]:
+        """Fallback generic vectors when no component-specific mapping exists."""
         if category == STRIDECategory.SPOOFING:
-            vectors = ["Credential theft", "Man-in-the-middle", "DNS hijacking"]
-        elif category == STRIDECategory.TAMPERING:
-            vectors = ["Code injection", "Unencrypted transmission", "SQL injection"]
-        elif category == STRIDECategory.REPUDIATION:
-            vectors = ["Insufficient logging", "Log tampering", "Weak audit trails"]
-        elif category == STRIDECategory.INFORMATION_DISCLOSURE:
-            vectors = ["Weak encryption", "Information leakage", "Metadata exposure"]
-        elif category == STRIDECategory.DENIAL_OF_SERVICE:
-            vectors = ["Resource exhaustion", "Flood attacks", "Rate limiting bypass"]
-        elif category == STRIDECategory.ELEVATION_OF_PRIVILEGE:
-            vectors = ["Unpatched vulnerabilities", "Weak permissions", "Privilege escalation"]
+            return ["Credential theft", "Man-in-the-middle", "DNS hijacking"]
+        if category == STRIDECategory.TAMPERING:
+            return ["Code injection", "Unencrypted transmission", "SQL injection"]
+        if category == STRIDECategory.REPUDIATION:
+            return ["Insufficient logging", "Log tampering", "Weak audit trails"]
+        if category == STRIDECategory.INFORMATION_DISCLOSURE:
+            return ["Weak encryption", "Information leakage", "Metadata exposure"]
+        if category == STRIDECategory.DENIAL_OF_SERVICE:
+            return ["Resource exhaustion", "Flood attacks", "Rate limiting bypass"]
+        if category == STRIDECategory.ELEVATION_OF_PRIVILEGE:
+            return ["Unpatched vulnerabilities", "Weak permissions", "Privilege escalation"]
+        return []
 
-        return vectors
+    def _top_mitre_for_category(self, category: "STRIDECategory", limit: int = 3) -> list[str]:
+        """Look up the first ``limit`` MITRE ATT&CK technique IDs mapped
+        to a STRIDE category. Reuses the large STRIDE→MITRE table in
+        ``map_to_mitre_attack``; we just call it on a synthetic stub
+        threat to get the list.
+        """
+        # map_to_mitre_attack takes an IdentifiedThreat row, but it only
+        # reads `.stride_category`. Use a tiny anonymous object.
+        class _Stub:
+            pass
+        s = _Stub()
+        s.stride_category = category.value if hasattr(category, "value") else str(category)
+        try:
+            mitres = self.map_to_mitre_attack(s)
+        except Exception:
+            mitres = []
+        return mitres[:limit]
 
     def auto_generate_threats(
         self, model: ThreatModel, components: list[ThreatModelComponent]
