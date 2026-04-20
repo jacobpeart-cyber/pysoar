@@ -76,4 +76,11 @@ celery_app.conf.beat_schedule = {
         "task": "intel.poll_threat_feeds",
         "schedule": 1800.0,  # Every 30 minutes — fetch all enabled feeds
     },
+    # --- SIEM cloud log polling (src.siem.tasks.poll_cloud_integrations) ---
+    # Pulls AWS CloudTrail / Azure Activity Log / GCP Cloud Logging into
+    # log_entries every 5 minutes for every installed cloud integration.
+    "siem-cloud-poll": {
+        "task": "siem.poll_cloud_integrations",
+        "schedule": 300.0,  # Every 5 minutes
+    },
 }
