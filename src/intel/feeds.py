@@ -680,7 +680,13 @@ class FeedManager:
                 if not ind_type or not ind_value:
                     continue
 
-                # Check for existing indicator
+                # Check for existing indicator. There is no uniqueness
+                # constraint on (indicator_type, value, feed_id) in the
+                # current schema — rows written by earlier ingestions or
+                # manual API calls can duplicate the same tuple, so
+                # scalar_one_or_none() blew up with "Multiple rows".
+                # Touch all duplicates so sighting_count reflects reality
+                # and last_seen advances on every surviving copy.
                 existing = await session.execute(
                     select(ThreatIndicator).where(
                         ThreatIndicator.indicator_type == ind_type,
@@ -688,12 +694,13 @@ class FeedManager:
                         ThreatIndicator.feed_id == feed.id,
                     )
                 )
-                existing_ind = existing.scalar_one_or_none()
+                existing_list = list(existing.scalars().all())
 
-                if existing_ind:
-                    # Update last_seen and sighting_count
-                    existing_ind.last_seen = datetime.now(timezone.utc)
-                    existing_ind.sighting_count += 1
+                if existing_list:
+                    now_utc = datetime.now(timezone.utc)
+                    for existing_ind in existing_list:
+                        existing_ind.last_seen = now_utc
+                        existing_ind.sighting_count = (existing_ind.sighting_count or 0) + 1
                 else:
                     new_indicator = ThreatIndicator(
                         indicator_type=ind_type,
