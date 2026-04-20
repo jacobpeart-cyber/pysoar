@@ -545,7 +545,60 @@ async def agent_heartbeat(
 
     svc = AgentService(session)
     await svc.record_heartbeat(agent, telemetry=request.telemetry)
-    return {"status": "ok", "agent_id": agent.id, "capabilities": agent.capabilities}
+
+    # Stream agent-tailed local logs into the SIEM. The agent reads
+    # /var/log/syslog (Linux) or Windows event log lines since its
+    # last heartbeat and ships them here so PySOAR doesn't need a
+    # separate log-shipper process per host.
+    logs_ingested = 0
+    logs_failed = 0
+    if request.logs:
+        from src.siem.pipeline import process_log
+        agent_org = getattr(agent, "organization_id", None)
+        agent_host = getattr(agent, "hostname", None) or agent.id
+        agent_ip = getattr(agent, "ip_address", None) or "0.0.0.0"
+        # Cap per-heartbeat batch to bound work — agents should ship
+        # in chunks of <=200 to keep heartbeats responsive.
+        for entry in (request.logs or [])[:500]:
+            try:
+                if isinstance(entry, str):
+                    raw_log = entry
+                    src_type = "agent"
+                    src_name = f"agent/{agent_host}"
+                    src_ip = agent_ip
+                    tags = None
+                elif isinstance(entry, dict):
+                    raw_log = entry.get("raw_log") or entry.get("message") or ""
+                    if not raw_log:
+                        continue
+                    src_type = entry.get("source_type") or "agent"
+                    src_name = entry.get("source_name") or f"agent/{agent_host}"
+                    src_ip = entry.get("source_ip") or agent_ip
+                    tags = entry.get("tags") if isinstance(entry.get("tags"), list) else None
+                else:
+                    continue
+                await process_log(
+                    raw_log=str(raw_log),
+                    source_type=src_type,
+                    source_name=src_name,
+                    source_ip=src_ip,
+                    db=session,
+                    organization_id=agent_org,
+                    tags=tags,
+                )
+                logs_ingested += 1
+            except Exception:  # noqa: BLE001
+                logs_failed += 1
+        if logs_ingested:
+            await session.commit()
+
+    return {
+        "status": "ok",
+        "agent_id": agent.id,
+        "capabilities": agent.capabilities,
+        "logs_ingested": logs_ingested,
+        "logs_failed": logs_failed,
+    }
 
 
 @router.get("/_agent/poll", response_model=AgentPollResponse)

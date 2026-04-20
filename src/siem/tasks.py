@@ -22,6 +22,33 @@ def run_async(coro):
     return loop.run_until_complete(coro)
 
 
+@shared_task(bind=True, max_retries=2, name="siem.poll_cloud_integrations")
+def poll_cloud_integrations_task(self) -> dict[str, Any]:
+    """Run every 5 minutes via Celery beat — pulls AWS CloudTrail,
+    Azure Activity Log, and GCP Cloud Logging for every installed
+    cloud integration into log_entries.
+
+    Each poller persists ``last_poll_at`` on its integration row so
+    subsequent runs only fetch incremental events.
+    """
+    async def _runner() -> dict[str, Any]:
+        from src.core.database import async_session_factory
+        from src.siem.cloud_poller import poll_all_cloud_integrations
+        async with async_session_factory() as db:
+            results = await poll_all_cloud_integrations(db)
+            await db.commit()
+        return {"polled": len(results), "results": results}
+
+    try:
+        return run_async(_runner())
+    except Exception as exc:  # noqa: BLE001
+        logger.error("Cloud poll task failed: %s", exc, exc_info=True)
+        try:
+            raise self.retry(exc=exc, countdown=60)
+        except Exception:
+            return {"status": "error", "reason": str(exc)}
+
+
 @shared_task(bind=True, max_retries=3)
 def process_siem_log_task(
     self,

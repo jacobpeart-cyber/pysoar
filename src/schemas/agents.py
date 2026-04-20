@@ -74,6 +74,12 @@ class HeartbeatRequest(BaseModel):
     os_version: Optional[str] = None
     agent_version: Optional[str] = None
     ip_address: Optional[str] = None
+    # Local log lines tailed by the agent since the last heartbeat.
+    # Each entry is a raw string (full syslog/event line) or a small
+    # dict with {raw_log, source_type, message, severity, ...}. Lets
+    # the SIEM ingest endpoint host telemetry without a separate
+    # log-shipper process — the agent IS the shipper.
+    logs: Optional[list[Any]] = None
 
 
 class IssueCommandRequest(BaseModel):

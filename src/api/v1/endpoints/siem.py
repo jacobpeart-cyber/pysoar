@@ -1323,6 +1323,32 @@ async def export_rule_yaml(
 
 
 # ============================================================================
+# CLOUD POLLER (manual trigger — Celery beat runs this on schedule)
+# ============================================================================
+
+
+@router.post("/cloud/poll-all", response_model=None)
+async def trigger_cloud_poll(
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+) -> dict:
+    """Manually trigger every installed cloud-log integration to poll.
+
+    Iterates installed AWS CloudTrail / Azure Activity / GCP Cloud
+    Logging integrations, fetches new events since each one's last
+    poll, and dispatches them through the SIEM pipeline. Celery beat
+    runs the same code on a 5-minute schedule; this endpoint is for
+    on-demand 'fetch latest now' use during demos and triage.
+    """
+    from src.siem.cloud_poller import poll_all_cloud_integrations
+    results = await poll_all_cloud_integrations(db)
+    return {
+        "polled": len(results),
+        "results": results,
+    }
+
+
+# ============================================================================
 # MIRROR / BACKFILL ENDPOINT
 # ============================================================================
 
