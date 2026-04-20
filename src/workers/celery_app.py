@@ -16,6 +16,12 @@ celery_app = Celery(
         "src.tasks.automation_tasks",
         "src.intel.tasks",
         "src.phishing_sim.tasks",
+        # SIEM module's celery tasks — includes
+        # `siem.poll_cloud_integrations` for the 5-min cloud-log
+        # poller. Without this entry the @shared_task decorator
+        # registers but the worker never imports the module on boot,
+        # so the beat schedule entry fires into the void.
+        "src.siem.tasks",
     ],
 )
 
