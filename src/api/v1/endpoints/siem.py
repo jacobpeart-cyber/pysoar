@@ -1367,19 +1367,42 @@ _collector_task = None
 
 
 async def _syslog_batch_handler(messages: list):
-    """Process a batch of syslog messages through the SIEM pipeline."""
+    """Process a batch of syslog messages through the SIEM pipeline.
+
+    SyslogReceiver._process_message hands batches of dicts shaped as
+    ``{"raw_message", "source_ip", "hostname", "app_name", "message",
+    "facility", "severity", "parsed_fields", ...}``. The previous
+    handler read ``msg.get("raw", "")`` (wrong key) so every row
+    landed with raw_log='' and message=''. Now reads the right keys
+    and prefers the parsed hostname for source_name so IDs from
+    routers/firewalls are usable.
+    """
     from src.siem.pipeline import process_log
     from src.core.database import async_session_factory
 
     async with async_session_factory() as db:
         for msg in messages:
             try:
-                raw_log = msg.get("raw", "") if isinstance(msg, dict) else str(msg)
-                source_ip = msg.get("source_ip", "0.0.0.0") if isinstance(msg, dict) else "0.0.0.0"
+                if isinstance(msg, dict):
+                    raw_log = (
+                        msg.get("raw_message")
+                        or msg.get("raw")
+                        or msg.get("message")
+                        or ""
+                    )
+                    source_ip = msg.get("source_ip") or "0.0.0.0"
+                    hostname = msg.get("hostname") or msg.get("app_name") or source_ip
+                    source_name = f"syslog/{hostname}"
+                else:
+                    raw_log = str(msg)
+                    source_ip = "0.0.0.0"
+                    source_name = "syslog-collector"
+                if not raw_log:
+                    continue
                 await process_log(
                     raw_log=raw_log,
                     source_type="syslog",
-                    source_name="syslog-collector",
+                    source_name=source_name,
                     source_ip=source_ip,
                     db=db,
                 )
