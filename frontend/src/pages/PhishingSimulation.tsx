@@ -218,15 +218,36 @@ export default function PhishingSimulation() {
     }));
   }, [awarenessScores]);
 
+  // Real training modules from /phishing_sim/training/modules.
+  // Previously this derived fake "TR-XXX" training records from email
+  // templates with hardcoded durations ('hard' → 45min, 'medium' →
+  // 25min, 'easy' → 15min) and a synthetic completion count =
+  // template.usage_count divided by 1500. None of that reflected the
+  // actual training catalog.
+  const { data: trainingModulesRaw } = useQuery({
+    queryKey: ['phishing-training-modules'],
+    queryFn: async () => {
+      try {
+        const res = await api.get('/phishing_sim/training/modules');
+        return res.data;
+      } catch {
+        return null;
+      }
+    },
+  });
   const trainingData = useMemo(() => {
-    return templates.map((t, idx) => ({
-      id: `TR-${String(idx + 1).padStart(3, '0')}`,
-      title: t.name,
-      completions: t.usage_count || 0,
-      duration: t.difficulty === 'hard' || t.difficulty === 'Hard' ? '45 min' : t.difficulty === 'medium' || t.difficulty === 'Medium' ? '25 min' : '15 min',
-      certification: t.difficulty !== 'easy' && t.difficulty !== 'Easy',
+    const items = Array.isArray(trainingModulesRaw)
+      ? trainingModulesRaw
+      : (trainingModulesRaw as any)?.items ?? [];
+    return items.map((m: any) => ({
+      id: m.id,
+      title: m.title ?? m.name ?? 'Training module',
+      completions: m.completion_count ?? m.completions ?? 0,
+      duration: m.duration_minutes ? `${m.duration_minutes} min` : (m.duration ?? '—'),
+      certification: !!(m.is_certification ?? m.certification),
+      difficulty: m.difficulty ?? m.difficulty_level ?? null,
     }));
-  }, [templates]);
+  }, [trainingModulesRaw]);
 
   // ---------------------------------------------------------------------------
   // Render
@@ -399,6 +420,60 @@ export default function PhishingSimulation() {
                             className="px-3 py-1 rounded text-xs font-medium bg-green-600 hover:bg-green-700 text-white transition-colors"
                           >
                             Launch
+                          </button>
+                        )}
+                        {/* Pause / Resume / End — backend endpoints
+                            have always existed; the UI previously
+                            exposed no way to govern a campaign after
+                            launch, so once running a campaign could
+                            only be watched from the sidelines. */}
+                        {(campaign.status === 'active' || campaign.status === 'running') && (
+                          <>
+                            <button
+                              onClick={async (e) => {
+                                e.stopPropagation();
+                                try {
+                                  await api.post(`/phishing_sim/campaigns/${campaign.id}/pause`);
+                                  queryClient.invalidateQueries({ queryKey: ['phishing-campaigns'] });
+                                } catch (err: any) {
+                                  alert(err?.response?.data?.detail || err?.message || 'Failed to pause');
+                                }
+                              }}
+                              className="px-3 py-1 rounded text-xs font-medium bg-yellow-600 hover:bg-yellow-700 text-white transition-colors"
+                            >
+                              Pause
+                            </button>
+                            <button
+                              onClick={async (e) => {
+                                e.stopPropagation();
+                                if (!window.confirm('End campaign now? No more emails will be sent.')) return;
+                                try {
+                                  await api.post(`/phishing_sim/campaigns/${campaign.id}/end`);
+                                  queryClient.invalidateQueries({ queryKey: ['phishing-campaigns'] });
+                                } catch (err: any) {
+                                  alert(err?.response?.data?.detail || err?.message || 'Failed to end');
+                                }
+                              }}
+                              className="px-3 py-1 rounded text-xs font-medium bg-red-600 hover:bg-red-700 text-white transition-colors"
+                            >
+                              End
+                            </button>
+                          </>
+                        )}
+                        {campaign.status === 'paused' && (
+                          <button
+                            onClick={async (e) => {
+                              e.stopPropagation();
+                              try {
+                                await api.post(`/phishing_sim/campaigns/${campaign.id}/resume`);
+                                queryClient.invalidateQueries({ queryKey: ['phishing-campaigns'] });
+                              } catch (err: any) {
+                                alert(err?.response?.data?.detail || err?.message || 'Failed to resume');
+                              }
+                            }}
+                            className="px-3 py-1 rounded text-xs font-medium bg-blue-600 hover:bg-blue-700 text-white transition-colors"
+                          >
+                            Resume
                           </button>
                         )}
                         <span

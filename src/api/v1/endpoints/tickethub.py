@@ -170,8 +170,22 @@ async def update_ticket_status(
     if not record:
         raise HTTPException(status_code=404, detail="Ticket not found")
 
+    # Translate generic kanban column labels (new/in_progress/review/
+    # closed) back to the source model's native status vocabulary.
+    # Previously this wrote the raw UI label into e.g. Incident.status,
+    # corrupting records that use open/investigating/contained/etc.
+    # When new_status is already a native status, KANBAN_MAP falls
+    # through and we accept it as-is.
+    from src.tickethub.engine import KANBAN_MAP
+    mapping = KANBAN_MAP.get(source_type, {})
+    translated_status = new_status
+    if new_status in mapping:
+        candidates = mapping[new_status]
+        if candidates:
+            translated_status = candidates[0]
+
     old_status = record.status
-    record.status = new_status
+    record.status = translated_status
     await db.flush()
 
     # Log activity
@@ -181,15 +195,20 @@ async def update_ticket_status(
         source_id=source_id,
         activity_type="status_change",
         actor_id=str(current_user.id),
-        description=f"Status changed from {old_status} to {new_status}",
+        description=f"Status changed from {old_status} to {translated_status}",
         old_value=old_status,
-        new_value=new_status,
+        new_value=translated_status,
         organization_id=getattr(current_user, "organization_id", None),
     )
     db.add(activity)
     await db.flush()
 
-    return {"status": "updated", "old_status": old_status, "new_status": new_status}
+    return {
+        "status": "updated",
+        "old_status": old_status,
+        "new_status": translated_status,
+        "ui_column": new_status if new_status in mapping else None,
+    }
 
 
 # ============================================================================
