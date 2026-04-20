@@ -59,8 +59,14 @@ export default function AuditLogs() {
     action: '',
     resource_type: '',
     success: undefined as boolean | undefined,
+    // Date-range filtering is required for any FedRAMP AU-6 /
+    // retention-era query. Previously the UI had no widget for this
+    // and returned arbitrarily-old audit rows mixed with recent ones.
+    days: 90,
+    search: '',
   });
   const [showFilters, setShowFilters] = useState(false);
+  const [exportFormat, setExportFormat] = useState<'csv' | 'json' | 'xml'>('csv');
 
   const { data, isLoading } = useQuery<AuditLogResponse>({
     queryKey: ['audit-logs', page, filters],
@@ -71,11 +77,27 @@ export default function AuditLogs() {
       if (filters.action) params.append('action', filters.action);
       if (filters.resource_type) params.append('resource_type', filters.resource_type);
       if (filters.success !== undefined) params.append('success', filters.success.toString());
+      if (filters.days) params.append('days', String(filters.days));
+      if (filters.search) params.append('search', filters.search);
 
       try {
       const response = await api.get(`/audit?${params.toString()}`);
       return response.data;
       } catch { return null; }
+    },
+  });
+
+  // Stats strip — /audit/stats returns { total, successful, failed,
+  // by_action }. Previously never rendered.
+  const { data: auditStats } = useQuery<any>({
+    queryKey: ['audit-stats', filters.days],
+    queryFn: async () => {
+      try {
+        const res = await api.get('/audit/stats', { params: { days: filters.days || 90 } });
+        return res.data;
+      } catch {
+        return null;
+      }
     },
   });
 
@@ -124,8 +146,8 @@ export default function AuditLogs() {
               // proper Content-Disposition. Required for FedRAMP AU-6 audit
               // evidence export.
               const params = new URLSearchParams();
-              params.append('format', 'csv');
-              params.append('days', '90');
+              params.append('format', exportFormat);
+              params.append('days', String(filters.days || 90));
               if (filters.action) params.append('action', filters.action);
               if (filters.resource_type) params.append('resource_type', filters.resource_type);
               try {
@@ -134,7 +156,7 @@ export default function AuditLogs() {
                 });
                 const blob = response.data as Blob;
                 const cd = response.headers?.['content-disposition'];
-                let filename = `pysoar_audit_${new Date().toISOString().slice(0, 10)}.csv`;
+                let filename = `pysoar_audit_${new Date().toISOString().slice(0, 10)}.${exportFormat}`;
                 if (cd && typeof cd === 'string') {
                   const m = cd.match(/filename="?([^"]+)"?/);
                   if (m) filename = m[1];

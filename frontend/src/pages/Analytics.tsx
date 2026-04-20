@@ -35,28 +35,69 @@ export default function Analytics() {
   const { data: metrics, isLoading } = useQuery<MetricsData>({
     queryKey: ['metrics'],
     queryFn: async () => {
+      // Previously this derived everything from two /stats endpoints
+      // and hardcoded `alerts_change`, `incidents_change`, `mttr_change`,
+      // `active_iocs`, and `top_attackers` to 0/[] — trend arrows never
+      // appeared and the Top Attackers panel was permanently empty
+      // despite /metrics/top-attackers returning real data. Now pulls
+      // from the real `/metrics/*` surface and computes trend deltas
+      // by comparing current-period totals to prior-period totals.
       try {
-        const [alertsRes, incidentsRes] = await Promise.allSettled([
+        const [
+          overviewRes, topAttackersRes, trendsRes, mttrRes,
+          alertsStatsRes, incidentsStatsRes, overviewPriorRes,
+        ] = await Promise.allSettled([
+          api.get('/metrics/overview', { params: { days: 30 } }),
+          api.get('/metrics/top-attackers', { params: { days: 30, limit: 10 } }),
+          api.get('/metrics/alerts/trend', { params: { days: 30 } }),
+          api.get('/metrics/incidents/mttr', { params: { days: 30 } }),
           api.get('/alerts/stats'),
           api.get('/incidents/stats'),
+          api.get('/metrics/overview', { params: { days: 60 } }),
         ]);
-        const alertStats = alertsRes.status === 'fulfilled' ? alertsRes.value.data : {};
-        const incidentStats = incidentsRes.status === 'fulfilled' ? incidentsRes.value.data : {};
+
+        const overview = overviewRes.status === 'fulfilled' ? overviewRes.value.data : {};
+        const overviewPrior = overviewPriorRes.status === 'fulfilled' ? overviewPriorRes.value.data : {};
+        const alertStats = alertsStatsRes.status === 'fulfilled' ? alertsStatsRes.value.data : {};
+        const incidentStats = incidentsStatsRes.status === 'fulfilled' ? incidentsStatsRes.value.data : {};
+        const topAttackersData = topAttackersRes.status === 'fulfilled' ? topAttackersRes.value.data : {};
+        const trendsData = trendsRes.status === 'fulfilled' ? trendsRes.value.data : {};
+        const mttrData = mttrRes.status === 'fulfilled' ? mttrRes.value.data : {};
+
+        // Prior-30-day counts = (last 60 days) − (last 30 days).
+        const priorAlerts = Math.max(0, (overviewPrior.total_alerts ?? 0) - (overview.total_alerts ?? 0));
+        const priorIncidents = Math.max(0, (overviewPrior.total_incidents ?? 0) - (overview.total_incidents ?? 0));
+        const pct = (current: number, prior: number) =>
+          prior > 0 ? Math.round(((current - prior) / prior) * 100) : 0;
+
+        const mttrHours = mttrData.avg_mttr_hours ?? mttrData.mean_time_to_resolve_hours ?? incidentStats.avg_resolution_hours ?? 0;
+        const mttrPrior = mttrData.prior_avg_mttr_hours ?? mttrData.prior_mttr_hours ?? 0;
+
+        const topAttackersItems = Array.isArray(topAttackersData) ? topAttackersData : (topAttackersData.items ?? topAttackersData.attackers ?? []);
+
         return {
           overview: {
-            total_alerts: alertStats.total ?? 0,
-            alerts_change: 0,
-            total_incidents: incidentStats.total ?? 0,
-            incidents_change: 0,
-            avg_mttr_hours: incidentStats.avg_resolution_hours ?? 0,
-            mttr_change: 0,
-            active_iocs: 0,
+            total_alerts: overview.total_alerts ?? alertStats.total ?? 0,
+            alerts_change: pct(overview.total_alerts ?? 0, priorAlerts),
+            total_incidents: overview.total_incidents ?? incidentStats.total ?? 0,
+            incidents_change: pct(overview.total_incidents ?? 0, priorIncidents),
+            avg_mttr_hours: mttrHours,
+            mttr_change: mttrPrior > 0
+              ? Math.round(((mttrHours - mttrPrior) / mttrPrior) * 100)
+              : 0,
+            active_iocs: overview.active_iocs ?? 0,
           },
-          alert_trends: alertStats.trends ?? [],
+          alert_trends: trendsData.series ?? trendsData.trend ?? alertStats.trends ?? [],
           severity_distribution: alertStats.by_severity ?? {},
           status_distribution: alertStats.by_status ?? {},
-          top_sources: Array.isArray(alertStats.by_source) ? alertStats.by_source.map((s: any) => ({ source: s.source ?? s.name ?? '', count: s.count ?? 0 })) : [],
-          top_attackers: [],
+          top_sources: Array.isArray(alertStats.by_source)
+            ? alertStats.by_source.map((s: any) => ({ source: s.source ?? s.name ?? '', count: s.count ?? 0 }))
+            : [],
+          top_attackers: topAttackersItems.map((a: any) => ({
+            ip: a.ip ?? a.source_ip ?? a.address ?? '',
+            count: a.count ?? a.hits ?? 0,
+            country: a.country ?? a.country_code,
+          })),
           incident_types: incidentStats.by_type ?? {},
         };
       } catch { return null; }
