@@ -1,10 +1,41 @@
 """SIEM schemas for API request/response validation"""
 
+import json as _json
 from datetime import datetime
 from typing import Any, Optional
 
 from src.schemas.base import DBModel
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+def _parse_json_list(v):
+    if v is None:
+        return None
+    if isinstance(v, list):
+        return [str(x) for x in v]
+    if isinstance(v, str):
+        try:
+            parsed = _json.loads(v)
+            if isinstance(parsed, list):
+                return [str(x) for x in parsed]
+        except (_json.JSONDecodeError, TypeError):
+            pass
+    return None
+
+
+def _parse_json_dict(v):
+    if v is None:
+        return None
+    if isinstance(v, dict):
+        return v
+    if isinstance(v, str):
+        try:
+            parsed = _json.loads(v)
+            if isinstance(parsed, dict):
+                return parsed
+        except (_json.JSONDecodeError, TypeError):
+            pass
+    return None
 
 
 class LogEntryBase(BaseModel):
@@ -60,6 +91,16 @@ class LogEntryResponse(LogEntryBase, DBModel):
     tags: Optional[list[str]] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+
+    @field_validator("parsed_fields", "normalized_fields", mode="before")
+    @classmethod
+    def _parse_json_dict_fields(cls, v):
+        return _parse_json_dict(v)
+
+    @field_validator("rule_matches", "tags", mode="before")
+    @classmethod
+    def _parse_json_list_fields(cls, v):
+        return _parse_json_list(v)
 
     class Config:
         from_attributes = True
@@ -185,6 +226,20 @@ class DetectionRuleResponse(DetectionRuleBase, DBModel):
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
+    @field_validator("detection_logic", mode="before")
+    @classmethod
+    def _parse_detection_logic(cls, v):
+        return _parse_json_dict(v)
+
+    @field_validator(
+        "log_types", "mitre_tactics", "mitre_techniques",
+        "tags", "group_by", "references",
+        mode="before",
+    )
+    @classmethod
+    def _parse_list_fields(cls, v):
+        return _parse_json_list(v)
+
     class Config:
         from_attributes = True
 
@@ -220,6 +275,15 @@ class CorrelationEventResponse(DBModel):
     alert_generated: bool = False
     status: str = ""
     created_at: Optional[datetime] = None
+
+    @field_validator(
+        "log_entry_ids", "source_addresses", "usernames", "hostnames",
+        "mitre_tactics", "mitre_techniques",
+        mode="before",
+    )
+    @classmethod
+    def _parse_list_fields(cls, v):
+        return _parse_json_list(v)
 
     class Config:
         from_attributes = True
