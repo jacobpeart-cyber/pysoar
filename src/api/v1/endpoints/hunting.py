@@ -209,11 +209,14 @@ async def execute_hunt_session(session_id: str):  # noqa: C901
                         db.add(finding)
                         findings_created += 1
 
-                # Step 3 — check active threat indicators against the hypothesis
-                # data_sources list (e.g. list of IPs/domains to investigate).
+                # Step 3 — check active threat indicators. Two modes:
+                #   (a) explicit data_sources list on the hypothesis
+                #       (analyst says "investigate these IPs/domains")
+                #   (b) broad scan — any active IOC whose value or source
+                #       mentions a hypothesis keyword.
                 from src.intel.models import ThreatIndicator
                 data_sources = safe_json_loads(hypothesis.data_sources, []) or []
-                for src_value in data_sources[:50]:  # cap
+                for src_value in data_sources[:50]:
                     if not isinstance(src_value, str):
                         continue
                     ioc_result = await db.execute(
@@ -244,6 +247,83 @@ async def execute_hunt_session(session_id: str):  # noqa: C901
                         db.add(finding)
                         findings_created += 1
 
+                # Step 4 — hunt the alerts table (last 14 days) for any
+                # matching keyword. This surfaces prior detections the
+                # hypothesis may have been written to find. Alerts are
+                # usually present even when raw logs are not, so this is
+                # the most valuable hunt source on most deployments.
+                from src.models.alert import Alert
+                alerts_scanned = 0
+                if keywords:
+                    alert_since = datetime.now(timezone.utc) - timedelta(days=14)
+                    alert_q = select(Alert).where(Alert.created_at >= alert_since).limit(2000)
+                    alert_res = await db.execute(alert_q)
+                    for a in alert_res.scalars().all():
+                        alerts_scanned += 1
+                        hay = " ".join(filter(None, [
+                            a.title, a.description, a.hostname, a.username,
+                            a.source, a.category, a.source_ip, a.destination_ip,
+                            a.domain, a.url, a.file_hash,
+                        ])).lower()
+                        matched = [k for k in keywords if k in hay]
+                        if matched:
+                            db.add(HuntFinding(
+                                session_id=session_id,
+                                title=f"Alert match: {a.title}",
+                                description=(
+                                    f"Historical alert from {a.source or 'unknown source'} "
+                                    f"matched {len(matched)} hypothesis keywords."
+                                ),
+                                severity=a.severity or "medium",
+                                evidence=json.dumps({
+                                    "alert_id": a.id,
+                                    "alert_status": a.status,
+                                    "created_at": a.created_at.isoformat() if a.created_at else None,
+                                    "matched_keywords": matched[:10],
+                                    "source_ip": a.source_ip,
+                                    "hostname": a.hostname,
+                                }),
+                                mitre_techniques=json.dumps(mitre_ids) if mitre_ids else None,
+                            ))
+                            findings_created += 1
+
+                # Step 5 — hunt audit_logs for keyword matches on actions.
+                # This catches abuse of platform actions (e.g. "playbook
+                # execution on critical host" matching "lateral movement"
+                # keywords).
+                from src.models.audit import AuditLog
+                audit_scanned = 0
+                if keywords:
+                    audit_since = datetime.now(timezone.utc) - timedelta(days=14)
+                    audit_q = select(AuditLog).where(AuditLog.created_at >= audit_since).limit(2000)
+                    audit_res = await db.execute(audit_q)
+                    for al in audit_res.scalars().all():
+                        audit_scanned += 1
+                        hay = " ".join(filter(None, [
+                            al.action, al.resource_type, al.resource_id,
+                            al.description, al.ip_address,
+                        ])).lower()
+                        matched = [k for k in keywords if k in hay]
+                        if matched:
+                            db.add(HuntFinding(
+                                session_id=session_id,
+                                title=f"Audit log match: {al.action} on {al.resource_type}",
+                                description=(
+                                    f"Audit event matched {len(matched)} hypothesis keywords."
+                                ),
+                                severity="medium" if al.success else "high",
+                                evidence=json.dumps({
+                                    "audit_id": al.id,
+                                    "action": al.action,
+                                    "resource_type": al.resource_type,
+                                    "resource_id": al.resource_id,
+                                    "user_id": al.user_id,
+                                    "success": al.success,
+                                    "matched_keywords": matched[:10],
+                                }),
+                            ))
+                            findings_created += 1
+
             # Flush the new findings before counting so the count query
             # can see them in this session's transaction.
             await db.flush()
@@ -251,14 +331,24 @@ async def execute_hunt_session(session_id: str):  # noqa: C901
                 select(func.count(HuntFinding.id)).where(HuntFinding.session_id == session_id)
             )
             session.findings_count = findings_count_result.scalar() or 0
-            session.events_analyzed = logs_scanned
-            session.query_count = iocs_checked + 1  # +1 for the log scan
+            # events_analyzed is the sum of rows actually inspected across
+            # every hunt source, so the UI's "analyzed N events" number
+            # reflects real work.
+            session.events_analyzed = logs_scanned + alerts_scanned + audit_scanned
+            # query_count is the number of distinct queries we ran: one
+            # SIEM log scan, one alerts scan, one audit scan, plus one
+            # per IOC lookup against the threat_indicators table.
+            session.query_count = 3 + iocs_checked
 
-            # Store per-run hunt telemetry for the UI to display
+            # Store per-run hunt telemetry for the UI to display.
             session.queries_executed = json.dumps({
                 "logs_scanned": logs_scanned,
+                "alerts_scanned": alerts_scanned,
+                "audit_logs_scanned": audit_scanned,
                 "iocs_checked": iocs_checked,
                 "findings_created_this_run": findings_created,
+                "keywords_used": sorted(list(keywords))[:30],
+                "mitre_techniques": mitre_ids,
             })
 
             completed_at = datetime.now(timezone.utc)
