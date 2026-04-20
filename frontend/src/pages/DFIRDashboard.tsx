@@ -747,48 +747,13 @@ export default function DFIRDashboard() {
               </div>
             )}
 
-            {/* Artifacts Tab */}
+            {/* Artifacts Tab — now backed by /dfir/cases/{id}/artifacts.
+                Previously this tab rendered a hardcoded checklist of
+                "MRU Lists / Chrome History / Prefetch Files" with green
+                checkmarks regardless of whether the case had any
+                ForensicArtifact rows — pure UI theater. */}
             {activeTab === 'artifacts' && (
-              <div className="space-y-6">
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
-                    <h3 className="font-semibold mb-4">Registry Artifacts</h3>
-                    <ul className="space-y-2 text-sm">
-                      <li className="flex items-center gap-2"><CheckCircle className="w-4 h-4 text-green-600" /> MRU Lists</li>
-                      <li className="flex items-center gap-2"><CheckCircle className="w-4 h-4 text-green-600" /> TypedURLs</li>
-                      <li className="flex items-center gap-2"><CheckCircle className="w-4 h-4 text-green-600" /> Installed Programs</li>
-                      <li className="flex items-center gap-2"><CheckCircle className="w-4 h-4 text-green-600" /> USB History</li>
-                    </ul>
-                  </div>
-                  <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
-                    <h3 className="font-semibold mb-4">File System Artifacts</h3>
-                    <ul className="space-y-2 text-sm">
-                      <li className="flex items-center gap-2"><CheckCircle className="w-4 h-4 text-green-600" /> Recycle Bin</li>
-                      <li className="flex items-center gap-2"><CheckCircle className="w-4 h-4 text-green-600" /> Prefetch Files</li>
-                      <li className="flex items-center gap-2"><CheckCircle className="w-4 h-4 text-green-600" /> Shadow Copies</li>
-                      <li className="flex items-center gap-2"><CheckCircle className="w-4 h-4 text-green-600" /> Thumbnail Cache</li>
-                    </ul>
-                  </div>
-                  <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
-                    <h3 className="font-semibold mb-4">Browser Artifacts</h3>
-                    <ul className="space-y-2 text-sm">
-                      <li className="flex items-center gap-2"><CheckCircle className="w-4 h-4 text-green-600" /> Chrome History</li>
-                      <li className="flex items-center gap-2"><CheckCircle className="w-4 h-4 text-green-600" /> Firefox Cookies</li>
-                      <li className="flex items-center gap-2"><CheckCircle className="w-4 h-4 text-green-600" /> IE Cache</li>
-                      <li className="flex items-center gap-2"><CheckCircle className="w-4 h-4 text-green-600" /> Downloaded Files</li>
-                    </ul>
-                  </div>
-                  <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
-                    <h3 className="font-semibold mb-4">Event Log Analysis</h3>
-                    <ul className="space-y-2 text-sm">
-                      <li className="flex items-center gap-2"><CheckCircle className="w-4 h-4 text-green-600" /> Process Creation (4688)</li>
-                      <li className="flex items-center gap-2"><CheckCircle className="w-4 h-4 text-green-600" /> Logon Events (4624)</li>
-                      <li className="flex items-center gap-2"><CheckCircle className="w-4 h-4 text-green-600" /> Lateral Movement (4672)</li>
-                      <li className="flex items-center gap-2"><CheckCircle className="w-4 h-4 text-green-600" /> Privilege Escalation (4673)</li>
-                    </ul>
-                  </div>
-                </div>
-              </div>
+              <ArtifactsTab caseId={activeCaseId} />
             )}
 
             {/* Legal Holds Tab */}
@@ -1299,6 +1264,111 @@ export default function DFIRDashboard() {
               </div>
             </form>
           </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+
+// Real Artifacts tab — fetches ForensicArtifact rows for the active
+// case from /dfir/cases/{id}/artifacts and exposes "Extract IOCs".
+// Previously this tab was a pure-CSS checklist ("MRU Lists / Chrome
+// History / Prefetch Files") that rendered green checkmarks whether
+// or not any artifacts existed — a cosmetic lie.
+function ArtifactsTab({ caseId }: { caseId: string | null }) {
+  const queryClient = useQueryClient();
+  const { data, isLoading, isError } = useQuery<any>({
+    queryKey: ['dfir-artifacts', caseId],
+    queryFn: async () => {
+      if (!caseId) return { items: [] };
+      const res = await api.get(`/dfir/cases/${caseId}/artifacts`, { params: { size: 100 } });
+      return res.data;
+    },
+    enabled: !!caseId,
+  });
+
+  const extractMutation = useMutation({
+    mutationFn: async () => {
+      if (!caseId) return null;
+      const res = await api.post(`/dfir/cases/${caseId}/artifacts/extract-iocs`, {});
+      return res.data;
+    },
+    onSuccess: (res) => {
+      queryClient.invalidateQueries({ queryKey: ['dfir-artifacts', caseId] });
+      alert(`IOC extraction complete — ${res?.iocs_extracted ?? 0} IOCs found across ${res?.artifacts_scanned ?? 0} artifacts.`);
+    },
+    onError: (err: any) => {
+      alert(`IOC extraction failed: ${err?.response?.data?.detail || err?.message}`);
+    },
+  });
+
+  if (!caseId) {
+    return (
+      <div className="bg-yellow-50 dark:bg-yellow-900/20 border border-yellow-200 dark:border-yellow-800 rounded-lg p-4 text-sm text-yellow-800 dark:text-yellow-200">
+        Select a case from the Cases tab to view its artifacts.
+      </div>
+    );
+  }
+
+  const items: any[] = Array.isArray(data) ? data : (data?.items ?? []);
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <h3 className="text-lg font-semibold">Case Artifacts ({items.length})</h3>
+        <button
+          onClick={() => extractMutation.mutate()}
+          disabled={items.length === 0 || extractMutation.isPending}
+          className="flex items-center gap-2 bg-purple-600 hover:bg-purple-700 text-white px-4 py-2 rounded-lg transition disabled:opacity-50"
+        >
+          <FileSearch className="w-4 h-4" />
+          {extractMutation.isPending ? 'Extracting…' : 'Extract IOCs'}
+        </button>
+      </div>
+      {isLoading && (
+        <div className="flex items-center gap-2 text-gray-500 dark:text-gray-400">
+          <Loader2 className="w-4 h-4 animate-spin" /> Loading artifacts…
+        </div>
+      )}
+      {isError && (
+        <div className="bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-lg p-3 text-sm text-red-700 dark:text-red-300">
+          Failed to load artifacts.
+        </div>
+      )}
+      {!isLoading && !isError && items.length === 0 && (
+        <div className="bg-gray-50 dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-6 text-center text-gray-600 dark:text-gray-400">
+          No artifacts registered on this case yet. Evidence registered via the Evidence tab produces artifacts as it is processed.
+        </div>
+      )}
+      {!isLoading && items.length > 0 && (
+        <div className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg overflow-hidden">
+          <table className="w-full">
+            <thead className="bg-gray-50 dark:bg-gray-700 text-xs font-medium uppercase text-gray-600 dark:text-gray-300">
+              <tr>
+                <th className="px-4 py-2 text-left">Artifact</th>
+                <th className="px-4 py-2 text-left">Type</th>
+                <th className="px-4 py-2 text-left">Source</th>
+                <th className="px-4 py-2 text-left">Extracted IOCs</th>
+                <th className="px-4 py-2 text-left">Collected</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-100 dark:divide-gray-700">
+              {items.map((a: any) => (
+                <tr key={a.id} className="text-sm">
+                  <td className="px-4 py-2">{a.name || a.filename || a.id}</td>
+                  <td className="px-4 py-2">{a.artifact_type || a.type || '—'}</td>
+                  <td className="px-4 py-2">{a.source || a.source_system || '—'}</td>
+                  <td className="px-4 py-2">
+                    {Array.isArray(a.extracted_iocs) ? a.extracted_iocs.length : (a.ioc_count ?? 0)}
+                  </td>
+                  <td className="px-4 py-2 text-gray-500 dark:text-gray-400">
+                    {a.collected_at ? new Date(a.collected_at).toLocaleString() : '—'}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       )}
     </div>

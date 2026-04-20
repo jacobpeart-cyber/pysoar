@@ -129,21 +129,29 @@ export default function AuditEvidence() {
   const { data: dashboardData, isLoading: dashboardLoading } = useQuery<DashboardData>({
     queryKey: ['audit-evidence-dashboard'],
     queryFn: async () => {
+      // Previously this derived everything from /packages and
+      // hardcoded auditEventsCount=0 + recentAuditEvents=[] — the
+      // backend /dashboard/stats endpoint exists and returns real
+      // counts + recent activity but was never called from the UI.
       try {
-        const pkgRes = await api.get('/audit-evidence/packages');
+        const [pkgRes, statsRes] = await Promise.all([
+          api.get('/audit-evidence/packages'),
+          api.get('/audit-evidence/dashboard/stats').catch(() => null),
+        ]);
         const pkgs = Array.isArray(pkgRes.data) ? pkgRes.data : (pkgRes.data?.items || []);
         const active = pkgs.filter((p: any) => p.status !== 'approved' && p.status !== 'archived').length;
         const withEv = pkgs.filter((p: any) => (p.evidenceCount ?? p.evidence_count ?? 0) > 0).length;
+        const stats = statsRes?.data ?? null;
         return {
-          auditEventsCount: 0,
-          evidenceItemsCount: pkgs.reduce((s: number, p: any) => s + (p.evidenceCount ?? p.evidence_count ?? 0), 0),
-          activePackagesCount: active,
-          readinessScore: pkgs.length > 0 ? Math.round((withEv / pkgs.length) * 100) : 0,
-          evidenceCoverage: {
+          auditEventsCount: stats?.audit_events_last_24h ?? stats?.audit_events_24h ?? stats?.audit_events_count ?? 0,
+          evidenceItemsCount: stats?.total_evidence_items ?? pkgs.reduce((s: number, p: any) => s + (p.evidenceCount ?? p.evidence_count ?? 0), 0),
+          activePackagesCount: stats?.active_packages ?? active,
+          readinessScore: stats?.readiness_score ?? (pkgs.length > 0 ? Math.round((withEv / pkgs.length) * 100) : 0),
+          evidenceCoverage: stats?.evidence_coverage ?? {
             withEvidence: withEv,
             withoutEvidence: pkgs.length - withEv,
           },
-          recentAuditEvents: [],
+          recentAuditEvents: stats?.recent_audit_events ?? stats?.recent_events ?? [],
         } as DashboardData;
       } catch {
         return {
@@ -166,15 +174,26 @@ export default function AuditEvidence() {
       dateRangeFilter,
     ],
     queryFn: async () => {
-      const params = new URLSearchParams();
-      if (eventTypeFilter !== 'all') params.append('type', eventTypeFilter);
-      if (resultFilter !== 'all') params.append('result', resultFilter);
-      if (dateRangeFilter !== '7d') params.append('range', dateRangeFilter);
+      // Map UI filters into the POST body the search endpoint actually
+      // reads. Previously only `type` was passed, so resultFilter and
+      // dateRangeFilter were silently ignored — user changed filters
+      // and saw no change in results.
+      const body: Record<string, any> = {};
+      if (eventTypeFilter !== 'all') body.type = eventTypeFilter;
+      if (resultFilter !== 'all') body.result = resultFilter;
+      const rangeDays: Record<string, number> = {
+        '1d': 1, '7d': 7, '30d': 30, '90d': 90,
+      };
+      const daysBack = rangeDays[dateRangeFilter] ?? 7;
+      body.date_from = new Date(Date.now() - daysBack * 86_400_000).toISOString();
       try {
-      const response = await api.post('/audit-evidence/audit/search', { type: eventTypeFilter !== 'all' ? eventTypeFilter : undefined });
-      const d = response.data;
-      return Array.isArray(d) ? d : (d?.items || []);
-      } catch { return []; }
+        const response = await api.post('/audit-evidence/audit/search', body);
+        const d = response.data;
+        return Array.isArray(d) ? d : (d?.items || []);
+      } catch (err) {
+        console.error('Audit search failed:', err);
+        return [];
+      }
     },
   });
 

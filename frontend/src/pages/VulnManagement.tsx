@@ -51,12 +51,53 @@ const getStatusColor = (status: string) => {
   }
 };
 
+// Normalize backend snake_case fields into the camelCase shape this
+// page expects. Previously every table (Vulnerabilities, Scan Profiles,
+// Patch Operations, Exceptions) rendered undefined/N/A/Invalid Date
+// because the frontend read `cveId`, `cvss`, `lastRun`, `vulnCount`,
+// etc. which the backend does not emit.
+const normalizeVuln = (v: any) => ({
+  ...v,
+  cveId: v.cve_id ?? v.cveId ?? null,
+  cvss: v.cvss_v3_score ?? v.cvss ?? null,
+  epss: v.epss_score ?? v.epss ?? null,
+  patchAvailable: v.patch_available ?? v.patchAvailable ?? false,
+  kev: v.is_kev ?? v.kev ?? false,
+  daysOpen: v.days_open ?? v.daysOpen ?? null,
+  affectedAssets: v.affected_instance_count ?? v.affected_assets ?? v.affectedAssets ?? 0,
+});
+
+const normalizeProfile = (p: any) => ({
+  ...p,
+  lastRun: p.last_run ?? p.lastRun ?? null,
+  nextRun: p.next_run ?? p.nextRun ?? null,
+  duration: p.avg_duration_seconds ?? p.duration ?? null,
+});
+
+const normalizePatchOp = (op: any) => ({
+  ...op,
+  vulnCount: op.vulnerability_count ?? op.vuln_count ?? op.vulnCount ?? 0,
+  systemsAffected: op.total_instances ?? op.systems_affected ?? op.systemsAffected ?? 0,
+  progress: op.progress_percentage ?? op.progress ?? 0,
+  startDate: op.started_at ?? op.start_date ?? op.startDate ?? null,
+  targetDate: op.scheduled_date ?? op.target_date ?? op.targetDate ?? null,
+  status: op.deployment_status ?? op.status ?? 'scheduled',
+});
+
+const normalizeException = (e: any) => ({
+  ...e,
+  cveId: e.vulnerability_id ?? e.cveId ?? null,
+  expiryDate: e.expiry_date ?? e.expiryDate ?? null,
+  approver: e.approved_by ?? e.approver ?? null,
+});
+
 export default function VulnManagement() {
   const [activeTab, setActiveTab] = useState('vulnerabilities');
   const [vulnerabilities, setVulnerabilities] = useState<any[]>([]);
   const [scanProfiles, setScanProfiles] = useState<any[]>([]);
   const [patchOps, setPatchOps] = useState<any[]>([]);
   const [exceptions, setExceptions] = useState<any[]>([]);
+  const [dashboardMetrics, setDashboardMetrics] = useState<any | null>(null);
   const [loading, setLoading] = useState(true);
   const [searchQuery, setSearchQuery] = useState('');
   const [showNewVulnModal, setShowNewVulnModal] = useState(false);
@@ -73,16 +114,22 @@ export default function VulnManagement() {
   const loadData = async () => {
     setLoading(true);
     try {
-      const [vulnsData, patchData, profilesData, exceptionsData] = await Promise.all([
+      const [vulnsData, patchData, profilesData, exceptionsData, dashRes] = await Promise.all([
         vulnmgmtApi.getVulnerabilities(),
         vulnmgmtApi.getPatchOperations(),
         vulnmgmtApi.getScanProfiles().catch(() => []),
         vulnmgmtApi.getExceptions().catch(() => []),
+        api.get('/vulnmgmt/dashboard').then(r => r.data).catch(() => null),
       ]);
-      setVulnerabilities(Array.isArray(vulnsData) ? vulnsData : (vulnsData?.items || []));
-      setScanProfiles(Array.isArray(profilesData) ? profilesData : []);
-      setPatchOps(Array.isArray(patchData) ? patchData : (patchData?.items || []));
-      setExceptions(Array.isArray(exceptionsData) ? exceptionsData : []);
+      const rawVulns = Array.isArray(vulnsData) ? vulnsData : (vulnsData?.items || []);
+      const rawProfiles = Array.isArray(profilesData) ? profilesData : [];
+      const rawPatches = Array.isArray(patchData) ? patchData : (patchData?.items || []);
+      const rawExceptions = Array.isArray(exceptionsData) ? exceptionsData : [];
+      setVulnerabilities(rawVulns.map(normalizeVuln));
+      setScanProfiles(rawProfiles.map(normalizeProfile));
+      setPatchOps(rawPatches.map(normalizePatchOp));
+      setExceptions(rawExceptions.map(normalizeException));
+      setDashboardMetrics(dashRes);
     } catch (error) {
       console.error('Error loading vulnerability data:', error);
     } finally {
@@ -94,10 +141,18 @@ export default function VulnManagement() {
     loadData();
   }, []);
 
-  const criticalVulns = vulnerabilities.filter(v => v.severity === 'critical').length;
-  const openFindings = vulnerabilities.length;
-  const mttrDays = 8.3;
-  const slaCompliance = 82;
+  // Prefer the backend dashboard aggregate — previously these two
+  // KPIs were hardcoded marketing numbers (8.3 days, 82% SLA) that
+  // customers saw regardless of actual posture.
+  const criticalVulns = dashboardMetrics?.by_severity?.critical
+    ?? vulnerabilities.filter(v => v.severity === 'critical').length;
+  const openFindings = dashboardMetrics?.total_vulnerabilities ?? vulnerabilities.length;
+  const mttrDays = dashboardMetrics?.mean_time_to_remediate_days
+    ?? dashboardMetrics?.mttr_days
+    ?? null;
+  const slaCompliance = dashboardMetrics?.sla_compliance?.compliance_percentage
+    ?? dashboardMetrics?.sla_compliance
+    ?? null;
 
   const tabs = [
     { id: 'vulnerabilities', label: 'Vulnerabilities', icon: Bug },
@@ -146,12 +201,16 @@ export default function VulnManagement() {
           </div>
           <div className="bg-gradient-to-br from-purple-50 to-purple-100 dark:from-purple-900 dark:to-purple-800 p-4 rounded-lg">
             <p className="text-sm font-medium text-purple-600 dark:text-purple-300">MTTR</p>
-            <p className="text-3xl font-bold text-purple-900 dark:text-purple-100 mt-2">{mttrDays}</p>
+            <p className="text-3xl font-bold text-purple-900 dark:text-purple-100 mt-2">
+              {mttrDays === null || mttrDays === undefined ? '—' : mttrDays}
+            </p>
             <p className="text-xs text-purple-600 dark:text-purple-300 mt-1">days mean time to remediate</p>
           </div>
           <div className="bg-gradient-to-br from-green-50 to-green-100 dark:from-green-900 dark:to-green-800 p-4 rounded-lg">
             <p className="text-sm font-medium text-green-600 dark:text-green-300">SLA Compliance</p>
-            <p className="text-3xl font-bold text-green-900 dark:text-green-100 mt-2">{slaCompliance}%</p>
+            <p className="text-3xl font-bold text-green-900 dark:text-green-100 mt-2">
+              {slaCompliance === null || slaCompliance === undefined ? '—' : `${slaCompliance}%`}
+            </p>
             <p className="text-xs text-green-600 dark:text-green-300 mt-1">target achievement</p>
           </div>
         </div>
