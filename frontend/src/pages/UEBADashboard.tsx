@@ -105,7 +105,6 @@ export default function UEBADashboard() {
   const [searchQuery, setSearchQuery] = useState('');
   const [entityTypeFilter, setEntityTypeFilter] = useState('all');
   const [riskLevelFilter, setRiskLevelFilter] = useState('all');
-  const [selectedEntity, setSelectedEntity] = useState<Entity | null>(null);
   const [expandedEntity, setExpandedEntity] = useState<string | null>(null);
   const [escalateAlert, setEscalateAlert] = useState<RiskAlert | null>(null);
 
@@ -429,7 +428,9 @@ export default function UEBADashboard() {
                   <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">
                     {alert.created_at ? new Date(alert.created_at || "").toLocaleString() : '—'}
                   </td>
-                  <td className="px-6 py-4 font-medium text-gray-900 dark:text-white">{alert.entity_profile_id ?? '—'}</td>
+                  <td className="px-6 py-4 font-medium text-gray-900 dark:text-white">
+                    {entities?.find(ent => ent.id === alert.entity_profile_id)?.name ?? alert.entity_profile_id ?? '—'}
+                  </td>
                   <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">{alert.alert_type ?? '—'}</td>
                   <td className="px-6 py-4">
                     {alert.severity ? (
@@ -528,65 +529,7 @@ export default function UEBADashboard() {
       )}
 
       {/* Behavior Timeline Tab */}
-      {activeTab === 'timeline' && (
-        <div className="space-y-6">
-          <div>
-            <label className="block text-sm font-medium text-gray-900 dark:text-white mb-2">Select Entity</label>
-            <select
-              onChange={(e) => {
-                const selected = entities?.find(ent => ent.id === e.target.value);
-                setSelectedEntity(selected || null);
-              }}
-              className="w-full md:w-64 px-4 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-purple-500"
-            >
-              <option value="">Choose an entity...</option>
-              {(entities ?? []).map((entity) => (
-                <option key={entity.id} value={entity.id}>{entity.name ?? entity.id}</option>
-              ))}
-            </select>
-          </div>
-
-          {selectedEntity ? (
-            selectedEntity.behavior_timeline && selectedEntity.behavior_timeline.length > 0 ? (
-              <div className="space-y-4">
-                {selectedEntity.behavior_timeline.map((event, idx) => {
-                  const eventColor = eventTypeColors[event.event_type as keyof typeof eventTypeColors] || 'bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300';
-                  return (
-                    <div key={idx} className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4 flex gap-4">
-                      <div className="flex-shrink-0">
-                        <div className={clsx('w-10 h-10 rounded-full flex items-center justify-center font-semibold text-xs', eventColor)}>
-                          {event.event_type ? event.event_type.charAt(0).toUpperCase() : '?'}
-                        </div>
-                      </div>
-                      <div className="flex-1">
-                        <div className="flex items-start justify-between">
-                          <div>
-                            <p className="font-medium text-gray-900 dark:text-white">{event.description ?? '—'}</p>
-                            <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">{event.timestamp ? new Date(event.timestamp || "").toLocaleString() : '—'}</p>
-                          </div>
-                          {event.is_anomaly && (
-                            <span className="px-2 py-1 rounded-full text-xs font-medium bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400">
-                              Anomaly
-                            </span>
-                          )}
-                        </div>
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            ) : (
-              <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-8 text-center text-gray-500 dark:text-gray-400">
-                No behavior events found for this entity.
-              </div>
-            )
-          ) : (
-            <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-8 text-center text-gray-500 dark:text-gray-400">
-              Select an entity above to view its behavior timeline.
-            </div>
-          )}
-        </div>
-      )}
+      {activeTab === 'timeline' && <TimelineTab entities={entities ?? []} />}
 
       {/* Escalate-to-Incident modal */}
       {escalateAlert && (
@@ -610,6 +553,109 @@ interface IncidentSummary {
   severity: string;
   status: string;
   created_at: string;
+}
+
+// Real timeline renderer — calls /ueba/entities/{id}/timeline which returns
+// the entity's behavior_events window. The previous implementation read
+// selectedEntity.behavior_timeline, but the list endpoint never hydrated
+// that field, so "No behavior events" rendered for every entity even when
+// the entity had hundreds of events in the DB.
+function TimelineTab({ entities }: { entities: Entity[] }) {
+  const [entityId, setEntityId] = useState<string>('');
+
+  const { data: timeline, isLoading } = useQuery<{ events: any[] } | null>({
+    queryKey: ['ueba-entity-timeline', entityId],
+    queryFn: async () => {
+      if (!entityId) return null;
+      try {
+        const response = await api.get(`/ueba/entities/${entityId}/timeline`, { params: { days: 7 } });
+        return response.data;
+      } catch (err) {
+        console.error('Failed to load timeline:', err);
+        return null;
+      }
+    },
+    enabled: !!entityId,
+  });
+
+  // Normalize the backend BehaviorEvent rows into the shape this
+  // component renders (backend uses is_anomalous + created_at, UI uses
+  // is_anomaly + timestamp, and has no dedicated description column).
+  const events: BehaviorEvent[] = (timeline?.events ?? []).map((e: any) => ({
+    timestamp: e.created_at ?? e.timestamp ?? '',
+    event_type: e.event_type ?? 'event',
+    description: (e.event_data && typeof e.event_data === 'object' && 'description' in e.event_data)
+      ? String(e.event_data.description)
+      : (Array.isArray(e.anomaly_reasons) && e.anomaly_reasons.length > 0
+          ? e.anomaly_reasons.join(', ')
+          : e.event_type ?? ''),
+    is_anomaly: Boolean(e.is_anomalous ?? e.is_anomaly),
+    severity: e.severity,
+  }));
+  const selectedName = entities.find((e) => e.id === entityId)?.name;
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <label className="block text-sm font-medium text-gray-900 dark:text-white mb-2">Select Entity</label>
+        <select
+          value={entityId}
+          onChange={(e) => setEntityId(e.target.value)}
+          className="w-full md:w-64 px-4 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-purple-500"
+        >
+          <option value="">Choose an entity...</option>
+          {entities.map((entity) => (
+            <option key={entity.id} value={entity.id}>{entity.name ?? entity.id}</option>
+          ))}
+        </select>
+        {selectedName && (
+          <p className="text-xs text-gray-500 dark:text-gray-400 mt-2">Last 7 days for {selectedName}</p>
+        )}
+      </div>
+
+      {!entityId ? (
+        <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-8 text-center text-gray-500 dark:text-gray-400">
+          Select an entity above to view its behavior timeline.
+        </div>
+      ) : isLoading ? (
+        <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-8 text-center text-gray-500 dark:text-gray-400">
+          Loading timeline...
+        </div>
+      ) : events.length === 0 ? (
+        <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-8 text-center text-gray-500 dark:text-gray-400">
+          No behavior events recorded in the last 7 days.
+        </div>
+      ) : (
+        <div className="space-y-4">
+          {events.map((event, idx) => {
+            const eventColor = eventTypeColors[event.event_type as keyof typeof eventTypeColors] || 'bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300';
+            return (
+              <div key={idx} className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4 flex gap-4">
+                <div className="flex-shrink-0">
+                  <div className={clsx('w-10 h-10 rounded-full flex items-center justify-center font-semibold text-xs', eventColor)}>
+                    {event.event_type ? event.event_type.charAt(0).toUpperCase() : '?'}
+                  </div>
+                </div>
+                <div className="flex-1">
+                  <div className="flex items-start justify-between">
+                    <div>
+                      <p className="font-medium text-gray-900 dark:text-white">{event.description ?? event.event_type ?? '—'}</p>
+                      <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">{event.timestamp ? new Date(event.timestamp).toLocaleString() : '—'}</p>
+                    </div>
+                    {event.is_anomaly && (
+                      <span className="px-2 py-1 rounded-full text-xs font-medium bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400">
+                        Anomaly
+                      </span>
+                    )}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
 }
 
 function EscalateAlertModal({

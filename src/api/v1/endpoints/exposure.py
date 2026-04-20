@@ -925,8 +925,19 @@ async def import_scan_results(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Import results from external scanners (Nessus, Qualys, etc.)"""
+    """Import results from external scanners (Nessus, Qualys, Tenable.io,
+    OpenVAS, generic JSON/CSV).
+
+    Previously this endpoint dropped the scan_data payload on the floor
+    and returned ``vulnerabilities_imported: 0``. It now parses the
+    payload, upserts ``ExposureVulnerability`` + ``AssetVulnerability``
+    rows (keyed by CVE + asset), and reports real counts plus any
+    per-finding errors.
+    """
+    from src.exposure.scan_parser import parse_scan_data, ingest_findings
+
     import_id = str(uuid.uuid4())
+    org_id = getattr(current_user, "organization_id", None)
 
     scan = ExposureScan(
         id=import_id,
@@ -936,18 +947,42 @@ async def import_scan_results(
         scanner=import_data.scanner_name,
         target_assets=[],
         initiated_by=current_user.id,
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
     )
     db.add(scan)
+    await db.flush()
+
+    findings, parse_errors = parse_scan_data(
+        import_data.scan_format, import_data.scan_data
+    )
+
+    vulnerabilities_imported = 0
+    assets_updated = 0
+    ingest_errors: list[str] = []
+
+    if findings and org_id:
+        vulnerabilities_imported, assets_updated, ingest_errors = await ingest_findings(
+            db=db,
+            findings=findings,
+            scanner=import_data.scanner_name,
+            scan_id=import_id,
+            organization_id=org_id,
+        )
+
+    scan.status = "completed" if not parse_errors and not ingest_errors else "completed_with_errors"
+    scan.vulnerabilities_found = vulnerabilities_imported
+    scan.hosts_scanned = assets_updated
+    scan.total_hosts = assets_updated
+    scan.completed_at = datetime.now(timezone.utc)
     await db.flush()
 
     return {
         "import_id": import_id,
         "scanner_name": import_data.scanner_name,
-        "vulnerabilities_imported": 0,
-        "assets_updated": 0,
-        "status": "processing",
-        "errors": [],
+        "vulnerabilities_imported": vulnerabilities_imported,
+        "assets_updated": assets_updated,
+        "status": scan.status,
+        "errors": parse_errors + ingest_errors,
     }
 
 
@@ -1252,37 +1287,139 @@ async def trigger_assessment(
     db: DatabaseSession = None,
     surface_id: str = Query(...),
 ):
-    """Trigger assessment of an attack surface"""
-    surface = await get_attack_surface_or_404(db, surface_id, getattr(current_user, "organization_id", None))
+    """Run an attack surface assessment against real DB state.
 
-    # Count exposures for this surface
-    asset_count_result = await db.execute(
-        select(func.count(ExposureAsset.id)).where(
-            ExposureAsset.organization_id == getattr(current_user, "organization_id", None)
-        )
+    Previously this returned the total org asset count regardless of
+    which surface was targeted, ignored ``AssetVulnerability.severity``
+    entirely, and never wrote back to ``surface.risk_score`` or
+    ``surface.last_assessed_at``. It now computes per-surface totals
+    (filtered to internet-facing or internal based on surface_type),
+    counts real critical/high exposures by severity, writes a composite
+    risk score to the surface row, and stamps last_assessed_at so the
+    Attack Surface card reflects the click.
+    """
+    org_id = getattr(current_user, "organization_id", None)
+    surface = await get_attack_surface_or_404(db, surface_id, org_id)
+
+    # Decide asset filter based on surface_type. 'external' / 'internet'
+    # surfaces only count internet-facing assets; others count every
+    # active asset.
+    surface_type = (surface.surface_type or "").lower()
+    asset_filter = [ExposureAsset.organization_id == org_id, ExposureAsset.is_active == True]
+    if surface_type in ("external", "internet", "internet_facing", "edge"):
+        asset_filter.append(ExposureAsset.is_internet_facing == True)
+    elif surface_type in ("cloud",):
+        asset_filter.append(ExposureAsset.cloud_provider.is_not(None))
+    elif surface_type in ("internal",):
+        asset_filter.append(ExposureAsset.is_internet_facing == False)
+
+    surface_asset_ids_res = await db.execute(
+        select(ExposureAsset.id).where(and_(*asset_filter))
     )
-    total_exposures = asset_count_result.scalar() or 0
+    surface_asset_ids = [row[0] for row in surface_asset_ids_res.all()]
+    total_exposures = len(surface_asset_ids)
 
-    critical_count_result = await db.execute(
-        select(func.count(AssetVulnerability.id)).where(
-            and_(
-                AssetVulnerability.organization_id == getattr(current_user, "organization_id", None),
-                AssetVulnerability.status == "open",
+    critical_exposures = 0
+    high_exposures = 0
+    open_exposures = 0
+    avg_cvss = 0.0
+
+    if surface_asset_ids:
+        open_res = await db.execute(
+            select(func.count(AssetVulnerability.id)).where(
+                and_(
+                    AssetVulnerability.asset_id.in_(surface_asset_ids),
+                    AssetVulnerability.status == "open",
+                )
             )
         )
-    )
-    critical_exposures = critical_count_result.scalar() or 0
+        open_exposures = open_res.scalar() or 0
 
+        by_sev_res = await db.execute(
+            select(Vulnerability.severity, func.count(AssetVulnerability.id))
+            .join(
+                Vulnerability,
+                AssetVulnerability.vulnerability_id == Vulnerability.id,
+            )
+            .where(
+                and_(
+                    AssetVulnerability.asset_id.in_(surface_asset_ids),
+                    AssetVulnerability.status == "open",
+                )
+            )
+            .group_by(Vulnerability.severity)
+        )
+        for row in by_sev_res.all():
+            sev = (row[0] or "").lower()
+            count = row[1] or 0
+            if sev == "critical":
+                critical_exposures = count
+            elif sev == "high":
+                high_exposures = count
+
+        avg_res = await db.execute(
+            select(func.avg(Vulnerability.cvss_v3_score))
+            .join(
+                Vulnerability,
+                AssetVulnerability.vulnerability_id == Vulnerability.id,
+            )
+            .where(
+                and_(
+                    AssetVulnerability.asset_id.in_(surface_asset_ids),
+                    AssetVulnerability.status == "open",
+                )
+            )
+        )
+        avg_val = avg_res.scalar()
+        avg_cvss = float(avg_val) if avg_val is not None else 0.0
+
+    # Composite risk score: critical counts 4x, high 2x, rest 1x,
+    # normalized to 0-100 against total exposures. Falls back to 0 when
+    # the surface has no assets.
+    if total_exposures > 0:
+        weighted = (critical_exposures * 4) + (high_exposures * 2) + max(open_exposures - critical_exposures - high_exposures, 0)
+        raw_score = (weighted / max(total_exposures, 1)) * 25.0
+        risk_score = round(min(raw_score, 100.0), 2)
+    else:
+        risk_score = 0.0
+
+    now_utc = datetime.now(timezone.utc)
     assessment_id = str(uuid.uuid4())
+
+    findings = [
+        {
+            "id": assessment_id,
+            "assessed_at": now_utc.isoformat(),
+            "total_assets": total_exposures,
+            "open_exposures": open_exposures,
+            "critical_exposures": critical_exposures,
+            "high_exposures": high_exposures,
+            "avg_cvss_v3": round(avg_cvss, 2),
+        }
+    ]
+
+    # Persist back to the surface so the Attack Surface card is honest.
+    surface.total_assets = total_exposures
+    surface.critical_exposures = critical_exposures
+    surface.exposed_assets = open_exposures
+    surface.risk_score = risk_score
+    surface.last_assessed_at = now_utc
+    surface.findings = (list(surface.findings or []) + findings)[-20:]
+    surface.metrics = {
+        "high_exposures": high_exposures,
+        "avg_cvss_v3": round(avg_cvss, 2),
+        "open_exposures": open_exposures,
+    }
+    await db.flush()
 
     return {
         "assessment_id": assessment_id,
         "surface_id": surface_id,
         "total_exposures": total_exposures,
         "critical_exposures": critical_exposures,
-        "risk_score": surface.risk_score,
-        "status": "running",
-        "findings": surface.findings,
+        "risk_score": risk_score,
+        "status": "completed",
+        "findings": findings,
     }
 
 
@@ -1677,6 +1814,104 @@ async def generate_exposure_report(
     )
     overdue_tickets = overdue_result.scalar() or 0
 
+    # Real MTTR from closed remediation tickets (copies the /dashboard
+    # logic — previously this section hardcoded 0.0).
+    mttr_result = await db.execute(
+        select(
+            func.avg(
+                func.extract(
+                    "epoch",
+                    RemediationTicket.completed_at - RemediationTicket.created_at,
+                )
+            )
+        ).where(
+            and_(
+                RemediationTicket.organization_id == org_id,
+                RemediationTicket.completed_at.is_not(None),
+            )
+        )
+    )
+    mttr_seconds = mttr_result.scalar()
+    mean_time_to_remediate_days = round(float(mttr_seconds) / 86400.0, 2) if mttr_seconds else 0.0
+
+    # Composite risk score weighted by severity. Critical=25, High=10,
+    # Medium=3, Low=1 — keeps overall_risk_score bounded roughly 0..100.
+    weighted_sum = (
+        severity_counts.get("critical", 0) * 25
+        + severity_counts.get("high", 0) * 10
+        + severity_counts.get("medium", 0) * 3
+        + severity_counts.get("low", 0) * 1
+    )
+    max_possible = max(total_vulnerabilities * 25, 1)
+    overall_risk_score = round(min(100.0, (weighted_sum / max_possible) * 100.0), 1)
+
+    # Top 5 most-vulnerable assets by count of open vulns.
+    top_assets_res = await db.execute(
+        select(
+            ExposureAsset.id,
+            ExposureAsset.name,
+            ExposureAsset.hostname,
+            func.count(AssetVulnerability.id).label("open_count"),
+        )
+        .join(AssetVulnerability, AssetVulnerability.asset_id == ExposureAsset.id)
+        .where(
+            and_(
+                ExposureAsset.organization_id == org_id,
+                AssetVulnerability.status == "open",
+            )
+        )
+        .group_by(ExposureAsset.id, ExposureAsset.name, ExposureAsset.hostname)
+        .order_by(func.count(AssetVulnerability.id).desc())
+        .limit(5)
+    )
+    top_vulnerable_assets = [
+        {
+            "asset_id": row[0],
+            "asset_name": row[1],
+            "hostname": row[2],
+            "open_vulnerabilities": row[3],
+        }
+        for row in top_assets_res.all()
+    ]
+
+    # Recommendations derived from the real state — honest triage
+    # guidance, not a placeholder list.
+    recommendations: list[str] = []
+    if include_recommendations:
+        if severity_counts.get("critical", 0) > 0:
+            recommendations.append(
+                f"Patch {severity_counts.get('critical', 0)} critical CVE(s) within 72 hours."
+            )
+        if severity_counts.get("high", 0) > 5:
+            recommendations.append(
+                f"Open remediation tickets for {severity_counts.get('high', 0)} high-severity vulns."
+            )
+        if internet_facing_assets > 0 and severity_counts.get("critical", 0) > 0:
+            recommendations.append(
+                "Review internet-facing assets — at least one critical vuln is publicly reachable."
+            )
+        if overdue_tickets > 0:
+            recommendations.append(
+                f"{overdue_tickets} remediation ticket(s) are overdue — escalate to ticket owners."
+            )
+        if mean_time_to_remediate_days > 30:
+            recommendations.append(
+                f"MTTR is {mean_time_to_remediate_days} days — consider SLA tightening or adding remediation automation."
+            )
+        if not recommendations:
+            recommendations.append(
+                "Posture looks healthy. Rerun scans weekly to stay ahead of newly disclosed CVEs."
+            )
+
+    top_findings = [
+        {
+            "asset_name": row["asset_name"],
+            "hostname": row["hostname"],
+            "open_vulnerabilities": row["open_vulnerabilities"],
+        }
+        for row in top_vulnerable_assets
+    ]
+
     statistics = {
         "total_assets": total_assets,
         "active_assets": active_assets,
@@ -1687,12 +1922,12 @@ async def generate_exposure_report(
         "medium_vulns": severity_counts.get("medium", 0),
         "low_vulns": severity_counts.get("low", 0),
         "info_vulns": severity_counts.get("informational", 0),
-        "mean_time_to_remediate_days": 0.0,
+        "mean_time_to_remediate_days": mean_time_to_remediate_days,
         "overdue_tickets": overdue_tickets,
-        "overall_risk_score": 0.0,
+        "overall_risk_score": overall_risk_score,
         "assets_by_criticality": {},
         "vulns_by_status": {},
-        "top_vulnerable_assets": [],
+        "top_vulnerable_assets": top_vulnerable_assets,
         "exposure_trend": [],
         "compliance_summary": {},
     }
@@ -1700,10 +1935,15 @@ async def generate_exposure_report(
     return {
         "title": title,
         "report_date": datetime.now(timezone.utc).isoformat(),
-        "summary": f"Exposure report: {total_assets} assets, {total_vulnerabilities} vulnerabilities tracked",
+        "summary": (
+            f"Exposure report: {total_assets} assets ({internet_facing_assets} internet-facing), "
+            f"{total_vulnerabilities} vulnerabilities ({severity_counts.get('critical', 0)} critical, "
+            f"{severity_counts.get('high', 0)} high). Overall risk score: {overall_risk_score}/100. "
+            f"MTTR: {mean_time_to_remediate_days} days."
+        ),
         "statistics": statistics,
-        "top_findings": [],
-        "recommendations": [],
+        "top_findings": top_findings,
+        "recommendations": recommendations,
         "compliance_status": {
             "frameworks": {},
             "overall_compliance_score": 0.0,

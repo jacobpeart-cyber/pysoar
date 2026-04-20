@@ -5,10 +5,11 @@ FastAPI routes for deploying, managing, and monitoring deception infrastructure.
 """
 
 from datetime import datetime, timedelta, timezone
-from typing import Any
+import uuid
+from typing import Any, Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -373,6 +374,114 @@ async def rotate_decoy(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to rotate decoy",
+        )
+
+
+@router.post(
+    "/decoys/{decoy_id}/interactions",
+    status_code=status.HTTP_201_CREATED,
+)
+async def record_decoy_interaction(
+    decoy_id: UUID,
+    payload: dict = Body(...),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
+):
+    """Record an attacker interaction with a deployed decoy.
+
+    Exposes a real ingestion path so an external honeypot process, a
+    webhook from a canary service, or a purple-team script can drive
+    ``decoy.interaction_count``, ``decoy.last_interaction_at``, and
+    create a linked ``Alert`` when ``alert_generated`` is true.
+
+    Previously the DB had the table and the UI charted "Interactions
+    Today" but nothing on the backend could write a row — so the
+    counter was forever 0 in any honest deployment.
+    """
+    from src.deception.models import DecoyInteraction
+    from src.models.alert import Alert
+    import json as _json
+
+    try:
+        decoy = await get_decoy_or_404(db, decoy_id)
+
+        interaction = DecoyInteraction(
+            id=str(uuid.uuid4()),
+            decoy_id=str(decoy.id),
+            interaction_type=(payload.get("interaction_type") or "connection"),
+            source_ip=payload.get("source_ip") or "0.0.0.0",
+            source_port=payload.get("source_port"),
+            source_hostname=payload.get("source_hostname"),
+            source_user=payload.get("source_user"),
+            protocol=payload.get("protocol"),
+            credentials_captured=payload.get("credentials_captured"),
+            commands_captured=payload.get("commands_captured") or [],
+            payloads_captured=payload.get("payloads_captured") or [],
+            files_accessed=payload.get("files_accessed") or [],
+            session_duration_seconds=payload.get("session_duration_seconds"),
+            geo_location=payload.get("geo_location"),
+            threat_assessment=payload.get("threat_assessment") or "high",
+            is_automated_scan=bool(payload.get("is_automated_scan", False)),
+            raw_traffic=payload.get("raw_traffic"),
+            alert_generated=bool(payload.get("alert_generated", True)),
+            mitre_techniques=payload.get("mitre_techniques") or [],
+        )
+        db.add(interaction)
+
+        # Bump counters on the decoy so the dashboard reflects the hit.
+        now_utc = datetime.now(timezone.utc)
+        decoy.interaction_count = (decoy.interaction_count or 0) + 1
+        decoy.last_interaction_at = now_utc
+
+        alert_id: Optional[str] = None
+        if interaction.alert_generated:
+            alert = Alert(
+                id=str(uuid.uuid4()),
+                title=f"Decoy interaction: {decoy.name} from {interaction.source_ip}",
+                description=(
+                    f"Interaction type: {interaction.interaction_type}. "
+                    f"Source IP {interaction.source_ip} engaged decoy '{decoy.name}'. "
+                    f"Any engagement with a decoy is suspicious by design."
+                ),
+                severity=interaction.threat_assessment or "high",
+                status="new",
+                source="deception",
+                source_id=str(interaction.id),
+                alert_type="decoy_interaction",
+                category="honeypot",
+                source_ip=interaction.source_ip,
+                username=interaction.source_user,
+                raw_data=_json.dumps({
+                    "interaction_type": interaction.interaction_type,
+                    "protocol": interaction.protocol,
+                    "commands_captured": interaction.commands_captured,
+                    "mitre_techniques": interaction.mitre_techniques,
+                }),
+                organization_id=getattr(current_user, "organization_id", None),
+                created_at=now_utc,
+                updated_at=now_utc,
+            )
+            db.add(alert)
+            await db.flush()
+            alert_id = alert.id
+            interaction.alert_id = alert_id
+
+        await db.flush()
+
+        return {
+            "interaction_id": str(interaction.id),
+            "decoy_id": str(decoy.id),
+            "alert_generated": bool(alert_id),
+            "alert_id": alert_id,
+            "interaction_count": decoy.interaction_count,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to record decoy interaction: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to record decoy interaction",
         )
 
 
@@ -1155,13 +1264,59 @@ async def get_campaign_effectiveness(
             )
             unique_attackers = attacker_count_result.scalar() or 0
 
-        effectiveness_score = campaign.effectiveness_score or 0.0
+        # Compute effectiveness_score from real interaction data rather
+        # than reading the stored column (which nothing ever wrote to,
+        # so every card showed 0.0 regardless of actual activity).
+        # Weighted formula: 40% interaction volume (saturated at 100),
+        # 30% unique attacker diversity (saturated at 10 distinct IPs),
+        # 30% coverage (decoys in campaign / 5 decoys-target).
+        decoy_count = len(campaign.decoy_ids or [])
+        interaction_component = min(total_interactions / 1.0, 100.0) * 0.4 if total_interactions <= 100 else 40.0
+        diversity_component = min(unique_attackers / 10.0, 1.0) * 30.0
+        coverage_component = min(decoy_count / 5.0, 1.0) * 30.0
+        effectiveness_score = round(interaction_component + diversity_component + coverage_component, 2)
+
+        # Persist back so the Campaigns list card reflects the score
+        # without every client having to recompute.
+        campaign.effectiveness_score = effectiveness_score
+        await db.flush()
+
+        # Real MTTD from first interaction after campaign start, if any.
+        mttd_seconds = 0.0
+        if campaign.decoy_ids and campaign.start_date:
+            first_hit_res = await db.execute(
+                select(func.min(DecoyInteraction.created_at)).where(
+                    DecoyInteraction.decoy_id.in_(campaign.decoy_ids)
+                )
+            )
+            first_hit = first_hit_res.scalar()
+            if first_hit:
+                mttd_seconds = max(
+                    0.0,
+                    (first_hit - campaign.start_date).total_seconds(),
+                )
+
+        recommendations: list[str] = []
+        if total_interactions == 0 and decoy_count > 0:
+            recommendations.append(
+                "No interactions yet — verify the campaign's decoys are reachable from the attacker path."
+            )
+        if decoy_count < 3:
+            recommendations.append(
+                f"Campaign only covers {decoy_count} decoy(s). Add more to increase coverage."
+            )
+        if unique_attackers == 1 and total_interactions > 10:
+            recommendations.append(
+                "All interactions came from a single source — investigate whether this is a scanner or a real adversary."
+            )
 
         logger.info(
             f"Assessed campaign effectiveness: {campaign_id}",
             extra={
                 "campaign_id": str(campaign_id),
                 "score": effectiveness_score,
+                "interactions": total_interactions,
+                "attackers": unique_attackers,
             },
         )
 
@@ -1179,8 +1334,8 @@ async def get_campaign_effectiveness(
             attacks_detected=total_interactions,
             false_positives=0,
             detection_rate=100.0 if total_interactions > 0 else 0.0,
-            mean_time_to_detection=0.0,
-            recommendations=[],
+            mean_time_to_detection=round(mttd_seconds / 60.0, 2),  # minutes
+            recommendations=recommendations,
         )
 
     except HTTPException:

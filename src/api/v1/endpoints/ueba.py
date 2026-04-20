@@ -909,13 +909,16 @@ async def ingest_batch(
     org_id = getattr(current_user, "organization_id", None)
     # org_id may be None for users without organization
 
+    import time as _t
+    _started = _t.monotonic()
+
     processed = 0
     failed = 0
     anomalies = 0
+    alerts_created = 0
 
     for event in batch.events:
         try:
-            # Look up entity profile
             entity_result = await db.execute(
                 select(EntityProfile).where(
                     and_(
@@ -940,21 +943,67 @@ async def ingest_batch(
                 device_info=event.device_info if hasattr(event, "device_info") else None,
                 organization_id=org_id,
             )
+
+            # Score every batch event against the entity baseline —
+            # previously batch ingestion skipped scoring entirely, so
+            # SIEM integrations pushing bulk events produced zero UEBA
+            # signal. Identical logic to single-event ingest.
+            is_anomalous, reasons, risk_delta = await _score_event_anomaly(
+                db, entity, behavior_event
+            )
+            behavior_event.is_anomalous = is_anomalous
+            behavior_event.anomaly_reasons = reasons
+            behavior_event.risk_contribution = risk_delta
+
+            if is_anomalous:
+                anomalies += 1
+                entity.risk_score = min(100.0, (entity.risk_score or 0.0) + risk_delta)
+                entity.anomaly_count_30d = (entity.anomaly_count_30d or 0) + 1
+                entity.last_anomaly_at = datetime.now(timezone.utc)
+                if entity.risk_score >= 80:
+                    entity.risk_level = "critical"
+                elif entity.risk_score >= 60:
+                    entity.risk_level = "high"
+                elif entity.risk_score >= 30:
+                    entity.risk_level = "medium"
+                else:
+                    entity.risk_level = "low"
+            entity.last_activity_at = datetime.now(timezone.utc)
+
             db.add(behavior_event)
             processed += 1
-        except Exception:
+
+            # Fire automation on anomalous batch events so the downstream
+            # alert/incident fanout matches single-event behavior.
+            if is_anomalous:
+                try:
+                    automation = AutomationService(db)
+                    await automation.on_ueba_anomaly(
+                        entity_type=entity.entity_type,
+                        entity_id=entity.entity_id,
+                        anomaly_type=event.event_type,
+                        risk_score=entity.risk_score or 0.0,
+                        organization_id=org_id,
+                    )
+                    alerts_created += 1
+                except Exception as e:
+                    logger.error(f"Batch UEBA automation failed: {e}")
+        except Exception as exc:
+            logger.error(f"Batch event ingest failed: {exc}", exc_info=True)
             failed += 1
 
     if processed > 0:
         await db.flush()
+
+    elapsed_ms = (_t.monotonic() - _started) * 1000.0
 
     return {
         "total_events": len(batch.events),
         "processed_events": processed,
         "failed_events": failed,
         "anomalies_detected": anomalies,
-        "alerts_created": 0,
-        "processing_time_ms": 0.0,
+        "alerts_created": alerts_created,
+        "processing_time_ms": round(elapsed_ms, 2),
     }
 
 

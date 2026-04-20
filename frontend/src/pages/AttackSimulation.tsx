@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '../lib/api';
 import {
@@ -166,12 +166,55 @@ function formatDuration(startedAt: string | null, completedAt: string | null, du
   return '--';
 }
 
+// Real visible toast — previously this was just console.log so users
+// ran tests/emulations and saw no feedback that anything had happened.
+type ToastMsg = { id: number; type: 'success' | 'error'; text: string };
+let _toastListeners: Array<(t: ToastMsg) => void> = [];
+let _toastSeq = 0;
+
 function showNotification(message: string, type: 'success' | 'error' = 'success') {
+  const msg: ToastMsg = { id: ++_toastSeq, type, text: message };
+  _toastListeners.forEach((l) => l(msg));
   if (type === 'error') {
     console.error(message);
-  } else {
-    console.log(message);
   }
+}
+
+function useToastInbox(): ToastMsg[] {
+  const [toasts, setToasts] = useState<ToastMsg[]>([]);
+  useEffect(() => {
+    const listener = (t: ToastMsg) => {
+      setToasts((prev) => [...prev, t]);
+      setTimeout(() => setToasts((prev) => prev.filter((p) => p.id !== t.id)), 4000);
+    };
+    _toastListeners.push(listener);
+    return () => {
+      _toastListeners = _toastListeners.filter((l) => l !== listener);
+    };
+  }, []);
+  return toasts;
+}
+
+function ToastStack() {
+  const toasts = useToastInbox();
+  if (toasts.length === 0) return null;
+  return (
+    <div className="fixed top-4 right-4 z-50 space-y-2">
+      {toasts.map((t) => (
+        <div
+          key={t.id}
+          className={clsx(
+            'px-4 py-3 rounded-lg shadow-lg border text-sm font-medium',
+            t.type === 'success'
+              ? 'bg-green-50 dark:bg-green-900/30 text-green-700 dark:text-green-300 border-green-200 dark:border-green-900/50'
+              : 'bg-red-50 dark:bg-red-900/30 text-red-700 dark:text-red-300 border-red-200 dark:border-red-900/50',
+          )}
+        >
+          {t.text}
+        </div>
+      ))}
+    </div>
+  );
 }
 
 export default function AttackSimulation() {
@@ -253,6 +296,7 @@ export default function AttackSimulation() {
 
   return (
     <div className="space-y-6">
+      <ToastStack />
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
@@ -325,53 +369,48 @@ export default function AttackSimulation() {
 
           {/* Charts */}
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-            {/* Posture Trend */}
-            {dashboard?.posture_trend && dashboard.posture_trend.length > 0 && (
-              <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
-                <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">Posture Score Trend</h3>
-                <ResponsiveContainer width="100%" height={250}>
-                  <LineChart data={dashboard.posture_trend}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
-                    <XAxis dataKey="date" stroke="#6b7280" />
-                    <YAxis stroke="#6b7280" domain={[0, 100]} />
-                    <Tooltip
-                      contentStyle={{
-                        backgroundColor: '#1f2937',
-                        border: 'none',
-                        borderRadius: '0.5rem',
-                        color: '#fff',
-                      }}
-                    />
-                    <Line
-                      type="monotone"
-                      dataKey="score"
-                      stroke="#3b82f6"
-                      strokeWidth={2}
-                      dot={{ fill: '#3b82f6', r: 4 }}
-                    />
-                  </LineChart>
-                </ResponsiveContainer>
-              </div>
-            )}
+            {/* Posture Score Trend — shaped from the backend's
+                security_trends.scores array. The previous wiring to
+                dashboard.posture_trend always evaluated falsy because
+                the backend never emits that key, so the chart never
+                rendered despite real trend data being available. */}
+            {dashboard?.security_trends?.scores && dashboard.security_trends.scores.length > 0 && (() => {
+              const scores = dashboard.security_trends.scores;
+              const count = scores.length;
+              const trendData = scores.map((score, i) => ({
+                date: new Date(Date.now() - (count - 1 - i) * 86_400_000).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
+                score,
+              }));
+              return (
+                <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
+                  <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">Posture Score Trend</h3>
+                  <ResponsiveContainer width="100%" height={250}>
+                    <LineChart data={trendData}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
+                      <XAxis dataKey="date" stroke="#6b7280" />
+                      <YAxis stroke="#6b7280" domain={[0, 100]} />
+                      <Tooltip contentStyle={{ backgroundColor: '#1f2937', border: 'none', borderRadius: '0.5rem', color: '#fff' }} />
+                      <Line type="monotone" dataKey="score" stroke="#3b82f6" strokeWidth={2} dot={{ fill: '#3b82f6', r: 4 }} />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+              );
+            })()}
 
-            {/* Detection by Tactic */}
-            {dashboard?.detection_by_tactic && dashboard.detection_by_tactic.length > 0 && (
+            {/* Detection by Tactic — backend returns top_tactics as
+                [{tactic, technique_count, average_detection_rate}].
+                The prior binding to dashboard.detection_by_tactic never
+                matched, so this chart also never rendered. */}
+            {dashboard?.top_tactics && dashboard.top_tactics.length > 0 && (
               <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
                 <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-4">Detection Rate by Tactic</h3>
                 <ResponsiveContainer width="100%" height={250}>
-                  <BarChart data={dashboard.detection_by_tactic}>
+                  <BarChart data={dashboard.top_tactics}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" />
                     <XAxis dataKey="tactic" stroke="#6b7280" angle={-45} textAnchor="end" height={80} />
-                    <YAxis stroke="#6b7280" />
-                    <Tooltip
-                      contentStyle={{
-                        backgroundColor: '#1f2937',
-                        border: 'none',
-                        borderRadius: '0.5rem',
-                        color: '#fff',
-                      }}
-                    />
-                    <Bar dataKey="detection_rate" fill="#10b981" />
+                    <YAxis stroke="#6b7280" domain={[0, 100]} />
+                    <Tooltip contentStyle={{ backgroundColor: '#1f2937', border: 'none', borderRadius: '0.5rem', color: '#fff' }} />
+                    <Bar dataKey="average_detection_rate" fill="#10b981" />
                   </BarChart>
                 </ResponsiveContainer>
               </div>

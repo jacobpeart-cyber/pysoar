@@ -256,12 +256,12 @@ export default function ExposureManagement() {
     .slice(0, 10)
     .map(a => ({ name: a.hostname, risk: a.risk_score })) || [];
 
-  const trendData = stats?.exposure_trend && stats.exposure_trend.length > 0
+  // Use the backend-supplied trend series; never fabricate a flatline
+  // from today's critical-vuln count (that misled operators into
+  // reading a real 30-day history where none existed).
+  const trendData = (stats?.exposure_trend && stats.exposure_trend.length > 0)
     ? stats.exposure_trend
-    : Array.from({ length: 30 }, (_, i) => ({
-        date: new Date(Date.now() - (29 - i) * 24 * 60 * 60 * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
-        exposures: stats?.critical_vulns ?? 0,
-      }));
+    : [];
 
   const colors = ['#ef4444', '#f97316', '#eab308', '#3b82f6'];
 
