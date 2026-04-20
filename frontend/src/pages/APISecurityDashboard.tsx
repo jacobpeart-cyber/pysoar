@@ -24,7 +24,33 @@ export default function APISecurityDashboard() {
   const [showModal, setShowModal] = useState(false);
   const [filterPublic, setFilterPublic] = useState<'all' | 'public' | 'private'>('all');
 
-  const { data: apiInventory = [] } = useQuery({ queryKey: ['apiInventory'], queryFn: apisecurityApi.getAPIs });
+  // Backend APIEndpointInventoryResponse uses snake_case and
+  // different field names than this page was written to expect
+  // (`name`, `shadow`, `auth`, `public`, `endpoints`, `method`).
+  // Normalize at fetch time so every downstream table/filter works
+  // — previously every inventory cell rendered `undefined` and every
+  // filter matched zero rows.
+  const normalizeAPIRecord = (a: any): APIRecord => ({
+    id: a.id,
+    name: a.name ?? a.service_name ?? a.display_name ?? `${a.http_method ?? 'GET'} ${a.path ?? '/'}`,
+    method: a.method ?? a.http_method ?? 'GET',
+    endpoints: a.endpoints ?? a.endpoint_count ?? 1,
+    public: typeof a.public === 'boolean' ? a.public : !!a.is_public,
+    shadow: typeof a.shadow === 'boolean' ? a.shadow : !!a.is_shadow,
+    auth: a.auth ?? a.authentication_type ?? 'unknown',
+    category: a.category ?? a.classification ?? null,
+    riskScore: typeof a.riskScore === 'number' ? a.riskScore : (a.risk_score ?? 0),
+    baseUrl: a.baseUrl ?? a.base_url ?? null,
+    description: a.description ?? null,
+  });
+
+  const { data: apiInventoryRaw = [] } = useQuery({ queryKey: ['apiInventory'], queryFn: apisecurityApi.getAPIs });
+  const apiInventory: APIRecord[] = useMemo(
+    () => (Array.isArray(apiInventoryRaw) ? apiInventoryRaw : (apiInventoryRaw as any)?.items || [])
+      .map(normalizeAPIRecord),
+    [apiInventoryRaw],
+  );
+
   const { data: vulnerabilities = [] } = useQuery({ queryKey: ['vulnerabilities'], queryFn: apisecurityApi.getVulnerabilities });
   const { data: policies = [] } = useQuery({ queryKey: ['policies'], queryFn: apisecurityApi.getPolicies });
   const { data: anomalies = [] } = useQuery({ queryKey: ['anomalies'], queryFn: apisecurityApi.getAnomalies });
@@ -32,8 +58,8 @@ export default function APISecurityDashboard() {
   const stats = useMemo(() => {
     const totalAPIs = apiInventory.length;
     const shadowAPIs = apiInventory.filter((a: APIRecord) => a.shadow).length;
-    const violations = vulnerabilities.length;
-    const detectedAnomalies = anomalies.length;
+    const violations = Array.isArray(vulnerabilities) ? vulnerabilities.length : 0;
+    const detectedAnomalies = Array.isArray(anomalies) ? anomalies.length : 0;
     return { totalAPIs, shadowAPIs, violations, detectedAnomalies };
   }, [apiInventory, vulnerabilities, anomalies]);
 
@@ -42,52 +68,48 @@ export default function APISecurityDashboard() {
     return apiInventory.filter((a: APIRecord) => (filterPublic === 'public' ? a.public : !a.public));
   }, [apiInventory, filterPublic]);
 
+  // OWASP compliance buckets — only tallied when the backend
+  // actually returns an `owasp_category` on the vulnerability. The
+  // previous implementation guaranteed at least one "pass" per bucket
+  // by falling back to `apiInventory.filter(a.riskScore<=5).length>0 ? 1 : 0`,
+  // and was further corrupted by `v.category?.includes(c.split(': ')[1])`
+  // substring matching ("Auth" matched almost everything). Result: a
+  // chart that always showed identical bars regardless of data.
   const owaspCompliance = useMemo(() => {
     const categories = [
-      'A01: BLOA', 'A02: Auth', 'A03: BOPLA', 'A04: URC', 'A05: BFLA',
-      'A06: CBOR', 'A07: Cross-Site Scripting', 'A08: Injection', 'A09: SSRF', 'A10: Logging',
+      'A01: Broken Object Level Authorization',
+      'A02: Broken Authentication',
+      'A03: Broken Object Property Level Authorization',
+      'A04: Unrestricted Resource Consumption',
+      'A05: Broken Function Level Authorization',
+      'A06: Unrestricted Access to Sensitive Business Flows',
+      'A07: Server Side Request Forgery',
+      'A08: Security Misconfiguration',
+      'A09: Improper Inventory Management',
+      'A10: Unsafe Consumption of APIs',
     ];
-    const vulnsByCategory: Record<string, { pass: number; fail: number }> = {};
-    categories.forEach((cat) => { vulnsByCategory[cat] = { pass: 0, fail: 0 }; });
-    vulnerabilities.forEach((v: Vulnerability) => {
-      const matched = categories.find((c) => v.category?.includes(c.split(': ')[1]));
-      const key = matched || categories[categories.length - 1];
-      if (v.status === 'Mitigated') {
-        vulnsByCategory[key].pass += v.count || 1;
-      } else {
-        vulnsByCategory[key].fail += v.count || 1;
-      }
+    const buckets: Record<string, { pass: number; fail: number }> = {};
+    categories.forEach((c) => { buckets[c] = { pass: 0, fail: 0 }; });
+    (Array.isArray(vulnerabilities) ? vulnerabilities : []).forEach((v: any) => {
+      const ow = v.owasp_category ?? v.owasp ?? v.category;
+      if (!ow) return;
+      const match = categories.find((c) => c.startsWith(String(ow)) || String(ow).startsWith(c.slice(0, 3)));
+      if (!match) return;
+      const mitigated = (v.status ?? '').toString().toLowerCase() === 'mitigated';
+      if (mitigated) buckets[match].pass += v.count || 1;
+      else buckets[match].fail += v.count || 1;
     });
-    // Ensure at least some data even when API returns few items
-    return categories.map((cat) => ({
-      category: cat,
-      pass: vulnsByCategory[cat].pass || apiInventory.filter((a: APIRecord) => a.riskScore <= 5).length > 0 ? vulnsByCategory[cat].pass || 1 : 0,
-      fail: vulnsByCategory[cat].fail,
-    }));
-  }, [vulnerabilities, apiInventory]);
-
-  const riskTrendData = useMemo(() => {
-    const severityCounts: Record<string, { critical: number; high: number; medium: number }> = {};
-    vulnerabilities.forEach((v: Vulnerability) => {
-      const key = v.severity || 'Medium';
-      if (!severityCounts[key]) severityCounts[key] = { critical: 0, high: 0, medium: 0 };
-    });
-    // Build a simple trend from current vulnerability counts
-    const critical = vulnerabilities.filter((v: Vulnerability) => v.severity === 'Critical').length;
-    const high = vulnerabilities.filter((v: Vulnerability) => v.severity === 'High').length;
-    const medium = vulnerabilities.filter((v: Vulnerability) => v.severity === 'Medium').length;
-    const now = new Date();
-    return [0, 1, 2, 3].map((weeksAgo) => {
-      const d = new Date(now);
-      d.setDate(d.getDate() - (3 - weeksAgo) * 7);
-      return {
-        date: d.toISOString().slice(0, 10),
-        critical: Math.max(0, critical - (3 - weeksAgo)),
-        high: Math.max(0, high - (3 - weeksAgo)),
-        medium: Math.max(0, medium - (3 - weeksAgo)),
-      };
-    });
+    return categories.map((c) => ({ category: c.slice(0, 3), pass: buckets[c].pass, fail: buckets[c].fail }));
   }, [vulnerabilities]);
+
+  // Real severity-weighted trend is not currently exposed by the
+  // backend. Until a trend endpoint exists we return [] and let the
+  // chart render an honest empty state instead of a fabricated line
+  // built by subtracting (3 - weeksAgo) from today's counts.
+  const riskTrendData: Array<{ date: string; critical: number; high: number; medium: number }> = useMemo(
+    () => [],
+    [],
+  );
 
   const apiScatterData = apiInventory.map((api: APIRecord) => ({
     name: api.name,
