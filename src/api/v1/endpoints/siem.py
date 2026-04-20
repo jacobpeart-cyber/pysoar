@@ -1,9 +1,12 @@
 """SIEM management endpoints"""
 
 import json
+import logging
 import math
 from datetime import datetime, timezone
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 from fastapi import APIRouter, BackgroundTasks, Body, HTTPException, Query, status
 from sqlalchemy import asc, desc, func, select
@@ -1136,6 +1139,42 @@ async def export_rule_yaml(
         "detection": safe_json_loads(rule.detection_logic, {}) if rule.detection_logic else {},
     }
     return {"yaml": yaml.dump(rule_dict, default_flow_style=False), "title": rule.title}
+
+
+# ============================================================================
+# MIRROR / BACKFILL ENDPOINT
+# ============================================================================
+
+
+@router.post("/logs/backfill", response_model=None)
+async def backfill_log_entries(
+    limit_per_source: int = Query(5000, ge=1, le=50000),
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+):
+    """Copy existing Alert + AuditLog rows into ``log_entries``.
+
+    Run once after deploy to populate the SIEM search surface with the
+    platform's historical security events. Idempotent — rows already
+    mirrored (tracked by source id in parsed_fields) are skipped. New
+    Alert/AuditLog inserts after this point are mirrored automatically
+    by the SQLAlchemy ``after_insert`` listeners registered at startup.
+    """
+    from src.siem.mirror import backfill_from_history
+
+    result = await backfill_from_history(db, limit_per_source=limit_per_source)
+    await db.commit()
+
+    # Recompute current totals so the response confirms what the user sees
+    total_result = await db.execute(select(func.count(LogEntry.id)))
+    total_after = total_result.scalar() or 0
+
+    return {
+        "status": "ok",
+        "alerts_mirrored": result["alerts_mirrored"],
+        "audits_mirrored": result["audits_mirrored"],
+        "log_entries_total_after": total_after,
+    }
 
 
 # ============================================================================

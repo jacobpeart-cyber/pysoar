@@ -68,6 +68,40 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     await init_db()
     logger.info("Database initialized")
 
+    # Register SIEM log mirror listeners: every Alert or AuditLog insert
+    # is copied into log_entries so the SIEM search/dashboard/rules see
+    # real platform activity rather than sitting empty.
+    try:
+        from src.siem.mirror import register_mirror_listeners
+        register_mirror_listeners()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("SIEM mirror registration failed", error=str(e))
+
+    # Seed real built-in detection rules. The previous state was 5 out of
+    # 7 rules having no detection_logic — decorative rows that could never
+    # fire. This seeder fills in the matching bodies (idempotent — won't
+    # overwrite user edits).
+    try:
+        from src.core.database import async_session_factory
+        from src.siem.rule_seeder import seed_builtin_detection_rules
+        from src.siem.engine_manager import load_rules_from_db
+        async with async_session_factory() as _seed_db:
+            seeder_result = await seed_builtin_detection_rules(_seed_db)
+            await _seed_db.commit()
+            if seeder_result.get("inserted") or seeder_result.get("refilled"):
+                logger.info(
+                    "Seeded SIEM detection rules",
+                    inserted=seeder_result["inserted"],
+                    refilled=seeder_result["refilled"],
+                )
+            # Prime the in-memory RuleEngine so mirrored audit events can
+            # be evaluated immediately after boot instead of waiting for
+            # the first HTTP /siem/logs/ingest to lazy-load.
+            loaded = await load_rules_from_db(_seed_db)
+            logger.info("SIEM rule engine primed", rules_loaded=loaded)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("SIEM rule seeder/prime failed", error=str(e))
+
     # Create first admin user if needed
     await create_first_admin()
 
