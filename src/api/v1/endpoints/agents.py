@@ -267,6 +267,78 @@ async def get_agent(
     return AgentSummary.model_validate(agent)
 
 
+@router.post("/{agent_id}/disable")
+async def disable_agent(
+    agent_id: str,
+    current_user: CurrentUser = None,
+    session: DatabaseSession = None,
+) -> dict:
+    """Disable an enrolled agent — future commands are rejected until
+    re-enabled. Keeps the agent record and credentials intact so the
+    same host can come back online with its existing enrollment.
+    """
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(EndpointAgent).where(EndpointAgent.id == agent_id)
+    if org_id is not None:
+        stmt = stmt.where(EndpointAgent.organization_id == org_id)
+    agent = (await session.execute(stmt)).scalar_one_or_none()
+    if agent is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    agent.status = "disabled"
+    await session.flush()
+    return {"agent_id": agent.id, "status": agent.status}
+
+
+@router.post("/{agent_id}/enable")
+async def enable_agent(
+    agent_id: str,
+    current_user: CurrentUser = None,
+    session: DatabaseSession = None,
+) -> dict:
+    """Re-enable a disabled agent. Cannot re-enable a revoked agent —
+    revocation is permanent."""
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(EndpointAgent).where(EndpointAgent.id == agent_id)
+    if org_id is not None:
+        stmt = stmt.where(EndpointAgent.organization_id == org_id)
+    agent = (await session.execute(stmt)).scalar_one_or_none()
+    if agent is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    if agent.status == "revoked":
+        raise HTTPException(
+            status_code=400,
+            detail="Revoked agents cannot be re-enabled — re-enroll instead",
+        )
+    agent.status = "active"
+    await session.flush()
+    return {"agent_id": agent.id, "status": agent.status}
+
+
+@router.post("/{agent_id}/revoke")
+async def revoke_agent(
+    agent_id: str,
+    current_user: CurrentUser = None,
+    session: DatabaseSession = None,
+) -> dict:
+    """Permanently revoke an agent's credentials. Invalidates its token
+    hash so even a replay of the previous token is rejected. Requires
+    re-enrollment to reconnect.
+    """
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(EndpointAgent).where(EndpointAgent.id == agent_id)
+    if org_id is not None:
+        stmt = stmt.where(EndpointAgent.organization_id == org_id)
+    agent = (await session.execute(stmt)).scalar_one_or_none()
+    if agent is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    agent.status = "revoked"
+    # Invalidate agent token so any replay fails.
+    if hasattr(agent, "agent_token_hash"):
+        agent.agent_token_hash = None
+    await session.flush()
+    return {"agent_id": agent.id, "status": agent.status}
+
+
 @router.post("/{agent_id}/commands", response_model=CommandSummary, status_code=202)
 async def issue_command(
     agent_id: str,

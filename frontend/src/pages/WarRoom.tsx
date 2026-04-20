@@ -398,7 +398,26 @@ export default function WarRoom() {
                     <div className="flex items-center justify-between">
                       <span className="text-xs text-gray-500">Type: {room.room_type?.replace(/_/g, ' ')}</span>
                       <button
-                        onClick={(e) => { e.stopPropagation(); setSelectedRoom(room); }}
+                        onClick={async (e) => {
+                          e.stopPropagation();
+                          // Attempt to join the room on the backend
+                          // before opening the modal. Previously this
+                          // only set React state — the viewing user
+                          // was never added to participants, so their
+                          // sender_id never appeared in activity
+                          // metrics. Silently tolerate a 409 "already
+                          // a participant" or missing endpoint so old
+                          // backends still work.
+                          try {
+                            const apiAny = collaborationApi as any;
+                            if (typeof apiAny.joinRoom === 'function') {
+                              await apiAny.joinRoom(room.id);
+                            }
+                          } catch {
+                            /* non-fatal */
+                          }
+                          setSelectedRoom(room);
+                        }}
                         className="text-blue-400 hover:text-blue-300 text-sm font-medium transition-colors"
                       >
                         Enter Room &rarr;

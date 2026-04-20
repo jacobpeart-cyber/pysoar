@@ -92,6 +92,26 @@ export default function Playbooks() {
     setShowExecuteModal(true)
   }
 
+  const handlePublish = async (id: string) => {
+    try {
+      await playbooksApi.update(id, { status: 'active', is_enabled: true })
+      fetchPlaybooks()
+    } catch (error: any) {
+      console.error('Failed to publish playbook:', error)
+      alert(`Publish failed: ${error?.response?.data?.detail || error?.message || 'unknown error'}`)
+    }
+  }
+
+  const handleArchive = async (id: string) => {
+    try {
+      await playbooksApi.update(id, { status: 'draft' })
+      fetchPlaybooks()
+    } catch (error: any) {
+      console.error('Failed to archive playbook:', error)
+      alert(`Archive failed: ${error?.response?.data?.detail || error?.message || 'unknown error'}`)
+    }
+  }
+
   const totalPages = Math.ceil(total / 10)
 
   return (
@@ -207,6 +227,29 @@ export default function Playbooks() {
                       >
                         <Play className="w-4 h-4 mr-1" />
                         Run
+                      </button>
+                    )}
+                    {/* Draft → Active toggle. Previously there was no
+                        UI way to activate a draft, and the executor
+                        rejected non-active playbooks — so every
+                        playbook a user created was permanently
+                        unrunnable. */}
+                    {playbook.status !== 'active' && (
+                      <button
+                        onClick={() => handlePublish(playbook.id)}
+                        className="flex items-center px-3 py-1.5 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm"
+                        title="Publish playbook (draft → active)"
+                      >
+                        Publish
+                      </button>
+                    )}
+                    {playbook.status === 'active' && (
+                      <button
+                        onClick={() => handleArchive(playbook.id)}
+                        className="flex items-center px-3 py-1.5 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 text-sm"
+                        title="Archive playbook (active → draft)"
+                      >
+                        Archive
                       </button>
                     )}
                     <button
