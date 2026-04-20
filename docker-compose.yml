@@ -38,6 +38,14 @@ services:
     container_name: pysoar-api
     env_file:
       - .env
+    # Expose SIEM syslog receiver on UDP+TCP 5514 (unprivileged —
+    # anything forwarding to this host can ship RFC 3164/5424 syslog
+    # directly into the platform without an intermediate collector).
+    # The auto-start hook in src/main.py lifespan starts SyslogReceiver
+    # when SIEM_SYSLOG_ENABLED=true.
+    ports:
+      - "5514:5514/udp"
+      - "5514:5514/tcp"
     volumes:
       - ./src:/app/src:ro
       - ./alembic:/app/alembic:ro
@@ -51,6 +59,12 @@ services:
     networks:
       - pysoar-network
     restart: unless-stopped
+    environment:
+      # Default the syslog receiver on so a fresh deploy is already a
+      # working SIEM endpoint. Override with SIEM_SYSLOG_ENABLED=false
+      # in .env if the operator wants it off.
+      SIEM_SYSLOG_ENABLED: "${SIEM_SYSLOG_ENABLED:-true}"
+      SIEM_SYSLOG_PORT: "${SIEM_SYSLOG_PORT:-5514}"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
       interval: 30s

@@ -96,6 +96,187 @@ async def get_source_or_404(db: AsyncSession, source_id: str) -> SIEMDataSource:
 # ============================================================================
 
 
+async def _resolve_api_key(api_key: str, db: AsyncSession) -> Optional[str]:
+    """Verify a ``pysoar_<token>`` API key header and return the owner_id.
+
+    Looks up by the 8-char prefix, then bcrypt-verifies the rest against
+    stored key_hash. Also checks is_active + not expired + permissions
+    include a log-ingest scope. Returns ``None`` on any mismatch.
+    """
+    from src.core.security import verify_password
+    from src.models.api_key import APIKey
+
+    if not api_key or not api_key.startswith("pysoar_"):
+        return None
+    stripped = api_key[len("pysoar_"):]
+    if len(stripped) < 9:
+        return None
+    prefix = stripped[:8]
+    result = await db.execute(
+        select(APIKey).where(APIKey.key_prefix == prefix, APIKey.is_active == True)
+    )
+    for candidate in result.scalars().all():
+        try:
+            if verify_password(stripped, candidate.key_hash):
+                if candidate.is_expired:
+                    return None
+                # Permissions check: allow if the key carries
+                # "siem:write" / "logs:write" / "*" / empty (full).
+                perms: list[str] = []
+                if candidate.permissions:
+                    try:
+                        perms = json.loads(candidate.permissions) or []
+                    except (json.JSONDecodeError, TypeError):
+                        perms = []
+                if perms and not any(
+                    p in ("*", "siem:write", "logs:write", "siem:*") for p in perms
+                ):
+                    return None
+                # Bump usage_count + last_used_at so the APIKeys page
+                # shows real traffic.
+                candidate.usage_count = (candidate.usage_count or 0) + 1
+                candidate.last_used_at = datetime.now(timezone.utc).isoformat()
+                await db.flush()
+                return candidate.owner_id
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+@router.post("/logs/ingest/bulk", response_model=None, status_code=status.HTTP_202_ACCEPTED)
+async def bulk_ingest_logs_apikey(
+    request: "Request" = None,  # type: ignore[name-defined]
+    db: DatabaseSession = None,
+):
+    """Authenticated bulk log ingestion for external forwarders.
+
+    This is the endpoint Filebeat, Fluentd, Logstash, Vector, Syslog-NG,
+    NXLog, or a custom shipper POSTs to. Authentication is via an API
+    key in the ``X-API-Key`` header (created under Admin > API Keys,
+    needs ``siem:write`` or ``logs:write`` permission).
+
+    Body can be either:
+      * ``application/x-ndjson`` — one JSON object per line
+      * ``application/json`` — a JSON array of log objects
+      * ``text/plain`` — raw lines, each treated as ``raw_log``
+
+    Each record is dispatched through the full SIEM pipeline (parse +
+    normalize + rule match + correlation + alert creation), so an
+    external SIEM source immediately contributes to detection.
+
+    Response is an aggregate summary so shippers can detect bad
+    batches without parsing per-line responses.
+    """
+    from fastapi import Request
+    from src.siem.pipeline import process_log
+
+    if request is None:
+        raise HTTPException(status_code=400, detail="missing request context")
+
+    api_key = request.headers.get("x-api-key") or request.headers.get("X-API-Key")
+    if not api_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="X-API-Key header required",
+        )
+    owner_id = await _resolve_api_key(api_key, db)
+    if owner_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired API key (or missing siem:write permission)",
+        )
+
+    # Resolve the owner's organization_id so mirrored rows are scoped.
+    from src.models.user import User
+    owner_res = await db.execute(select(User).where(User.id == owner_id))
+    owner = owner_res.scalar_one_or_none()
+    org_id = getattr(owner, "organization_id", None) if owner else None
+
+    raw_body = await request.body()
+    if not raw_body:
+        return {"success_count": 0, "error_count": 0, "alerts_generated": 0}
+
+    content_type = (request.headers.get("content-type") or "").lower()
+    records: list[dict] = []
+
+    try:
+        if "ndjson" in content_type or "jsonlines" in content_type or "x-json-lines" in content_type:
+            for line in raw_body.decode("utf-8", errors="replace").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    if isinstance(obj, dict):
+                        records.append(obj)
+                except json.JSONDecodeError:
+                    records.append({"raw_log": line})
+        elif "json" in content_type:
+            parsed = json.loads(raw_body.decode("utf-8", errors="replace") or "[]")
+            if isinstance(parsed, list):
+                for obj in parsed:
+                    if isinstance(obj, dict):
+                        records.append(obj)
+            elif isinstance(parsed, dict):
+                records.append(parsed)
+        else:
+            # text/plain — one raw syslog-style line per record
+            for line in raw_body.decode("utf-8", errors="replace").splitlines():
+                line = line.strip()
+                if line:
+                    records.append({"raw_log": line})
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Failed to parse body: {exc}",
+        )
+
+    # Cap batch size so a bad shipper can't DoS the pipeline. 1000 is
+    # high enough for normal batching (most forwarders use 50-200).
+    if len(records) > 1000:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"Batch too large ({len(records)} > 1000) — split the request",
+        )
+
+    source_ip = request.client.host if request.client else "0.0.0.0"
+
+    processed = 0
+    errors: list[dict] = []
+    total_alerts = 0
+    total_correlations = 0
+
+    for rec in records:
+        raw_log = rec.get("raw_log") or rec.get("message") or json.dumps(rec)
+        src_type = rec.get("source_type") or "auto"
+        src_name = rec.get("source_name") or rec.get("host") or "external-forwarder"
+        src_ip = rec.get("source_ip") or source_ip
+        tags = rec.get("tags") if isinstance(rec.get("tags"), list) else None
+        try:
+            _log_entry, alerts, correlations = await process_log(
+                raw_log=raw_log,
+                source_type=src_type,
+                source_name=src_name,
+                source_ip=src_ip,
+                db=db,
+                organization_id=org_id,
+                tags=tags,
+            )
+            processed += 1
+            total_alerts += len(alerts)
+            total_correlations += len(correlations)
+        except Exception as exc:  # noqa: BLE001
+            errors.append({"raw_log": str(raw_log)[:200], "error": str(exc)[:200]})
+
+    return {
+        "success_count": processed,
+        "error_count": len(errors),
+        "alerts_generated": total_alerts,
+        "correlations_triggered": total_correlations,
+        "errors": errors[:20],
+    }
+
+
 @router.post("/logs/ingest", response_model=None, status_code=status.HTTP_201_CREATED)
 async def ingest_log(
     log_data: LogIngestRequest,
