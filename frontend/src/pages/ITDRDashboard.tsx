@@ -11,6 +11,7 @@ import {
   Trash2,
   Search,
   Filter,
+  AlertCircle,
   AlertTriangle,
   CheckCircle,
   Clock,
@@ -18,6 +19,7 @@ import {
 } from 'lucide-react';
 import clsx from 'clsx';
 import { itdrApi } from '../api/endpoints';
+import { api } from '../lib/api';
 
 const getSeverityColor = (severity: string) => {
   switch (severity) {
@@ -259,6 +261,9 @@ export default function ITDRDashboard() {
     confidence_score: 80,
   });
   const [submitting, setSubmitting] = useState(false);
+  const [dashboardMetrics, setDashboardMetrics] = useState<any | null>(null);
+  const [scanInProgress, setScanInProgress] = useState(false);
+  const [exposureCheckInProgress, setExposureCheckInProgress] = useState(false);
   const [selectedThreat, setSelectedThreat] = useState<any | null>(null);
   const [selectedExposure, setSelectedExposure] = useState<any | null>(null);
   const [selectedAnomaly, setSelectedAnomaly] = useState<any | null>(null);
@@ -267,30 +272,63 @@ export default function ITDRDashboard() {
   const [showFilterPanel, setShowFilterPanel] = useState(false);
   const [severityFilter, setSeverityFilter] = useState('all');
 
-  React.useEffect(() => {
-    const loadData = async () => {
-      setLoading(true);
-      try {
-        const [threatsData, exposuresData, anomaliesData, accessData, identitiesData] = await Promise.all([
-          itdrApi.getIdentityThreats().catch(() => null),
-          itdrApi.getCredentialExposures().catch(() => null),
-          itdrApi.getAccessAnomalies().catch(() => null),
-          itdrApi.getPrivilegedAccess().catch(() => null),
-          itdrApi.getIdentities().catch(() => null),
-        ]);
-        setIdentityThreats(threatsData?.items ?? []);
-        setCredentialExposures(exposuresData?.items ?? []);
-        setAccessAnomalies(anomaliesData?.items ?? []);
-        setPrivilegedAccess(accessData?.items ?? []);
-        setIdentities(identitiesData?.items ?? []);
-      } catch (error) {
-        console.error('Error loading ITDR data:', error);
-      } finally {
-        setLoading(false);
-      }
-    };
-    loadData();
+  const loadData = React.useCallback(async () => {
+    setLoading(true);
+    try {
+      const [threatsData, exposuresData, anomaliesData, accessData, identitiesData, metricsData] = await Promise.all([
+        itdrApi.getIdentityThreats().catch(() => null),
+        itdrApi.getCredentialExposures().catch(() => null),
+        itdrApi.getAccessAnomalies().catch(() => null),
+        itdrApi.getPrivilegedAccess().catch(() => null),
+        itdrApi.getIdentities({ size: 500 } as any).catch(() => null),
+        api.get('/itdr/dashboard/metrics').then(r => r.data).catch(() => null),
+      ]);
+      setIdentityThreats(threatsData?.items ?? []);
+      setCredentialExposures(exposuresData?.items ?? []);
+      setAccessAnomalies(anomaliesData?.items ?? []);
+      setPrivilegedAccess(accessData?.items ?? []);
+      setIdentities(identitiesData?.items ?? []);
+      setDashboardMetrics(metricsData);
+    } catch (error) {
+      console.error('Error loading ITDR data:', error);
+    } finally {
+      setLoading(false);
+    }
   }, []);
+
+  React.useEffect(() => {
+    loadData();
+  }, [loadData]);
+
+  // Real scan dispatch — previously the ITDR page had no way to
+  // trigger /threats/scan from the UI, so the "Active Threats" card
+  // was just whatever rows happened to already exist. Now the header
+  // button kicks off the real three-heuristic scan and refreshes.
+  const handleRunScan = async () => {
+    try {
+      setScanInProgress(true);
+      const res = await api.post('/itdr/threats/scan', {});
+      await loadData();
+      alert(`Identity threat scan complete — ${res.data?.threats_found ?? 0} threat(s) found.`);
+    } catch (err: any) {
+      alert(`Scan failed: ${err?.response?.data?.detail || err?.message || 'unknown error'}`);
+    } finally {
+      setScanInProgress(false);
+    }
+  };
+
+  const handleCheckExposures = async () => {
+    try {
+      setExposureCheckInProgress(true);
+      const res = await api.post('/itdr/credential-exposures/check', {});
+      await loadData();
+      alert(`Credential exposure check complete — ${res.data?.exposures_found ?? 0} exposure(s) found.`);
+    } catch (err: any) {
+      alert(`Exposure check failed: ${err?.response?.data?.detail || err?.message || 'unknown error'}`);
+    } finally {
+      setExposureCheckInProgress(false);
+    }
+  };
 
   const handleCreateThreat = async () => {
     if (!newThreatForm.threat_type || !newThreatForm.identity_id) return;
@@ -402,13 +440,33 @@ export default function ITDRDashboard() {
             <UserX className="w-8 h-8 text-orange-600" />
             <h1 className="text-3xl font-bold">Identity Threat Detection & Response</h1>
           </div>
-          <button
-            onClick={() => setShowNewThreatModal(true)}
-            className="flex items-center gap-2 bg-orange-600 hover:bg-orange-700 text-white px-4 py-2 rounded-lg transition"
-          >
-            <Plus className="w-4 h-4" />
-            New Threat
-          </button>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={handleRunScan}
+              disabled={scanInProgress}
+              className="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg transition disabled:opacity-50"
+              title="Run identity threat scan (dormant admins, privileged-without-MFA, stale credentials)"
+            >
+              <Shield className="w-4 h-4" />
+              {scanInProgress ? 'Scanning…' : 'Run Threat Scan'}
+            </button>
+            <button
+              onClick={handleCheckExposures}
+              disabled={exposureCheckInProgress}
+              className="flex items-center gap-2 bg-purple-600 hover:bg-purple-700 text-white px-4 py-2 rounded-lg transition disabled:opacity-50"
+              title="Check every identity against leaked-credential datasets"
+            >
+              <AlertCircle className="w-4 h-4" />
+              {exposureCheckInProgress ? 'Checking…' : 'Check Exposures'}
+            </button>
+            <button
+              onClick={() => setShowNewThreatModal(true)}
+              className="flex items-center gap-2 bg-orange-600 hover:bg-orange-700 text-white px-4 py-2 rounded-lg transition"
+            >
+              <Plus className="w-4 h-4" />
+              New Threat
+            </button>
+          </div>
         </div>
 
         {/* Summary Cards */}
