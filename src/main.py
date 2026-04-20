@@ -102,6 +102,36 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     except Exception as e:  # noqa: BLE001
         logger.warning("SIEM rule seeder/prime failed", error=str(e))
 
+    # Start the SIEM syslog receiver on boot so the platform actually
+    # functions as a SIEM — external devices (firewalls, routers,
+    # Linux hosts, Windows via NXLog) can ship RFC 3164/5424 syslog
+    # directly to UDP/TCP 5514. Previously the collector only ran when
+    # an admin manually POSTed /siem/collector/start, so fresh deploys
+    # had no network-facing log ingestion surface.
+    import os as _os
+    if _os.getenv("SIEM_SYSLOG_ENABLED", "true").lower() in ("1", "true", "yes"):
+        try:
+            import asyncio as _asyncio
+            from src.siem.syslog_receiver import SyslogReceiver
+            from src.api.v1.endpoints.siem import _syslog_batch_handler as _siem_batch
+
+            syslog_port = int(_os.getenv("SIEM_SYSLOG_PORT", "5514"))
+            _receiver = SyslogReceiver(
+                host="0.0.0.0",
+                udp_port=syslog_port,
+                tcp_port=syslog_port,
+                batch_size=50,
+                flush_interval=3,
+                message_handler=_siem_batch,
+            )
+            # Persist so /siem/collector/status + /stop still work.
+            from src.api.v1.endpoints import siem as _siem_ep
+            _siem_ep._collector_instance = _receiver
+            _siem_ep._collector_task = _asyncio.create_task(_receiver.start())
+            logger.info("SIEM syslog receiver started", port=syslog_port, protocol="udp+tcp")
+        except Exception as e:  # noqa: BLE001
+            logger.warning("SIEM syslog receiver failed to start", error=str(e))
+
     # Create first admin user if needed
     await create_first_admin()
 
