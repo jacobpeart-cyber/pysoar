@@ -688,11 +688,19 @@ async def _get_organization(
 
 
 async def _get_team(
+    db: AsyncSession,
     team_id: str,
     user: User,
-    db: AsyncSession,
 ) -> Team:
-    """Get a team with access check"""
+    """Get a team with access check.
+
+    Signature matches every caller's argument order (``db, team_id,
+    current_user``). The previous ``team_id, user, db`` order meant
+    every callsite was passing an ``AsyncSession`` where the UUID
+    string should have been, and SQLAlchemy blew up on
+    ``Team.id == <AsyncSession>`` — all team GET/PATCH/DELETE/members
+    endpoints were broken until this was fixed.
+    """
     result = await db.execute(select(Team).where(Team.id == team_id))
     team = result.scalar_one_or_none()
 

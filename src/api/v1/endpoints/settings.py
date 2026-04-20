@@ -538,13 +538,23 @@ async def save_integration_config(
 
 @router.post("/test-email")
 async def test_email_settings(
+    db: DatabaseSession = None,
     current_user: User = Depends(get_current_superuser),
 ) -> dict:
-    """Test email configuration by sending a test email"""
-    if not app_settings.smtp_user:
+    """Test email configuration by sending a test email.
+
+    Treats a DB-saved SMTP section as authoritative over the env-time
+    ``app_settings.smtp_user``. Previously a user who configured SMTP
+    through the UI got "Email is not configured" on Test until the
+    container was restarted — save+test was broken within a session.
+    """
+    org_id = _user_org(current_user)
+    saved_smtp = await _load_section(db, org_id, "smtp") if db is not None else {}
+    configured_user = (saved_smtp or {}).get("smtp_user") or (saved_smtp or {}).get("user") or app_settings.smtp_user
+    if not configured_user:
         raise HTTPException(
             status_code=400,
-            detail="Email is not configured"
+            detail="Email is not configured",
         )
 
     from src.services.email_service import EmailService
@@ -574,9 +584,21 @@ async def test_email_settings(
 @router.post("/test-integration/{integration_name}")
 async def test_integration(
     integration_name: str,
+    db: DatabaseSession = None,
     current_user: User = Depends(get_current_superuser),
 ) -> dict:
-    """Test an integration connection"""
+    """Test an integration connection.
+
+    Previously this read every API key / URL / host directly from
+    ``app_settings`` (which is loaded once from env at startup). A user
+    who saved a new VirusTotal key through the UI and clicked Test
+    immediately got a 400 / failed probe because the container hadn't
+    restarted and ``app_settings`` still held the env-time value. Now
+    we load the most-recently persisted ``integration:<name>`` section
+    from ``system_settings`` and fall back to ``app_settings`` only
+    when no DB override exists — so Save + Test actually works in the
+    same session.
+    """
     valid_integrations = ["virustotal", "abuseipdb", "shodan", "greynoise", "elasticsearch", "splunk"]
 
     if integration_name not in valid_integrations:
@@ -585,13 +607,30 @@ async def test_integration(
             detail=f"Unknown integration: {integration_name}"
         )
 
+    org_id = _user_org(current_user)
+    saved = await _load_section(db, org_id, f"integration:{integration_name}") if db is not None else {}
+
+    def _pick(keys: list[str], fallback: str = "") -> str:
+        for k in keys:
+            v = saved.get(k) if isinstance(saved, dict) else None
+            if v:
+                return str(v)
+        return fallback or ""
+
+    vt_key = _pick(["api_key"], app_settings.virustotal_api_key or "")
+    abuse_key = _pick(["api_key"], app_settings.abuseipdb_api_key or "")
+    shodan_key = _pick(["api_key"], app_settings.shodan_api_key or "")
+    greynoise_key = _pick(["api_key"], app_settings.greynoise_api_key or "")
+    es_url = _pick(["url"], app_settings.elasticsearch_url or "")
+    splunk_host = _pick(["host"], app_settings.splunk_host or "")
+
     api_key_map = {
-        "virustotal": app_settings.virustotal_api_key,
-        "abuseipdb": app_settings.abuseipdb_api_key,
-        "shodan": app_settings.shodan_api_key,
-        "greynoise": app_settings.greynoise_api_key,
-        "elasticsearch": app_settings.elasticsearch_url,
-        "splunk": app_settings.splunk_host,
+        "virustotal": vt_key,
+        "abuseipdb": abuse_key,
+        "shodan": shodan_key,
+        "greynoise": greynoise_key,
+        "elasticsearch": es_url,
+        "splunk": splunk_host,
     }
 
     if not api_key_map.get(integration_name):
@@ -603,12 +642,12 @@ async def test_integration(
     import httpx
 
     test_endpoints = {
-        "virustotal": ("https://www.virustotal.com/api/v3/urls", {"x-apikey": app_settings.virustotal_api_key}),
-        "abuseipdb": ("https://api.abuseipdb.com/api/v2/check?ipAddress=8.8.8.8&maxAgeInDays=1", {"Key": app_settings.abuseipdb_api_key, "Accept": "application/json"}),
-        "shodan": (f"https://api.shodan.io/api-info?key={app_settings.shodan_api_key}", {}),
-        "greynoise": ("https://api.greynoise.io/v3/community/8.8.8.8", {"key": app_settings.greynoise_api_key}),
-        "elasticsearch": (app_settings.elasticsearch_url or "", {}),
-        "splunk": (f"https://{app_settings.splunk_host}:8089/services/server/info", {}),
+        "virustotal": ("https://www.virustotal.com/api/v3/urls", {"x-apikey": vt_key}),
+        "abuseipdb": ("https://api.abuseipdb.com/api/v2/check?ipAddress=8.8.8.8&maxAgeInDays=1", {"Key": abuse_key, "Accept": "application/json"}),
+        "shodan": (f"https://api.shodan.io/api-info?key={shodan_key}", {}),
+        "greynoise": ("https://api.greynoise.io/v3/community/8.8.8.8", {"key": greynoise_key}),
+        "elasticsearch": (es_url, {}),
+        "splunk": (f"https://{splunk_host}:8089/services/server/info", {}),
     }
 
     url, headers = test_endpoints.get(integration_name, ("", {}))

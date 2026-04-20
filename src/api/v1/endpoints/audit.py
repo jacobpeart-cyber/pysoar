@@ -25,8 +25,19 @@ async def list_audit_logs(
     resource_type: Optional[str] = None,
     user_id: Optional[str] = None,
     success: Optional[bool] = None,
+    days: Optional[int] = Query(None, ge=1, le=3650),
+    search: Optional[str] = None,
+    ip_address: Optional[str] = None,
 ) -> AuditLogListResponse:
-    """List audit logs with filtering (admin only)"""
+    """List audit logs with filtering (admin only).
+
+    Added `days` (time-window), `search` (substring over description
+    + user context), and `ip_address` filters. Previously the list
+    endpoint had no time-bounding at all, so any retention-era query
+    paged through years of history.
+    """
+    from datetime import datetime, timedelta, timezone
+    from sqlalchemy import or_
 
     # Build query
     query = select(AuditLog).options(selectinload(AuditLog.user))
@@ -48,6 +59,25 @@ async def list_audit_logs(
     if success is not None:
         query = query.where(AuditLog.success == success)
         count_query = count_query.where(AuditLog.success == success)
+
+    if days is not None:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        query = query.where(AuditLog.created_at >= cutoff)
+        count_query = count_query.where(AuditLog.created_at >= cutoff)
+
+    if ip_address:
+        query = query.where(AuditLog.ip_address == ip_address)
+        count_query = count_query.where(AuditLog.ip_address == ip_address)
+
+    if search:
+        like = f"%{search}%"
+        text_filter = or_(
+            AuditLog.description.ilike(like),
+            AuditLog.resource_type.ilike(like),
+            AuditLog.action.ilike(like),
+        )
+        query = query.where(text_filter)
+        count_query = count_query.where(text_filter)
 
     # Get total count
     total_result = await db.execute(count_query)
