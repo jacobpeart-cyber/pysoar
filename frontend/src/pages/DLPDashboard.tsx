@@ -617,42 +617,54 @@ export default function DLPDashboard() {
                   </div>
                 ) : (
                   <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                    {classifications.map((classification, index) => (
-                      <div key={index} className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4 hover:shadow-lg transition">
-                        <div className="flex items-center gap-3 mb-3">
-                          <Lock className="w-5 h-5 text-indigo-600 dark:text-indigo-400" />
-                          <h3 className="font-semibold text-lg">{classification}</h3>
-                        </div>
-                        <div className="space-y-2 text-sm text-gray-600 dark:text-gray-400">
-                          <div className="flex justify-between">
-                            <span>Policies using</span>
-                            <span className="font-semibold text-gray-900 dark:text-gray-100">
-                              {policies.filter(p => p.classification === classification || p.dataType === classification).length}
-                            </span>
+                    {classifications.map((c: any, index) => {
+                      // The backend returns full objects
+                      // {id, name, handling_rules, sensitivity, ...} —
+                      // previously the page rendered them directly as
+                      // strings, producing "[object Object]" headers
+                      // and every usage/incident counter stuck at 0
+                      // because the string compare never matched.
+                      const name = typeof c === 'string' ? c : (c?.name ?? c?.id ?? 'Unknown');
+                      const sensitivity = typeof c === 'object' ? c?.sensitivity ?? c?.level : null;
+                      const key = typeof c === 'object' ? c?.id ?? name : name;
+                      const policiesUsing = policies.filter(
+                        (p: any) => p.classification === name || p.dataType === name,
+                      ).length;
+                      const relatedIncidents = incidents.filter(
+                        (i: any) => i.classification === name || i.dataType === name,
+                      ).length;
+                      return (
+                        <div key={String(key) + index} className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4 hover:shadow-lg transition">
+                          <div className="flex items-center gap-3 mb-3">
+                            <Lock className="w-5 h-5 text-indigo-600 dark:text-indigo-400" />
+                            <h3 className="font-semibold text-lg">{name}</h3>
+                            {sensitivity && (
+                              <span className="ml-auto text-xs uppercase text-gray-500 dark:text-gray-400">
+                                {sensitivity}
+                              </span>
+                            )}
                           </div>
-                          <div className="flex justify-between">
-                            <span>Related incidents</span>
-                            <span className="font-semibold text-gray-900 dark:text-gray-100">
-                              {incidents.filter(i => i.classification === classification || i.dataType === classification).length}
-                            </span>
+                          <div className="space-y-2 text-sm text-gray-600 dark:text-gray-400">
+                            <div className="flex justify-between">
+                              <span>Policies using</span>
+                              <span className="font-semibold text-gray-900 dark:text-gray-100">{policiesUsing}</span>
+                            </div>
+                            <div className="flex justify-between">
+                              <span>Related incidents</span>
+                              <span className="font-semibold text-gray-900 dark:text-gray-100">{relatedIncidents}</span>
+                            </div>
+                          </div>
+                          <div className="flex gap-2 mt-4">
+                            <button
+                              onClick={() => setSelectedClassification(name)}
+                              className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+                            >
+                              View Details
+                            </button>
                           </div>
                         </div>
-                        <div className="flex gap-2 mt-4">
-                          <button
-                            onClick={() => setSelectedClassification(classification)}
-                            className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition"
-                          >
-                            View Details
-                          </button>
-                          <button
-                            onClick={() => setSelectedClassification(classification)}
-                            className="flex-1 px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 rounded hover:bg-gray-100 dark:hover:bg-gray-700 transition"
-                          >
-                            Edit
-                          </button>
-                        </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 )}
               </div>

@@ -31,9 +31,62 @@ export default function DataLakeDashboard() {
   const [queryRunning, setQueryRunning] = useState(false);
   const [catalogSearch, setCatalogSearch] = useState('');
 
-  const { data: sources = [] } = useQuery({ queryKey: ['dataSources'], queryFn: datalakeApi.getDataSources });
-  const { data: pipelines = [] } = useQuery({ queryKey: ['pipelines'], queryFn: datalakeApi.getPipelines });
+  // Backend DataSourceResponse emits snake_case + different field
+  // names than this page was written against. Previously every row
+  // in the Sources table rendered `undefined/NaN/sec`; every summary
+  // number (`Events/sec`, `Storage TB`) was 0. Normalize once so the
+  // downstream consumers see the shape they expect.
+  const normalizeSource = (s: any): DataSource => ({
+    id: s.id,
+    name: s.name ?? s.source_name ?? s.display_name ?? 'Unnamed source',
+    type: s.type ?? s.source_type ?? 'unknown',
+    health: s.health ?? s.health_status ?? s.status ?? 'unknown',
+    ingestionRate: typeof s.ingestionRate === 'number'
+      ? s.ingestionRate
+      : (s.ingestion_rate ?? s.events_per_second ?? 0),
+    events: typeof s.events === 'number' ? s.events : (s.total_events ?? s.event_count ?? 0),
+    lastSync: s.lastSync ?? s.last_sync_at ?? s.last_event_at ?? null,
+    schema: s.schema ?? null,
+  });
+  const normalizePipeline = (p: any): Pipeline => ({
+    id: p.id,
+    name: p.name,
+    status: p.status ?? p.pipeline_status ?? 'unknown',
+    successRate: typeof p.successRate === 'number'
+      ? p.successRate
+      : (p.success_rate ?? 0),
+    throughput: p.throughput ?? p.events_processed ?? 0,
+    lastRun: p.lastRun ?? p.last_run_at ?? null,
+  });
+
+  const { data: sourcesRaw = [] } = useQuery({ queryKey: ['dataSources'], queryFn: datalakeApi.getDataSources });
+  const { data: pipelinesRaw = [] } = useQuery({ queryKey: ['pipelines'], queryFn: datalakeApi.getPipelines });
   const { data: catalog = [] } = useQuery({ queryKey: ['dataCatalog'], queryFn: datalakeApi.getCatalog });
+  const sources: DataSource[] = useMemo(
+    () => (Array.isArray(sourcesRaw) ? sourcesRaw : ((sourcesRaw as any)?.items ?? [])).map(normalizeSource),
+    [sourcesRaw],
+  );
+  const pipelines: Pipeline[] = useMemo(
+    () => (Array.isArray(pipelinesRaw) ? pipelinesRaw : ((pipelinesRaw as any)?.items ?? [])).map(normalizePipeline),
+    [pipelinesRaw],
+  );
+
+  // Real storage-breakdown from the backend. Replaces the previous
+  // fabrication (hot 0.7% / warm 2.5% / cold 12% split of an
+  // events×0.0002 estimate) that produced a pie chart of invented
+  // numbers even when the lake was empty.
+  const { data: storageBreakdownRaw } = useQuery({
+    queryKey: ['dl-storage-breakdown'],
+    queryFn: async () => {
+      try {
+        const res = await fetch('/api/v1/data-lake/dashboard/storage-breakdown', { credentials: 'include' });
+        if (!res.ok) return null;
+        return await res.json();
+      } catch {
+        return null;
+      }
+    },
+  });
 
   const filteredCatalog = useMemo(() => {
     const q = catalogSearch.trim().toLowerCase();
@@ -63,33 +116,38 @@ export default function DataLakeDashboard() {
   }, [sources, pipelines]);
 
   const storageBreakdown = useMemo(() => {
-    // Distribute total estimated storage across tiers based on source data
-    const totalGB = sources.reduce((sum: number, s: DataSource) => sum + (s.events * 0.0002), 0) / 1000;
-    const hotPct = 0.007, warmPct = 0.025, coldPct = 0.12;
-    const hotVal = Math.round(totalGB * hotPct) || 1;
-    const warmVal = Math.round(totalGB * warmPct) || 1;
-    const coldVal = Math.round(totalGB * coldPct) || 1;
-    const archivedVal = Math.round(totalGB * (1 - hotPct - warmPct - coldPct)) || 1;
-    const fmt = (v: number) => v >= 1000 ? `${(v / 1000).toFixed(1)}TB` : `${v}GB`;
-    return [
-      { name: 'Hot', value: hotVal, size: fmt(hotVal) },
-      { name: 'Warm', value: warmVal, size: fmt(warmVal) },
-      { name: 'Cold', value: coldVal, size: fmt(coldVal) },
-      { name: 'Archived', value: archivedVal, size: fmt(archivedVal) },
-    ];
-  }, [sources]);
+    // Use the backend's real hot/warm/cold/archived split when
+    // available. The previous fabrication applied hardcoded percentage
+    // splits to an events×0.0002 estimate, producing a chart even when
+    // no data existed.
+    const fmt = (v: number) => (v >= 1000 ? `${(v / 1000).toFixed(1)}TB` : `${v}GB`);
+    if (storageBreakdownRaw && typeof storageBreakdownRaw === 'object') {
+      const tiers = (storageBreakdownRaw as any).tiers || storageBreakdownRaw;
+      if (Array.isArray(tiers)) {
+        return tiers.map((t: any) => ({
+          name: t.name ?? t.tier ?? 'tier',
+          value: t.size_gb ?? t.value ?? 0,
+          size: fmt(t.size_gb ?? t.value ?? 0),
+        }));
+      }
+      return ['hot', 'warm', 'cold', 'archived']
+        .filter((k) => k in (tiers as any))
+        .map((k) => ({
+          name: k.charAt(0).toUpperCase() + k.slice(1),
+          value: (tiers as any)[k] ?? 0,
+          size: fmt((tiers as any)[k] ?? 0),
+        }));
+    }
+    return [];
+  }, [storageBreakdownRaw]);
 
   const STORAGE_COLORS = ['#3B82F6', '#10B981', '#F59E0B', '#8B5CF6'];
 
-  const ingestTrendData = useMemo(() => {
-    // Build trend from individual source ingestion rates
-    if (sources.length === 0) return [];
-    const baseRate = sources.reduce((sum: number, s: DataSource) => sum + s.ingestionRate, 0);
-    return ['10:00', '11:00', '12:00', '13:00', '14:00'].map((time, i) => ({
-      time,
-      rate: Math.round(baseRate * (0.9 + (i % 3) * 0.05)),
-    }));
-  }, [sources]);
+  // Ingest trend: backend `/data-lake/dashboard/metrics` is the real
+  // source. Until that query is wired we show an empty state instead
+  // of fabricating a 5-point line by multiplying base rate × random
+  // jitter ([0.9, 0.95, 1.0] rotating pattern).
+  const ingestTrendData: Array<{ time: string; rate: number }> = useMemo(() => [], []);
 
   const pipelineHealthData = useMemo(() => {
     return pipelines.map((p: Pipeline) => ({

@@ -172,15 +172,18 @@ export default function PlaybookBuilder() {
     const loadData = async () => {
       setLoading(true);
       try {
-        const [playbooksRes, templatesRes] = await Promise.all([
+        const [playbooksRes, templatesRes, execRes] = await Promise.all([
           api.get('/playbook-builder').catch(() => ({ data: { items: [] } })),
           api.get('/playbook-builder/templates').catch(() => ({ data: { items: [] } })),
+          // Real execution history — previously hardcoded to [].
+          api.get('/playbook-builder/executions', { params: { size: 50 } }).catch(() => ({ data: { items: [] } })),
         ]);
         const pbItems = playbooksRes.data?.items || playbooksRes.data;
         setPlaybooks(Array.isArray(pbItems) ? pbItems : []);
         const tplItems = templatesRes.data?.items || templatesRes.data;
         setTemplates(Array.isArray(tplItems) ? tplItems : []);
-        setExecutions([]);
+        const execItems = execRes.data?.items || execRes.data;
+        setExecutions(Array.isArray(execItems) ? execItems : []);
       } catch (error) {
         setNotification({ type: 'error', text: 'Failed to load playbook data' });
         setPlaybooks([]);
@@ -642,7 +645,27 @@ export default function PlaybookBuilder() {
                       Average Duration
                     </h3>
                     <p className="text-2xl font-bold text-gray-900 dark:text-gray-100">
-                      {executions.length > 0 ? '2m 34s' : '--'}
+                      {(() => {
+                        // Previously this showed the literal string
+                        // "2m 34s" whenever any executions existed —
+                        // pure theater. Compute the mean from real
+                        // duration_seconds / completed_at - started_at.
+                        const durations = executions
+                          .map((e: any) => {
+                            if (typeof e.duration_seconds === 'number') return e.duration_seconds;
+                            if (e.started_at && e.completed_at) {
+                              const d = (new Date(e.completed_at).getTime() - new Date(e.started_at).getTime()) / 1000;
+                              return Number.isFinite(d) ? d : null;
+                            }
+                            return null;
+                          })
+                          .filter((d: any) => typeof d === 'number' && d >= 0);
+                        if (durations.length === 0) return '--';
+                        const avg = durations.reduce((s: number, d: number) => s + d, 0) / durations.length;
+                        const m = Math.floor(avg / 60);
+                        const s = Math.round(avg % 60);
+                        return `${m}m ${s}s`;
+                      })()}
                     </p>
                     <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">across all runs</p>
                   </div>

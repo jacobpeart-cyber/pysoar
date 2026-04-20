@@ -270,14 +270,65 @@ async def delete_asset(asset_id: str, current_user: CurrentUser = None, db: Data
 
 @router.post("/assets/{asset_id}/discover")
 async def discover_asset_networks(
-    org_id: str = Query(...),
-    network_ranges: list = Query([]),
+    asset_id: str,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+    org_id: Optional[str] = Query(None),
+    network_ranges: list[str] = Query([]),
 ):
-    """Trigger asset discovery on network ranges"""
-    monitor = OTMonitor(org_id)
+    """Discover neighbouring OT devices on the provided network ranges.
+
+    Previously this handler instantiated ``OTMonitor(org_id)`` and
+    returned ``{"status": "discovery_queued"}`` without calling any
+    method on the monitor — nothing was queued, nothing was scanned.
+    Now invokes ``OTMonitor.discover_assets`` when it exists and falls
+    back to an honest ``awaiting_network_scanner`` status when the
+    monitor has no discovery backend configured, so the UI knows
+    whether a real scan ran.
+    """
+    effective_org = org_id or getattr(current_user, "organization_id", None)
+    asset = await get_asset_or_404(db, asset_id, effective_org)
+
+    monitor = OTMonitor(effective_org)
+    discovered: list[dict] = []
+    status_label = "awaiting_network_scanner"
+    error_message: Optional[str] = None
+
+    discover_fn = getattr(monitor, "discover_assets", None) or getattr(monitor, "scan", None)
+    if discover_fn is not None:
+        try:
+            result = discover_fn(
+                network_ranges=network_ranges or [asset.ip_address] if asset.ip_address else network_ranges,
+                seed_asset=asset,
+            )
+            if hasattr(result, "__await__"):
+                result = await result  # type: ignore[assignment]
+            if isinstance(result, dict):
+                discovered = list(result.get("assets") or result.get("discovered") or [])
+            elif isinstance(result, list):
+                discovered = result
+            status_label = "completed"
+        except TypeError:
+            # Method exists but has a different signature — fall back
+            # to invoking with no kwargs rather than silently failing.
+            try:
+                result = discover_fn()
+                if hasattr(result, "__await__"):
+                    result = await result  # type: ignore[assignment]
+                discovered = list(result or [])
+                status_label = "completed"
+            except Exception as exc:  # noqa: BLE001
+                error_message = str(exc)[:500]
+        except Exception as exc:  # noqa: BLE001
+            error_message = str(exc)[:500]
+
     return {
-        "status": "discovery_queued",
+        "asset_id": asset_id,
+        "status": status_label,
         "network_ranges": network_ranges,
+        "discovered_count": len(discovered),
+        "discovered": discovered[:50],
+        "error": error_message,
     }
 
 

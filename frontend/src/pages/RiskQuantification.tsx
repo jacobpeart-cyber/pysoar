@@ -17,6 +17,7 @@ import {
 } from 'lucide-react';
 import clsx from 'clsx';
 import { riskquantApi } from '../api/endpoints';
+import { api } from '../lib/api';
 
 const getSeverityColor = (severity: string) => {
   switch (severity) {
