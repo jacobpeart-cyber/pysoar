@@ -485,6 +485,19 @@ _INTEGRATION_KEY_ATTR = {
     "greynoise": "greynoise_api_key",
     "elasticsearch": "elasticsearch_url",
     "splunk": "splunk_host",
+    # Notification channels — Configure X buttons on the Settings page
+    # for Slack / Teams / PagerDuty previously returned "Unknown
+    # integration" because only the enrichment set was whitelisted.
+    "slack": "slack_webhook_url",
+    "teams": "teams_webhook_url",
+    "pagerduty": "pagerduty_api_key",
+    "opsgenie": "opsgenie_api_key",
+    # Ticketing
+    "jira": "jira_url",
+    "servicenow": "servicenow_url",
+    # OpenAI / AI providers
+    "openai": "openai_api_key",
+    "anthropic": "anthropic_api_key",
 }
 
 
@@ -511,9 +524,19 @@ async def save_integration_config(
         or config.get("url")
         or config.get("host")
         or config.get("token")
+        or config.get("webhook_url")
     )
-    if primary_value is not None:
-        setattr(app_settings, attr, str(primary_value))
+    # Only mutate app_settings when the target attribute actually
+    # exists on the BaseSettings object (pydantic v2 rejects unknown
+    # attrs). Notification/ticketing integrations like Slack, Teams,
+    # PagerDuty, Jira don't have corresponding app_settings attrs —
+    # they're read exclusively from the DB-saved `integration:<name>`
+    # row, which is what `_upsert_section` below persists.
+    if primary_value is not None and hasattr(app_settings, attr):
+        try:
+            setattr(app_settings, attr, str(primary_value))
+        except Exception:  # pydantic validation — non-fatal
+            pass
 
     merged = await _upsert_section(
         db, org_id, f"integration:{integration_id}", config, uid
