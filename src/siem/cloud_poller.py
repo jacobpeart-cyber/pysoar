@@ -404,12 +404,146 @@ async def _ingest_cloud_events(
 # --------------------------------------------------------------------------- #
 
 
+async def poll_splunk(db: AsyncSession, integration: InstalledIntegration) -> dict[str, Any]:
+    """Pull recent Splunk events via a real-time search job.
+
+    Required credentials:
+      * ``base_url`` (e.g. ``https://splunk.example.com:8089``)
+      * ``token`` (Splunk HEC or authentication token)
+    Optional config:
+      * ``search`` (SPL string — defaults to 'search index=* earliest=-5m')
+    """
+    import httpx
+    creds = _decrypt_creds(integration)
+    config = _decrypt_config(integration)
+    base_url = (creds.get("base_url") or config.get("base_url") or "").rstrip("/")
+    token = creds.get("token") or creds.get("api_key")
+    if not base_url or not token:
+        return {"status": "error", "reason": "Missing base_url / token"}
+    cutoff = _last_poll_cutoff(config, default_minutes=10)
+    now = datetime.now(timezone.utc)
+    search = config.get("search") or f'search index=* earliest={int(cutoff.timestamp())} latest={int(now.timestamp())}'
+    try:
+        async with httpx.AsyncClient(timeout=30.0, verify=False, headers={"Authorization": f"Bearer {token}"}) as client:
+            r = await client.post(f"{base_url}/services/search/jobs", data={"search": search, "output_mode": "json", "exec_mode": "oneshot"})
+            r.raise_for_status()
+            data = r.json()
+            events = data.get("results", []) if isinstance(data, dict) else []
+    except Exception as exc:  # noqa: BLE001
+        integration.health_status = "unhealthy"
+        integration.error_message = str(exc)[:500]
+        await db.flush()
+        return {"status": "error", "reason": str(exc)}
+    ingested = await _ingest_cloud_events(
+        db, events, source_type="splunk", source_name="splunk",
+        organization_id=integration.organization_id, event_serializer=lambda e: e, ip_field="src_ip",
+    )
+    await _persist_poll_marker(db, integration, now)
+    return {"status": "ok", "events_fetched": len(events), "events_ingested": ingested}
+
+
+async def poll_elastic(db: AsyncSession, integration: InstalledIntegration) -> dict[str, Any]:
+    """Pull Elasticsearch docs added since last poll.
+
+    Required credentials:
+      * ``base_url`` (Elasticsearch / OpenSearch URL)
+      * ``api_key`` or (``username`` + ``password``)
+    Optional config:
+      * ``index`` (default ``logs-*``)
+      * ``timestamp_field`` (default ``@timestamp``)
+    """
+    import httpx
+    creds = _decrypt_creds(integration)
+    config = _decrypt_config(integration)
+    base_url = (creds.get("base_url") or config.get("base_url") or "").rstrip("/")
+    api_key = creds.get("api_key")
+    user = creds.get("username"); pw = creds.get("password")
+    if not base_url or not (api_key or (user and pw)):
+        return {"status": "error", "reason": "Missing base_url and auth"}
+    index = config.get("index") or "logs-*"
+    ts_field = config.get("timestamp_field") or "@timestamp"
+    cutoff = _last_poll_cutoff(config, default_minutes=10)
+    now = datetime.now(timezone.utc)
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"ApiKey {api_key}"
+        auth = None
+    else:
+        auth = (user, pw)
+    query = {
+        "size": 500,
+        "sort": [{ts_field: "asc"}],
+        "query": {"range": {ts_field: {"gte": cutoff.isoformat(), "lte": now.isoformat()}}},
+    }
+    try:
+        async with httpx.AsyncClient(timeout=30.0, verify=False, headers=headers, auth=auth) as client:
+            r = await client.post(f"{base_url}/{index}/_search", json=query)
+            r.raise_for_status()
+            hits = r.json().get("hits", {}).get("hits", [])
+            events = [h.get("_source", {}) for h in hits]
+    except Exception as exc:  # noqa: BLE001
+        integration.health_status = "unhealthy"
+        integration.error_message = str(exc)[:500]
+        await db.flush()
+        return {"status": "error", "reason": str(exc)}
+    ingested = await _ingest_cloud_events(
+        db, events, source_type="elastic", source_name=f"elastic/{index}",
+        organization_id=integration.organization_id, event_serializer=lambda e: e, ip_field="source.ip",
+    )
+    await _persist_poll_marker(db, integration, now)
+    return {"status": "ok", "events_fetched": len(events), "events_ingested": ingested}
+
+
+async def poll_qradar(db: AsyncSession, integration: InstalledIntegration) -> dict[str, Any]:
+    """Pull recent QRadar offenses via the Ariel /api/siem/offenses endpoint.
+
+    Required credentials:
+      * ``base_url`` (e.g. ``https://qradar.example.com``)
+      * ``sec_token`` (QRadar SEC token from Admin → User Mgmt)
+    """
+    import httpx
+    creds = _decrypt_creds(integration)
+    config = _decrypt_config(integration)
+    base_url = (creds.get("base_url") or config.get("base_url") or "").rstrip("/")
+    sec_token = creds.get("sec_token") or creds.get("api_key") or creds.get("token")
+    if not base_url or not sec_token:
+        return {"status": "error", "reason": "Missing base_url / sec_token"}
+    cutoff = _last_poll_cutoff(config, default_minutes=10)
+    now = datetime.now(timezone.utc)
+    headers = {"SEC": sec_token, "Version": "12.0", "Accept": "application/json"}
+    # QRadar epoch ms filter on start_time
+    filter_str = f"start_time>={int(cutoff.timestamp() * 1000)}"
+    try:
+        async with httpx.AsyncClient(timeout=30.0, verify=False, headers=headers) as client:
+            r = await client.get(f"{base_url}/api/siem/offenses", params={"filter": filter_str})
+            r.raise_for_status()
+            events = r.json() if isinstance(r.json(), list) else []
+    except Exception as exc:  # noqa: BLE001
+        integration.health_status = "unhealthy"
+        integration.error_message = str(exc)[:500]
+        await db.flush()
+        return {"status": "error", "reason": str(exc)}
+    ingested = await _ingest_cloud_events(
+        db, events, source_type="qradar", source_name="qradar",
+        organization_id=integration.organization_id, event_serializer=lambda e: e, ip_field="source_address_ids",
+    )
+    await _persist_poll_marker(db, integration, now)
+    return {"status": "ok", "events_fetched": len(events), "events_ingested": ingested}
+
+
 _CLOUD_CONNECTOR_DISPATCH = {
     "aws_cloudtrail": poll_aws_cloudtrail,
     "azure_activity_log": poll_azure_activity_log,
     "azure_activity": poll_azure_activity_log,
     "gcp_cloud_logging": poll_gcp_cloud_logging,
     "gcp_logging": poll_gcp_cloud_logging,
+    # SIEM log sources — these are connectors the operator already has
+    # installed (Splunk Cloud, Elastic Security, QRadar, etc.) that
+    # PySOAR pulls events from so they all land in the same SIEM
+    # search surface and detection rule evaluation.
+    "splunk": poll_splunk,
+    "elastic": poll_elastic,
+    "qradar": poll_qradar,
 }
 
 

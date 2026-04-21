@@ -11,7 +11,10 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
+import json
+
 from fastapi import APIRouter, Body, Depends, HTTPException
+from sqlalchemy import select
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -524,6 +527,48 @@ async def save_integration_config(
         or getattr(app_settings, attr, None)
     )
     enabled = bool(merged.get("enabled", configured))
+
+    # Bridge: also upsert an InstalledIntegration row so the
+    # Integrations marketplace page ("Installed: N · Active: N")
+    # reflects what the operator configured through Settings. The two
+    # pages used to be fully independent — you'd save VT through
+    # Settings and the Integrations page still said "0 installed".
+    try:
+        from src.api.v1.endpoints.integrations import _encrypt_secret_json
+        from src.integrations.models import InstalledIntegration
+        res = await db.execute(
+            select(InstalledIntegration).where(
+                InstalledIntegration.connector_id == integration_id,
+                InstalledIntegration.organization_id == org_id,
+            ).limit(1)
+        )
+        existing = res.scalars().first()
+        encrypted_creds = _encrypt_secret_json({k: v for k, v in config.items() if k in ("api_key", "token", "url", "host", "username", "password")})
+        public_config = {k: v for k, v in config.items() if k not in ("api_key", "token", "password")}
+        if existing is None:
+            installation = InstalledIntegration(
+                organization_id=org_id,
+                connector_id=integration_id,
+                display_name=integration_id.replace("_", " ").title(),
+                config_encrypted=json.dumps(public_config) if public_config else "{}",
+                auth_credentials_encrypted=encrypted_creds,
+                status="active" if enabled else "disabled",
+                health_status="unknown",
+            )
+            db.add(installation)
+        else:
+            existing.auth_credentials_encrypted = encrypted_creds
+            existing.config_encrypted = json.dumps(public_config) if public_config else existing.config_encrypted
+            existing.status = "active" if enabled else "disabled"
+        await db.flush()
+    except Exception as exc:  # noqa: BLE001
+        # Bridge failure is non-fatal — the Settings save already
+        # succeeded. Log and move on.
+        import logging
+        logging.getLogger(__name__).warning(
+            "Bridge to InstalledIntegration failed for %s: %s", integration_id, exc
+        )
+
     return {
         "integration_id": integration_id,
         "enabled": enabled,

@@ -154,6 +154,54 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     except Exception as e:  # noqa: BLE001
         logger.warning("Integration connector seeding failed", error=str(e))
 
+    # Backfill: any integrations saved under Settings (app_settings
+    # rows keyed `integration:<name>`) get mirrored into the
+    # installed_integrations table so the Integrations marketplace
+    # page shows a consistent count. Historically the two pages were
+    # independent — Settings saves would never appear in the
+    # marketplace. Bridge is idempotent: only inserts missing rows.
+    try:
+        from src.core.database import async_session_factory
+        from src.integrations.models import InstalledIntegration
+        from src.api.v1.endpoints.integrations import _encrypt_secret_json
+        from sqlalchemy import select, text
+
+        async with async_session_factory() as _bridge_db:
+            rows = await _bridge_db.execute(
+                text("SELECT organization_id, section, value FROM app_settings WHERE section LIKE 'integration:%'")
+            )
+            bridged = 0
+            for org_id, section, value in rows.all():
+                connector_id = section.split(":", 1)[1] if ":" in section else section
+                existing = (
+                    await _bridge_db.execute(
+                        select(InstalledIntegration).where(
+                            InstalledIntegration.connector_id == connector_id,
+                            InstalledIntegration.organization_id == org_id,
+                        ).limit(1)
+                    )
+                ).scalars().first()
+                if existing is not None:
+                    continue
+                cfg = value if isinstance(value, dict) else {}
+                secrets_subset = {k: v for k, v in cfg.items() if k in ("api_key", "token", "url", "host", "username", "password")}
+                public_subset = {k: v for k, v in cfg.items() if k not in secrets_subset}
+                _bridge_db.add(InstalledIntegration(
+                    organization_id=org_id,
+                    connector_id=connector_id,
+                    display_name=connector_id.replace("_", " ").title(),
+                    config_encrypted=__import__("json").dumps(public_subset) if public_subset else "{}",
+                    auth_credentials_encrypted=_encrypt_secret_json(secrets_subset),
+                    status="active",
+                    health_status="unknown",
+                ))
+                bridged += 1
+            if bridged:
+                await _bridge_db.commit()
+                logger.info("Bridged Settings integrations into marketplace", count=bridged)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Settings→marketplace bridge failed", error=str(e))
+
     # Seed compliance frameworks (idempotent). Populates FedRAMP Moderate
     # w/ 191 NIST 800-53 Rev 5 controls, plus NIST 800-171, CMMC 2 L2,
     # PCI DSS v4, HIPAA, SOC 2, and ISO 27001:2022 for every organization.
