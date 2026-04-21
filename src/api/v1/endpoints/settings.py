@@ -768,6 +768,20 @@ async def test_integration(
     #     and return 200. If it's wrong, they return 403/404/400 and
     #     the test surfaces the real failure to the operator.
     async def _probe_slack() -> dict:
+        # Guard against the common mistake of pasting the Slack
+        # client/browser URL (https://app.slack.com/client/...) or a
+        # channel deep-link. Neither accepts webhook POSTs. The real
+        # incoming webhook lives at https://hooks.slack.com/services/...
+        if not slack_webhook.startswith("https://hooks.slack.com/"):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Slack URL is not an incoming webhook. Real webhooks "
+                    "start with 'https://hooks.slack.com/services/'. "
+                    "Create one at api.slack.com/apps → Incoming Webhooks "
+                    "→ Add New Webhook to Workspace."
+                ),
+            )
         payload = {
             "text": "PySOAR connection test — if you see this, Slack integration is working.",
         }
@@ -775,9 +789,22 @@ async def test_integration(
             resp = await client.post(slack_webhook, json=payload)
             if resp.status_code < 400 and (resp.text or "").strip().lower() in ("ok", ""):
                 return {"message": "Test message delivered to Slack", "status": "healthy", "http_status": resp.status_code}
-            raise HTTPException(status_code=502, detail=f"Slack returned HTTP {resp.status_code}: {resp.text[:200]}")
+            # Slack's common rejection bodies are `no_team`,
+            # `invalid_token`, `no_service` — surface them verbatim so
+            # the operator knows exactly what's wrong.
+            body = (resp.text or "").strip()
+            raise HTTPException(status_code=502, detail=f"Slack returned HTTP {resp.status_code}: {body[:200] or 'no body'}")
 
     async def _probe_teams() -> dict:
+        if not (teams_webhook.startswith("https://") and (".webhook.office.com" in teams_webhook or ".logic.azure.com" in teams_webhook)):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Teams URL is not a Microsoft Teams incoming webhook. "
+                    "Expected https://<tenant>.webhook.office.com/webhookb2/... "
+                    "(get one from the Teams channel → Connectors → Incoming Webhook)."
+                ),
+            )
         payload = {
             "@type": "MessageCard",
             "text": "PySOAR connection test — if you see this, Teams integration is working.",
