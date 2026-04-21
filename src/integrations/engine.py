@@ -226,6 +226,45 @@ BUILTIN_CONNECTORS = {
         "supported_actions": ["query", "create", "update"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
     },
+    # Cloud Log Sources — pulled every 5 min by Celery beat
+    # (siem.poll_cloud_integrations) into log_entries for SIEM search
+    # and rule evaluation. Each requires credentials installed through
+    # the marketplace; the poller keys off connector_id == one of these.
+    "aws_cloudtrail": {
+        "name": "aws_cloudtrail",
+        "display_name": "AWS CloudTrail",
+        "description": "Poll AWS CloudTrail account activity logs into the SIEM every 5 min",
+        "vendor": "Amazon",
+        "category": IntegrationCategory.CLOUD_PROVIDER,
+        "auth_type": AuthType.API_KEY,
+        "supported_actions": ["poll_logs"],
+        "supported_triggers": ["scheduled", "manual"],
+        "required_credentials": ["aws_access_key_id", "aws_secret_access_key"],
+        "optional_config": ["region"],
+    },
+    "azure_activity_log": {
+        "name": "azure_activity_log",
+        "display_name": "Azure Activity Log",
+        "description": "Poll Azure subscription Activity Log into the SIEM every 5 min",
+        "vendor": "Microsoft",
+        "category": IntegrationCategory.CLOUD_PROVIDER,
+        "auth_type": AuthType.OAUTH2,
+        "supported_actions": ["poll_logs"],
+        "supported_triggers": ["scheduled", "manual"],
+        "required_credentials": ["tenant_id", "client_id", "client_secret", "subscription_id"],
+    },
+    "gcp_cloud_logging": {
+        "name": "gcp_cloud_logging",
+        "display_name": "GCP Cloud Logging",
+        "description": "Poll GCP Cloud Audit Logs into the SIEM every 5 min",
+        "vendor": "Google",
+        "category": IntegrationCategory.CLOUD_PROVIDER,
+        "auth_type": AuthType.OAUTH2,
+        "supported_actions": ["poll_logs"],
+        "supported_triggers": ["scheduled", "manual"],
+        "required_credentials": ["service_account_json"],
+        "optional_config": ["project_id", "log_filter"],
+    },
     # Identity Providers
     "okta": {
         "name": "okta",
