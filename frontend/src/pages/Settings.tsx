@@ -663,6 +663,11 @@ function IntegrationSettings({
     setConfigModal(integration);
     setFormData({});
     setShowPasswords({});
+    // Clear any stale save error from a prior attempt — the modal
+    // previously kept showing 'Unknown integration: slack' even
+    // after the backend fix deployed because saveError survived
+    // modal close+reopen.
+    setSaveError(null);
   };
 
   const handleSave = () => {
