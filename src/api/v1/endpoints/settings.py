@@ -679,7 +679,17 @@ async def test_integration(
     when no DB override exists — so Save + Test actually works in the
     same session.
     """
-    valid_integrations = ["virustotal", "abuseipdb", "shodan", "greynoise", "elasticsearch", "splunk"]
+    # Valid-set must match the save whitelist — adding new integrations
+    # here required matching entries in _INTEGRATION_KEY_ATTR. Previously
+    # this list had only the 6 enrichers so clicking Test on Slack/
+    # Teams/PagerDuty/Jira gave "Unknown integration".
+    valid_integrations = {
+        "virustotal", "abuseipdb", "shodan", "greynoise",
+        "elasticsearch", "splunk",
+        "slack", "teams", "pagerduty", "opsgenie",
+        "jira", "servicenow", "openai", "anthropic",
+        "misp", "cortex",
+    }
 
     if integration_name not in valid_integrations:
         raise HTTPException(
@@ -704,22 +714,161 @@ async def test_integration(
     es_url = _pick(["url"], app_settings.elasticsearch_url or "")
     splunk_host = _pick(["host"], app_settings.splunk_host or "")
 
-    api_key_map = {
+    # Webhook / notification channels — Slack and Teams use an
+    # incoming webhook URL, PagerDuty/OpsGenie use an API token.
+    slack_webhook = _pick(["webhook_url", "url"], app_settings.slack_webhook_url or "")
+    teams_webhook = _pick(["webhook_url", "url"], app_settings.teams_webhook_url or "")
+    pagerduty_key = _pick(["api_key", "token"])
+    opsgenie_key = _pick(["api_key", "token"])
+    # Ticketing
+    jira_url = _pick(["url", "host"])
+    jira_key = _pick(["api_key", "token", "password"])
+    jira_user = _pick(["username", "email"])
+    servicenow_url = _pick(["url", "host"])
+    servicenow_user = _pick(["username"])
+    servicenow_pw = _pick(["password", "api_key"])
+    # AI providers
+    openai_key = _pick(["api_key", "token"])
+    anthropic_key = _pick(["api_key", "token"])
+    # Analysis
+    misp_url = _pick(["url", "host"])
+    misp_key = _pick(["api_key", "token"])
+    cortex_url = _pick(["url", "host"])
+    cortex_key = _pick(["api_key", "token"])
+
+    primary_map = {
         "virustotal": vt_key,
         "abuseipdb": abuse_key,
         "shodan": shodan_key,
         "greynoise": greynoise_key,
         "elasticsearch": es_url,
         "splunk": splunk_host,
+        "slack": slack_webhook,
+        "teams": teams_webhook,
+        "pagerduty": pagerduty_key,
+        "opsgenie": opsgenie_key,
+        "jira": jira_url,
+        "servicenow": servicenow_url,
+        "openai": openai_key,
+        "anthropic": anthropic_key,
+        "misp": misp_url,
+        "cortex": cortex_url,
     }
 
-    if not api_key_map.get(integration_name):
+    if not primary_map.get(integration_name):
         raise HTTPException(
             status_code=400,
             detail=f"Integration {integration_name} is not configured"
         )
 
     import httpx
+
+    # --- Webhook-style tests — POST a real probe payload to the saved
+    #     webhook URL. If the webhook is valid, Slack/Teams accept it
+    #     and return 200. If it's wrong, they return 403/404/400 and
+    #     the test surfaces the real failure to the operator.
+    async def _probe_slack() -> dict:
+        payload = {
+            "text": "PySOAR connection test — if you see this, Slack integration is working.",
+        }
+        async with httpx.AsyncClient(timeout=10.0, verify=False) as client:
+            resp = await client.post(slack_webhook, json=payload)
+            if resp.status_code < 400 and (resp.text or "").strip().lower() in ("ok", ""):
+                return {"message": "Test message delivered to Slack", "status": "healthy", "http_status": resp.status_code}
+            raise HTTPException(status_code=502, detail=f"Slack returned HTTP {resp.status_code}: {resp.text[:200]}")
+
+    async def _probe_teams() -> dict:
+        payload = {
+            "@type": "MessageCard",
+            "text": "PySOAR connection test — if you see this, Teams integration is working.",
+        }
+        async with httpx.AsyncClient(timeout=10.0, verify=False) as client:
+            resp = await client.post(teams_webhook, json=payload)
+            if resp.status_code < 400:
+                return {"message": "Test message delivered to Teams", "status": "healthy", "http_status": resp.status_code}
+            raise HTTPException(status_code=502, detail=f"Teams returned HTTP {resp.status_code}: {resp.text[:200]}")
+
+    async def _probe_pagerduty() -> dict:
+        async with httpx.AsyncClient(timeout=10.0, verify=False, headers={"Authorization": f"Token token={pagerduty_key}", "Accept": "application/vnd.pagerduty+json;version=2"}) as client:
+            resp = await client.get("https://api.pagerduty.com/abilities")
+            if resp.status_code < 400:
+                return {"message": "PagerDuty API token valid", "status": "healthy", "http_status": resp.status_code}
+            raise HTTPException(status_code=502, detail=f"PagerDuty returned HTTP {resp.status_code}")
+
+    async def _probe_opsgenie() -> dict:
+        async with httpx.AsyncClient(timeout=10.0, verify=False, headers={"Authorization": f"GenieKey {opsgenie_key}"}) as client:
+            resp = await client.get("https://api.opsgenie.com/v2/account")
+            if resp.status_code < 400:
+                return {"message": "OpsGenie API token valid", "status": "healthy", "http_status": resp.status_code}
+            raise HTTPException(status_code=502, detail=f"OpsGenie returned HTTP {resp.status_code}")
+
+    async def _probe_jira() -> dict:
+        if not jira_url:
+            raise HTTPException(status_code=400, detail="Jira URL is not configured")
+        auth = (jira_user, jira_key) if jira_user else None
+        headers_j = {"Accept": "application/json"}
+        if not auth and jira_key:
+            headers_j["Authorization"] = f"Bearer {jira_key}"
+        async with httpx.AsyncClient(timeout=10.0, verify=False, headers=headers_j, auth=auth) as client:
+            resp = await client.get(f"{jira_url.rstrip('/')}/rest/api/3/myself")
+            if resp.status_code < 400:
+                return {"message": "Jira credentials valid", "status": "healthy", "http_status": resp.status_code}
+            raise HTTPException(status_code=502, detail=f"Jira returned HTTP {resp.status_code}")
+
+    async def _probe_servicenow() -> dict:
+        if not servicenow_url or not servicenow_user:
+            raise HTTPException(status_code=400, detail="ServiceNow requires url + username + password")
+        async with httpx.AsyncClient(timeout=10.0, verify=False, auth=(servicenow_user, servicenow_pw)) as client:
+            resp = await client.get(f"{servicenow_url.rstrip('/')}/api/now/table/sys_user?sysparm_limit=1")
+            if resp.status_code < 400:
+                return {"message": "ServiceNow credentials valid", "status": "healthy", "http_status": resp.status_code}
+            raise HTTPException(status_code=502, detail=f"ServiceNow returned HTTP {resp.status_code}")
+
+    async def _probe_openai() -> dict:
+        async with httpx.AsyncClient(timeout=10.0, verify=False, headers={"Authorization": f"Bearer {openai_key}"}) as client:
+            resp = await client.get("https://api.openai.com/v1/models")
+            if resp.status_code < 400:
+                return {"message": "OpenAI API key valid", "status": "healthy", "http_status": resp.status_code}
+            raise HTTPException(status_code=502, detail=f"OpenAI returned HTTP {resp.status_code}")
+
+    async def _probe_anthropic() -> dict:
+        # Anthropic has no cheap auth-check; a minimal messages POST
+        # with an invalid model name returns 400 auth-valid if the key
+        # is good, 401 if not. Send a 1-token real request to /models.
+        async with httpx.AsyncClient(timeout=10.0, verify=False, headers={"x-api-key": anthropic_key, "anthropic-version": "2023-06-01"}) as client:
+            resp = await client.get("https://api.anthropic.com/v1/models")
+            if resp.status_code < 400:
+                return {"message": "Anthropic API key valid", "status": "healthy", "http_status": resp.status_code}
+            raise HTTPException(status_code=502, detail=f"Anthropic returned HTTP {resp.status_code}")
+
+    async def _probe_misp() -> dict:
+        async with httpx.AsyncClient(timeout=10.0, verify=False, headers={"Authorization": misp_key, "Accept": "application/json"}) as client:
+            resp = await client.get(f"{misp_url.rstrip('/')}/users/view/me.json")
+            if resp.status_code < 400:
+                return {"message": "MISP credentials valid", "status": "healthy", "http_status": resp.status_code}
+            raise HTTPException(status_code=502, detail=f"MISP returned HTTP {resp.status_code}")
+
+    async def _probe_cortex() -> dict:
+        async with httpx.AsyncClient(timeout=10.0, verify=False, headers={"Authorization": f"Bearer {cortex_key}"}) as client:
+            resp = await client.get(f"{cortex_url.rstrip('/')}/api/analyzer")
+            if resp.status_code < 400:
+                return {"message": "Cortex credentials valid", "status": "healthy", "http_status": resp.status_code}
+            raise HTTPException(status_code=502, detail=f"Cortex returned HTTP {resp.status_code}")
+
+    _custom_probes = {
+        "slack": _probe_slack,
+        "teams": _probe_teams,
+        "pagerduty": _probe_pagerduty,
+        "opsgenie": _probe_opsgenie,
+        "jira": _probe_jira,
+        "servicenow": _probe_servicenow,
+        "openai": _probe_openai,
+        "anthropic": _probe_anthropic,
+        "misp": _probe_misp,
+        "cortex": _probe_cortex,
+    }
+    if integration_name in _custom_probes:
+        return await _custom_probes[integration_name]()
 
     test_endpoints = {
         # /urls returns 405 on GET (it's a POST-only submission endpoint).
