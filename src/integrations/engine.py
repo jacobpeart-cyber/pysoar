@@ -42,13 +42,20 @@ def _classify_response(resp: Any) -> tuple[str, Optional[str]]:
 
 # Built-in connector definitions
 BUILTIN_CONNECTORS = {
-    # SIEM
+    # External SIEM (optional interop) — PySOAR SHIPS with its own
+    # native SIEM (UDP/TCP 5514 syslog + HTTP bulk ingest + agent
+    # heartbeat stream + cloud log pollers + rule engine +
+    # correlation + alert creation). These connectors are for
+    # customers who already have an incumbent SIEM and want to pull
+    # events from it into PySOAR for unified detection+response —
+    # not for customers who want the built-in SIEM.
     "splunk": {
         "name": "splunk",
         "display_name": "Splunk Enterprise",
-        "description": "SIEM and data platform for security analytics",
+        "description": "OPTIONAL INTEROP — pull events from an existing Splunk deployment. Not required; PySOAR has its own native SIEM.",
         "vendor": "Splunk",
         "category": IntegrationCategory.SIEM,
+        "integration_role": "external_siem",
         "auth_type": AuthType.API_KEY,
         "supported_actions": ["query", "search", "create_alert"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
@@ -56,9 +63,10 @@ BUILTIN_CONNECTORS = {
     "qradar": {
         "name": "qradar",
         "display_name": "IBM QRadar",
-        "description": "Enterprise SIEM for threat detection and response",
+        "description": "OPTIONAL INTEROP — pull offenses from an existing QRadar deployment. Not required; PySOAR has its own native SIEM.",
         "vendor": "IBM",
         "category": IntegrationCategory.SIEM,
+        "integration_role": "external_siem",
         "auth_type": AuthType.API_KEY,
         "supported_actions": ["query", "create_offense", "close_offense"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
@@ -66,9 +74,10 @@ BUILTIN_CONNECTORS = {
     "elastic": {
         "name": "elastic",
         "display_name": "Elastic Security",
-        "description": "Elastic Stack with security analytics and threat hunting",
+        "description": "OPTIONAL INTEROP — pull events from an existing Elastic / OpenSearch cluster. Not required; PySOAR has its own native SIEM.",
         "vendor": "Elastic",
         "category": IntegrationCategory.SIEM,
+        "integration_role": "external_siem",
         "auth_type": AuthType.API_KEY,
         "supported_actions": ["query", "search", "create_detection"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
@@ -76,9 +85,10 @@ BUILTIN_CONNECTORS = {
     "wazuh": {
         "name": "wazuh",
         "display_name": "Wazuh",
-        "description": "Open-source security monitoring and incident response",
+        "description": "OPTIONAL INTEROP — pull events from an existing Wazuh deployment. Not required; PySOAR has its own native SIEM.",
         "vendor": "Wazuh",
         "category": IntegrationCategory.SIEM,
+        "integration_role": "external_siem",
         "auth_type": AuthType.API_KEY,
         "supported_actions": ["query", "create_group", "run_agent_command"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
@@ -86,9 +96,10 @@ BUILTIN_CONNECTORS = {
     "sumo_logic": {
         "name": "sumo_logic",
         "display_name": "Sumo Logic",
-        "description": "Cloud-native SIEM and log analytics platform",
+        "description": "OPTIONAL INTEROP — pull events from Sumo Logic. Not required; PySOAR has its own native SIEM.",
         "vendor": "Sumo Logic",
         "category": IntegrationCategory.SIEM,
+        "integration_role": "external_siem",
         "auth_type": AuthType.API_KEY,
         "supported_actions": ["query", "create_alert", "search"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
@@ -96,9 +107,10 @@ BUILTIN_CONNECTORS = {
     "chronicle": {
         "name": "chronicle",
         "display_name": "Google Chronicle",
-        "description": "Cloud-native SIEM for threat detection and investigation",
+        "description": "OPTIONAL INTEROP — pull events from Google Chronicle. Not required; PySOAR has its own native SIEM.",
         "vendor": "Google",
         "category": IntegrationCategory.SIEM,
+        "integration_role": "external_siem",
         "auth_type": AuthType.OAUTH2,
         "supported_actions": ["query", "enrich", "search"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
@@ -106,9 +118,10 @@ BUILTIN_CONNECTORS = {
     "graylog": {
         "name": "graylog",
         "display_name": "Graylog",
-        "description": "Open-source log management and SIEM platform",
+        "description": "OPTIONAL INTEROP — pull events from Graylog. Not required; PySOAR has its own native SIEM.",
         "vendor": "Graylog",
         "category": IntegrationCategory.SIEM,
+        "integration_role": "external_siem",
         "auth_type": AuthType.API_KEY,
         "supported_actions": ["query", "search", "create_alert"],
         "supported_triggers": ["manual", "scheduled", "webhook"],
@@ -535,6 +548,13 @@ class ConnectorRegistry:
                 "auth_type": config["auth_type"],
                 "version": "1.0.0",
                 "is_builtin": True,
+                # Optional flag — "external_siem" surfaces in the
+                # marketplace UI so operators know these are interop
+                # connectors, not a requirement to replace PySOAR's
+                # native SIEM.
+                "integration_role": config.get("integration_role"),
+                "required_credentials": config.get("required_credentials"),
+                "optional_config": config.get("optional_config"),
                 "supported_actions": config["supported_actions"],
                 "supported_triggers": config["supported_triggers"],
                 "config_schema": json.dumps({"type": "object", "properties": {}}),

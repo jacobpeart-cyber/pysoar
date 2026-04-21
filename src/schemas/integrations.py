@@ -34,6 +34,10 @@ class ConnectorResponse(ConnectorBase, DBModel):
     rating: Optional[float] = None
     install_count: int = 0
     last_updated: Optional[str] = None
+    # Role surfaces whether an integration is optional interop
+    # (e.g. "external_siem" — PySOAR already ships its own SIEM) so
+    # the marketplace UI can render a clarifying badge.
+    integration_role: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
