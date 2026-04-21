@@ -642,7 +642,10 @@ async def test_integration(
     import httpx
 
     test_endpoints = {
-        "virustotal": ("https://www.virustotal.com/api/v3/urls", {"x-apikey": vt_key}),
+        # /urls returns 405 on GET (it's a POST-only submission endpoint).
+        # /users/current is the canonical auth-check endpoint that returns
+        # the API key's quota + privileges on GET.
+        "virustotal": ("https://www.virustotal.com/api/v3/users/current", {"x-apikey": vt_key}),
         "abuseipdb": ("https://api.abuseipdb.com/api/v2/check?ipAddress=8.8.8.8&maxAgeInDays=1", {"Key": abuse_key, "Accept": "application/json"}),
         "shodan": (f"https://api.shodan.io/api-info?key={shodan_key}", {}),
         "greynoise": ("https://api.greynoise.io/v3/community/8.8.8.8", {"key": greynoise_key}),
