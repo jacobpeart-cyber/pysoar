@@ -146,44 +146,56 @@ async def get_settings(
     def pick(ovr: Dict[str, Any], key: str, default: Any) -> Any:
         return ovr.get(key, default) if ovr else default
 
+    # Base status from app_settings env attributes (for the 6 connectors
+    # that have corresponding BaseSettings fields).
     integrations: dict = {
-        "virustotal": {
-            "enabled": bool(app_settings.virustotal_api_key),
-            "configured": bool(app_settings.virustotal_api_key),
-        },
-        "abuseipdb": {
-            "enabled": bool(app_settings.abuseipdb_api_key),
-            "configured": bool(app_settings.abuseipdb_api_key),
-        },
-        "shodan": {
-            "enabled": bool(app_settings.shodan_api_key),
-            "configured": bool(app_settings.shodan_api_key),
-        },
-        "greynoise": {
-            "enabled": bool(app_settings.greynoise_api_key),
-            "configured": bool(app_settings.greynoise_api_key),
-        },
-        "elasticsearch": {
-            "enabled": bool(app_settings.elasticsearch_url),
-            "configured": bool(app_settings.elasticsearch_url),
-        },
-        "splunk": {
-            "enabled": bool(app_settings.splunk_host),
-            "configured": bool(app_settings.splunk_host),
-        },
+        "virustotal": {"enabled": bool(app_settings.virustotal_api_key), "configured": bool(app_settings.virustotal_api_key)},
+        "abuseipdb": {"enabled": bool(app_settings.abuseipdb_api_key), "configured": bool(app_settings.abuseipdb_api_key)},
+        "shodan": {"enabled": bool(app_settings.shodan_api_key), "configured": bool(app_settings.shodan_api_key)},
+        "greynoise": {"enabled": bool(app_settings.greynoise_api_key), "configured": bool(app_settings.greynoise_api_key)},
+        "elasticsearch": {"enabled": bool(app_settings.elasticsearch_url), "configured": bool(app_settings.elasticsearch_url)},
+        "splunk": {"enabled": bool(app_settings.splunk_host), "configured": bool(app_settings.splunk_host)},
     }
+    # Integration keys the UI knows how to render (must match the
+    # _INTEGRATION_KEY_ATTR whitelist on the save endpoint). Start
+    # every one as unconfigured; the DB merge below flips them on.
+    for _k in (
+        "slack", "teams", "pagerduty", "opsgenie",
+        "jira", "servicenow", "openai", "anthropic",
+        "misp", "cortex",
+    ):
+        integrations.setdefault(_k, {"enabled": False, "configured": False})
 
-    # Merge integration overrides: any section "integration:<id>"
-    for integ_id in list(integrations.keys()):
-        ovr = await _load_section(db, org_id, f"integration:{integ_id}")
-        if ovr:
-            configured = bool(
-                ovr.get("api_key") or ovr.get("url") or ovr.get("host") or ovr.get("token")
-            ) or integrations[integ_id]["configured"]
-            integrations[integ_id] = {
-                "enabled": bool(ovr.get("enabled", integrations[integ_id]["enabled"])),
-                "configured": configured,
-            }
+    # Merge DB-saved integration sections — scans every `integration:*`
+    # row under this org, not just the hardcoded keys. Previously the
+    # merge loop only iterated over the 6 pre-seeded keys, so saving
+    # an API key for slack/teams/pagerduty/etc. persisted fine but
+    # never flipped the UI's Configured indicator.
+    from sqlalchemy import text
+    rows = await db.execute(
+        text(
+            "SELECT section, value FROM app_settings "
+            "WHERE section LIKE 'integration:%' AND "
+            "(organization_id = :org OR (organization_id IS NULL AND :org IS NULL))"
+        ),
+        {"org": org_id},
+    )
+    for section, value in rows.all():
+        integ_id = section.split(":", 1)[1] if ":" in section else section
+        ovr = value if isinstance(value, dict) else {}
+        if not ovr:
+            continue
+        configured = bool(
+            ovr.get("api_key")
+            or ovr.get("url")
+            or ovr.get("host")
+            or ovr.get("token")
+            or ovr.get("webhook_url")
+        ) or integrations.get(integ_id, {}).get("configured", False)
+        integrations[integ_id] = {
+            "enabled": bool(ovr.get("enabled", configured)),
+            "configured": configured,
+        }
 
     return SettingsResponse(
         general=GeneralSettings(
