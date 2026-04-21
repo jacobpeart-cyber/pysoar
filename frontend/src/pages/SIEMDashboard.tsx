@@ -362,8 +362,25 @@ export default function SIEMDashboard() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-3xl font-bold text-gray-900">SIEM Dashboard</h1>
-          <p className="text-gray-500 mt-1">Security information and event management</p>
+          <div className="flex items-center gap-3 flex-wrap">
+            <h1 className="text-3xl font-bold text-gray-900">SIEM Dashboard</h1>
+            {/* "Native SIEM" badge — makes clear this page IS the
+                SIEM (log_entries + RuleEngine + CorrelationEngine +
+                ingest paths) rather than a view onto Splunk/Elastic/
+                QRadar. Install those external-SIEM connectors from
+                Integrations only if you want to pull events from an
+                incumbent deployment into this same search UI. */}
+            <span
+              title="PySOAR ships its own SIEM: UDP/TCP 5514 syslog, HTTP bulk ingest, agent heartbeat stream, cloud log pollers, Sigma-style rule engine, correlation engine, and alert generation."
+              className="text-xs px-2.5 py-1 bg-emerald-100 text-emerald-800 rounded-full border border-emerald-300 font-semibold uppercase tracking-wide"
+            >
+              Native SIEM
+            </span>
+          </div>
+          <p className="text-gray-500 mt-1">
+            Security information and event management &mdash;
+            <span className="text-gray-700"> ingest, parse, correlate, and detect on your own infrastructure.</span>
+          </p>
         </div>
       </div>
 

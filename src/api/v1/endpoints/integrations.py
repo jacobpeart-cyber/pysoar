@@ -185,6 +185,7 @@ async def list_connectors(
                 rating=connector_meta.get("rating"),
                 install_count=connector_meta.get("install_count", 0),
                 last_updated=connector_meta.get("last_updated"),
+                integration_role=connector_meta.get("integration_role"),
                 created_at=None,
                 updated_at=None,
             ),
@@ -233,6 +234,7 @@ async def get_connector_details(
         rating=connector_meta.get("rating"),
         install_count=connector_meta.get("install_count", 0),
         last_updated=connector_meta.get("last_updated"),
+        integration_role=connector_meta.get("integration_role"),
         created_at=None,
         updated_at=None,
     )

@@ -217,9 +217,23 @@ export default function IntegrationMarketplace() {
                         </div>
                       </div>
                       <h3 className="font-semibold text-lg mb-1">{connector.name}</h3>
-                      <span className="text-xs px-2 py-1 bg-blue-100 dark:bg-blue-900 text-blue-800 dark:text-blue-100 rounded w-fit mb-2">
-                        {connector.category}
-                      </span>
+                      <div className="flex gap-2 mb-2 flex-wrap">
+                        <span className="text-xs px-2 py-1 bg-blue-100 dark:bg-blue-900 text-blue-800 dark:text-blue-100 rounded w-fit">
+                          {connector.category}
+                        </span>
+                        {/* External-SIEM badge — distinguishes optional
+                            interop connectors from PySOAR's native SIEM
+                            so operators aren't misled into thinking they
+                            need to install Splunk to have a SIEM. */}
+                        {connector.integration_role === 'external_siem' && (
+                          <span
+                            title="Optional interop — PySOAR already ships its own native SIEM. Install this only if you have an existing Splunk/Elastic/QRadar/etc. deployment you want to pull events from."
+                            className="text-xs px-2 py-1 bg-amber-100 dark:bg-amber-900/40 text-amber-800 dark:text-amber-200 rounded w-fit border border-amber-300 dark:border-amber-800"
+                          >
+                            Optional · External SIEM
+                          </span>
+                        )}
+                      </div>
                       <p className="text-sm text-gray-600 dark:text-gray-400 mb-4 flex-grow">{connector.description}</p>
                       {connector.installed ? (
                         <div className="space-y-2">
