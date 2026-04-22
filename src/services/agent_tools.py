@@ -84,23 +84,32 @@ class AgentToolRegistry:
             # Build JSON schema properties from the parameters dict
             properties = {}
             required = []
+            import re
             for param_name, param_desc in (t.parameters or {}).items():
                 desc_str = str(param_desc)
-                is_optional = "optional" in desc_str.lower()
+                lower = desc_str.lower()
+                is_optional = "optional" in lower
+                # Match whole-word type hints so substrings like "list_processes"
+                # inside an enum description don't accidentally flip the type to
+                # array. Only the LEADING type word counts (the description
+                # starts with "string", "int", "list of", "dict", etc.).
                 param_type = "string"
-                if "int" in desc_str.lower() or "number" in desc_str.lower():
+                head = lower.lstrip("-• *").split(" ", 1)[0].split(",", 1)[0]
+                if head in {"int", "integer", "number", "float"}:
                     param_type = "integer"
-                elif "bool" in desc_str.lower():
+                elif head in {"bool", "boolean"}:
                     param_type = "boolean"
-                elif "dict" in desc_str.lower() or "object" in desc_str.lower():
+                elif head in {"dict", "object", "mapping"}:
                     param_type = "object"
-                elif "list" in desc_str.lower() or "array" in desc_str.lower():
+                elif head in {"list", "array"} or lower.startswith(("list of", "array of")):
                     param_type = "array"
 
-                properties[param_name] = {
-                    "type": param_type,
-                    "description": desc_str,
-                }
+                prop: dict = {"type": param_type, "description": desc_str}
+                # Gemini requires `items` on arrays; default to string items
+                # since the registry doesn't carry per-element typing.
+                if param_type == "array":
+                    prop["items"] = {"type": "string"}
+                properties[param_name] = prop
                 if not is_optional:
                     required.append(param_name)
 
@@ -477,6 +486,38 @@ class AgentToolRegistry:
             parameters={"source_type": "optional string", "status": "optional string", "priority": "optional string", "limit": "optional int, default 25"},
             category="query",
             handler=self._list_tickets,
+        ))
+
+        # ===== COMPLIANCE =====
+        self._register(Tool(
+            name="list_compliance_frameworks",
+            description="List compliance frameworks enabled for the org (NIST, FedRAMP, PCI, HIPAA, etc.)",
+            parameters={"limit": "optional int, default 20"},
+            category="query",
+            handler=self._list_compliance_frameworks,
+        ))
+        self._register(Tool(
+            name="list_compliance_controls",
+            description="List compliance controls, optionally filtered by framework or status",
+            parameters={"framework_id": "optional string", "status": "optional string", "limit": "optional int, default 25"},
+            category="query",
+            handler=self._list_compliance_controls,
+        ))
+
+        # ===== ENDPOINT AGENTS / LIVE RESPONSE =====
+        self._register(Tool(
+            name="list_endpoint_agents",
+            description="List enrolled endpoint agents (hosts with the PySOAR agent installed)",
+            parameters={"status": "optional string (active/pending/offline)", "limit": "optional int, default 25"},
+            category="query",
+            handler=self._list_endpoint_agents,
+        ))
+        self._register(Tool(
+            name="queue_endpoint_command",
+            description="Queue a live-response command on an endpoint agent (collect_triage, run_script, etc.). Requires authorize_actions.",
+            parameters={"agent_id": "string - endpoint agent UUID", "action": "string action name such as collect_triage, processes, kill_process, network_isolate", "payload": "optional dict - action parameters"},
+            category="action",
+            handler=self._queue_endpoint_command,
         ))
 
     # =========================================================================
@@ -1160,6 +1201,82 @@ class AgentToolRegistry:
         } for r in rows]
 
     # ---- TICKETS ----
+
+    # ---- COMPLIANCE ----
+
+    async def _list_compliance_frameworks(self, limit=20):
+        from src.compliance.models import ComplianceFramework
+        rows = (await self.db.execute(select(ComplianceFramework).where(ComplianceFramework.is_enabled == True).order_by(ComplianceFramework.compliance_score.desc()).limit(int(limit)))).scalars().all()  # noqa: E712
+        return [{
+            "id": f.id, "name": f.name, "short_name": f.short_name,
+            "version": f.version, "authority": f.authority,
+            "total_controls": f.total_controls,
+            "implemented_controls": f.implemented_controls,
+            "compliance_score": float(f.compliance_score) if f.compliance_score is not None else 0.0,
+            "status": f.status,
+        } for f in rows]
+
+    async def _list_compliance_controls(self, framework_id=None, status=None, limit=25):
+        from src.compliance.models import ComplianceControl
+        q = select(ComplianceControl)
+        if framework_id:
+            q = q.where(ComplianceControl.framework_id == framework_id)
+        if status:
+            q = q.where(ComplianceControl.status == status)
+        q = q.order_by(ComplianceControl.priority.asc()).limit(int(limit))
+        rows = (await self.db.execute(q)).scalars().all()
+        return [{
+            "id": c.id, "control_id": c.control_id, "title": c.title,
+            "control_family": c.control_family, "priority": c.priority,
+            "status": c.status,
+            "implementation_status": float(c.implementation_status) if c.implementation_status is not None else 0.0,
+        } for c in rows]
+
+    # ---- LIVE RESPONSE ----
+
+    async def _list_endpoint_agents(self, status=None, limit=25):
+        from src.agents.models import EndpointAgent
+        q = select(EndpointAgent).order_by(EndpointAgent.last_heartbeat_at.desc().nullslast())
+        if status:
+            q = q.where(EndpointAgent.status == status)
+        q = q.limit(int(limit))
+        rows = (await self.db.execute(q)).scalars().all()
+        return [{
+            "id": a.id, "hostname": a.hostname, "display_name": a.display_name,
+            "os_type": a.os_type, "os_version": a.os_version,
+            "status": a.status, "ip_address": a.ip_address,
+            "last_heartbeat_at": a.last_heartbeat_at.isoformat() if a.last_heartbeat_at else None,
+        } for a in rows]
+
+    async def _queue_endpoint_command(self, agent_id, action, payload=None):
+        """Queue a live-response command on an endpoint. Hash-chains into the
+        command ledger so the agent's worker polls and executes it."""
+        import hashlib
+        import json as _json
+        from src.agents.models import AgentCommand, EndpointAgent
+        agent = (await self.db.execute(
+            select(EndpointAgent).where(EndpointAgent.id == agent_id)
+        )).scalar_one_or_none()
+        if agent is None:
+            return {"error": f"Endpoint agent {agent_id} not found"}
+        payload_dict = payload or {}
+        prev_hash = agent.last_command_hash or ""
+        body = _json.dumps({"agent_id": agent_id, "action": action, "payload": payload_dict}, sort_keys=True)
+        cmd_hash = hashlib.sha256(body.encode()).hexdigest()
+        chain = hashlib.sha256((prev_hash + cmd_hash).encode()).hexdigest()
+        cmd = AgentCommand(
+            agent_id=agent_id, action=action, payload=payload_dict,
+            command_hash=cmd_hash, prev_hash=prev_hash or None, chain_hash=chain,
+            status="queued",
+        )
+        self.db.add(cmd)
+        agent.last_command_hash = chain
+        await self.db.commit()
+        await self.db.refresh(cmd)
+        return {
+            "command_id": cmd.id, "agent_id": agent_id, "action": action,
+            "status": cmd.status, "chain_hash": chain,
+        }
 
     async def _list_tickets(self, source_type=None, status=None, priority=None, limit=25):
         try:
