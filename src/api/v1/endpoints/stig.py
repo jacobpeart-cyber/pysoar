@@ -5,10 +5,13 @@ REST endpoints for STIG benchmark scanning, rule management, remediation,
 SCAP operations, and compliance dashboard.
 """
 
+import os
+import tempfile
+from pathlib import Path
 from typing import Optional
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Body
+from fastapi import APIRouter, Depends, HTTPException, Query, Body, UploadFile, File, Path as FPath
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
 
@@ -368,7 +371,7 @@ async def import_scap_content(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
 ):
-    """Import SCAP content (XCCDF, OVAL)"""
+    """Import SCAP content (XCCDF, OVAL) by server-side path."""
     try:
         engine = SCAPEngine(db)
         result = await engine.import_scap_content(
@@ -379,6 +382,78 @@ async def import_scap_content(
     except Exception as e:
         logger.error(f"Error importing SCAP content: {str(e)}")
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
+
+
+# Where uploaded XCCDF files are persisted on disk. A bind mount in
+# production, a tmp dir in tests. Kept outside /tmp so the file survives
+# container restarts; the SCAPProfile row stores the absolute path so
+# later re-scans can hash-verify content integrity.
+STIG_CONTENT_DIR = os.environ.get("PYSOAR_STIG_CONTENT_DIR", "/app/data/stig/xccdf")
+
+
+@router.post("/scap/upload", response_model=SCAPProfileResponse)
+async def upload_scap_content(
+    file: UploadFile = File(..., description="XCCDF XML file (DISA STIG content)"),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
+):
+    """Upload an XCCDF STIG file and import it.
+
+    Accepts multipart form data. Content is written to the persistent
+    STIG content directory, SHA-256 hashed, parsed, and every <Rule>
+    element is stored as an STIGRule row.
+    """
+    if not file.filename or not file.filename.lower().endswith((".xml", ".xccdf", ".xccdf.xml")):
+        raise HTTPException(status_code=400, detail="File must have .xml, .xccdf, or .xccdf.xml extension")
+
+    org_id = getattr(current_user, "organization_id", None)
+    if not org_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+
+    Path(STIG_CONTENT_DIR).mkdir(parents=True, exist_ok=True)
+    # Use a UUID prefix to avoid filename collisions between orgs uploading
+    # the same DISA content package.
+    from uuid import uuid4 as _uuid4
+    safe_name = file.filename.replace("..", "_").replace("/", "_").replace("\\", "_")
+    dest = Path(STIG_CONTENT_DIR) / f"{_uuid4().hex[:12]}_{safe_name}"
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty")
+    dest.write_bytes(content)
+
+    engine = SCAPEngine(db)
+    try:
+        result = await engine.import_scap_content(xccdf_path=str(dest), org_id=org_id)
+    except Exception as e:
+        logger.error("SCAP upload import failed", error=str(e))
+        # Leave the uploaded file on disk for forensics even when import fails.
+        raise HTTPException(status_code=400, detail=f"Import failed: {str(e)[:200]}")
+    if result.get("status", "").startswith("error"):
+        raise HTTPException(status_code=400, detail=result.get("parse_error") or "Import error")
+    return result
+
+
+@router.post("/scans/{scan_id}/arf")
+async def ingest_arf_result(
+    scan_id: str = FPath(..., description="STIGScanResult UUID"),
+    file: UploadFile = File(..., description="oscap-generated ARF XML"),
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
+):
+    """Ingest an oscap ARF (Asset Reporting Format) report into an existing
+    scan record. Parses <rule-result> elements and updates findings +
+    compliance percentage. Endpoint agents call this after running
+    `oscap xccdf eval --results-arf ...`.
+    """
+    arf_bytes = await file.read()
+    if not arf_bytes:
+        raise HTTPException(status_code=400, detail="ARF file is empty")
+
+    scanner = STIGScanner(db)
+    result = await scanner.ingest_arf_result(scan_id=scan_id, arf_xml=arf_bytes)
+    if result.get("status") == "error":
+        raise HTTPException(status_code=400, detail=result.get("error") or "ARF ingestion failed")
+    return result
 
 
 @router.post("/scap/scan", response_model=None)
