@@ -13,9 +13,16 @@ from pydantic import BaseModel, Field
 
 
 class WarRoomBase(BaseModel):
-    """Base war room schema"""
+    """Base war room schema — response-side (no length caps).
 
-    name: str = Field(..., min_length=1, max_length=255)
+    Length validation belongs on Create/Update (user input) so bad
+    clients can't insert pathological values. Responses must tolerate
+    whatever is already in the DB — a 333-char auto-created room name
+    was 500'ing every /rooms request because this field had a
+    max_length=255 cap.
+    """
+
+    name: str = Field(..., min_length=1)
     description: Optional[str] = None
     room_type: str = ""
     severity_level: str = ""
@@ -26,8 +33,9 @@ class WarRoomBase(BaseModel):
 
 
 class WarRoomCreate(WarRoomBase):
-    """Schema for creating a war room"""
+    """Schema for creating a war room — enforces 255 char name cap."""
 
+    name: str = Field(..., min_length=1, max_length=255)
     incident_id: Optional[str] = None
     commander_id: Optional[str] = None
 
