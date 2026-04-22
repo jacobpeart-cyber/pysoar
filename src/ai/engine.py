@@ -968,6 +968,63 @@ class AIAnalyzer:
             return {"name": "platform_stats", "args": {}}
         return None
 
+    def call_llm_with_tools_chain(
+        self,
+        system_prompt: str,
+        user_prompt: str,
+        tools: list[dict],
+        history: list[dict],
+    ) -> dict:
+        """
+        Continue a tool-calling conversation. `history` is a list of
+        {"tool": name, "args": {...}, "result": {...}} entries representing
+        tool calls already made this turn. Gemini gets the full transcript
+        and the tool declarations, so it can decide to either call another
+        tool or produce the final text answer.
+
+        Returns the same shape as call_llm_with_tools (tool_call | text | error).
+        """
+        import httpx
+
+        try:
+            contents = [
+                {"role": "user", "parts": [{"text": f"{system_prompt}\n\n{user_prompt}"}]},
+            ]
+            for h in history:
+                contents.append({
+                    "role": "model",
+                    "parts": [{"functionCall": {"name": h["tool"], "args": h.get("args", {})}}],
+                })
+                contents.append({
+                    "role": "function",
+                    "parts": [{"functionResponse": {"name": h["tool"], "response": h.get("result", {})}}],
+                })
+
+            response = httpx.post(
+                self.GEMINI_URL,
+                headers={"x-goog-api-key": self.GEMINI_API_KEY, "Content-Type": "application/json"},
+                json={
+                    "contents": contents,
+                    "tools": [{"function_declarations": tools}],
+                    "tool_config": {"function_calling_config": {"mode": "AUTO"}},
+                    "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1024},
+                },
+                timeout=30.0,
+            )
+            response.raise_for_status()
+            data = response.json()
+            parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+            for part in parts:
+                if "functionCall" in part:
+                    fc = part["functionCall"]
+                    return {"type": "tool_call", "name": fc.get("name", ""), "args": fc.get("args", {})}
+                if "text" in part and part["text"]:
+                    return {"type": "text", "text": part["text"]}
+            return {"type": "text", "text": ""}
+        except Exception as e:
+            self.logger.error(f"Gemini chain call failed: {e}")
+            return {"type": "error", "error": str(e)[:200]}
+
     def call_llm_followup(
         self,
         system_prompt: str,

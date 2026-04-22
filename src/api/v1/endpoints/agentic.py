@@ -756,29 +756,39 @@ async def chat_with_agent(
         "block_ip", "isolate_host", "disable_user", "execute_playbook",
         "create_incident", "create_alert", "create_ioc", "create_war_room",
         "create_remediation_ticket", "update_alert_status", "assign_alert",
-        "create_action_item",
+        "create_action_item", "create_forensic_case", "queue_endpoint_command",
     }
 
     system_prompt = (
-        "You are an autonomous SOC agent for PySOAR. You have direct access to the security platform "
-        "via function tools. When the user asks for information, CALL the appropriate query tool. "
-        "When the user asks you to take an action (block, create, assign, execute), CALL the action tool. "
-        "Do not just suggest tools - actually call them. After calling tools, summarize the results for the user "
-        "in 2-4 sentences. If the user is authorizing you to act on a previous recommendation, execute the action now."
+        "You are an autonomous SOC analyst for PySOAR with direct tool access to the security platform. "
+        "When a question needs data, CALL the appropriate query tool. When the user asks to take an action "
+        "(block, create, assign, execute, queue), CALL the action tool — do not merely suggest. "
+        "Chain tools when it helps: e.g. list_alerts → triage_alert → correlate_alerts → check_ioc_matches; "
+        "list_entity_risks → list_ueba_alerts for a top-risk user; list_endpoint_agents → queue_endpoint_command. "
+        "You may call multiple tools in sequence (up to 6). After gathering enough evidence, produce a final "
+        "text answer (2-5 sentences) summarizing findings and any actions taken. "
+        "If the user is authorizing you to act on a previous recommendation, execute the action now."
     )
 
     tool_log: list[dict] = []
     final_text: str = ""
-    MAX_STEPS = 4
+    MAX_STEPS = 6
 
-    # Initial query
-    current_prompt = query_data.query
+    history: list[dict] = []
     for step in range(MAX_STEPS):
-        llm_result = analyzer.call_llm_with_tools(
-            system_prompt=system_prompt,
-            user_prompt=current_prompt,
-            tools=tool_declarations,
-        )
+        if step == 0:
+            llm_result = analyzer.call_llm_with_tools(
+                system_prompt=system_prompt,
+                user_prompt=query_data.query,
+                tools=tool_declarations,
+            )
+        else:
+            llm_result = analyzer.call_llm_with_tools_chain(
+                system_prompt=system_prompt,
+                user_prompt=query_data.query,
+                tools=tool_declarations,
+                history=history,
+            )
 
         if llm_result.get("type") == "error":
             # Gemini failed - fall back to heuristic tool execution
@@ -870,28 +880,15 @@ async def chat_with_agent(
                 "result": exec_result,
                 "fallback": is_fallback,
             })
-
-            # Feed the result back to Gemini for a natural-language answer
-            followup = analyzer.call_llm_followup(
-                system_prompt=system_prompt,
-                user_prompt=current_prompt,
-                tool_name=tool_name,
-                tool_args=tool_args,
-                tool_result=exec_result,
-            )
-            final_text = followup
-
-            # Check if Gemini wants another tool call by feeding the followup back through
-            # For simplicity, stop after one tool execution unless the final_text is empty
-            if final_text and final_text.strip():
-                break
-
-            # If we got empty followup, try another round with context
-            current_prompt = (
-                f"Original question: {query_data.query}\n\n"
-                f"Tool {tool_name} returned: {json.dumps(exec_result, default=str)[:800]}\n\n"
-                f"Summarize this for the user or call another tool if needed."
-            )
+            history.append({
+                "tool": tool_name,
+                "args": tool_args,
+                "result": exec_result,
+            })
+            # Loop back — next iteration feeds the transcript through
+            # call_llm_with_tools_chain so Gemini can either call another
+            # tool or produce the final text answer.
+            continue
 
     if not final_text:
         # Absolute fallback - build from tool log
