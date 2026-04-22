@@ -313,6 +313,172 @@ class AgentToolRegistry:
             handler=self._generate_incident_summary,
         ))
 
+        # ===== SIEM =====
+        self._register(Tool(
+            name="search_logs",
+            description="Search SIEM logs by keyword across message/source fields",
+            parameters={"keyword": "string", "severity": "optional string", "log_type": "optional string", "limit": "optional int, default 20"},
+            category="query",
+            handler=self._search_logs,
+        ))
+        self._register(Tool(
+            name="list_siem_rules",
+            description="List active SIEM detection rules",
+            parameters={"status": "optional string (active/disabled)", "limit": "optional int, default 20"},
+            category="query",
+            handler=self._list_siem_rules,
+        ))
+
+        # ===== UEBA =====
+        self._register(Tool(
+            name="list_entity_risks",
+            description="List top high-risk UEBA entities (users/devices) by risk score",
+            parameters={"risk_level": "optional string (critical/high/medium/low)", "entity_type": "optional string (user/device)", "limit": "optional int, default 20"},
+            category="query",
+            handler=self._list_entity_risks,
+        ))
+        self._register(Tool(
+            name="list_ueba_alerts",
+            description="List UEBA behavior risk alerts",
+            parameters={"severity": "optional string", "limit": "optional int, default 20"},
+            category="query",
+            handler=self._list_ueba_alerts,
+        ))
+
+        # ===== VULN MGMT =====
+        self._register(Tool(
+            name="list_vulnerabilities",
+            description="List known vulnerabilities (CVE records)",
+            parameters={"severity": "optional string (critical/high/medium/low)", "keyword": "optional string", "limit": "optional int, default 20"},
+            category="query",
+            handler=self._list_vulnerabilities,
+        ))
+        self._register(Tool(
+            name="get_vulnerability",
+            description="Get full detail on a vulnerability by CVE id or UUID",
+            parameters={"cve_or_id": "string"},
+            category="query",
+            handler=self._get_vulnerability,
+        ))
+
+        # ===== DFIR =====
+        self._register(Tool(
+            name="list_forensic_cases",
+            description="List DFIR forensic cases",
+            parameters={"status": "optional string", "severity": "optional string", "limit": "optional int, default 20"},
+            category="query",
+            handler=self._list_forensic_cases,
+        ))
+        self._register(Tool(
+            name="create_forensic_case",
+            description="Open a new DFIR forensic case",
+            parameters={"title": "string", "severity": "string (critical/high/medium/low)", "description": "optional string"},
+            category="action",
+            handler=self._create_forensic_case,
+        ))
+
+        # ===== DARK WEB =====
+        self._register(Tool(
+            name="list_darkweb_findings",
+            description="List dark web findings (credential leaks, brand mentions, etc)",
+            parameters={"finding_type": "optional string", "severity": "optional string", "status": "optional string", "limit": "optional int, default 20"},
+            category="query",
+            handler=self._list_darkweb_findings,
+        ))
+
+        # ===== THREAT HUNTING =====
+        self._register(Tool(
+            name="list_hunts",
+            description="List threat-hunting hypotheses (prior and active hunts)",
+            parameters={"status": "optional string", "limit": "optional int, default 20"},
+            category="query",
+            handler=self._list_hunts,
+        ))
+        self._register(Tool(
+            name="list_hunt_findings",
+            description="List findings produced by threat hunts",
+            parameters={"severity": "optional string", "limit": "optional int, default 20"},
+            category="query",
+            handler=self._list_hunt_findings,
+        ))
+
+        # ===== THREAT INTEL =====
+        self._register(Tool(
+            name="list_threat_actors",
+            description="List threat actors tracked in the intel database",
+            parameters={"limit": "optional int, default 20"},
+            category="query",
+            handler=self._list_threat_actors,
+        ))
+        self._register(Tool(
+            name="list_threat_campaigns",
+            description="List known threat campaigns",
+            parameters={"limit": "optional int, default 20"},
+            category="query",
+            handler=self._list_threat_campaigns,
+        ))
+
+        # ===== ASSETS =====
+        self._register(Tool(
+            name="list_assets",
+            description="List inventoried assets (hosts, endpoints, cloud resources)",
+            parameters={"asset_type": "optional string", "status": "optional string", "keyword": "optional string", "limit": "optional int, default 20"},
+            category="query",
+            handler=self._list_assets,
+        ))
+        self._register(Tool(
+            name="get_asset",
+            description="Get details on a specific asset by id or name",
+            parameters={"asset_ref": "string - asset id or name"},
+            category="query",
+            handler=self._get_asset,
+        ))
+
+        # ===== REMEDIATION =====
+        self._register(Tool(
+            name="list_remediation_executions",
+            description="List recent remediation executions (actions the platform has run)",
+            parameters={"status": "optional string", "limit": "optional int, default 20"},
+            category="query",
+            handler=self._list_remediation_executions,
+        ))
+
+        # ===== DECEPTION =====
+        self._register(Tool(
+            name="list_decoy_interactions",
+            description="List recent decoy/honeypot interactions (attacker touched deception assets)",
+            parameters={"limit": "optional int, default 20"},
+            category="query",
+            handler=self._list_decoy_interactions,
+        ))
+
+        # ===== PHISHING SIM =====
+        self._register(Tool(
+            name="list_phishing_campaigns",
+            description="List phishing simulation campaigns and their completion status",
+            parameters={"status": "optional string", "limit": "optional int, default 20"},
+            category="query",
+            handler=self._list_phishing_campaigns,
+        ))
+
+        # ===== RISK (FAIR) =====
+        self._register(Tool(
+            name="list_risks",
+            description="List FAIR risk scenarios with loss-exposure estimates",
+            parameters={"status": "optional string", "limit": "optional int, default 20"},
+            category="query",
+            handler=self._list_risks,
+        ))
+
+        # ===== TICKETS (Ticket Hub) =====
+        self._register(Tool(
+            name="list_tickets",
+            description="List unified tickets across incidents, remediation, POAMs, war-room actions, case tasks",
+            parameters={"source_type": "optional string", "status": "optional string", "priority": "optional string", "limit": "optional int, default 25"},
+            category="query",
+            handler=self._list_tickets,
+        ))
+
     # =========================================================================
     # TOOL IMPLEMENTATIONS
     # =========================================================================
@@ -718,3 +884,295 @@ class AgentToolRegistry:
                 "Stakeholder notification",
             ],
         }
+
+    # ---- SIEM ----
+
+    async def _search_logs(self, keyword, severity=None, log_type=None, limit=20):
+        from src.siem.models import LogEntry
+        from sqlalchemy import or_
+        pat = f"%{keyword}%"
+        q = select(LogEntry).where(or_(
+            LogEntry.message.ilike(pat),
+            LogEntry.source_name.ilike(pat),
+        )).order_by(LogEntry.received_at.desc())
+        if severity:
+            q = q.where(LogEntry.severity == severity)
+        if log_type:
+            q = q.where(LogEntry.log_type == log_type)
+        rows = (await self.db.execute(q.limit(int(limit)))).scalars().all()
+        return [{
+            "id": r.id, "timestamp": r.timestamp, "source_type": r.source_type,
+            "source_name": r.source_name, "log_type": r.log_type, "severity": r.severity,
+            "message": (getattr(r, "message", "") or "")[:500],
+        } for r in rows]
+
+    async def _list_siem_rules(self, status=None, limit=20):
+        from src.siem.models import DetectionRule
+        q = select(DetectionRule).order_by(DetectionRule.updated_at.desc())
+        if status:
+            q = q.where(DetectionRule.status == status)
+        rows = (await self.db.execute(q.limit(int(limit)))).scalars().all()
+        return [{
+            "id": r.id, "name": getattr(r, "name", None), "status": r.status,
+            "severity": getattr(r, "severity", None),
+            "description": (getattr(r, "description", "") or "")[:200],
+        } for r in rows]
+
+    # ---- UEBA ----
+
+    async def _list_entity_risks(self, risk_level=None, entity_type=None, limit=20):
+        from src.ueba.models import EntityProfile
+        q = select(EntityProfile).order_by(EntityProfile.risk_score.desc())
+        if risk_level:
+            q = q.where(EntityProfile.risk_level == risk_level)
+        if entity_type:
+            q = q.where(EntityProfile.entity_type == entity_type)
+        rows = (await self.db.execute(q.limit(int(limit)))).scalars().all()
+        return [{
+            "id": p.id, "entity_type": p.entity_type, "entity_id": p.entity_id,
+            "display_name": p.display_name, "risk_score": p.risk_score,
+            "risk_level": p.risk_level, "anomaly_count_30d": p.anomaly_count_30d,
+        } for p in rows]
+
+    async def _list_ueba_alerts(self, severity=None, limit=20):
+        from src.ueba.models import UEBARiskAlert
+        q = select(UEBARiskAlert).order_by(UEBARiskAlert.created_at.desc())
+        if severity:
+            q = q.where(UEBARiskAlert.severity == severity)
+        rows = (await self.db.execute(q.limit(int(limit)))).scalars().all()
+        return [{
+            "id": a.id, "alert_type": a.alert_type, "severity": a.severity,
+            "entity_profile_id": a.entity_profile_id,
+            "risk_score_delta": a.risk_score_delta,
+            "created_at": a.created_at.isoformat() if a.created_at else None,
+        } for a in rows]
+
+    # ---- VULN MGMT ----
+
+    async def _list_vulnerabilities(self, severity=None, keyword=None, limit=20):
+        from src.vulnmgmt.models import Vulnerability
+        q = select(Vulnerability).order_by(Vulnerability.created_at.desc())
+        if severity:
+            q = q.where(Vulnerability.severity == severity)
+        if keyword:
+            pat = f"%{keyword}%"
+            q = q.where(Vulnerability.title.ilike(pat))
+        rows = (await self.db.execute(q.limit(int(limit)))).scalars().all()
+        return [{
+            "id": v.id, "cve_id": v.cve_id, "title": v.title, "severity": v.severity,
+            "cvss_score": float(v.cvss_score) if getattr(v, "cvss_score", None) is not None else None,
+        } for v in rows]
+
+    async def _get_vulnerability(self, cve_or_id):
+        from src.vulnmgmt.models import Vulnerability
+        from sqlalchemy import or_
+        row = (await self.db.execute(select(Vulnerability).where(
+            or_(Vulnerability.id == cve_or_id, Vulnerability.cve_id == cve_or_id)
+        ))).scalar_one_or_none()
+        if not row:
+            return {"error": "Vulnerability not found"}
+        return {
+            "id": row.id, "cve_id": row.cve_id, "title": row.title,
+            "severity": row.severity,
+            "description": (getattr(row, "description", "") or "")[:1000],
+            "cvss_score": float(row.cvss_score) if getattr(row, "cvss_score", None) is not None else None,
+        }
+
+    # ---- DFIR ----
+
+    async def _list_forensic_cases(self, status=None, severity=None, limit=20):
+        from src.dfir.models import ForensicCase
+        q = select(ForensicCase).order_by(ForensicCase.created_at.desc())
+        if status:
+            q = q.where(ForensicCase.status == status)
+        if severity:
+            q = q.where(ForensicCase.severity == severity)
+        rows = (await self.db.execute(q.limit(int(limit)))).scalars().all()
+        return [{
+            "id": c.id, "title": c.title, "status": c.status, "severity": c.severity,
+            "created_at": c.created_at.isoformat() if c.created_at else None,
+        } for c in rows]
+
+    async def _create_forensic_case(self, title, severity, description=""):
+        from src.dfir.models import ForensicCase
+        case = ForensicCase(title=title, severity=severity, status="open", description=description)
+        self.db.add(case)
+        await self.db.commit()
+        await self.db.refresh(case)
+        return {"id": case.id, "title": case.title, "severity": case.severity, "status": case.status}
+
+    # ---- DARK WEB ----
+
+    async def _list_darkweb_findings(self, finding_type=None, severity=None, status=None, limit=20):
+        from src.darkweb.models import DarkWebFinding
+        q = select(DarkWebFinding).order_by(DarkWebFinding.created_at.desc())
+        if finding_type:
+            q = q.where(DarkWebFinding.finding_type == finding_type)
+        if severity:
+            q = q.where(DarkWebFinding.severity == severity)
+        if status:
+            q = q.where(DarkWebFinding.status == status)
+        rows = (await self.db.execute(q.limit(int(limit)))).scalars().all()
+        return [{
+            "id": f.id, "finding_type": f.finding_type, "title": f.title,
+            "severity": f.severity, "status": f.status,
+            "created_at": f.created_at.isoformat() if f.created_at else None,
+        } for f in rows]
+
+    # ---- HUNTING ----
+
+    async def _list_hunts(self, status=None, limit=20):
+        from src.hunting.models import HuntHypothesis
+        q = select(HuntHypothesis).order_by(HuntHypothesis.created_at.desc())
+        if status:
+            q = q.where(HuntHypothesis.status == status)
+        rows = (await self.db.execute(q.limit(int(limit)))).scalars().all()
+        return [{
+            "id": h.id, "title": h.title, "status": h.status,
+            "priority": getattr(h, "priority", None),
+            "created_at": h.created_at.isoformat() if h.created_at else None,
+        } for h in rows]
+
+    async def _list_hunt_findings(self, severity=None, limit=20):
+        from src.hunting.models import HuntFinding
+        q = select(HuntFinding).order_by(HuntFinding.created_at.desc())
+        if severity:
+            q = q.where(HuntFinding.severity == severity)
+        rows = (await self.db.execute(q.limit(int(limit)))).scalars().all()
+        return [{
+            "id": f.id, "title": getattr(f, "title", None),
+            "severity": getattr(f, "severity", None),
+            "session_id": f.session_id,
+            "created_at": f.created_at.isoformat() if f.created_at else None,
+        } for f in rows]
+
+    # ---- THREAT INTEL ----
+
+    async def _list_threat_actors(self, limit=20):
+        from src.intel.models import ThreatActor
+        rows = (await self.db.execute(select(ThreatActor).order_by(ThreatActor.created_at.desc()).limit(int(limit)))).scalars().all()
+        return [{
+            "id": a.id, "name": getattr(a, "name", None),
+            "aliases": getattr(a, "aliases", None),
+            "motivation": getattr(a, "motivation", None),
+            "sophistication": getattr(a, "sophistication", None),
+        } for a in rows]
+
+    async def _list_threat_campaigns(self, limit=20):
+        from src.intel.models import ThreatCampaign
+        rows = (await self.db.execute(select(ThreatCampaign).order_by(ThreatCampaign.created_at.desc()).limit(int(limit)))).scalars().all()
+        return [{
+            "id": c.id, "name": getattr(c, "name", None),
+            "status": getattr(c, "status", None),
+            "first_seen": c.first_seen.isoformat() if getattr(c, "first_seen", None) else None,
+        } for c in rows]
+
+    # ---- ASSETS ----
+
+    async def _list_assets(self, asset_type=None, status=None, keyword=None, limit=20):
+        from src.models.asset import Asset
+        q = select(Asset).order_by(Asset.created_at.desc())
+        if asset_type:
+            q = q.where(Asset.asset_type == asset_type)
+        if status:
+            q = q.where(Asset.status == status)
+        if keyword:
+            pat = f"%{keyword}%"
+            from sqlalchemy import or_
+            q = q.where(or_(Asset.name.ilike(pat), Asset.hostname.ilike(pat), Asset.ip_address.ilike(pat)))
+        rows = (await self.db.execute(q.limit(int(limit)))).scalars().all()
+        return [{
+            "id": a.id, "name": a.name, "hostname": a.hostname,
+            "asset_type": a.asset_type, "status": a.status,
+            "ip_address": a.ip_address,
+        } for a in rows]
+
+    async def _get_asset(self, asset_ref):
+        from src.models.asset import Asset
+        from sqlalchemy import or_
+        row = (await self.db.execute(select(Asset).where(
+            or_(Asset.id == asset_ref, Asset.name == asset_ref, Asset.hostname == asset_ref)
+        ))).scalar_one_or_none()
+        if not row:
+            return {"error": "Asset not found"}
+        return {
+            "id": row.id, "name": row.name, "hostname": row.hostname,
+            "asset_type": row.asset_type, "status": row.status,
+            "ip_address": row.ip_address, "fqdn": row.fqdn,
+            "mac_address": row.mac_address,
+        }
+
+    # ---- REMEDIATION ----
+
+    async def _list_remediation_executions(self, status=None, limit=20):
+        from src.remediation.models import RemediationExecution
+        q = select(RemediationExecution).order_by(RemediationExecution.created_at.desc())
+        if status:
+            q = q.where(RemediationExecution.status == status)
+        rows = (await self.db.execute(q.limit(int(limit)))).scalars().all()
+        return [{
+            "id": e.id, "status": e.status,
+            "trigger_source": e.trigger_source, "trigger_id": e.trigger_id,
+            "approval_status": e.approval_status,
+            "started_at": e.started_at.isoformat() if e.started_at else None,
+            "completed_at": e.completed_at.isoformat() if e.completed_at else None,
+        } for e in rows]
+
+    # ---- DECEPTION ----
+
+    async def _list_decoy_interactions(self, limit=20):
+        from src.deception.models import DecoyInteraction
+        rows = (await self.db.execute(select(DecoyInteraction).order_by(DecoyInteraction.created_at.desc()).limit(int(limit)))).scalars().all()
+        return [{
+            "id": i.id, "decoy_id": i.decoy_id,
+            "interaction_type": i.interaction_type,
+            "source_ip": i.source_ip, "source_hostname": i.source_hostname,
+            "protocol": i.protocol,
+            "created_at": i.created_at.isoformat() if i.created_at else None,
+        } for i in rows]
+
+    # ---- PHISHING SIM ----
+
+    async def _list_phishing_campaigns(self, status=None, limit=20):
+        from src.phishing_sim.models import PhishingCampaign
+        q = select(PhishingCampaign).order_by(PhishingCampaign.created_at.desc())
+        if status:
+            q = q.where(PhishingCampaign.status == status)
+        rows = (await self.db.execute(q.limit(int(limit)))).scalars().all()
+        return [{
+            "id": c.id, "name": getattr(c, "name", None),
+            "status": getattr(c, "status", None),
+            "created_at": c.created_at.isoformat() if c.created_at else None,
+        } for c in rows]
+
+    # ---- RISK (FAIR) ----
+
+    async def _list_risks(self, status=None, limit=20):
+        from src.risk_quant.models import RiskScenario
+        q = select(RiskScenario).order_by(RiskScenario.created_at.desc())
+        if status:
+            q = q.where(RiskScenario.status == status)
+        rows = (await self.db.execute(q.limit(int(limit)))).scalars().all()
+        return [{
+            "id": r.id, "name": getattr(r, "name", None),
+            "status": getattr(r, "status", None),
+            "annualized_loss_expectancy": getattr(r, "annualized_loss_expectancy", None),
+        } for r in rows]
+
+    # ---- TICKETS ----
+
+    async def _list_tickets(self, source_type=None, status=None, priority=None, limit=25):
+        try:
+            from src.tickethub.engine import TicketAggregator
+        except Exception:
+            return {"error": "Ticket Hub engine not available"}
+        agg = TicketAggregator(self.db)
+        result = await agg.get_unified_tickets(
+            source_types=[source_type] if source_type else None,
+            priority=priority,
+            size=int(limit),
+        )
+        items = result.get("tickets") or result.get("items") or []
+        if status:
+            items = [t for t in items if (t.get("status") or "").lower() == status.lower()]
+        return {"total": len(items), "tickets": items[: int(limit)]}
