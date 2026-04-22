@@ -630,7 +630,7 @@ function ControlsTab({
                   ) : (
                     <ChevronRight className="w-4 h-4 inline mr-2" />
                   )}
-                  {control.id}
+                  {control.control_id || control.id}
                 </td>
                 <td className="px-6 py-4 text-sm text-gray-900 dark:text-white">
                   {control.title}
@@ -1075,12 +1075,17 @@ function CUITab({
     );
   }
 
+  // Filter out fully-empty CUI markings — test-seeded records with no
+  // asset_id/category/designation would render as a row of dashes and
+  // inflate the stat counts.
+  const validAssets = assets.filter((a) => a.asset_id || a.cui_category || a.cui_designation);
+
   return (
     <div className="space-y-6">
       <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-        <StatCard label="CUI Assets" value={assets.length} icon={FileText} color="blue" />
-        <StatCard label="Active Markings" value={assets.filter((a) => a.cui_designation).length} icon={CheckCircle} color="green" />
-        <StatCard label="Categories Tracked" value={new Set(assets.map((a) => a.cui_category)).size} icon={AlertTriangle} color="orange" />
+        <StatCard label="CUI Assets" value={validAssets.length} icon={FileText} color="blue" />
+        <StatCard label="Active Markings" value={validAssets.filter((a) => a.cui_designation).length} icon={CheckCircle} color="green" />
+        <StatCard label="Categories Tracked" value={new Set(validAssets.map((a) => a.cui_category).filter(Boolean)).size} icon={AlertTriangle} color="orange" />
       </div>
 
       <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 overflow-hidden">
@@ -1096,9 +1101,9 @@ function CUITab({
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-200 dark:divide-gray-700">
-            {assets.length === 0 ? (
+            {validAssets.length === 0 ? (
               <tr><td colSpan={6} className="px-6 py-8 text-center text-gray-500">No CUI markings yet. Click "Mark as CUI" to add one.</td></tr>
-            ) : assets.map((asset) => (
+            ) : validAssets.map((asset) => (
               <tr key={asset.id} className="hover:bg-gray-50 dark:hover:bg-gray-700/50">
                 <td className="px-6 py-4 text-sm font-medium text-gray-900 dark:text-white">{asset.asset_id || '-'}</td>
                 <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">{asset.asset_type || '-'}</td>
@@ -1217,6 +1222,21 @@ function CISATab({
 
   return (
     <div className="space-y-6">
+      <div>
+        <h2 className="text-lg font-semibold text-gray-900 dark:text-white mb-1">
+          Active CISA Binding Operational Directives
+        </h2>
+        <p className="text-sm text-gray-600 dark:text-gray-400">
+          Directives the org is tracking. Click “Check Compliance” to run the
+          automated check against platform state.
+        </p>
+      </div>
+      {directives.length === 0 ? (
+        <div className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-8 text-center text-sm text-gray-500 dark:text-gray-400">
+          No CISA directives are being tracked yet. Directives are seeded per
+          framework activation or can be added through the API.
+        </div>
+      ) : null}
       {/* Active Directives Cards */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
         {directives.map((directive) => (
