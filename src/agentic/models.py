@@ -475,3 +475,42 @@ class AgentMemory(BaseModel):
 
     def __repr__(self) -> str:
         return f"<AgentMemory {self.id}: {self.memory_type}/{self.key}>"
+
+
+class AgentChatSession(BaseModel):
+    """A SOC analyst chat session with the agent.
+
+    Sessions group related turns together so the analyst can return
+    to a prior conversation, share it with a teammate, or audit what
+    the agent was asked to do. Every turn writes two rows into
+    agent_chat_messages (user + assistant).
+    """
+
+    __tablename__ = "agent_chat_sessions"
+
+    user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id"), nullable=False, index=True
+    )
+    organization_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("organizations.id"), nullable=False, index=True
+    )
+    title: Mapped[str] = mapped_column(String(255), nullable=False, default="New chat")
+    is_archived: Mapped[bool] = mapped_column(default=False, nullable=False)
+
+
+class AgentChatMessage(BaseModel):
+    """One turn (user question OR assistant reply) in a chat session."""
+
+    __tablename__ = "agent_chat_messages"
+
+    session_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("agent_chat_sessions.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    role: Mapped[str] = mapped_column(String(20), nullable=False)  # user | assistant | system
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    # Tool invocations recorded on assistant turns; list of
+    # {step, tool, args, result, blocked?} dicts.
+    tool_calls: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
