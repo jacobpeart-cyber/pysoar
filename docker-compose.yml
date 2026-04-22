@@ -51,6 +51,10 @@ services:
       - ./alembic:/app/alembic:ro
       - pysoar-uploads:/app/uploads
       - pysoar-logs:/app/logs
+      # Persistent content directory for STIG XCCDF uploads, ARF reports,
+      # and other compliance artifacts. Must survive container rebuilds
+      # so re-scan hash-verification works.
+      - pysoar-data:/app/data
     depends_on:
       postgres:
         condition: service_healthy
@@ -261,4 +265,6 @@ volumes:
   pysoar-prometheus:
     driver: local
   pysoar-grafana:
+    driver: local
+  pysoar-data:
     driver: local

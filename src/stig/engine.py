@@ -29,9 +29,129 @@ class STIGScanner:
     automated (SCAP), or hybrid approaches. Generates detailed finding reports.
     """
 
+    # Map oscap TestResult/<result> codes to STIGScanResult finding statuses.
+    # Reference: NIST SP 800-126 Rev 3, §5.5 (XCCDF rule-result values) and
+    # DISA STIG Viewer conventions.
+    _ARF_RESULT_MAP = {
+        "pass": "not_a_finding",
+        "fail": "open",
+        "notapplicable": "not_applicable",
+        "notchecked": "not_reviewed",
+        "notselected": "not_reviewed",
+        "informational": "not_reviewed",
+        "error": "not_reviewed",
+        "unknown": "not_reviewed",
+        "fixed": "not_a_finding",
+    }
+
     def __init__(self, session: AsyncSession):
         """Initialize scanner with database session"""
         self.session = session
+
+    async def ingest_arf_result(
+        self,
+        scan_id: str,
+        arf_xml: bytes,
+    ) -> dict[str, Any]:
+        """
+        Parse an oscap-generated ARF (Asset Reporting Format) XML document
+        and update the matching STIGScanResult row with real findings.
+
+        ARF contains one <rule-result> element per evaluated rule, with
+        idref matching an XCCDF Rule id (e.g. SV-230221r627750_rule) and
+        a <result> child holding pass / fail / notapplicable / etc. We
+        translate those into finding statuses and recompute compliance.
+        """
+        from src.stig.models import STIGRule, STIGScanResult
+        scan = await self.session.get(STIGScanResult, scan_id)
+        if scan is None:
+            return {"status": "error", "error": f"Scan {scan_id} not found"}
+
+        try:
+            root = ET.fromstring(arf_xml)
+        except ET.ParseError as e:
+            return {"status": "error", "error": f"ARF parse error: {e}"}
+
+        def _local(tag: str) -> str:
+            return tag.split("}", 1)[1] if "}" in tag else tag
+
+        # Index rules for this benchmark by stig_id and rule_id so we can
+        # resolve idrefs whether ARF uses the SV- or V- number.
+        rules = list(await self.session.scalars(
+            select(STIGRule).where(STIGRule.benchmark_id_ref == scan.benchmark_id_ref)
+        ))
+        by_stig_id = {r.stig_id: r for r in rules if r.stig_id}
+        by_rule_id = {r.rule_id: r for r in rules if r.rule_id}
+
+        findings: dict[str, dict[str, Any]] = {}
+        cat_counts = {"cat_1": 0, "cat_2": 0, "cat_3": 0}
+        status_counts = {"open": 0, "not_a_finding": 0, "not_applicable": 0, "not_reviewed": 0}
+
+        for elem in root.iter():
+            if _local(elem.tag) != "rule-result":
+                continue
+            idref = elem.attrib.get("idref", "")
+            severity = (elem.attrib.get("severity") or "medium").lower()
+            result_val = "unknown"
+            for child in elem:
+                if _local(child.tag) == "result":
+                    result_val = (child.text or "").strip().lower()
+                    break
+            status = self._ARF_RESULT_MAP.get(result_val, "not_reviewed")
+
+            # Resolve rule — try exact id first, then strip common xccdf_
+            # prefixes that oscap sometimes emits.
+            rule = by_stig_id.get(idref) or by_rule_id.get(idref)
+            if rule is None and "_rule_" in idref:
+                suffix = idref.split("_rule_", 1)[1]
+                rule = by_stig_id.get(f"SV-{suffix}") or by_rule_id.get(f"V-{suffix}")
+            if rule is None:
+                # Unknown rule — still record the raw idref so an auditor
+                # can reconcile against the ARF manifest.
+                findings[idref] = {"status": status, "severity": severity, "source": "arf"}
+            else:
+                findings[rule.rule_id] = {
+                    "status": status,
+                    "severity": rule.severity,
+                    "title": rule.title,
+                    "stig_id": rule.stig_id,
+                    "source": "arf",
+                }
+                if status == "open":
+                    if rule.severity == "high":
+                        cat_counts["cat_1"] += 1
+                    elif rule.severity == "low":
+                        cat_counts["cat_3"] += 1
+                    else:
+                        cat_counts["cat_2"] += 1
+            status_counts[status] = status_counts.get(status, 0) + 1
+
+        total_evaluated = sum(status_counts.values())
+        pass_or_na = status_counts["not_a_finding"] + status_counts["not_applicable"]
+        compliance_percentage = (pass_or_na / total_evaluated * 100.0) if total_evaluated else 0.0
+
+        scan.findings = findings
+        scan.status = "completed"
+        scan.total_checks = total_evaluated
+        scan.open_findings = status_counts["open"]
+        scan.not_a_finding = status_counts["not_a_finding"]
+        scan.not_applicable = status_counts["not_applicable"]
+        scan.not_reviewed = status_counts["not_reviewed"]
+        scan.cat1_open = cat_counts["cat_1"]
+        scan.cat2_open = cat_counts["cat_2"]
+        scan.cat3_open = cat_counts["cat_3"]
+        scan.compliance_percentage = compliance_percentage
+        scan.completed_at = datetime.now(timezone.utc)
+        await self.session.commit()
+
+        return {
+            "scan_id": scan_id,
+            "status": "ingested",
+            "checks_evaluated": total_evaluated,
+            "open_findings": status_counts["open"],
+            "compliance_percentage": round(compliance_percentage, 2),
+            "cat_counts": cat_counts,
+        }
 
     async def scan_host(
         self,
@@ -80,7 +200,7 @@ class STIGScanner:
             stmt = select(STIGRule).where(
                 STIGRule.benchmark_id_ref == benchmark.id
             )
-            rules = await self.session.scalars(stmt)
+            rules = list(await self.session.scalars(stmt))
 
             # Execute checks
             findings = {}
@@ -198,74 +318,34 @@ class STIGScanner:
         self, rule: STIGRule, host: str, scan_type: str
     ) -> dict[str, Any]:
         """
-        Execute single STIG rule check
+        Execute a single STIG rule check.
 
-        Args:
-            rule: STIGRule to check
-            host: Target host
-            scan_type: Type of scan
+        Federal-honesty policy: this in-process scanner does NOT touch
+        remote hosts. Real scans are dispatched through
+        src.stig.tasks.run_stig_scan → endpoint agent → oscap, and the
+        results are ingested via POST /stig/scans/{id}/arf.
 
-        Returns:
-            Check result with status and evidence
+        The synchronous path returns status="not_reviewed" for every
+        rule, so an auditor reading a scan result can tell the check
+        was not executed. Previously this code copied the last scan's
+        status and labelled it a fresh result — that was a lie; we've
+        removed it.
         """
-        try:
-            status = "not_reviewed"
-            evidence = f"Check executed on {host}"
+        if scan_type in ("scap", "automated"):
+            evidence = (
+                f"Rule {rule.rule_id} requires live scanner execution. "
+                "Dispatch via Celery run_stig_scan with an enrolled endpoint "
+                "agent, then POST the ARF result to /stig/scans/{scan_id}/arf."
+            )
+        else:
+            evidence = f"Manual review required for rule {rule.rule_id} on {host}"
 
-            if rule.is_automatable and scan_type in ["scap", "automated"]:
-                # Query previous scan results for this rule and host
-                prev_stmt = (
-                    select(STIGScanResult)
-                    .where(
-                        STIGScanResult.target_host == host,
-                    )
-                    .order_by(STIGScanResult.started_at.desc())
-                    .limit(5)
-                )
-                prev_results = await self.session.scalars(prev_stmt)
-                prev_scans = list(prev_results)
-
-                if prev_scans:
-                    # Check findings from the most recent completed scan
-                    latest = prev_scans[0]
-                    if latest.findings and isinstance(latest.findings, dict):
-                        prev_finding = latest.findings.get(rule.rule_id, {})
-                        prev_status = prev_finding.get("status")
-                        if prev_status in ("open", "not_a_finding", "not_applicable"):
-                            status = prev_status
-                            evidence = (
-                                f"Based on previous scan {latest.id}: "
-                                f"{prev_finding.get('evidence', 'No details')}"
-                            )
-                        else:
-                            status = "not_reviewed"
-                            evidence = "No prior automated finding; manual review needed"
-                    else:
-                        status = "not_reviewed"
-                        evidence = "Previous scan has no parsed findings for this rule"
-                else:
-                    # No previous scans - first time check
-                    status = "not_reviewed"
-                    evidence = "No prior scan data available; initial assessment needed"
-            elif scan_type in ["manual", "hybrid"]:
-                status = "not_reviewed"
-                evidence = f"Manual review required for rule {rule.rule_id} on {host}"
-
-            return {
-                "rule_id": rule.rule_id,
-                "status": status,
-                "evidence": evidence,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
-
-        except Exception as e:
-            logger.error(f"Check failed for rule {rule.rule_id}: {str(e)}")
-            return {
-                "rule_id": rule.rule_id,
-                "status": "error",
-                "error": str(e),
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
+        return {
+            "rule_id": rule.rule_id,
+            "status": "not_reviewed",
+            "evidence": evidence,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
 
     async def get_scan_comparison(
         self, scan_id_1: str, scan_id_2: str
@@ -961,90 +1041,242 @@ class SCAPEngine:
         self, xccdf_path: str, org_id: str
     ) -> dict[str, Any]:
         """
-        Import SCAP content (XCCDF file)
+        Import SCAP content (XCCDF file).
 
-        Args:
-            xccdf_path: Path to XCCDF file
-            org_id: Organization ID
+        Parses a DISA-style XCCDF document and persists:
+          - one STIGBenchmark (metadata + severity counts)
+          - one STIGRule per <Rule> element (severity, title, description,
+            check_text, fix_text, CCI and NIST-800-53 mappings, OVAL ref)
+          - one SCAPProfile pointing at the source file + hash
 
-        Returns:
-            Imported profile metadata
+        Honest failure modes: if the file can't be read, can't be parsed, or
+        contains no rules, we record that and return is_enabled=False so the
+        scan pipeline refuses to scan against vacuous benchmarks.
         """
+        from src.stig.models import STIGBenchmark, STIGRule
         logger.info(f"Importing SCAP content from {xccdf_path}")
-
-        # Read the actual file contents so we can hash and parse them. If the
-        # file is missing or unreadable, record that honestly.
-        content_hash: Optional[str] = None
-        check_count = 0
-        parse_error: Optional[str] = None
 
         try:
             with open(xccdf_path, "rb") as fh:
                 raw = fh.read()
-            content_hash = hashlib.sha256(raw).hexdigest()
         except OSError as io_err:
-            parse_error = f"unable to read file: {io_err}"
-            logger.warning(
-                "SCAP content file could not be read",
-                path=xccdf_path,
-                error=str(io_err),
-            )
+            logger.warning("SCAP content file could not be read", path=xccdf_path, error=str(io_err))
+            return {"status": "error", "parse_error": f"unable to read file: {io_err}"}
 
-        # Attempt to parse XCCDF and count <Rule> elements regardless of XML
-        # namespace.
-        if content_hash is not None and parse_error is None:
-            try:
-                root = ET.fromstring(raw)
-                rule_count = 0
-                for elem in root.iter():
-                    tag = elem.tag
-                    if "}" in tag:
-                        tag = tag.split("}", 1)[1]
-                    if tag == "Rule":
-                        rule_count += 1
-                check_count = rule_count
-            except ET.ParseError as parse_err:
-                parse_error = f"xml parse error: {parse_err}"
-                logger.warning(
-                    "SCAP content could not be parsed as XCCDF",
-                    path=xccdf_path,
-                    error=str(parse_err),
-                )
+        content_hash = hashlib.sha256(raw).hexdigest()
 
         try:
-            profile = SCAPProfile(
-                name=f"Imported_{uuid4().hex[:8]}",
-                profile_type="xccdf",
-                content_path=xccdf_path,
-                content_hash=content_hash,
-                check_count=check_count,
-                is_enabled=parse_error is None and check_count > 0,
+            root = ET.fromstring(raw)
+        except ET.ParseError as parse_err:
+            logger.warning("SCAP content is not valid XML", path=xccdf_path, error=str(parse_err))
+            return {"status": "error", "parse_error": f"xml parse error: {parse_err}"}
+
+        def _local(tag: str) -> str:
+            return tag.split("}", 1)[1] if "}" in tag else tag
+
+        def _text(elem) -> str:
+            """Return concatenated text of an element stripped of XHTML tags
+            that DISA uses inside <description>/<fixtext> bodies."""
+            if elem is None:
+                return ""
+            return "".join(elem.itertext()).strip()
+
+        # ---- Benchmark metadata ----
+        if _local(root.tag) != "Benchmark":
+            # Some SCAP data-streams wrap XCCDF; find the first Benchmark element.
+            bench_elem = next((e for e in root.iter() if _local(e.tag) == "Benchmark"), None)
+        else:
+            bench_elem = root
+        if bench_elem is None:
+            return {"status": "error", "parse_error": "no <Benchmark> element found"}
+
+        benchmark_id = bench_elem.attrib.get("id") or f"benchmark_{content_hash[:12]}"
+        title = ""
+        version = ""
+        description = ""
+        platform = ""
+        for child in bench_elem:
+            t = _local(child.tag)
+            if t == "title" and not title:
+                title = _text(child)
+            elif t == "version" and not version:
+                version = _text(child)
+            elif t == "description" and not description:
+                description = _text(child)[:5000]
+            elif t == "platform" and not platform:
+                platform = child.attrib.get("idref", "") or _text(child)
+
+        # ---- Walk every Rule, including Rules nested under Group ----
+        rule_rows: list[dict[str, Any]] = []
+        cat1 = cat2 = cat3 = 0
+
+        # XCCDF Groups wrap Rules. The Group.id is typically V-xxxxx (the
+        # vulnerability / rule_id), the Rule.id is SV-xxxxxrxxx_rule
+        # (the STIG rule identifier). We capture both.
+        group_stack: list[dict] = []
+        for elem in bench_elem.iter():
+            t = _local(elem.tag)
+            if t == "Rule":
+                rule_attrib = elem.attrib
+                stig_id = rule_attrib.get("id", "")
+                severity_attr = (rule_attrib.get("severity") or "medium").lower()
+                if severity_attr == "high":
+                    cat1 += 1
+                elif severity_attr == "low":
+                    cat3 += 1
+                else:
+                    cat2 += 1
+
+                rule_title = ""
+                rule_desc = ""
+                check_text = ""
+                fix_text = ""
+                ccis: list[str] = []
+                oval_ref: Optional[dict[str, str]] = None
+                group_id = ""
+
+                # Find ancestor Group id by iterating up — etree doesn't
+                # expose parent pointers, so walk the group_stack that
+                # tracks depth encountered during iter().
+                if group_stack:
+                    group_id = group_stack[-1].get("id", "")
+
+                for child in elem:
+                    ct = _local(child.tag)
+                    if ct == "title":
+                        rule_title = _text(child)[:500]
+                    elif ct == "description":
+                        rule_desc = _text(child)[:8000]
+                    elif ct == "ident":
+                        system = child.attrib.get("system", "") or ""
+                        val = (child.text or "").strip()
+                        if val and ("cci" in system.lower() or val.startswith("CCI-")):
+                            ccis.append(val)
+                    elif ct == "fixtext":
+                        fix_text = _text(child)[:8000]
+                    elif ct == "check":
+                        for cref in child:
+                            if _local(cref.tag) == "check-content-ref":
+                                oval_ref = {
+                                    "href": cref.attrib.get("href", ""),
+                                    "name": cref.attrib.get("name", ""),
+                                }
+                                break
+                        if not check_text:
+                            check_text = _text(child)[:8000]
+
+                # rule_id: prefer Group V-number; fall back to Rule id.
+                rule_id = group_id or stig_id
+                rule_rows.append({
+                    "rule_id": rule_id,
+                    "stig_id": stig_id,
+                    "group_id": group_id or None,
+                    "severity": severity_attr,
+                    "title": rule_title or stig_id or rule_id,
+                    "description": rule_desc,
+                    "check_text": check_text,
+                    "fix_text": fix_text,
+                    "cci": {"ids": ccis} if ccis else {},
+                    "automated_check": oval_ref,
+                    "is_automatable": oval_ref is not None,
+                })
+            elif t == "Group":
+                # Shallow group tracking: we iterate DFS, so replace the top
+                # of the stack when we enter a new Group. This is a best
+                # effort — real XCCDF groups aren't typically nested, so
+                # this captures the common case reliably.
+                group_stack.append({"id": elem.attrib.get("id", "")})
+                # Clean up groups that have been fully walked by trimming
+                # on each new Group encounter: keep the stack to the most
+                # recent 1 to avoid stale group_ids bleeding across siblings.
+                group_stack = group_stack[-1:]
+
+        if not rule_rows:
+            logger.warning("XCCDF file contained no <Rule> elements", path=xccdf_path)
+
+        # ---- Persist benchmark + rules in one transaction ----
+        # Upsert by (benchmark_id, organization_id). STIGBenchmark.benchmark_id
+        # has a unique index globally, so multiple orgs importing the same
+        # DISA content share the row — scope rules per-org via organization_id.
+        from sqlalchemy import select as sa_select
+        existing = (await self.session.execute(
+            sa_select(STIGBenchmark).where(STIGBenchmark.benchmark_id == benchmark_id)
+        )).scalar_one_or_none()
+
+        if existing is not None:
+            benchmark = existing
+            benchmark.title = title or benchmark.title
+            benchmark.version = version or benchmark.version
+            benchmark.description = description or benchmark.description
+            benchmark.platform = platform or benchmark.platform
+            benchmark.total_rules = len(rule_rows)
+            benchmark.category_1_count = cat1
+            benchmark.category_2_count = cat2
+            benchmark.category_3_count = cat3
+            # Replace this org's rules for this benchmark.
+            await self.session.execute(
+                STIGRule.__table__.delete().where(
+                    (STIGRule.benchmark_id_ref == benchmark.id)
+                    & (STIGRule.organization_id == org_id)
+                )
+            )
+        else:
+            benchmark = STIGBenchmark(
+                benchmark_id=benchmark_id,
+                title=title or benchmark_id,
+                version=version,
+                description=description,
+                platform=platform,
+                total_rules=len(rule_rows),
+                category_1_count=cat1,
+                category_2_count=cat2,
+                category_3_count=cat3,
+                status="available" if rule_rows else "empty",
                 organization_id=org_id,
             )
+            self.session.add(benchmark)
+            await self.session.flush()
 
-            self.session.add(profile)
-            await self.session.commit()
+        for rr in rule_rows:
+            self.session.add(STIGRule(
+                benchmark_id_ref=benchmark.id,
+                organization_id=org_id,
+                **rr,
+            ))
 
-            logger.info(
-                "SCAP content imported",
-                profile_id=profile.id,
-                check_count=check_count,
-                parse_error=parse_error,
-            )
+        profile = SCAPProfile(
+            name=(title[:120] if title else f"Imported_{uuid4().hex[:8]}"),
+            profile_type="xccdf",
+            content_path=xccdf_path,
+            content_hash=content_hash,
+            check_count=len(rule_rows),
+            is_enabled=bool(rule_rows),
+            organization_id=org_id,
+        )
+        self.session.add(profile)
+        await self.session.commit()
 
-            return {
-                "profile_id": profile.id,
-                "name": profile.name,
-                "content_path": xccdf_path,
-                "content_hash": content_hash,
-                "check_count": check_count,
-                "status": "imported" if parse_error is None else "imported_with_errors",
-                "parse_error": parse_error,
-            }
+        logger.info(
+            "SCAP content imported",
+            benchmark_id=benchmark.id,
+            profile_id=profile.id,
+            check_count=len(rule_rows),
+            cat1=cat1, cat2=cat2, cat3=cat3,
+        )
 
-        except Exception as e:
-            logger.error(f"SCAP import failed: {str(e)}")
-            raise
+        return {
+            "profile_id": profile.id,
+            "benchmark_id": benchmark.id,
+            "name": profile.name,
+            "benchmark_title": benchmark.title,
+            "benchmark_version": benchmark.version,
+            "platform": benchmark.platform,
+            "content_path": xccdf_path,
+            "content_hash": content_hash,
+            "check_count": len(rule_rows),
+            "cat_1": cat1, "cat_2": cat2, "cat_3": cat3,
+            "status": "imported" if rule_rows else "imported_empty",
+        }
 
     async def validate_oval_definitions(self, content: str) -> dict[str, Any]:
         """

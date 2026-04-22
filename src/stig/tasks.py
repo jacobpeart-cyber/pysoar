@@ -362,6 +362,46 @@ def auto_remediate_findings(self, scan_result_id: str, org_id: str):
         raise self.retry(exc=exc, countdown=60)
 
 
+@shared_task(bind=True)
+def scheduled_fleet_stig_sweep(self):
+    """Weekly STIG sweep across every enrolled endpoint agent and every
+    imported benchmark. Dispatches ``run_stig_scan`` tasks per
+    (host, benchmark) pair and returns the work list for observability.
+
+    Federal-compliance ask: FedRAMP Moderate + DoD STIG baselines
+    require continuous monitoring (NIST SP 800-137 CAESARS) with
+    periodic scans. A weekly cadence is the industry norm for STIG;
+    IAVM findings trigger ad-hoc scans separately.
+    """
+    from src.core.database import async_session_factory
+    from src.stig.models import STIGBenchmark
+    from src.agents.models import EndpointAgent
+    from sqlalchemy import select as sa_select
+
+    async def _sweep():
+        dispatched = []
+        async with async_session_factory() as session:
+            agents = list(await session.scalars(
+                sa_select(EndpointAgent).where(EndpointAgent.status == "active")
+            ))
+            benchmarks = list(await session.scalars(
+                sa_select(STIGBenchmark).where(STIGBenchmark.status == "available")
+            ))
+            for agent in agents:
+                for bench in benchmarks:
+                    if agent.organization_id != bench.organization_id:
+                        continue
+                    run_stig_scan.delay(
+                        host=agent.hostname,
+                        benchmark_id=bench.id,
+                        org_id=agent.organization_id,
+                    )
+                    dispatched.append({"host": agent.hostname, "benchmark_id": bench.id})
+        return {"status": "dispatched", "count": len(dispatched), "items": dispatched}
+
+    return _run_async(_sweep())
+
+
 @shared_task(bind=True, max_retries=2)
 def update_stig_benchmarks(self, org_id: str):
     """Load built-in STIG benchmarks into the database for the given org."""

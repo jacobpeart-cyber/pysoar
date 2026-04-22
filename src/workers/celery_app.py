@@ -89,4 +89,12 @@ celery_app.conf.beat_schedule = {
         "task": "siem.poll_cloud_integrations",
         "schedule": 300.0,  # Every 5 minutes
     },
+    # --- Weekly STIG fleet sweep (src.stig.tasks.scheduled_fleet_stig_sweep) ---
+    # FedRAMP/NIST SP 800-137 continuous monitoring: every active endpoint
+    # agent is scanned against every loaded STIG benchmark once per week.
+    # Findings populate STIGScanResult via the ARF ingest path.
+    "stig-fleet-sweep": {
+        "task": "src.stig.tasks.scheduled_fleet_stig_sweep",
+        "schedule": crontab(day_of_week=0, hour=6, minute=0),  # Sundays 06:00 UTC
+    },
 }
