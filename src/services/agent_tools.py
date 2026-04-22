@@ -491,17 +491,31 @@ class AgentToolRegistry:
         # ===== COMPLIANCE =====
         self._register(Tool(
             name="list_compliance_frameworks",
-            description="List compliance frameworks enabled for the org (NIST, FedRAMP, PCI, HIPAA, etc.)",
+            description="List enabled compliance frameworks with scores. Returns name, short_name, version, compliance_score, total/implemented controls. Use this for ANY question about NIST, FedRAMP, PCI, HIPAA, SOC2, CMMC, ISO-27001 posture.",
             parameters={"limit": "optional int, default 20"},
             category="query",
             handler=self._list_compliance_frameworks,
         ))
         self._register(Tool(
             name="list_compliance_controls",
-            description="List compliance controls, optionally filtered by framework or status",
-            parameters={"framework_id": "optional string", "status": "optional string", "limit": "optional int, default 25"},
+            description="List compliance controls. `framework` matches framework by short_name (NIST-800-53, FedRAMP, PCI-DSS, HIPAA), full name, or UUID. Returns control_id, title, family, priority, status, implementation %.",
+            parameters={"framework": "optional string - framework short_name, full name, or UUID", "status": "optional string (implemented/not_implemented/partial)", "limit": "optional int, default 25"},
             category="query",
             handler=self._list_compliance_controls,
+        ))
+        self._register(Tool(
+            name="list_poams",
+            description="List Plan-of-Action-&-Milestones items (compliance deficiencies being remediated). Required for FedRAMP/NIST SP 800-37 posture questions.",
+            parameters={"status": "optional string (open/in_progress/completed/closed)", "priority": "optional string", "limit": "optional int, default 25"},
+            category="query",
+            handler=self._list_poams,
+        ))
+        self._register(Tool(
+            name="list_compliance_evidence",
+            description="List evidence artifacts collected to support compliance control attestations (screenshots, configs, reports, logs).",
+            parameters={"control_id": "optional string", "limit": "optional int, default 25"},
+            category="query",
+            handler=self._list_compliance_evidence,
         ))
 
         # ===== ENDPOINT AGENTS / LIVE RESPONSE =====
@@ -1216,11 +1230,35 @@ class AgentToolRegistry:
             "status": f.status,
         } for f in rows]
 
-    async def _list_compliance_controls(self, framework_id=None, status=None, limit=25):
-        from src.compliance.models import ComplianceControl
+    async def _list_compliance_controls(self, framework=None, status=None, limit=25, framework_id=None):
+        from src.compliance.models import ComplianceControl, ComplianceFramework
+        from sqlalchemy import or_, func as sqlfunc
+        # Accept `framework` (flexible) OR legacy `framework_id`.
+        framework_ref = framework or framework_id
         q = select(ComplianceControl)
-        if framework_id:
-            q = q.where(ComplianceControl.framework_id == framework_id)
+        if framework_ref:
+            # Resolve friendly name/short_name to framework UUID (case-insensitive
+            # and space/dash tolerant — Gemini often sends "NIST 800-53" while
+            # the DB has short_name "NIST-800-53" or name "NIST SP 800-53").
+            norm = framework_ref.lower().replace(" ", "").replace("-", "").replace("_", "")
+            fw_rows = (await self.db.execute(
+                select(ComplianceFramework.id, ComplianceFramework.name, ComplianceFramework.short_name)
+            )).all()
+            match_id = None
+            for fid, fname, fshort in fw_rows:
+                if fid == framework_ref:
+                    match_id = fid
+                    break
+                for candidate in (fname or "", fshort or ""):
+                    if candidate.lower().replace(" ", "").replace("-", "").replace("_", "") == norm:
+                        match_id = fid
+                        break
+                if match_id:
+                    break
+            if match_id:
+                q = q.where(ComplianceControl.framework_id == match_id)
+            else:
+                return {"warning": f"No framework matched '{framework_ref}'. Try one of the enabled short_names (call list_compliance_frameworks first).", "controls": []}
         if status:
             q = q.where(ComplianceControl.status == status)
         q = q.order_by(ComplianceControl.priority.asc()).limit(int(limit))
@@ -1231,6 +1269,42 @@ class AgentToolRegistry:
             "status": c.status,
             "implementation_status": float(c.implementation_status) if c.implementation_status is not None else 0.0,
         } for c in rows]
+
+    async def _list_poams(self, status=None, priority=None, limit=25):
+        from src.compliance.models import POAM
+        q = select(POAM).order_by(POAM.created_at.desc())
+        if status:
+            q = q.where(POAM.status == status)
+        if priority:
+            # POAMs use risk_level (critical/high/moderate/low), not priority.
+            q = q.where(POAM.risk_level == priority)
+        rows = (await self.db.execute(q.limit(int(limit)))).scalars().all()
+        return [{
+            "id": p.id,
+            "weakness_name": p.weakness_name,
+            "control_id_ref": p.control_id_ref,
+            "status": p.status,
+            "risk_level": p.risk_level,
+            "residual_risk_rating": float(p.residual_risk_rating) if p.residual_risk_rating is not None else None,
+            "scheduled_completion_date": p.scheduled_completion_date.isoformat() if p.scheduled_completion_date else None,
+        } for p in rows]
+
+    async def _list_compliance_evidence(self, control_id=None, limit=25):
+        from src.compliance.models import ComplianceEvidence
+        q = select(ComplianceEvidence).order_by(ComplianceEvidence.collected_at.desc())
+        if control_id:
+            q = q.where(ComplianceEvidence.control_id_ref == control_id)
+        rows = (await self.db.execute(q.limit(int(limit)))).scalars().all()
+        return [{
+            "id": e.id,
+            "control_id_ref": e.control_id_ref,
+            "evidence_type": e.evidence_type,
+            "title": e.title,
+            "source_system": e.source_system,
+            "is_automated": e.is_automated,
+            "is_valid": e.is_valid,
+            "collected_at": e.collected_at.isoformat() if e.collected_at else None,
+        } for e in rows]
 
     # ---- LIVE RESPONSE ----
 

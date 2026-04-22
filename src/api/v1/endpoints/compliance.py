@@ -927,7 +927,19 @@ async def mark_cui(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
 ):
-    """Mark asset as CUI."""
+    """Mark asset as CUI.
+
+    NARA CUI Notice 2022-02: every marking must identify the asset, the
+    category, and the CUI designation. Reject empty markings that would
+    render as a blank row in the registry and mislead stat counts.
+    """
+    if not (req.asset_id and (req.asset_id or "").strip()):
+        raise HTTPException(status_code=400, detail="asset_id is required")
+    if not (req.cui_category and (req.cui_category or "").strip()):
+        raise HTTPException(status_code=400, detail="cui_category is required")
+    if not (req.cui_designation and (req.cui_designation or "").strip()):
+        raise HTTPException(status_code=400, detail="cui_designation is required")
+
     marking = CUIMarking(
         asset_id=req.asset_id,
         asset_type=req.asset_type,
