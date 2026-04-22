@@ -442,6 +442,12 @@ const AgenticSOC: React.FC = () => {
           {activeTab === 'agents' && (
             <div>
               <h2 className="text-xl font-bold text-gray-900 dark:text-white mb-6">Active Agents</h2>
+              {agents.length === 0 ? (
+                <div className="text-center py-8 text-gray-500 dark:text-gray-400 text-sm">
+                  No agents registered. Agents come online when the backend
+                  workers boot.
+                </div>
+              ) : null}
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
                 {agents.map((agent) => (
                   <div
@@ -506,7 +512,7 @@ const AgenticSOC: React.FC = () => {
                 <ResponsiveContainer width="100%" height={300}>
                   <LineChart data={timelineData}>
                     <CartesianGrid stroke="#e5e7eb" strokeDasharray="5 5" />
-                    <XAxis stroke="#9ca3af" />
+                    <XAxis dataKey="time" stroke="#9ca3af" />
                     <YAxis stroke="#9ca3af" />
                     <Tooltip
                       contentStyle={{
@@ -528,6 +534,12 @@ const AgenticSOC: React.FC = () => {
               </div>
 
               <div className="space-y-4">
+                {investigations.length === 0 ? (
+                  <div className="text-center py-8 text-gray-500 dark:text-gray-400 text-sm">
+                    No investigations yet. Kick one off from an alert or run
+                    an agent against an incident to see it here.
+                  </div>
+                ) : null}
                 {investigations.map((inv) => (
                   <div
                     key={inv.id}
@@ -573,6 +585,12 @@ const AgenticSOC: React.FC = () => {
               <h2 className="text-xl font-bold text-gray-900 dark:text-white mb-6">
                 OODA Loop - Reasoning Chain
               </h2>
+              {reasoningChain.length === 0 ? (
+                <div className="text-center py-8 text-gray-500 dark:text-gray-400 text-sm">
+                  No reasoning steps recorded yet. An investigation logs steps
+                  here as its agent observes, orients, decides, and acts.
+                </div>
+              ) : null}
               <div className="space-y-4">
                 {reasoningChain.map((item, idx) => (
                   <div key={idx} className="flex gap-4">
@@ -965,6 +983,13 @@ const AgenticSOC: React.FC = () => {
                     </tr>
                   </thead>
                   <tbody>
+                    {pendingApprovals.length === 0 ? (
+                      <tr>
+                        <td colSpan={5} className="py-8 text-center text-gray-500 dark:text-gray-400 text-sm">
+                          No actions awaiting approval.
+                        </td>
+                      </tr>
+                    ) : null}
                     {pendingApprovals.map((approval) => (
                       <tr
                         key={approval.action_id || approval.id}
