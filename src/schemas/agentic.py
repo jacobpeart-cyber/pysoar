@@ -304,6 +304,9 @@ class NaturalLanguageQuery(BaseModel):
 
     query: str = Field(..., min_length=1)
     agent_id: Optional[str] = None  # Specific agent or auto-select
+    # If provided, the turn is persisted into an existing chat session.
+    # If omitted, the chat remains ephemeral (backwards-compatible).
+    session_id: Optional[str] = None
     # If False, destructive action tools (block_ip, isolate_host, disable_user,
     # execute_playbook, create_incident, etc.) are blocked — the agent can only
     # query and analyze. Caller must explicitly authorize actions.
@@ -317,6 +320,39 @@ class NaturalLanguageResponse(BaseModel):
     agent_id: str = ""
     agent_name: str = ""
     interpretation: dict[str, Any]
+    session_id: Optional[str] = None
+
+
+class ChatSessionResponse(BaseModel):
+    """A persisted chat session."""
+    id: str
+    title: str
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    is_archived: bool = False
+
+
+class ChatSessionListResponse(BaseModel):
+    items: list[ChatSessionResponse]
+    total: int = 0
+
+
+class ChatMessageResponse(BaseModel):
+    """One turn in a chat session."""
+    id: str
+    role: str
+    content: str
+    tool_calls: Optional[list[dict[str, Any]]] = None
+    created_at: Optional[datetime] = None
+
+
+class ChatMessageListResponse(BaseModel):
+    items: list[ChatMessageResponse]
+    total: int = 0
+
+
+class ChatSessionCreate(BaseModel):
+    title: Optional[str] = None
 
 
 class AlertExplanation(BaseModel):

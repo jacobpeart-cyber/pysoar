@@ -28,6 +28,8 @@ from src.agentic.models import (
     Investigation,
     AgentAction,
     AgentMemory,
+    AgentChatSession,
+    AgentChatMessage,
     InvestigationStatus,
     ActionExecutionStatus,
 )
@@ -59,6 +61,11 @@ from src.schemas.agentic import (
     AgentMemoryListResponse,
     AgentMemoryResponse,
     MemoryStats,
+    ChatSessionCreate,
+    ChatSessionResponse,
+    ChatSessionListResponse,
+    ChatMessageResponse,
+    ChatMessageListResponse,
 )
 
 router = APIRouter(prefix="/agentic", tags=["Agentic"])
@@ -717,6 +724,28 @@ async def chat_with_agent(
     from src.services.agent_tools import AgentToolRegistry
 
     org_id = getattr(current_user, "organization_id", None)
+    user_id = getattr(current_user, "id", None)
+
+    # Resolve or create session for persistence
+    session = None
+    if query_data.session_id:
+        session = (await db.execute(
+            select(AgentChatSession).where(AgentChatSession.id == query_data.session_id)
+        )).scalar_one_or_none()
+    if session is None and user_id and org_id:
+        session = AgentChatSession(
+            user_id=user_id,
+            organization_id=org_id,
+            title=(query_data.query[:60] + ("…" if len(query_data.query) > 60 else "")) or "New chat",
+        )
+        db.add(session)
+        await db.flush()
+    if session is not None:
+        db.add(AgentChatMessage(
+            session_id=session.id, role="user", content=query_data.query, tool_calls=None,
+        ))
+        await db.flush()
+
     tool_registry = AgentToolRegistry(db)
     tool_declarations = tool_registry.gemini_function_declarations()
     analyzer = AIAnalyzer()
@@ -871,6 +900,16 @@ async def chat_with_agent(
         else:
             final_text = "I couldn't determine how to answer that. Please rephrase your question."
 
+    # Persist assistant reply before commit so it lands in the same txn as
+    # any state-changing tool calls.
+    if session is not None:
+        db.add(AgentChatMessage(
+            session_id=session.id,
+            role="assistant",
+            content=final_text or "",
+            tool_calls=tool_log or None,
+        ))
+
     # Commit any DB changes made by action tools
     try:
         await db.commit()
@@ -882,7 +921,118 @@ async def chat_with_agent(
         agent_id=query_data.agent_id or "auto",
         agent_name="SOC Agent",
         interpretation={"tools_invoked": tool_log},
+        session_id=session.id if session is not None else None,
     )
+
+
+# ============================================================================
+# Chat Session endpoints (persistence)
+# ============================================================================
+
+
+@router.get("/chat/sessions", response_model=ChatSessionListResponse)
+async def list_chat_sessions(
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+    limit: int = Query(50, ge=1, le=200),
+    include_archived: bool = Query(False),
+):
+    """List the current user's chat sessions, newest first."""
+    user_id = getattr(current_user, "id", None)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    q = select(AgentChatSession).where(AgentChatSession.user_id == user_id)
+    if not include_archived:
+        q = q.where(AgentChatSession.is_archived == False)  # noqa: E712
+    q = q.order_by(AgentChatSession.updated_at.desc()).limit(limit)
+    rows = (await db.execute(q)).scalars().all()
+    return ChatSessionListResponse(
+        items=[
+            ChatSessionResponse(
+                id=s.id, title=s.title, created_at=s.created_at,
+                updated_at=s.updated_at, is_archived=s.is_archived,
+            ) for s in rows
+        ],
+        total=len(rows),
+    )
+
+
+@router.post("/chat/sessions", response_model=ChatSessionResponse)
+async def create_chat_session(
+    body: ChatSessionCreate,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+):
+    """Create a new chat session."""
+    user_id = getattr(current_user, "id", None)
+    org_id = getattr(current_user, "organization_id", None)
+    if not user_id or not org_id:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    s = AgentChatSession(
+        user_id=user_id, organization_id=org_id, title=body.title or "New chat",
+    )
+    db.add(s)
+    await db.commit()
+    await db.refresh(s)
+    return ChatSessionResponse(
+        id=s.id, title=s.title, created_at=s.created_at,
+        updated_at=s.updated_at, is_archived=s.is_archived,
+    )
+
+
+@router.get("/chat/sessions/{session_id}/messages", response_model=ChatMessageListResponse)
+async def list_chat_messages(
+    session_id: str = Path(...),
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+    limit: int = Query(200, ge=1, le=1000),
+):
+    """List messages in a chat session (oldest first so rendering is straight-forward)."""
+    user_id = getattr(current_user, "id", None)
+    session = (await db.execute(
+        select(AgentChatSession).where(AgentChatSession.id == session_id)
+    )).scalar_one_or_none()
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if session.user_id != user_id:
+        raise HTTPException(status_code=403, detail="Not your session")
+    rows = (await db.execute(
+        select(AgentChatMessage)
+        .where(AgentChatMessage.session_id == session_id)
+        .order_by(AgentChatMessage.created_at.asc())
+        .limit(limit)
+    )).scalars().all()
+    items = []
+    for m in rows:
+        tc = m.tool_calls
+        if tc is not None and not isinstance(tc, list):
+            # Stored shape is always a list; defensive unwrap in case legacy rows
+            # wrote a dict {"tools_invoked": [...]}
+            tc = tc.get("tools_invoked") if isinstance(tc, dict) else None
+        items.append(ChatMessageResponse(
+            id=m.id, role=m.role, content=m.content, tool_calls=tc,
+            created_at=m.created_at,
+        ))
+    return ChatMessageListResponse(items=items, total=len(items))
+
+
+@router.delete("/chat/sessions/{session_id}", status_code=204)
+async def delete_chat_session(
+    session_id: str = Path(...),
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+):
+    """Delete a chat session and all its messages."""
+    user_id = getattr(current_user, "id", None)
+    session = (await db.execute(
+        select(AgentChatSession).where(AgentChatSession.id == session_id)
+    )).scalar_one_or_none()
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    if session.user_id != user_id:
+        raise HTTPException(status_code=403, detail="Not your session")
+    await db.delete(session)
+    await db.commit()
 
 
 @router.get("/alerts/{alert_id}/explain", response_model=AlertExplanation)
