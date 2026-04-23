@@ -23,6 +23,48 @@ from src.zerotrust.models import (
 logger = get_logger(__name__)
 
 
+def _compare(op: str, observed: Any, expected: Any) -> bool:
+    """Boolean compare for policy condition attributes.
+
+    Supported operators (case-insensitive): equals/eq/is, not_equals/ne,
+    in, not_in, contains, starts_with, ends_with, greater_than/gt,
+    less_than/lt, gte, lte. Missing observed values never satisfy a
+    positive match — the PDP fails closed.
+    """
+    op = (op or "equals").lower()
+    if observed is None and op not in ("not_equals", "ne", "not_in"):
+        return False
+    try:
+        if op in ("equals", "eq", "is"):
+            return str(observed).lower() == str(expected).lower()
+        if op in ("not_equals", "ne"):
+            return str(observed).lower() != str(expected).lower()
+        if op == "in":
+            seq = expected if isinstance(expected, (list, tuple, set)) else [expected]
+            return str(observed).lower() in {str(v).lower() for v in seq}
+        if op == "not_in":
+            seq = expected if isinstance(expected, (list, tuple, set)) else [expected]
+            return str(observed).lower() not in {str(v).lower() for v in seq}
+        if op == "contains":
+            return str(expected).lower() in str(observed).lower()
+        if op == "starts_with":
+            return str(observed).lower().startswith(str(expected).lower())
+        if op == "ends_with":
+            return str(observed).lower().endswith(str(expected).lower())
+        if op in ("greater_than", "gt"):
+            return float(observed) > float(expected)
+        if op in ("less_than", "lt"):
+            return float(observed) < float(expected)
+        if op == "gte":
+            return float(observed) >= float(expected)
+        if op == "lte":
+            return float(observed) <= float(expected)
+    except (TypeError, ValueError):
+        return False
+    # Unknown operator: fail closed rather than silently allow.
+    return False
+
+
 class PolicyDecisionPoint:
     """Policy Decision Point (PDP) - Core access control engine"""
 
@@ -88,6 +130,30 @@ class PolicyDecisionPoint:
         authentication_method = context.get("authentication_method")
         mfa_completed = context.get("mfa_completed", False)
         risk_factors = []
+
+        if matching_policies:
+            policy = matching_policies[0]
+            policy_id = policy.id
+
+            # Location-based force deny: if the matched policy declares
+            # blocked_locations and the request originates from one, the
+            # configured actions are overridden to deny. This matches the
+            # enforcement convention of Cloudflare Access / Okta / Azure
+            # Conditional Access — an admin writing "block RU" expects
+            # RU requests to be denied, not processed under MFA challenge.
+            if self._location_force_deny(policy, context):
+                decision = "deny"
+                decision_reason = (
+                    f"Policy {policy.name} denies access from blocked location"
+                )
+                risk_factors.append("blocked_location")
+                policy.hit_count += 1
+                policy.last_triggered_at = datetime.now(timezone.utc)
+                self.db.add(policy)
+                # Fall through to decision persistence below without the
+                # risk / MFA / device-trust branches — a blocked-location
+                # deny is absolute.
+                matching_policies = []
 
         if matching_policies:
             policy = matching_policies[0]
@@ -296,13 +362,24 @@ class PolicyDecisionPoint:
         """
         risk_score = 30.0  # Baseline
 
-        # Geographic risk
-        if context.get("location"):
-            location = context["location"]
-            if location.get("is_new_location"):
+        # Geographic risk. `location` may be a plain country/city string
+        # (e.g. "RU") or a structured dict with is_new_location /
+        # is_high_risk_country flags. Support both shapes — callers from
+        # the UI and from SIEM alert escalation hand us different
+        # formats, and a dict/str confusion crashed the evaluator.
+        loc = context.get("location")
+        if isinstance(loc, dict):
+            if loc.get("is_new_location"):
                 risk_score += 15
-            if location.get("is_high_risk_country"):
+            if loc.get("is_high_risk_country"):
                 risk_score += 20
+        elif isinstance(loc, str) and loc:
+            HIGH_RISK_COUNTRIES = {"RU", "CN", "KP", "IR", "SY", "BY", "VE"}
+            code = loc.strip().upper()[:2]
+            if code in HIGH_RISK_COUNTRIES:
+                risk_score += 20
+            if context.get("is_new_location"):
+                risk_score += 15
 
         # Network risk
         if context.get("network_type") == "public":
@@ -350,28 +427,217 @@ class PolicyDecisionPoint:
             .where(
                 and_(
                     ZeroTrustPolicy.organization_id == self.organization_id,
-                    ZeroTrustPolicy.is_enabled == True,
+                    ZeroTrustPolicy.is_enabled == True,  # noqa: E712
                 )
             )
             .order_by(desc(ZeroTrustPolicy.priority))
         )
         all_policies = result.scalars().all()
 
-        # Simple matching logic (can be extended with more sophisticated matching)
-        matching = []
+        matching: list[ZeroTrustPolicy] = []
         for policy in all_policies:
-            # Basic check: policy risk threshold vs actual risk
-            if risk_score <= policy.risk_threshold:
-                matching.append(policy)
+            # A policy applies to a request only if EVERY scope dimension
+            # matches. Previous revision matched on risk_threshold alone,
+            # so every enabled policy applied to every resource, location,
+            # and hour — a critical Zero Trust audit lie. NIST SP 800-207
+            # §3.2.2 requires the PDP to evaluate policy against the full
+            # subject/resource/environment tuple before emitting a decision.
+            if risk_score > policy.risk_threshold:
+                continue
+            if not self._policy_type_matches(policy, resource_type):
+                continue
+            if not self._resource_scope_matches(policy, resource_type, resource_id):
+                continue
+            if not self._location_scope_matches(policy, context):
+                continue
+            if not self._time_scope_matches(policy, context):
+                continue
+            if not self._conditions_match(policy, subject_type, subject_id, resource_type, resource_id, context):
+                continue
+            matching.append(policy)
 
         logger.debug(
             "matched_policies",
             subject=subject_type,
             resource=resource_type,
+            risk=risk_score,
             count=len(matching),
         )
 
         return matching
+
+    # ------------------------------------------------------------------
+    # Scope evaluators — real NIST SP 800-207 PDP attribute matching.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _policy_type_matches(policy: ZeroTrustPolicy, resource_type: str) -> bool:
+        """`policy_type == 'access'` is the catch-all; typed policies only
+        fire on matching resource classes."""
+        ptype = (policy.policy_type or "").lower()
+        if ptype in ("", "access"):
+            return True
+        rtype = (resource_type or "").lower()
+        # Accept either exact match or common synonyms (network⇄net,
+        # workload⇄service, data⇄file, identity⇄user).
+        synonyms = {
+            "network": {"network", "net", "segment"},
+            "workload": {"workload", "service", "app", "application"},
+            "data": {"data", "file", "document"},
+            "identity": {"identity", "user", "principal", "group"},
+            "device": {"device", "endpoint", "host"},
+            "visibility": {"visibility", "telemetry", "log"},
+        }
+        for key, aliases in synonyms.items():
+            if ptype == key and rtype in aliases:
+                return True
+        return ptype == rtype
+
+    @staticmethod
+    def _resource_scope_matches(policy: ZeroTrustPolicy, resource_type: str, resource_id: str) -> bool:
+        """Honor resource_type / resource_id constraints encoded in the
+        `conditions` JSON. Policies without explicit resource conditions
+        remain wildcards (they have already passed policy_type)."""
+        try:
+            conds = json.loads(policy.conditions or "[]")
+        except (ValueError, TypeError):
+            return True
+        if not isinstance(conds, list):
+            return True
+        for c in conds:
+            if not isinstance(c, dict):
+                continue
+            attr = c.get("attribute")
+            op = (c.get("operator") or "equals").lower()
+            value = c.get("value")
+            observed = None
+            if attr in ("resource_type", "resource"):
+                observed = resource_type
+            elif attr in ("resource_id", "id"):
+                observed = resource_id
+            else:
+                continue
+            if not _compare(op, observed, value):
+                return False
+        return True
+
+    @staticmethod
+    def _location_scope_matches(policy: ZeroTrustPolicy, context: dict[str, Any]) -> bool:
+        """Scope check for location.
+
+        - `allowed_locations` = positive scope: policy applies only when
+          the user is in one of these locations.
+        - `blocked_locations` = negative scope + force-deny: policy ALSO
+          applies only when the user is in one of these locations, and
+          then the action is overridden to deny inside
+          evaluate_access_request (see `_location_force_deny`).
+
+        So an admin who writes ``blocked_locations: ["RU"], actions:
+        ["deny"]`` gets exactly what they expect: the policy only fires
+        for RU requests and always denies them. Matches Cloudflare
+        Access / Okta / Azure Conditional Access conventions.
+        """
+        loc = (context or {}).get("location") or (context or {}).get("country_code") or ""
+        ip = (context or {}).get("ip_address") or ""
+        try:
+            allowed = json.loads(policy.allowed_locations or "[]") or []
+            blocked = json.loads(policy.blocked_locations or "[]") or []
+        except (ValueError, TypeError):
+            allowed, blocked = [], []
+        haystack = [str(loc).lower(), str(ip).lower()]
+        if allowed and not any(str(a).lower() in haystack for a in allowed):
+            return False
+        if blocked and not any(str(b).lower() in haystack for b in blocked):
+            return False
+        return True
+
+    @staticmethod
+    def _location_force_deny(policy: ZeroTrustPolicy, context: dict[str, Any]) -> bool:
+        """Return True if this policy's blocked_locations covers the
+        request's origin, meaning the evaluator MUST emit deny regardless
+        of the configured actions array. Called after scope matching."""
+        loc = (context or {}).get("location") or (context or {}).get("country_code") or ""
+        ip = (context or {}).get("ip_address") or ""
+        try:
+            blocked = json.loads(policy.blocked_locations or "[]") or []
+        except (ValueError, TypeError):
+            blocked = []
+        if not blocked:
+            return False
+        haystack = [str(loc).lower(), str(ip).lower()]
+        return any(str(b).lower() in haystack for b in blocked)
+
+    @staticmethod
+    def _time_scope_matches(policy: ZeroTrustPolicy, context: dict[str, Any]) -> bool:
+        """Honor `time_restrictions` = {start_time, end_time, days_of_week}.
+        Times are UTC HH:MM strings; days_of_week uses 0=Mon … 6=Sun."""
+        try:
+            restr = json.loads(policy.time_restrictions or "{}")
+        except (ValueError, TypeError):
+            return True
+        if not isinstance(restr, dict) or not restr:
+            return True
+        now = datetime.now(timezone.utc)
+        days = restr.get("days_of_week")
+        if isinstance(days, list) and days and now.weekday() not in days:
+            return False
+        start = restr.get("start_time")
+        end = restr.get("end_time")
+        if start and end and isinstance(start, str) and isinstance(end, str):
+            try:
+                sh, sm = [int(x) for x in start.split(":")[:2]]
+                eh, em = [int(x) for x in end.split(":")[:2]]
+                minute_now = now.hour * 60 + now.minute
+                start_min = sh * 60 + sm
+                end_min = eh * 60 + em
+                if start_min <= end_min:
+                    if not (start_min <= minute_now <= end_min):
+                        return False
+                else:
+                    # Window wraps midnight (e.g. 22:00 → 06:00).
+                    if not (minute_now >= start_min or minute_now <= end_min):
+                        return False
+            except (ValueError, IndexError):
+                return True
+        return True
+
+    @staticmethod
+    def _conditions_match(
+        policy: ZeroTrustPolicy,
+        subject_type: str,
+        subject_id: str,
+        resource_type: str,
+        resource_id: str,
+        context: dict[str, Any],
+    ) -> bool:
+        """Evaluate non-resource conditions in the policy JSON.
+        Supported attributes: subject_type, subject_id, user, group, tag,
+        authentication_method, mfa_completed, plus any key present in
+        the `context` dict (network_type, location, device_id, etc.)."""
+        try:
+            conds = json.loads(policy.conditions or "[]")
+        except (ValueError, TypeError):
+            return True
+        if not isinstance(conds, list):
+            return True
+        for c in conds:
+            if not isinstance(c, dict):
+                continue
+            attr = c.get("attribute")
+            if attr in ("resource_type", "resource", "resource_id", "id"):
+                # Handled by _resource_scope_matches.
+                continue
+            op = (c.get("operator") or "equals").lower()
+            value = c.get("value")
+            if attr == "subject_type":
+                observed = subject_type
+            elif attr in ("subject_id", "user", "principal"):
+                observed = subject_id
+            else:
+                observed = (context or {}).get(attr)
+            if not _compare(op, observed, value):
+                return False
+        return True
 
 
 class DeviceTrustAssessor:
@@ -490,7 +756,18 @@ class DeviceTrustAssessor:
         device = result.scalar_one_or_none()
 
         if not device:
-            raise ValueError(f"Device {device_id} not found")
+            # First-time posture heartbeat for this device — create the
+            # profile rather than raise, so Zero Trust coverage is
+            # automatic the moment an agent enrolls (no manual step).
+            device = DeviceTrustProfile(
+                device_id=device_id,
+                device_type="managed",
+                organization_id=self.organization_id,
+                compliance_status=json.dumps({}),
+                trust_score=0.0,
+                trust_level="unknown",
+            )
+            self.db.add(device)
 
         # Update compliance status
         current_status = json.loads(device.compliance_status or "{}")

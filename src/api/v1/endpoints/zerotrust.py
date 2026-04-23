@@ -122,7 +122,8 @@ async def evaluate_access_request(
         )
 
     except Exception as e:
-        logger.error("api_error_evaluate_access", error=str(e))
+        import traceback
+        logger.error("api_error_evaluate_access", error=str(e), traceback=traceback.format_exc()[-1500:])
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Error evaluating access request",

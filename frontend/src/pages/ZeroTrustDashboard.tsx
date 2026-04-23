@@ -371,9 +371,12 @@ export default function ZeroTrustDashboard() {
 
 function OverviewTab({
   data,
+  recentDecisions,
   loading,
 }: {
   data?: DashboardData;
+  recentDecisions?: AccessDecision[];
+  accessDecisions24h?: { allowed: number; denied: number; challenged: number };
   loading: boolean;
 }) {
   if (loading) {
@@ -514,7 +517,12 @@ function OverviewTab({
           Recent Access Decisions
         </h2>
         <div className="space-y-2">
-          {([] as AccessDecision[]).slice(0, 5).map((decision) => (
+          {(recentDecisions || []).length === 0 ? (
+            <div className="text-sm text-gray-500 dark:text-gray-400 px-3 py-6 text-center">
+              No access decisions recorded yet. Policy hits, challenges, and denials will appear here.
+            </div>
+          ) : null}
+          {(recentDecisions || []).slice(0, 5).map((decision) => (
             <div
               key={decision.id}
               className="flex items-center justify-between p-3 bg-gray-50 dark:bg-gray-700/50 rounded-lg"
