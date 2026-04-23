@@ -225,6 +225,39 @@ services:
       timeout: 10s
       retries: 3
 
+  # PySOAR Simulation Agent — a live, enrolled endpoint that Purple
+  # Team / Live Response / STIG can target out of the box. The API
+  # container's startup seeds a long-lived token for it at
+  # /app/data/agent/<org>.token; this container reads the first such
+  # file and runs the real pysoar_agent.py poll loop against the API.
+  # Subprocess commands actually execute inside this container, so a
+  # BAS "fire T1059" hits a real /bin/sh.
+  agent:
+    image: python:3.11-alpine
+    container_name: pysoar-sim-agent
+    depends_on:
+      api:
+        condition: service_healthy
+    volumes:
+      - ./agent:/app/agent:ro
+      - pysoar-data:/data
+    environment:
+      PYSOAR_URL: "http://api:8000"
+      PYSOAR_AGENT_TOKEN_DIR: "/data/agent"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        apk add --no-cache bash curl 2>/dev/null;
+        echo "[sim-agent] waiting for token file…";
+        while [ -z "$$(ls /data/agent/*.token 2>/dev/null | head -1)" ]; do sleep 2; done;
+        TOKEN_FILE=$$(ls /data/agent/*.token | head -1);
+        export PYSOAR_AGENT_TOKEN_FILE="$$TOKEN_FILE";
+        echo "[sim-agent] using token at $$TOKEN_FILE";
+        exec python -u /app/agent/pysoar_agent.py --poll --server "$$PYSOAR_URL" --token-file "$$TOKEN_FILE"
+    networks:
+      - pysoar-network
+    restart: unless-stopped
+
   # Nginx Reverse Proxy with SSL termination
   nginx:
     image: nginx:1.25-alpine
