@@ -155,6 +155,11 @@ export default function STIGCompliance() {
       return response.data;
       } catch { return null; }
     },
+    // Poll every 10s when the user is on the Scan Results tab so
+    // a newly-launched scan transitions through queued → running →
+    // completed live, and an ARF upload's effect is visible without
+    // a manual reload.
+    refetchInterval: activeTab === 'results' ? 10000 : false,
   });
 
   const { data: expandedScanResults, isLoading: scanResultsLoading } = useQuery<
@@ -530,6 +535,111 @@ function DashboardTab({
   );
 }
 
+function XCCDFUploader() {
+  const queryClient = useQueryClient();
+  const [dragActive, setDragActive] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [status, setStatus] = useState<{ kind: 'ok' | 'err'; msg: string } | null>(null);
+
+  const handleFile = async (file: File) => {
+    setUploading(true);
+    setStatus(null);
+    try {
+      const fd = new FormData();
+      fd.append('file', file);
+      const res = await api.post('/stig/scap/upload', fd, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      });
+      const parsed = res.data?.check_count ?? 0;
+      const name = res.data?.benchmark_title || res.data?.name || file.name;
+      setStatus({
+        kind: 'ok',
+        msg: `Imported "${name}" — ${parsed} rule${parsed === 1 ? '' : 's'} parsed.`,
+      });
+      // Refresh the benchmarks list so the new one appears immediately.
+      queryClient.invalidateQueries({ queryKey: ['stig-benchmarks'] });
+    } catch (err: any) {
+      setStatus({
+        kind: 'err',
+        msg: err?.response?.data?.detail || err?.message || 'Upload failed',
+      });
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const onDrop = async (e: React.DragEvent) => {
+    e.preventDefault();
+    setDragActive(false);
+    const file = e.dataTransfer.files?.[0];
+    if (file) await handleFile(file);
+  };
+
+  return (
+    <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
+      <div className="flex items-center gap-2 mb-3">
+        <Plus className="w-5 h-5 text-blue-600 dark:text-blue-400" />
+        <span className="text-sm font-semibold text-gray-700 dark:text-gray-300">
+          Upload STIG / SCAP Benchmark
+        </span>
+        <span className="text-xs text-gray-500 dark:text-gray-400">
+          (XCCDF .xml from <span className="underline">public.cyber.mil/stigs</span>)
+        </span>
+      </div>
+      <label
+        onDragOver={(e) => { e.preventDefault(); setDragActive(true); }}
+        onDragLeave={() => setDragActive(false)}
+        onDrop={onDrop}
+        className={clsx(
+          'flex flex-col items-center justify-center gap-1 py-6 px-4 border-2 border-dashed rounded-lg cursor-pointer transition',
+          dragActive
+            ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/20'
+            : 'border-gray-300 dark:border-gray-600 hover:border-blue-400 dark:hover:border-blue-500',
+          uploading && 'opacity-60 pointer-events-none',
+        )}
+      >
+        <input
+          type="file"
+          accept=".xml,.xccdf,application/xml"
+          className="hidden"
+          disabled={uploading}
+          onChange={(e) => {
+            const file = e.target.files?.[0];
+            if (file) handleFile(file);
+            e.target.value = '';
+          }}
+        />
+        {uploading ? (
+          <>
+            <Loader2 className="w-6 h-6 animate-spin text-blue-600" />
+            <span className="text-sm text-gray-600 dark:text-gray-300">Parsing XCCDF…</span>
+          </>
+        ) : (
+          <>
+            <Plus className="w-6 h-6 text-gray-400" />
+            <span className="text-sm text-gray-700 dark:text-gray-300">
+              Drop an XCCDF file here or click to choose
+            </span>
+            <span className="text-xs text-gray-500 dark:text-gray-400">
+              Parsed rules land in the benchmark list immediately.
+            </span>
+          </>
+        )}
+      </label>
+      {status && (
+        <div className={clsx(
+          'mt-3 text-sm px-3 py-2 rounded border',
+          status.kind === 'ok'
+            ? 'bg-green-50 dark:bg-green-900/20 border-green-200 dark:border-green-800 text-green-800 dark:text-green-200'
+            : 'bg-red-50 dark:bg-red-900/20 border-red-200 dark:border-red-800 text-red-800 dark:text-red-200',
+        )}>
+          {status.msg}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function BenchmarksTab({
   benchmarks,
   loading,
@@ -555,6 +665,9 @@ function BenchmarksTab({
 
   return (
     <div className="space-y-6">
+      {/* XCCDF upload — the operator path to load DISA STIG content */}
+      <XCCDFUploader />
+
       {/* Filter */}
       <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
         <div className="flex items-center gap-2 mb-3">
@@ -576,6 +689,28 @@ function BenchmarksTab({
       </div>
 
       {/* Benchmark Cards */}
+      {benchmarks.length === 0 ? (
+        <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-8 text-center">
+          <AlertCircle className="w-10 h-10 text-gray-400 mx-auto mb-3" />
+          <h3 className="text-base font-semibold text-gray-900 dark:text-white mb-1">
+            No benchmarks loaded yet
+          </h3>
+          <p className="text-sm text-gray-600 dark:text-gray-400 max-w-lg mx-auto">
+            Upload an XCCDF benchmark above to get started. Download current
+            DISA STIGs from{' '}
+            <a
+              href="https://public.cyber.mil/stigs/downloads/"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-blue-600 dark:text-blue-400 underline"
+            >
+              public.cyber.mil/stigs/downloads
+            </a>
+            . After upload, each benchmark's rules are ingested into the
+            platform and available for scans.
+          </p>
+        </div>
+      ) : null}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
         {benchmarks.map((benchmark) => (
           <div
@@ -624,6 +759,84 @@ function BenchmarksTab({
           </div>
         ))}
       </div>
+    </div>
+  );
+}
+
+function ARFUploader({ scanId }: { scanId: string }) {
+  const queryClient = useQueryClient();
+  const [uploading, setUploading] = useState(false);
+  const [status, setStatus] = useState<{ kind: 'ok' | 'err'; msg: string } | null>(null);
+
+  const handleFile = async (file: File) => {
+    setUploading(true);
+    setStatus(null);
+    try {
+      const fd = new FormData();
+      fd.append('file', file);
+      const res = await api.post(`/stig/scans/${scanId}/arf`, fd, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      });
+      setStatus({
+        kind: 'ok',
+        msg: `Ingested — ${res.data?.checks_evaluated ?? 0} checks, ${res.data?.open_findings ?? 0} open, ${(res.data?.compliance_percentage ?? 0).toFixed(1)}% compliant.`,
+      });
+      queryClient.invalidateQueries({ queryKey: ['stig-scans'] });
+      queryClient.invalidateQueries({ queryKey: ['stig-scan-results', scanId] });
+    } catch (err: any) {
+      setStatus({
+        kind: 'err',
+        msg: err?.response?.data?.detail || err?.message || 'Upload failed',
+      });
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  return (
+    <div className="bg-white dark:bg-gray-800 rounded-lg border border-blue-300 dark:border-blue-700 p-4">
+      <div className="flex items-center gap-2 mb-2">
+        <Plus className="w-4 h-4 text-blue-600 dark:text-blue-400" />
+        <span className="text-sm font-semibold text-gray-700 dark:text-gray-300">
+          Upload ARF report for this scan
+        </span>
+        <span className="text-xs text-gray-500 dark:text-gray-400">
+          (oscap --results-arf output)
+        </span>
+      </div>
+      <label className={clsx(
+        "flex items-center gap-2 text-sm cursor-pointer",
+        uploading && 'opacity-60 pointer-events-none'
+      )}>
+        <input
+          type="file"
+          accept=".xml,application/xml"
+          className="hidden"
+          disabled={uploading}
+          onChange={(e) => {
+            const file = e.target.files?.[0];
+            if (file) handleFile(file);
+            e.target.value = '';
+          }}
+        />
+        <span className="px-3 py-1.5 bg-blue-600 text-white rounded hover:bg-blue-700 text-xs font-medium inline-flex items-center gap-1">
+          {uploading ? <Loader2 className="w-3 h-3 animate-spin" /> : <Plus className="w-3 h-3" />}
+          {uploading ? 'Ingesting…' : 'Choose ARF file'}
+        </span>
+        <span className="text-xs text-gray-500 dark:text-gray-400">
+          Parses {`<rule-result>`} elements per NIST SP 800-126 §5.5, updates findings + compliance %.
+        </span>
+      </label>
+      {status && (
+        <div className={clsx(
+          'mt-2 text-xs px-2 py-1 rounded',
+          status.kind === 'ok'
+            ? 'bg-green-50 dark:bg-green-900/20 text-green-800 dark:text-green-200'
+            : 'bg-red-50 dark:bg-red-900/20 text-red-800 dark:text-red-200',
+        )}>
+          {status.msg}
+        </div>
+      )}
     </div>
   );
 }
@@ -750,10 +963,26 @@ function ScanResultsTab({
         </table>
       </div>
 
+      {scans.length === 0 && (
+        <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-8 text-center">
+          <AlertCircle className="w-10 h-10 text-gray-400 mx-auto mb-3" />
+          <h3 className="text-base font-semibold text-gray-900 dark:text-white mb-1">
+            No scans yet
+          </h3>
+          <p className="text-sm text-gray-600 dark:text-gray-400 max-w-lg mx-auto">
+            Run a scan from the Benchmarks tab to populate this view. For
+            fully-automated scans, enroll an endpoint agent with the
+            compliance capability — the weekly fleet sweep (Sundays 06:00
+            UTC) runs every loaded benchmark against every enrolled agent.
+          </p>
+        </div>
+      )}
+
       {/* Expanded Scan Results */}
       {expandedScan && (
         <div className="bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded-lg p-6">
-          <h3 className="font-semibold text-gray-900 dark:text-white mb-4">
+          <ARFUploader scanId={expandedScan} />
+          <h3 className="font-semibold text-gray-900 dark:text-white mb-4 mt-6">
             Per-Rule Results
           </h3>
           {scanResultsLoading ? (
