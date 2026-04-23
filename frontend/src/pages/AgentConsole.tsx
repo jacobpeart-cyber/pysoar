@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Send, Trash2, Plus, Wrench, ChevronDown, ChevronRight, ShieldAlert, CheckCircle2, AlertTriangle } from 'lucide-react';
+import { Send, Trash2, Plus, Wrench, ChevronDown, ChevronRight, ShieldAlert, CheckCircle2, AlertTriangle, Activity, XCircle } from 'lucide-react';
 import clsx from 'clsx';
 import { api } from '../api/client';
 
@@ -31,6 +31,26 @@ interface ChatSession {
   updated_at?: string | null;
 }
 
+interface InvestigationCard {
+  id: string;
+  title: string;
+  status: string;
+  confidence_score: number;
+  resolution_type?: string | null;
+  findings_summary?: string | null;
+  hypothesis?: string | null;
+  created_at?: string | null;
+  mitre_techniques?: string | null;
+}
+
+const VERDICT_OPTIONS = [
+  { value: 'true_positive', label: 'True positive' },
+  { value: 'false_positive', label: 'False positive' },
+  { value: 'benign', label: 'Benign' },
+  { value: 'inconclusive', label: 'Inconclusive' },
+  { value: 'escalated', label: 'Escalated' },
+];
+
 const suggestedPrompts = [
   'Show me the top 5 high-risk UEBA users.',
   'What critical vulnerabilities are open right now?',
@@ -50,6 +70,12 @@ const AgentConsole: React.FC = () => {
   const [authorizeActions, setAuthorizeActions] = useState(false);
   const [expandedTools, setExpandedTools] = useState<Record<string, boolean>>({});
   const [error, setError] = useState<string | null>(null);
+  const [investigations, setInvestigations] = useState<InvestigationCard[]>([]);
+  const [showInvestigations, setShowInvestigations] = useState(true);
+  const [correctingId, setCorrectingId] = useState<string | null>(null);
+  const [correctionVerdict, setCorrectionVerdict] = useState<string>('false_positive');
+  const [correctionNote, setCorrectionNote] = useState<string>('');
+  const [correctionBusy, setCorrectionBusy] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   const loadSessions = async () => {
@@ -76,14 +102,54 @@ const AgentConsole: React.FC = () => {
     }
   };
 
+  const loadInvestigations = async () => {
+    try {
+      const res = await api.get('/agentic/investigations');
+      const items: InvestigationCard[] =
+        res.data?.items ||
+        (Array.isArray(res.data) ? res.data : []);
+      // Most recent first; cap at 6.
+      items.sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+      setInvestigations(items.slice(0, 6));
+    } catch {
+      setInvestigations([]);
+    }
+  };
+
   useEffect(() => {
     (async () => {
       const items = await loadSessions();
       if (items.length > 0) {
         setActiveSessionId(items[0].id);
       }
+      await loadInvestigations();
     })();
+    // Poll investigations every 10s so auto-triage kickoffs and live
+    // investigation progress appear without a page reload.
+    const pollId = window.setInterval(() => {
+      loadInvestigations();
+    }, 10000);
+    return () => window.clearInterval(pollId);
   }, []);
+
+  const submitCorrection = async (invId: string) => {
+    if (!correctionVerdict) return;
+    setCorrectionBusy(true);
+    try {
+      await api.post(`/agentic/investigations/${invId}/correct`, {
+        corrected_verdict: correctionVerdict,
+        correction_note: correctionNote || undefined,
+      });
+      setCorrectingId(null);
+      setCorrectionNote('');
+      setCorrectionVerdict('false_positive');
+      await loadInvestigations();
+    } catch {
+      setError('Correction failed. Try again.');
+    } finally {
+      setCorrectionBusy(false);
+    }
+  };
 
   useEffect(() => {
     if (activeSessionId) loadMessages(activeSessionId);
@@ -239,7 +305,117 @@ const AgentConsole: React.FC = () => {
   );
 
   return (
-    <div className="flex h-[calc(100vh-4rem)] gap-4 p-4">
+    <div className="flex flex-col h-[calc(100vh-4rem)] gap-4 p-4">
+      {/* Live Investigations panel — surfaces auto-triage kickoffs
+          and ongoing investigations directly above the chat so an
+          analyst can see what the agent did without leaving the
+          console. */}
+      {showInvestigations && investigations.length > 0 && (
+        <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700">
+          <div className="px-4 py-2 flex items-center gap-2 border-b border-gray-200 dark:border-gray-700">
+            <Activity className="w-4 h-4 text-blue-600 dark:text-blue-400" />
+            <h2 className="text-sm font-semibold text-gray-900 dark:text-white">Live investigations</h2>
+            <span className="text-xs text-gray-500 dark:text-gray-400">{investigations.length}</span>
+            <button
+              onClick={() => setShowInvestigations(false)}
+              className="ml-auto text-xs text-gray-500 hover:text-gray-700 dark:hover:text-gray-300"
+            >
+              Hide
+            </button>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-2 p-3">
+            {investigations.map((inv) => {
+              const running = inv.status === 'gathering_evidence' || inv.status === 'analyzing' || inv.status === 'reasoning' || inv.status === 'initiated';
+              const verdict = inv.resolution_type;
+              const verdictColor =
+                verdict === 'true_positive' ? 'bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300'
+                : verdict === 'false_positive' || verdict === 'benign' ? 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300'
+                : verdict === 'escalated' ? 'bg-orange-100 text-orange-800 dark:bg-orange-900/30 dark:text-orange-300'
+                : 'bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-300';
+              const isAuto = /^auto-triage:/i.test(inv.title || '');
+              return (
+                <div key={inv.id} className="border border-gray-200 dark:border-gray-700 rounded p-2">
+                  <div className="flex items-start gap-2 mb-1">
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-1.5">
+                        {isAuto && <span className="text-[9px] uppercase px-1 py-0.5 bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300 rounded">auto</span>}
+                        {running && <span className="text-[9px] px-1 py-0.5 bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 rounded animate-pulse">running</span>}
+                        <span className="text-[11px] text-gray-500 dark:text-gray-400 truncate">{inv.created_at ? new Date(inv.created_at).toLocaleTimeString() : ''}</span>
+                      </div>
+                      <h3 className="text-xs font-semibold text-gray-900 dark:text-white truncate mt-0.5">{inv.title}</h3>
+                    </div>
+                    {verdict && (
+                      <span className={clsx('text-[10px] font-semibold px-1.5 py-0.5 rounded whitespace-nowrap', verdictColor)}>
+                        {verdict.replace(/_/g, ' ')} · {Math.round(inv.confidence_score || 0)}%
+                      </span>
+                    )}
+                  </div>
+                  {inv.findings_summary && (
+                    <p className="text-[11px] text-gray-700 dark:text-gray-300 line-clamp-3">{inv.findings_summary}</p>
+                  )}
+                  {verdict && verdict !== 'inconclusive' && (
+                    <div className="mt-1.5">
+                      {correctingId === inv.id ? (
+                        <div className="flex flex-col gap-1 mt-1 p-2 bg-gray-50 dark:bg-gray-900 rounded">
+                          <select
+                            value={correctionVerdict}
+                            onChange={(e) => setCorrectionVerdict(e.target.value)}
+                            className="text-xs border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 rounded px-1.5 py-0.5"
+                          >
+                            {VERDICT_OPTIONS.filter((v) => v.value !== verdict).map((v) => (
+                              <option key={v.value} value={v.value}>{v.label}</option>
+                            ))}
+                          </select>
+                          <textarea
+                            value={correctionNote}
+                            onChange={(e) => setCorrectionNote(e.target.value)}
+                            placeholder="Why was the agent wrong? (optional but recommended — future investigations will see this note)"
+                            rows={2}
+                            className="text-xs border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 rounded px-1.5 py-1 resize-none"
+                          />
+                          <div className="flex gap-1">
+                            <button
+                              disabled={correctionBusy}
+                              onClick={() => submitCorrection(inv.id)}
+                              className="text-xs px-2 py-0.5 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-300 text-white rounded"
+                            >
+                              {correctionBusy ? 'Saving…' : 'Save correction'}
+                            </button>
+                            <button
+                              disabled={correctionBusy}
+                              onClick={() => { setCorrectingId(null); setCorrectionNote(''); }}
+                              className="text-xs px-2 py-0.5 border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 rounded"
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <button
+                          onClick={() => { setCorrectingId(inv.id); setCorrectionVerdict(verdict === 'true_positive' ? 'false_positive' : 'true_positive'); }}
+                          className="text-[10px] inline-flex items-center gap-1 text-gray-500 hover:text-red-600 dark:hover:text-red-400"
+                          title="Tell the agent this verdict is wrong"
+                        >
+                          <XCircle className="w-3 h-3" /> Mark verdict wrong
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
+      {showInvestigations === false && investigations.length > 0 && (
+        <button
+          onClick={() => setShowInvestigations(true)}
+          className="text-xs text-gray-600 hover:text-gray-900 dark:text-gray-400 dark:hover:text-gray-100 flex items-center gap-1 px-3 py-1 bg-white dark:bg-gray-800 rounded border border-gray-200 dark:border-gray-700 self-start"
+        >
+          <Activity className="w-3 h-3" /> Show {investigations.length} live investigation{investigations.length === 1 ? '' : 's'}
+        </button>
+      )}
+      <div className="flex flex-1 min-h-0 gap-4">
       {/* Sidebar */}
       <aside className="w-72 flex-shrink-0 bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 flex flex-col">
         <div className="p-3 border-b border-gray-200 dark:border-gray-700">
@@ -393,6 +569,7 @@ const AgentConsole: React.FC = () => {
           </div>
         </div>
       </section>
+      </div>
     </div>
   );
 };
