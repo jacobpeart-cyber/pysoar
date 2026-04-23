@@ -259,7 +259,80 @@ class AutomationService:
             logger.warning(f"Agent containment proposals failed for incident {incident.id}: {e}")
             results["agent_commands_queued"] = 0
 
+        # ------------------------------------------------------------------
+        # Outbound notifications (Slack / Teams / PagerDuty / OpsGenie)
+        # ------------------------------------------------------------------
+        # Every auto-opened or manually-created incident pings every
+        # configured integration for the org. Best-effort: a failed
+        # webhook never breaks incident creation. Only critical and
+        # high-severity incidents notify by default to keep the signal-
+        # to-noise ratio sane for on-call analysts; lower-severity
+        # incidents are still tracked in the UI and war room.
+        if severity in ("critical", "high"):
+            try:
+                from src.services.notifications import send_incident_notifications
+                # Pull enrichment from the investigation record, if this
+                # incident was auto-opened by the autonomous investigator.
+                verdict_info = await self._pull_investigation_enrichment(incident)
+                event_payload = {
+                    "incident_id": incident.id,
+                    "title": getattr(incident, "title", ""),
+                    "severity": severity,
+                    "summary": (getattr(incident, "description", "") or "")[:3500],
+                    "trigger": "auto-opened" if verdict_info else "manual",
+                    **verdict_info,
+                }
+                notif_result = await send_incident_notifications(
+                    self.db, organization_id=org_id, event=event_payload,
+                )
+                results["notifications"] = notif_result
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"Notifications failed for incident {incident.id}: {e}")
+                results["notifications"] = {"error": str(e)[:200]}
+
         return results
+
+    async def _pull_investigation_enrichment(self, incident: Incident) -> dict[str, Any]:
+        """If this incident was auto-opened by the autonomous investigator,
+        pull its verdict + MITRE + top recommendations so the notification
+        carries the richer payload. Returns {} otherwise."""
+        try:
+            from src.agentic.models import Investigation
+            from sqlalchemy import select as sa_select
+            import json as _json
+            source_alert_id = getattr(incident, "source_alert_id", None)
+            if not source_alert_id:
+                return {}
+            inv = (await self.db.execute(
+                sa_select(Investigation).where(
+                    Investigation.trigger_source_id == source_alert_id,
+                    Investigation.trigger_type == "alert",
+                )
+            )).scalar_one_or_none()
+            if inv is None:
+                return {}
+            out: dict[str, Any] = {}
+            if inv.resolution_type:
+                out["verdict"] = inv.resolution_type
+            if inv.confidence_score is not None:
+                out["confidence"] = inv.confidence_score
+            if inv.mitre_techniques:
+                try:
+                    out["mitre_techniques"] = _json.loads(inv.mitre_techniques)
+                except (ValueError, TypeError):
+                    pass
+            if inv.recommendations:
+                try:
+                    out["recommendations"] = _json.loads(inv.recommendations)
+                except (ValueError, TypeError):
+                    pass
+            if inv.findings_summary:
+                out["summary"] = inv.findings_summary[:3500]
+            out["investigation_id"] = inv.id
+            return out
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"investigation enrichment failed for {incident.id}: {exc}")
+            return {}
 
     async def _queue_incident_containment(
         self,
