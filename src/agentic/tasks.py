@@ -5,6 +5,7 @@ Background tasks for autonomous investigations, memory maintenance,
 performance evaluation, and threat hunts.
 """
 
+import json
 from datetime import datetime, timedelta, timezone
 
 from celery import shared_task
@@ -42,7 +43,7 @@ async def get_db():
         yield session
 
 
-@shared_task(bind=True, max_retries=3)
+@shared_task(bind=True, max_retries=0)
 def run_investigation(
     self,
     agent_id: str,
@@ -53,43 +54,66 @@ def run_investigation(
     initial_context: dict = None,
 ):
     """
-    Run autonomous investigation for an alert/anomaly
+    Run an autonomous investigation for an alert/anomaly using the
+    LLM-driven AutonomousInvestigator.
 
-    Executes the full OODA loop investigation cycle in background.
-
-    Args:
-        agent_id: SOC Agent ID
-        organization_id: Organization context
-        trigger_type: Type of trigger
-        trigger_source_id: ID of alert/anomaly
-        title: Investigation title
-        initial_context: Optional context data
-
-    Returns:
-        Investigation result dictionary
+    Creates an Investigation row (if not pre-created), seeds the
+    triggering alert/incident into the evidence bundle, then runs the
+    OODA loop until Gemini emits a verdict or the step budget is hit.
+    Every step persists a ReasoningStep + ticket_activities audit row,
+    and lifecycle events are broadcast on the per-org WebSocket
+    channel so the Agent Console renders progress live.
     """
     try:
         logger.info(f"Running investigation: {title}")
 
         async def _run():
+            from src.agentic.investigator import AutonomousInvestigator
+            from src.agentic.models import Investigation, InvestigationStatus
+            from sqlalchemy import select as sa_select
             async with AsyncSessionLocal() as db:
-                engine = AgenticSOCEngine(db)
-                investigation = await engine.investigate(
-                    agent_id=agent_id,
-                    organization_id=organization_id,
-                    trigger_type=trigger_type,
-                    trigger_source_id=trigger_source_id,
-                    title=title,
-                    initial_context=initial_context,
-                )
+                # Find or create the Investigation row. If the caller
+                # already POSTed /investigations, reuse that row;
+                # otherwise create one here.
+                existing = None
+                if trigger_source_id:
+                    existing = (await db.execute(
+                        sa_select(Investigation).where(
+                            Investigation.trigger_source_id == trigger_source_id,
+                            Investigation.organization_id == organization_id,
+                            Investigation.status.notin_([
+                                InvestigationStatus.COMPLETED.value,
+                                InvestigationStatus.ABANDONED.value,
+                            ]),
+                        )
+                    )).scalar_one_or_none()
+                if existing is None:
+                    existing = Investigation(
+                        agent_id=agent_id,
+                        organization_id=organization_id,
+                        trigger_type=trigger_type,
+                        trigger_source_id=trigger_source_id,
+                        title=title,
+                        status=InvestigationStatus.INITIATED.value,
+                        priority=3,
+                        confidence_score=0.0,
+                        reasoning_chain=json.dumps([]),
+                        evidence_collected=json.dumps(initial_context or {}),
+                        actions_taken=json.dumps([]),
+                    )
+                    db.add(existing)
+                    await db.flush()
+
+                investigator = AutonomousInvestigator(db)
+                await investigator.run(existing)
                 return {
-                    "investigation_id": investigation.id,
-                    "status": investigation.status,
-                    "confidence": investigation.confidence_score,
-                    "resolution_type": investigation.resolution_type,
+                    "investigation_id": existing.id,
+                    "status": existing.status,
+                    "confidence": existing.confidence_score,
+                    "resolution_type": existing.resolution_type,
+                    "findings_summary": existing.findings_summary,
                 }
 
-        # Execute async function
         import asyncio
         result = asyncio.run(_run())
 
