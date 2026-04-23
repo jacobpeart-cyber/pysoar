@@ -38,7 +38,6 @@ import SupplyChainDashboard from './pages/SupplyChainDashboard'
 import DarkWebMonitor from './pages/DarkWebMonitor'
 import IntegrationMarketplace from './pages/IntegrationMarketplace'
 import AgenticSOC from './pages/AgenticSOC'
-import AgentConsole from './pages/AgentConsole'
 import PlaybookBuilder from './pages/PlaybookBuilder'
 import DLPDashboard from './pages/DLPDashboard'
 import RiskQuantification from './pages/RiskQuantification'
@@ -183,7 +182,9 @@ function AppRoutes() {
         <Route path="darkweb" element={<DarkWebMonitor />} />
         <Route path="integrations" element={<IntegrationMarketplace />} />
         <Route path="agentic" element={<AgenticSOC />} />
-        <Route path="agent-console" element={<AgentConsole />} />
+        {/* Legacy path kept as a redirect so old bookmarks still work —
+            the two pages were consolidated into /agentic's Chat tab. */}
+        <Route path="agent-console" element={<Navigate to="/agentic?tab=chat" replace />} />
         <Route path="playbook-builder" element={<PlaybookBuilder />} />
         <Route path="dlp" element={<DLPDashboard />} />
         <Route path="risk" element={<RiskQuantification />} />
