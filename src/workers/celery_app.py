@@ -29,6 +29,10 @@ celery_app = Celery(
         "src.agentic.tasks",
         # STIG fleet sweep + scan execution.
         "src.stig.tasks",
+        # ITDR — identity threat detection (dormant admin / MFA-less
+        # privileged / stale credential) runs hourly across all orgs
+        # and fires on_itdr_threat → alerts → investigator chain.
+        "src.itdr.tasks",
     ],
 )
 
@@ -113,6 +117,15 @@ celery_app.conf.beat_schedule = {
     "agentic-broad-sweep": {
         "task": "src.agentic.tasks.auto_triage_broad_sweep",
         "schedule": 120.0,  # Every 2 minutes
+    },
+    # --- ITDR: hourly identity threat sweep across all orgs ---
+    # Populates IdentityThreat rows for dormant_admin, MFA-missing
+    # privileged users, and stale credentials. Each detection fires
+    # on_itdr_threat → alert → investigator chain so identity
+    # threats flow into the same autonomous pipeline as alerts.
+    "itdr-identity-threat-sweep": {
+        "task": "src.itdr.tasks.scheduled_identity_threat_sweep",
+        "schedule": 3600.0,  # Every hour
     },
     # --- Post-incident followup ---
     # Re-notify if recommended actions on an open incident are

@@ -309,7 +309,12 @@ export default function ITDRDashboard() {
       setScanInProgress(true);
       const res = await api.post('/itdr/threats/scan', {});
       await loadData();
-      alert(`Identity threat scan complete — ${res.data?.threats_found ?? 0} threat(s) found.`);
+      // Backend returns `threats_created` (not `threats_found`). The
+      // count reflects NEW threats opened this run — already-open
+      // threats of the same type on the same identity are deduped.
+      const newCount = res.data?.threats_created ?? 0;
+      const scanned = res.data?.identities_scanned ?? 0;
+      alert(`Identity threat scan complete — ${newCount} new threat(s) created across ${scanned} identities.`);
     } catch (err: any) {
       alert(`Scan failed: ${err?.response?.data?.detail || err?.message || 'unknown error'}`);
     } finally {
@@ -318,11 +323,24 @@ export default function ITDRDashboard() {
   };
 
   const handleCheckExposures = async () => {
+    // The /credential-exposures/check endpoint requires an
+    // identity_id query param. Iterate every identity in scope and
+    // aggregate the hit counts so the button is genuinely org-wide.
     try {
       setExposureCheckInProgress(true);
-      const res = await api.post('/itdr/credential-exposures/check', {});
+      let totalHits = 0;
+      let ids = 0;
+      for (const profile of identities) {
+        try {
+          const r = await api.post(`/itdr/credential-exposures/check?identity_id=${encodeURIComponent(profile.id)}`);
+          totalHits += r.data?.exposures_found ?? 0;
+          ids += 1;
+        } catch {
+          /* ignore per-identity failures — sweep continues */
+        }
+      }
       await loadData();
-      alert(`Credential exposure check complete — ${res.data?.exposures_found ?? 0} exposure(s) found.`);
+      alert(`Credential exposure check complete — ${totalHits} exposure(s) across ${ids} identities.`);
     } catch (err: any) {
       alert(`Exposure check failed: ${err?.response?.data?.detail || err?.message || 'unknown error'}`);
     } finally {
@@ -385,7 +403,13 @@ export default function ITDRDashboard() {
     if (access) { setSelectedAccess(access); setDetailMode('edit'); }
   };
 
-  const activeThreats = identityThreats.filter(t => t.status === 'investigating').length;
+  // A threat is "active" while it's still open — that's `detected`
+  // (fresh from scan) OR `investigating` (analyst has picked it up).
+  // Anything else (contained, remediated, false_positive) has been
+  // closed and should not count toward the Active Threats card.
+  const activeThreats = identityThreats.filter(
+    t => t.status === 'detected' || t.status === 'investigating'
+  ).length;
   const exposedCredentials = credentialExposures.filter(c => !c.is_remediated).length;
   const highRiskIdentities = identityThreats.filter(t => (t.confidence_score ?? 0) >= 80).length;
 

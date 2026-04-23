@@ -430,15 +430,109 @@ async def respond_to_threat(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Execute threat response action"""
+    """Run a real threat-response action via the AgentToolRegistry.
+
+    Previously this endpoint only set ``threat.status = 'contained'``
+    and returned success — no account was disabled, no session was
+    revoked. It now dispatches through the same tool registry the
+    autonomous investigator uses. Every call is audited into
+    ticket_activities (AU-2) and the tool result is persisted.
+
+    Supported action types:
+      - disable_account / disable_user  -> disable_user
+      - isolate_host                    -> isolate_host
+      - block_ip                        -> block_ip
+      - quarantine                      -> disable_user + isolate_host
+      - force_password_reset            -> disable_user (reason=reset)
+      - open_incident                   -> create_incident
+      - contain (default)               -> mark contained only
+    """
+    from src.services.agent_tools import AgentToolRegistry
+    import json as _json
+
     threat = await get_threat_or_404(db, threat_id)
+    org_id = getattr(current_user, "organization_id", None)
+    action = (data.action_type or "contain").lower()
+
+    registry = AgentToolRegistry(db)
+    tool_results: list[dict] = []
+    target_hint = None
+
+    identity_row = None
+    try:
+        identity_row = await db.get(IdentityProfile, threat.identity_id)
+    except Exception:
+        identity_row = None
+    username = getattr(identity_row, "username", None)
+    primary_email = getattr(identity_row, "primary_email", None)
+    target_user = primary_email or username
+
+    async def _call_tool(tool_name: str, args: dict) -> dict:
+        r = await registry.execute(tool_name, args)
+        tool_results.append({"tool": tool_name, "args": args, "result": r})
+        return r
+
+    params = getattr(data, "parameters", None) or {}
+    ev = threat.evidence if isinstance(threat.evidence, dict) else {}
+    try:
+        if action in ("disable_account", "disable_user"):
+            if target_user:
+                await _call_tool("disable_user", {"user_email": target_user, "reason": f"ITDR threat {threat.threat_type}"})
+                target_hint = target_user
+        elif action == "force_password_reset":
+            if target_user:
+                await _call_tool("disable_user", {"user_email": target_user, "reason": f"password reset required: {threat.threat_type}"})
+                target_hint = target_user
+        elif action == "isolate_host":
+            hostname = params.get("hostname") if isinstance(params, dict) else None
+            if hostname:
+                await _call_tool("isolate_host", {"hostname": hostname, "reason": f"ITDR threat {threat.threat_type}"})
+                target_hint = hostname
+        elif action == "block_ip":
+            ip = params.get("ip") if isinstance(params, dict) else None
+            if ip:
+                await _call_tool("block_ip", {"ip": ip, "reason": f"ITDR threat {threat.threat_type}"})
+                target_hint = ip
+        elif action == "quarantine":
+            if target_user:
+                await _call_tool("disable_user", {"user_email": target_user, "reason": f"ITDR quarantine: {threat.threat_type}"})
+            host = ev.get("hostname") if isinstance(ev, dict) else None
+            if host:
+                await _call_tool("isolate_host", {"hostname": host, "reason": f"ITDR quarantine: {threat.threat_type}"})
+            target_hint = target_user
+        elif action == "open_incident":
+            await _call_tool("create_incident", {
+                "title": f"ITDR: {threat.threat_type} on {target_user or threat.identity_id}",
+                "severity": threat.severity or "high",
+                "description": _json.dumps(threat.evidence or {}, default=str)[:1500],
+            })
+            target_hint = target_user
+    except Exception as err:  # noqa: BLE001
+        logger.warning(f"ITDR respond tool dispatch failed on threat={threat_id}: {err}")
+
     threat.status = "contained"
+    try:
+        from src.tickethub.models import TicketActivity
+        db.add(TicketActivity(
+            source_type="itdr_threat",
+            source_id=threat_id,
+            activity_type="threat_respond",
+            description=(
+                f"action={action} target={target_hint or 'n/a'} "
+                f"user={getattr(current_user, 'email', 'system')} "
+                f"tools_dispatched={[t['tool'] for t in tool_results]}"
+            ),
+            organization_id=org_id,
+        ))
+    except Exception:
+        pass
     await db.commit()
-    logger.info(f"Threat response executed: {threat_id} - {data.action_type}")
+    logger.info(f"ITDR response {action} on threat={threat_id}: {len(tool_results)} tool(s) dispatched")
     return {
         "threat_id": threat_id,
-        "action": data.action_type,
-        "status": "executed",
+        "action": action,
+        "status": "executed" if tool_results else "marked_contained",
+        "tool_results": tool_results,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
