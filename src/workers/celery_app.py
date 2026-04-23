@@ -22,6 +22,13 @@ celery_app = Celery(
         # registers but the worker never imports the module on boot,
         # so the beat schedule entry fires into the void.
         "src.siem.tasks",
+        # Agentic SOC autonomous investigations — `run_investigation`
+        # drives AutonomousInvestigator against a real Gemini + tool
+        # loop. Missing this entry silently drops every investigation
+        # kickoff on the floor.
+        "src.agentic.tasks",
+        # STIG fleet sweep + scan execution.
+        "src.stig.tasks",
     ],
 )
 
