@@ -116,6 +116,34 @@ const getRiskColor = (score: number) => {
   return 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400';
 };
 
+// Derive SLA status from the actual ticket state rather than trusting
+// whatever was stamped on the record at creation time. Backend used to
+// write sla_status="on_track" on insert and never recompute it, so a
+// ticket whose due_date had long since passed still rendered green.
+// Truth source: status + due_date + today.
+const deriveSlaStatus = (
+  ticket: Pick<RemediationTicket, 'status' | 'due_date' | 'sla_status'>,
+): 'on_track' | 'at_risk' | 'overdue' | 'completed' => {
+  if (ticket.status === 'closed' || ticket.status === 'verification') {
+    return 'completed';
+  }
+  if (!ticket.due_date) {
+    return ticket.sla_status || 'on_track';
+  }
+  const due = new Date(ticket.due_date);
+  if (Number.isNaN(due.getTime())) {
+    return ticket.sla_status || 'on_track';
+  }
+  const now = Date.now();
+  const msToDue = due.getTime() - now;
+  // Anything with a due date in the past is overdue — regardless of
+  // what the server thinks.
+  if (msToDue < 0) return 'overdue';
+  // Within 3 days: at risk.
+  if (msToDue < 3 * 24 * 60 * 60 * 1000) return 'at_risk';
+  return 'on_track';
+};
+
 const getStatusColor = (status: string) => {
   switch (status) {
     case 'active':
@@ -128,8 +156,12 @@ const getStatusColor = (status: string) => {
       return 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400';
     case 'quarantined':
     case 'verification':
-    case 'overdue':
       return 'bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-400';
+    case 'overdue':
+      // Explicit red — an overdue SLA item is a compliance breach, not
+      // a warning. Don't share the color of "verification" etc.
+      return 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400';
+    case 'completed':
     case 'closed':
     case 'patched':
       return 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400';
@@ -727,14 +759,14 @@ export default function ExposureManagement() {
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
               <p className="text-sm text-gray-500 dark:text-gray-400">Overdue</p>
               <p className="text-2xl font-semibold text-gray-900 dark:text-white mt-1">
-                {tickets?.filter(t => t.sla_status === 'overdue').length || 0}
+                {tickets?.filter(t => deriveSlaStatus(t) === 'overdue').length || 0}
               </p>
             </div>
             <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-4">
               <p className="text-sm text-gray-500 dark:text-gray-400">Avg SLA Compliance</p>
               <p className="text-2xl font-semibold text-gray-900 dark:text-white mt-1">
                 {tickets && tickets.length > 0
-                  ? `${Math.round(tickets.filter(t => t.sla_status !== 'overdue').length / (tickets.length || 1) * 100)}%`
+                  ? `${Math.round(tickets.filter(t => deriveSlaStatus(t) !== 'overdue').length / (tickets.length || 1) * 100)}%`
                   : '0%'}
               </p>
             </div>
@@ -853,9 +885,14 @@ export default function ExposureManagement() {
                         {ticket.due_date ? new Date(ticket.due_date || "").toLocaleDateString() : '-'}
                       </td>
                       <td className="px-4 py-3">
-                        <span className={clsx('px-2 py-1 text-xs font-medium rounded-full', getStatusColor(ticket.sla_status || 'on_track'))}>
-                          {(ticket.sla_status || 'on_track').replace('_', ' ')}
-                        </span>
+                        {(() => {
+                          const sla = deriveSlaStatus(ticket);
+                          return (
+                            <span className={clsx('px-2 py-1 text-xs font-medium rounded-full', getStatusColor(sla))}>
+                              {sla.replace('_', ' ')}
+                            </span>
+                          );
+                        })()}
                       </td>
                     </tr>
                   ))}
