@@ -56,7 +56,6 @@ import {
   Cpu,
   Terminal,
   Swords,
-  Sparkles,
 } from 'lucide-react';
 import { useState, useEffect } from 'react';
 import clsx from 'clsx';
@@ -86,7 +85,6 @@ const navigation = [
   { name: 'Dark Web', href: '/darkweb', icon: Eye },
   { name: 'Integrations', href: '/integrations', icon: Plug },
   { name: 'Agentic SOC', href: '/agentic', icon: Bot },
-  { name: 'Agent Console', href: '/agent-console', icon: Sparkles },
   { name: 'Playbook Builder', href: '/playbook-builder', icon: Workflow },
   { name: 'DLP', href: '/dlp', icon: ShieldOff },
   { name: 'Risk (FAIR)', href: '/risk', icon: Calculator },

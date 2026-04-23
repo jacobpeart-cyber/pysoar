@@ -27,8 +27,9 @@ import {
 } from 'recharts';
 import clsx from 'clsx';
 import { api } from '../api/client';
+import ChatWorkbench from '../components/ChatWorkbench';
 
-type TabId = 'agents' | 'investigations' | 'reasoning' | 'approvals' | 'triage' | 'anomalies' | 'predictions' | 'models';
+type TabId = 'chat' | 'investigations' | 'approvals' | 'triage' | 'anomalies' | 'predictions' | 'models' | 'agents';
 
 const priorityColors: Record<string, string> = {
   critical: 'text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-900/20',
@@ -45,17 +46,20 @@ const severityColors: Record<string, string> = {
 };
 
 const AgenticSOC: React.FC = () => {
-  const [activeTab, setActiveTab] = useState<TabId>('agents');
+  const [activeTab, setActiveTab] = useState<TabId>(() => {
+    // Support both /agentic (default) and a deep-link like
+    // /agentic?tab=investigations so /agent-console can redirect in
+    // and land on the chat workbench without a second click.
+    const params = new URLSearchParams(window.location.search);
+    const t = (params.get('tab') as TabId | null) || null;
+    const valid: TabId[] = ['chat', 'investigations', 'approvals', 'triage', 'anomalies', 'predictions', 'models', 'agents'];
+    return t && valid.includes(t) ? t : 'chat';
+  });
   const [selectedAgent, setSelectedAgent] = useState<string | null>(null);
   const [selectedInvestigation, setSelectedInvestigation] = useState<string | null>(null);
-  const [chatMessages, setChatMessages] = useState<Array<{ role: string; text: string }>>([
-    { role: 'system', text: 'Hello! I am your Agentic SOC assistant. How can I help?' },
-  ]);
-  const [chatInput, setChatInput] = useState('');
   const [approvalModal, setApprovalModal] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
-  const [chatLoading, setChatLoading] = useState(false);
   const [statusToast, setStatusToast] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
   // State for API data
@@ -297,23 +301,6 @@ const AgenticSOC: React.FC = () => {
     }
   };
 
-  const handleChatSend = async () => {
-    if (!chatInput.trim() || chatLoading) return;
-    const userMessage = chatInput;
-    setChatMessages((prev) => [...prev, { role: 'user', text: userMessage }]);
-    setChatInput('');
-    setChatLoading(true);
-    try {
-      const response = await api.post('/agentic/chat', { query: userMessage });
-      const reply = response.data?.response || response.data?.answer || 'No response';
-      setChatMessages((prev) => [...prev, { role: 'system', text: reply }]);
-    } catch {
-      setChatMessages((prev) => [...prev, { role: 'system', text: 'Sorry, something went wrong. Please try again.' }]);
-    } finally {
-      setChatLoading(false);
-    }
-  };
-
   const handleApprove = async (id: string) => {
     try {
       await api.post(`/agentic/actions/${id}/approve`, { approved: true });
@@ -438,14 +425,18 @@ const AgenticSOC: React.FC = () => {
         {/* Tabs */}
         <div className="mb-6 flex gap-2 border-b border-gray-200 dark:border-gray-700 overflow-x-auto">
           {([
-            { id: 'agents', label: 'Agents' },
+            // Primary work surface — what an analyst comes here to do.
+            { id: 'chat', label: 'Chat' },
             { id: 'investigations', label: 'Investigations' },
-            { id: 'reasoning', label: 'Reasoning' },
             { id: 'approvals', label: 'Approvals' },
-            { id: 'triage', label: 'Alert Triage' },
+            // Analytics — read-only dashboards of what the platform
+            // has observed or predicted.
+            { id: 'triage', label: 'Triage' },
             { id: 'anomalies', label: 'Anomalies' },
             { id: 'predictions', label: 'Predictions' },
-            { id: 'models', label: 'ML Models' },
+            { id: 'models', label: 'Models' },
+            // Config — the SOC agent roster (mostly reference).
+            { id: 'agents', label: 'Agents' },
           ] as const).map((tab) => (
             <button
               key={tab.id}
@@ -463,7 +454,15 @@ const AgenticSOC: React.FC = () => {
         </div>
 
         {/* Tab Content */}
-        <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6 mb-8">
+        <div className={clsx(
+          'bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 mb-8',
+          activeTab === 'chat' ? 'p-4' : 'p-6',
+        )}>
+          {/* Chat Tab — the primary agent workbench */}
+          {activeTab === 'chat' && (
+            <ChatWorkbench />
+          )}
+
           {/* Agents Tab */}
           {activeTab === 'agents' && (
             <div>
@@ -632,56 +631,11 @@ const AgenticSOC: React.FC = () => {
             </div>
           )}
 
-          {/* Reasoning Chain Tab */}
-          {activeTab === 'reasoning' && (
-            <div>
-              <h2 className="text-xl font-bold text-gray-900 dark:text-white mb-6">
-                OODA Loop - Reasoning Chain
-              </h2>
-              {reasoningChain.length === 0 ? (
-                <div className="text-center py-8 text-gray-500 dark:text-gray-400 text-sm">
-                  No reasoning steps recorded yet. An investigation logs steps
-                  here as its agent observes, orients, decides, and acts.
-                </div>
-              ) : null}
-              <div className="space-y-4">
-                {reasoningChain.map((item, idx) => (
-                  <div key={idx} className="flex gap-4">
-                    <div className="flex flex-col items-center">
-                      <div className="w-10 h-10 rounded-full bg-blue-600 dark:bg-blue-500 text-white flex items-center justify-center font-bold text-sm">
-                        {item.step}
-                      </div>
-                      {idx < reasoningChain.length - 1 && (
-                        <div className="w-1 h-12 bg-blue-300 dark:bg-blue-700 mt-2"></div>
-                      )}
-                    </div>
-                    <div className="flex-1 pt-1">
-                      <h3 className="font-semibold text-gray-900 dark:text-white">
-                        {item.stage}
-                      </h3>
-                      <p className="text-gray-600 dark:text-gray-400 text-sm mt-1">
-                        {item.description}
-                      </p>
-                      <div className="mt-2 flex items-center gap-2">
-                        <span className="text-xs font-medium text-gray-700 dark:text-gray-300">
-                          Confidence:
-                        </span>
-                        <div className="flex-1 max-w-xs bg-gray-200 dark:bg-gray-700 rounded-full h-2">
-                          <div
-                            className="bg-green-600 dark:bg-green-500 h-2 rounded-full"
-                            style={{ width: `${item.confidence}%` }}
-                          ></div>
-                        </div>
-                        <span className="text-xs font-medium text-gray-700 dark:text-gray-300">
-                          {item.confidence}%
-                        </span>
-                      </div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          )}
+          {/* Reasoning tab removed — per-investigation reasoning
+              chains are surfaced inline on the Investigations tab
+              when a row is expanded, which is where an analyst
+              expects to find them. Keeping Reasoning as its own
+              always-empty top-level tab was noise. */}
 
           {/* Alert Triage Tab */}
           {activeTab === 'triage' && (
@@ -1086,53 +1040,9 @@ const AgenticSOC: React.FC = () => {
           )}
         </div>
 
-        {/* Chat Interface */}
-        <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-6">
-          <h2 className="text-xl font-bold text-gray-900 dark:text-white mb-4 flex items-center gap-2">
-            <MessageSquare className="w-5 h-5" />
-            Natural Language Interface
-          </h2>
-
-          <div className="bg-gray-50 dark:bg-gray-900 rounded-lg border border-gray-200 dark:border-gray-700 h-80 overflow-y-auto mb-4 p-4 space-y-3">
-            {chatMessages.map((msg, idx) => (
-              <div
-                key={idx}
-                className={clsx(
-                  'flex',
-                  msg.role === 'user' ? 'justify-end' : 'justify-start'
-                )}
-              >
-                <div
-                  className={clsx(
-                    'max-w-xs px-4 py-2 rounded-lg',
-                    msg.role === 'user'
-                      ? 'bg-blue-600 dark:bg-blue-500 text-white'
-                      : 'bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-white'
-                  )}
-                >
-                  {msg.text}
-                </div>
-              </div>
-            ))}
-          </div>
-
-          <div className="flex gap-2">
-            <input
-              type="text"
-              value={chatInput}
-              onChange={(e) => setChatInput(e.target.value)}
-              onKeyPress={(e) => e.key === 'Enter' && handleChatSend()}
-              placeholder="Ask me about investigations, agents, or security events..."
-              className="flex-1 px-4 py-3 border border-gray-200 dark:border-gray-700 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-white placeholder-gray-500 dark:placeholder-gray-400"
-            />
-            <button
-              onClick={handleChatSend}
-              className="px-4 py-3 bg-blue-600 dark:bg-blue-500 text-white rounded-lg hover:bg-blue-700 dark:hover:bg-blue-600 transition"
-            >
-              <Send className="w-5 h-5" />
-            </button>
-          </div>
-        </div>
+        {/* Bottom chat widget removed — the full Chat tab (first in
+            the tab row) is the primary agent workbench now. No sense
+            shipping two different chat UIs on the same page. */}
       </div>
 
       {/* Approval Modal */}

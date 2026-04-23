@@ -60,7 +60,13 @@ const suggestedPrompts = [
   'Which assets are most exposed? Show me critical ones.',
 ];
 
-const AgentConsole: React.FC = () => {
+/**
+ * Reusable chat workbench — session sidebar + chat pane + live
+ * investigations strip. Used as the Chat tab on /agentic. Expects the
+ * parent to provide vertical space; renders inside h-full so it fits
+ * the containing tab body rather than forcing its own viewport height.
+ */
+const ChatWorkbench: React.FC = () => {
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
@@ -305,7 +311,7 @@ const AgentConsole: React.FC = () => {
   );
 
   return (
-    <div className="flex flex-col h-[calc(100vh-4rem)] gap-4 p-4">
+    <div className="flex flex-col h-full min-h-[640px] gap-4">
       {/* Live Investigations panel — surfaces auto-triage kickoffs
           and ongoing investigations directly above the chat so an
           analyst can see what the agent did without leaving the
@@ -574,4 +580,4 @@ const AgentConsole: React.FC = () => {
   );
 };
 
-export default AgentConsole;
+export default ChatWorkbench;
