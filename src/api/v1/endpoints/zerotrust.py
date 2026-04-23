@@ -4,7 +4,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Body, HTTPException, Query, Response, status
+from fastapi import APIRouter, Body, HTTPException, Query, Request, Response, status
 from sqlalchemy import and_, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -58,6 +58,7 @@ router = APIRouter(prefix="/zerotrust", tags=["Zero Trust"])
 @router.post("/evaluate", response_model=AccessDecisionResponse)
 async def evaluate_access_request(
     request: AccessRequestSchema,
+    raw_request: Request,
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
 ) -> AccessDecisionResponse:
@@ -76,12 +77,34 @@ async def evaluate_access_request(
         org_id = getattr(current_user, "organization_id", None)
         pdp = PolicyDecisionPoint(db, org_id)
 
+        # Thread the caller's JWT jti into context as session_id so the
+        # Zero Trust session gate can use the decision for subsequent
+        # per-request gating (NIST SP 800-207 continuous verification).
+        context = dict(request.context or {})
+        if "session_id" not in context or not context["session_id"]:
+            auth = raw_request.headers.get("Authorization", "")
+            if auth.startswith("Bearer "):
+                try:
+                    from jose import jwt
+                    from src.core.config import settings as _settings
+                    payload = jwt.decode(
+                        auth.split(" ", 1)[1].strip(),
+                        _settings.jwt_secret_key,
+                        algorithms=["HS256"],
+                        options={"verify_exp": False},
+                    )
+                    jti = payload.get("jti")
+                    if jti:
+                        context["session_id"] = jti
+                except Exception:  # noqa: BLE001
+                    pass
+
         decision = await pdp.evaluate_access_request(
             subject_type=request.subject_type,
             subject_id=request.subject_id,
             resource_type=request.resource_type,
             resource_id=request.resource_id,
-            context=request.context,
+            context=context,
         )
 
         # Determine required actions based on decision
@@ -133,11 +156,12 @@ async def evaluate_access_request(
 @router.post("/evaluate-access", response_model=AccessDecisionResponse)
 async def evaluate_access_alias(
     request: AccessRequestSchema,
+    raw_request: Request,
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
 ) -> AccessDecisionResponse:
     """Alias for /evaluate — evaluate access request and return decision"""
-    return await evaluate_access_request(request, db, current_user)
+    return await evaluate_access_request(request, raw_request, db, current_user)
 
 
 @router.post("/continuous-eval/{session_id}", response_model=AccessDecisionResponse)

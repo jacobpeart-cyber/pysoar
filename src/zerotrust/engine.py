@@ -234,6 +234,22 @@ class PolicyDecisionPoint:
             policy_id=policy_id,
         )
 
+        # Push the verdict into the session-gate cache so the
+        # middleware picks up the new state on the very next request —
+        # revocation propagates within a single request cycle instead of
+        # waiting 30s for the cache to expire.
+        sid = context.get("session_id")
+        if sid:
+            try:
+                from src.zerotrust.session_gate import invalidate_session_cache
+                await invalidate_session_cache(sid, decision)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "zt_session_cache_push_failed",
+                    session_id=sid[:8] if isinstance(sid, str) else None,
+                    error=str(exc),
+                )
+
         return access_decision
 
     async def continuous_evaluation(self, session_id: str) -> Optional[AccessDecision]:
