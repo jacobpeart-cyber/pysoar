@@ -105,11 +105,23 @@ async def list_benchmark_rules(
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=500),
 ):
-    """List rules for STIG benchmark"""
+    """List rules for a STIG benchmark.
+
+    `benchmark_id` accepts EITHER the row UUID (which /scap/upload
+    returns to the client) or the XCCDF-declared benchmark_id string
+    (what the document itself asserts). Ambiguity here used to 404
+    every lookup the UI made after an upload — the widget holds the
+    UUID, the matcher required the string.
+    """
     try:
+        from sqlalchemy import or_
+        org_id = getattr(current_user, "organization_id", None)
         stmt = select(STIGBenchmark).where(
-            (STIGBenchmark.benchmark_id == benchmark_id)
-            & (STIGBenchmark.organization_id == getattr(current_user, "organization_id", None))
+            or_(
+                STIGBenchmark.id == benchmark_id,
+                STIGBenchmark.benchmark_id == benchmark_id,
+            )
+            & (STIGBenchmark.organization_id == org_id)
         )
         benchmark = await db.scalar(stmt)
         if not benchmark:
@@ -391,7 +403,7 @@ async def import_scap_content(
 STIG_CONTENT_DIR = os.environ.get("PYSOAR_STIG_CONTENT_DIR", "/app/data/stig/xccdf")
 
 
-@router.post("/scap/upload", response_model=SCAPProfileResponse)
+@router.post("/scap/upload")
 async def upload_scap_content(
     file: UploadFile = File(..., description="XCCDF XML file (DISA STIG content)"),
     db: DatabaseSession = None,
