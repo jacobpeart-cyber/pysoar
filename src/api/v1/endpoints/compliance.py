@@ -234,9 +234,12 @@ async def generate_ssp(
     current_user: CurrentUser = None,
 ):
     """
-    Generate System Security Plan (SSP) for framework.
+    Generate a System Security Plan (SSP) for a framework.
 
-    Returns SSP document with all control implementations organized by family.
+    The Control Auto-Attester runs first, populating each known NIST
+    800-53 control's implementation narrative from live platform
+    evidence. Returns the JSON SSP structure; markdown/PDF exports
+    available via /ssp/download.
     """
     stmt = select(ComplianceFramework).where(
         and_(
@@ -254,6 +257,79 @@ async def generate_ssp(
     ssp = await engine.generate_ssp(framework_id)
 
     return ssp
+
+
+@router.get("/frameworks/{framework_id}/ssp/download")
+async def download_ssp(
+    framework_id: str,
+    format: str = "markdown",
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
+):
+    """Download the SSP as a file.
+
+    `format` may be `markdown` (default, .md) or `json`. Response is
+    served as an attachment so a browser save-as dialog opens —
+    intended for handing the document to a 3PAO.
+    """
+    from fastapi.responses import Response as _Response
+    from src.compliance.engine import ssp_to_markdown
+
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(ComplianceFramework).where(
+        and_(
+            ComplianceFramework.id == framework_id,
+            ComplianceFramework.organization_id == org_id,
+        )
+    )
+    framework = (await db.execute(stmt)).scalar_one_or_none()
+    if not framework:
+        raise HTTPException(status_code=404, detail="Framework not found")
+
+    engine = ComplianceEngine(db, org_id)
+    ssp = await engine.generate_ssp(framework_id)
+
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
+    base = f"ssp_{(framework.short_name or 'framework').lower().replace(' ', '_')}_{stamp}"
+
+    if format == "json":
+        import json as _json
+        body = _json.dumps(ssp, indent=2, default=str).encode("utf-8")
+        return _Response(
+            content=body,
+            media_type="application/json",
+            headers={"Content-Disposition": f'attachment; filename="{base}.json"'},
+        )
+
+    md = ssp_to_markdown(ssp)
+    return _Response(
+        content=md.encode("utf-8"),
+        media_type="text/markdown",
+        headers={"Content-Disposition": f'attachment; filename="{base}.md"'},
+    )
+
+
+@router.post("/frameworks/{framework_id}/attest")
+async def run_auto_attestation(
+    framework_id: str,
+    db: DatabaseSession = None,
+    current_user: CurrentUser = None,
+):
+    """Run the Control Auto-Attester against this framework.
+
+    Inspects live platform state and populates implementation narratives
+    on every control the attester has a rule for. Idempotent; returns a
+    summary of what was attested.
+    """
+    from src.compliance.attester import ControlAutoAttester
+
+    org_id = getattr(current_user, "organization_id", None)
+    framework = await db.get(ComplianceFramework, framework_id)
+    if not framework or framework.organization_id != org_id:
+        raise HTTPException(status_code=404, detail="Framework not found")
+
+    attester = ControlAutoAttester(db, org_id)
+    return await attester.attest_all(framework_id=framework_id)
 
 
 @router.get("/frameworks/{framework_id}/report")
