@@ -39,6 +39,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.agentic.models import (
+    ActionExecutionStatus,
+    ActionType,
+    AgentAction,
     Investigation,
     InvestigationStatus,
     ReasoningStep,
@@ -496,8 +499,222 @@ class AutonomousInvestigator:
             thought=investigation.findings_summary or "verdict recorded",
             tool_name=None, tool_args=None, tool_result=None,
         )
+
+        # Close the IR loop: on a confirmed true_positive, auto-open an
+        # Incident row linked to the trigger alert and materialize each
+        # verdict recommendation as an approval-gated AgentAction. The
+        # human analyst sees them all in the pending-approvals queue and
+        # can one-click execute; nothing state-changing runs without
+        # human sign-off (NIST AC-3).
+        if verdict_type == ResolutionType.TRUE_POSITIVE.value and confidence >= 70:
+            try:
+                await self._open_incident_for_verdict(investigation, verdict)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[autonomous] incident auto-open failed: {exc}")
+            try:
+                await self._materialize_recommendations(investigation, verdict)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"[autonomous] materialize recs failed: {exc}")
+
         await self.db.commit()
         logger.info(
             f"[autonomous] investigation={investigation.id} concluded "
             f"verdict={verdict_type} confidence={confidence}"
         )
+
+    # ------------------------------------------------------------------
+    # Incident-response loop closure
+    # ------------------------------------------------------------------
+
+    async def _open_incident_for_verdict(
+        self,
+        investigation: Investigation,
+        verdict: dict[str, Any],
+    ) -> None:
+        """Auto-open an Incident for a TP verdict.
+
+        Idempotent: skips if the triggering alert already has an incident.
+        Links incident → alert so the incident response team has the full
+        chain (alert → investigation → incident).
+        """
+        from sqlalchemy import select as sa_select
+        from src.models.alert import Alert
+        from src.models.incident import Incident
+
+        trigger_id = investigation.trigger_source_id
+        if not trigger_id:
+            return
+        alert = await self.db.get(Alert, trigger_id)
+        if alert is None:
+            return
+
+        # Check for an existing incident linked to this alert. The Alert
+        # model may carry an incident_id; if not, we use a marker in the
+        # incident description/title to avoid double-open on re-triage.
+        existing_incident_id = getattr(alert, "incident_id", None)
+        if existing_incident_id:
+            inv_evidence = json.loads(investigation.evidence_collected or "{}")
+            inv_evidence["linked_incident_id"] = existing_incident_id
+            investigation.evidence_collected = json.dumps(inv_evidence)[:MAX_EVIDENCE_BYTES]
+            return
+
+        # Create the incident. Severity mirrors the alert's severity.
+        severity = (alert.severity or "high").lower()
+        title = f"{alert.title} (auto-opened from investigation {investigation.id[:8]})"
+        summary = verdict.get("reasoning") or investigation.findings_summary or ""
+        incident = Incident(
+            title=title[:500],
+            severity=severity,
+            status="open",
+            description=summary[:4000],
+            organization_id=investigation.organization_id,
+        )
+        # Optional fields only set if the column exists on this schema.
+        for attr, value in (
+            ("source_alert_id", alert.id),
+            ("detected_at", datetime.now(timezone.utc)),
+            ("assigned_to", None),
+        ):
+            if hasattr(incident, attr):
+                setattr(incident, attr, value)
+        self.db.add(incident)
+        await self.db.flush()
+
+        # Link back so the alert shows the incident reference.
+        if hasattr(alert, "incident_id"):
+            alert.incident_id = incident.id
+        if hasattr(alert, "status"):
+            alert.status = "investigating"
+
+        inv_evidence = json.loads(investigation.evidence_collected or "{}")
+        inv_evidence["linked_incident_id"] = incident.id
+        investigation.evidence_collected = json.dumps(inv_evidence)[:MAX_EVIDENCE_BYTES]
+        logger.info(f"[autonomous] opened incident {incident.id} from investigation {investigation.id}")
+
+    # Map plain-English recommendation verbs → (ActionType, tool_name,
+    # required_arg_extractor). The investigator emits free-form
+    # recommendations; this translator classifies each into a concrete
+    # state-changing tool call so a human can one-click approve.
+    # Recommendation classifier. Gemini writes these as plain English
+    # ("Block the C2 IP '203.0.113.99' at the perimeter firewall."),
+    # so we extract a structured action_type + arguments for each.
+    # Ordering matters — more specific patterns before more general.
+    _IP_RE = r"([0-9]{1,3}(?:\.[0-9]{1,3}){3}|[0-9a-fA-F:]{4,45})"
+    _HOST_RE = r"[a-zA-Z0-9_\-\.]+"
+    _USER_RE = r"[a-zA-Z0-9_\-\.@]+"
+
+    _ACTION_RULES = (
+        # block_ip — "block IP 1.2.3.4" / "block 1.2.3.4 at the firewall"
+        (
+            re.compile(rf"\bblock\b[^\.]*?['`\"]?{_IP_RE}['`\"]?", re.IGNORECASE),
+            ActionType.BLOCK_IP.value, "block_ip",
+            lambda m, rec: {"ip": m.group(1), "reason": rec[:200]},
+        ),
+        # isolate_host — "isolate 'file-share-01'" / "isolate host X"
+        (
+            re.compile(rf"\bisolate\b[^\.]*?['`\"]({_HOST_RE})['`\"]", re.IGNORECASE),
+            ActionType.ISOLATE_HOST.value, "isolate_host",
+            lambda m, rec: {"hostname": m.group(1), "reason": rec[:200]},
+        ),
+        (
+            re.compile(rf"\bisolate(?:\s+the)?\s+(?:host\s+)?({_HOST_RE})\s+(?:from|immediately|now)", re.IGNORECASE),
+            ActionType.ISOLATE_HOST.value, "isolate_host",
+            lambda m, rec: {"hostname": m.group(1), "reason": rec[:200]},
+        ),
+        # disable account — "disable alice@corp" / "suspend 'bob' account"
+        (
+            re.compile(rf"\b(?:disable|suspend|lock)(?:\s+the)?\s+(?:user|account)\s+['`\"]?({_USER_RE})['`\"]?", re.IGNORECASE),
+            ActionType.DISABLE_ACCOUNT.value, "disable_user",
+            lambda m, rec: {"user_email": m.group(1), "reason": rec[:200]},
+        ),
+        (
+            re.compile(rf"\b(?:disable|suspend|lock)\s+['`\"]({_USER_RE})['`\"]\s+(?:account|user)", re.IGNORECASE),
+            ActionType.DISABLE_ACCOUNT.value, "disable_user",
+            lambda m, rec: {"user_email": m.group(1), "reason": rec[:200]},
+        ),
+        # password reset — "force password reset for alice@corp" or
+        # "force a password reset for the 'backup-svc' account". The
+        # user token is ALWAYS the one inside quotes; if none is
+        # quoted, we fall back to the first word that isn't an
+        # English filler (the/a/an/user/account).
+        (
+            re.compile(rf"\b(?:force\s+)?(?:a\s+)?password\s+reset\s+for\s+(?:the\s+)?['`\"]({_USER_RE})['`\"]", re.IGNORECASE),
+            ActionType.RESET_CREDENTIALS.value, "disable_user",
+            lambda m, rec: {"user_email": m.group(1), "reason": f"password reset: {rec[:150]}"},
+        ),
+        (
+            re.compile(rf"\b(?:force\s+)?(?:a\s+)?password\s+reset\s+for\s+(?:user|account)?\s*({_USER_RE}@{_USER_RE})", re.IGNORECASE),
+            ActionType.RESET_CREDENTIALS.value, "disable_user",
+            lambda m, rec: {"user_email": m.group(1), "reason": f"password reset: {rec[:150]}"},
+        ),
+        # forensic snapshot — "create a forensic snapshot of file-share-01"
+        (
+            re.compile(rf"\b(?:forensic\s+snapshot|memory\s+dump|collect\s+triage|forensic\s+analysis)\s+(?:of\s+|on\s+)?(?:the\s+)?(?:host\s+|server\s+)?['`\"]?({_HOST_RE})['`\"]?", re.IGNORECASE),
+            ActionType.SNAPSHOT_VM.value, None,
+            lambda m, rec: {"target": m.group(1), "description": rec[:200]},
+        ),
+        # open incident / create ticket
+        (
+            re.compile(r"\b(?:open|create)(?:\s+an?)?\s+(?:incident|ticket|case)", re.IGNORECASE),
+            ActionType.CREATE_TICKET.value, None,
+            lambda m, rec: {"description": rec[:200]},
+        ),
+    )
+
+    async def _materialize_recommendations(
+        self,
+        investigation: Investigation,
+        verdict: dict[str, Any],
+    ) -> None:
+        """Translate each recommendation string into a structured
+        AgentAction row with execution_status=PENDING_APPROVAL, so the
+        human analyst sees them in the approval queue. Unclassified
+        recommendations become ESCALATE actions (human task)."""
+        recs = verdict.get("recommendations") or []
+        if not isinstance(recs, list):
+            return
+        materialized = 0
+        for rec in recs:
+            if not isinstance(rec, str) or not rec.strip():
+                continue
+            matched = False
+            for pattern, action_type, tool_name, args_fn in self._ACTION_RULES:
+                m = pattern.search(rec)
+                if not m:
+                    continue
+                try:
+                    params = args_fn(m, rec)
+                except Exception:
+                    continue
+                target_val = params.get("ip") or params.get("hostname") or params.get("user_email") or params.get("target") or "—"
+                params["_description"] = rec
+                params["_tool"] = tool_name
+                self.db.add(AgentAction(
+                    investigation_id=investigation.id,
+                    organization_id=investigation.organization_id,
+                    action_type=action_type,
+                    target=str(target_val)[:255],
+                    parameters=json.dumps(params),
+                    requires_approval=True,
+                    execution_status=ActionExecutionStatus.PENDING_APPROVAL.value,
+                    rollback_available=True,
+                ))
+                materialized += 1
+                matched = True
+                break
+            if not matched:
+                # Unclassifiable recommendation — still surface as a human
+                # task so nothing gets silently dropped.
+                self.db.add(AgentAction(
+                    investigation_id=investigation.id,
+                    organization_id=investigation.organization_id,
+                    action_type=ActionType.ESCALATE.value,
+                    target="human-analyst",
+                    parameters=json.dumps({"_description": rec, "_tool": None}),
+                    requires_approval=True,
+                    execution_status=ActionExecutionStatus.PENDING_APPROVAL.value,
+                    rollback_available=False,
+                ))
+                materialized += 1
+        if materialized:
+            logger.info(f"[autonomous] materialized {materialized} recommendations as approval-gated actions")

@@ -71,7 +71,8 @@ def run_investigation(
             from src.agentic.investigator import AutonomousInvestigator
             from src.agentic.models import Investigation, InvestigationStatus
             from sqlalchemy import select as sa_select
-            async with AsyncSessionLocal() as db:
+            _engine, _factory = _fresh_async_session_factory()
+            async with _factory() as db:
                 # Find or create the Investigation row. If the caller
                 # already POSTed /investigations, reuse that row;
                 # otherwise create one here.
@@ -106,13 +107,15 @@ def run_investigation(
 
                 investigator = AutonomousInvestigator(db)
                 await investigator.run(existing)
-                return {
+                result = {
                     "investigation_id": existing.id,
                     "status": existing.status,
                     "confidence": existing.confidence_score,
                     "resolution_type": existing.resolution_type,
                     "findings_summary": existing.findings_summary,
                 }
+                await _engine.dispose()
+                return result
 
         import asyncio
         result = asyncio.run(_run())
@@ -388,6 +391,23 @@ def autonomous_triage(
         raise self.retry(exc=e, countdown=60 * (2 ** self.request.retries))
 
 
+def _fresh_async_session_factory():
+    """Create a per-call engine with NullPool.
+
+    Celery prefork workers re-enter asyncio.run() per task, and
+    asyncpg connection pools tie futures to the first loop that opened
+    them. Sharing the module-level engine across tasks produces
+    `Task ... got Future attached to a different loop` crashes on the
+    second invocation. A per-task engine with NullPool closes every
+    connection at context exit, so the next task gets a clean slate.
+    """
+    from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+    from sqlalchemy.orm import sessionmaker as _sm
+    from sqlalchemy.pool import NullPool
+    e = create_async_engine(settings.database_url, echo=False, poolclass=NullPool)
+    return e, _sm(e, class_=AsyncSession, expire_on_commit=False)
+
+
 @shared_task(bind=True)
 def auto_triage_new_alerts(self):
     """Proactive auto-triage across all orgs.
@@ -413,7 +433,8 @@ def auto_triage_new_alerts(self):
     async def _scan():
         since = datetime.now(timezone.utc) - timedelta(minutes=10)
         enqueued = 0
-        async with AsyncSessionLocal() as db:
+        _engine, _session_factory = _fresh_async_session_factory()
+        async with _session_factory() as db:
             # Pick every new-enough high/critical alert that has not
             # already been investigated. We check trigger_source_id
             # instead of a dedicated column because Investigation
@@ -470,6 +491,7 @@ def auto_triage_new_alerts(self):
                     initial_context={"auto_triage": True, "severity": a.severity},
                 )
                 enqueued += 1
+        await _engine.dispose()
         return {"enqueued": enqueued, "checked": len(alerts)}
 
     try:
