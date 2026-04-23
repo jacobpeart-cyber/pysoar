@@ -389,6 +389,101 @@ def autonomous_triage(
 
 
 @shared_task(bind=True)
+def auto_triage_new_alerts(self):
+    """Proactive auto-triage across all orgs.
+
+    Runs every 60s. For each critical/high alert created in the last
+    10 minutes that has NO existing Investigation row referencing it,
+    kicks off `run_investigation` so the autonomous investigator
+    handles triage without a human typing in chat.
+
+    This is what turns the agent from reactive (user asks) to a
+    standing analyst queue watcher. Every org's Investigation Agent
+    (seeded by default at deploy) becomes the on-call triage bot.
+
+    Idempotent by design: the Investigation-by-trigger lookup prevents
+    double-triaging the same alert, and the 10-minute lookback window
+    caps backlog processing on a slow worker.
+    """
+    from sqlalchemy import select, func as sqlfunc
+    from src.agentic.models import Investigation, SOCAgent
+    from src.models.alert import Alert
+    from datetime import datetime, timedelta, timezone
+
+    async def _scan():
+        since = datetime.now(timezone.utc) - timedelta(minutes=10)
+        enqueued = 0
+        async with AsyncSessionLocal() as db:
+            # Pick every new-enough high/critical alert that has not
+            # already been investigated. We check trigger_source_id
+            # instead of a dedicated column because Investigation
+            # points back to the triggering entity via that field.
+            alerts = list(await db.scalars(
+                select(Alert).where(
+                    Alert.created_at >= since,
+                    Alert.severity.in_(["critical", "high"]),
+                    Alert.status.in_(["new", "open", "investigating"]),
+                ).limit(25)
+            ))
+            if not alerts:
+                return {"enqueued": 0, "checked": 0}
+
+            existing_ids = set(await db.scalars(
+                select(Investigation.trigger_source_id).where(
+                    Investigation.trigger_source_id.in_([a.id for a in alerts]),
+                    Investigation.trigger_type == "alert",
+                )
+            ))
+
+            # Resolve the investigation-capable SOC agent per org once.
+            agent_by_org: dict[str, str] = {}
+            for a in alerts:
+                if a.id in existing_ids:
+                    continue
+                org_id = a.organization_id
+                if not org_id:
+                    continue
+                if org_id not in agent_by_org:
+                    agent = (await db.execute(
+                        select(SOCAgent).where(
+                            SOCAgent.organization_id == org_id,
+                            SOCAgent.agent_type.in_(["investigation", "triage_analyst"]),
+                        ).limit(1)
+                    )).scalar_one_or_none()
+                    if agent is None:
+                        # Fallback: any agent in the org.
+                        agent = (await db.execute(
+                            select(SOCAgent).where(
+                                SOCAgent.organization_id == org_id,
+                            ).limit(1)
+                        )).scalar_one_or_none()
+                    agent_by_org[org_id] = agent.id if agent else None
+                agent_id = agent_by_org[org_id]
+                if not agent_id:
+                    continue
+                run_investigation.delay(
+                    agent_id=agent_id,
+                    organization_id=org_id,
+                    trigger_type="alert",
+                    trigger_source_id=a.id,
+                    title=f"Auto-triage: {a.title[:160]}",
+                    initial_context={"auto_triage": True, "severity": a.severity},
+                )
+                enqueued += 1
+        return {"enqueued": enqueued, "checked": len(alerts)}
+
+    try:
+        import asyncio
+        result = asyncio.run(_scan())
+        if result.get("enqueued"):
+            logger.info(f"auto_triage_new_alerts: enqueued {result['enqueued']} investigations")
+        return result
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"auto_triage_new_alerts failed: {exc}")
+        return {"enqueued": 0, "error": str(exc)[:200]}
+
+
+@shared_task(bind=True)
 def cleanup_stale_investigations(
     self,
     days_old: int = 30,

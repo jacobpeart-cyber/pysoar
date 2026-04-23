@@ -169,6 +169,32 @@ const AgenticSOC: React.FC = () => {
       }
     };
     loadData();
+    // Refresh investigations + agent metrics every 10s so the UI
+    // reflects auto-triage kickoffs and live investigation progress
+    // without a page reload. Other slow/one-shot data (AI models,
+    // dashboard counters) stays on-mount only.
+    const pollId = window.setInterval(() => {
+      (async () => {
+        try {
+          const [invRes, actRes] = await Promise.all([
+            api.get('/agentic/investigations').catch(() => ({ data: { items: [] } })),
+            api.get('/agentic/actions/pending-approval').catch(() => ({ data: { items: [] } })),
+          ]);
+          const invList = invRes?.data?.items || (Array.isArray(invRes?.data) ? invRes.data : []);
+          const actList = actRes?.data?.items || (Array.isArray(actRes?.data) ? actRes.data : []);
+          setInvestigations(invList);
+          setPendingApprovals(actList);
+          setAgentMetrics((m) => ({
+            ...m,
+            openInvestigations: invList.filter((i: any) => i.status !== 'completed' && i.status !== 'closed').length,
+            actionsPendingApproval: actList.length,
+          }));
+        } catch {
+          /* ignore transient poll errors */
+        }
+      })();
+    }, 10000);
+    return () => window.clearInterval(pollId);
   }, []);
 
   // Load AI Engine data (dashboard, triage, models) once on mount
@@ -536,45 +562,72 @@ const AgenticSOC: React.FC = () => {
               <div className="space-y-4">
                 {investigations.length === 0 ? (
                   <div className="text-center py-8 text-gray-500 dark:text-gray-400 text-sm">
-                    No investigations yet. Kick one off from an alert or run
-                    an agent against an incident to see it here.
+                    No investigations yet. The auto-triage beat will open one
+                    the moment a critical or high alert arrives; or kick one
+                    off manually from an alert.
                   </div>
                 ) : null}
-                {investigations.map((inv) => (
-                  <div
-                    key={inv.id}
-                    className="border border-gray-200 dark:border-gray-700 rounded-lg p-4 hover:bg-gray-50 dark:hover:bg-gray-700 transition cursor-pointer"
-                    onClick={() => setSelectedInvestigation(inv.id)}
-                  >
-                    <div className="flex items-center justify-between">
-                      <div className="flex-1">
-                        <h3 className="font-semibold text-gray-900 dark:text-white">
-                          {inv.title || 'Untitled Investigation'}
-                        </h3>
-                        <p className="text-sm text-gray-600 dark:text-gray-400 mt-1">
-                          Started {inv.created_at ? new Date(inv.created_at || "").toLocaleString() : 'Unknown'}
-                        </p>
-                      </div>
-                      <div className="text-right">
-                        <div
-                          className={clsx(
-                            'px-3 py-1 text-xs font-medium rounded mb-2',
-                            (inv.confidence_score || 0) >= 95
-                              ? 'bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-200'
-                              : (inv.confidence_score || 0) >= 85
-                                ? 'bg-blue-100 dark:bg-blue-900 text-blue-800 dark:text-blue-200'
-                                : 'bg-orange-100 dark:bg-orange-900 text-orange-800 dark:text-orange-200'
-                          )}
-                        >
-                          {inv.confidence_score ?? 0}% Confidence
+                {investigations.map((inv: any) => {
+                  const verdict: string | null = inv.resolution_type || null;
+                  const verdictColor = verdict === 'true_positive'
+                    ? 'bg-red-100 dark:bg-red-900/30 text-red-800 dark:text-red-300'
+                    : verdict === 'false_positive' || verdict === 'benign'
+                      ? 'bg-green-100 dark:bg-green-900/30 text-green-800 dark:text-green-300'
+                      : verdict === 'escalated'
+                        ? 'bg-orange-100 dark:bg-orange-900/30 text-orange-800 dark:text-orange-300'
+                        : 'bg-gray-100 dark:bg-gray-700 text-gray-800 dark:text-gray-300';
+                  const isRunning = inv.status === 'gathering_evidence' || inv.status === 'analyzing' || inv.status === 'reasoning';
+                  const summary: string = inv.findings_summary || inv.hypothesis || '';
+                  const isAutoTriage = /^auto-triage:/i.test(inv.title || '');
+                  return (
+                    <div
+                      key={inv.id}
+                      className="border border-gray-200 dark:border-gray-700 rounded-lg p-4 hover:bg-gray-50 dark:hover:bg-gray-700 transition cursor-pointer"
+                      onClick={() => setSelectedInvestigation(inv.id)}
+                    >
+                      <div className="flex items-start justify-between gap-4">
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <h3 className="font-semibold text-gray-900 dark:text-white truncate">
+                              {inv.title || 'Untitled Investigation'}
+                            </h3>
+                            {isAutoTriage && (
+                              <span className="text-[10px] px-2 py-0.5 bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300 rounded-full uppercase tracking-wide">
+                                auto
+                              </span>
+                            )}
+                            {isRunning && (
+                              <span className="text-[10px] px-2 py-0.5 bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 rounded-full animate-pulse">
+                                running…
+                              </span>
+                            )}
+                          </div>
+                          <p className="text-xs text-gray-500 dark:text-gray-400 mt-1">
+                            {inv.created_at ? new Date(inv.created_at).toLocaleString() : '—'} · {inv.status}
+                          </p>
+                          {summary ? (
+                            <p className="text-sm text-gray-700 dark:text-gray-300 mt-2 line-clamp-2">
+                              {summary}
+                            </p>
+                          ) : null}
                         </div>
-                        <p className="text-sm font-medium text-gray-700 dark:text-gray-300">
-                          {inv.status || 'Unknown'}
-                        </p>
+                        <div className="text-right flex-shrink-0">
+                          {verdict ? (
+                            <span className={clsx(
+                              'inline-block px-2.5 py-1 text-[11px] font-semibold rounded mb-2',
+                              verdictColor,
+                            )}>
+                              {verdict.replace(/_/g, ' ')}
+                            </span>
+                          ) : null}
+                          <div className="text-xs font-medium text-gray-900 dark:text-white">
+                            {inv.confidence_score ?? 0}% conf
+                          </div>
+                        </div>
                       </div>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
           )}
