@@ -174,10 +174,21 @@ class STIGScanner:
         """
         logger.info(f"Starting STIG scan on {host} for {benchmark_id}")
 
+        # Initialize so the except branch can safely reference it even
+        # if the benchmark lookup fails before scan_result is assigned.
+        scan_result = None
+
         try:
-            # Verify benchmark exists
+            # Accept either the STIGBenchmark row UUID (what the UI
+            # holds after an upload) OR the XCCDF benchmark_id string
+            # (what the doc itself declares). Fail open on UUID lookup
+            # misses so the string match still has a chance.
+            from sqlalchemy import or_
             stmt = select(STIGBenchmark).where(
-                STIGBenchmark.benchmark_id == benchmark_id
+                or_(
+                    STIGBenchmark.id == benchmark_id,
+                    STIGBenchmark.benchmark_id == benchmark_id,
+                )
             )
             benchmark = await self.session.scalar(stmt)
             if not benchmark:
