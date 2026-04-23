@@ -112,3 +112,11 @@ site/
 # Jupyter Notebooks
 .ipynb_checkpoints/
 .playwright-mcp/
+
+# Playwright/debug screenshots dropped in repo root during audits
+/agentic*.png
+/agent-console*.png
+/compliance*.png
+/fedramp*.png
+/stig*.png
+/page-*.png
