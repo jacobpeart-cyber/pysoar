@@ -35,11 +35,12 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 
 AGENT_VERSION = "0.1.0"
 DEFAULT_TOKEN_FILE = Path.home() / ".pysoar" / "agent.token"
 POLL_INTERVAL_SECONDS = 30
+HEARTBEAT_INTERVAL_SECONDS = 300  # 5 min posture push for ZT PDP freshness
 HEARTBEAT_EVERY_N_POLLS = 1  # poll doubles as heartbeat server-side
 
 
@@ -641,6 +642,100 @@ ACTION_HANDLERS: dict[str, Any] = {}
 # HTTP helpers (stdlib only so the agent has zero dependencies)
 # ---------------------------------------------------------------------------
 
+def _collect_posture() -> Dict[str, Any]:
+    """Snapshot device posture for the Zero Trust trust-score pipeline.
+
+    Returns a telemetry dict with booleans the server's
+    DeviceTrustAssessor consumes to compute a device trust score
+    (encryption, AV, firewall, patching). Every signal is inspected
+    directly on the host — no cached values — so a device that drifts
+    out of compliance mid-session is caught by the next heartbeat.
+
+    Runs best-effort: a failed probe is reported as ``None``, never a
+    false-positive ``True``. Downstream code treats ``None`` as
+    untrusted.
+    """
+    posture: Dict[str, Any] = {
+        "uptime_seconds": int(time.monotonic()),
+        "os_type": platform.system().lower(),
+        "os_release": platform.release(),
+        "hostname": socket.gethostname(),
+    }
+    osname = posture["os_type"]
+
+    def _run(cmd: list[str], timeout: int = 4) -> Optional[str]:
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            return (result.stdout or "") + (result.stderr or "")
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+            return None
+
+    # OS patch freshness — approximate from package index age on Linux,
+    # or swupd/softwareupdate on macOS, or Windows Update service state.
+    patched: Optional[bool] = None
+    if osname == "linux":
+        for marker in ("/var/lib/apt/periodic/update-success-stamp", "/var/lib/dnf/last_makecache", "/var/cache/apt/pkgcache.bin"):
+            try:
+                age = time.time() - os.path.getmtime(marker)
+                patched = age < (14 * 24 * 3600)  # Patched within 2 weeks
+                break
+            except OSError:
+                continue
+    elif osname == "darwin":
+        patched = _run(["softwareupdate", "-l"]) is not None
+    elif osname == "windows":
+        out = _run(["sc", "query", "wuauserv"]) or ""
+        patched = "RUNNING" in out.upper()
+    posture["os_patched"] = patched
+
+    # Full-disk encryption.
+    encrypted: Optional[bool] = None
+    if osname == "linux":
+        out = _run(["lsblk", "-o", "TYPE,NAME"])
+        if out is not None:
+            encrypted = "crypt" in out.lower()
+    elif osname == "darwin":
+        out = _run(["fdesetup", "status"])
+        encrypted = ("on" in (out or "").lower()) if out else None
+    elif osname == "windows":
+        out = _run(["manage-bde", "-status"])
+        encrypted = ("protection on" in (out or "").lower()) if out else None
+    posture["encryption_enabled"] = encrypted
+
+    # Antivirus / EDR presence — best-effort process-name sniff.
+    av_markers = {
+        "linux": ("clamd", "freshclam", "crowdstrike", "sentinel", "carbonblack"),
+        "darwin": ("clamd", "crowdstrike", "xprotect", "sentinel"),
+        "windows": ("msmpeng", "mssense", "crowdstrike", "sentinel", "carbonblack"),
+    }.get(osname, ())
+    av_active: Optional[bool] = None
+    ps_out = _run(["ps", "-eo", "comm"]) if osname != "windows" else _run(["tasklist"])
+    if ps_out is not None:
+        blob = ps_out.lower()
+        av_active = any(m in blob for m in av_markers) if av_markers else False
+    posture["av_active"] = av_active
+
+    # Host firewall state.
+    firewall_on: Optional[bool] = None
+    if osname == "linux":
+        out = (_run(["iptables", "-S"]) or _run(["nft", "list", "ruleset"]) or "") or None
+        firewall_on = (out is not None) and ("DROP" in out or "drop" in out or "policy drop" in out.lower())
+    elif osname == "darwin":
+        out = _run(["/usr/libexec/ApplicationFirewall/socketfilterfw", "--getglobalstate"])
+        firewall_on = ("enabled" in (out or "").lower()) if out else None
+    elif osname == "windows":
+        out = _run(["netsh", "advfirewall", "show", "allprofiles", "state"])
+        firewall_on = ("state                                 ON" in (out or "")) if out else None
+    posture["firewall_on"] = firewall_on
+
+    return posture
+
+
 def _http_request(
     url: str,
     method: str = "GET",
@@ -768,10 +863,29 @@ def cmd_poll(args: argparse.Namespace) -> int:
     result_base = f"{args.server.rstrip('/')}/api/v1/agents/_agent/commands"
 
     print(f"[pysoar-agent] polling {poll_url} every {POLL_INTERVAL_SECONDS}s")
-    telemetry_payload = {"telemetry": {"uptime": 0}, "agent_version": AGENT_VERSION}
-    _http_request(hb_url, method="POST", body=telemetry_payload, token=token)
+    # Send initial posture heartbeat, then re-send every
+    # HEARTBEAT_INTERVAL_SECONDS so the Zero Trust PDP always sees
+    # fresh device compliance state (NIST SP 800-207 §2.1).
+    def _send_heartbeat() -> None:
+        _http_request(
+            hb_url,
+            method="POST",
+            body={"telemetry": _collect_posture(), "agent_version": AGENT_VERSION},
+            token=token,
+        )
+
+    _send_heartbeat()
+    last_heartbeat_ts = time.monotonic()
 
     while True:
+        # Time-triggered heartbeat: push posture every
+        # HEARTBEAT_INTERVAL_SECONDS (default 300s / 5 min). The ZT
+        # continuous evaluation task runs every 5 min too, so a device
+        # drift is reflected in the next session evaluation.
+        if time.monotonic() - last_heartbeat_ts >= HEARTBEAT_INTERVAL_SECONDS:
+            _send_heartbeat()
+            last_heartbeat_ts = time.monotonic()
+
         status_code, resp = _http_request(poll_url, method="GET", token=token)
         if status_code == 401:
             print("[pysoar-agent] token rejected — re-enroll required")

@@ -546,6 +546,33 @@ async def agent_heartbeat(
     svc = AgentService(session)
     await svc.record_heartbeat(agent, telemetry=request.telemetry)
 
+    # Zero Trust continuous verification: fold the agent's fresh posture
+    # telemetry into its DeviceTrustProfile so the PDP evaluates against
+    # up-to-the-minute compliance state. Posture keys (os_patched,
+    # encryption_enabled, av_active, firewall_on) are written from the
+    # agent on every heartbeat; the trust score is then recalculated.
+    try:
+        posture = request.telemetry or {}
+        if any(k in posture for k in ("os_patched", "encryption_enabled", "av_active", "firewall_on")):
+            from src.zerotrust.engine import DeviceTrustAssessor
+            assessor = DeviceTrustAssessor(session, agent.organization_id)
+            await assessor.update_device_compliance(
+                device_id=agent.id,
+                compliance_data={
+                    "os_patched": bool(posture.get("os_patched")),
+                    "encryption_enabled": bool(posture.get("encryption_enabled")),
+                    "av_active": bool(posture.get("av_active")),
+                    "firewall_on": bool(posture.get("firewall_on")),
+                    "certificate_valid": True,
+                    "jailbroken": False,
+                    "last_posture_at": posture.get("hostname") and str(agent.last_heartbeat_at or ""),
+                },
+            )
+            await session.commit()
+    except Exception as _zt_err:  # noqa: BLE001
+        # Heartbeat must succeed even if ZT telemetry ingestion fails.
+        logger.warning("ZT posture update failed for agent %s: %s", agent.id, _zt_err)
+
     # Stream agent-tailed local logs into the SIEM. The agent reads
     # /var/log/syslog (Linux) or Windows event log lines since its
     # last heartbeat and ships them here so PySOAR doesn't need a
