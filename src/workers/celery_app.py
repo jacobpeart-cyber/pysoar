@@ -96,6 +96,15 @@ celery_app.conf.beat_schedule = {
         "task": "siem.poll_cloud_integrations",
         "schedule": 300.0,  # Every 5 minutes
     },
+    # --- Autonomous SOC triage (src.agentic.tasks.auto_triage_new_alerts) ---
+    # Every 60s, scan for new critical/high alerts that don't yet have an
+    # Investigation row and kick off the LLM-driven AutonomousInvestigator
+    # on each. Turns the agent from reactive (wait for chat) to a
+    # standing on-call analyst that handles incoming work automatically.
+    "agentic-auto-triage": {
+        "task": "src.agentic.tasks.auto_triage_new_alerts",
+        "schedule": 60.0,
+    },
     # --- Weekly STIG fleet sweep (src.stig.tasks.scheduled_fleet_stig_sweep) ---
     # FedRAMP/NIST SP 800-137 continuous monitoring: every active endpoint
     # agent is scanned against every loaded STIG benchmark once per week.
