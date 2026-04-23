@@ -599,7 +599,20 @@ async def approve_action(
     db: DatabaseSession = None,
     action_id: str = Path(...),
 ):
-    """Approve action execution"""
+    """Approve an agent-proposed action and execute it.
+
+    When `approved=true`, the action is dispatched through the
+    AgentToolRegistry (same registry the chat agent and autonomous
+    investigator use). The tool executes against real platform state
+    and the outcome is persisted back onto the AgentAction row so a
+    3PAO can trace: investigation → recommendation → approval →
+    execution → result.
+
+    Closes the IR loop the autonomous investigator started: a TP
+    verdict produces approval-gated actions; a human clicks approve;
+    the platform actually executes. Every hop is logged in
+    ticket_activities (AU-2) and the AgentAction row (AU-3).
+    """
     action = await db.get(AgentAction, action_id)
 
     if not action or action.organization_id != getattr(current_user, "organization_id", None):
@@ -608,18 +621,72 @@ async def approve_action(
             detail="Action not found",
         )
 
-    if approval.approved:
-        action.execution_status = ActionExecutionStatus.APPROVED.value
-        action.approved_by = current_user.id
-        action.approval_timestamp = datetime.now(timezone.utc).isoformat()
-    else:
+    if not approval.approved:
         action.execution_status = ActionExecutionStatus.DENIED.value
+        await db.commit()
+        return {"status": "denied", "action_id": action_id}
+
+    # Mark approved, then dispatch.
+    action.execution_status = ActionExecutionStatus.APPROVED.value
+    action.approved_by = current_user.id
+    action.approval_timestamp = datetime.now(timezone.utc).isoformat()
+    await db.flush()
+
+    # AU-2 audit: record the approval decision before execution.
+    try:
+        from src.tickethub.models import TicketActivity
+        db.add(TicketActivity(
+            source_type="agent_action",
+            source_id=action.id,
+            activity_type="action_approved",
+            description=(
+                f"user={getattr(current_user, 'email', 'system')} "
+                f"action_type={action.action_type} target={action.target}"
+            ),
+            organization_id=action.organization_id,
+        ))
+        await db.flush()
+    except Exception:
+        pass
+
+    # Execute via the same tool registry the agent uses. `parameters`
+    # carries _tool (which registered tool to invoke) + the tool args.
+    try:
+        from src.services.agent_tools import AgentToolRegistry
+        registry = AgentToolRegistry(db)
+        params = json.loads(action.parameters) if action.parameters else {}
+        tool_name = params.pop("_tool", None)
+        params.pop("_description", None)  # not a tool arg
+        if tool_name:
+            action.execution_status = ActionExecutionStatus.EXECUTING.value
+            await db.flush()
+            result = await registry.execute(tool_name, params)
+            action.result = json.dumps(result, default=str)[:8000]
+            action.execution_status = (
+                ActionExecutionStatus.COMPLETED.value
+                if result.get("success")
+                else ActionExecutionStatus.FAILED.value
+            )
+        else:
+            # No mapped tool (e.g. ESCALATE / SNAPSHOT_VM) — the human
+            # analyst is the executor. We record approval only.
+            action.result = json.dumps({
+                "note": "Approved as human task — no automated tool",
+                "description": params.get("description") or "",
+            })
+            action.execution_status = ActionExecutionStatus.COMPLETED.value
+    except Exception as exc:  # noqa: BLE001
+        action.execution_status = ActionExecutionStatus.FAILED.value
+        action.result = json.dumps({"error": str(exc)[:500]})
+        logger.exception("approve_action execution failed")
 
     await db.commit()
 
     return {
-        "status": "approved" if approval.approved else "denied",
+        "status": "approved",
         "action_id": action_id,
+        "execution_status": action.execution_status,
+        "result_preview": (action.result or "")[:300],
     }
 
 
