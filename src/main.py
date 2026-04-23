@@ -312,6 +312,14 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 
 app.add_middleware(RateLimitMiddleware)
 
+# Zero Trust session gate — NIST SP 800-207 continuous verification.
+# Runs before audit so a denied request is still logged, and before
+# routing so revoked sessions never reach route handlers. Cached in
+# Redis (30s TTL for allows, 24h for denies) to keep latency within
+# a millisecond or two per request.
+from src.zerotrust.session_gate import ZeroTrustSessionMiddleware
+app.add_middleware(ZeroTrustSessionMiddleware)
+
 # Add audit logging middleware
 app.add_middleware(AuditLoggingMiddleware)
 
