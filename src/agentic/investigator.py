@@ -235,7 +235,17 @@ class AutonomousInvestigator:
         # Seed the transcript with the primary alert data so Gemini
         # doesn't have to call list_alerts first.
         seeded_context = await self._seed_context(investigation)
-        evidence = {"seed": seeded_context, "tool_results": []}
+        # Pull the most recent analyst corrections for this org so the
+        # investigator sees prior mistakes and adjusts. This is the
+        # learning-from-feedback loop — without it, the agent would
+        # repeat the same false-positive classification on every
+        # similar alert.
+        recent_corrections = await self._recent_corrections(investigation)
+        evidence = {
+            "seed": seeded_context,
+            "recent_analyst_corrections": recent_corrections,
+            "tool_results": [],
+        }
 
         tool_declarations = self._filtered_tool_declarations()
 
@@ -369,6 +379,32 @@ class AutonomousInvestigator:
             if d["name"] not in AUTONOMOUS_BLOCKED_TOOLS
         ]
 
+    async def _recent_corrections(self, investigation: Investigation) -> list[dict[str, Any]]:
+        """Pull the most recent N analyst corrections for this org so
+        the investigator learns from prior mistakes. Each correction
+        carries what the agent originally said + what the reviewer
+        changed it to + why."""
+        try:
+            from src.agentic.models import InvestigationFeedback as _IF
+            rows = list(await self.db.scalars(
+                select(_IF).where(
+                    _IF.organization_id == investigation.organization_id,
+                    _IF.investigation_id != investigation.id,
+                ).order_by(_IF.created_at.desc()).limit(5)
+            ))
+            return [
+                {
+                    "agent_verdict": r.agent_verdict,
+                    "agent_confidence": r.agent_confidence,
+                    "corrected_verdict": r.corrected_verdict,
+                    "correction_note": (r.correction_note or "")[:500],
+                }
+                for r in rows
+            ]
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"[autonomous] _recent_corrections failed: {exc}")
+            return []
+
     async def _seed_context(self, investigation: Investigation) -> dict[str, Any]:
         """Pull the primary triggering alert/incident into the evidence
         bundle so step 1 always has something concrete to reason over."""
@@ -409,11 +445,27 @@ class AutonomousInvestigator:
     ) -> str:
         """Compact the investigation state into a prompt the LLM can reason over."""
         recent_tools = evidence.get("tool_results", [])[-5:]  # keep prompt small
+        corrections = evidence.get("recent_analyst_corrections") or []
+        corrections_block = ""
+        if corrections:
+            # Surface each correction in a form the LLM can act on.
+            corrections_block = (
+                "\nRECENT ANALYST CORRECTIONS (the agent got these wrong "
+                "before — use them to calibrate your verdict):\n"
+            )
+            for c in corrections:
+                corrections_block += (
+                    f"  - Agent said {c.get('agent_verdict')}"
+                    f"@{c.get('agent_confidence') or 0:.0f}%; reviewer changed to "
+                    f"{c.get('corrected_verdict')}. Why: "
+                    f"{c.get('correction_note') or '(no note)'}\n"
+                )
         return (
             f"Investigation #{investigation.id[:8]} — step {step_num}/{MAX_STEPS}\n"
             f"Goal: {investigation.title}\n"
             f"Trigger: {investigation.trigger_type}:{investigation.trigger_source_id}\n"
-            f"Current hypothesis: {investigation.hypothesis or '(not yet formed)'}\n\n"
+            f"Current hypothesis: {investigation.hypothesis or '(not yet formed)'}\n"
+            f"{corrections_block}\n"
             f"Primary trigger data:\n{json.dumps(evidence.get('seed', {}), indent=2, default=str)[:3000]}\n\n"
             f"Recent tool results (last 5):\n{json.dumps(recent_tools, indent=2, default=str)[:8000]}\n\n"
             "Take the next step. Either call a tool to gather more evidence or,"

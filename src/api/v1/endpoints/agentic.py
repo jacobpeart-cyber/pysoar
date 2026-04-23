@@ -30,6 +30,7 @@ from src.agentic.models import (
     AgentMemory,
     AgentChatSession,
     AgentChatMessage,
+    InvestigationFeedback as InvestigationFeedbackRow,
     InvestigationStatus,
     ActionExecutionStatus,
 )
@@ -44,6 +45,7 @@ from src.schemas.agentic import (
     InvestigationUpdate,
     InvestigationResponse,
     InvestigationListResponse,
+    InvestigationCorrection,
     InvestigationFeedback,
     AgentActionResponse,
     AgentActionApproval,
@@ -510,7 +512,7 @@ async def submit_investigation_feedback(
     db: DatabaseSession = None,
     investigation_id: str = Path(...),
 ):
-    """Submit feedback on investigation quality"""
+    """Submit quality-rating feedback on an investigation."""
     investigation = await db.get(Investigation, investigation_id)
 
     if not investigation or investigation.organization_id != getattr(current_user, "organization_id", None):
@@ -528,6 +530,106 @@ async def submit_investigation_feedback(
         "status": "feedback_recorded",
         "investigation_id": investigation_id,
         "rating": feedback.rating,
+    }
+
+
+@router.post("/investigations/{investigation_id}/correct")
+async def correct_investigation_verdict(
+    correction: InvestigationCorrection,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+    investigation_id: str = Path(...),
+):
+    """Mark an investigation's verdict wrong.
+
+    Writes a structured InvestigationFeedback row that future
+    investigations read into their prompt context — so the agent
+    adjusts its hypothesis-generation when similar alerts arrive.
+    A reviewer explanation in `correction_note` is the most valuable
+    learning signal; the agent quotes it verbatim in the prompt so
+    the next investigation understands WHY the prior call was wrong.
+    """
+    investigation = await db.get(Investigation, investigation_id)
+    org_id = getattr(current_user, "organization_id", None)
+    if not investigation or investigation.organization_id != org_id:
+        raise HTTPException(status_code=404, detail="Investigation not found")
+
+    row = InvestigationFeedbackRow(
+        investigation_id=investigation_id,
+        organization_id=org_id,
+        reviewer_user_id=current_user.id,
+        corrected_verdict=correction.corrected_verdict,
+        agent_verdict=investigation.resolution_type,
+        agent_confidence=investigation.confidence_score,
+        correction_note=correction.correction_note,
+    )
+    db.add(row)
+
+    # Update the investigation itself so the Investigations UI shows
+    # the corrected verdict with a visible "human-corrected" marker.
+    investigation.resolution_type = correction.corrected_verdict
+    if not investigation.human_feedback and correction.correction_note:
+        investigation.human_feedback = correction.correction_note
+
+    # AU-2 audit — record the correction so a 3PAO can see who
+    # overrode which agent call.
+    try:
+        from src.tickethub.models import TicketActivity
+        db.add(TicketActivity(
+            source_type="investigation",
+            source_id=investigation_id,
+            activity_type="verdict_corrected",
+            description=(
+                f"user={current_user.email} "
+                f"agent_verdict={row.agent_verdict}@{row.agent_confidence or 0:.0f}% "
+                f"→ corrected={correction.corrected_verdict} "
+                f"note={(correction.correction_note or '')[:300]}"
+            ),
+            organization_id=org_id,
+        ))
+    except Exception:
+        pass
+
+    await db.commit()
+    await db.refresh(row)
+    return {
+        "status": "correction_recorded",
+        "investigation_id": investigation_id,
+        "corrected_verdict": row.corrected_verdict,
+        "feedback_id": row.id,
+    }
+
+
+@router.get("/investigations/{investigation_id}/feedback")
+async def list_investigation_feedback(
+    investigation_id: str = Path(...),
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+):
+    """Return corrections recorded for this investigation."""
+    investigation = await db.get(Investigation, investigation_id)
+    org_id = getattr(current_user, "organization_id", None)
+    if not investigation or investigation.organization_id != org_id:
+        raise HTTPException(status_code=404, detail="Investigation not found")
+    rows = list(await db.scalars(
+        select(InvestigationFeedbackRow)
+        .where(InvestigationFeedbackRow.investigation_id == investigation_id)
+        .order_by(InvestigationFeedbackRow.created_at.desc())
+    ))
+    return {
+        "items": [
+            {
+                "id": r.id,
+                "reviewer_user_id": r.reviewer_user_id,
+                "agent_verdict": r.agent_verdict,
+                "agent_confidence": r.agent_confidence,
+                "corrected_verdict": r.corrected_verdict,
+                "correction_note": r.correction_note,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+            }
+            for r in rows
+        ],
+        "total": len(rows),
     }
 
 

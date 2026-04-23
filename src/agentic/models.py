@@ -514,3 +514,41 @@ class AgentChatMessage(BaseModel):
     # Tool invocations recorded on assistant turns; list of
     # {step, tool, args, result, blocked?} dicts.
     tool_calls: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+
+
+class InvestigationFeedback(BaseModel):
+    """Human correction on an autonomous investigation's verdict.
+
+    When an analyst marks a verdict wrong, this row captures what
+    the agent got wrong so the investigator can read recent feedback
+    on future runs and (eventually) improve its hypothesis-generation
+    prompt. Every feedback is org-scoped and user-attributed so we
+    can filter out reviewer-specific noise."""
+
+    __tablename__ = "investigation_feedback"
+
+    investigation_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("investigations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    organization_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("organizations.id"), nullable=False, index=True
+    )
+    reviewer_user_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("users.id"), nullable=False, index=True
+    )
+    # Corrected verdict the reviewer believes is right.
+    corrected_verdict: Mapped[str] = mapped_column(
+        String(50), nullable=False
+    )  # true_positive | false_positive | benign | inconclusive | escalated
+    # Original verdict the agent emitted (snapshot for audit even if
+    # the Investigation row is later deleted).
+    agent_verdict: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    agent_confidence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    # Free-form explanation of what the agent missed or got wrong. The
+    # investigator reads the most recent N of these into its prompt
+    # context so future investigations of similar alerts don't repeat
+    # the same mistake.
+    correction_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)

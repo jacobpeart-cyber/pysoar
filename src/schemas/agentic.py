@@ -446,6 +446,15 @@ class ResolutionTimes(BaseModel):
 # ============================================================================
 
 
+class InvestigationCorrection(BaseModel):
+    """Structured analyst correction for an investigation verdict.
+    Captures the reviewer's corrected verdict + why, so future
+    investigations can read recent corrections into their prompt
+    context and avoid repeating the same wrong call."""
+    corrected_verdict: str = Field(..., description="true_positive | false_positive | benign | inconclusive | escalated")
+    correction_note: Optional[str] = Field(None, max_length=4000, description="What the agent missed or got wrong")
+
+
 class InvestigationFeedback(BaseModel):
     """Feedback on investigation quality"""
 
