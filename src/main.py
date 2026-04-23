@@ -218,6 +218,23 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     except Exception as e:  # noqa: BLE001
         logger.warning("Compliance framework seeding failed", error=str(e))
 
+    # Seed the on-host simulation agent that Purple Team / Live Response
+    # targets. Creates a single active EndpointAgent per organization
+    # (idempotent) and writes its long-lived token to
+    # /app/data/agent/<org>.token so the pysoar-agent container can read
+    # it and start polling immediately after API boot.
+    try:
+        from src.agents.sim_seeder import seed_sim_agents
+        sim_result = await seed_sim_agents()
+        if sim_result.get("created") or sim_result.get("tokens_written"):
+            logger.info(
+                "Seeded simulation agent",
+                created=sim_result.get("created", 0),
+                tokens_written=sim_result.get("tokens_written", 0),
+            )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Simulation agent seeding failed", error=str(e))
+
     yield
 
     # Shutdown

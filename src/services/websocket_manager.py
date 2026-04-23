@@ -14,16 +14,20 @@ logger = get_logger(__name__)
 class ConnectionManager:
     """Manages WebSocket connections and broadcasts"""
 
+    # Channels every new connection is auto-joined to. Additional
+    # channels (e.g. per-org `agents:<org_id>`, per-simulation
+    # `purple:<org>:<sim>`, per-room `warroom:<id>`) are opened on
+    # demand via subscribe() / broadcast_channel().
+    _DEFAULT_CHANNELS = ("alerts", "incidents", "playbooks", "system")
+
     def __init__(self):
         # Active connections by user ID
         self.active_connections: dict[str, list[WebSocket]] = {}
-        # Connections by channel/room
-        self.channels: dict[str, set[str]] = {
-            "alerts": set(),
-            "incidents": set(),
-            "playbooks": set(),
-            "system": set(),
-        }
+        # Connections by channel/room. Starts with the defaults but
+        # new channels are auto-created by subscribe/broadcast so
+        # dynamic channels like `agents:<org>` or
+        # `purple:<org>:<sim>` work without a hardcoded allowlist.
+        self.channels: dict[str, set[str]] = {c: set() for c in self._DEFAULT_CHANNELS}
 
     async def connect(self, websocket: WebSocket, user_id: str):
         """Accept a new WebSocket connection"""
@@ -33,9 +37,10 @@ class ConnectionManager:
             self.active_connections[user_id] = []
         self.active_connections[user_id].append(websocket)
 
-        # Subscribe to all channels by default
-        for channel in self.channels:
-            self.channels[channel].add(user_id)
+        # Auto-subscribe to default channels only — dynamic channels
+        # require an explicit subscribe message from the client.
+        for channel in self._DEFAULT_CHANNELS:
+            self.channels.setdefault(channel, set()).add(user_id)
 
         logger.info(f"WebSocket connected: user {user_id}")
 
@@ -43,7 +48,7 @@ class ConnectionManager:
         await self.send_personal(user_id, {
             "type": "connected",
             "message": "Connected to PySOAR real-time updates",
-            "channels": list(self.channels.keys()),
+            "channels": list(self._DEFAULT_CHANNELS),
         })
 
     def disconnect(self, websocket: WebSocket, user_id: str):
@@ -61,15 +66,18 @@ class ConnectionManager:
         logger.info(f"WebSocket disconnected: user {user_id}")
 
     async def subscribe(self, user_id: str, channel: str):
-        """Subscribe a user to a channel"""
-        if channel in self.channels:
-            self.channels[channel].add(user_id)
-            logger.info(f"User {user_id} subscribed to {channel}")
+        """Subscribe a user to a channel (auto-creates the channel)."""
+        self.channels.setdefault(channel, set()).add(user_id)
+        logger.info(f"User {user_id} subscribed to {channel}")
 
     async def unsubscribe(self, user_id: str, channel: str):
-        """Unsubscribe a user from a channel"""
+        """Unsubscribe a user from a channel."""
         if channel in self.channels:
             self.channels[channel].discard(user_id)
+            if not self.channels[channel] and channel not in self._DEFAULT_CHANNELS:
+                # Garbage-collect empty ad-hoc channels so the dict
+                # doesn't grow unboundedly with per-simulation ids.
+                del self.channels[channel]
             logger.info(f"User {user_id} unsubscribed from {channel}")
 
     async def send_personal(self, user_id: str, message: dict[str, Any]):
@@ -83,14 +91,23 @@ class ConnectionManager:
                     logger.error(f"Failed to send to user {user_id}: {e}")
 
     async def broadcast_channel(self, channel: str, message: dict[str, Any]):
-        """Broadcast a message to all users in a channel"""
-        if channel not in self.channels:
+        """Broadcast a message to all users subscribed to a channel.
+
+        No-op if no one is listening — we intentionally do NOT drop the
+        message on unknown channels here (unlike earlier revisions),
+        because arbitrary dynamic channels like ``agents:<org>`` and
+        ``purple:<org>:<sim>`` are valid first-class channels created on
+        subscribe. Auto-creating the channel here keeps things
+        symmetrical: if subscribe() would accept it, broadcast() must too.
+        """
+        subscribers = self.channels.get(channel)
+        if not subscribers:
             return
 
         message["channel"] = channel
         message["timestamp"] = datetime.now(timezone.utc).isoformat()
 
-        for user_id in self.channels[channel]:
+        for user_id in list(subscribers):
             await self.send_personal(user_id, message)
 
     async def broadcast_all(self, message: dict[str, Any]):
