@@ -105,6 +105,24 @@ celery_app.conf.beat_schedule = {
         "task": "src.agentic.tasks.auto_triage_new_alerts",
         "schedule": 60.0,
     },
+    # --- Broad-signal sweep (non-alert sources) ---
+    # Watches UEBA risk alerts, dark web findings, and decoy
+    # interactions and kicks off investigations on each. Closes the
+    # gap where the old auto-triage only covered alerts; now the
+    # agent investigates every security signal the platform emits.
+    "agentic-broad-sweep": {
+        "task": "src.agentic.tasks.auto_triage_broad_sweep",
+        "schedule": 120.0,  # Every 2 minutes
+    },
+    # --- Post-incident followup ---
+    # Re-notify if recommended actions on an open incident are
+    # still awaiting approval 4+ hours after creation. Turns
+    # "incident opened at 3 AM but nobody approved the block" into
+    # a second page at 7 AM instead of silent rot.
+    "agentic-incident-followup": {
+        "task": "src.agentic.tasks.followup_open_incidents",
+        "schedule": crontab(minute="*/30"),  # Every 30 min
+    },
     # --- Weekly STIG fleet sweep (src.stig.tasks.scheduled_fleet_stig_sweep) ---
     # FedRAMP/NIST SP 800-137 continuous monitoring: every active endpoint
     # agent is scanned against every loaded STIG benchmark once per week.

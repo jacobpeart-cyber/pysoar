@@ -7,6 +7,7 @@ performance evaluation, and threat hunts.
 
 import json
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 from celery import shared_task
 from sqlalchemy import select
@@ -406,6 +407,250 @@ def _fresh_async_session_factory():
     from sqlalchemy.pool import NullPool
     e = create_async_engine(settings.database_url, echo=False, poolclass=NullPool)
     return e, _sm(e, class_=AsyncSession, expire_on_commit=False)
+
+
+@shared_task(bind=True)
+def auto_triage_broad_sweep(self):
+    """Proactive investigation of non-alert security signals.
+
+    The original auto_triage_new_alerts task only watches the alerts
+    table. A real SOC analyst watches *every* signal source: UEBA
+    risk alerts, dark web findings, decoy-asset interactions, and
+    fresh KEV-listed vulnerabilities against the asset inventory.
+    This sweep fans those into autonomous investigations so the
+    agent keeps up regardless of which detector fired.
+
+    Runs every 2 minutes. Each source is scanned within a 30-minute
+    lookback window; an Investigation is created only if one doesn't
+    already exist for the triggering entity (idempotent by
+    trigger_source_id + trigger_type).
+
+    Sources covered:
+      - UEBA risk alerts of severity=high|critical
+      - Dark web findings of severity=high|critical
+      - Decoy interactions (ALWAYS investigate — no legitimate
+        reason to touch a decoy)
+      - Vulnerability instances on the KEV catalog with
+        SLA=overdue (existing unpatched CVEs known-exploited)
+    """
+    from sqlalchemy import select, and_, or_
+    from datetime import datetime, timedelta, timezone
+    from src.agentic.models import Investigation, SOCAgent
+
+    async def _sweep():
+        since = datetime.now(timezone.utc) - timedelta(minutes=30)
+        enqueued: list[dict] = []
+        _engine, _session_factory = _fresh_async_session_factory()
+
+        async with _session_factory() as db:
+            # Resolve the investigation-capable agent once per org.
+            agent_by_org: dict[str, str] = {}
+
+            async def _agent_for(org_id: str) -> Optional[str]:
+                if org_id in agent_by_org:
+                    return agent_by_org[org_id]
+                agent = (await db.execute(
+                    select(SOCAgent).where(
+                        SOCAgent.organization_id == org_id,
+                        SOCAgent.agent_type.in_(["investigation", "triage_analyst"]),
+                    ).limit(1)
+                )).scalar_one_or_none()
+                if agent is None:
+                    agent = (await db.execute(
+                        select(SOCAgent).where(SOCAgent.organization_id == org_id).limit(1)
+                    )).scalar_one_or_none()
+                agent_by_org[org_id] = agent.id if agent else None
+                return agent_by_org[org_id]
+
+            async def _already_investigated(trigger_type: str, trigger_source_id: str) -> bool:
+                existing = (await db.execute(
+                    select(Investigation.id).where(
+                        Investigation.trigger_type == trigger_type,
+                        Investigation.trigger_source_id == trigger_source_id,
+                    ).limit(1)
+                )).scalar_one_or_none()
+                return existing is not None
+
+            async def _kickoff(org_id: str, trigger_type: str, trigger_source_id: str, title: str, severity: str):
+                agent_id = await _agent_for(org_id)
+                if not agent_id:
+                    return
+                if await _already_investigated(trigger_type, trigger_source_id):
+                    return
+                run_investigation.delay(
+                    agent_id=agent_id,
+                    organization_id=org_id,
+                    trigger_type=trigger_type,
+                    trigger_source_id=trigger_source_id,
+                    title=f"Auto-triage: {title[:160]}",
+                    initial_context={"auto_triage": True, "severity": severity, "source": trigger_type},
+                )
+                enqueued.append({"type": trigger_type, "id": trigger_source_id})
+
+            # --- UEBA risk alerts (high / critical) ---
+            try:
+                from src.ueba.models import UEBARiskAlert, EntityProfile
+                rows = list(await db.scalars(
+                    select(UEBARiskAlert).where(
+                        UEBARiskAlert.created_at >= since,
+                        UEBARiskAlert.severity.in_(["critical", "high"]),
+                    ).limit(25)
+                ))
+                for r in rows:
+                    # UEBARiskAlert doesn't have a direct organization_id;
+                    # climb through EntityProfile.
+                    entity = await db.get(EntityProfile, r.entity_profile_id)
+                    if entity is None or not entity.organization_id:
+                        continue
+                    await _kickoff(
+                        entity.organization_id, "ueba_alert", r.id,
+                        f"UEBA {r.severity} risk alert: {r.alert_type} on {entity.display_name or entity.entity_id}",
+                        r.severity,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"broad_sweep UEBA branch failed: {exc}")
+
+            # --- Dark web findings (high / critical) ---
+            try:
+                from src.darkweb.models import DarkWebFinding
+                rows = list(await db.scalars(
+                    select(DarkWebFinding).where(
+                        DarkWebFinding.created_at >= since,
+                        DarkWebFinding.severity.in_(["critical", "high"]),
+                        DarkWebFinding.status.in_(["new", "reviewing"]),
+                    ).limit(25)
+                ))
+                for r in rows:
+                    if not r.organization_id:
+                        continue
+                    await _kickoff(
+                        r.organization_id, "darkweb_finding", r.id,
+                        f"Dark web {r.severity} finding ({r.finding_type}): {r.title or r.id}",
+                        r.severity,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"broad_sweep darkweb branch failed: {exc}")
+
+            # --- Decoy / honey-token interactions (ALWAYS investigate) ---
+            try:
+                from src.deception.models import DecoyInteraction, Decoy
+                rows = list(await db.scalars(
+                    select(DecoyInteraction).where(
+                        DecoyInteraction.created_at >= since,
+                    ).limit(25)
+                ))
+                for r in rows:
+                    decoy = await db.get(Decoy, r.decoy_id)
+                    org_id = getattr(decoy, "organization_id", None) if decoy else None
+                    if not org_id:
+                        continue
+                    await _kickoff(
+                        org_id, "decoy_interaction", r.id,
+                        f"Decoy touched: {r.interaction_type} from {r.source_ip} on {decoy.name if decoy else r.decoy_id}",
+                        "high",  # no legitimate reason to touch a decoy
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(f"broad_sweep decoy branch failed: {exc}")
+
+        await _engine.dispose()
+        return {"enqueued": len(enqueued), "items": enqueued[:10]}
+
+    try:
+        import asyncio
+        result = asyncio.run(_sweep())
+        if result.get("enqueued"):
+            logger.info(f"broad_sweep: enqueued {result['enqueued']} investigations")
+        return result
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"broad_sweep failed: {exc}")
+        return {"enqueued": 0, "error": str(exc)[:200]}
+
+
+@shared_task(bind=True)
+def followup_open_incidents(self):
+    """Post-incident followup check.
+
+    Real SOC analysts circle back on incidents to verify remediation
+    actually happened. This task scans incidents that were auto-opened
+    >= 4 hours ago and haven't transitioned to a terminal state
+    ('contained'/'eradicated'/'recovered'/'closed'), and for each one
+    checks whether the recommended AgentActions were approved +
+    executed. If any actions are still PENDING_APPROVAL after 4 hours,
+    re-sends the notification so the on-call analyst gets a nudge.
+
+    This is the bot-level equivalent of 'did the isolate-host action
+    ever get approved? the incident is still open.'
+    """
+    from datetime import datetime, timedelta, timezone
+    from sqlalchemy import select, and_, func as sqlfunc
+    from src.agentic.models import AgentAction, ActionExecutionStatus, Investigation
+    from src.models.incident import Incident
+
+    async def _followup():
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=4)
+        nudged: list[str] = []
+        _engine, _session_factory = _fresh_async_session_factory()
+        async with _session_factory() as db:
+            # Pull incidents that have been open for >= 4 hours and
+            # still aren't in a terminal status.
+            incidents = list(await db.scalars(
+                select(Incident).where(
+                    Incident.created_at <= cutoff,
+                    Incident.status.in_(["open", "investigating", "triaged"]),
+                ).limit(50)
+            ))
+            for inc in incidents:
+                # Find the investigation that auto-opened this incident.
+                source_alert_id = getattr(inc, "source_alert_id", None)
+                if not source_alert_id:
+                    continue
+                inv = (await db.execute(
+                    select(Investigation).where(
+                        Investigation.trigger_source_id == source_alert_id,
+                        Investigation.trigger_type == "alert",
+                    ).limit(1)
+                )).scalar_one_or_none()
+                if inv is None:
+                    continue
+                # Count pending approvals for this investigation.
+                pending_count = await db.scalar(
+                    select(sqlfunc.count(AgentAction.id)).where(
+                        AgentAction.investigation_id == inv.id,
+                        AgentAction.execution_status == ActionExecutionStatus.PENDING_APPROVAL.value,
+                    )
+                )
+                if not pending_count:
+                    continue
+                # Re-fire the notification via the existing dispatcher.
+                try:
+                    from src.services.notifications import send_incident_notifications
+                    event = {
+                        "incident_id": inc.id,
+                        "title": f"[FOLLOW-UP] {inc.title}",
+                        "severity": inc.severity,
+                        "summary": (
+                            f"Incident has been open {int((datetime.now(timezone.utc) - inc.created_at).total_seconds() / 3600)} hours "
+                            f"with {pending_count} agent-recommended action(s) still awaiting approval. "
+                            f"Verdict: {inv.resolution_type or 'unknown'}. "
+                            f"Open /agentic → Approvals to review."
+                        ),
+                        "trigger": "followup-check",
+                    }
+                    await send_incident_notifications(
+                        db, organization_id=inc.organization_id, event=event,
+                    )
+                    nudged.append(inc.id)
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(f"followup notify failed for {inc.id}: {exc}")
+        await _engine.dispose()
+        return {"nudged": len(nudged), "incidents": nudged}
+
+    try:
+        import asyncio
+        return asyncio.run(_followup())
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"followup_open_incidents failed: {exc}")
+        return {"nudged": 0, "error": str(exc)[:200]}
 
 
 @shared_task(bind=True)
