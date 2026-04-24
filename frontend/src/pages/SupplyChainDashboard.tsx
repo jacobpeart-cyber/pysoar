@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useRef, useState } from 'react';
 import {
   Package,
   GitBranch,
@@ -14,10 +14,53 @@ import {
   CheckCircle,
   Star,
   Trash2,
+  Upload,
 } from 'lucide-react';
 import clsx from 'clsx';
 import { api } from '../lib/api';
 import { supplychainApi } from '../api/endpoints';
+
+
+const riskScoreToLevel = (score: number | null | undefined): string => {
+  const s = Number(score || 0);
+  if (s >= 9) return 'critical';
+  if (s >= 7) return 'high';
+  if (s >= 4) return 'medium';
+  if (s > 0) return 'low';
+  return 'none';
+};
+
+const complianceScoreFromSbom = (sbom: any): number => {
+  if (typeof sbom?.vulnerability_risk_score === 'number') {
+    return Math.max(0, Math.min(100, Math.round(100 - sbom.vulnerability_risk_score)));
+  }
+  return sbom?.compliance_status === 'compliant' ? 100 : 0;
+};
+
+const parseCertifications = (raw: any): string[] => {
+  if (!raw) return [];
+  if (Array.isArray(raw)) {
+    return raw.map((c: any) => (typeof c === 'string' ? c : c?.name || '')).filter(Boolean);
+  }
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw);
+      return parseCertifications(parsed);
+    } catch {
+      return [raw];
+    }
+  }
+  return [];
+};
+
+const shortDate = (iso: any): string => {
+  if (!iso) return '—';
+  try {
+    return new Date(iso).toISOString().slice(0, 10);
+  } catch {
+    return String(iso).slice(0, 10);
+  }
+};
 
 
 const getSeverityColor = (severity: string) => {
@@ -77,7 +120,7 @@ export default function SupplyChainDashboard() {
       setSBOMs(Array.isArray(sbomData) ? sbomData : (sbomData?.items || []));
       setComponents(compData);
       setVendors(Array.isArray(vendorData) ? vendorData : (vendorData?.items || []));
-      setRisks(Array.isArray(riskData) ? riskData : (riskData?.findings || []));
+      setRisks(Array.isArray(riskData) ? riskData : (riskData?.items || riskData?.findings || []));
     } catch (error) {
       console.error('Error loading supply chain data:', error);
     } finally {
@@ -91,8 +134,41 @@ export default function SupplyChainDashboard() {
 
   const totalComponents = components.length;
   const criticalRisks = risks.filter(r => r.severity === 'critical').length;
-  const vendorScoreAvg = (vendors.reduce((sum, v) => sum + v.assessmentScore, 0) / (vendors.length || 1)).toFixed(1);
-  const sbomCompliance = sboms.filter(s => s.status === 'compliant').length * 25;
+  const vendorScoreAvg = (
+    vendors.reduce((sum, v) => sum + (Number(v.security_score) || 0), 0) / (vendors.length || 1)
+  ).toFixed(1);
+  const sbomCompliance = sboms.length
+    ? Math.round(
+        (sboms.filter((s) => s.compliance_status === 'compliant').length / sboms.length) * 100,
+      )
+    : 0;
+
+  const uploadInputRef = useRef<HTMLInputElement | null>(null);
+  const [uploadBusy, setUploadBusy] = useState(false);
+  const [uploadMessage, setUploadMessage] = useState<string | null>(null);
+
+  const handleSBOMUpload = async (file: File | null) => {
+    if (!file) return;
+    setUploadBusy(true);
+    setUploadMessage(null);
+    try {
+      const fd = new FormData();
+      fd.append('file', file);
+      const r = await api.post('/supplychain/sboms/upload', fd, {
+        headers: { 'Content-Type': 'multipart/form-data' },
+      });
+      setUploadMessage(`Uploaded: ${r.data?.name || file.name}`);
+      await loadData();
+    } catch (err: any) {
+      console.error('SBOM upload failed:', err);
+      setUploadMessage(
+        `Upload failed: ${err?.response?.data?.detail || err?.message || 'unknown error'}`,
+      );
+    } finally {
+      setUploadBusy(false);
+      if (uploadInputRef.current) uploadInputRef.current.value = '';
+    }
+  };
 
   const tabs = [
     { id: 'sboms', label: 'SBOMs', icon: FileCheck },
@@ -102,17 +178,21 @@ export default function SupplyChainDashboard() {
   ];
 
   const filteredComponents = components.filter(c =>
-    c.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
-    c.version.includes(searchQuery)
+    (c.name || '').toLowerCase().includes(searchQuery.toLowerCase()) ||
+    (c.version || '').includes(searchQuery)
   );
 
-  const filteredRisks = risks.filter(r =>
-    r.title.toLowerCase().includes(searchQuery.toLowerCase()) ||
-    r.component.toLowerCase().includes(searchQuery.toLowerCase())
-  );
+  const filteredRisks = risks.filter((r) => {
+    const q = searchQuery.toLowerCase();
+    return (
+      (r.risk_type || '').toLowerCase().includes(q) ||
+      (r.description || '').toLowerCase().includes(q) ||
+      (r.severity || '').toLowerCase().includes(q)
+    );
+  });
 
   const filteredVendors = vendors.filter(v =>
-    v.name.toLowerCase().includes(searchQuery.toLowerCase())
+    (v.vendor_name || '').toLowerCase().includes(searchQuery.toLowerCase())
   );
 
   return (
@@ -193,7 +273,22 @@ export default function SupplyChainDashboard() {
             {/* SBOMs Tab */}
             {activeTab === 'sboms' && (
               <div className="space-y-6">
-                <div className="flex justify-end">
+                <div className="flex justify-end gap-2">
+                  <input
+                    ref={uploadInputRef}
+                    type="file"
+                    accept=".json,application/json"
+                    className="hidden"
+                    onChange={(e) => handleSBOMUpload(e.target.files?.[0] || null)}
+                  />
+                  <button
+                    onClick={() => uploadInputRef.current?.click()}
+                    disabled={uploadBusy}
+                    className="flex items-center gap-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white px-4 py-2 rounded-lg transition"
+                  >
+                    <Upload className="w-4 h-4" />
+                    {uploadBusy ? 'Uploading…' : 'Upload SBOM (SPDX/CycloneDX)'}
+                  </button>
                   <button
                     onClick={() => setShowGenerateSBOMModal(true)}
                     className="flex items-center gap-2 bg-purple-600 hover:bg-purple-700 text-white px-4 py-2 rounded-lg transition"
@@ -202,45 +297,52 @@ export default function SupplyChainDashboard() {
                     Generate SBOM
                   </button>
                 </div>
+                {uploadMessage && (
+                  <div className="text-sm px-4 py-2 rounded border border-gray-300 dark:border-gray-700 bg-gray-50 dark:bg-gray-800 text-gray-700 dark:text-gray-200">
+                    {uploadMessage}
+                  </div>
+                )}
                 {sboms.length === 0 && (
                   <div className="text-center text-gray-500 dark:text-gray-400 py-6 border border-dashed border-gray-300 dark:border-gray-700 rounded-lg">
-                    No SBOMs yet. Click "Generate SBOM" to create one.
+                    No SBOMs yet. Upload an SPDX/CycloneDX JSON or click "Generate SBOM".
                   </div>
                 )}
                 <div className="grid grid-cols-1 gap-4">
-                  {sboms.map((sbom) => (
+                  {sboms.map((sbom) => {
+                    const complianceScore = complianceScoreFromSbom(sbom);
+                    return (
                     <div key={sbom.id} className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4 hover:shadow-lg transition">
                       <div className="flex justify-between items-start mb-3">
                         <div className="flex-1">
                           <h3 className="font-semibold text-lg">{sbom.name}</h3>
-                          <p className="text-sm text-gray-600 dark:text-gray-400">Format: {sbom.format}</p>
+                          <p className="text-sm text-gray-600 dark:text-gray-400">Format: {sbom.sbom_format}</p>
                         </div>
-                        <span className={`px-3 py-1 rounded-full text-xs font-medium ${getStatusColor(sbom.status)}`}>
-                          {sbom.status}
+                        <span className={`px-3 py-1 rounded-full text-xs font-medium ${getStatusColor(sbom.compliance_status || 'unknown')}`}>
+                          {sbom.compliance_status || 'unknown'}
                         </span>
                       </div>
                       <div className="grid grid-cols-4 gap-4 text-sm mb-4">
                         <div>
                           <p className="text-gray-600 dark:text-gray-400">Version</p>
-                          <p className="font-medium">{sbom.version}</p>
+                          <p className="font-medium">{sbom.application_version}</p>
                         </div>
                         <div>
                           <p className="text-gray-600 dark:text-gray-400">Components</p>
-                          <p className="font-medium">{sbom.componentCount}</p>
+                          <p className="font-medium">{sbom.components_count ?? 0}</p>
                         </div>
                         <div>
                           <p className="text-gray-600 dark:text-gray-400">Compliance Score</p>
-                          <p className="font-medium">{sbom.complianceScore}%</p>
+                          <p className="font-medium">{complianceScore}%</p>
                         </div>
                         <div>
                           <p className="text-gray-600 dark:text-gray-400">Created</p>
-                          <p className="font-medium">{sbom.createdDate}</p>
+                          <p className="font-medium">{shortDate(sbom.created_at)}</p>
                         </div>
                       </div>
                       <div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-2 mb-3">
                         <div
                           className="bg-purple-600 h-2 rounded-full"
-                          style={{ width: `${sbom.complianceScore}%` }}
+                          style={{ width: `${complianceScore}%` }}
                         />
                       </div>
                       <div className="flex gap-2">
@@ -281,7 +383,8 @@ export default function SupplyChainDashboard() {
                         </button>
                       </div>
                     </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             )}
@@ -309,6 +412,11 @@ export default function SupplyChainDashboard() {
                   </button>
                 </div>
 
+                {filteredComponents.length === 0 && (
+                  <div className="text-center text-gray-500 dark:text-gray-400 py-6 border border-dashed border-gray-300 dark:border-gray-700 rounded-lg">
+                    No components. Upload an SBOM or add components via the New Component button.
+                  </div>
+                )}
                 <div className="bg-white dark:bg-gray-800 rounded-lg overflow-hidden border border-gray-200 dark:border-gray-700">
                   <table className="w-full">
                     <thead>
@@ -319,24 +427,27 @@ export default function SupplyChainDashboard() {
                         <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">License</th>
                         <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Vulns</th>
                         <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Risk</th>
-                        <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Latest</th>
+                        <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Score</th>
                         <th className="px-6 py-4 text-left text-sm font-semibold text-gray-900 dark:text-gray-100">Actions</th>
                       </tr>
                     </thead>
                     <tbody>
-                      {filteredComponents.map((comp) => (
+                      {filteredComponents.map((comp) => {
+                        const level = riskScoreToLevel(comp.risk_score);
+                        const license = comp.license_spdx_id || comp.license_type || '—';
+                        return (
                         <tr key={comp.id} className="border-b border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700 transition">
                           <td className="px-6 py-4 text-sm font-medium">{comp.name}</td>
                           <td className="px-6 py-4 text-sm font-mono">{comp.version}</td>
-                          <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">{comp.type}</td>
-                          <td className="px-6 py-4 text-sm">{comp.license}</td>
-                          <td className="px-6 py-4 text-sm font-semibold">{comp.vulnerabilities}</td>
+                          <td className="px-6 py-4 text-sm text-gray-600 dark:text-gray-400">{comp.package_type || '—'}</td>
+                          <td className="px-6 py-4 text-sm">{license}</td>
+                          <td className="px-6 py-4 text-sm font-semibold">{comp.known_vulnerabilities_count ?? 0}</td>
                           <td className="px-6 py-4">
-                            <span className={`px-3 py-1 rounded-full text-xs font-medium ${getSeverityColor(comp.riskLevel)}`}>
-                              {comp.riskLevel}
+                            <span className={`px-3 py-1 rounded-full text-xs font-medium ${getSeverityColor(level)}`}>
+                              {level}
                             </span>
                           </td>
-                          <td className="px-6 py-4 text-sm font-mono text-gray-600 dark:text-gray-400">{comp.latestVersion}</td>
+                          <td className="px-6 py-4 text-sm font-mono text-gray-600 dark:text-gray-400">{(comp.risk_score ?? 0).toFixed ? comp.risk_score.toFixed(1) : comp.risk_score}</td>
                           <td className="px-6 py-4 text-sm flex gap-2">
                             <button
                               onClick={() => setSelectedComponent(comp)}
@@ -352,7 +463,8 @@ export default function SupplyChainDashboard() {
                             </button>
                           </td>
                         </tr>
-                      ))}
+                        );
+                      })}
                     </tbody>
                   </table>
                 </div>
@@ -375,6 +487,11 @@ export default function SupplyChainDashboard() {
                   </div>
                 </div>
 
+                {filteredRisks.length === 0 && (
+                  <div className="text-center text-gray-500 dark:text-gray-400 py-6 border border-dashed border-gray-300 dark:border-gray-700 rounded-lg">
+                    No supply-chain risks detected yet. The daily cross-org sweep populates typosquat and CVE risks automatically.
+                  </div>
+                )}
                 <div className="grid grid-cols-1 gap-4">
                   {filteredRisks.map((risk) => (
                     <div key={risk.id} className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4 hover:shadow-lg transition">
@@ -382,9 +499,9 @@ export default function SupplyChainDashboard() {
                         <div className="flex-1">
                           <div className="flex items-center gap-2 mb-1">
                             <AlertTriangle className="w-5 h-5 text-orange-600" />
-                            <h3 className="font-semibold">{risk.title}</h3>
+                            <h3 className="font-semibold">{risk.risk_type || 'Risk'}</h3>
                           </div>
-                          <p className="text-sm text-gray-600 dark:text-gray-400 mb-2">{risk.component}</p>
+                          <p className="text-sm text-gray-600 dark:text-gray-400 mb-2">{risk.description}</p>
                         </div>
                         <div className="text-right">
                           <span className={`px-3 py-1 rounded-full text-xs font-medium ${getSeverityColor(risk.severity)}`}>
@@ -394,13 +511,13 @@ export default function SupplyChainDashboard() {
                       </div>
                       <div className="space-y-2">
                         <div>
-                          <p className="text-xs text-gray-600 dark:text-gray-400">Recommendation</p>
-                          <p className="text-sm font-medium">{risk.recommendation}</p>
+                          <p className="text-xs text-gray-600 dark:text-gray-400">Remediation</p>
+                          <p className="text-sm font-medium">{risk.remediation_advice || 'Pending analyst triage'}</p>
                         </div>
                         <div className="flex justify-between items-center pt-2 border-t border-gray-200 dark:border-gray-700">
                           <div>
                             <p className="text-xs text-gray-600 dark:text-gray-400">Detected</p>
-                            <p className="text-sm">{risk.detectedDate}</p>
+                            <p className="text-sm">{shortDate(risk.detected_date || risk.created_at)}</p>
                           </div>
                           <span className={`px-3 py-1 rounded-full text-xs font-medium ${getStatusColor(risk.status)}`}>
                             {risk.status}
@@ -429,36 +546,44 @@ export default function SupplyChainDashboard() {
                   </div>
                 </div>
 
+                {filteredVendors.length === 0 && (
+                  <div className="text-center text-gray-500 dark:text-gray-400 py-6 border border-dashed border-gray-300 dark:border-gray-700 rounded-lg">
+                    No vendor assessments yet.
+                  </div>
+                )}
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                  {filteredVendors.map((vendor) => (
+                  {filteredVendors.map((vendor) => {
+                    const score = Number(vendor.security_score) || 0;
+                    const certs = parseCertifications(vendor.certifications);
+                    return (
                     <div key={vendor.id} className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4 hover:shadow-lg transition">
                       <div className="flex justify-between items-start mb-4">
                         <div>
-                          <h3 className="font-semibold text-lg">{vendor.name}</h3>
-                          <p className="text-sm text-gray-600 dark:text-gray-400">{vendor.components} components</p>
+                          <h3 className="font-semibold text-lg">{vendor.vendor_name}</h3>
+                          <p className="text-sm text-gray-600 dark:text-gray-400">{vendor.assessment_type || 'assessment'}</p>
                         </div>
-                        <span className={`px-3 py-1 rounded-full text-xs font-medium ${getSeverityColor(vendor.riskLevel)}`}>
-                          {vendor.riskLevel}
+                        <span className={`px-3 py-1 rounded-full text-xs font-medium ${getSeverityColor(vendor.risk_tier || 'medium')}`}>
+                          {vendor.risk_tier || 'medium'}
                         </span>
                       </div>
                       <div className="space-y-3">
                         <div>
                           <div className="flex justify-between mb-1">
-                            <span className="text-sm text-gray-600 dark:text-gray-400">Assessment Score</span>
-                            <span className="font-semibold">{vendor.assessmentScore}%</span>
+                            <span className="text-sm text-gray-600 dark:text-gray-400">Security Score</span>
+                            <span className="font-semibold">{score.toFixed(1)}%</span>
                           </div>
                           <div className="w-full bg-gray-200 dark:bg-gray-700 rounded-full h-2">
                             <div
-                              className={`h-2 rounded-full ${vendor.assessmentScore >= 90 ? 'bg-green-600' : vendor.assessmentScore >= 80 ? 'bg-yellow-600' : 'bg-orange-600'}`}
-                              style={{ width: `${vendor.assessmentScore}%` }}
+                              className={`h-2 rounded-full ${score >= 90 ? 'bg-green-600' : score >= 80 ? 'bg-yellow-600' : 'bg-orange-600'}`}
+                              style={{ width: `${score}%` }}
                             />
                           </div>
                         </div>
                         <div>
                           <p className="text-sm font-medium mb-2">Certifications</p>
                           <div className="flex flex-wrap gap-2">
-                            {vendor.certifications.length > 0 ? (
-                              vendor.certifications.map((cert: any, idx: number) => (
+                            {certs.length > 0 ? (
+                              certs.map((cert: string, idx: number) => (
                                 <span key={idx} className="px-2 py-1 bg-blue-100 dark:bg-blue-900 text-blue-800 dark:text-blue-100 rounded text-xs">
                                   {cert}
                                 </span>
@@ -469,7 +594,10 @@ export default function SupplyChainDashboard() {
                           </div>
                         </div>
                         <div className="pt-2 border-t border-gray-200 dark:border-gray-700">
-                          <p className="text-xs text-gray-600 dark:text-gray-400">Last Audit: {vendor.lastAudit}</p>
+                          <p className="text-xs text-gray-600 dark:text-gray-400">Assessed: {shortDate(vendor.assessment_date)}</p>
+                          {vendor.incident_count > 0 && (
+                            <p className="text-xs text-red-600 dark:text-red-400 mt-1">{vendor.incident_count} incident(s) on file</p>
+                          )}
                         </div>
                         <button
                           onClick={() => setSelectedVendor(vendor)}
@@ -479,7 +607,8 @@ export default function SupplyChainDashboard() {
                         </button>
                       </div>
                     </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             )}

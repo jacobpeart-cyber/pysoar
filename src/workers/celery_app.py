@@ -33,6 +33,10 @@ celery_app = Celery(
         # privileged / stale credential) runs hourly across all orgs
         # and fires on_itdr_threat → alerts → investigator chain.
         "src.itdr.tasks",
+        # Supply chain — typosquat detection against dep list + vendor
+        # cert expiry + vuln cross-reference. Included so the beat-
+        # scheduled sweeps below can resolve the task names.
+        "src.supplychain.tasks",
     ],
 )
 
@@ -117,6 +121,16 @@ celery_app.conf.beat_schedule = {
     "agentic-broad-sweep": {
         "task": "src.agentic.tasks.auto_triage_broad_sweep",
         "schedule": 120.0,  # Every 2 minutes
+    },
+    # --- Supply chain: daily typosquat + vuln cross-ref sweep ---
+    # Scans every org's software_components against a small popular-
+    # packages list (typosquat), then cross-references declared CVE
+    # ids against the vulnerabilities table so newly-disclosed CVEs
+    # propagate into supply-chain-risk rows. Vendor cert expiry runs
+    # weekly on Mondays morning so cert-rotation work has a full week.
+    "supplychain-typosquat-sweep": {
+        "task": "src.supplychain.tasks.supplychain_cross_org_sweep",
+        "schedule": 86400.0,  # Daily
     },
     # --- ITDR: hourly identity threat sweep across all orgs ---
     # Populates IdentityThreat rows for dormant_admin, MFA-missing
