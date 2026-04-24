@@ -698,7 +698,7 @@ export const supplychainApi = {
     return extractData(response.data);
   },
 
-  getSupplyChainRisks: async (): Promise<{ risk_score: number; findings: Record<string, any>[] }> => {
+  getSupplyChainRisks: async (): Promise<{ items: Record<string, any>[]; total: number; page: number; size: number; pages: number }> => {
     const response = await api.get('/supplychain/risks');
     return response.data;
   },
@@ -707,7 +707,7 @@ export const supplychainApi = {
     page?: number;
     size?: number;
   }): Promise<PaginatedResponse<VendorAssessment>> => {
-    const response = await api.get('/supplychain/vendor-assessments', { params });
+    const response = await api.get('/supplychain/vendors', { params });
     return extractData(response.data);
   },
 

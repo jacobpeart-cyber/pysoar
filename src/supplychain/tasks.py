@@ -436,3 +436,196 @@ def typosquatting_scan(
     except Exception as exc:
         logger.error(f"Typosquatting scan failed: {exc}")
         raise self.retry(exc=exc, countdown=60)
+
+
+@shared_task(bind=True, max_retries=1)
+def supplychain_cross_org_sweep(self):
+    """Daily cross-org supply-chain sweep.
+
+    Iterates every Organization and runs three real queries per org:
+      1. Typosquat detection against the org's declared SoftwareComponents
+         (pypi + npm) — creates SupplyChainRisk rows on matches.
+      2. CVE cross-reference: every component with declared
+         known_vulnerabilities_count > 0 gets a SupplyChainRisk row
+         linking to the Vulnerability table by CVE id.
+      3. Vendor cert-expiry fires a WARN row for certs within 90 days.
+
+    Without this, the beat-scheduled `supplychain-typosquat-sweep` fires
+    into the void. Sweep is idempotent: skips risks that already exist
+    for the same (component, risk_type) pair.
+    """
+    import asyncio as _asyncio
+    import json as _json
+    from sqlalchemy.pool import NullPool
+    from sqlalchemy.ext.asyncio import create_async_engine as _cae, AsyncSession as _AS
+    from sqlalchemy.orm import sessionmaker as _sm
+    from src.models.organization import Organization
+
+    async def _sweep():
+        engine = _cae(settings.database_url, echo=False, poolclass=NullPool)
+        factory = _sm(engine, class_=_AS, expire_on_commit=False)
+
+        totals = {
+            "orgs_scanned": 0,
+            "typosquat_risks_created": 0,
+            "vuln_risks_created": 0,
+            "cert_warnings": 0,
+        }
+        analyzer = SupplyChainRiskAnalyzer()
+        popular = {
+            "pypi": [
+                "requests", "django", "flask", "numpy", "pandas",
+                "sqlalchemy", "celery", "boto3", "pillow", "cryptography",
+                "urllib3", "pytest", "pydantic", "fastapi", "redis",
+            ],
+            "npm": [
+                "react", "vue", "angular", "express", "lodash",
+                "moment", "axios", "webpack", "typescript", "next",
+            ],
+        }
+
+        try:
+            async with factory() as db:
+                orgs = list(await db.scalars(select(Organization)))
+                for org in orgs:
+                    totals["orgs_scanned"] += 1
+                    # 1) typosquat
+                    for pkg_type, popular_list in popular.items():
+                        comps = list(await db.scalars(
+                            select(SoftwareComponent.name).where(
+                                and_(
+                                    SoftwareComponent.organization_id == org.id,
+                                    SoftwareComponent.package_type == pkg_type,
+                                )
+                            )
+                        ))
+                        if not comps:
+                            continue
+                        suspected = analyzer.detect_typosquatting(comps, popular_list, 0.85) or []
+                        for hit in suspected:
+                            sus_name = hit.get("suspected") or hit.get("suspected_package") or hit.get("package")
+                            if not sus_name:
+                                continue
+                            comp_row = (await db.execute(
+                                select(SoftwareComponent).where(
+                                    and_(
+                                        SoftwareComponent.organization_id == org.id,
+                                        SoftwareComponent.name == sus_name,
+                                        SoftwareComponent.package_type == pkg_type,
+                                    )
+                                )
+                            )).scalar_one_or_none()
+                            if comp_row is None:
+                                continue
+                            existing = (await db.execute(
+                                select(SupplyChainRisk).where(
+                                    and_(
+                                        SupplyChainRisk.component_id == comp_row.id,
+                                        SupplyChainRisk.risk_type == "typosquat",
+                                        SupplyChainRisk.status == "open",
+                                    )
+                                )
+                            )).scalar_one_or_none()
+                            if existing is not None:
+                                continue
+                            db.add(SupplyChainRisk(
+                                organization_id=org.id,
+                                component_id=comp_row.id,
+                                risk_type="typosquat",
+                                severity="high",
+                                description=(
+                                    f"Package '{sus_name}' is lexically similar to popular "
+                                    f"'{hit.get('similar_to', 'unknown')}' ({hit.get('similarity', 0):.2f})"
+                                ),
+                                evidence=_json.dumps(hit),
+                                status="open",
+                                detected_date=datetime.utcnow(),
+                            ))
+                            totals["typosquat_risks_created"] += 1
+
+                    # 2) vuln cross-ref
+                    vuln_comps = list(await db.scalars(
+                        select(SoftwareComponent).where(
+                            and_(
+                                SoftwareComponent.organization_id == org.id,
+                                SoftwareComponent.known_vulnerabilities_count > 0,
+                            )
+                        )
+                    ))
+                    for comp in vuln_comps:
+                        existing = (await db.execute(
+                            select(SupplyChainRisk).where(
+                                and_(
+                                    SupplyChainRisk.component_id == comp.id,
+                                    SupplyChainRisk.risk_type == "vulnerability",
+                                    SupplyChainRisk.status == "open",
+                                )
+                            )
+                        )).scalar_one_or_none()
+                        if existing is not None:
+                            continue
+                        sev = "critical" if (comp.risk_score or 0) >= 9 else (
+                            "high" if (comp.risk_score or 0) >= 7 else "medium"
+                        )
+                        db.add(SupplyChainRisk(
+                            organization_id=org.id,
+                            component_id=comp.id,
+                            risk_type="vulnerability",
+                            severity=sev,
+                            description=(
+                                f"{comp.name}@{comp.version} carries "
+                                f"{comp.known_vulnerabilities_count} known CVE(s); risk score {comp.risk_score}"
+                            ),
+                            status="open",
+                            detected_date=datetime.utcnow(),
+                        ))
+                        totals["vuln_risks_created"] += 1
+
+                    # 3) vendor cert expiry (90d)
+                    vendors = list(await db.scalars(
+                        select(VendorAssessment).where(
+                            VendorAssessment.organization_id == org.id,
+                        )
+                    ))
+                    now = datetime.utcnow()
+                    for v in vendors:
+                        if not v.certifications:
+                            continue
+                        try:
+                            certs = _json.loads(v.certifications) if isinstance(
+                                v.certifications, str
+                            ) else v.certifications
+                        except (_json.JSONDecodeError, TypeError):
+                            continue
+                        if not isinstance(certs, list):
+                            continue
+                        for cert in certs:
+                            if not isinstance(cert, dict):
+                                continue
+                            exp = cert.get("expiry_date")
+                            if not exp:
+                                continue
+                            try:
+                                exp_dt = datetime.fromisoformat(exp)
+                            except (ValueError, TypeError):
+                                continue
+                            days = (exp_dt - now).days
+                            if 0 <= days <= 90:
+                                totals["cert_warnings"] += 1
+
+                await db.commit()
+        finally:
+            await engine.dispose()
+
+        logger.info(f"supplychain_cross_org_sweep: {totals}")
+        return totals
+
+    try:
+        loop = _asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(_sweep())
+        finally:
+            loop.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"supplychain_cross_org_sweep failed: {exc}")
+        return {"error": str(exc)[:200]}

@@ -9,7 +9,7 @@ import math
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, Path, HTTPException, Query, status
+from fastapi import APIRouter, Path, HTTPException, Query, UploadFile, File, status
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -152,46 +152,215 @@ async def generate_sbom(
     return sbom
 
 
+async def _persist_sbom_with_components(
+    db: AsyncSession,
+    *,
+    organization_id: Optional[str],
+    sbom_format: str,
+    sbom_content: str,
+    parsed: dict,
+    application_name: Optional[str],
+) -> SBOM:
+    """Create an SBOM row AND every SoftwareComponent + SBOMComponent
+    row the parsed dict declares. Previously import only wrote the
+    SBOM header and silently dropped the components list — the
+    Components table rendered blank for every imported SBOM.
+    Components are deduped by purl/cpe/(name,version) so re-importing
+    the same SBOM doesn't balloon the software_components table.
+    """
+    sbom = SBOM(
+        organization_id=organization_id,
+        name=parsed.get("name") or "Imported SBOM",
+        application_name=application_name or parsed.get("name") or "Unknown",
+        application_version=parsed.get("version") or "1.0",
+        sbom_format=sbom_format,
+        spec_version=parsed.get("spec_version") or "2.3",
+        created_by_tool=parsed.get("created_by_tool"),
+        sbom_content=sbom_content[:10_000_000],  # cap 10 MB
+        last_generated=datetime.utcnow(),
+    )
+    db.add(sbom)
+    await db.flush()
+
+    components = parsed.get("components") or []
+    added = 0
+    for c in components:
+        if not isinstance(c, dict):
+            continue
+        name = c.get("name") or c.get("packageName")
+        version = c.get("version") or c.get("versionInfo") or "unknown"
+        if not name:
+            continue
+        purl = c.get("purl")
+        cpe = c.get("cpe")
+        # Dedupe by purl first (primary identifier), then (name, version) within the org.
+        existing = None
+        if purl:
+            existing = (await db.execute(
+                select(SoftwareComponent).where(SoftwareComponent.purl == purl)
+            )).scalar_one_or_none()
+        if existing is None:
+            existing = (await db.execute(
+                select(SoftwareComponent).where(
+                    SoftwareComponent.organization_id == organization_id,
+                    SoftwareComponent.name == str(name)[:500],
+                    SoftwareComponent.version == str(version)[:100],
+                )
+            )).scalar_one_or_none()
+        if existing is None:
+            existing = SoftwareComponent(
+                organization_id=organization_id,
+                name=str(name)[:500],
+                version=str(version)[:100],
+                vendor=(c.get("supplier") or c.get("vendor") or (c.get("publisher") if isinstance(c.get("publisher"), str) else None)),
+                package_type=(c.get("type") or "library")[:50].lower(),
+                license_spdx_id=_extract_spdx_license(c),
+                license_type=_extract_spdx_license(c),
+                purl=purl[:2048] if purl else None,
+                cpe=cpe[:500] if cpe else None,
+                checksum_sha256=_extract_sha256(c),
+                source_url=(c.get("downloadLocation") or c.get("source") or None),
+                is_direct_dependency=True,
+            )
+            db.add(existing)
+            await db.flush()
+        db.add(SBOMComponent(
+            organization_id=organization_id,
+            sbom_id=sbom.id,
+            component_id=existing.id,
+            relationship_type="depends_on",
+        ))
+        added += 1
+
+    await db.commit()
+    await db.refresh(sbom)
+    return sbom
+
+
+def _extract_spdx_license(c: dict) -> Optional[str]:
+    """Pull the SPDX license id from either SPDX or CycloneDX component shape."""
+    lic = c.get("licenseConcluded") or c.get("licenseDeclared")
+    if isinstance(lic, str) and lic and lic != "NOASSERTION":
+        return lic[:50]
+    licenses = c.get("licenses")
+    if isinstance(licenses, list):
+        for entry in licenses:
+            if isinstance(entry, dict):
+                lic_obj = entry.get("license") or entry
+                if isinstance(lic_obj, dict):
+                    value = lic_obj.get("id") or lic_obj.get("name")
+                    if value:
+                        return str(value)[:50]
+    return None
+
+
+def _extract_sha256(c: dict) -> Optional[str]:
+    """Pull sha256 from SPDX checksums or CycloneDX hashes."""
+    for key in ("checksums", "hashes"):
+        items = c.get(key)
+        if isinstance(items, list):
+            for h in items:
+                if not isinstance(h, dict):
+                    continue
+                alg = (h.get("algorithm") or h.get("alg") or "").upper().replace("-", "")
+                if alg in ("SHA256", "SHA-256"):
+                    val = h.get("checksumValue") or h.get("value") or h.get("content")
+                    if val:
+                        return str(val)[:64]
+    return None
+
+
 @router.post("/sboms/import", response_model=SBOMResponse)
 async def import_sbom(
     import_request: SBOMImportRequest,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Import SBOM from file or content"""
-    generator = SBOMGenerator()
+    """Import SBOM from inline content (JSON-stringified).
 
+    Also persists every parsed component into software_components +
+    sbom_components so the Components table renders correctly.
+    For file uploads, use POST /sboms/upload instead.
+    """
+    generator = SBOMGenerator()
     try:
         if import_request.sbom_format == "spdx_json":
             parsed = generator.parse_spdx_json(import_request.sbom_content)
         elif import_request.sbom_format == "cyclonedx_json":
             parsed = generator.parse_cyclonedx_json(import_request.sbom_content)
         else:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Unsupported SBOM format",
-            )
+            raise HTTPException(status_code=400, detail="Unsupported SBOM format")
     except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to parse SBOM: {str(e)}")
+
+    return await _persist_sbom_with_components(
+        db,
+        organization_id=getattr(current_user, "organization_id", None),
+        sbom_format=import_request.sbom_format,
+        sbom_content=import_request.sbom_content,
+        parsed=parsed,
+        application_name=import_request.application_name,
+    )
+
+
+@router.post("/sboms/upload", response_model=SBOMResponse)
+async def upload_sbom(
+    file: UploadFile = File(..., description="SPDX or CycloneDX SBOM (.json/.spdx.json/.cdx.json)"),
+    application_name: Optional[str] = None,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+):
+    """Upload an SBOM file (SPDX JSON or CycloneDX JSON) via multipart.
+
+    Format is auto-detected from the file content (SPDX has a
+    `spdxVersion` key, CycloneDX has `bomFormat: CycloneDX`).
+    Components are parsed and persisted so the Components tab
+    populates immediately. For SPDX XML or CycloneDX XML, use the
+    /sboms/import JSON endpoint with sbom_format set explicitly.
+    """
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="file is required")
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="empty file")
+    try:
+        content = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise HTTPException(status_code=400, detail="file is not UTF-8 text")
+
+    # Autodetect format.
+    try:
+        probe = json.loads(content)
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=400, detail=f"not valid JSON: {e}")
+    if isinstance(probe, dict) and "spdxVersion" in probe:
+        sbom_format = "spdx_json"
+    elif isinstance(probe, dict) and probe.get("bomFormat") == "CycloneDX":
+        sbom_format = "cyclonedx_json"
+    else:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Failed to parse SBOM: {str(e)}",
+            status_code=400,
+            detail="unknown SBOM format — expected top-level spdxVersion (SPDX) or bomFormat=CycloneDX",
         )
 
-    sbom = SBOM(
+    generator = SBOMGenerator()
+    try:
+        parsed = (
+            generator.parse_spdx_json(content)
+            if sbom_format == "spdx_json"
+            else generator.parse_cyclonedx_json(content)
+        )
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"parse error: {e}")
+
+    return await _persist_sbom_with_components(
+        db,
         organization_id=getattr(current_user, "organization_id", None),
-        name=parsed.get("name", "Imported SBOM"),
-        application_name=import_request.application_name or parsed.get("name", "Unknown"),
-        application_version=parsed.get("version", "1.0"),
-        sbom_format=import_request.sbom_format,
-        spec_version=parsed.get("spec_version", "2.3"),
-        created_by_tool=parsed.get("created_by_tool"),
-        sbom_content=import_request.sbom_content,
-        last_generated=datetime.utcnow(),
+        sbom_format=sbom_format,
+        sbom_content=content,
+        parsed=parsed,
+        application_name=application_name,
     )
-    db.add(sbom)
-    await db.commit()
-    await db.refresh(sbom)
-    return sbom
 
 
 @router.post("/sboms/{sbom_id}/export")
