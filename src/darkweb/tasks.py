@@ -20,11 +20,199 @@ from src.darkweb.engine import (
     BrandProtection,
     ThreatIntelCorrelator,
 )
-from src.darkweb.models import DarkWebFinding, DarkWebMonitor
+from src.darkweb.models import (
+    CredentialLeak,
+    DarkWebFinding,
+    DarkWebMonitor,
+)
 from src.models.incident import Incident
 from src.intel.models import ThreatIndicator as IOC
 
 logger = get_logger(__name__)
+
+
+def _fresh_darkweb_session_factory():
+    """Per-task NullPool engine to avoid 'Future attached to a different loop'
+    errors under Celery prefork — same pattern as itdr/agentic/supplychain."""
+    from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import NullPool
+    e = create_async_engine(settings.database_url, echo=False, poolclass=NullPool)
+    return e, sessionmaker(e, class_=AsyncSession, expire_on_commit=False)
+
+
+def _map_source_to_finding_types(source: str) -> tuple[str, str]:
+    """Return (source_platform, finding_type) enum values for a scanner source key."""
+    mapping = {
+        "paste_sites": ("paste_site", "paste_site_exposure"),           # URLhaus malicious URLs
+        "breach_databases": ("breach_database", "data_breach_listing"),
+        "forums": ("tor_forum", "forum_mention"),                        # ThreatFox IOCs
+        "telegram": ("telegram", "forum_mention"),                       # OTX pulses
+        # Tier 2 HIBP sources — per-email / per-domain lookups
+        "hibp_account": ("breach_database", "credential_leak"),
+        "hibp_stealer": ("breach_database", "credential_leak"),
+        "hibp_paste": ("paste_site", "credential_leak"),
+        "hibp_domain": ("breach_database", "data_breach_listing"),
+    }
+    return mapping.get(source, ("breach_database", "data_breach_listing"))
+
+
+def _derive_finding_severity(source: str, raw: dict) -> str:
+    """Pick severity from the underlying feed payload.
+
+    - URLhaus "threat" containing malware/ransomware → critical
+    - HIBP breach with > 10M accounts or IsVerified=True → critical
+    - ThreatFox confidence_level >= 75 → high
+    - OTX with TLP amber/red → high
+    - everything else → medium
+    """
+    threat_type = str(raw.get("threat_type", "")).lower()
+    if source == "paste_sites" and any(k in threat_type for k in ("malware", "ransomware", "phishing", "c2")):
+        return "critical"
+    if source == "breach_databases":
+        if int(raw.get("affected_count") or 0) >= 10_000_000 or raw.get("is_verified"):
+            return "critical"
+        return "high"
+    if source == "forums":
+        try:
+            if int(raw.get("confidence", 0) or 0) >= 75:
+                return "high"
+        except (TypeError, ValueError):
+            pass
+        return "medium"
+    if source == "telegram":
+        tlp = str(raw.get("tlp", "")).lower()
+        return "high" if tlp in ("amber", "red") else "medium"
+    # Tier 2 HIBP — employee credentials in a breach is always serious
+    if source in ("hibp_account", "hibp_stealer"):
+        return "critical"
+    if source == "hibp_paste":
+        return "high"
+    if source == "hibp_domain":
+        # Domain-scoped breach: severity scales with affected count
+        if int(raw.get("affected_count") or 0) >= 10_000_000 or raw.get("is_verified"):
+            return "critical"
+        return "high"
+    return "medium"
+
+
+async def _persist_findings(
+    db,
+    organization_id: str,
+    monitor_id: str | None,
+    findings: list[dict],
+    monitor_alert_severity: str = "medium",
+) -> tuple[int, int, list[dict], int]:
+    """Write findings to darkweb_findings with dedup by content_hash.
+
+    For Tier 2 HIBP per-email findings (sources hibp_account, hibp_stealer,
+    hibp_paste) we also create a CredentialLeak row linked to the
+    DarkWebFinding so the Credentials tab / remediation flow works.
+
+    Returns (created_count, skipped_duplicate_count,
+             critical_findings_for_automation, credential_leaks_created).
+    """
+    created = 0
+    skipped = 0
+    cred_leaks_created = 0
+    criticals: list[dict] = []
+    for f in findings:
+        content_hash = f.get("content_hash")
+        if not content_hash:
+            # Engine already stamps a hash; if missing, skip — without a
+            # stable identity we'd duplicate rows on every scan.
+            skipped += 1
+            continue
+        # Dedup inside this org.
+        existing = (await db.execute(
+            select(DarkWebFinding).where(
+                DarkWebFinding.organization_id == organization_id,
+                DarkWebFinding.raw_data_hash == content_hash,
+            )
+        )).scalar_one_or_none()
+        if existing is not None:
+            skipped += 1
+            continue
+
+        source_key = f.get("source") or ""
+        source_platform, finding_type = _map_source_to_finding_types(source_key)
+        severity = _derive_finding_severity(source_key, f)
+
+        # Pack a sensible title + description from whichever fields the
+        # underlying feed used (each feed's payload shape differs).
+        title = (
+            f.get("title")
+            or f.get("breach_name")
+            or f.get("message")
+            or f.get("url")
+            or f.get("ioc_value")
+            or "dark web finding"
+        )
+        description = (
+            f.get("description")
+            or f.get("content_snippet")
+            or f.get("malware")
+            or ""
+        )
+        source_url = f.get("url") or f.get("source_url") or ""
+        import hashlib
+        source_url_hash = (
+            hashlib.sha256(source_url.encode()).hexdigest()
+            if source_url else None
+        )
+
+        row = DarkWebFinding(
+            organization_id=organization_id,
+            monitor_id=monitor_id,
+            finding_type=finding_type,
+            source_platform=source_platform,
+            source_url_hash=source_url_hash,
+            title=str(title)[:500],
+            description=str(description)[:4000],
+            raw_data_hash=str(content_hash)[:128],
+            affected_count=int(f.get("affected_count") or 1),
+            severity=severity,
+            confidence_score=int(f.get("confidence") or 50),
+            status="new",
+            discovered_date=datetime.now(timezone.utc).isoformat(),
+        )
+        db.add(row)
+        await db.flush()  # assign row.id so CredentialLeak can reference it
+        created += 1
+
+        # Tier 2 HIBP per-email hit -> CredentialLeak row.
+        if source_key in ("hibp_account", "hibp_stealer", "hibp_paste"):
+            email = f.get("email")
+            if email:
+                db.add(CredentialLeak(
+                    organization_id=organization_id,
+                    finding_id=row.id,
+                    email=str(email)[:255],
+                    username=str(email).split("@", 1)[0][:255] if "@" in str(email) else None,
+                    password_hash=None,  # HIBP doesn't expose password hashes
+                    password_type="unknown",
+                    breach_source=(
+                        f.get("breach_name")
+                        or f.get("site")
+                        or f.get("paste_source")
+                        or "hibp"
+                    )[:255],
+                    breach_date=f.get("breach_date") or f.get("paste_date"),
+                    is_valid=False,  # Requires confirmation via /unifiedsearch workflow
+                    is_remediated=False,
+                ))
+                cred_leaks_created += 1
+
+        if severity == "critical":
+            criticals.append({
+                "finding_type": finding_type,
+                "description": str(description or title)[:500],
+                "source_url": source_url,
+                "severity": severity,
+            })
+    if created:
+        await db.commit()
+    return created, skipped, criticals, cred_leaks_created
 
 
 @shared_task(bind=True, max_retries=3)
@@ -32,79 +220,213 @@ def scheduled_dark_web_scan(
     self,
     monitor_id: str | None = None,
     scan_type: str = "full",
+    organization_id: str | None = None,
 ) -> dict[str, Any]:
     """
-    Scheduled dark web scan across monitored sources.
-
-    Executes periodically to scan paste sites, breach databases, forums,
-    and other dark web sources for exposed organizational data.
+    Real dark web scan against URLhaus, HIBP /breaches, ThreatFox, and
+    OTX (when API key is set). Persists findings into darkweb_findings
+    with dedup by content_hash. Fires ``AutomationService.on_darkweb_finding``
+    on critical findings so the agentic SOC pipeline opens an alert →
+    investigator chain. Updates the monitor's ``last_check`` and
+    ``findings_count`` so the UI can show a real "last scan" timestamp.
 
     Args:
-        monitor_id: Optional specific monitor to scan
-        scan_type: "full" for all sources, "quick" for recent sources only
-
-    Returns:
-        Dictionary with scan results and finding statistics
+        monitor_id: Optional specific monitor to scan. If omitted, scans
+            at org-level (requires organization_id) and attributes
+            findings to no specific monitor.
+        scan_type: "full" for all sources, "quick" to skip OTX/paste feeds.
+        organization_id: Required when monitor_id is None. Scoping is
+            enforced: findings only land against this org.
     """
+    async def _run():
+        engine, factory = _fresh_darkweb_session_factory()
+        try:
+            async with factory() as db:
+                monitor = None
+                org_id = organization_id
+                if monitor_id:
+                    monitor = (await db.execute(
+                        select(DarkWebMonitor).where(DarkWebMonitor.id == monitor_id)
+                    )).scalar_one_or_none()
+                    if monitor is None:
+                        return {"status": "error", "error": f"monitor {monitor_id} not found"}
+                    org_id = monitor.organization_id
+                if not org_id:
+                    return {"status": "error", "error": "organization_id required when monitor_id is not provided"}
+
+                scanner = DarkWebScanner()
+                if scan_type == "quick":
+                    # Only hit the cheap / high-value feeds.
+                    results = {
+                        "paste_sites": await scanner.search_paste_sites(),
+                        "breach_databases": await scanner.search_breach_databases(),
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                    }
+                else:
+                    results = await scanner.run_scan_cycle()
+                    # run_scan_cycle returns {total_findings, findings, timestamp}
+                    # but _persist_findings wants the raw per-source list.
+                    # Fetch again via aggregate_findings or re-run sources.
+                    # Simplest: use the aggregated 'findings' list the engine
+                    # already deduped in-memory.
+                    findings_list = results.get("findings", [])
+
+                if scan_type == "quick":
+                    findings_list = []
+                    for source, items in results.items():
+                        if source == "timestamp" or not isinstance(items, list):
+                            continue
+                        for item in items:
+                            item["source"] = source
+                            # Engine's deduplicate_results sets content_hash; the
+                            # quick path skips it so stamp one here.
+                            import hashlib as _h, json as _j
+                            if "content_hash" not in item:
+                                item["content_hash"] = _h.sha256(
+                                    _j.dumps(item, sort_keys=True, default=str).encode()
+                                ).hexdigest()
+                            findings_list.append(item)
+
+# ---- Tier 2: per-monitor HIBP account & domain lookups ----
+# Runs when the monitor has emails_watched / domains_watched
+# AND either the API key is set (for per-email) or not (for
+# domain-level breach list which is free).
+                if monitor is not None:
+                    import json as _json
+                    emails = monitor.emails_watched
+                    if isinstance(emails, str):
+                        try:
+                            emails = _json.loads(emails)
+                        except Exception:  # noqa: BLE001
+                            emails = []
+                    domains = monitor.domains_watched
+                    if isinstance(domains, str):
+                        try:
+                            domains = _json.loads(domains)
+                        except Exception:  # noqa: BLE001
+                            domains = []
+                    emails = list(emails or [])
+                    domains = list(domains or [])
+                    if emails:
+                        findings_list.extend(
+                            await scanner.hibp_lookup_emails(emails)
+                        )
+                    if domains:
+                        findings_list.extend(
+                            await scanner.hibp_lookup_domains(domains)
+                        )
+
+                alert_severity = (monitor.alert_severity if monitor else "medium") or "medium"
+                created, skipped, criticals, cred_leaks_created = await _persist_findings(
+                    db,
+                    organization_id=org_id,
+                    monitor_id=monitor.id if monitor else None,
+                    findings=findings_list,
+                    monitor_alert_severity=alert_severity,
+                )
+
+                # Update monitor health fields — the UI renders "last
+                # scan" from these; previously stayed null because no
+                # real scan ever ran.
+                if monitor is not None:
+                    monitor.last_check = datetime.now(timezone.utc).isoformat()
+                    monitor.findings_count = (monitor.findings_count or 0) + created
+                    await db.commit()
+
+                # Fire the agentic pipeline for critical findings so the
+                # investigator picks them up like it does ITDR / supply-
+                # chain threats today.
+                automation_fired = 0
+                if criticals:
+                    from src.services.automation import AutomationService
+                    svc = AutomationService(db)
+                    for c in criticals:
+                        try:
+                            await svc.on_darkweb_finding(
+                                finding_type=c["finding_type"],
+                                description=c["description"],
+                                source_url=c["source_url"],
+                                severity=c["severity"],
+                                organization_id=org_id,
+                            )
+                            automation_fired += 1
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning(f"on_darkweb_finding fire failed: {exc}")
+
+                return {
+                    "scan_id": f"scan_{monitor_id or org_id}_{datetime.now(timezone.utc).timestamp()}",
+                    "monitor_id": monitor_id,
+                    "organization_id": org_id,
+                    "created": created,
+                    "credential_leaks_created": cred_leaks_created,
+                    "skipped_duplicate": skipped,
+                    "critical_fired": automation_fired,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "status": "completed",
+                }
+        finally:
+            await engine.dispose()
+
     try:
-        logger.info(f"Starting dark web scan (monitor={monitor_id}, type={scan_type})")
-
-        scanner = DarkWebScanner()
-
-        # Run scan cycle based on type
-        if scan_type == "quick":
-            results = {
-                "paste_sites": [],  # Use cache for quick scans
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
-        else:
-            # Full scan (async in production)
-            results = {
-                "paste_sites": [
-                    {
-                        "site": "pastebin.com",
-                        "findings": 3,
-                        "new_findings": 1,
-                    }
-                ],
-                "breach_databases": [
-                    {
-                        "database": "hibp",
-                        "findings": 2,
-                        "new_findings": 0,
-                    }
-                ],
-                "forums": [
-                    {
-                        "forum": "exploit",
-                        "findings": 1,
-                        "new_findings": 1,
-                    }
-                ],
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-            }
-
-        total_findings = sum(
-            f.get("findings", 0)
-            for source_findings in results.values()
-            if isinstance(source_findings, list)
-            for f in source_findings
-        )
-
-        logger.info(f"Dark web scan completed: {total_findings} findings")
-
-        return {
-            "scan_id": f"scan_{monitor_id or 'all'}_{datetime.now(timezone.utc).timestamp()}",
-            "monitor_id": monitor_id,
-            "total_findings": total_findings,
-            "results": results,
-            "status": "completed",
-        }
-
-    except Exception as exc:
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(_run())
+        finally:
+            loop.close()
+    except Exception as exc:  # noqa: BLE001
         logger.error(f"Dark web scan failed: {exc}")
-        # Retry with exponential backoff
         raise self.retry(exc=exc, countdown=60 * (2 ** self.request.retries))
+
+
+@shared_task(bind=True, max_retries=1)
+def darkweb_cross_org_sweep(self) -> dict[str, Any]:
+    """Periodic cross-org dark-web sweep.
+
+    Iterates every Organization with at least one enabled DarkWebMonitor
+    and runs ``scheduled_dark_web_scan`` against each monitor. Gives us
+    a single beat-schedule entry that fans out properly instead of
+    requiring one beat entry per monitor.
+    """
+    async def _sweep():
+        from src.models.organization import Organization
+        engine, factory = _fresh_darkweb_session_factory()
+        totals = {"orgs_scanned": 0, "monitors_scanned": 0, "findings_created": 0}
+        try:
+            async with factory() as db:
+                orgs = list((await db.execute(select(Organization))).scalars().all())
+                for org in orgs:
+                    monitors = list((await db.execute(
+                        select(DarkWebMonitor).where(
+                            DarkWebMonitor.organization_id == org.id,
+                            DarkWebMonitor.enabled == True,  # noqa: E712
+                        )
+                    )).scalars().all())
+                    if not monitors:
+                        continue
+                    totals["orgs_scanned"] += 1
+                    for m in monitors:
+                        totals["monitors_scanned"] += 1
+                        # Delegate to the per-monitor task in-process
+                        # (sync Celery .apply() so we can collect totals).
+                        res = scheduled_dark_web_scan.apply(
+                            kwargs={"monitor_id": m.id, "scan_type": "full"}
+                        ).get()
+                        if isinstance(res, dict):
+                            totals["findings_created"] += int(res.get("created") or 0)
+        finally:
+            await engine.dispose()
+        logger.info(f"darkweb_cross_org_sweep: {totals}")
+        return totals
+
+    try:
+        loop = asyncio.new_event_loop()
+        try:
+            return loop.run_until_complete(_sweep())
+        finally:
+            loop.close()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"darkweb_cross_org_sweep failed: {exc}")
+        return {"error": str(exc)[:200]}
 
 
 @shared_task(bind=True, max_retries=3)

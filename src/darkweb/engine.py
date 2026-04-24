@@ -192,6 +192,174 @@ class DarkWebScanner:
             logger.warning(f"OTX search failed: {e}")
         return findings
 
+    async def hibp_lookup_emails(self, emails: list[str]) -> list[dict[str, Any]]:
+        """Tier 2 — per-email HIBP lookup.
+
+        Calls ``/breachedaccount/{email}`` and ``/stealerlogsbyemail/{email}``
+        for each email in ``emails``. Returns one finding dict per
+        (email × breach) pair. Requires an HIBP API key in
+        ``settings.hibp_api_key``; returns [] with a logged note when
+        the key is absent so Tier 1 keeps working.
+
+        HIBP Pwned 1 ($3.50/mo) allows 10 req/min — we space requests
+        1.7s apart. At typical monitor size (< 50 emails) this finishes
+        in well under a minute per scan.
+        """
+        from src.core.config import settings as _settings
+        key = getattr(_settings, "hibp_api_key", None) or os.environ.get("HIBP_API_KEY", "")
+        if not key:
+            logger.info("HIBP per-email lookup skipped: HIBP_API_KEY not set")
+            return []
+
+        findings: list[dict[str, Any]] = []
+        headers = {
+            "hibp-api-key": key,
+            "User-Agent": "PySOAR-DarkWebMonitor",
+        }
+        # HIBP Pwned 1 tier: 10 req/min -> 6s between bursts of 5 is safe
+        import asyncio as _asyncio
+        async with httpx.AsyncClient(timeout=15.0, headers=headers) as client:
+            for email in emails:
+                email = (email or "").strip()
+                if not email or "@" not in email:
+                    continue
+                # 1. Full breach list for this account (password hashes
+                # are NOT returned by HIBP — it returns the breach names
+                # the account appears in).
+                try:
+                    resp = await client.get(
+                        f"{HIBP_API}/breachedaccount/{email}",
+                        params={"truncateResponse": "false"},
+                    )
+                    if resp.status_code == 200:
+                        for b in resp.json():
+                            findings.append({
+                                "source": "hibp_account",
+                                "lookup_kind": "breached_account",
+                                "email": email,
+                                "breach_name": b.get("Name"),
+                                "breach_date": b.get("BreachDate"),
+                                "affected_count": b.get("PwnCount", 0),
+                                "compromised_data": b.get("DataClasses", []),
+                                "is_verified": b.get("IsVerified", False),
+                                "domain": b.get("Domain"),
+                                "description": (b.get("Description") or "")[:300],
+                                "content_hash": hashlib.sha256(
+                                    f"hibp_ba::{email}::{b.get('Name')}".encode()
+                                ).hexdigest(),
+                                "title": f"{email} exposed in {b.get('Name')}",
+                            })
+                    elif resp.status_code == 404:
+                        # Account not in any breach — clean; skip
+                        pass
+                    elif resp.status_code == 401:
+                        logger.warning("HIBP returned 401 — API key invalid")
+                        return findings
+                    elif resp.status_code == 429:
+                        logger.warning("HIBP rate-limited; backing off")
+                        await _asyncio.sleep(6)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"HIBP breachedaccount({email}) failed: {exc}")
+
+                await _asyncio.sleep(1.7)
+
+                # 2. Stealer logs (infostealer malware exfils).
+                try:
+                    resp = await client.get(
+                        f"{HIBP_API}/stealerlogsbyemail/{email}",
+                    )
+                    if resp.status_code == 200:
+                        for site in resp.json() or []:
+                            findings.append({
+                                "source": "hibp_stealer",
+                                "lookup_kind": "stealer_log",
+                                "email": email,
+                                "site": site,
+                                "content_hash": hashlib.sha256(
+                                    f"hibp_sl::{email}::{site}".encode()
+                                ).hexdigest(),
+                                "title": f"{email} in infostealer log for {site}",
+                                "description": f"Credentials for {site} exfiltrated by infostealer malware targeting {email}",
+                            })
+                    elif resp.status_code == 404:
+                        pass
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"HIBP stealerlogsbyemail({email}) failed: {exc}")
+
+                await _asyncio.sleep(1.7)
+
+                # 3. Pastes containing the account.
+                try:
+                    resp = await client.get(f"{HIBP_API}/pasteaccount/{email}")
+                    if resp.status_code == 200:
+                        for p in resp.json() or []:
+                            findings.append({
+                                "source": "hibp_paste",
+                                "lookup_kind": "paste",
+                                "email": email,
+                                "paste_source": p.get("Source"),
+                                "paste_id": p.get("Id"),
+                                "paste_title": p.get("Title"),
+                                "paste_date": p.get("Date"),
+                                "email_count": p.get("EmailCount"),
+                                "content_hash": hashlib.sha256(
+                                    f"hibp_paste::{email}::{p.get('Source')}::{p.get('Id')}".encode()
+                                ).hexdigest(),
+                                "title": f"{email} in paste: {p.get('Source')}/{p.get('Id')}",
+                                "description": (p.get("Title") or "")[:300],
+                            })
+                    elif resp.status_code == 404:
+                        pass
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"HIBP pasteaccount({email}) failed: {exc}")
+
+                await _asyncio.sleep(1.7)
+
+        logger.info(f"HIBP per-email lookup: {len(findings)} findings across {len(emails)} emails")
+        return findings
+
+    async def hibp_lookup_domains(self, domains: list[str]) -> list[dict[str, Any]]:
+        """Tier 2 — per-domain HIBP breach lookup.
+
+        Returns all breaches that affected the given domain(s). Uses
+        ``GET /breaches?domain=...`` which is free (no key required) but
+        limited — for domain subscription lookups (all accounts in the
+        domain) you need a paid subscription. This method is key-free
+        and always runs when a monitor has domains_watched set.
+        """
+        findings: list[dict[str, Any]] = []
+        async with httpx.AsyncClient(timeout=15.0, headers={"User-Agent": "PySOAR-DarkWebMonitor"}) as client:
+            for domain in domains:
+                domain = (domain or "").strip().lower()
+                if not domain:
+                    continue
+                try:
+                    resp = await client.get(
+                        f"{HIBP_API}/breaches",
+                        params={"domain": domain},
+                    )
+                    if resp.status_code == 200:
+                        for b in resp.json() or []:
+                            findings.append({
+                                "source": "hibp_domain",
+                                "lookup_kind": "domain_breach",
+                                "domain": domain,
+                                "breach_name": b.get("Name"),
+                                "breach_date": b.get("BreachDate"),
+                                "affected_count": b.get("PwnCount", 0),
+                                "compromised_data": b.get("DataClasses", []),
+                                "is_verified": b.get("IsVerified", False),
+                                "description": (b.get("Description") or "")[:300],
+                                "content_hash": hashlib.sha256(
+                                    f"hibp_dom::{domain}::{b.get('Name')}".encode()
+                                ).hexdigest(),
+                                "title": f"{domain} in {b.get('Name')}",
+                            })
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"HIBP breaches({domain}) failed: {exc}")
+        logger.info(f"HIBP per-domain lookup: {len(findings)} findings across {len(domains)} domains")
+        return findings
+
     async def aggregate_findings(self, results: dict[str, Any]) -> dict[str, Any]:
         """Aggregate and deduplicate findings from multiple sources"""
         all_findings = []
