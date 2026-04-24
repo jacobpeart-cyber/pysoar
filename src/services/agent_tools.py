@@ -488,6 +488,25 @@ class AgentToolRegistry:
             handler=self._list_tickets,
         ))
 
+        # ===== INTEGRATIONS =====
+        # Tells the agent which notification + intel integrations the
+        # operator has actually configured. Without this the agent
+        # recommends "notify Slack" even when Slack isn't set up.
+        self._register(Tool(
+            name="list_configured_integrations",
+            description=(
+                "List integrations the operator has configured (notification channels "
+                "like Slack/Teams/PagerDuty/OpsGenie, ITSM like Jira/ServiceNow, intel "
+                "like VirusTotal/Shodan/AbuseIPDB/GreyNoise). Returns {id, configured, "
+                "has_webhook, has_api_key, enabled, health} per integration. "
+                "REQUIRED READ before recommending any notification, ticket, or "
+                "enrichment action — only recommend channels that are configured."
+            ),
+            parameters={},
+            category="query",
+            handler=self._list_configured_integrations,
+        ))
+
         # ===== COMPLIANCE =====
         self._register(Tool(
             name="list_compliance_frameworks",
@@ -1367,3 +1386,63 @@ class AgentToolRegistry:
         if status:
             items = [t for t in items if (t.get("status") or "").lower() == status.lower()]
         return {"total": len(items), "tickets": items[: int(limit)]}
+
+    async def _list_configured_integrations(self):
+        """Return a grounded summary of which integrations the org has
+        actually configured. Reads app_settings (credential source of
+        truth) plus installed_integrations (marketplace health state)
+        and returns per-integration {configured, has_webhook,
+        has_api_key, enabled, health}. Use this BEFORE recommending a
+        notification channel, an ITSM ticket, or an intel enrichment
+        — only recommend channels the operator has set up."""
+        from sqlalchemy import text as _sql_text
+        # Pull the credential config from app_settings.
+        rows = []
+        try:
+            rows = list((await self.db.execute(_sql_text(
+                "SELECT section, value FROM app_settings "
+                "WHERE section LIKE 'integration:%'"
+            ))).all())
+        except Exception as exc:  # noqa: BLE001
+            return {"error": f"app_settings read failed: {exc}"}
+
+        from_settings: dict[str, dict] = {}
+        for sec, value in rows:
+            if not sec or not sec.startswith("integration:"):
+                continue
+            iid = sec.split(":", 1)[1]
+            cfg = value if isinstance(value, dict) else {}
+            from_settings[iid] = {
+                "id": iid,
+                "configured": bool(
+                    cfg.get("api_key")
+                    or cfg.get("webhook_url")
+                    or cfg.get("url")
+                    or cfg.get("token")
+                ),
+                "has_webhook": bool(cfg.get("webhook_url")),
+                "has_api_key": bool(cfg.get("api_key") or cfg.get("token")),
+                "has_url": bool(cfg.get("url") or cfg.get("host")),
+                "channel": cfg.get("channel"),
+            }
+
+        # Merge health state from installed_integrations if the
+        # marketplace has a row for it.
+        try:
+            from src.integrations.models import InstalledIntegration
+            installed = list(await self.db.scalars(select(InstalledIntegration)))
+            for ii in installed:
+                entry = from_settings.setdefault(ii.connector_id, {"id": ii.connector_id})
+                entry["enabled"] = ii.status == "active"
+                entry["health"] = ii.health_status or "unknown"
+                entry["last_health_check"] = ii.last_health_check.isoformat() if ii.last_health_check else None
+        except Exception:
+            pass
+
+        items = list(from_settings.values())
+        items.sort(key=lambda x: (not x.get("configured"), x["id"]))
+        return {
+            "total": len(items),
+            "configured_count": sum(1 for i in items if i.get("configured")),
+            "integrations": items,
+        }

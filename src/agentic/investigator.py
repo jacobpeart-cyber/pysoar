@@ -116,6 +116,10 @@ Tool discipline:
   execute_playbook, create_ticket) are PROHIBITED during autonomous
   investigation. Instead, include them in `recommendations` in your
   final verdict.
+- `configured_integrations` in the seed data tells you which
+  notification / ITSM / enrichment channels are actually set up.
+  Your recommendations MUST reference only configured channels. If
+  Slack isn't in that list, do not recommend a Slack notification.
 
 Final verdict format — when ready to conclude, respond with a JSON object
 in a ```json code block``` with this exact shape:
@@ -233,8 +237,26 @@ class AutonomousInvestigator:
         )
 
         # Seed the transcript with the primary alert data so Gemini
-        # doesn't have to call list_alerts first.
+        # doesn't have to call list_alerts first. Also pull which
+        # integrations are actually configured so Gemini's final
+        # recommendations reference only real, wired channels — no
+        # more "notify via Slack" when Slack isn't set up.
+        configured_integrations: list[str] = []
+        try:
+            integ_result = await self.tool_registry.execute(
+                "list_configured_integrations", {}
+            )
+            if integ_result.get("success"):
+                items = (integ_result.get("result") or {}).get("integrations") or []
+                configured_integrations = [
+                    i["id"] for i in items if i.get("configured")
+                ]
+        except Exception:
+            pass
+
         seeded_context = await self._seed_context(investigation)
+        if configured_integrations:
+            seeded_context["configured_integrations"] = configured_integrations
         # Pull the most recent analyst corrections for this org so the
         # investigator sees prior mistakes and adjusts. This is the
         # learning-from-feedback loop — without it, the agent would
