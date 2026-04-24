@@ -21,7 +21,7 @@ import { datalakeApi } from '../api/endpoints';
 
 
 export default function DataLakeDashboard() {
-  const [activeTab, setActiveTab] = useState<'sources' | 'pipelines' | 'query' | 'catalog' | 'storage'>('sources');
+  const [activeTab, setActiveTab] = useState<'sources' | 'pipelines' | 'query' | 'catalog' | 'partitions' | 'storage'>('sources');
   const [selectedSource, setSelectedSource] = useState<DataSource | null>(null);
   const [selectedPipeline, setSelectedPipeline] = useState<Pipeline | null>(null);
   const [showModal, setShowModal] = useState(false);
@@ -31,32 +31,51 @@ export default function DataLakeDashboard() {
   const [queryRunning, setQueryRunning] = useState(false);
   const [catalogSearch, setCatalogSearch] = useState('');
 
-  // Backend DataSourceResponse emits snake_case + different field
-  // names than this page was written against. Previously every row
-  // in the Sources table rendered `undefined/NaN/sec`; every summary
-  // number (`Events/sec`, `Storage TB`) was 0. Normalize once so the
-  // downstream consumers see the shape they expect.
+  // Backend DataSourceResponse emits snake_case + status values
+  // ("active", "initializing") that don't match the UI's Healthy/Error
+  // colors. Normalize once so all downstream consumers see the shape
+  // they expect, and map backend status words into UI health labels.
+  const backendStatusToHealth = (s: any): string => {
+    const raw = String(s?.status ?? s?.health ?? s?.health_status ?? '').toLowerCase();
+    if (raw === 'active' || raw === 'healthy' || raw === 'running') return 'Healthy';
+    if (raw === 'error' || raw === 'failed' || raw === 'disabled') return 'Error';
+    if (raw === 'paused') return 'Paused';
+    if (raw === 'initializing' || raw === 'building') return 'Initializing';
+    return raw || 'unknown';
+  };
   const normalizeSource = (s: any): DataSource => ({
     id: s.id,
     name: s.name ?? s.source_name ?? s.display_name ?? 'Unnamed source',
     type: s.type ?? s.source_type ?? 'unknown',
-    health: s.health ?? s.health_status ?? s.status ?? 'unknown',
+    health: backendStatusToHealth(s),
     ingestionRate: typeof s.ingestionRate === 'number'
       ? s.ingestionRate
-      : (s.ingestion_rate ?? s.events_per_second ?? 0),
-    events: typeof s.events === 'number' ? s.events : (s.total_events ?? s.event_count ?? 0),
-    lastSync: s.lastSync ?? s.last_sync_at ?? s.last_event_at ?? null,
+      : (s.ingestion_rate ?? s.ingestion_rate_eps ?? s.events_per_second ?? 0),
+    events: typeof s.events === 'number'
+      ? s.events
+      : (s.total_events ?? s.total_events_ingested ?? s.event_count ?? 0),
+    lastSync: s.lastSync ?? s.last_sync_at ?? s.last_event_received ?? s.last_event_at ?? null,
     schema: s.schema ?? null,
   });
+  const backendStatusToPipelineStatus = (p: any): string => {
+    const raw = String(p?.status ?? p?.pipeline_status ?? '').toLowerCase();
+    if (raw === 'active' || raw === 'running') return 'Running';
+    if (raw === 'paused') return 'Paused';
+    if (raw === 'failed' || raw === 'error') return 'Failed';
+    if (raw === 'completed') return 'Completed';
+    if (raw === 'building' || raw === 'initializing') return 'Building';
+    return raw || 'unknown';
+  };
   const normalizePipeline = (p: any): Pipeline => ({
     id: p.id,
     name: p.name,
-    status: p.status ?? p.pipeline_status ?? 'unknown',
+    status: backendStatusToPipelineStatus(p),
     successRate: typeof p.successRate === 'number'
       ? p.successRate
-      : (p.success_rate ?? 0),
-    throughput: p.throughput ?? p.events_processed ?? 0,
-    lastRun: p.lastRun ?? p.last_run_at ?? null,
+      : (p.success_rate ?? (p.error_count > 0 ? 0 : 100)),
+    throughput: p.throughput ?? p.records_processed_total ?? p.events_processed ?? 0,
+    lastRun: p.lastRun ?? p.last_run ?? p.last_run_at ?? null,
+    duration: p.duration ?? (p.avg_processing_time_ms ? `${p.avg_processing_time_ms}ms` : ''),
   });
 
   const { data: sourcesRaw = [] } = useQuery({ queryKey: ['dataSources'], queryFn: datalakeApi.getDataSources });
@@ -109,37 +128,78 @@ export default function DataLakeDashboard() {
 
   const stats = useMemo(() => {
     const activeSources = sources.filter((s: DataSource) => s.health === 'Healthy').length;
-    const totalEventsPerSec = sources.reduce((sum: number, s: DataSource) => sum + s.ingestionRate, 0);
-    const totalStorage = (sources.reduce((sum: number, s: DataSource) => sum + (s.events * 0.0002), 0) / 1000000).toFixed(2); // rough estimate in TB
+    const totalEvents = sources.reduce((sum: number, s: DataSource) => sum + (s.events || 0), 0);
+    const totalBytes = Number((storageBreakdownRaw as any)?.total_bytes ?? 0);
+    const tb = totalBytes / 1024 ** 4;
+    const totalStorage = tb >= 1
+      ? `${tb.toFixed(2)} TB`
+      : totalBytes >= 1024 ** 3
+        ? `${(totalBytes / 1024 ** 3).toFixed(2)} GB`
+        : totalBytes >= 1024 ** 2
+          ? `${(totalBytes / 1024 ** 2).toFixed(1)} MB`
+          : `${totalBytes} B`;
     const activePipelines = pipelines.filter((p: Pipeline) => p.status === 'Running').length;
-    return { activeSources, totalEventsPerSec, totalStorage, activePipelines };
-  }, [sources, pipelines]);
+    return { activeSources, totalEvents, totalStorage, activePipelines };
+  }, [sources, pipelines, storageBreakdownRaw]);
 
   const storageBreakdown = useMemo(() => {
     // Use the backend's real hot/warm/cold/archived split when
     // available. The previous fabrication applied hardcoded percentage
     // splits to an events×0.0002 estimate, producing a chart even when
     // no data existed.
-    const fmt = (v: number) => (v >= 1000 ? `${(v / 1000).toFixed(1)}TB` : `${v}GB`);
+    const fmtBytes = (b: number): { label: string; gb: number } => {
+      if (!b || b <= 0) return { label: '0 B', gb: 0 };
+      if (b >= 1024 ** 4) return { label: `${(b / 1024 ** 4).toFixed(2)} TB`, gb: b / 1024 ** 3 };
+      if (b >= 1024 ** 3) return { label: `${(b / 1024 ** 3).toFixed(2)} GB`, gb: b / 1024 ** 3 };
+      if (b >= 1024 ** 2) return { label: `${(b / 1024 ** 2).toFixed(1)} MB`, gb: b / 1024 ** 3 };
+      if (b >= 1024) return { label: `${(b / 1024).toFixed(1)} KB`, gb: b / 1024 ** 3 };
+      return { label: `${b} B`, gb: b / 1024 ** 3 };
+    };
     if (storageBreakdownRaw && typeof storageBreakdownRaw === 'object') {
-      const tiers = (storageBreakdownRaw as any).tiers || storageBreakdownRaw;
+      // New backend shape: { total_bytes, by_tier: {hot, warm, cold, archived}, ... }
+      const tiers = (storageBreakdownRaw as any).by_tier
+        || (storageBreakdownRaw as any).tiers
+        || storageBreakdownRaw;
       if (Array.isArray(tiers)) {
-        return tiers.map((t: any) => ({
-          name: t.name ?? t.tier ?? 'tier',
-          value: t.size_gb ?? t.value ?? 0,
-          size: fmt(t.size_gb ?? t.value ?? 0),
-        }));
+        return tiers.map((t: any) => {
+          const b = t.bytes ?? t.size_bytes ?? t.value ?? 0;
+          const f = fmtBytes(b);
+          return {
+            name: t.name ?? t.tier ?? 'tier',
+            value: Number(f.gb.toFixed(3)),
+            size: f.label,
+          };
+        });
       }
       return ['hot', 'warm', 'cold', 'archived']
         .filter((k) => k in (tiers as any))
-        .map((k) => ({
-          name: k.charAt(0).toUpperCase() + k.slice(1),
-          value: (tiers as any)[k] ?? 0,
-          size: fmt((tiers as any)[k] ?? 0),
-        }));
+        .map((k) => {
+          const b = (tiers as any)[k] ?? 0;
+          const f = fmtBytes(b);
+          return {
+            name: k.charAt(0).toUpperCase() + k.slice(1),
+            value: Number(f.gb.toFixed(3)),
+            size: f.label,
+          };
+        });
     }
     return [];
   }, [storageBreakdownRaw]);
+
+  // Real live partitions for the SIEM log table — one row per day,
+  // bucketed hot/warm/cold/archived by age. Replaces the static
+  // dashboard with genuine partitioned-data view.
+  const { data: logPartitions } = useQuery({
+    queryKey: ['dl-log-partitions'],
+    queryFn: async () => {
+      try {
+        const res = await api.get('/data-lake/partitions/daily/log_entries?days=30');
+        return res.data;
+      } catch {
+        return { partitions: [], partition_count: 0, total_rows_scanned: 0 };
+      }
+    },
+  });
 
   const STORAGE_COLORS = ['#3B82F6', '#10B981', '#F59E0B', '#8B5CF6'];
 
@@ -184,8 +244,8 @@ export default function DataLakeDashboard() {
           <div className="bg-gray-800 border border-gray-700 rounded-lg p-6 dark:bg-gray-800 dark:border-gray-700">
             <div className="flex items-start justify-between">
               <div>
-                <p className="text-gray-400 text-sm mb-2">Events/sec</p>
-                <p className="text-3xl font-bold">{(stats.totalEventsPerSec / 1000).toFixed(0)}K</p>
+                <p className="text-gray-400 text-sm mb-2">Total Events</p>
+                <p className="text-3xl font-bold">{stats.totalEvents.toLocaleString()}</p>
               </div>
               <TrendingUp className="w-8 h-8 text-green-400" />
             </div>
@@ -194,7 +254,7 @@ export default function DataLakeDashboard() {
           <div className="bg-gray-800 border border-gray-700 rounded-lg p-6 dark:bg-gray-800 dark:border-gray-700">
             <div className="flex items-start justify-between">
               <div>
-                <p className="text-gray-400 text-sm mb-2">Storage TB</p>
+                <p className="text-gray-400 text-sm mb-2">Total Storage</p>
                 <p className="text-3xl font-bold">{stats.totalStorage}</p>
               </div>
               <HardDrive className="w-8 h-8 text-purple-400" />
@@ -220,6 +280,7 @@ export default function DataLakeDashboard() {
               { id: 'pipelines', label: 'Pipelines', icon: Workflow },
               { id: 'query', label: 'Query Engine', icon: Search },
               { id: 'catalog', label: 'Data Catalog', icon: Layers },
+              { id: 'partitions', label: 'Partitions', icon: Layers },
               { id: 'storage', label: 'Storage Tiers', icon: HardDrive },
             ].map((tab) => {
               const TabIcon = tab.icon;
@@ -523,27 +584,128 @@ export default function DataLakeDashboard() {
               <table className="w-full">
                 <thead className="bg-gray-700/50 border-b border-gray-700">
                   <tr>
-                    <th className="px-6 py-4 text-left text-sm font-semibold text-gray-300">Table Name</th>
-                    <th className="px-6 py-4 text-left text-sm font-semibold text-gray-300">Schema</th>
+                    <th className="px-6 py-4 text-left text-sm font-semibold text-gray-300">Dataset</th>
+                    <th className="px-6 py-4 text-left text-sm font-semibold text-gray-300">Type</th>
                     <th className="px-6 py-4 text-left text-sm font-semibold text-gray-300">Rows</th>
-                    <th className="px-6 py-4 text-left text-sm font-semibold text-gray-300">Size (GB)</th>
-                    <th className="px-6 py-4 text-left text-sm font-semibold text-gray-300">Owner</th>
+                    <th className="px-6 py-4 text-left text-sm font-semibold text-gray-300">Size</th>
+                    <th className="px-6 py-4 text-left text-sm font-semibold text-gray-300">Columns</th>
+                    <th className="px-6 py-4 text-left text-sm font-semibold text-gray-300">Last event</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {filteredCatalog.map((item: CatalogItem) => (
-                    <tr key={item.id} className="border-t border-gray-700 hover:bg-gray-700/50">
-                      <td className="px-6 py-4 text-sm font-medium text-white">{item.name}</td>
-                      <td className="px-6 py-4 text-sm">
-                        <span className="bg-gray-700 text-gray-200 px-3 py-1 rounded text-xs dark:bg-gray-700">
-                          {item.schema}
-                        </span>
+                  {filteredCatalog.map((item: any) => {
+                    const rowCount = item.row_count ?? item.rows ?? 0;
+                    const bytes = item.size_bytes ?? 0;
+                    const sizeLabel = bytes >= 1024 ** 3
+                      ? `${(bytes / 1024 ** 3).toFixed(2)} GB`
+                      : bytes >= 1024 ** 2
+                        ? `${(bytes / 1024 ** 2).toFixed(1)} MB`
+                        : bytes >= 1024
+                          ? `${(bytes / 1024).toFixed(1)} KB`
+                          : bytes > 0
+                            ? `${bytes} B`
+                            : '—';
+                    const columnCount = Array.isArray(item.schema) ? item.schema.length : 0;
+                    const last = item.last_event_at
+                      ? new Date(item.last_event_at).toISOString().replace('T', ' ').slice(0, 16) + ' UTC'
+                      : '—';
+                    return (
+                      <tr key={item.id} className="border-t border-gray-700 hover:bg-gray-700/50">
+                        <td className="px-6 py-4 text-sm font-medium text-white">
+                          <div className="flex items-center gap-2">
+                            <span>{item.name}</span>
+                            {item.queryable && (
+                              <span className="text-[10px] bg-emerald-900/40 text-emerald-300 px-2 py-0.5 rounded">queryable</span>
+                            )}
+                            {item.tenant_scoped && (
+                              <span className="text-[10px] bg-blue-900/40 text-blue-300 px-2 py-0.5 rounded">tenant-scoped</span>
+                            )}
+                          </div>
+                          {item.description && (
+                            <div className="text-xs text-gray-500 mt-1">{item.description}</div>
+                          )}
+                        </td>
+                        <td className="px-6 py-4 text-sm text-gray-300">{item.type ?? item.entity_type ?? '—'}</td>
+                        <td className="px-6 py-4 text-sm text-gray-300">{Number(rowCount).toLocaleString()}</td>
+                        <td className="px-6 py-4 text-sm text-gray-300">{sizeLabel}</td>
+                        <td className="px-6 py-4 text-sm text-gray-300">{columnCount || '—'}</td>
+                        <td className="px-6 py-4 text-sm text-gray-400">{last}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {/* Partitions Tab — real daily partitions of log_entries bucketed by age */}
+        {activeTab === 'partitions' && (
+          <div>
+            <div className="mb-6 flex items-center justify-between">
+              <div>
+                <h3 className="text-lg font-semibold">SIEM Log Partitions (last 30 days)</h3>
+                <p className="text-sm text-gray-400">
+                  One partition per day · hot (&lt;7d) / warm (7–30d) / cold (30–365d) / archived (&gt;1y)
+                </p>
+              </div>
+              {logPartitions && (
+                <div className="text-sm text-gray-400">
+                  {(logPartitions as any).partition_count} partitions ·{' '}
+                  {Number((logPartitions as any).total_rows_scanned || 0).toLocaleString()} rows
+                </div>
+              )}
+            </div>
+            <div className="bg-gray-800 border border-gray-700 rounded-lg overflow-hidden dark:bg-gray-800 dark:border-gray-700">
+              <table className="w-full">
+                <thead className="bg-gray-700/50 border-b border-gray-700">
+                  <tr>
+                    <th className="px-6 py-4 text-left text-sm font-semibold text-gray-300">Partition Key</th>
+                    <th className="px-6 py-4 text-left text-sm font-semibold text-gray-300">Day</th>
+                    <th className="px-6 py-4 text-left text-sm font-semibold text-gray-300">Tier</th>
+                    <th className="px-6 py-4 text-left text-sm font-semibold text-gray-300">Rows</th>
+                    <th className="px-6 py-4 text-left text-sm font-semibold text-gray-300">Size</th>
+                    <th className="px-6 py-4 text-left text-sm font-semibold text-gray-300">Range</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(logPartitions as any)?.partitions?.length ? (
+                    (logPartitions as any).partitions.map((p: any) => {
+                      const bytes = p.size_bytes || 0;
+                      const sizeLabel =
+                        bytes >= 1024 ** 3 ? `${(bytes / 1024 ** 3).toFixed(2)} GB`
+                        : bytes >= 1024 ** 2 ? `${(bytes / 1024 ** 2).toFixed(1)} MB`
+                        : bytes >= 1024 ? `${(bytes / 1024).toFixed(1)} KB`
+                        : bytes > 0 ? `${bytes} B` : '—';
+                      const tierColor =
+                        p.storage_tier === 'hot' ? 'bg-red-900/40 text-red-300'
+                        : p.storage_tier === 'warm' ? 'bg-orange-900/40 text-orange-300'
+                        : p.storage_tier === 'cold' ? 'bg-blue-900/40 text-blue-300'
+                        : 'bg-gray-900/40 text-gray-300';
+                      return (
+                        <tr key={p.partition_key} className="border-t border-gray-700 hover:bg-gray-700/50">
+                          <td className="px-6 py-4 text-sm font-mono text-white">{p.partition_key}</td>
+                          <td className="px-6 py-4 text-sm text-gray-300">{p.day?.slice(0, 10)}</td>
+                          <td className="px-6 py-4 text-sm">
+                            <span className={clsx('px-3 py-1 rounded text-xs font-medium', tierColor)}>
+                              {p.storage_tier}
+                            </span>
+                          </td>
+                          <td className="px-6 py-4 text-sm text-gray-300">{Number(p.record_count).toLocaleString()}</td>
+                          <td className="px-6 py-4 text-sm text-gray-300">{sizeLabel}</td>
+                          <td className="px-6 py-4 text-xs text-gray-500">
+                            {p.first_at?.slice(11, 16)} → {p.last_at?.slice(11, 16)}
+                          </td>
+                        </tr>
+                      );
+                    })
+                  ) : (
+                    <tr>
+                      <td colSpan={6} className="px-6 py-6 text-center text-sm text-gray-500">
+                        No log_entries in the last 30 days for this org.
                       </td>
-                      <td className="px-6 py-4 text-sm text-gray-300">{(item.rows / 1000).toFixed(0)}K</td>
-                      <td className="px-6 py-4 text-sm text-gray-300">{item.size}</td>
-                      <td className="px-6 py-4 text-sm text-gray-300">{item.owner}</td>
                     </tr>
-                  ))}
+                  )}
                 </tbody>
               </table>
             </div>
