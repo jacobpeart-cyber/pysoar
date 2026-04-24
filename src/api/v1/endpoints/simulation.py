@@ -56,6 +56,46 @@ logger = get_logger(__name__)
 router = APIRouter(prefix="/simulation", tags=["simulation"])
 
 
+# ==================== TARGETS (real enrolled BAS agents) ====================
+
+@router.get("/targets")
+async def list_bas_targets(
+    current_user: CurrentUser = None,
+    session: DatabaseSession = None,
+) -> list[dict]:
+    """List active, BAS-capable endpoint agents enrolled in this org.
+
+    The AttackSimulation UI uses this to populate the "target host"
+    picker so users can only run real tests against real agents.
+    Returns [] when no BAS-capable agent is enrolled; the UI renders a
+    "coverage-only mode" banner in that case instead of silently
+    defaulting to a non-existent hostname.
+    """
+    from sqlalchemy import select as _sel
+    from src.agents.capabilities import AgentCapability
+    from src.agents.models import EndpointAgent
+
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = _sel(EndpointAgent).where(EndpointAgent.status == "active")
+    if org_id:
+        stmt = stmt.where(EndpointAgent.organization_id == org_id)
+    rows = list((await session.execute(stmt)).scalars().all())
+
+    targets = []
+    for a in rows:
+        caps = a.capabilities or []
+        if AgentCapability.BAS.value not in caps:
+            continue
+        targets.append({
+            "id": a.id,
+            "hostname": a.hostname,
+            "capabilities": caps,
+            "last_checkin": a.last_checkin.isoformat() if getattr(a, "last_checkin", None) else None,
+            "os_type": getattr(a, "os_type", None),
+        })
+    return targets
+
+
 # ==================== SIMULATIONS ====================
 
 @router.post("/simulations")
@@ -516,10 +556,10 @@ async def test_technique(
     Run a single-technique simulation end-to-end synchronously.
 
     The frontend "Run Test" button posts with no body, so ``payload`` is
-    optional. A target host may be provided in ``payload["target_host"]``
-    (defaults to "lab-target"). This endpoint creates a one-technique
-    simulation, starts it, executes the coverage check in-process, and
-    returns the real pass/fail result — not a fake "executing" status.
+    optional. A target host may be provided in ``payload["target_host"]``;
+    when omitted, the engine picks any active BAS-capable agent for this
+    org. The old ``"lab-target"`` default silently sent every test to the
+    coverage-only path because no agent has that hostname.
 
     If the technique is NOT covered by any detection rule, we fire
     on_simulation_result so the agentic SOC pipeline can generate a
@@ -532,17 +572,20 @@ async def test_technique(
         if not technique:
             raise HTTPException(status_code=404, detail="Technique not found")
 
-        target_host = "lab-target"
+        target_host: Optional[str] = None
         if isinstance(payload, dict) and payload.get("target_host"):
             target_host = str(payload["target_host"])
 
         org_id = getattr(current_user, "organization_id", None)
         orchestrator = SimulationOrchestrator(session)
+        scope: dict = {}
+        if target_host:
+            scope["target_host"] = target_host
         simulation = await orchestrator.create_simulation(
             name=f"Single Test: {mitre_id}",
             sim_type="atomic_test",
             techniques=[mitre_id],
-            scope={"target_host": target_host},
+            scope=scope,
             target_environment="lab",
             created_by=str(current_user.id),
             organization_id=org_id,
@@ -581,15 +624,38 @@ async def test_technique(
             except Exception as e:  # noqa: BLE001
                 logger.error(f"Automation on_simulation_result failed: {e}")
 
-        await session.flush()
+        # Roll up: set simulation.status=completed/failed + aggregate counts.
+        roll = await orchestrator.finalize_simulation(simulation.id)
+
+        # Reload tests to pick up execution_mode stamp from _execute_test.
+        tests = list((await session.execute(tests_q)).scalars().all())
+        execution_mode = "real"
+        for t in tests:
+            if (t.detection_details or {}).get("execution_mode") == "coverage_only":
+                execution_mode = "coverage_only"
+                break
+
+        # Reload the sim so scope reflects any host-fallback stamping
+        # the engine did when target_host missed.
+        sim_final = await orchestrator._get_simulation(simulation.id)
+        actual_target_host = None
+        if sim_final and isinstance(sim_final.scope, dict):
+            actual_target_host = (
+                sim_final.scope.get("actual_target_host")
+                or sim_final.scope.get("target_host")
+            )
 
         return {
             "simulation_id": simulation.id,
-            "status": "completed",
+            "status": roll["status"],
             "technique": mitre_id,
             "target_host": target_host,
+            "actual_target_host": actual_target_host,
+            "execution_mode": execution_mode,
             "detected": detected_any,
             "tests_executed": len(tests),
+            "detection_rate": roll["detection_rate"],
+            "overall_score": roll["overall_score"],
         }
 
     except HTTPException:
@@ -726,22 +792,15 @@ async def create_emulation_plan(
             except Exception as test_exc:  # noqa: BLE001
                 logger.error(f"Failed to execute emulation test {t.id}: {test_exc}")
 
-        # Finalize simulation stats
-        simulation.passed_tests = sum(1 for t in tests if t.was_detected)
-        simulation.failed_tests = sum(1 for t in tests if not t.was_detected and t.status != "error")
-        simulation.blocked_tests = sum(1 for t in tests if t.status == "error")
-        if tests:
-            simulation.detection_rate = (simulation.passed_tests / len(tests)) * 100
-            simulation.overall_score = simulation.detection_rate
-        simulation.status = "completed"
-        simulation.completed_at = __import__("src.models.base", fromlist=["utc_now"]).utc_now()
-        if simulation.started_at:
-            simulation.duration_seconds = int(
-                (simulation.completed_at - simulation.started_at).total_seconds()
-            )
+        # Roll up counts + set completed/failed via the shared helper so
+        # every code path produces the same aggregate semantics.
+        await orchestrator.finalize_simulation(simulation.id)
 
         await session.flush()
         await session.refresh(simulation)
+        tests = list((await session.execute(
+            _sel(SimulationTest).where(SimulationTest.simulation_id == simulation.id)
+        )).scalars().all())
 
         return SimulationDetailResponse(
             simulation=AttackSimulationSchema.model_validate(simulation),

@@ -233,6 +233,39 @@ export default function AttackSimulation() {
   const [newSimEnvironment, setNewSimEnvironment] = useState('lab');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [runningTests, setRunningTests] = useState<Set<string>>(new Set());
+  const [selectedTargetHost, setSelectedTargetHost] = useState<string>('');
+
+  // Real enrolled BAS agents — populates the "target host" picker so
+  // users can only aim tests at agents that will actually execute them.
+  // Empty array -> no BAS-capable agent enrolled -> we tell the user
+  // the test will run in coverage-only mode instead of silently doing
+  // it after the fact.
+  interface BasTarget {
+    id: string;
+    hostname: string;
+    capabilities: string[];
+    last_checkin?: string | null;
+    os_type?: string | null;
+  }
+  const { data: basTargets } = useQuery<BasTarget[]>({
+    queryKey: ['basTargets'],
+    queryFn: async () => {
+      try {
+        const response = await api.get<BasTarget[]>('/simulation/targets');
+        return Array.isArray(response.data) ? response.data : [];
+      } catch {
+        return [];
+      }
+    },
+    refetchInterval: 30_000,
+  });
+  useEffect(() => {
+    // Auto-select the first real BAS target so users don't have to
+    // remember to pick one; they can still change it in the dropdown.
+    if (!selectedTargetHost && basTargets && basTargets.length > 0) {
+      setSelectedTargetHost(basTargets[0].hostname);
+    }
+  }, [basTargets, selectedTargetHost]);
 
   // Fetch simulation dashboard
   const { data: dashboard, isLoading: dashboardLoading, error: dashboardError } = useQuery({
@@ -554,6 +587,48 @@ export default function AttackSimulation() {
       {/* Technique Library Tab */}
       {activeTab === 'techniques' && (
         <div className="space-y-6">
+          {/* Target-agent picker. Without this, tests silently default
+              to a non-existent host and every run scored coverage-only. */}
+          <div className="flex items-center gap-4 p-4 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800">
+            <div className="flex-1">
+              <label className="block text-sm font-medium text-gray-900 dark:text-white mb-1">
+                Target Host
+              </label>
+              {basTargets && basTargets.length > 0 ? (
+                <>
+                  <select
+                    value={selectedTargetHost}
+                    onChange={(e) => setSelectedTargetHost(e.target.value)}
+                    className="w-full px-3 py-2 rounded-lg border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white focus:outline-none focus:ring-2 focus:ring-red-500"
+                  >
+                    {basTargets.map((t) => (
+                      <option key={t.id} value={t.hostname}>
+                        {t.hostname}
+                        {t.os_type ? ` · ${t.os_type}` : ''}
+                        {' · '}
+                        {t.capabilities.filter((c) => ['bas', 'purple', 'ir'].includes(c)).join('/')}
+                      </option>
+                    ))}
+                  </select>
+                  <p className="mt-1 text-xs text-green-700 dark:text-green-400">
+                    {basTargets.length} enrolled BAS-capable agent
+                    {basTargets.length > 1 ? 's' : ''} — tests will execute live on the selected host.
+                  </p>
+                </>
+              ) : (
+                <div className="px-3 py-2 rounded-lg bg-yellow-50 dark:bg-yellow-900/40 border border-yellow-300 dark:border-yellow-700">
+                  <p className="text-sm font-medium text-yellow-800 dark:text-yellow-200">
+                    No BAS-capable agent enrolled
+                  </p>
+                  <p className="text-xs text-yellow-700 dark:text-yellow-300 mt-1">
+                    Tests will score against detection-rule coverage only and will not
+                    execute a real payload. Enroll an agent with the <code>bas</code> capability to run live tests.
+                  </p>
+                </div>
+              )}
+            </div>
+          </div>
+
           {/* Filters */}
           <div className="flex flex-wrap gap-4">
             <div>
@@ -659,8 +734,18 @@ export default function AttackSimulation() {
                         const techId = technique.mitre_id ?? technique.id;
                         setRunningTests((prev) => new Set(prev).add(techId));
                         try {
-                          await api.post(`/simulation/techniques/${technique.mitre_id}/test`);
-                          showNotification('Test started for technique: ' + technique.name);
+                          const body: Record<string, any> = {};
+                          if (selectedTargetHost) body.target_host = selectedTargetHost;
+                          const res = await api.post(`/simulation/techniques/${technique.mitre_id}/test`, body);
+                          const mode = res.data?.execution_mode;
+                          const detected = res.data?.detected;
+                          const actualHost = res.data?.actual_target_host ?? selectedTargetHost ?? 'auto';
+                          const icon = mode === 'real' ? '🟢' : '⚪';
+                          const detLabel = detected ? 'detected' : 'missed';
+                          showNotification(
+                            `${icon} ${technique.name}: ${mode === 'real' ? `executed on ${actualHost}` : 'coverage-only'} · ${detLabel}`,
+                            detected ? 'success' : 'error',
+                          );
                         } catch (error: any) {
                           showNotification(error?.response?.data?.detail ?? 'Failed to start test.', 'error');
                         } finally {
