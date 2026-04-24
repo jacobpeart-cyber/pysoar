@@ -503,7 +503,12 @@ def supplychain_cross_org_sweep(self):
                             continue
                         suspected = analyzer.detect_typosquatting(comps, popular_list, 0.85) or []
                         for hit in suspected:
-                            sus_name = hit.get("suspected") or hit.get("suspected_package") or hit.get("package")
+                            sus_name = (
+                                hit.get("component")
+                                or hit.get("suspected")
+                                or hit.get("suspected_package")
+                                or hit.get("package")
+                            )
                             if not sus_name:
                                 continue
                             comp_row = (await db.execute(
@@ -528,6 +533,11 @@ def supplychain_cross_org_sweep(self):
                             )).scalar_one_or_none()
                             if existing is not None:
                                 continue
+                            similarity = (
+                                hit.get("similarity_score")
+                                or hit.get("similarity")
+                                or 0.0
+                            )
                             db.add(SupplyChainRisk(
                                 organization_id=org.id,
                                 component_id=comp_row.id,
@@ -535,7 +545,7 @@ def supplychain_cross_org_sweep(self):
                                 severity="high",
                                 description=(
                                     f"Package '{sus_name}' is lexically similar to popular "
-                                    f"'{hit.get('similar_to', 'unknown')}' ({hit.get('similarity', 0):.2f})"
+                                    f"'{hit.get('similar_to', 'unknown')}' ({similarity:.2f})"
                                 ),
                                 evidence=_json.dumps(hit),
                                 status="open",
