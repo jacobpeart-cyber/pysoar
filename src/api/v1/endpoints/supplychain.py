@@ -213,7 +213,7 @@ async def _persist_sbom_with_components(
                 name=str(name)[:500],
                 version=str(version)[:100],
                 vendor=(c.get("supplier") or c.get("vendor") or (c.get("publisher") if isinstance(c.get("publisher"), str) else None)),
-                package_type=(c.get("type") or "library")[:50].lower(),
+                package_type=_derive_package_type(purl, c.get("type")),
                 license_spdx_id=_extract_spdx_license(c),
                 license_type=_extract_spdx_license(c),
                 purl=purl[:2048] if purl else None,
@@ -235,6 +235,27 @@ async def _persist_sbom_with_components(
     await db.commit()
     await db.refresh(sbom)
     return sbom
+
+
+def _derive_package_type(purl: Optional[str], cdx_type: Optional[str]) -> str:
+    """Return the registry type (pypi/npm/maven/gem/golang/nuget/…) if the
+    purl makes it clear, else fall back to the CycloneDX component type
+    (library/application/framework/file/container). The typosquat + CVE
+    sweeps filter by registry type, so "library" — CycloneDX's default —
+    would make every imported component invisible to them.
+    """
+    if isinstance(purl, str) and purl.startswith("pkg:"):
+        # pkg:<type>/<namespace>/<name>@<version>
+        try:
+            after = purl[4:]
+            reg = after.split("/", 1)[0].split("@", 1)[0]
+            if reg:
+                return reg[:50].lower()
+        except Exception:  # noqa: BLE001
+            pass
+    if isinstance(cdx_type, str) and cdx_type:
+        return cdx_type[:50].lower()
+    return "library"
 
 
 def _extract_spdx_license(c: dict) -> Optional[str]:
