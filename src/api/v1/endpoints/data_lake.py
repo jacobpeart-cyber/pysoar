@@ -61,6 +61,271 @@ logger = get_logger(__name__)
 router = APIRouter(prefix="/data-lake", tags=["Data Lake"])
 
 
+# ==================== BUILT-IN DATA SOURCES ====================
+# Every org gets a read-only DataSource row per canonical platform table
+# so the Sources tab shows real, queryable entities from day one instead
+# of an empty page. These are auto-seeded on first /sources fetch and
+# row counts + last-event timestamps refresh on every GET.
+
+BUILTIN_DATA_SOURCES: list[dict] = [
+    {
+        "name": "SIEM Logs",
+        "description": "Canonical ingest surface — every correlated log event the platform sees lands here (AWS CloudTrail, syslog, Windows events, custom connectors).",
+        "source_type": "siem_events",
+        "format": "json",
+        "ingestion_type": "streaming",
+        "table": "log_entries",
+        "timestamp_col": "created_at",
+    },
+    {
+        "name": "Alerts",
+        "description": "Detection-engine output — rule-driven + ML-scored alerts with severity, status, and MITRE mapping.",
+        "source_type": "siem_events",
+        "format": "json",
+        "ingestion_type": "push",
+        "table": "alerts",
+        "timestamp_col": "created_at",
+    },
+    {
+        "name": "Incidents",
+        "description": "Verdict-confirmed security incidents opened by the autonomous investigator.",
+        "source_type": "siem_events",
+        "format": "json",
+        "ingestion_type": "push",
+        "table": "incidents",
+        "timestamp_col": "created_at",
+    },
+    {
+        "name": "UEBA Risk Alerts",
+        "description": "Behavioral anomalies — dormant-account logins, off-hours privileged actions, baseline deviations.",
+        "source_type": "identity_logs",
+        "format": "json",
+        "ingestion_type": "batch",
+        "table": "ueba_risk_alerts",
+        "timestamp_col": "created_at",
+    },
+    {
+        "name": "Identity Threats",
+        "description": "ITDR detections — dormant admin, MFA-missing privileged, stale credentials.",
+        "source_type": "identity_logs",
+        "format": "json",
+        "ingestion_type": "batch",
+        "table": "identity_threats",
+        "timestamp_col": "created_at",
+    },
+    {
+        "name": "Vulnerabilities",
+        "description": "CVE inventory per asset — consumed by RA-5 attester + Supply Chain cross-reference sweep.",
+        "source_type": "vulnerability_scans",
+        "format": "json",
+        "ingestion_type": "batch",
+        "table": "vulnerabilities",
+        "timestamp_col": "created_at",
+    },
+    {
+        "name": "Supply Chain Risks",
+        "description": "Typosquat hits + CVE cross-refs + vendor cert expiry from the daily supply-chain sweep.",
+        "source_type": "threat_intel",
+        "format": "json",
+        "ingestion_type": "batch",
+        "table": "supply_chain_risks",
+        "timestamp_col": "created_at",
+    },
+    {
+        "name": "Software Components",
+        "description": "SBOM-sourced dependency inventory (SPDX + CycloneDX imports) with license + purl + risk score.",
+        "source_type": "application_logs",
+        "format": "json",
+        "ingestion_type": "batch",
+        "table": "software_components",
+        "timestamp_col": "created_at",
+    },
+    {
+        "name": "STIG Scan Results",
+        "description": "DISA STIG / SCAP compliance findings (ARF ingested per endpoint per benchmark).",
+        "source_type": "vulnerability_scans",
+        "format": "json",
+        "ingestion_type": "batch",
+        "table": "stig_scan_results",
+        "timestamp_col": "created_at",
+    },
+    {
+        "name": "Assets",
+        "description": "Platform asset inventory — hosts, cloud instances, endpoints with criticality + owner.",
+        "source_type": "application_logs",
+        "format": "json",
+        "ingestion_type": "batch",
+        "table": "assets",
+        "timestamp_col": "created_at",
+    },
+    {
+        "name": "Threat Indicators",
+        "description": "IOC feed — IPs, domains, hashes pulled from threat-intel feeds every 30 min.",
+        "source_type": "threat_intel",
+        "format": "json",
+        "ingestion_type": "pull",
+        "table": "threat_indicators",
+        "timestamp_col": "created_at",
+    },
+    {
+        "name": "Decoy Interactions",
+        "description": "Honeypot / decoy captures — any connection = guaranteed-malicious signal.",
+        "source_type": "network_flow",
+        "format": "json",
+        "ingestion_type": "push",
+        "table": "decoy_interactions",
+        "timestamp_col": "created_at",
+    },
+    {
+        "name": "Audit Trails",
+        "description": "AU-2 audit trail — every privileged action + data-access event across the platform.",
+        "source_type": "application_logs",
+        "format": "json",
+        "ingestion_type": "push",
+        "table": "audit_trails",
+        "timestamp_col": "created_at",
+    },
+]
+
+BUILTIN_SOURCE_NAMES = {s["name"] for s in BUILTIN_DATA_SOURCES}
+
+
+async def _ensure_builtin_sources(db: AsyncSession, org_id: Optional[str]) -> None:
+    """Upsert a DataSource row per BUILTIN_DATA_SOURCES entry for this org
+    and refresh live row count + last-event timestamp from the underlying
+    table. Safe to call on every /sources list — runs in O(builtins) and
+    skips updates when the table doesn't exist or the org has no rows.
+    """
+    if not org_id:
+        return
+    from sqlalchemy import text as sa_text
+
+    existing = (await db.execute(
+        select(DataSource).where(
+            DataSource.organization_id == org_id,
+            DataSource.name.in_(list(BUILTIN_SOURCE_NAMES)),
+        )
+    )).scalars().all()
+    by_name = {s.name: s for s in existing}
+
+    changed = False
+    for spec in BUILTIN_DATA_SOURCES:
+        table = spec["table"]
+        ts_col = spec["timestamp_col"]
+        # Live row count + last-event timestamp. Use :org_id param to
+        # prevent any tenant leakage even though these are fixed literals.
+        try:
+            count_q = sa_text(
+                f"SELECT COUNT(*), MAX({ts_col}) FROM {table} "
+                f"WHERE organization_id = :org_id"
+            )
+            count_row = (await db.execute(count_q, {"org_id": org_id})).first()
+            live_count = int(count_row[0] or 0) if count_row else 0
+            last_event = count_row[1] if count_row else None
+        except Exception:  # noqa: BLE001
+            live_count = 0
+            last_event = None
+
+        last_event_iso = last_event.isoformat() if hasattr(last_event, "isoformat") else (
+            last_event if isinstance(last_event, str) else None
+        )
+
+        row = by_name.get(spec["name"])
+        if row is None:
+            db.add(DataSource(
+                organization_id=org_id,
+                name=spec["name"],
+                description=spec["description"],
+                source_type=spec["source_type"],
+                format=spec["format"],
+                ingestion_type=spec["ingestion_type"],
+                connection_config_encrypted={"builtin": True, "table": table},
+                schema_definition={"columns": DATA_LAKE_READABLE_TABLES.get(table, [])},
+                normalization_mapping={},
+                status="active" if live_count > 0 else "initializing",
+                total_events_ingested=live_count,
+                last_event_received=last_event_iso,
+                is_enabled=True,
+            ))
+            changed = True
+        else:
+            if (row.total_events_ingested or 0) != live_count or row.last_event_received != last_event_iso:
+                row.total_events_ingested = live_count
+                row.last_event_received = last_event_iso
+                row.status = "active" if live_count > 0 else row.status
+                changed = True
+
+    if changed:
+        try:
+            await db.commit()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"ensure_builtin_sources commit failed: {exc}")
+            await db.rollback()
+
+
+# --- Real Celery beat entries surfaced as built-in pipelines ---
+# Lets the Pipelines tab show the actual scheduled work PySOAR runs
+# (SIEM cloud poll, ITDR sweep, supply-chain sweep, STIG fleet sweep,
+# threat-intel poll, agentic auto-triage) instead of a blank table.
+
+def _builtin_celery_pipelines(org_id: Optional[str]) -> list[dict]:
+    """Reflect the live celery_app.beat_schedule into pipeline cards."""
+    try:
+        from src.workers.celery_app import celery_app
+        schedule = celery_app.conf.beat_schedule or {}
+    except Exception:  # noqa: BLE001
+        return []
+
+    now = datetime.now(timezone.utc).isoformat()
+    out = []
+    for name, cfg in schedule.items():
+        task = cfg.get("task", "")
+        schedule_val = cfg.get("schedule")
+        if hasattr(schedule_val, "hour"):
+            cadence = f"crontab {schedule_val}"
+        else:
+            try:
+                secs = float(schedule_val)
+                if secs >= 3600:
+                    cadence = f"every {int(secs/3600)}h"
+                elif secs >= 60:
+                    cadence = f"every {int(secs/60)}min"
+                else:
+                    cadence = f"every {int(secs)}s"
+            except Exception:  # noqa: BLE001
+                cadence = str(schedule_val)
+        ptype = "ingestion"
+        if "sweep" in task or "poll" in task:
+            ptype = "ingestion"
+        elif "cleanup" in task or "retention" in task:
+            ptype = "retention_management"
+        elif "enrichment" in task or "correlation" in task:
+            ptype = "enrichment"
+        elif "automation." in task:
+            ptype = "transformation"
+        out.append({
+            "id": f"builtin:{name}",
+            "organization_id": org_id,
+            "name": name.replace("-", " ").title(),
+            "description": f"Celery beat task `{task}` — {cadence}",
+            "pipeline_type": ptype,
+            "destination": task,
+            "transform_rules": [],
+            "schedule_cron": cadence,
+            "status": "active",
+            "last_run": now,
+            "next_run": None,
+            "avg_processing_time_ms": 0,
+            "records_processed_total": 0,
+            "error_count": 0,
+            "last_error": None,
+            "created_at": now,
+            "updated_at": now,
+            "builtin": True,
+        })
+    return out
+
+
 # ==================== DATA SOURCE ENDPOINTS ====================
 
 
@@ -104,9 +369,20 @@ async def list_data_sources(
     source_type: Optional[str] = None,
     status: Optional[str] = None,
 ):
-    """List data sources with filtering and pagination"""
+    """List data sources with filtering and pagination.
+
+    Auto-seeds one DataSource row per canonical platform table (SIEM Logs,
+    Alerts, Incidents, UEBA, ITDR, Supply Chain, STIG, Assets, …) for this
+    org if they're missing, and refreshes live row counts + last-event
+    timestamps on every call. Without this, the Sources tab is an empty
+    shell for a brand-new org even though the platform is actively
+    ingesting logs.
+    """
+    org_id = getattr(current_user, "organization_id", None)
+    await _ensure_builtin_sources(db, org_id)
+
     query = select(DataSource).where(
-        DataSource.organization_id == getattr(current_user, "organization_id", None)
+        DataSource.organization_id == org_id
     )
 
     if search:
@@ -324,6 +600,116 @@ async def list_partitions(
     )
 
 
+@router.get("/partitions/daily/{table}")
+async def get_daily_partitions(
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+    table: str = Path(..., description="Whitelisted table name (e.g. log_entries)"),
+    days: int = Query(30, ge=1, le=365),
+):
+    """Synthetic time-based partitions over a real canonical table.
+
+    PySOAR doesn't run native Postgres declarative partitioning yet —
+    instead we surface one partition row per day by bucketing
+    `created_at`, returning count + estimated bytes + age-based tier so
+    the UI can show a real partitioned-data view without schema changes.
+    Tenant-scoped when the table has an organization_id column.
+    """
+    from sqlalchemy import text as sa_text
+    if table not in DATA_LAKE_READABLE_TABLES:
+        raise HTTPException(status_code=400, detail=f"Unknown table '{table}'")
+    org_id = getattr(current_user, "organization_id", None)
+
+    # Introspect whether the table has organization_id.
+    has_org = (await db.execute(
+        sa_text(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_schema='public' AND table_name=:t "
+            "AND column_name='organization_id'"
+        ),
+        {"t": table},
+    )).scalar() is not None
+
+    where_org = "WHERE organization_id = :org_id AND created_at >= NOW() - :days * INTERVAL '1 day'"
+    where_no_org = "WHERE created_at >= NOW() - :days * INTERVAL '1 day'"
+    params = {"days": days}
+    if has_org and org_id:
+        params["org_id"] = org_id
+        where = where_org
+    else:
+        where = where_no_org
+
+    try:
+        rows = (await db.execute(
+            sa_text(
+                f"""
+                SELECT
+                  date_trunc('day', created_at) AS day,
+                  COUNT(*) AS row_count,
+                  MIN(created_at) AS first_at,
+                  MAX(created_at) AS last_at
+                FROM {table}
+                {where}
+                GROUP BY 1
+                ORDER BY 1 DESC
+                """
+            ),
+            params,
+        )).all()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Partition query failed: {exc}")
+
+    # Pull table total bytes to estimate per-partition size.
+    try:
+        tbl_bytes = (await db.execute(
+            sa_text("SELECT pg_total_relation_size(quote_ident(:t))"),
+            {"t": table},
+        )).scalar() or 0
+        total_rows_row = (await db.execute(
+            sa_text(
+                f"SELECT COUNT(*) FROM {table}"
+                + (" WHERE organization_id = :org_id" if has_org and org_id else "")
+            ),
+            {"org_id": org_id} if has_org and org_id else {},
+        )).scalar() or 0
+        total_rows = int(total_rows_row)
+    except Exception:  # noqa: BLE001
+        tbl_bytes = 0
+        total_rows = 0
+
+    bytes_per_row = (int(tbl_bytes) / total_rows) if total_rows else 0
+
+    partitions = []
+    for day, row_count, first_at, last_at in rows:
+        row_count = int(row_count or 0)
+        age_days = (datetime.now(timezone.utc) - (day if day.tzinfo else day.replace(tzinfo=timezone.utc))).days
+        if age_days < 7:
+            tier = "hot"
+        elif age_days < 30:
+            tier = "warm"
+        elif age_days < 365:
+            tier = "cold"
+        else:
+            tier = "archived"
+        partitions.append({
+            "partition_key": f"{table}_{day.strftime('%Y_%m_%d')}",
+            "day": day.isoformat(),
+            "record_count": row_count,
+            "size_bytes": int(row_count * bytes_per_row),
+            "storage_tier": tier,
+            "first_at": first_at.isoformat() if first_at else None,
+            "last_at": last_at.isoformat() if last_at else None,
+        })
+
+    return {
+        "table": table,
+        "days_window": days,
+        "partition_count": len(partitions),
+        "total_rows_scanned": sum(p["record_count"] for p in partitions),
+        "partitions": partitions,
+    }
+
+
 @router.patch("/partitions/{partition_id}", response_model=DataPartitionResponse)
 async def update_partition(
     partition_in: DataPartitionUpdate,
@@ -384,7 +770,7 @@ async def create_pipeline(
         raise HTTPException(status_code=400, detail="Operation failed. Please try again or contact support.")
 
 
-@router.get("/pipelines", response_model=DataPipelineListResponse)
+@router.get("/pipelines")
 async def list_pipelines(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
@@ -392,8 +778,13 @@ async def list_pipelines(
     size: int = Query(20, ge=1, le=100),
     pipeline_type: Optional[str] = None,
     status: Optional[str] = None,
+    include_builtins: bool = Query(True, description="Include live Celery beat pipelines"),
 ):
-    """List data pipelines with filtering"""
+    """List data pipelines — user-created rows merged with live Celery
+    beat pipelines (SIEM poll, ITDR sweep, supply-chain sweep, threat-
+    intel poll, agentic auto-triage, STIG fleet sweep, etc.). Set
+    include_builtins=false to see only the org's own DataPipeline rows.
+    """
     query = select(DataPipeline).where(
         DataPipeline.organization_id == getattr(current_user, "organization_id", None)
     )
@@ -417,13 +808,49 @@ async def list_pipelines(
 
     pages = math.ceil(total / size) if total > 0 else 0
 
-    return DataPipelineListResponse(
-        items=items,
-        total=total,
-        page=page,
-        size=size,
-        pages=pages,
-    )
+    # Serialize custom rows to plain dicts so we can union with builtins.
+    custom_items = [
+        {
+            "id": p.id,
+            "organization_id": p.organization_id,
+            "name": p.name,
+            "description": p.description,
+            "pipeline_type": p.pipeline_type,
+            "source_id": p.source_id,
+            "destination": p.destination,
+            "transform_rules": p.transform_rules,
+            "schedule_cron": p.schedule_cron,
+            "status": p.status,
+            "last_run": p.last_run,
+            "next_run": p.next_run,
+            "avg_processing_time_ms": p.avg_processing_time_ms,
+            "records_processed_total": p.records_processed_total,
+            "error_count": p.error_count,
+            "last_error": p.last_error,
+            "created_at": p.created_at.isoformat() if p.created_at else None,
+            "updated_at": p.updated_at.isoformat() if p.updated_at else None,
+            "builtin": False,
+        }
+        for p in items
+    ]
+
+    merged = custom_items
+    if include_builtins:
+        builtins = _builtin_celery_pipelines(getattr(current_user, "organization_id", None))
+        # Apply the same filters the caller passed.
+        if pipeline_type:
+            builtins = [b for b in builtins if b["pipeline_type"] == pipeline_type]
+        if status:
+            builtins = [b for b in builtins if b["status"] == status]
+        merged = custom_items + builtins
+
+    return {
+        "items": merged,
+        "total": total + (len(merged) - len(custom_items)),
+        "page": page,
+        "size": size,
+        "pages": pages,
+    }
 
 
 @router.patch("/pipelines/{pipeline_id}", response_model=DataPipelineResponse)
@@ -711,18 +1138,108 @@ async def list_catalog(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """List all catalog datasets for this org (wraps DataSource + UnifiedDataModel)."""
+    """Real data catalog — introspects Postgres for every whitelisted
+    table and returns its column list, live row count (tenant-scoped),
+    and total table size. Augmented with any UnifiedDataModel rows the
+    org has registered. This is what an analyst needs to know *before*
+    writing a query against the lake.
+    """
+    from sqlalchemy import text as sa_text
     org_id = getattr(current_user, "organization_id", None)
 
+    entries: list[dict] = []
+
+    for table, whitelisted_cols in DATA_LAKE_READABLE_TABLES.items():
+        # Real schema from information_schema.
+        try:
+            cols_result = await db.execute(
+                sa_text(
+                    "SELECT column_name, data_type, is_nullable "
+                    "FROM information_schema.columns "
+                    "WHERE table_schema='public' AND table_name=:t "
+                    "ORDER BY ordinal_position"
+                ),
+                {"t": table},
+            )
+            columns = [
+                {
+                    "name": c[0],
+                    "type": c[1],
+                    "nullable": c[2] == "YES",
+                    "queryable": c[0] in whitelisted_cols,
+                }
+                for c in cols_result.all()
+            ]
+        except Exception:  # noqa: BLE001
+            columns = []
+
+        if not columns:
+            continue  # table doesn't exist in this DB
+
+        # Tenant-scoped row count.
+        org_scoped = any(c["name"] == "organization_id" for c in columns)
+        try:
+            if org_scoped and org_id:
+                rc = (await db.execute(
+                    sa_text(f"SELECT COUNT(*) FROM {table} WHERE organization_id = :org_id"),
+                    {"org_id": org_id},
+                )).scalar()
+            else:
+                rc = (await db.execute(
+                    sa_text(f"SELECT COUNT(*) FROM {table}"),
+                )).scalar()
+            row_count = int(rc or 0)
+        except Exception:  # noqa: BLE001
+            row_count = 0
+
+        # Table bytes via pg_total_relation_size.
+        try:
+            tbytes = (await db.execute(
+                sa_text("SELECT pg_total_relation_size(quote_ident(:t))"),
+                {"t": table},
+            )).scalar() or 0
+        except Exception:  # noqa: BLE001
+            tbytes = 0
+
+        # Last event timestamp.
+        last_event = None
+        for ts_col in ("created_at", "detected_at", "timestamp"):
+            if any(c["name"] == ts_col for c in columns):
+                try:
+                    last = (await db.execute(
+                        sa_text(
+                            f"SELECT MAX({ts_col}) FROM {table}"
+                            + (" WHERE organization_id = :org_id" if org_scoped and org_id else "")
+                        ),
+                        {"org_id": org_id} if org_scoped and org_id else {},
+                    )).scalar()
+                    if last is not None:
+                        last_event = last.isoformat() if hasattr(last, "isoformat") else str(last)
+                    break
+                except Exception:  # noqa: BLE001
+                    continue
+
+        entries.append({
+            "id": f"table:{table}",
+            "name": table,
+            "description": f"Built-in canonical table `{table}` ({len(columns)} columns).",
+            "type": "table",
+            "entity_type": table,
+            "queryable": True,
+            "tenant_scoped": org_scoped,
+            "row_count": row_count,
+            "size_bytes": int(tbytes),
+            "last_event_at": last_event,
+            "schema": columns,
+        })
+
+    # Layer org-registered DataSource + UnifiedDataModel entries on top.
     sources = (await db.execute(
         select(DataSource).where(DataSource.organization_id == org_id)
     )).scalars().all()
-    models = (await db.execute(
-        select(UnifiedDataModel).where(UnifiedDataModel.organization_id == org_id)
-    )).scalars().all()
-
-    entries = []
     for s in sources:
+        if s.name in BUILTIN_SOURCE_NAMES:
+            continue  # the table row above already represents this
         entries.append({
             "id": s.id,
             "name": s.name,
@@ -731,7 +1248,13 @@ async def list_catalog(
             "source_type": s.source_type,
             "status": s.status,
             "format": getattr(s, "format", None),
+            "row_count": int(s.total_events_ingested or 0),
+            "last_event_at": s.last_event_received,
         })
+
+    models = (await db.execute(
+        select(UnifiedDataModel).where(UnifiedDataModel.organization_id == org_id)
+    )).scalars().all()
     for m in models:
         entries.append({
             "id": m.id,
@@ -770,6 +1293,59 @@ DATA_LAKE_READABLE_TABLES: dict[str, list[str]] = {
     "audit_logs": [
         "id", "event_type", "action", "actor_id", "resource_type",
         "resource_id", "result", "organization_id", "created_at",
+    ],
+    # SIEM canonical log surface — the biggest data source in the platform.
+    "log_entries": [
+        "id", "organization_id", "source", "log_type", "severity",
+        "source_ip", "destination_ip", "user_id", "host", "message",
+        "raw_event", "indexed_fields", "created_at", "timestamp",
+    ],
+    # UEBA — behavioral anomalies.
+    "ueba_risk_alerts": [
+        "id", "organization_id", "user_id", "risk_type", "risk_score",
+        "severity", "baseline_deviation", "status", "evidence",
+        "detected_at", "created_at",
+    ],
+    # ITDR — identity threat detections (dormant_admin / MFA-less / stale).
+    "identity_threats": [
+        "id", "organization_id", "identity_id", "threat_type", "severity",
+        "status", "evidence", "remediation_advice", "detected_at",
+        "created_at", "resolved_at",
+    ],
+    # CVE table.
+    "vulnerabilities": [
+        "id", "organization_id", "cve_id", "title", "description",
+        "severity", "cvss_score", "status", "asset_id",
+        "first_seen", "patched_at", "created_at",
+    ],
+    # Supply chain risks (typosquat/vuln/vendor).
+    "supply_chain_risks": [
+        "id", "organization_id", "component_id", "risk_type", "severity",
+        "description", "status", "detected_date", "remediation_date",
+        "created_at", "updated_at",
+    ],
+    # Dependency inventory from SBOM imports.
+    "software_components": [
+        "id", "organization_id", "name", "version", "vendor",
+        "package_type", "license_spdx_id", "license_type",
+        "known_vulnerabilities_count", "risk_score", "purl", "cpe",
+        "created_at",
+    ],
+    # STIG/SCAP compliance scan results.
+    "stig_scan_results": [
+        "id", "organization_id", "benchmark_id", "asset_id", "rule_id",
+        "result", "severity", "compliance_score", "scanned_at", "created_at",
+    ],
+    # Asset inventory.
+    "assets": [
+        "id", "organization_id", "name", "asset_type", "ip_address",
+        "hostname", "os", "criticality", "owner", "status",
+        "created_at", "updated_at", "last_seen",
+    ],
+    # Deception / honeypot interactions.
+    "decoy_interactions": [
+        "id", "organization_id", "decoy_id", "interaction_type",
+        "source_ip", "severity", "captured_at", "created_at",
     ],
 }
 
@@ -1403,48 +1979,108 @@ async def get_storage_breakdown(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Get detailed storage usage breakdown (real bytes by tier and source)."""
+    """Real storage usage broken down by hot/warm/cold tier and by source.
+
+    "Hot/warm/cold/archived" here is a real time-based heuristic over the
+    underlying Postgres tables instead of the old fabricated percentages:
+      * **hot**   — rows created in the last 7 days
+      * **warm**  — 7 to 30 days old
+      * **cold**  — 30 to 365 days old
+      * **archived** — older than 365 days (retention candidate)
+
+    Bytes are estimated from `pg_total_relation_size / total_rows * tier_rows`
+    for each whitelisted table, tenant-scoped by organization_id. Also
+    includes anything the org registered manually via DataPartition rows.
+    """
+    from sqlalchemy import text as sa_text
     org_id = getattr(current_user, "organization_id", None)
 
-    # Total + by tier
-    total_bytes = 0
-    by_tier: dict = {}
-    try:
-        total_bytes = (await db.execute(
-            select(func.coalesce(func.sum(DataPartition.size_bytes), 0)).where(
-                DataPartition.organization_id == org_id
-            )
-        )).scalar() or 0
+    # Real per-table byte count + tier breakdown via age bucketing.
+    tiers = {"hot": 0, "warm": 0, "cold": 0, "archived": 0}
+    by_source: dict[str, int] = {}
+    by_table_detail: list[dict] = []
 
-        tier_result = await db.execute(
+    for table, _cols in DATA_LAKE_READABLE_TABLES.items():
+        try:
+            row = (await db.execute(
+                sa_text(f"SELECT pg_total_relation_size(quote_ident(:t))"),
+                {"t": table},
+            )).scalar()
+            table_bytes = int(row or 0)
+        except Exception:  # noqa: BLE001
+            continue
+
+        if table_bytes == 0:
+            continue
+
+        # Tenant-scoped age bucket counts.
+        where_org = "WHERE organization_id = :org_id" if org_id else ""
+        params = {"org_id": org_id} if org_id else {}
+        try:
+            bucket_row = (await db.execute(
+                sa_text(
+                    f"""
+                    SELECT
+                      COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days') AS hot,
+                      COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days' AND created_at < NOW() - INTERVAL '7 days') AS warm,
+                      COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '365 days' AND created_at < NOW() - INTERVAL '30 days') AS cold,
+                      COUNT(*) FILTER (WHERE created_at < NOW() - INTERVAL '365 days') AS archived,
+                      COUNT(*) AS total
+                    FROM {table} {where_org}
+                    """
+                ),
+                params,
+            )).first()
+        except Exception:  # noqa: BLE001
+            continue
+
+        if bucket_row is None:
+            continue
+        hot, warm, cold, archived, total_rows = bucket_row
+        total_rows = int(total_rows or 0)
+        if total_rows == 0:
+            continue
+        # Estimate per-bucket bytes proportional to row counts.
+        def _b(n):
+            return int(table_bytes * (int(n or 0) / total_rows))
+        tiers["hot"] += _b(hot)
+        tiers["warm"] += _b(warm)
+        tiers["cold"] += _b(cold)
+        tiers["archived"] += _b(archived)
+        table_live_bytes = _b(hot) + _b(warm) + _b(cold) + _b(archived)
+        by_source[table] = table_live_bytes
+        by_table_detail.append({
+            "table": table,
+            "bytes": table_live_bytes,
+            "total_rows": total_rows,
+            "hot_rows": int(hot or 0),
+            "warm_rows": int(warm or 0),
+            "cold_rows": int(cold or 0),
+            "archived_rows": int(archived or 0),
+        })
+
+    # Fold in any user-registered DataPartition rows so explicit archival
+    # work still counts.
+    try:
+        part_tier = await db.execute(
             select(DataPartition.storage_tier, func.coalesce(func.sum(DataPartition.size_bytes), 0))
             .where(DataPartition.organization_id == org_id)
             .group_by(DataPartition.storage_tier)
         )
-        for tier, bytes_ in tier_result.all():
-            by_tier[tier or "unknown"] = int(bytes_ or 0)
-    except Exception:
-        by_tier = {}
+        for tier, bytes_ in part_tier.all():
+            key = (tier or "hot").lower()
+            if key in tiers:
+                tiers[key] += int(bytes_ or 0)
+    except Exception:  # noqa: BLE001
+        pass
 
-    # By source name (join through DataSource)
-    by_source: dict = {}
-    try:
-        src_result = await db.execute(
-            select(DataSource.name, func.coalesce(func.sum(DataPartition.size_bytes), 0))
-            .select_from(DataPartition)
-            .join(DataSource, DataSource.id == DataPartition.source_id)
-            .where(DataSource.organization_id == org_id)
-            .group_by(DataSource.name)
-        )
-        for name, bytes_ in src_result.all():
-            by_source[name or "unknown"] = int(bytes_ or 0)
-    except Exception:
-        by_source = {}
-
+    total = sum(tiers.values())
     return {
-        "total_bytes": int(total_bytes),
-        "by_tier": by_tier,
+        "total_bytes": total,
+        "by_tier": tiers,
         "by_source": by_source,
+        "by_table": by_table_detail,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
     }
 
 
