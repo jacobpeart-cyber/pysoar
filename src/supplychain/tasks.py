@@ -501,7 +501,10 @@ def supplychain_cross_org_sweep(self):
                         ))
                         if not comps:
                             continue
-                        suspected = analyzer.detect_typosquatting(comps, popular_list, 0.85) or []
+                        # Threshold 0.70: the built-in similarity uses a lexical
+                        # score where a single-char edit on an 8-char name lands at
+                        # ~0.75. 0.85 was so strict it caught nothing in practice.
+                        suspected = analyzer.detect_typosquatting(comps, popular_list, 0.70) or []
                         for hit in suspected:
                             sus_name = (
                                 hit.get("component")
