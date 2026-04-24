@@ -73,38 +73,11 @@ def execute_simulation(self, simulation_id: str, organization_id: str) -> dict:
                         test.error_output = str(e)
                         await session.commit()
 
-                # Update simulation completion
-                simulation.status = "completed"
-                simulation.completed_at = utc_now()
-                simulation.duration_seconds = int(
-                    (simulation.completed_at - simulation.started_at).total_seconds()
-                )
-
-                # Recount test statistics
-                stmt = select(SimulationTest).where(SimulationTest.simulation_id == simulation_id)
-                result = await session.execute(stmt)
-                all_tests = result.scalars().all()
-
-                # Count outcomes. In this engine's terminology:
-                #   passed_tests  = technique was detected by a rule (defender win)
-                #   failed_tests  = technique went undetected (defender miss)
-                #   blocked_tests = test errored out / could not run
-                simulation.passed_tests = sum(1 for t in all_tests if t.was_detected)
-                simulation.failed_tests = sum(
-                    1 for t in all_tests if not t.was_detected and t.status != "error"
-                )
-                simulation.blocked_tests = sum(1 for t in all_tests if t.status == "error")
-
-                if simulation.total_tests > 0:
-                    # detection_rate = fraction of techniques covered by a rule.
-                    # Previously this used blocked_tests / total, which was
-                    # both inverted and counted errors as detections.
-                    simulation.detection_rate = (
-                        simulation.passed_tests / simulation.total_tests
-                    ) * 100
-                    simulation.overall_score = simulation.detection_rate
-
-                await session.commit()
+                # Roll up test results -> parent simulation via the shared
+                # finalize_simulation helper so every execution path
+                # (sync endpoint, async Celery, emulation) converges on
+                # the same completed/failed semantics + aggregate counts.
+                roll = await orchestrator.finalize_simulation(simulation_id)
 
                 logger.info(
                     f"Simulation {simulation_id} completed: "
@@ -113,11 +86,11 @@ def execute_simulation(self, simulation_id: str, organization_id: str) -> dict:
 
                 return {
                     "simulation_id": simulation_id,
-                    "status": "completed",
+                    "status": roll["status"],
                     "tests_executed": executed,
-                    "total_tests": simulation.total_tests,
+                    "total_tests": roll["total"],
                     "duration_seconds": simulation.duration_seconds,
-                    "detection_rate": simulation.detection_rate,
+                    "detection_rate": roll["detection_rate"],
                 }
 
         # Run async function

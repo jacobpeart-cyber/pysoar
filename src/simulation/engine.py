@@ -157,6 +157,74 @@ class SimulationOrchestrator:
             "message": f"Simulation started with {test_order} tests"
         }
 
+    async def finalize_simulation(self, simulation_id: str) -> Dict[str, Any]:
+        """Roll up per-test results onto the parent simulation.
+
+        Called after all tests for a run have been executed. Aggregates
+        pass/fail/block counts, computes detection rate + overall score,
+        stamps ``completed_at`` + ``duration_seconds``, and sets status
+        to ``completed`` or ``failed`` based on whether any test errored.
+        Previously the parent status was left at ``running`` indefinitely,
+        so the UI showed long-complete runs as still in progress.
+        """
+        simulation = await self._get_simulation(simulation_id)
+        if simulation is None:
+            raise ValueError(f"Simulation {simulation_id} not found")
+
+        tests_stmt = select(SimulationTest).where(
+            SimulationTest.simulation_id == simulation_id
+        )
+        tests = list((await self.session.execute(tests_stmt)).scalars().all())
+
+        total = len(tests)
+        passed = sum(1 for t in tests if t.status == "passed")
+        blocked = sum(1 for t in tests if t.status == "blocked")
+        errored = sum(1 for t in tests if t.status == "error")
+        skipped = sum(1 for t in tests if t.status == "skipped")
+        detected = sum(1 for t in tests if t.was_detected)
+
+        # detection_rate = % of tests that the detection pipeline caught
+        detection_rate = (detected / total * 100.0) if total else 0.0
+        # overall_score matches detection_rate for now; PostureScorer can
+        # later weight by tactic severity. Don't invent a different number.
+        overall_score = detection_rate
+
+        simulation.total_tests = total
+        simulation.passed_tests = passed
+        simulation.blocked_tests = blocked
+        simulation.failed_tests = errored
+        simulation.detection_rate = detection_rate
+        simulation.overall_score = overall_score
+        simulation.completed_at = utc_now()
+        if simulation.started_at:
+            simulation.duration_seconds = int(
+                (simulation.completed_at - simulation.started_at).total_seconds()
+            )
+        # Any test still "running"/"pending" at this point indicates a
+        # hang or agent timeout; mark the sim failed so it stops looking
+        # complete.
+        unfinished = any(t.status in ("pending", "running") for t in tests)
+        if unfinished:
+            simulation.status = "failed"
+        elif errored and passed == 0:
+            simulation.status = "failed"
+        else:
+            simulation.status = "completed"
+
+        await self.session.commit()
+        return {
+            "simulation_id": simulation_id,
+            "status": simulation.status,
+            "total": total,
+            "passed": passed,
+            "blocked": blocked,
+            "errored": errored,
+            "skipped": skipped,
+            "detected": detected,
+            "detection_rate": detection_rate,
+            "overall_score": overall_score,
+        }
+
     async def pause_simulation(self, simulation_id: str) -> None:
         """Pause an ongoing simulation."""
         simulation = await self._get_simulation(simulation_id)
@@ -277,6 +345,14 @@ class SimulationOrchestrator:
                 if agent_result.stderr:
                     test.error_output = agent_result.stderr
                 test.status = "passed" if agent_result.status == "success" else "error"
+                # Real-execution stamps for audit + UI.
+                test.detection_details = {
+                    **(test.detection_details or {}),
+                    "execution_mode": "real",
+                    "agent_id": agent_result.agent_id,
+                    "command_id": agent_result.command_id,
+                    "agent_reported_status": agent_result.status,
+                }
             else:
                 # No live agent — score against detection rule coverage only
                 test.output = (
@@ -288,6 +364,10 @@ class SimulationOrchestrator:
                     f"scored against detection rule coverage only.)"
                 )
                 test.status = "passed"
+                test.detection_details = {
+                    **(test.detection_details or {}),
+                    "execution_mode": "coverage_only",
+                }
 
             # Deterministic detection lookup against active detection rules
             detected = await self._check_detection(test, technique)
@@ -321,19 +401,23 @@ class SimulationOrchestrator:
         technique: "AttackTechnique",
         command: str,
         executor: str,
-        max_wait_seconds: int = 30,
+        max_wait_seconds: int = 90,
     ):
         """Dispatch this atomic test to a live BAS-capable endpoint agent.
 
-        The simulation's ``scope`` may contain a ``target_host`` hint. We
-        look for an ACTIVE agent whose hostname matches the hint AND has
-        the ``bas`` capability. If one exists, we issue a
-        ``run_atomic_test`` command via AgentService (which chains the
-        audit hash) and poll the agent_results table until a row lands
-        or we time out. Returns the AgentResult row, or None if no agent
-        matched or the agent didn't report back in time.
+        Agent selection order (first match wins, all filtered to status=active
+        + ``bas`` capability + this org):
 
-        Any exception here is non-fatal — the test simply degrades to
+          1. Agent whose hostname matches ``simulation.scope.target_host``
+             (explicit user choice).
+          2. Any other active BAS-capable agent in the org — so a typo in
+             ``target_host`` (or the legacy ``lab-target`` default) no
+             longer silently degrades every test to coverage-only.
+          3. None → the test legitimately has no real BAS-capable agent
+             enrolled; the caller falls back to coverage-only scoring
+             and marks ``test.execution_mode='coverage_only'``.
+
+        Any exception is non-fatal — the test simply degrades to
         coverage-only scoring rather than failing the whole simulation.
         """
         try:
@@ -349,26 +433,39 @@ class SimulationOrchestrator:
             target_host = scope.get("target_host") if isinstance(scope, dict) else None
             org_id = simulation.organization_id
 
-            agent_query = select(EndpointAgent).where(
-                EndpointAgent.status == "active"
-            )
+            base_query = select(EndpointAgent).where(EndpointAgent.status == "active")
             if org_id:
-                agent_query = agent_query.where(EndpointAgent.organization_id == org_id)
-            if target_host:
-                agent_query = agent_query.where(EndpointAgent.hostname == target_host)
+                base_query = base_query.where(EndpointAgent.organization_id == org_id)
 
-            result = await self.session.execute(agent_query)
-            candidates = list(result.scalars().all())
+            # Pool of active BAS-capable agents in the org (no hostname
+            # filter) — used as the fallback when target_host misses.
+            bas_pool = [
+                a for a in (await self.session.execute(base_query)).scalars().all()
+                if AgentCapability.BAS.value in (a.capabilities or [])
+            ]
+            if not bas_pool:
+                return None
 
             agent = None
-            for candidate in candidates:
-                caps = candidate.capabilities or []
-                if AgentCapability.BAS.value in caps:
-                    agent = candidate
-                    break
-
-            if agent is None:
-                return None
+            if target_host:
+                agent = next(
+                    (a for a in bas_pool if a.hostname == target_host),
+                    None,
+                )
+                if agent is None:
+                    # Exact-host filter missed. Pick any BAS-capable
+                    # agent — and record what happened so the UI/audit
+                    # trail can show the actual host used instead of
+                    # the requested one.
+                    agent = bas_pool[0]
+                    scope_out = dict(scope) if isinstance(scope, dict) else {}
+                    scope_out["requested_target_host"] = target_host
+                    scope_out["actual_target_host"] = agent.hostname
+                    scope_out["host_fallback"] = True
+                    simulation.scope = scope_out
+                    await self.session.commit()
+            else:
+                agent = bas_pool[0]
 
             svc = AgentService(self.session)
             payload = {
