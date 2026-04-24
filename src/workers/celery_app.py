@@ -37,6 +37,11 @@ celery_app = Celery(
         # cert expiry + vuln cross-reference. Included so the beat-
         # scheduled sweeps below can resolve the task names.
         "src.supplychain.tasks",
+        # Dark-web monitoring — real HIBP / URLhaus / ThreatFox / OTX
+        # scan that persists findings into darkweb_findings and fires
+        # on_darkweb_finding for criticals. Without this entry the beat
+        # sweep below wouldn't be able to resolve the task.
+        "src.darkweb.tasks",
     ],
 )
 
@@ -149,6 +154,17 @@ celery_app.conf.beat_schedule = {
     "agentic-incident-followup": {
         "task": "src.agentic.tasks.followup_open_incidents",
         "schedule": crontab(minute="*/30"),  # Every 30 min
+    },
+    # --- Dark web cross-org sweep ---
+    # Every 30 min, iterate every enabled DarkWebMonitor across every
+    # org and hit URLhaus + HIBP /breaches + ThreatFox + OTX. Persists
+    # new findings (deduped by content_hash) and fires
+    # on_darkweb_finding -> alert -> investigator chain on criticals.
+    # Previous state: no beat entry -> zero dark-web scans ever ran
+    # in production.
+    "darkweb-cross-org-sweep": {
+        "task": "src.darkweb.tasks.darkweb_cross_org_sweep",
+        "schedule": 1800.0,  # Every 30 min
     },
     # --- Weekly STIG fleet sweep (src.stig.tasks.scheduled_fleet_stig_sweep) ---
     # FedRAMP/NIST SP 800-137 continuous monitoring: every active endpoint
