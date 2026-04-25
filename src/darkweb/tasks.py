@@ -352,6 +352,11 @@ def scheduled_dark_web_scan(
                             automation_fired += 1
                         except Exception as exc:  # noqa: BLE001
                             logger.warning(f"on_darkweb_finding fire failed: {exc}")
+                    # on_darkweb_finding only flushes — without an explicit
+                    # commit here every Alert row would roll back on session
+                    # exit and the dashboard would show 0 dark-web alerts.
+                    if automation_fired:
+                        await db.commit()
 
                 return {
                     "scan_id": f"scan_{monitor_id or org_id}_{datetime.now(timezone.utc).timestamp()}",
