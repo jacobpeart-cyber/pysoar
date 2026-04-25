@@ -2,6 +2,13 @@
 
 @source "./";
 
+/* Tailwind v4 class-based dark mode. Default in v4 is `prefers-color-scheme`
+   which ignores ThemeContext's `class="dark"` toggle on <html> — clicking
+   the sun/moon icon flipped the attribute but no `dark:*` utilities ever
+   activated. This @custom-variant rebinds the `dark:` variant so it
+   triggers when `.dark` is on the element OR any ancestor. */
+@custom-variant dark (&:where(.dark, .dark *));
+
 @theme {
   --color-primary-50: #eff6ff;
   --color-primary-100: #dbeafe;
