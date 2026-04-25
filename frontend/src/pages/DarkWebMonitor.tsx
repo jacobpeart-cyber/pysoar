@@ -71,8 +71,10 @@ export default function DarkWebMonitor() {
       setLoading(true);
       try {
         const [alertsData, credentialsData, brandData, monitorsData] = await Promise.all([
-          darkwebApi.getAlerts().catch(() => ({ items: [] })),
-          darkwebApi.getCredentialLeaks().catch(() => ({ items: [] })),
+          // size=100 so the user sees all real findings on first load
+          // instead of just the default first page (20).
+          darkwebApi.getAlerts({ size: 100 }).catch(() => ({ items: [] })),
+          darkwebApi.getCredentialLeaks({ size: 100 }).catch(() => ({ items: [] })),
           darkwebApi.getBrandMonitors().catch(() => []),
           darkwebApi.getMonitors().catch(() => []),
         ]);
@@ -86,8 +88,14 @@ export default function DarkWebMonitor() {
         // columns, and filters matched nothing.
         const normMonitor = (m: any) => ({
           ...m,
-          keyword: m.keyword ?? (Array.isArray(m.search_terms) ? m.search_terms.join(', ') : ''),
-          lastScan: m.lastScan ?? m.last_scanned_at ?? m.last_scan_at ?? null,
+          // Backend stores `enabled` as bool + `last_check` as iso string
+          // (DarkWebMonitor model). Older versions had `last_scanned_at`;
+          // accept both.
+          status: m.status ?? (m.enabled ? 'active' : 'paused'),
+          keyword: m.keyword ?? (Array.isArray(m.search_terms)
+            ? m.search_terms.join(', ')
+            : (typeof m.search_terms === 'string' ? m.search_terms : '')),
+          lastScan: m.lastScan ?? m.last_check ?? m.last_scanned_at ?? m.last_scan_at ?? null,
           findingsCount: m.findingsCount ?? m.findings_count ?? 0,
           darkWebSources: m.darkWebSources ?? m.sources ?? m.platforms ?? [],
           createdDate: m.createdDate ?? m.created_at ?? null,

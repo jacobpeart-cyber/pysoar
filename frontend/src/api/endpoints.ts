@@ -743,13 +743,16 @@ export const supplychainApi = {
 
 // Dark Web
 export const darkwebApi = {
+  // Backend exposes /findings (the canonical name); the page calls
+  // these "alerts" historically. Same idea, real route. Without this fix
+  // every page load 404'd silently and the Findings tab rendered blank.
   getAlerts: async (params?: {
     page?: number;
     size?: number;
     type?: string;
     status?: string;
   }): Promise<PaginatedResponse<DarkWebAlert>> => {
-    const response = await api.get('/darkweb/alerts', { params });
+    const response = await api.get('/darkweb/findings', { params });
     return extractData(response.data);
   },
 
@@ -757,12 +760,12 @@ export const darkwebApi = {
     page?: number;
     size?: number;
   }): Promise<PaginatedResponse<{ email: string; password_hash: string; source: string; date_found: string }>> => {
-    const response = await api.get('/darkweb/credential-leaks', { params });
+    const response = await api.get('/darkweb/credentials', { params });
     return extractData(response.data);
   },
 
   getBrandMonitors: async (): Promise<{ brand_name: string; mentions: number; alerts: DarkWebAlert[] }[]> => {
-    const response = await api.get('/darkweb/brand-monitors');
+    const response = await api.get('/darkweb/brand-threats');
     return extractData(response.data);
   },
 
