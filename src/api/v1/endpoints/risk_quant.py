@@ -1189,25 +1189,56 @@ async def get_loss_exceedance_portfolio(
             "note": "No completed FAIR analyses for this organization",
         }
 
-    # Merge curves by summing losses at each probability bucket.
+    # Merge per-analysis loss-exceedance curves into a portfolio curve.
     #
     # The FAIR engine writes loss_exceedance_curve as
     #   {"x_values": [thresholds...], "y_values": [exceedance_probs...]}
-    # i.e. parallel arrays where y_values[i] = P(loss > x_values[i]).
-    # The original implementation here iterated the dict expecting
-    # list-of-{"probability","loss"} dicts and silently produced an
-    # empty curve on every call. We now accept BOTH shapes:
-    #   1. {x_values, y_values}           — current engine output
-    #   2. [{"probability","loss"}, ...]  — legacy / future format
-    # Probabilities are bucketed into 21 grid points (0.00, 0.05, …, 1.00)
-    # so curves from different scenarios merge cleanly even when their
-    # raw threshold counts differ.
-    GRID = [round(i * 0.05, 2) for i in range(21)]
-    merged: dict[float, float] = {p: 0.0 for p in GRID}
+    # where y_values[i] = P(loss > x_values[i]). The original aggregator
+    # iterated the dict expecting list-of-{probability,loss} entries and
+    # silently produced an empty curve every call.
+    #
+    # The right portfolio aggregation: at each grid probability P, sum
+    # across analyses of "the loss threshold where THIS analysis hits
+    # exceedance probability P". That's a real per-scenario interpolation
+    # (linear) over the analysis's own (x,y) curve — naively bucketing
+    # would over-count when many threshold points fall in one bucket.
+    #
+    # We accept both the engine's {x_values,y_values} and any legacy
+    # list-of-{probability,loss} shape so older runs still aggregate.
+    import bisect
 
-    def _bucket(prob: float) -> float:
-        return min(GRID, key=lambda g: abs(g - prob))
+    GRID = [round(i * 0.05, 2) for i in range(21)]  # 0.00 .. 1.00 step 0.05
 
+    def _interp_loss_at_prob(xs: list[float], ys: list[float], target_p: float) -> float:
+        """Given a per-analysis (loss thresholds, exceedance probs) curve,
+        return the loss threshold X such that P(loss > X) ~= target_p, by
+        linear interpolation. Engine emits ys monotonically decreasing
+        (higher loss -> lower exceedance prob), so we walk in reverse.
+        """
+        if not xs or not ys or len(xs) != len(ys):
+            return 0.0
+        # Sort by exceedance probability ascending so we can interpolate.
+        pairs = sorted(zip(ys, xs))  # [(prob_lo, loss_hi), ..., (prob_hi, loss_lo)]
+        ps_sorted = [p for p, _ in pairs]
+        ls_sorted = [l for _, l in pairs]
+        # Clamp out of range to nearest endpoint.
+        if target_p <= ps_sorted[0]:
+            return float(ls_sorted[0])
+        if target_p >= ps_sorted[-1]:
+            return float(ls_sorted[-1])
+        idx = bisect.bisect_left(ps_sorted, target_p)
+        if idx == 0:
+            return float(ls_sorted[0])
+        p_lo, p_hi = ps_sorted[idx - 1], ps_sorted[idx]
+        l_lo, l_hi = ls_sorted[idx - 1], ls_sorted[idx]
+        if p_hi == p_lo:
+            return float(l_lo)
+        # Linear interp between the two surrounding points.
+        t = (target_p - p_lo) / (p_hi - p_lo)
+        return float(l_lo + t * (l_hi - l_lo))
+
+    portfolio_loss_at_p: dict[float, float] = {p: 0.0 for p in GRID}
+    contributing = 0
     for analysis in analyses:
         try:
             curve_data = json.loads(analysis.loss_exceedance_curve or "null")
@@ -1215,42 +1246,37 @@ async def get_loss_exceedance_portfolio(
             continue
         if curve_data is None:
             continue
-
-        # Shape 1: parallel arrays
+        xs: list[float] = []
+        ys: list[float] = []
         if (
             isinstance(curve_data, dict)
             and isinstance(curve_data.get("x_values"), list)
             and isinstance(curve_data.get("y_values"), list)
         ):
-            xs = curve_data["x_values"]
-            ys = curve_data["y_values"]
-            for x, y in zip(xs, ys):
-                try:
-                    loss = float(x or 0)
-                    prob = float(y or 0)
-                except (TypeError, ValueError):
-                    continue
-                merged[_bucket(prob)] += loss
-        # Shape 2: list of {"probability","loss"} dicts
+            try:
+                xs = [float(x) for x in curve_data["x_values"]]
+                ys = [float(y) for y in curve_data["y_values"]]
+            except (TypeError, ValueError):
+                continue
         elif isinstance(curve_data, list):
             for point in curve_data:
                 if not isinstance(point, dict):
                     continue
                 try:
-                    prob = float(point.get("probability") or 0)
-                    loss = float(point.get("loss") or 0)
+                    xs.append(float(point.get("loss") or 0))
+                    ys.append(float(point.get("probability") or 0))
                 except (TypeError, ValueError):
                     continue
-                merged[_bucket(prob)] += loss
+        if not xs:
+            continue
+        contributing += 1
+        for p in GRID:
+            portfolio_loss_at_p[p] += _interp_loss_at_prob(xs, ys, p)
 
-    # Drop probability buckets where every analysis contributed 0 (i.e.
-    # losses are far above that threshold for every scenario, so the
-    # exceedance probability is effectively 1 across the board — those
-    # rows are uninformative and clutter the chart).
     curve = [
         {"probability": p, "loss": round(l, 2)}
-        for p, l in sorted(merged.items())
-        if l > 0
+        for p, l in sorted(portfolio_loss_at_p.items())
+        if l > 0 or p == 0.0  # always keep p=0 to anchor the chart
     ]
 
     total_mean = sum(a.ale_mean or 0 for a in analyses)
