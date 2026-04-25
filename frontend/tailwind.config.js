@@ -4,6 +4,12 @@ export default {
     "./index.html",
     "./src/**/*.{js,ts,jsx,tsx}",
   ],
+  // Class-based dark mode so the in-app toggle works. Without this,
+  // Tailwind defaults to 'media' (prefers-color-scheme) and ignores
+  // the .dark class ThemeContext puts on <html>, so clicking the
+  // sun/moon icon flipped the attribute but no `dark:*` utilities
+  // ever activated.
+  darkMode: 'class',
   theme: {
     extend: {
       colors: {
