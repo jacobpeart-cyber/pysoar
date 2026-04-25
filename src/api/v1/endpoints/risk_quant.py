@@ -1189,23 +1189,68 @@ async def get_loss_exceedance_portfolio(
             "note": "No completed FAIR analyses for this organization",
         }
 
-    # Merge curves by summing losses at each probability bucket
-    merged: dict[float, float] = {}
+    # Merge curves by summing losses at each probability bucket.
+    #
+    # The FAIR engine writes loss_exceedance_curve as
+    #   {"x_values": [thresholds...], "y_values": [exceedance_probs...]}
+    # i.e. parallel arrays where y_values[i] = P(loss > x_values[i]).
+    # The original implementation here iterated the dict expecting
+    # list-of-{"probability","loss"} dicts and silently produced an
+    # empty curve on every call. We now accept BOTH shapes:
+    #   1. {x_values, y_values}           — current engine output
+    #   2. [{"probability","loss"}, ...]  — legacy / future format
+    # Probabilities are bucketed into 21 grid points (0.00, 0.05, …, 1.00)
+    # so curves from different scenarios merge cleanly even when their
+    # raw threshold counts differ.
+    GRID = [round(i * 0.05, 2) for i in range(21)]
+    merged: dict[float, float] = {p: 0.0 for p in GRID}
+
+    def _bucket(prob: float) -> float:
+        return min(GRID, key=lambda g: abs(g - prob))
+
     for analysis in analyses:
         try:
-            curve = json.loads(analysis.loss_exceedance_curve or "[]")
+            curve_data = json.loads(analysis.loss_exceedance_curve or "null")
         except (ValueError, TypeError):
             continue
-        for point in curve:
-            if not isinstance(point, dict):
-                continue
-            prob = float(point.get("probability") or 0)
-            loss = float(point.get("loss") or 0)
-            merged[prob] = merged.get(prob, 0.0) + loss
+        if curve_data is None:
+            continue
 
+        # Shape 1: parallel arrays
+        if (
+            isinstance(curve_data, dict)
+            and isinstance(curve_data.get("x_values"), list)
+            and isinstance(curve_data.get("y_values"), list)
+        ):
+            xs = curve_data["x_values"]
+            ys = curve_data["y_values"]
+            for x, y in zip(xs, ys):
+                try:
+                    loss = float(x or 0)
+                    prob = float(y or 0)
+                except (TypeError, ValueError):
+                    continue
+                merged[_bucket(prob)] += loss
+        # Shape 2: list of {"probability","loss"} dicts
+        elif isinstance(curve_data, list):
+            for point in curve_data:
+                if not isinstance(point, dict):
+                    continue
+                try:
+                    prob = float(point.get("probability") or 0)
+                    loss = float(point.get("loss") or 0)
+                except (TypeError, ValueError):
+                    continue
+                merged[_bucket(prob)] += loss
+
+    # Drop probability buckets where every analysis contributed 0 (i.e.
+    # losses are far above that threshold for every scenario, so the
+    # exceedance probability is effectively 1 across the board — those
+    # rows are uninformative and clutter the chart).
     curve = [
         {"probability": p, "loss": round(l, 2)}
         for p, l in sorted(merged.items())
+        if l > 0
     ]
 
     total_mean = sum(a.ale_mean or 0 for a in analyses)
