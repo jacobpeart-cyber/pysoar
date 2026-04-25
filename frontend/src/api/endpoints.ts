@@ -1033,14 +1033,49 @@ export const riskquantApi = {
     return Array.isArray(data) ? data : (data?.items ?? []);
   },
 
-  runAnalysis: async (scenarioIds: string[]): Promise<{ analysis_id: string }> => {
-    const response = await api.post('/risk-quantification/analyze', { scenario_ids: scenarioIds });
+  runAnalysis: async (
+    scenarioIds: string[],
+    iterations: number = 5000,
+  ): Promise<{
+    status: string;
+    scenarios_analyzed: number;
+    total_ale_mean: number;
+    portfolio_var_95: number;
+    per_scenario: Array<{
+      analysis_id: string;
+      scenario_id: string;
+      ale_mean: number;
+      ale_p50: number;
+      ale_p90: number;
+      ale_p99: number;
+    }>;
+    timestamp: string;
+  }> => {
+    const response = await api.post('/risk-quantification/analyze', {
+      scenario_ids: scenarioIds,
+      iterations,
+    });
     return response.data;
   },
 
   getLossExceedance: async (): Promise<any> => {
     const response = await api.get('/risk-quantification/loss-exceedance');
     return response.data;
+  },
+
+  getDashboard: async (): Promise<any> => {
+    const response = await api.get('/risk-quantification/dashboard');
+    return response.data;
+  },
+
+  // List existing FAIR analyses so the page can show real ALE / loss
+  // exceedance numbers per scenario instead of placeholder zeros.
+  getFairAnalyses: async (): Promise<any[]> => {
+    const response = await api.get('/risk-quantification/fair-analyses', {
+      params: { size: 100 },
+    });
+    const data = response.data;
+    return Array.isArray(data) ? data : (data?.items ?? []);
   },
 
   createScenario: async (data: { name: string; description: string; loss_magnitude: number }): Promise<any> => {
