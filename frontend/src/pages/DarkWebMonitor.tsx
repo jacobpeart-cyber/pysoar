@@ -535,16 +535,101 @@ export default function DarkWebMonitor() {
         </div>
       )}
 
-      {/* Action Modal */}
+      {/* Action Modal — buttons now call the real backend actions
+          (escalate creates an Incident; notify dispatches Slack/Teams/
+          PagerDuty/OpsGenie via send_incident_notifications). The PATCH
+          fallback used to look like nothing happened because no
+          incident was created and no message was sent. */}
       {actionFinding && (
         <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
           <div className="bg-white dark:bg-gray-800 rounded-lg p-6 w-[500px] max-h-screen overflow-y-auto">
             <h2 className="text-xl font-bold mb-4">Take Action: {actionFinding.title}</h2>
             <div className="space-y-3">
-              <button onClick={async () => { try { await darkwebApi.updateFinding(actionFinding.id, { status: 'escalated' }); setFindings(prev => prev.map(f => f.id === actionFinding.id ? { ...f, status: 'escalated' } : f)); } catch(e) { console.error(e); } setActionFinding(null); }} className="w-full px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition">Escalate to Incident</button>
-              <button onClick={async () => { try { await darkwebApi.updateFinding(actionFinding.id, { status: 'notified' }); setFindings(prev => prev.map(f => f.id === actionFinding.id ? { ...f, status: 'notified' } : f)); } catch(e) { console.error(e); } setActionFinding(null); }} className="w-full px-4 py-2 bg-orange-600 hover:bg-orange-700 text-white rounded-lg transition">Notify Stakeholders</button>
-              <button onClick={async () => { try { await darkwebApi.updateFinding(actionFinding.id, { status: 'reviewed' }); setFindings(prev => prev.map(f => f.id === actionFinding.id ? { ...f, status: 'reviewed' } : f)); } catch(e) { console.error(e); } setActionFinding(null); }} className="w-full px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg transition">Mark as Reviewed</button>
-              <button onClick={() => setActionFinding(null)} className="w-full px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition">Cancel</button>
+              <button
+                onClick={async () => {
+                  try {
+                    const res = await api.post(
+                      `/darkweb/findings/${actionFinding.id}/escalate`,
+                    );
+                    const incidentId = res.data?.incident_id;
+                    setFindings((prev) =>
+                      prev.map((f) =>
+                        f.id === actionFinding.id ? { ...f, status: 'escalated' } : f,
+                      ),
+                    );
+                    alert(
+                      res.data?.status === 'already_escalated'
+                        ? `Already escalated. Incident ${incidentId}`
+                        : `Incident ${incidentId} created. Severity: ${res.data?.incident_severity}`,
+                    );
+                  } catch (e: any) {
+                    alert(`Escalate failed: ${e?.response?.data?.detail || e?.message}`);
+                  }
+                  setActionFinding(null);
+                }}
+                className="w-full px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg transition"
+              >
+                Escalate to Incident
+              </button>
+              <button
+                onClick={async () => {
+                  try {
+                    const res = await api.post(
+                      `/darkweb/findings/${actionFinding.id}/notify`,
+                    );
+                    const sent = res.data?.delivery?.sent ?? [];
+                    const failed = res.data?.delivery?.failed ?? [];
+                    const skipped = res.data?.delivery?.skipped ?? [];
+                    if (sent.length === 0) {
+                      alert(
+                        'No notification channels configured. Add Slack/Teams/PagerDuty in Integrations to receive alerts.\n\n'
+                          + (skipped.length ? `Skipped: ${skipped.join(', ')}` : ''),
+                      );
+                    } else {
+                      setFindings((prev) =>
+                        prev.map((f) =>
+                          f.id === actionFinding.id ? { ...f, status: 'notified' } : f,
+                        ),
+                      );
+                      alert(
+                        `Sent to: ${sent.join(', ')}`
+                          + (failed.length ? `\nFailed: ${failed.join(', ')}` : '')
+                          + (skipped.length ? `\nSkipped: ${skipped.join(', ')}` : ''),
+                      );
+                    }
+                  } catch (e: any) {
+                    alert(`Notify failed: ${e?.response?.data?.detail || e?.message}`);
+                  }
+                  setActionFinding(null);
+                }}
+                className="w-full px-4 py-2 bg-orange-600 hover:bg-orange-700 text-white rounded-lg transition"
+              >
+                Notify Stakeholders
+              </button>
+              <button
+                onClick={async () => {
+                  try {
+                    await darkwebApi.updateFinding(actionFinding.id, { status: 'reviewed' });
+                    setFindings((prev) =>
+                      prev.map((f) =>
+                        f.id === actionFinding.id ? { ...f, status: 'reviewed' } : f,
+                      ),
+                    );
+                  } catch (e: any) {
+                    alert(`Mark reviewed failed: ${e?.response?.data?.detail || e?.message}`);
+                  }
+                  setActionFinding(null);
+                }}
+                className="w-full px-4 py-2 bg-green-600 hover:bg-green-700 text-white rounded-lg transition"
+              >
+                Mark as Reviewed
+              </button>
+              <button
+                onClick={() => setActionFinding(null)}
+                className="w-full px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-100 dark:hover:bg-gray-700 transition"
+              >
+                Cancel
+              </button>
             </div>
           </div>
         </div>
