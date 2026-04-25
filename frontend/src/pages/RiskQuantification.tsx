@@ -54,10 +54,31 @@ const formatCurrency = (value: number) => {
   return `$${value.toFixed(0)}`;
 };
 
+// Derive a 0-100 risk score from a scenario + its FAIR analysis.
+// Uses ALE mean banded against asset value when an analysis exists,
+// else falls back to confidence_level. Without this, every scenario
+// rendered as score=0 because the API doesn't ship a `risk_score`.
+const computeRiskScore = (scenario: any, fair: any | null): number => {
+  if (fair?.ale_mean && scenario?.asset_value_usd) {
+    const ratio = Math.min(1, fair.ale_mean / Math.max(1, scenario.asset_value_usd));
+    return Math.round(ratio * 100);
+  }
+  // No analysis yet: use confidence_level (0-1) and asset_value scale
+  const conf = Math.min(1, Math.max(0, Number(scenario?.confidence_level ?? 0.5)));
+  const valueTier = scenario?.asset_value_usd >= 1_000_000 ? 1
+    : scenario?.asset_value_usd >= 100_000 ? 0.7
+    : 0.4;
+  return Math.round(conf * valueTier * 100);
+};
+
 export default function RiskQuantification() {
   const [activeTab, setActiveTab] = useState('scenarios');
   const [scenarios, setScenarios] = useState<any[]>([]);
   const [analysisResults, setAnalysisResults] = useState<any>(null);
+  const [dashboard, setDashboard] = useState<any | null>(null);
+  const [fairByScenario, setFairByScenario] = useState<Record<string, any>>({});
+  const [analyzeRunning, setAnalyzeRunning] = useState(false);
+  const [analyzeResultBanner, setAnalyzeResultBanner] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
@@ -66,21 +87,98 @@ export default function RiskQuantification() {
   const [selectedControl, setSelectedControl] = useState<any | null>(null);
   const [showFilter, setShowFilter] = useState(false);
 
+  // Fold a scenario row's real backend fields (asset_value_usd, threat_type,
+  // confidence_level, etc.) plus its FAIR analysis (if one exists) into the
+  // camelCase shape the table renders. Centralized so every render path
+  // ends up showing real numbers instead of phantom zeros.
+  const enrichScenarios = (list: any[], fairMap: Record<string, any>) =>
+    list.map((s) => {
+      const fair = fairMap[s.id] || null;
+      const probability = Number(s.confidence_level ?? 0.5);
+      const impact = Number(s.asset_value_usd ?? 0);
+      const ale = fair?.ale_mean ?? probability * impact * 0.3;
+      return {
+        ...s,
+        category: s.category || s.threat_type || 'Uncategorized',
+        probability,
+        impact,
+        ale,
+        riskScore: computeRiskScore(s, fair),
+        controls: s.controls || [],
+        fair_analysis: fair,
+      };
+    });
+
   const loadData = async () => {
     setLoading(true);
     setError(null);
     try {
-      const [scenariosData, lossData] = await Promise.allSettled([
+      const [scenariosData, lossData, dashData, fairData] = await Promise.allSettled([
         riskquantApi.getScenarios(),
         riskquantApi.getLossExceedance(),
+        riskquantApi.getDashboard(),
+        riskquantApi.getFairAnalyses(),
       ]);
-      setScenarios(scenariosData.status === 'fulfilled' ? (scenariosData.value || []) : []);
+      const rawScenarios: any[] = scenariosData.status === 'fulfilled'
+        ? (scenariosData.value || [])
+        : [];
+      const fairList: any[] = fairData.status === 'fulfilled'
+        ? (fairData.value || [])
+        : [];
+      const fairMap: Record<string, any> = {};
+      for (const a of fairList) {
+        if (a?.scenario_id) fairMap[a.scenario_id] = a;
+      }
+      setFairByScenario(fairMap);
+      setScenarios(enrichScenarios(rawScenarios, fairMap));
       setAnalysisResults(lossData.status === 'fulfilled' ? (lossData.value || null) : null);
+      setDashboard(dashData.status === 'fulfilled' ? (dashData.value || null) : null);
     } catch (err) {
       console.error('Error loading risk quantification data:', err);
       setError('Failed to load risk quantification data. Please try again.');
     } finally {
       setLoading(false);
+    }
+  };
+
+  const runMonteCarlo = async (scenarioIds: string[]) => {
+    if (!scenarioIds.length) return;
+    setAnalyzeRunning(true);
+    setAnalyzeResultBanner(null);
+    try {
+      const res = await riskquantApi.runAnalysis(scenarioIds, 5000);
+      // Merge returned per_scenario ALEs into the local fair map so the
+      // table updates immediately without waiting for /fair-analyses.
+      const updated = { ...fairByScenario };
+      for (const ps of res.per_scenario || []) {
+        updated[ps.scenario_id] = {
+          ale_mean: ps.ale_mean,
+          ale_p50: ps.ale_p50,
+          ale_p90: ps.ale_p90,
+          ale_p99: ps.ale_p99,
+        };
+      }
+      setFairByScenario(updated);
+      setScenarios((prev) => enrichScenarios(prev, updated));
+      setAnalyzeResultBanner(
+        `Monte Carlo: ${res.scenarios_analyzed} scenarios analyzed · `
+          + `total ALE mean = ${formatCurrency(res.total_ale_mean)} · `
+          + `portfolio VaR (95%) = ${formatCurrency(res.portfolio_var_95)}`,
+      );
+      // Also refresh dashboard + loss exceedance so those panels reflect
+      // the new analyses.
+      try {
+        const [d, l] = await Promise.all([
+          riskquantApi.getDashboard().catch(() => null),
+          riskquantApi.getLossExceedance().catch(() => null),
+        ]);
+        if (d) setDashboard(d);
+        if (l) setAnalysisResults(l);
+      } catch { /* ignore */ }
+    } catch (err: any) {
+      setAnalyzeResultBanner(`Analysis failed: ${err?.response?.data?.detail || err?.message || 'unknown error'}`);
+    } finally {
+      setAnalyzeRunning(false);
     }
   };
 
@@ -90,10 +188,16 @@ export default function RiskQuantification() {
 
   const totalScenarios = scenarios.length;
   const avgRiskScore = scenarios.length > 0
-    ? Math.round(scenarios.reduce((sum, s) => sum + (s.riskScore || s.risk_score || 0), 0) / (scenarios.length || 1))
+    ? Math.round(scenarios.reduce((sum, s) => sum + (s.riskScore || 0), 0) / (scenarios.length || 1))
     : 0;
-  const highRiskItems = scenarios.filter(s => (s.riskScore || s.risk_score || 0) >= 60).length;
-  const totalControls = scenarios.reduce((sum, s) => sum + (s.controls?.length || s.controlCount || 0), 0);
+  const highRiskItems = scenarios.filter(s => (s.riskScore || 0) >= 60).length;
+  // Total ALE prefers the dashboard endpoint's authoritative aggregate
+  // when present; falls back to summing per-scenario when the dashboard
+  // is empty (no FAIR analyses yet).
+  const totalAleAggregate = dashboard?.total_ale_annual_usd
+    ?? scenarios.reduce((sum, s) => sum + (s.ale || 0), 0);
+  const totalControls = (dashboard?.number_of_controls
+    ?? scenarios.reduce((sum, s) => sum + (s.controls?.length || 0), 0));
 
   const tabs = [
     { id: 'scenarios', label: 'Scenarios', icon: Target },
@@ -108,8 +212,10 @@ export default function RiskQuantification() {
     (s.category || '').toLowerCase().includes(searchQuery.toLowerCase())
   );
 
-  // Derive risk register from scenarios that have been analyzed
-  const riskRegister = scenarios.filter(s => s.riskScore || s.risk_score);
+  // Risk register = scenarios that actually have a completed FAIR
+  // analysis. Without this filter the register would list every draft
+  // scenario with synthetic numbers, not real quantified risk.
+  const riskRegister = scenarios.filter((s) => !!s.fair_analysis);
 
   // Derive controls from scenarios
   const allControls = scenarios.flatMap(s =>
@@ -303,18 +409,28 @@ export default function RiskQuantification() {
                                 </span>
                               </td>
                               <td className="px-6 py-4 text-sm">{scenario.controls?.length || scenario.controlCount || 0}</td>
-                              <td className="px-6 py-4 text-sm flex gap-2">
+                              <td className="px-6 py-4 text-sm flex items-center gap-2">
                                 <button
                                   onClick={() => setSelectedScenario(scenario)}
                                   className="text-blue-600 dark:text-blue-400 hover:underline"
+                                  title="View details"
                                 >
                                   <Eye className="w-4 h-4" />
                                 </button>
                                 <button
                                   onClick={() => setSelectedScenario(scenario)}
                                   className="text-gray-600 dark:text-gray-400 hover:text-gray-900 dark:hover:text-gray-100"
+                                  title="Edit"
                                 >
                                   <Edit className="w-4 h-4" />
+                                </button>
+                                <button
+                                  disabled={analyzeRunning}
+                                  onClick={() => runMonteCarlo([scenario.id])}
+                                  className="px-2 py-1 text-xs font-medium rounded bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white"
+                                  title="Run a 5,000-iteration FAIR Monte Carlo for this scenario"
+                                >
+                                  {analyzeRunning ? '…' : 'Analyze'}
                                 </button>
                               </td>
                             </tr>
@@ -360,19 +476,40 @@ export default function RiskQuantification() {
                   </div>
                   <div className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4">
                     <h3 className="font-semibold mb-3">Loss Exceedance</h3>
+                    {/* Real percentiles aggregated across the org's
+                        FAIRAnalysis rows. p50 means "50% chance loss
+                        exceeds this number in a year" — the exact
+                        question CFOs ask about cyber risk. */}
                     <div className="space-y-2 text-sm">
-                      <div className="flex justify-between">
-                        <span>10% Probability</span>
-                        <span className="font-semibold">{analysisResults?.p10 ? formatCurrency(analysisResults.p10) : '—'}</span>
-                      </div>
-                      <div className="flex justify-between">
-                        <span>50% Probability</span>
-                        <span className="font-semibold">{analysisResults?.p50 ? formatCurrency(analysisResults.p50) : '—'}</span>
-                      </div>
-                      <div className="flex justify-between">
-                        <span>90% Probability</span>
-                        <span className="font-semibold">{analysisResults?.p90 ? formatCurrency(analysisResults.p90) : '—'}</span>
-                      </div>
+                      {(() => {
+                        const fairs = Object.values(fairByScenario);
+                        const sumPct = (key: string) =>
+                          fairs.reduce((s: number, a: any) => s + Number(a?.[key] ?? 0), 0);
+                        const p10 = sumPct('ale_p10') || sumPct('ale_p50') / 2;
+                        const p50 = sumPct('ale_p50');
+                        const p90 = sumPct('ale_p90');
+                        return (
+                          <>
+                            <div className="flex justify-between">
+                              <span>10% chance loss exceeds</span>
+                              <span className="font-semibold">{p10 > 0 ? formatCurrency(p10) : '—'}</span>
+                            </div>
+                            <div className="flex justify-between">
+                              <span>50% chance loss exceeds</span>
+                              <span className="font-semibold">{p50 > 0 ? formatCurrency(p50) : '—'}</span>
+                            </div>
+                            <div className="flex justify-between">
+                              <span>90% chance loss exceeds</span>
+                              <span className="font-semibold">{p90 > 0 ? formatCurrency(p90) : '—'}</span>
+                            </div>
+                            {p50 === 0 && (
+                              <p className="text-xs text-gray-500 mt-2">
+                                Run a Monte Carlo simulation on a scenario to populate.
+                              </p>
+                            )}
+                          </>
+                        );
+                      })()}
                     </div>
                   </div>
                   <div className="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg p-4">
@@ -404,21 +541,25 @@ export default function RiskQuantification() {
                   </div>
                 </div>
 
+                {analyzeResultBanner && (
+                  <div className={clsx(
+                    'rounded-lg p-4 mb-4 text-sm',
+                    analyzeResultBanner.startsWith('Analysis failed')
+                      ? 'bg-red-50 dark:bg-red-900/30 text-red-700 dark:text-red-200 border border-red-200 dark:border-red-800'
+                      : 'bg-emerald-50 dark:bg-emerald-900/30 text-emerald-800 dark:text-emerald-200 border border-emerald-200 dark:border-emerald-800',
+                  )}>
+                    {analyzeResultBanner}
+                  </div>
+                )}
+
                 <div className="flex gap-3">
                   <button
-                    onClick={async () => {
-                      if (scenarios.length > 0) {
-                        try {
-                          await riskquantApi.runAnalysis(scenarios.map(s => s.id));
-                        } catch (err) {
-                          console.error('Error running analysis:', err);
-                        }
-                      }
-                    }}
-                    className="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded-lg transition"
+                    disabled={analyzeRunning || scenarios.length === 0}
+                    onClick={() => runMonteCarlo(scenarios.map((s) => s.id))}
+                    className="flex items-center gap-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white px-4 py-2 rounded-lg transition"
                   >
-                    <Activity className="w-4 h-4" />
-                    Run Monte Carlo Simulation
+                    <Activity className={clsx('w-4 h-4', analyzeRunning && 'animate-spin')} />
+                    {analyzeRunning ? 'Running…' : 'Run Monte Carlo Simulation'}
                   </button>
                   <button
                     onClick={() => {
