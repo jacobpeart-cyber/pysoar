@@ -595,6 +595,130 @@ async def update_finding(
     return DarkWebFindingResponse.model_validate(finding)
 
 
+@router.post("/findings/{finding_id}/escalate")
+async def escalate_finding(
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+    finding_id: str = Path(...),
+):
+    """Escalate a dark-web finding into a real Incident.
+
+    Creates an Incident row keyed by the finding's title + severity,
+    links the finding via Incident.external_id = "darkweb:{finding_id}",
+    updates the finding status to 'escalated', and returns the new
+    incident_id. Previously the UI's "Escalate to Incident" button
+    only flipped the finding's status — no incident was ever created
+    so analysts thought the action was broken.
+    """
+    from src.models.incident import Incident
+    from src.models.base import generate_uuid, utc_now
+    finding = await get_finding_or_404(db, finding_id)
+
+    if finding.organization_id != getattr(current_user, "organization_id", None):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+
+    # Idempotency: if already escalated and an Incident exists for this
+    # finding, return the existing incident rather than creating a dup.
+    existing = (await db.execute(
+        select(Incident).where(
+            Incident.external_id == f"darkweb:{finding_id}"
+        )
+    )).scalar_one_or_none()
+    if existing is not None:
+        return {
+            "incident_id": existing.id,
+            "finding_id": finding_id,
+            "status": "already_escalated",
+            "incident_status": existing.status,
+        }
+
+    incident = Incident(
+        id=generate_uuid(),
+        organization_id=finding.organization_id,
+        title=f"Dark Web: {finding.title or finding.finding_type}",
+        description=(
+            (finding.description or "")
+            + f"\n\nEscalated from dark web finding {finding_id} "
+            + f"(source={finding.source_platform}, severity={finding.severity})."
+        )[:4000],
+        severity=finding.severity or "medium",
+        status="open",
+        incident_type="data_leak",
+        priority={"critical": 1, "high": 2, "medium": 3, "low": 4}.get(
+            (finding.severity or "medium").lower(), 3
+        ),
+        detected_at=finding.discovered_date or utc_now().isoformat(),
+        external_id=f"darkweb:{finding_id}",
+        created_at=utc_now(),
+        updated_at=utc_now(),
+    )
+    db.add(incident)
+    finding.status = "escalated"
+    await db.commit()
+    await db.refresh(incident)
+    return {
+        "incident_id": incident.id,
+        "finding_id": finding_id,
+        "status": "escalated",
+        "incident_status": incident.status,
+        "incident_severity": incident.severity,
+    }
+
+
+@router.post("/findings/{finding_id}/notify")
+async def notify_stakeholders(
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+    finding_id: str = Path(...),
+):
+    """Send the finding to every enabled notification channel for the org.
+
+    Calls ``send_incident_notifications`` so Slack / Teams / PagerDuty /
+    OpsGenie all receive the alert at once. Returns a per-channel
+    sent/failed/skipped breakdown. Updates the finding status to
+    'notified' on success.
+    """
+    from src.services.notifications import send_incident_notifications
+
+    finding = await get_finding_or_404(db, finding_id)
+    if finding.organization_id != getattr(current_user, "organization_id", None):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+
+    event = {
+        "title": f"Dark Web: {finding.title or finding.finding_type}",
+        "severity": finding.severity or "medium",
+        "summary": (finding.description or finding.title or "")[:1500],
+        "trigger": "dark_web",
+        "incident_id": None,
+        "investigation_id": None,
+        "verdict": None,
+        "confidence": finding.confidence_score,
+        "mitre_techniques": [],
+        "recommendations": [
+            "Force password reset for any matching internal users",
+            "Block source URL at the proxy/firewall edge",
+            "Review SIEM logs for matching IOCs in the last 30 days",
+        ],
+    }
+
+    results = await send_incident_notifications(
+        db,
+        organization_id=finding.organization_id,
+        event=event,
+    )
+
+    # Mark notified only if at least one channel actually sent.
+    if results.get("sent"):
+        finding.status = "notified"
+        await db.commit()
+
+    return {
+        "finding_id": finding_id,
+        "status": "notified" if results.get("sent") else "no_channels_configured",
+        "delivery": results,
+    }
+
+
 @router.post("/findings/bulk-action")
 async def bulk_finding_action(action: BulkFindingAction, current_user: CurrentUser = None, db: DatabaseSession = None, background_tasks: BackgroundTasks = None):
     """Perform bulk actions on findings"""
