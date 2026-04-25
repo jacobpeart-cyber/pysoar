@@ -202,7 +202,9 @@ export default function Remediation() {
       });
       return response.data;
     },
-    enabled: activeTab === 'policies',
+    // Always-on so the Executions tab can resolve policy_id -> human
+    // policy name; otherwise the table renders raw UUIDs that overflow
+    // the viewport.
   });
 
   // Fetch executions
@@ -768,6 +770,21 @@ export default function Remediation() {
 
     const allExecutions: Execution[] = Array.isArray(executionsData) ? executionsData : (executionsData?.items || executionsData?.executions || []);
     const pendingApprovals = pendingApprovalsData?.executions || [];
+    // Build a UUID -> human-name lookup so rows render readable policy
+    // names instead of `4e872065-853c-...` strings that wrap the table
+    // off-screen on narrow viewports.
+    const policiesArr: Policy[] = Array.isArray(policiesData)
+      ? policiesData
+      : (policiesData?.items || policiesData?.policies || []);
+    const policyNameById = new Map<string, string>();
+    for (const p of policiesArr) {
+      if (p?.id && p?.name) policyNameById.set(p.id, p.name);
+    }
+    const shortId = (s: string | null | undefined): string => {
+      if (!s) return '—';
+      // 36-char UUID -> "4e872065…272e" so the column stays narrow.
+      return s.length > 12 ? `${s.slice(0, 8)}…${s.slice(-4)}` : s;
+    };
 
     return (
       <div className="space-y-6">
@@ -863,32 +880,37 @@ export default function Remediation() {
         {/* Executions Table */}
         <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700">
           <div className="overflow-x-auto">
-            <table className="w-full">
+            <table className="w-full min-w-[1100px]">
               <thead className="bg-gray-50 dark:bg-gray-700">
                 <tr>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
                     Time
                   </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
                     Trigger
                   </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
                     Target
                   </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
                     Policy
                   </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
                     Status
                   </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
                     Actions
                   </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
                     Duration
                   </th>
-                  <th className="px-6 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
+                  <th className="px-4 py-3 text-left text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
                     Analyst
+                  </th>
+                  {/* Action-buttons column — was missing a <th>, leaving
+                      headers/body misaligned on the Status column edge. */}
+                  <th className="px-4 py-3 text-right text-xs font-medium text-gray-700 dark:text-gray-300 uppercase tracking-wider">
+                    <span className="sr-only">Row Actions</span>
                   </th>
                 </tr>
               </thead>
@@ -903,10 +925,10 @@ export default function Remediation() {
                         )
                       }
                     >
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-white">
+                      <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-900 dark:text-white">
                         {new Date(execution.created_at || "").toLocaleString()}
                       </td>
-                      <td className="px-6 py-4 whitespace-nowrap">
+                      <td className="px-4 py-4 whitespace-nowrap">
                         <div className="flex items-center gap-2">
                           {triggerIcons[execution.trigger_source] || <AlertCircle className="w-4 h-4" />}
                           <span className="text-sm text-gray-600 dark:text-gray-400">
@@ -914,13 +936,17 @@ export default function Remediation() {
                           </span>
                         </div>
                       </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
-                        {execution.target_entity}
+                      <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400 font-mono"
+                          title={execution.target_entity || ''}>
+                        {shortId(execution.target_entity)}
                       </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
-                        {execution.policy_id || 'Manual'}
+                      <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400"
+                          title={execution.policy_id || ''}>
+                        {execution.policy_id
+                          ? (policyNameById.get(execution.policy_id) || shortId(execution.policy_id))
+                          : 'Manual'}
                       </td>
-                      <td className="px-6 py-4 whitespace-nowrap">
+                      <td className="px-4 py-4 whitespace-nowrap">
                         <span
                           className={clsx(
                             'inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium',
@@ -933,18 +959,18 @@ export default function Remediation() {
                           {execution.status}
                         </span>
                       </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
+                      <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
                         {execution.actions_completed?.length || 0}/{execution.actions_planned?.length || 0}
                       </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
+                      <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
                         {execution.started_at && execution.completed_at
                           ? `${((new Date(execution.completed_at || "").getTime() - new Date(execution.started_at || "").getTime()) / 1000).toFixed(1)}s`
                           : execution.started_at ? 'Running' : '-'}
                       </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
+                      <td className="px-4 py-4 whitespace-nowrap text-sm text-gray-600 dark:text-gray-400">
                         {execution.created_by || 'System'}
                       </td>
-                      <td className="px-6 py-4 whitespace-nowrap text-right">
+                      <td className="px-4 py-4 whitespace-nowrap text-right">
                         <div className="flex items-center justify-end gap-2">
                           {(execution.status === 'awaiting_manual' || execution.status === 'awaiting_integration') && (
                             <>
