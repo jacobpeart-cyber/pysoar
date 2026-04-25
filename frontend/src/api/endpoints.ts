@@ -783,6 +783,26 @@ export const darkwebApi = {
     return response.data;
   },
 
+  escalateFinding: async (findingId: string): Promise<{
+    incident_id: string;
+    finding_id: string;
+    status: string;
+    incident_status: string;
+    incident_severity?: string;
+  }> => {
+    const response = await api.post(`/darkweb/findings/${findingId}/escalate`);
+    return response.data;
+  },
+
+  notifyStakeholders: async (findingId: string): Promise<{
+    finding_id: string;
+    status: string;
+    delivery: { sent: string[]; failed: string[]; skipped: string[] };
+  }> => {
+    const response = await api.post(`/darkweb/findings/${findingId}/notify`);
+    return response.data;
+  },
+
   createMonitor: async (data: { name: string; keywords?: string[]; monitor_type?: string; keyword?: string }): Promise<any> => {
     const response = await api.post('/darkweb/monitors', {
       name: data.name,

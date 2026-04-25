@@ -548,22 +548,20 @@ export default function DarkWebMonitor() {
               <button
                 onClick={async () => {
                   try {
-                    const res = await api.post(
-                      `/darkweb/findings/${actionFinding.id}/escalate`,
-                    );
-                    const incidentId = res.data?.incident_id;
+                    const res = await darkwebApi.escalateFinding(actionFinding.id);
+                    const incidentId = res?.incident_id;
                     setFindings((prev) =>
                       prev.map((f) =>
                         f.id === actionFinding.id ? { ...f, status: 'escalated' } : f,
                       ),
                     );
                     alert(
-                      res.data?.status === 'already_escalated'
+                      res?.status === 'already_escalated'
                         ? `Already escalated. Incident ${incidentId}`
-                        : `Incident ${incidentId} created. Severity: ${res.data?.incident_severity}`,
+                        : `Incident ${incidentId} created. Severity: ${res?.incident_severity ?? 'medium'}`,
                     );
                   } catch (e: any) {
-                    alert(`Escalate failed: ${e?.response?.data?.detail || e?.message}`);
+                    alert(`Escalate failed: ${e?.response?.data?.detail || e?.message || 'unknown error'}`);
                   }
                   setActionFinding(null);
                 }}
@@ -574,15 +572,14 @@ export default function DarkWebMonitor() {
               <button
                 onClick={async () => {
                   try {
-                    const res = await api.post(
-                      `/darkweb/findings/${actionFinding.id}/notify`,
-                    );
-                    const sent = res.data?.delivery?.sent ?? [];
-                    const failed = res.data?.delivery?.failed ?? [];
-                    const skipped = res.data?.delivery?.skipped ?? [];
+                    const res = await darkwebApi.notifyStakeholders(actionFinding.id);
+                    const sent = res?.delivery?.sent ?? [];
+                    const failed = res?.delivery?.failed ?? [];
+                    const skipped = res?.delivery?.skipped ?? [];
                     if (sent.length === 0) {
                       alert(
-                        'No notification channels configured. Add Slack/Teams/PagerDuty in Integrations to receive alerts.\n\n'
+                        'No notification channels accepted the message. Configure Slack/Teams/PagerDuty in Settings → Integrations.\n\n'
+                          + (failed.length ? `Failed: ${failed.join(', ')}\n` : '')
                           + (skipped.length ? `Skipped: ${skipped.join(', ')}` : ''),
                       );
                     } else {
@@ -598,7 +595,7 @@ export default function DarkWebMonitor() {
                       );
                     }
                   } catch (e: any) {
-                    alert(`Notify failed: ${e?.response?.data?.detail || e?.message}`);
+                    alert(`Notify failed: ${e?.response?.data?.detail || e?.message || 'unknown error'}`);
                   }
                   setActionFinding(null);
                 }}
