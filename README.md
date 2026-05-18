@@ -65,7 +65,7 @@ PySOAR is a full-stack, multi-tenant SOAR platform that unifies security operati
 - **Reports** — Exportable alert, incident, and executive reports in CSV/JSON/PDF.
 
 ### Automation & Workflow
-- **Agentic SOC** — AI-powered autonomous investigation with OODA loop reasoning, natural-language query summarization via Gemini 2.5 Flash, and real threat-hunt aggregation across 4 data sources.
+- **Agentic SOC** — AI-powered autonomous investigation with OODA loop reasoning, natural-language query summarization via Gemini 2.5 Flash, expert SOC skill registry, guarded tool execution, and real threat-hunt aggregation across 4 data sources.
 - **Playbook Builder** — Visual drag-and-drop playbook authoring with template library, schedule triggers, and execution history.
 - **Playbook Engine** — 8-step action library (alert, enrich, block, isolate, notify, ticket, query, custom) with conditional branching.
 - **Unified Ticket Hub** — Cross-module ticket aggregation layer that surfaces incidents, case tasks, remediation tickets, remediation executions, war room actions, POA&Ms, compliance control work, and evidence requests in one list + Kanban view. Includes threaded comments, activity log, ticket linking, and automation rules.

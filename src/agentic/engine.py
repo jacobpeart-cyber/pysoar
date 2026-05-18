@@ -9,7 +9,7 @@ and multi-agent orchestration.
 import json
 import logging
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 from uuid import uuid4
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -33,13 +33,13 @@ from src.agentic.models import (
     ResolutionType,
 )
 from src.core.config import settings
+from src.agentic.tools import ToolExecutor
 
 logger = logging.getLogger(__name__)
 
 # LLM integration (optional, set USE_LLM_ENABLED in config)
 try:
     from src.agentic.llm import LLMOrchestrator, LocalProvider
-    from src.agentic.tools import SecurityTools, ToolExecutor
     LLM_AVAILABLE = True
 except ImportError:
     LLM_AVAILABLE = False
@@ -76,12 +76,13 @@ class AgenticSOCEngine:
         self.memory_manager = AgentMemoryManager(db)
         self.nl_interface = NaturalLanguageInterface(db)
         self.llm_orchestrator = llm_orchestrator
-        self.tool_executor = None
-        self.use_llm = settings.get("AGENTIC_LLM_ENABLED", False) and LLM_AVAILABLE
+        self.tool_executor = ToolExecutor()
+        self.use_llm = getattr(settings, "AGENTIC_LLM_ENABLED", False) and LLM_AVAILABLE
 
         if self.use_llm and self.llm_orchestrator:
-            self.tool_executor = ToolExecutor()
             logger.info("Agentic SOC Engine initialized with LLM support")
+        else:
+            logger.info("Agentic SOC Engine initialized without LLM support")
 
     async def investigate(
         self,
@@ -134,6 +135,12 @@ class AgenticSOCEngine:
 
         await self.db.commit()
         return investigation
+
+    async def run_skill(self, skill_name: str, **kwargs) -> Dict[str, Any]:
+        """Execute a registered expert SOC skill through the engine."""
+        if not self.tool_executor:
+            self.tool_executor = ToolExecutor()
+        return await self.tool_executor.run_skill(skill_name, db=self.db, **kwargs)
 
     async def _reasoning_loop(
         self,
@@ -804,6 +811,26 @@ class AgenticSOCEngine:
 
         reasoning_chain = []
         collected_evidence = {}
+
+        # Enrich the investigation using expert SOC skills before entering the OODA loop
+        alert_reference_id = alert_data.get("alert_id") or investigation.trigger_source_id
+        if alert_reference_id:
+            try:
+                logger.info("Running expert SOC skill: threat_hunt_from_alert")
+                skill_response = await self.tool_executor.run_skill(
+                    "threat_hunt_from_alert",
+                    db=self.db,
+                    alert_id=alert_reference_id,
+                )
+                if skill_response.get("success"):
+                    collected_evidence["threat_hunt_from_alert"] = skill_response.get("result")
+                else:
+                    logger.warning(
+                        "Skill execution failed: %s",
+                        skill_response.get("error"),
+                    )
+            except Exception as e:
+                logger.error(f"Skill integration failed: {e}")
 
         # Step 2-4: OODA loop with tool execution
         max_iterations = 5

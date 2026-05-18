@@ -20,6 +20,9 @@ from typing import Any, Callable, Optional
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.integrations.engine import ActionExecutor
+from src.integrations.models import InstalledIntegration
+
 logger = logging.getLogger(__name__)
 
 
@@ -505,6 +508,20 @@ class AgentToolRegistry:
             parameters={},
             category="query",
             handler=self._list_configured_integrations,
+        ))
+        self._register(Tool(
+            name="execute_integration_action",
+            description=(
+                "Execute a configured integration action by installation_id and action_name. "
+                "Use this to notify channels, enrich IOCs, or run connector-specific API actions."
+            ),
+            parameters={
+                "installation_id": "string",
+                "action_name": "string",
+                "input_data": "optional dict",
+            },
+            category="action",
+            handler=self._execute_integration_action,
         ))
 
         # ===== COMPLIANCE =====
@@ -1445,4 +1462,32 @@ class AgentToolRegistry:
             "total": len(items),
             "configured_count": sum(1 for i in items if i.get("configured")),
             "integrations": items,
+        }
+
+    async def _execute_integration_action(self, installation_id: str, action_name: str, input_data: Optional[dict] = None):
+        """Execute a configured integration action through the integration engine."""
+        if input_data is None:
+            input_data = {}
+
+        result = await self.db.execute(
+            select(InstalledIntegration).where(InstalledIntegration.id == installation_id)
+        )
+        integration = result.scalar_one_or_none()
+        if not integration:
+            return {"success": False, "error": "Integration installation not found"}
+        if integration.status != "active":
+            return {"success": False, "error": "Integration is not active"}
+
+        executor = ActionExecutor()
+        execution_result = await executor.execute_action(
+            installation_id=installation_id,
+            action_name=action_name,
+            input_data=input_data,
+            triggered_by="agent_tool",
+        )
+
+        return {
+            "installation_id": installation_id,
+            "action_name": action_name,
+            "execution_result": execution_result,
         }
