@@ -10,6 +10,9 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
+from src.agentic.guardrails import Guardrails
+from src.agentic.skills import SkillRegistry, registry
+
 logger = logging.getLogger(__name__)
 
 
@@ -224,6 +227,10 @@ class ToolExecutor:
         """
         self.tool_handlers = tool_handlers or {}
         self.audit_logger = ToolAuditLogger()
+        # Guardrails enforce safety checks before executing tools
+        self.guardrails = Guardrails()
+        # Skill registry for higher-level composed actions
+        self.skill_registry = registry
 
     def register_handler(self, tool_name: str, handler: Callable) -> None:
         """Register a handler for a tool"""
@@ -250,6 +257,13 @@ class ToolExecutor:
             Tool execution result
         """
         try:
+            # Guardrails: validate the call before doing anything
+            allowed, reason = await self.guardrails.check_tool_call(
+                tool_name, arguments, user_id=user_id, organization_id=organization_id
+            )
+            if not allowed:
+                raise ValueError(f"Guardrail blocked tool call: {reason}")
+
             # Validate tool exists
             valid_tools = [t["name"] for t in SecurityTools.TOOLS]
             if tool_name not in valid_tools:
@@ -300,6 +314,24 @@ class ToolExecutor:
                 "tool": tool_name,
                 "error": str(e),
             }
+
+    async def run_skill(
+        self,
+        skill_name: str,
+        db: Any = None,
+        user_id: Optional[str] = None,
+        organization_id: Optional[str] = None,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        """Run a registered skill by name through the skill registry."""
+        try:
+            result = await self.skill_registry.run_skill(
+                skill_name, tool_executor=self, db=db, **kwargs
+            )
+            return {"success": True, "skill": skill_name, "result": result}
+        except Exception as e:
+            logger.error(f"Skill execution failed: {skill_name}: {e}")
+            return {"success": False, "skill": skill_name, "error": str(e)}
 
     async def _default_handler(
         self,

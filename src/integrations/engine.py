@@ -7,7 +7,21 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 from uuid import uuid4
 
+from src.core.encryption import get_encryption_service
 from src.core.logging import get_logger
+from src.core.utils import safe_json_loads
+from src.integrations.connectors import (
+    AbuseIPDBConnector,
+    AWSSecurityHubConnector,
+    CrowdStrikeConnector,
+    JiraConnector,
+    MicrosoftSentinelConnector,
+    PagerDutyConnector,
+    ServiceNowConnector,
+    ShodanConnector,
+    SlackConnector,
+    VirusTotalConnector,
+)
 from src.integrations.models import (
     ActionType,
     AuthType,
@@ -24,6 +38,19 @@ from src.integrations.models import (
 )
 
 logger = get_logger(__name__)
+
+CONNECTOR_CLASS_MAP = {
+    "slack": SlackConnector,
+    "virustotal": VirusTotalConnector,
+    "shodan": ShodanConnector,
+    "abuseipdb": AbuseIPDBConnector,
+    "crowdstrike": CrowdStrikeConnector,
+    "servicenow": ServiceNowConnector,
+    "pagerduty": PagerDutyConnector,
+    "aws_security_hub": AWSSecurityHubConnector,
+    "jira": JiraConnector,
+    "microsoft_sentinel": MicrosoftSentinelConnector,
+}
 
 
 def _classify_response(resp: Any) -> tuple[str, Optional[str]]:
@@ -1112,7 +1139,40 @@ class ActionExecutor:
         action_name: str,
         input_data: dict[str, Any],
     ) -> dict[str, Any]:
-        """Call connector action via HTTP using httpx"""
+        """Call connector action using a configured connector wrapper."""
+        from sqlalchemy import select
+        from sqlalchemy.orm import selectinload
+        from src.core.database import async_session_factory
+
+        async with async_session_factory() as db:
+            query = select(InstalledIntegration).options(
+                selectinload(InstalledIntegration.connector),
+            ).where(InstalledIntegration.id == installation_id)
+            result = await db.execute(query)
+            integration = result.scalar_one_or_none()
+
+        if not integration:
+            raise ValueError(f"Installed integration not found: {installation_id}")
+
+        config = safe_json_loads(integration.config_encrypted, {}) or {}
+        credentials = self._decrypt_secret_json(integration.auth_credentials_encrypted)
+        connector_name = (integration.connector.name if integration.connector else integration.connector_id or "").lower()
+        connector_cls = self._get_connector_class(connector_name)
+
+        if connector_cls:
+            connector = connector_cls(config=config, credentials=credentials)
+            return await connector.execute_action(action_name, input_data)
+
+        # Fallback to generic HTTP based connector execution when no wrapper exists.
+        return await self._call_generic_http_action(installation_id, action_name, input_data)
+
+    async def _call_generic_http_action(
+        self,
+        installation_id: str,
+        action_name: str,
+        input_data: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Call connector action via HTTP using httpx."""
         import httpx
 
         # Build request from input data
@@ -1151,6 +1211,23 @@ class ActionExecutor:
                 "data": response_data,
                 "headers": dict(response.headers),
             }
+
+    def _decrypt_secret_json(self, value: Optional[str]) -> dict[str, Any]:
+        """Decrypt a stored credentials blob from the database."""
+        if not value:
+            return {}
+        if isinstance(value, str) and value.startswith("__plaintext__:"):
+            return safe_json_loads(value[len("__plaintext__:"):], {}) or {}
+
+        try:
+            decrypted = get_encryption_service().decrypt_field(value)
+            return safe_json_loads(decrypted, {}) or {}
+        except Exception:
+            return safe_json_loads(value, {}) or {}
+
+    def _get_connector_class(self, connector_name: str):
+        """Resolve a connector wrapper class by connector name."""
+        return CONNECTOR_CLASS_MAP.get(connector_name)
 
     def handle_rate_limiting(
         self,
