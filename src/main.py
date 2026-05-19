@@ -132,6 +132,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         except Exception as e:  # noqa: BLE001
             logger.warning("SIEM syslog receiver failed to start", error=str(e))
 
+    # Start the SIEM ingest queue worker for host/EDR events. If REDIS_URL
+    # is present, prefer Redis-backed durable queue; otherwise fall back
+    # to the in-memory asyncio queue.
+    try:
+        from src.siem.ingest_queue import init as _ingest_init, start as _ingest_start
+        from src.core.database import async_session_factory as _async_session_factory
+        redis_url = _os.getenv("REDIS_URL")
+        _ingest_init(db_session_factory=_async_session_factory, redis_url=redis_url)
+        _ingest_start()
+        logger.info("SIEM ingest queue started", redis=bool(redis_url))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("SIEM ingest queue failed to start", error=str(e))
+
     # Create first admin user if needed
     await create_first_admin()
 

@@ -187,6 +187,66 @@ def _extract_verdict(text: str) -> Optional[dict[str, Any]]:
     return None
 
 
+def _validate_and_normalize_verdict(candidate: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Validate and normalize a parsed LLM verdict dict.
+
+    Returns a cleaned dict suitable for persistence, or None if the
+    candidate is malformed (caller should nudge the LLM instead of
+    accepting it).
+    """
+    if not isinstance(candidate, dict):
+        return None
+
+    # verdict type
+    try:
+        valid_verdicts = {v.value for v in ResolutionType}
+    except Exception:
+        valid_verdicts = {"true_positive", "false_positive", "benign", "inconclusive"}
+
+    verdict_raw = str(candidate.get("verdict", "") or "").lower()
+    if verdict_raw not in valid_verdicts:
+        return None
+
+    # confidence: allow numbers or strings like '85' or '85%'
+    conf = candidate.get("confidence", 0)
+    try:
+        if isinstance(conf, str):
+            conf = conf.strip().rstrip("%")
+        confidence = float(conf)
+    except Exception:
+        return None
+    if not (0 <= confidence <= 100):
+        return None
+
+    # reasoning and hypothesis
+    reasoning = candidate.get("reasoning") or ""
+    hypothesis = candidate.get("hypothesis") or ""
+    if not isinstance(reasoning, str) or not isinstance(hypothesis, str):
+        return None
+
+    # mitre_techniques, affected_assets, recommendations
+    mitre = candidate.get("mitre_techniques") or []
+    affected = candidate.get("affected_assets") or []
+    recs = candidate.get("recommendations") or []
+    if not isinstance(mitre, list) or not all(isinstance(x, str) for x in mitre):
+        return None
+    if not isinstance(affected, list) or not all(isinstance(x, str) for x in affected):
+        return None
+    if not isinstance(recs, list) or not all(isinstance(x, str) for x in recs):
+        return None
+
+    # Truncate long fields to bounds used elsewhere
+    return {
+        "verdict": verdict_raw,
+        "confidence": max(0.0, min(100.0, float(confidence))),
+        "reasoning": reasoning[:4000],
+        "hypothesis": hypothesis[:2000],
+        "mitre_techniques": mitre,
+        "affected_assets": affected,
+        "recommendations": recs,
+    }
+
+
 async def _broadcast_investigation_event(org_id: str, event: dict[str, Any]) -> None:
     """Best-effort WebSocket publish. Never raises — investigation
     progress is strictly additive; a downed WS must not fail the run."""
@@ -342,8 +402,23 @@ class AutonomousInvestigator:
                 text = llm_result.get("text", "")
                 verdict = _extract_verdict(text)
                 if verdict:
-                    verdict_data = verdict
-                    break
+                    validated = _validate_and_normalize_verdict(verdict)
+                    if validated:
+                        verdict_data = validated
+                        break
+                    else:
+                        # Persist a step noting the malformed verdict and
+                        # nudge the model to return the exact JSON schema.
+                        await self._persist_step(
+                            investigation, step_num, StepType.ANALYZE.value,
+                            thought=(
+                                "LLM returned a verdict-like JSON but it failed schema "
+                                "validation. Requesting corrected JSON with exact fields."
+                            ),
+                            tool_name=None, tool_args=None, tool_result={"raw_verdict": verdict},
+                        )
+                        transcript.append({"note": "malformed_verdict", "raw": text})
+                        continue
                 # Treat free-form text as a hypothesis/interim thought.
                 investigation.hypothesis = text[:2000]
                 await self._persist_step(

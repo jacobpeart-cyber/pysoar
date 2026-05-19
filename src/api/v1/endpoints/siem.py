@@ -43,6 +43,20 @@ from src.core.utils import safe_json_loads
 router = APIRouter(prefix="/siem", tags=["SIEM"])
 
 
+@router.get("/ingest/status")
+async def ingest_status(
+    request: Request = None,
+):
+    """Return ingest queue status for monitoring and autoscaling."""
+    try:
+        from src.siem.ingest_queue import get_status
+        status_info = await get_status()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(f"ingest status check failed: {exc}")
+        status_info = {"mode": "unknown", "queue_length": -1, "redis_connected": False}
+    return status_info
+
+
 async def get_log_or_404(db: AsyncSession, log_id: str) -> LogEntry:
     """Get log entry by ID or raise 404"""
     result = await db.execute(select(LogEntry).where(LogEntry.id == log_id))

@@ -187,6 +187,32 @@ class AgentService:
         agent.last_heartbeat_at = _utc_now()
         if agent.status in ("offline", "pending"):
             agent.status = "active"
+        # Optional anti-replay: if agent includes a monotonic `nonce` in
+        # its telemetry, enforce that it increases. Store last seen
+        # nonce in agent.extra_metadata so it survives restarts.
+        try:
+            if telemetry and isinstance(telemetry, dict) and "nonce" in telemetry:
+                try:
+                    incoming_nonce = int(telemetry.get("nonce"))
+                except Exception:
+                    incoming_nonce = None
+                if incoming_nonce is not None:
+                    last_nonce = 0
+                    try:
+                        last_nonce = int(agent.extra_metadata.get("last_heartbeat_nonce", 0))
+                    except Exception:
+                        last_nonce = 0
+                    if incoming_nonce <= last_nonce:
+                        raise AgentServiceError("stale or replayed heartbeat nonce")
+                    agent.extra_metadata["last_heartbeat_nonce"] = incoming_nonce
+
+        except AgentServiceError:
+            # Propagate to caller so a replayed heartbeat is rejected.
+            raise
+        except Exception:
+            # Non-fatal: don't block heartbeats for unexpected metadata issues
+            pass
+
         self.session.add(
             AgentHeartbeat(
                 agent_id=agent.id,

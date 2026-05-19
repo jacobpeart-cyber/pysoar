@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
   Workflow,
   Play,
@@ -104,6 +104,30 @@ interface Execution {
   totalNodes: number;
 }
 
+interface BuilderNode {
+  id: string;
+  node_id: string;
+  node_type: string;
+  display_name: string;
+  description?: string;
+  position_x: number;
+  position_y: number;
+  config?: any;
+  timeout_seconds: number;
+  retry_count: number;
+  on_error: string;
+}
+
+interface BuilderEdge {
+  id: string;
+  source_node_id: string;
+  target_node_id: string;
+  edge_type: string;
+  label?: string;
+  condition_expression?: string;
+  priority: number;
+}
+
 export default function PlaybookBuilder() {
   const [activeTab, setActiveTab] = useState('playbooks');
   const [playbooks, setPlaybooks] = useState<Playbook[]>([]);
@@ -118,6 +142,26 @@ export default function PlaybookBuilder() {
   const [actionLoading, setActionLoading] = useState<string | null>(null);
   const [notification, setNotification] = useState<{ type: string; text: string } | null>(null);
   const [showCreateModal, setShowCreateModal] = useState(false);
+  const [builderPlaybook, setBuilderPlaybook] = useState<Playbook | null>(null);
+  const [builderNodes, setBuilderNodes] = useState<BuilderNode[]>([]);
+  const [builderEdges, setBuilderEdges] = useState<BuilderEdge[]>([]);
+  const [builderLoading, setBuilderLoading] = useState(false);
+  const [builderError, setBuilderError] = useState<string | null>(null);
+  const [selectedBuilderNode, setSelectedBuilderNode] = useState<BuilderNode | null>(null);
+  const [nodeDragState, setNodeDragState] = useState<{
+    nodeId: string;
+    pointerX: number;
+    pointerY: number;
+    offsetX: number;
+    offsetY: number;
+  } | null>(null);
+  const [newNodeName, setNewNodeName] = useState('');
+  const [newNodeType, setNewNodeType] = useState('action');
+  const [newEdgeSource, setNewEdgeSource] = useState('');
+  const [newEdgeTarget, setNewEdgeTarget] = useState('');
+  const [newEdgeType, setNewEdgeType] = useState('success');
+  const [newEdgeLabel, setNewEdgeLabel] = useState('');
+  const builderCanvasRef = useRef<HTMLDivElement | null>(null);
 
   const createPlaybook = async (values: Record<string, string>) => {
     const payload: Record<string, any> = {
@@ -168,6 +212,205 @@ export default function PlaybookBuilder() {
     },
   ];
 
+  const openBuilder = async (playbook: Playbook) => {
+    setBuilderLoading(true);
+    setBuilderError(null);
+    setBuilderPlaybook(null);
+    setBuilderNodes([]);
+    setBuilderEdges([]);
+    setSelectedBuilderNode(null);
+    setActiveTab('builder');
+
+    try {
+      const res = await api.get(`/playbook-builder/${playbook.id}`);
+      const builderData = res.data;
+      setBuilderPlaybook(builderData);
+      setBuilderNodes(builderData.nodes || []);
+      setBuilderEdges(builderData.edges || []);
+      setNewEdgeSource(builderData.nodes?.[0]?.node_id || '');
+      setNewEdgeTarget(builderData.nodes?.[1]?.node_id || '');
+    } catch (err) {
+      setBuilderError('Failed to load visual playbook builder.');
+      setNotification({ type: 'error', text: 'Unable to open playbook builder' });
+    } finally {
+      setBuilderLoading(false);
+    }
+  };
+
+  const closeBuilder = () => {
+    setBuilderPlaybook(null);
+    setBuilderNodes([]);
+    setBuilderEdges([]);
+    setSelectedBuilderNode(null);
+    setBuilderError(null);
+    setNodeDragState(null);
+  };
+
+  const saveNodePosition = async (nodeId: string, position_x: number, position_y: number) => {
+    if (!builderPlaybook) return;
+    setBuilderNodes((prev) =>
+      prev.map((node) =>
+        node.node_id === nodeId ? { ...node, position_x, position_y } : node
+      )
+    );
+    if (selectedBuilderNode?.node_id === nodeId) {
+      setSelectedBuilderNode({ ...selectedBuilderNode, position_x, position_y });
+    }
+
+    try {
+      await api.put(`/playbook-builder/${builderPlaybook.id}/nodes/${nodeId}`, {
+        position_x,
+        position_y,
+      });
+      setNotification({ type: 'success', text: 'Node position saved' });
+    } catch (err) {
+      setNotification({ type: 'error', text: 'Failed to save node position' });
+    }
+  };
+
+  const handleNodePointerDown = (
+    e: React.MouseEvent<HTMLButtonElement>,
+    node: BuilderNode
+  ) => {
+    if (!builderCanvasRef.current) return;
+    e.preventDefault();
+    const bounds = builderCanvasRef.current.getBoundingClientRect();
+    setSelectedBuilderNode(node);
+    setNodeDragState({
+      nodeId: node.node_id,
+      pointerX: e.clientX,
+      pointerY: e.clientY,
+      offsetX: e.clientX - bounds.left - node.position_x,
+      offsetY: e.clientY - bounds.top - node.position_y,
+    });
+  };
+
+  const handleCanvasMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (!nodeDragState || !builderCanvasRef.current) return;
+    const bounds = builderCanvasRef.current.getBoundingClientRect();
+    const newX = e.clientX - bounds.left - nodeDragState.offsetX;
+    const newY = e.clientY - bounds.top - nodeDragState.offsetY;
+
+    setBuilderNodes((prev) =>
+      prev.map((node) =>
+        node.node_id === nodeDragState.nodeId
+          ? {
+              ...node,
+              position_x: Math.max(0, Math.min(newX, bounds.width - 180)),
+              position_y: Math.max(0, Math.min(newY, bounds.height - 80)),
+            }
+          : node
+      )
+    );
+  };
+
+  const handleCanvasMouseUp = async () => {
+    if (!nodeDragState || !builderPlaybook) {
+      setNodeDragState(null);
+      return;
+    }
+
+    const node = builderNodes.find((n) => n.node_id === nodeDragState.nodeId);
+    if (node) {
+      await saveNodePosition(node.node_id, node.position_x, node.position_y);
+    }
+    setNodeDragState(null);
+  };
+
+  const handleCreateBuilderNode = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    if (!builderPlaybook) return;
+    if (!newNodeName.trim()) {
+      setNotification({ type: 'error', text: 'Enter a name for the node.' });
+      return;
+    }
+
+    try {
+      const position_x = 40 + (builderNodes.length % 4) * 180;
+      const position_y = 40 + Math.floor(builderNodes.length / 4) * 100;
+      const res = await api.post(`/playbook-builder/${builderPlaybook.id}/nodes`, {
+        node_type: newNodeType,
+        display_name: newNodeName.trim(),
+        description: '',
+        position_x,
+        position_y,
+        config: null,
+        timeout_seconds: 300,
+        retry_count: 0,
+        on_error: 'stop',
+      });
+
+      setBuilderNodes((prev) => [...prev, res.data]);
+      setNewNodeName('');
+      setNewEdgeSource(res.data.node_id);
+      setNotification({ type: 'success', text: 'Node created' });
+    } catch (err) {
+      setNotification({ type: 'error', text: 'Failed to create node' });
+    }
+  };
+
+  const handleCreateEdge = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    if (!builderPlaybook) return;
+    if (!newEdgeSource || !newEdgeTarget) {
+      setNotification({ type: 'error', text: 'Choose source and target nodes first.' });
+      return;
+    }
+    if (newEdgeSource === newEdgeTarget) {
+      setNotification({ type: 'error', text: 'Source and target cannot be the same node.' });
+      return;
+    }
+
+    try {
+      const res = await api.post(`/playbook-builder/${builderPlaybook.id}/edges`, {
+        source_node_id: newEdgeSource,
+        target_node_id: newEdgeTarget,
+        edge_type: newEdgeType,
+        label: newEdgeLabel || undefined,
+        priority: 0,
+      });
+      setBuilderEdges((prev) => [...prev, res.data]);
+      setNewEdgeLabel('');
+      setNotification({ type: 'success', text: 'Connection added' });
+    } catch (err) {
+      setNotification({ type: 'error', text: 'Failed to create connection' });
+    }
+  };
+
+  const handleDeleteEdge = async (edgeId: string) => {
+    if (!builderPlaybook) return;
+    try {
+      await api.delete(`/playbook-builder/${builderPlaybook.id}/edges/${edgeId}`);
+      setBuilderEdges((prev) => prev.filter((edge) => edge.id !== edgeId));
+      setNotification({ type: 'success', text: 'Connection removed' });
+    } catch (err) {
+      setNotification({ type: 'error', text: 'Failed to remove connection' });
+    }
+  };
+
+  const handleDeleteNode = async (nodeId: string) => {
+    if (!builderPlaybook) return;
+    try {
+      await api.delete(`/playbook-builder/${builderPlaybook.id}/nodes/${nodeId}`);
+      setBuilderNodes((prev) => prev.filter((node) => node.node_id !== nodeId));
+      setBuilderEdges((prev) =>
+        prev.filter((edge) => edge.source_node_id !== nodeId && edge.target_node_id !== nodeId)
+      );
+      if (selectedBuilderNode?.node_id === nodeId) {
+        setSelectedBuilderNode(null);
+      }
+      setNotification({ type: 'success', text: 'Node removed' });
+    } catch (err) {
+      setNotification({ type: 'error', text: 'Failed to remove node' });
+    }
+  };
+
+  const builderNodeOptions = builderNodes.map((node) => (
+    <option key={node.node_id} value={node.node_id}>
+      {node.display_name || node.node_type}
+    </option>
+  ));
+
   useEffect(() => {
     const loadData = async () => {
       setLoading(true);
@@ -205,6 +448,7 @@ export default function PlaybookBuilder() {
     { id: 'playbooks', label: 'Playbooks', icon: Workflow },
     { id: 'templates', label: 'Templates', icon: FileText },
     { id: 'executions', label: 'Executions', icon: Play },
+    { id: 'builder', label: 'Builder', icon: Globe },
   ];
 
   const filteredPlaybooks = playbooks.filter(
@@ -443,6 +687,13 @@ export default function PlaybookBuilder() {
                                   title="Edit"
                                 >
                                   <Edit className="w-4 h-4" />
+                                </button>
+                                <button
+                                  onClick={() => openBuilder(playbook)}
+                                  className="p-1.5 text-gray-500 hover:text-blue-600 dark:hover:text-blue-400 hover:bg-gray-100 dark:hover:bg-gray-600 rounded transition"
+                                  title="Open Builder"
+                                >
+                                  <Globe className="w-4 h-4" />
                                 </button>
                                 <button
                                   onClick={async () => {
@@ -830,6 +1081,261 @@ export default function PlaybookBuilder() {
                         ))}
                       </tbody>
                     </table>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Builder Tab */}
+            {activeTab === 'builder' && (
+              <div className="space-y-6">
+                {builderLoading ? (
+                  <div className="flex flex-col items-center justify-center h-64 gap-3">
+                    <Loader2 className="w-8 h-8 text-indigo-500 animate-spin" />
+                    <p className="text-gray-500 dark:text-gray-400">Loading visual builder...</p>
+                  </div>
+                ) : builderError ? (
+                  <div className="bg-red-50 dark:bg-red-900 border border-red-200 dark:border-red-700 rounded-lg p-8 text-center">
+                    <p className="text-red-700 dark:text-red-200">{builderError}</p>
+                  </div>
+                ) : !builderPlaybook ? (
+                  <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 p-12 text-center">
+                    <Workflow className="w-16 h-16 text-gray-300 dark:text-gray-600 mx-auto mb-4" />
+                    <h3 className="text-xl font-semibold text-gray-700 dark:text-gray-300 mb-2">
+                      Visual Playbook Builder
+                    </h3>
+                    <p className="text-gray-500 dark:text-gray-400 mb-6">
+                      Select a playbook from the Playbooks tab and click the builder icon to design it visually.
+                    </p>
+                    <button
+                      onClick={() => setActiveTab('playbooks')}
+                      className="inline-flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white px-6 py-3 rounded-lg transition"
+                    >
+                      <GitBranch className="w-4 h-4" />
+                      View Playbooks
+                    </button>
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-1 lg:grid-cols-[1.5fr_0.9fr] gap-6">
+                    <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 shadow p-4">
+                      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-4">
+                        <div>
+                          <h2 className="text-2xl font-semibold text-gray-900 dark:text-white">{builderPlaybook.name}</h2>
+                          <p className="text-sm text-gray-500 dark:text-gray-400 mt-1">{builderPlaybook.description}</p>
+                        </div>
+                        <div className="flex gap-2">
+                          <button
+                            onClick={closeBuilder}
+                            className="px-4 py-2 border border-gray-300 dark:border-gray-600 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700 transition"
+                          >
+                            Close builder
+                          </button>
+                          <button
+                            onClick={() => setActiveTab('playbooks')}
+                            className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition"
+                          >
+                            Back to Playbooks
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="mb-4 rounded-2xl border border-indigo-200 dark:border-indigo-700 bg-indigo-50 dark:bg-indigo-950 px-4 py-3 text-sm text-indigo-700 dark:text-indigo-200 shadow-sm">
+                        <strong className="font-semibold">Visual builder ready:</strong> drag any node card to reposition it, then connect nodes with the toolbar on the right.
+                      </div>
+
+                      <div
+                        ref={builderCanvasRef}
+                        className="relative h-[580px] rounded-lg border border-dashed border-gray-300 dark:border-gray-600 bg-slate-50 dark:bg-gray-950 overflow-hidden"
+                        onMouseMove={handleCanvasMouseMove}
+                        onMouseUp={handleCanvasMouseUp}
+                        onMouseLeave={handleCanvasMouseUp}
+                      >
+                        <svg className="absolute inset-0 w-full h-full pointer-events-none">
+                          <defs>
+                            <marker
+                              id="builder-arrow"
+                              viewBox="0 0 6 6"
+                              refX="5"
+                              refY="3"
+                              markerWidth="6"
+                              markerHeight="6"
+                              orient="auto"
+                            >
+                              <path d="M0,0 L6,3 L0,6 Z" fill="#4338ca" />
+                            </marker>
+                          </defs>
+                          {builderEdges.map((edge) => {
+                            const source = builderNodes.find((node) => node.node_id === edge.source_node_id);
+                            const target = builderNodes.find((node) => node.node_id === edge.target_node_id);
+                            if (!source || !target) return null;
+                            const sourceX = source.position_x + 160;
+                            const sourceY = source.position_y + 32;
+                            const targetX = target.position_x;
+                            const targetY = target.position_y + 32;
+                            return (
+                              <line
+                                key={edge.id}
+                                x1={sourceX}
+                                y1={sourceY}
+                                x2={targetX}
+                                y2={targetY}
+                                stroke="#4338ca"
+                                strokeWidth={2}
+                                markerEnd="url(#builder-arrow)"
+                                strokeLinecap="round"
+                              />
+                            );
+                          })}
+                        </svg>
+
+                        {builderNodes.map((node) => (
+                          <button
+                            key={node.node_id}
+                            type="button"
+                            className={clsx(
+                              'absolute w-40 min-h-[90px] rounded-[28px] border p-3 text-left shadow-[0px_10px_40px_rgba(15,23,42,0.08)] transition-all duration-200',
+                              selectedBuilderNode?.node_id === node.node_id
+                                ? 'border-indigo-500 bg-indigo-50 dark:bg-indigo-900 ring-2 ring-indigo-500/20'
+                                : 'border-gray-200 bg-white dark:border-gray-700 dark:bg-gray-800 hover:border-indigo-400 hover:shadow-[0px_16px_48px_rgba(15,23,42,0.12)]',
+                              nodeDragState?.nodeId === node.node_id ? 'cursor-grabbing scale-[1.01]' : 'cursor-grab'
+                            )}
+                            style={{ left: node.position_x, top: node.position_y }}
+                            onMouseDown={(e) => handleNodePointerDown(e, node)}
+                            onClick={() => setSelectedBuilderNode(node)}
+                          >
+                            <div className="flex items-center justify-between gap-2 mb-2">
+                              <span className="text-sm font-semibold text-gray-900 dark:text-gray-100">{node.display_name || node.node_type}</span>
+                              <span className="text-[11px] uppercase tracking-[0.18em] text-gray-500 dark:text-gray-400">
+                                {node.node_type}
+                              </span>
+                            </div>
+                            <p className="text-xs text-gray-500 dark:text-gray-400 line-clamp-2">
+                              {node.description || 'No description'}
+                            </p>
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="space-y-6">
+                      <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 shadow p-4">
+                        <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-3">Add Node</h3>
+                        <form className="space-y-3" onSubmit={handleCreateBuilderNode}>
+                          <div>
+                            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Name</label>
+                            <input
+                              value={newNodeName}
+                              onChange={(e) => setNewNodeName(e.target.value)}
+                              placeholder="New node label"
+                              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+                            />
+                          </div>
+                          <div>
+                            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Type</label>
+                            <select
+                              value={newNodeType}
+                              onChange={(e) => setNewNodeType(e.target.value)}
+                              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+                            >
+                              <option value="trigger">Trigger</option>
+                              <option value="action">Action</option>
+                              <option value="condition">Condition</option>
+                              <option value="delay">Delay</option>
+                              <option value="human_approval">Human Approval</option>
+                              <option value="notification">Notification</option>
+                              <option value="enrichment">Enrichment</option>
+                            </select>
+                          </div>
+                          <button
+                            type="submit"
+                            className="w-full inline-flex items-center justify-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition"
+                          >
+                            <Plus className="w-4 h-4" />
+                            Add Node
+                          </button>
+                        </form>
+                      </div>
+
+                      <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 shadow p-4">
+                        <h3 className="text-lg font-semibold text-gray-900 dark:text-white mb-3">Connect Nodes</h3>
+                        <form className="space-y-3" onSubmit={handleCreateEdge}>
+                          <div>
+                            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Source</label>
+                            <select
+                              value={newEdgeSource}
+                              onChange={(e) => setNewEdgeSource(e.target.value)}
+                              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+                            >
+                              {builderNodeOptions}
+                            </select>
+                          </div>
+                          <div>
+                            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Target</label>
+                            <select
+                              value={newEdgeTarget}
+                              onChange={(e) => setNewEdgeTarget(e.target.value)}
+                              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+                            >
+                              {builderNodeOptions}
+                            </select>
+                          </div>
+                          <div>
+                            <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">Label</label>
+                            <input
+                              value={newEdgeLabel}
+                              onChange={(e) => setNewEdgeLabel(e.target.value)}
+                              placeholder="Optional connection label"
+                              className="w-full px-3 py-2 border border-gray-300 dark:border-gray-600 rounded-lg bg-white dark:bg-gray-700 text-gray-900 dark:text-gray-100"
+                            />
+                          </div>
+                          <button
+                            type="submit"
+                            className="w-full inline-flex items-center justify-center gap-2 px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg transition"
+                          >
+                            <Plus className="w-4 h-4" />
+                            Add Connection
+                          </button>
+                        </form>
+                      </div>
+
+                      <div className="bg-white dark:bg-gray-800 rounded-lg border border-gray-200 dark:border-gray-700 shadow p-4">
+                        <div className="flex items-center justify-between mb-3">
+                          <h3 className="text-lg font-semibold text-gray-900 dark:text-white">Connections</h3>
+                          {selectedBuilderNode && (
+                            <button
+                              type="button"
+                              onClick={() => handleDeleteNode(selectedBuilderNode.node_id)}
+                              className="text-sm text-red-600 hover:text-red-700 transition"
+                            >
+                              Remove selected node
+                            </button>
+                          )}
+                        </div>
+                        {builderEdges.length === 0 ? (
+                          <p className="text-sm text-gray-500 dark:text-gray-400">No connections created yet.</p>
+                        ) : (
+                          <div className="space-y-3">
+                            {builderEdges.map((edge) => (
+                              <div key={edge.id} className="flex items-center justify-between gap-3 rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 px-3 py-2">
+                                <div>
+                                  <p className="text-sm font-semibold text-gray-900 dark:text-gray-100">
+                                    {edge.source_node_id} → {edge.target_node_id}
+                                  </p>
+                                  <p className="text-xs text-gray-500 dark:text-gray-400">{edge.label || edge.edge_type}</p>
+                                </div>
+                                <button
+                                  type="button"
+                                  onClick={() => handleDeleteEdge(edge.id)}
+                                  className="text-sm text-red-600 hover:text-red-700 transition"
+                                >
+                                  Remove
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </div>
                   </div>
                 )}
               </div>

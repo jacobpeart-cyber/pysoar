@@ -62,6 +62,159 @@ class TestPlaybookActions:
         assert result["success"] is True
         assert result["condition_met"] is False
 
+    @pytest.mark.asyncio
+    async def test_execute_integration_action_playbook_action(self, monkeypatch):
+        """Test the playbook integration action wrapper."""
+
+        class DummyExecutor:
+            async def execute_action(
+                self,
+                installation_id,
+                action_name,
+                input_data,
+                triggered_by=None,
+                playbook_run_id=None,
+            ):
+                return {
+                    "status": "success",
+                    "output_data": {
+                        "provider": "slack",
+                        "channel": "#security",
+                    },
+                }
+
+        monkeypatch.setattr("src.playbooks.actions.ActionExecutor", DummyExecutor)
+
+        action = get_action("execute_integration_action")
+        assert action is not None
+
+        result = await action.execute(
+            parameters={
+                "installation_id": "inst-001",
+                "action_name": "send_message",
+                "input_data": {"channel": "#security", "text": "Alert"},
+            },
+            context={"playbook_execution_id": "pb-123"},
+        )
+
+        assert result["success"] is True
+        assert result["execution"]["status"] == "success"
+        assert result["execution"]["output_data"]["provider"] == "slack"
+
+    @pytest.mark.asyncio
+    async def test_virus_total_enrich_and_notify_playbook_action(self, monkeypatch):
+        """Test the VirusTotal enrichment and Slack notification playbook action."""
+
+        class DummyExecutor:
+            async def execute_action(
+                self,
+                installation_id,
+                action_name,
+                input_data,
+                triggered_by=None,
+                playbook_run_id=None,
+            ):
+                if action_name.startswith("scan_"):
+                    return {
+                        "status": "success",
+                        "output_data": {
+                            "provider": "virustotal",
+                            "malicious": 5,
+                            "suspicious": 2,
+                            "reputation": -10,
+                            "tags": ["botnet", "malicious"],
+                        },
+                    }
+                if action_name == "send_message":
+                    return {
+                        "status": "success",
+                        "output_data": {
+                            "provider": "slack",
+                            "channel": "#security",
+                        },
+                    }
+                return {"status": "failed", "error": "unknown action"}
+
+        async def dummy_upsert(self, **kwargs):
+            return "ioc-123"
+
+        monkeypatch.setattr("src.playbooks.actions.ActionExecutor", DummyExecutor)
+        monkeypatch.setattr(
+            "src.playbooks.actions.VirusTotalEnrichAndNotifyAction._upsert_threat_indicator",
+            dummy_upsert,
+        )
+
+        action = get_action("virus_total_enrich_and_notify")
+        assert action is not None
+
+        result = await action.execute(
+            parameters={
+                "ioc_type": "ip",
+                "value": "8.8.8.8",
+                "virustotal_installation_id": "vt-001",
+                "slack_installation_id": "slack-001",
+                "slack_channel": "#security",
+            },
+            context={"playbook_execution_id": "pb-123"},
+        )
+
+        assert result["success"] is True
+        assert result["virus_total"]["provider"] == "virustotal"
+        assert result["slack"]["status"] == "success"
+        assert result["indicator_id"] == "ioc-123"
+
+    @pytest.mark.asyncio
+    async def test_virus_total_enrich_and_notify_hash_action(self, monkeypatch):
+        """Test VirusTotal enrichment action mapping for hash indicators."""
+
+        recorded = {"actions": []}
+
+        class DummyExecutor:
+            async def execute_action(
+                self,
+                installation_id,
+                action_name,
+                input_data,
+                triggered_by=None,
+                playbook_run_id=None,
+            ):
+                recorded["actions"].append(action_name)
+                return {
+                    "status": "success",
+                    "output_data": {
+                        "provider": "virustotal",
+                        "malicious": 1,
+                        "suspicious": 0,
+                        "reputation": -3,
+                        "tags": ["malicious"],
+                    },
+                }
+
+        async def dummy_upsert(self, **kwargs):
+            return "ioc-456"
+
+        monkeypatch.setattr("src.playbooks.actions.ActionExecutor", DummyExecutor)
+        monkeypatch.setattr(
+            "src.playbooks.actions.VirusTotalEnrichAndNotifyAction._upsert_threat_indicator",
+            dummy_upsert,
+        )
+
+        action = get_action("virus_total_enrich_and_notify")
+        result = await action.execute(
+            parameters={
+                "ioc_type": "hash",
+                "value": "abcd1234",
+                "virustotal_installation_id": "vt-001",
+                "slack_installation_id": "slack-001",
+                "slack_channel": "#security",
+            },
+            context={"playbook_execution_id": "pb-456"},
+        )
+
+        assert result["success"] is True
+        assert recorded["actions"][0] == "scan_file"
+        assert result["indicator_id"] == "ioc-456"
+
 
 @pytest.mark.asyncio
 class TestPlaybookEndpoints:

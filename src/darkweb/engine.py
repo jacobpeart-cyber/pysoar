@@ -17,6 +17,7 @@ from difflib import SequenceMatcher
 
 import httpx
 
+from src.core.config import settings
 from src.core.logging import get_logger
 
 logger = get_logger(__name__)
@@ -25,6 +26,69 @@ HIBP_API = "https://haveibeenpwned.com/api/v3"
 OTX_API = "https://otx.alienvault.com/api/v1"
 ABUSECH_URLHAUS = "https://urlhaus-api.abuse.ch/v1"
 ABUSECH_THREATFOX = "https://threatfox-api.abuse.ch/api/v1"
+
+
+class DarkWebMarketplaceScanner:
+    """Dedicated marketplace feed ingestion for dark web listings."""
+
+    def __init__(self):
+        self.feed_url = (
+            getattr(settings, "darkweb_marketplace_feed_url", None)
+            or os.environ.get("DARKWEB_MARKETPLACE_FEED_URL")
+        )
+
+    async def search_marketplaces(self) -> list[dict[str, Any]]:
+        """Search marketplace feeds or infer marketplace listings from public dark web sources."""
+        if self.feed_url:
+            return await self._fetch_marketplace_feed()
+        return await self._infer_marketplace_listings()
+
+    async def _fetch_marketplace_feed(self) -> list[dict[str, Any]]:
+        findings = []
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                resp = await client.get(self.feed_url)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    for item in data if isinstance(data, list) else data.get("results", []):
+                        findings.append({
+                            "source": "marketplace_feed",
+                            "marketplace_name": item.get("marketplace") or item.get("site") or "marketplace",
+                            "marketplace_url": item.get("url") or item.get("onion_url"),
+                            "title": item.get("title") or item.get("description") or "marketplace listing",
+                            "description": item.get("description") or item.get("details") or "",
+                            "confidence": int(item.get("confidence", 50) or 50),
+                            "content_hash": hashlib.sha256(
+                                json.dumps(item, sort_keys=True, default=str).encode()
+                            ).hexdigest(),
+                        })
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Marketplace feed search failed: {exc}")
+        return findings
+
+    async def _infer_marketplace_listings(self) -> list[dict[str, Any]]:
+        findings = []
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as client:
+                resp = await client.post(ABUSECH_URLHAUS + "/urls/recent/", data={"limit": "50"})
+                if resp.status_code == 200:
+                    data = resp.json()
+                    for url_entry in (data.get("urls") or [])[:50]:
+                        url = url_entry.get("url", "")
+                        title = url_entry.get("threat", "malicious_url")
+                        if any(k in url.lower() for k in ("market", "shop", "store", "vendor", "onion", "blackmarket")):
+                            findings.append({
+                                "source": "urlhaus_marketplace",
+                                "marketplace_name": "urlhaus",
+                                "marketplace_url": url,
+                                "title": title,
+                                "description": url_entry.get("tags") or [],
+                                "confidence": 60,
+                                "content_hash": hashlib.sha256(url.encode()).hexdigest(),
+                            })
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"Marketplace inference failed: {exc}")
+        return findings
 
 
 class DarkWebScanner:
@@ -72,6 +136,7 @@ class DarkWebScanner:
             "breach_databases": await self.search_breach_databases(),
             "forums": await self.search_forums(),
             "telegram": await self.search_telegram_channels(),
+            "marketplaces": await self.search_marketplaces(),
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         return await self.aggregate_findings(results)
@@ -191,6 +256,10 @@ class DarkWebScanner:
         except Exception as e:
             logger.warning(f"OTX search failed: {e}")
         return findings
+
+    async def search_marketplaces(self) -> list[dict[str, Any]]:
+        """Search dark web marketplaces and marketplace feeds."""
+        return await DarkWebMarketplaceScanner().search_marketplaces()
 
     async def hibp_lookup_emails(self, emails: list[str]) -> list[dict[str, Any]]:
         """Tier 2 — per-email HIBP lookup.

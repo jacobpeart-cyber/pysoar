@@ -14,7 +14,6 @@ from redis.asyncio import Redis
 from src.core.config import settings
 from src.core.database import get_db
 from src.core.security import get_password_hash
-from src.main import app
 from src.models.base import Base
 from src.models.user import User
 
@@ -65,6 +64,9 @@ async def client(db_session: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
 
     async def override_get_db():
         yield db_session
+
+    # Import `app` lazily to avoid importing heavy modules during test collection
+    from src.main import app
 
     app.dependency_overrides[get_db] = override_get_db
 

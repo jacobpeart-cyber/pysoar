@@ -913,45 +913,321 @@ class AgentToolRegistry:
             "match_count": len(matches),
         }
 
+    async def _get_or_create_default_org(self):
+        from src.models.organization import Organization
+
+        result = await self.db.execute(select(Organization).limit(1))
+        org = result.scalar_one_or_none()
+        if org:
+            return org
+
+        org = Organization(
+            name="PySOAR Agent Org",
+            slug="pysoar-agent",
+            plan="free",
+            is_active=True,
+        )
+        self.db.add(org)
+        await self.db.commit()
+        await self.db.refresh(org)
+        return org
+
+    async def _get_or_create_system_user(self, organization_id):
+        from src.models.user import User
+        from src.core.security import get_password_hash
+
+        result = await self.db.execute(select(User).limit(1))
+        user = result.scalar_one_or_none()
+        if user:
+            return user
+
+        user = User(
+            email="agent-tool@pysoar.local",
+            hashed_password=get_password_hash("agenttool"),
+            full_name="Agent Tool",
+            role="viewer",
+            is_active=False,
+            is_superuser=False,
+            organization_id=organization_id,
+        )
+        self.db.add(user)
+        await self.db.commit()
+        await self.db.refresh(user)
+        return user
+
     async def _run_threat_hunt(self, hypothesis, timeframe_hours=24):
+        from src.hunting.models import HuntHypothesis, HuntSession, HuntFinding
+        from src.siem.models import LogEntry
         from src.models.alert import Alert
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=int(timeframe_hours))
-        # Simple hunt: search alerts matching hypothesis keywords
-        keywords = [w.lower() for w in hypothesis.split() if len(w) > 3]
+        from src.models.audit import AuditLog
+        from src.intel.models import ThreatIndicator
+        import json
+        import re
+
+        org = await self._get_or_create_default_org()
+        user = await self._get_or_create_system_user(org.id)
+
+        title = hypothesis.strip() or "Threat hunt"
+        if len(title) > 200:
+            title = title[:197] + "..."
+
+        mitre_ids = [m.upper() for m in re.findall(r"\bT\d{4}(?:\.\d+)?\b", hypothesis)]
+
+        hunt = HuntHypothesis(
+            title=title,
+            description=hypothesis,
+            status="active",
+            priority="medium",
+            hunt_type="hypothesis_driven",
+            mitre_techniques=mitre_ids or None,
+            data_sources=None,
+            created_by=user.id,
+            organization_id=org.id,
+        )
+        self.db.add(hunt)
+        await self.db.flush()
+
+        session = HuntSession(
+            hypothesis_id=hunt.id,
+            status="running",
+            parameters={
+                "timeframe_hours": int(timeframe_hours),
+                "target_hosts": [],
+                "log_types": [],
+            },
+            created_by=user.id,
+            organization_id=org.id,
+        )
+        self.db.add(session)
+        await self.db.flush()
+
+        stopwords = {
+            "the", "and", "for", "with", "this", "that", "from", "user",
+            "data", "have", "will", "should", "could", "would",
+        }
+        keywords = [
+            w.lower()
+            for w in re.findall(r"[A-Za-z][A-Za-z0-9_-]{3,}", hypothesis)
+            if w.lower() not in stopwords
+        ]
+
         if not keywords:
-            return {"findings": 0, "message": "Hypothesis too vague"}
-        q = select(Alert).where(Alert.created_at >= cutoff)
-        for kw in keywords[:3]:
-            q = q.where(Alert.title.ilike(f"%{kw}%") | Alert.description.ilike(f"%{kw}%"))
-        q = q.limit(20)
-        result = await self.db.execute(q)
-        matches = result.scalars().all()
+            session.status = "failed"
+            session.error_message = "Hypothesis too vague"
+            await self.db.commit()
+            return {"hypothesis": hypothesis, "findings": 0, "message": "Hypothesis too vague"}
+
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=int(timeframe_hours))
+        findings_created = 0
+        logs_scanned = 0
+        alerts_scanned = 0
+        audit_scanned = 0
+        iocs_checked = 0
+
+        log_query = select(LogEntry).where(LogEntry.timestamp >= cutoff.isoformat())
+        log_rows = (await self.db.execute(log_query.limit(500))).scalars().all()
+        logs_scanned = len(log_rows)
+        for log in log_rows:
+            haystack = " ".join(
+                filter(None, [
+                    log.message, log.raw_log, log.hostname, log.username,
+                    log.process_name, log.action, log.source_name,
+                ])
+            ).lower()
+            matched = [k for k in keywords if k in haystack]
+            if not matched:
+                continue
+            finding = HuntFinding(
+                session_id=session.id,
+                title=f"Log search match: {log.source_name or 'log event'}",
+                description=(
+                    f"Log entry matched hunt keywords: {', '.join(sorted(set(matched))[:10])}"
+                ),
+                severity=log.severity or "medium",
+                classification="needs_review",
+                evidence=json.dumps({
+                    "log_id": getattr(log, "id", None),
+                    "timestamp": getattr(log, "timestamp", None),
+                    "source_type": log.source_type,
+                    "matched_keywords": sorted(set(matched))[:10],
+                }),
+                affected_assets=json.dumps([log.hostname] if log.hostname else []),
+                iocs_found=json.dumps([]),
+                mitre_techniques=json.dumps(mitre_ids) if mitre_ids else None,
+                organization_id=org.id,
+            )
+            self.db.add(finding)
+            findings_created += 1
+
+        alert_query = select(Alert).where(Alert.created_at >= cutoff)
+        alert_rows = (await self.db.execute(alert_query.limit(500))).scalars().all()
+        alerts_scanned = len(alert_rows)
+        for alert in alert_rows:
+            haystack = " ".join(
+                filter(None, [
+                    alert.title, alert.description, alert.hostname, alert.username,
+                    alert.source, alert.category, alert.source_ip, alert.destination_ip,
+                    getattr(alert, "domain", None), getattr(alert, "url", None), getattr(alert, "file_hash", None),
+                ])
+            ).lower()
+            matched = [k for k in keywords if k in haystack]
+            if not matched:
+                continue
+            finding = HuntFinding(
+                session_id=session.id,
+                title=f"Alert search match: {alert.title}",
+                description=(
+                    f"Historical alert matched hunt keywords: {', '.join(sorted(set(matched))[:10])}"
+                ),
+                severity=alert.severity or "medium",
+                classification="needs_review",
+                evidence=json.dumps({
+                    "alert_id": alert.id,
+                    "alert_status": alert.status,
+                    "matched_keywords": sorted(set(matched))[:10],
+                    "source_ip": getattr(alert, "source_ip", None),
+                }),
+                affected_assets=json.dumps([alert.hostname] if getattr(alert, "hostname", None) else []),
+                iocs_found=json.dumps([]),
+                mitre_techniques=json.dumps(mitre_ids) if mitre_ids else None,
+                organization_id=org.id,
+            )
+            self.db.add(finding)
+            findings_created += 1
+
+        audit_query = select(AuditLog).where(AuditLog.created_at >= cutoff)
+        audit_rows = (await self.db.execute(audit_query.limit(500))).scalars().all()
+        audit_scanned = len(audit_rows)
+        for audit in audit_rows:
+            haystack = " ".join(
+                filter(None, [
+                    audit.action, audit.resource_type, audit.resource_id,
+                    audit.description, audit.ip_address,
+                ])
+            ).lower()
+            matched = [k for k in keywords if k in haystack]
+            if not matched:
+                continue
+            finding = HuntFinding(
+                session_id=session.id,
+                title=f"Audit search match: {audit.action or 'audit event'}",
+                description=(
+                    f"Audit event matched hunt keywords: {', '.join(sorted(set(matched))[:10])}"
+                ),
+                severity="high" if not getattr(audit, "success", True) else "medium",
+                classification="needs_review",
+                evidence=json.dumps({
+                    "audit_id": audit.id,
+                    "action": audit.action,
+                    "resource_type": audit.resource_type,
+                    "resource_id": audit.resource_id,
+                    "matched_keywords": sorted(set(matched))[:10],
+                }),
+                affected_assets=json.dumps([]),
+                iocs_found=json.dumps([]),
+                organization_id=org.id,
+            )
+            self.db.add(finding)
+            findings_created += 1
+
+        ioc_candidates = [k for k in keywords if re.match(r"^\d+\.\d+\.\d+\.\d+$", k) or "." in k or "/" in k]
+        if ioc_candidates:
+            ioc_query = select(ThreatIndicator).where(
+                ThreatIndicator.value.in_(ioc_candidates),
+                ThreatIndicator.is_active == True,  # noqa: E712
+            )
+            ioc_rows = (await self.db.execute(ioc_query.limit(100))).scalars().all()
+            iocs_checked = len(ioc_rows)
+            for ioc in ioc_rows:
+                finding = HuntFinding(
+                    session_id=session.id,
+                    title=f"IOC match: {ioc.indicator_type}:{ioc.value}",
+                    description=(
+                        f"Threat indicator matched hunt hypothesis keywords."
+                    ),
+                    severity=ioc.severity or "high",
+                    classification="needs_review",
+                    evidence=json.dumps({
+                        "indicator_id": ioc.id,
+                        "type": ioc.indicator_type,
+                        "value": ioc.value,
+                        "source": ioc.source,
+                    }),
+                    affected_assets=json.dumps([]),
+                    iocs_found=json.dumps([ioc.value]),
+                    mitre_techniques=json.dumps(mitre_ids) if mitre_ids else None,
+                    organization_id=org.id,
+                )
+                self.db.add(finding)
+                findings_created += 1
+
+        session.findings_count = findings_created
+        session.events_analyzed = logs_scanned + alerts_scanned + audit_scanned
+        session.query_count = 3 + iocs_checked
+        session.queries_executed = {
+            "logs_scanned": logs_scanned,
+            "alerts_scanned": alerts_scanned,
+            "audit_logs_scanned": audit_scanned,
+            "iocs_checked": iocs_checked,
+            "keywords": sorted(set(keywords))[:50],
+        }
+        session.status = "completed"
+        session.completed_at = datetime.now(timezone.utc)
+        await self.db.commit()
+
         return {
             "hypothesis": hypothesis,
-            "timeframe_hours": timeframe_hours,
-            "findings": len(matches),
-            "matched_alerts": [{"id": m.id, "title": m.title, "severity": m.severity} for m in matches],
+            "session_id": session.id,
+            "findings": findings_created,
+            "logs_scanned": logs_scanned,
+            "alerts_scanned": alerts_scanned,
+            "audit_scanned": audit_scanned,
+            "iocs_checked": iocs_checked,
+            "matched_keywords": sorted(set(keywords))[:10],
         }
 
     async def _simulate_attack(self, technique_id, target):
-        # Create a simulated attack alert
-        from src.models.alert import Alert
-        alert = Alert(
-            title=f"Simulation: {technique_id} against {target}",
-            description=f"Attack simulation for MITRE technique {technique_id} targeting {target}",
-            severity="medium",
-            source="attack_simulation",
-            status="new",
-            category="simulation",
+        from src.simulation.engine import SimulationOrchestrator
+        from src.simulation.models import SimulationTest
+
+        org = await self._get_or_create_default_org()
+        user = await self._get_or_create_system_user(org.id)
+
+        orchestrator = SimulationOrchestrator(self.db)
+        simulation = await orchestrator.create_simulation(
+            name=f"Agent-initiated simulation {technique_id}",
+            sim_type="atomic_test",
+            techniques=[technique_id],
+            scope={"target_host": target} if target else {},
+            target_environment="lab",
+            created_by=user.id,
+            organization_id=org.id,
+            description=(
+                f"Agent tool launched an atomic MITRE ATT&CK simulation for "
+                f"technique {technique_id} against {target}."
+            ),
         )
-        self.db.add(alert)
-        await self.db.flush()
+
+        await orchestrator.start_simulation(simulation.id)
+
+        test_rows = (await self.db.execute(select(SimulationTest).where(SimulationTest.simulation_id == simulation.id))).scalars().all()
+        results = []
+        for test in test_rows:
+            result = await orchestrator._execute_test(test)
+            results.append(result)
+
+        await orchestrator.finalize_simulation(simulation.id)
+        await self.db.refresh(simulation)
+
         return {
-            "technique_id": technique_id,
-            "target": target,
-            "simulation_alert_id": alert.id,
-            "result": "executed",
-            "note": "Check if this triggered detection rules and auto-correlation",
+            "simulation_id": simulation.id,
+            "status": simulation.status,
+            "total_tests": len(results),
+            "passed_tests": simulation.passed_tests,
+            "failed_tests": simulation.failed_tests,
+            "blocked_tests": simulation.blocked_tests,
+            "detection_rate": simulation.detection_rate,
+            "tests": results,
         }
 
     async def _generate_incident_summary(self, incident_id):

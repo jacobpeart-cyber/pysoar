@@ -290,3 +290,39 @@ async def process_log(
     await db.flush()
 
     return log_entry, alerts_created, correlation_results
+
+
+async def process_host_event(
+    event: dict,
+    db: AsyncSession,
+    organization_id: Optional[str] = None,
+) -> Tuple[Optional[LogEntry], List[Dict], List[Dict]]:
+    """Process a structured host/EDR event dictionary.
+
+    This accepts normalized host event types (process_start, net_conn,
+    file_mod, etc.) and materializes them as a `LogEntry` so the
+    existing detection and correlation pipeline can operate on them.
+    Returns the created LogEntry plus any alerts/correlations produced.
+    """
+    try:
+        raw = json.dumps(event)
+    except Exception:
+        raw = str(event)
+
+    # Map common fields if present
+    source_name = event.get("agent_id") or event.get("hostname") or "endpoint"
+    source_ip = event.get("ip") or event.get("source_ip") or "0.0.0.0"
+    event_type = event.get("event_type") or "endpoint"
+    message = event.get("message") or json.dumps(event.get("meta", {}))
+
+    # Reuse the main pipeline by delegating to process_log — this keeps
+    # normalization and rule engines unified across log types.
+    return await process_log(
+        raw_log=raw,
+        source_type="json_api",
+        source_name=source_name,
+        source_ip=source_ip,
+        db=db,
+        organization_id=organization_id,
+        tags=["host_event", event_type],
+    )
