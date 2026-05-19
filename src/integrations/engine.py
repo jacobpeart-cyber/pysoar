@@ -1092,6 +1092,9 @@ class ActionExecutor:
         """Execute an integration action"""
         execution_id = str(uuid4())
         start_time = time.time()
+        output_data: dict[str, Any] = {}
+        error_message: Optional[str] = None
+        status = ExecutionStatus.PENDING.value
 
         try:
             logger.info(
@@ -1102,31 +1105,46 @@ class ActionExecutor:
             # Validate input
             self._validate_input(input_data)
 
-            # Execute (simulate with delay)
+            # Execute using connector wrapper or generic HTTP fallback
             output_data = await self._call_connector_action(
                 installation_id,
                 action_name,
                 input_data,
             )
 
-            duration_ms = int((time.time() - start_time) * 1000)
-
+            status = ExecutionStatus.SUCCESS.value
             return {
                 "execution_id": execution_id,
-                "status": ExecutionStatus.SUCCESS.value,
+                "status": status,
                 "output_data": output_data,
-                "duration_ms": duration_ms,
+                "duration_ms": int((time.time() - start_time) * 1000),
                 "retry_count": 0,
             }
 
         except Exception as e:
-            logger.error(f"Action execution failed: {e}")
+            error_message = str(e)
+            status = ExecutionStatus.FAILED.value
+            logger.error(f"Action execution failed: {error_message}")
             return {
                 "execution_id": execution_id,
-                "status": ExecutionStatus.FAILED.value,
-                "error_message": str(e),
+                "status": status,
+                "error_message": error_message,
                 "duration_ms": int((time.time() - start_time) * 1000),
             }
+
+        finally:
+            await self._persist_execution(
+                installation_id=installation_id,
+                action_name=action_name,
+                input_data=input_data,
+                output_data=output_data,
+                execution_id=execution_id,
+                status=status,
+                error_message=error_message,
+                duration_ms=int((time.time() - start_time) * 1000),
+                triggered_by=triggered_by,
+                playbook_run_id=playbook_run_id,
+            )
 
     def _validate_input(self, input_data: dict[str, Any]) -> None:
         """Validate action input"""
@@ -1211,6 +1229,74 @@ class ActionExecutor:
                 "data": response_data,
                 "headers": dict(response.headers),
             }
+
+    async def _persist_execution(
+        self,
+        installation_id: str,
+        action_name: str,
+        input_data: dict[str, Any],
+        output_data: dict[str, Any],
+        execution_id: str,
+        status: str,
+        error_message: Optional[str],
+        duration_ms: int,
+        triggered_by: str,
+        playbook_run_id: Optional[str],
+    ) -> None:
+        """Persist integration action execution history to the database."""
+        from sqlalchemy import select
+        from src.core.database import async_session_factory
+
+        try:
+            async with async_session_factory() as db:
+                query = select(InstalledIntegration).where(InstalledIntegration.id == installation_id)
+                result = await db.execute(query)
+                integration = result.scalar_one_or_none()
+                if not integration:
+                    return
+
+                action_query = select(IntegrationAction).where(
+                    IntegrationAction.connector_id == integration.connector_id,
+                    IntegrationAction.action_name == action_name,
+                )
+                action_result = await db.execute(action_query)
+                action = action_result.scalar_one_or_none()
+                if not action:
+                    action = IntegrationAction(
+                        connector_id=integration.connector_id,
+                        action_name=action_name,
+                        display_name=action_name,
+                        description=f"Auto-created action for {action_name}",
+                        action_type=ActionType.CREATE.value,
+                        input_schema="{}",
+                        output_schema="{}",
+                        requires_approval=False,
+                        timeout_seconds=300,
+                        retry_policy="{}",
+                        is_idempotent=False,
+                    )
+                    db.add(action)
+                    await db.flush()
+
+                execution = IntegrationExecution(
+                    organization_id=integration.organization_id,
+                    installed_id=integration.id,
+                    action_id=action.id,
+                    triggered_by=triggered_by,
+                    playbook_run_id=playbook_run_id,
+                    input_data=json.dumps(input_data, default=str),
+                    output_data=json.dumps(output_data, default=str) if output_data is not None else None,
+                    status=status,
+                    started_at=datetime.now(timezone.utc).isoformat(),
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                    duration_ms=duration_ms,
+                    error_message=error_message,
+                    retry_count=0,
+                )
+                db.add(execution)
+                await db.commit()
+        except Exception as exc:
+            logger.error(f"Failed to persist integration execution: {exc}")
 
     def _decrypt_secret_json(self, value: Optional[str]) -> dict[str, Any]:
         """Decrypt a stored credentials blob from the database."""

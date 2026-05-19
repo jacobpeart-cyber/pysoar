@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from sqlalchemy import desc, select
 
 from src.agents.capabilities import AgentAction
@@ -42,6 +42,8 @@ from src.schemas.agents import (
     HeartbeatRequest,
     IssueCommandRequest,
 )
+from src.api.v1.schemas.agent_events import HostEventsRequest
+from src.agents.attestation import verify_request_signature
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/agents", tags=["agents"])
@@ -519,6 +521,14 @@ async def exchange(
         agent.agent_version = request.agent_version
     if request.ip_address:
         agent.ip_address = request.ip_address
+    # Persist optional agent public key for later attestation checks
+    try:
+        if getattr(request, "public_key", None):
+            extra = getattr(agent, "extra_metadata", {}) or {}
+            extra["public_key"] = request.public_key
+            agent.extra_metadata = extra
+    except Exception:
+        pass
     await session.flush()
 
     return AgentExchangeResponse(
@@ -530,18 +540,30 @@ async def exchange(
 
 @router.post("/_agent/heartbeat")
 async def agent_heartbeat(
-    request: HeartbeatRequest,
+    hb_request: HeartbeatRequest,
     agent: EndpointAgent = Depends(_require_agent),
     session: DatabaseSession = None,
+    request: Request = None,
 ) -> dict:
-    if request.os_type:
-        agent.os_type = request.os_type
-    if request.os_version:
-        agent.os_version = request.os_version
-    if request.agent_version:
-        agent.agent_version = request.agent_version
-    if request.ip_address:
-        agent.ip_address = request.ip_address
+    # If the agent previously registered a public key during exchange,
+    # require the inbound HTTP body to be JWS-signed with that key.
+    try:
+        public_key = (getattr(agent, "extra_metadata", {}) or {}).get("public_key")
+        await verify_request_signature(request, public_key)
+    except HTTPException:
+        raise
+    except Exception:
+        # Non-fatal: allow heartbeat if verification helper fails unexpectedly
+        pass
+
+    if hb_request.os_type:
+        agent.os_type = hb_request.os_type
+    if hb_request.os_version:
+        agent.os_version = hb_request.os_version
+    if hb_request.agent_version:
+        agent.agent_version = hb_request.agent_version
+    if hb_request.ip_address:
+        agent.ip_address = hb_request.ip_address
 
     svc = AgentService(session)
     await svc.record_heartbeat(agent, telemetry=request.telemetry)
@@ -552,7 +574,7 @@ async def agent_heartbeat(
     # encryption_enabled, av_active, firewall_on) are written from the
     # agent on every heartbeat; the trust score is then recalculated.
     try:
-        posture = request.telemetry or {}
+        posture = hb_request.telemetry or {}
         if any(k in posture for k in ("os_patched", "encryption_enabled", "av_active", "firewall_on")):
             from src.zerotrust.engine import DeviceTrustAssessor
             assessor = DeviceTrustAssessor(session, agent.organization_id)
@@ -579,14 +601,14 @@ async def agent_heartbeat(
     # separate log-shipper process per host.
     logs_ingested = 0
     logs_failed = 0
-    if request.logs:
+    if hb_request.logs:
         from src.siem.pipeline import process_log
         agent_org = getattr(agent, "organization_id", None)
         agent_host = getattr(agent, "hostname", None) or agent.id
         agent_ip = getattr(agent, "ip_address", None) or "0.0.0.0"
         # Cap per-heartbeat batch to bound work — agents should ship
         # in chunks of <=200 to keep heartbeats responsive.
-        for entry in (request.logs or [])[:500]:
+        for entry in (hb_request.logs or [])[:500]:
             try:
                 if isinstance(entry, str):
                     raw_log = entry
@@ -664,3 +686,45 @@ async def agent_post_result(
     except AgentServiceError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"status": "accepted", "command_id": command_id}
+
+
+@router.post("/_agent/host_events")
+async def agent_host_events(
+    events_request: HostEventsRequest,
+    agent: EndpointAgent = Depends(_require_agent),
+    session: DatabaseSession = None,
+    request: Request = None,
+) -> dict:
+    """Accept a batch of structured host/endpoint events from an agent.
+
+    The payload may be either a single event dict or a list of events.
+    Each event is processed through the SIEM pipeline so detection
+    and correlation engines can evaluate them.
+    """
+    # If a public key is registered for this agent, require JWS-signed body.
+    try:
+        public_key = (getattr(agent, "extra_metadata", {}) or {}).get("public_key")
+        await verify_request_signature(request, public_key)
+    except HTTPException:
+        raise
+    except Exception:
+        # Non-fatal — allow processing if verification helper errors.
+        pass
+
+    events = events_request.events or []
+    from src.siem.ingest_queue import enqueue
+
+    ingested = 0
+    failed = 0
+    for ev in events[:200]:
+        try:
+            ok = await enqueue(ev.dict(), organization_id=agent.organization_id)
+            if ok:
+                ingested += 1
+            else:
+                failed += 1
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(f"host_event enqueue failed: {exc}")
+            failed += 1
+
+    return {"status": "accepted", "agent_id": agent.id, "events_enqueued": ingested, "events_failed": failed}

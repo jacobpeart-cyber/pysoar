@@ -5,7 +5,9 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 from src.core.logging import get_logger
+from src.integrations.engine import ActionExecutor
 from src.integrations.manager import threat_intel_manager
+from src.integrations.models import ExecutionStatus
 
 logger = get_logger(__name__)
 
@@ -263,6 +265,190 @@ class CreateIncidentAction(PlaybookAction):
         }
 
 
+class ExecuteIntegrationAction(PlaybookAction):
+    """Execute a configured integration connector action"""
+
+    name = "execute_integration_action"
+    description = "Execute a configured integration action using an installed connector"
+
+    async def execute(
+        self,
+        parameters: dict[str, Any],
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        installation_id = parameters.get("installation_id")
+        action_name = parameters.get("action_name")
+        input_data = parameters.get("input_data", {}) or {}
+
+        if not installation_id or not action_name:
+            return {"success": False, "error": "installation_id and action_name are required"}
+
+        try:
+            executor = ActionExecutor()
+            execution = await executor.execute_action(
+                installation_id=installation_id,
+                action_name=action_name,
+                input_data=input_data,
+                triggered_by="playbook",
+                playbook_run_id=context.get("playbook_execution_id"),
+            )
+
+            return {
+                "success": execution.get("status") == ExecutionStatus.SUCCESS.value,
+                "execution": execution,
+            }
+        except Exception as e:
+            logger.error(f"Integration action execution failed: {e}")
+            return {"success": False, "error": str(e)}
+
+
+class VirusTotalEnrichAndNotifyAction(PlaybookAction):
+    """Enrich an IOC with VirusTotal and notify via Slack"""
+
+    name = "virus_total_enrich_and_notify"
+    description = "Enrich an IOC using VirusTotal and send a Slack notification with the results"
+
+    async def execute(
+        self,
+        parameters: dict[str, Any],
+        context: dict[str, Any],
+    ) -> dict[str, Any]:
+        ioc_type = parameters.get("ioc_type")
+        value = parameters.get("value")
+        vt_installation_id = parameters.get("virustotal_installation_id")
+        slack_installation_id = parameters.get("slack_installation_id")
+        slack_channel = parameters.get("slack_channel")
+        message_template = parameters.get(
+            "message_template",
+            "VirusTotal enrichment completed for {value}: {summary}",
+        )
+
+        if not ioc_type or not value:
+            return {"success": False, "error": "ioc_type and value are required"}
+        if not vt_installation_id or not slack_installation_id:
+            return {"success": False, "error": "virustotal_installation_id and slack_installation_id are required"}
+        if not slack_channel:
+            return {"success": False, "error": "slack_channel is required"}
+
+        vt_action_map = {
+            "ip": "scan_ip",
+            "domain": "scan_domain",
+            "hash": "scan_file",
+            "url": "scan_url",
+        }
+        vt_action = vt_action_map.get(ioc_type.lower())
+        if not vt_action:
+            return {"success": False, "error": f"Unsupported IOC type: {ioc_type}"}
+
+        try:
+            executor = ActionExecutor()
+
+            vt_result = await executor.execute_action(
+                installation_id=vt_installation_id,
+                action_name=vt_action,
+                input_data={ioc_type: value},
+                triggered_by="playbook",
+                playbook_run_id=context.get("playbook_execution_id"),
+            )
+
+            if vt_result.get("status") != ExecutionStatus.SUCCESS.value:
+                return {"success": False, "error": "VirusTotal enrichment failed", "details": vt_result}
+
+            vt_output = vt_result.get("output_data") or {}
+            indicator_id = await self._upsert_threat_indicator(
+                ioc_type=ioc_type,
+                value=value,
+                enrichment=vt_output,
+                context=context,
+            )
+
+            summary = self._summarize_vt_output(value, vt_output)
+            message = message_template.format(value=value, summary=summary)
+
+            slack_result = await executor.execute_action(
+                installation_id=slack_installation_id,
+                action_name="send_message",
+                input_data={
+                    "channel": slack_channel,
+                    "text": message,
+                },
+                triggered_by="playbook",
+                playbook_run_id=context.get("playbook_execution_id"),
+            )
+
+            return {
+                "success": slack_result.get("status") == ExecutionStatus.SUCCESS.value,
+                "virus_total": vt_output,
+                "slack": slack_result,
+                "indicator_id": indicator_id,
+            }
+        except Exception as e:
+            logger.error(f"VirusTotal enrichment workflow failed: {e}")
+            return {"success": False, "error": str(e)}
+
+    async def _upsert_threat_indicator(
+        self,
+        ioc_type: str,
+        value: str,
+        enrichment: dict[str, Any],
+        context: dict[str, Any],
+    ) -> str:
+        from sqlalchemy import select
+        from src.core.database import async_session_factory
+        from src.intel.models import ThreatIndicator
+
+        organization_id = context.get("organization_id")
+        async with async_session_factory() as db:
+            result = await db.execute(
+                select(ThreatIndicator).where(
+                    ThreatIndicator.indicator_type == ioc_type,
+                    ThreatIndicator.value == value,
+                    ThreatIndicator.organization_id == organization_id,
+                )
+            )
+            existing = result.scalar_one_or_none()
+
+            if existing:
+                existing.confidence = enrichment.get("malicious", existing.confidence)
+                existing.severity = "high" if enrichment.get("malicious", 0) > 0 else existing.severity
+                existing.tags = list(
+                    set(existing.tags or [])
+                    | set(enrichment.get("tags", []))
+                )
+                existing.context = {**existing.context, "virustotal": enrichment}
+                await db.commit()
+                return existing.id
+
+            indicator = ThreatIndicator(
+                indicator_type=ioc_type,
+                value=value,
+                source="VirusTotal",
+                confidence=enrichment.get("malicious"),
+                severity="high" if enrichment.get("malicious", 0) > 0 else "medium",
+                tags=enrichment.get("tags", []),
+                context={"virustotal": enrichment},
+                organization_id=organization_id,
+            )
+            db.add(indicator)
+            await db.commit()
+            return indicator.id
+
+    def _summarize_vt_output(self, value: str, vt_output: dict[str, Any]) -> str:
+        malicious = vt_output.get("malicious")
+        suspicious = vt_output.get("suspicious")
+        reputation = vt_output.get("reputation")
+        summary_parts = []
+
+        if malicious is not None:
+            summary_parts.append(f"malicious={malicious}")
+        if suspicious is not None:
+            summary_parts.append(f"suspicious={suspicious}")
+        if reputation is not None:
+            summary_parts.append(f"reputation={reputation}")
+
+        return ", ".join(summary_parts) if summary_parts else "no detailed results"
+
+
 class RunScriptAction(PlaybookAction):
     """Execute a custom script or command"""
 
@@ -395,6 +581,8 @@ ACTION_REGISTRY: dict[str, type[PlaybookAction]] = {
     "run_script": RunScriptAction,
     "conditional": ConditionalAction,
     "wait": WaitAction,
+    "execute_integration_action": ExecuteIntegrationAction,
+    "virus_total_enrich_and_notify": VirusTotalEnrichAndNotifyAction,
 }
 
 

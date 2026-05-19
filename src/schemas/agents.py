@@ -38,6 +38,7 @@ class AgentExchangeRequest(BaseModel):
     os_version: Optional[str] = None
     agent_version: Optional[str] = None
     ip_address: Optional[str] = None
+    public_key: Optional[str] = None
 
 
 class AgentExchangeResponse(BaseModel):

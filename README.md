@@ -14,12 +14,12 @@ PySOAR is a full-stack, multi-tenant SOAR platform that unifies security operati
 - **Alert Management** — Ingest, triage, and correlate alerts from SIEM, EDR, IDS, firewall, cloud, and email gateways. Real-time WebSocket notifications, bulk actions, and whitelisted sort fields.
 - **Incident Response** — Full incident lifecycle with severity tracking, real MTTR calculation, automatic War Room creation on critical/high incidents, and cross-module automation fan-out.
 - **Case Management** — Collaborative case investigation with notes, attachments, tasks, timeline, and audit trails.
-- **Threat Hunting** — Hypothesis-driven hunts with MITRE ATT&CK mapping, multi-source query aggregation, and notebook support.
+- **Threat Hunting** — Hypothesis-driven hunts with MITRE ATT&CK mapping, multi-source query aggregation, and in-app interactive hunt notebooks.
 - **SIEM Integration** — Real-time log ingestion, correlation rules, and event streaming to multiple backends.
 
 ### Threat Intelligence
 - **Intel Platform** — IOC management with automated enrichment via VirusTotal, AbuseIPDB, Shodan, GreyNoise, and MISP.
-- **Dark Web Monitoring** — Real scanners for credential leaks and brand exposure on dark web marketplaces and paste sites.
+- **Dark Web Monitoring** — Feed/API-based dark web monitoring for credential leaks, marketplace feeds, paste sites, and brand exposure.
 - **Adversary Profiles** — 5 built-in APT profiles (APT29, APT28, FIN7, Lazarus, Generic Ransomware) plus tenant-authored profiles.
 
 ### Breach & Attack Simulation + Purple Team

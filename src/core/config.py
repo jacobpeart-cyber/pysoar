@@ -118,6 +118,7 @@ class Settings(BaseSettings):
     greynoise_api_key: Optional[str] = None
     urlscan_api_key: Optional[str] = None
     hibp_api_key: Optional[str] = None
+    darkweb_marketplace_feed_url: Optional[str] = None
 
     # Email (SMTP)
     smtp_host: str = "smtp.gmail.com"

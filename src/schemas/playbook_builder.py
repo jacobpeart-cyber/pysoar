@@ -48,8 +48,14 @@ class PlaybookNodeResponse(DBModel):
     id: str = ""
     node_id: str = ""
     node_type: str = ""
+    display_name: str = ""
+    description: Optional[str] = None
     position_x: float = 0.0
     position_y: float = 0.0
+    config: Optional[dict[str, Any]] = None
+    timeout_seconds: int = 0
+    retry_count: int = 0
+    on_error: str = "stop"
     input_schema: Optional[dict[str, Any]] = None
     output_schema: Optional[dict[str, Any]] = None
     created_at: Optional[datetime] = None

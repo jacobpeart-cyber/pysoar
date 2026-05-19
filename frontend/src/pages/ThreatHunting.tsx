@@ -354,6 +354,93 @@ export default function ThreatHunting() {
     onError: (err: any) => showError(err),
   });
 
+  const updateNotebookMutation = useMutation({
+    mutationFn: async (payload: { notebookId: string; content: any[] }) => {
+      const response = await api.put(`/hunting/notebooks/${payload.notebookId}`, {
+        content: payload.content,
+      });
+      return response.data;
+    },
+    onSuccess: (data: any) => {
+      queryClient.invalidateQueries({ queryKey: ['hunting-notebooks'] });
+      setSelectedNotebook(data);
+    },
+    onError: (err: any) => showError(err),
+  });
+
+  const executeNotebookCellMutation = useMutation({
+    mutationFn: async (payload: { notebookId: string; cellIndex: number; query: string }) => {
+      const response = await api.post(`/hunting/notebooks/${payload.notebookId}/execute-cell`, {
+        cell_index: payload.cellIndex,
+        query: payload.query,
+      });
+      return response.data;
+    },
+    onSuccess: (data: any, variables: { cellIndex: number; query: string }) => {
+      if (!selectedNotebook) return;
+      const cells = safeArray(selectedNotebook.content);
+      const updatedCells = [...cells];
+      const existing = updatedCells[variables.cellIndex] || {};
+      updatedCells[variables.cellIndex] = {
+        ...existing,
+        content: variables.query || existing.content,
+        output: data.result,
+        executed_at: new Date().toISOString(),
+        execution_time_ms: data.execution_time_ms,
+        result_type: data.result_type,
+      };
+      setSelectedNotebook({ ...selectedNotebook, content: updatedCells });
+      queryClient.invalidateQueries({ queryKey: ['hunting-notebooks'] });
+    },
+    onError: (err: any) => showError(err),
+  });
+
+  const notebookCells = safeArray(selectedNotebook?.content);
+
+  const addNotebookCell = (cellType: 'markdown' | 'query') => {
+    if (!selectedNotebook) return;
+    const cells = safeArray(selectedNotebook.content);
+    const newCell = {
+      cell_type: cellType,
+      content: cellType === 'markdown' ? 'New markdown cell' : 'query ',
+      output: null,
+      metadata: {},
+    };
+    setSelectedNotebook({ ...selectedNotebook, content: [...cells, newCell] });
+  };
+
+  const updateNotebookCell = (index: number, changes: Partial<any>) => {
+    if (!selectedNotebook) return;
+    const cells = safeArray(selectedNotebook.content);
+    const updated = [...cells];
+    updated[index] = { ...updated[index], ...changes };
+    setSelectedNotebook({ ...selectedNotebook, content: updated });
+  };
+
+  const removeNotebookCell = (index: number) => {
+    if (!selectedNotebook) return;
+    const cells = safeArray(selectedNotebook.content);
+    const updated = cells.filter((_: any, idx: number) => idx !== index);
+    setSelectedNotebook({ ...selectedNotebook, content: updated });
+  };
+
+  const saveSelectedNotebook = () => {
+    if (!selectedNotebook) return;
+    updateNotebookMutation.mutate({
+      notebookId: selectedNotebook.id,
+      content: notebookCells,
+    });
+  };
+
+  const executeCell = (index: number, query: string) => {
+    if (!selectedNotebook) return;
+    executeNotebookCellMutation.mutate({
+      notebookId: selectedNotebook.id,
+      cellIndex: index,
+      query,
+    });
+  };
+
   const tabs = [
     { id: 'hunts', label: 'Hunts', icon: Zap },
     { id: 'hypotheses', label: 'Hypotheses', icon: Lightbulb },
@@ -1584,11 +1671,107 @@ export default function ThreatHunting() {
                     <label className="block text-sm font-medium text-gray-500 mb-1">Status</label>
                     <p className="text-gray-900">{selectedNotebook.is_published ? 'Published' : 'Draft'}</p>
                   </div>
-                  <div>
-                    <label className="block text-sm font-medium text-gray-500 mb-1">Content ({selectedNotebook.content?.length || 0} cells)</label>
-                    <pre className="bg-gray-50 rounded-lg p-4 text-sm text-gray-800 overflow-x-auto max-h-64 overflow-y-auto">
-                      {JSON.stringify(selectedNotebook.content, null, 2) || '[]'}
-                    </pre>
+                  <div className="flex items-center justify-between gap-4">
+                    <div>
+                      <label className="block text-sm font-medium text-gray-500 mb-1">Content ({notebookCells.length} cells)</label>
+                      <p className="text-xs text-gray-400">Edit, execute, and save notebook cells directly in the hunt UI.</p>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <button
+                        type="button"
+                        onClick={() => addNotebookCell('markdown')}
+                        className="px-3 py-2 bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 text-sm"
+                      >
+                        + Markdown
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => addNotebookCell('query')}
+                        className="px-3 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 text-sm"
+                      >
+                        + Query
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="space-y-4">
+                    {notebookCells.length === 0 ? (
+                      <div className="rounded-lg border border-dashed border-gray-300 p-6 text-center text-sm text-gray-500">
+                        No notebook cells yet. Add a markdown or query cell to begin.
+                      </div>
+                    ) : (
+                      notebookCells.map((cell: any, idx: number) => (
+                        <div key={idx} className="rounded-xl border border-gray-200 bg-white p-4 shadow-sm">
+                          <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between mb-3">
+                            <div>
+                              <p className="text-sm font-semibold text-gray-900">Cell {idx + 1} · {cell.cell_type}</p>
+                              <p className="text-xs text-gray-500">{cell.cell_type === 'query' ? 'Query cell executes hunting lookups and session searches.' : 'Markdown notes for investigation context and findings.'}</p>
+                            </div>
+                            <div className="flex items-center gap-2">
+                              {cell.cell_type === 'query' && (
+                                <button
+                                  type="button"
+                                  onClick={() => executeCell(idx, String(cell.content || ''))}
+                                  className="px-3 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 text-sm"
+                                >
+                                  {executeNotebookCellMutation.isLoading ? 'Running...' : 'Run'}
+                                </button>
+                              )}
+                              <button
+                                type="button"
+                                onClick={() => removeNotebookCell(idx)}
+                                className="px-3 py-2 bg-red-50 text-red-700 rounded-lg border border-red-100 hover:bg-red-100 text-sm"
+                              >
+                                Remove
+                              </button>
+                            </div>
+                          </div>
+                          <textarea
+                            value={String(cell.content || '')}
+                            onChange={(e) => updateNotebookCell(idx, { content: e.target.value })}
+                            rows={cell.cell_type === 'query' ? 5 : 6}
+                            className="w-full rounded-lg border border-gray-300 bg-gray-50 p-3 text-sm text-gray-900 focus:border-blue-500 focus:outline-none focus:ring-2 focus:ring-blue-100"
+                          />
+                          {cell.output != null && (
+                            <div className="mt-3 rounded-lg border border-gray-200 bg-gray-50 p-3 text-xs text-gray-800">
+                              <div className="mb-2 flex items-center justify-between gap-2">
+                                <span className="font-medium">Output</span>
+                                <span className="text-gray-500">{cell.result_type || 'results'} · {Array.isArray(cell.output) ? `${cell.output.length} rows` : '1 item'}</span>
+                              </div>
+                              <pre className="overflow-x-auto text-xs text-gray-700">{JSON.stringify(cell.output, null, 2)}</pre>
+                            </div>
+                          )}
+                          {cell.executed_at && (
+                            <div className="mt-2 text-xs text-gray-500">
+                              Last run: {new Date(cell.executed_at).toLocaleString()} · {cell.execution_time_ms != null ? `${cell.execution_time_ms} ms` : 'n/a'}
+                            </div>
+                          )}
+                        </div>
+                      ))
+                    )}
+                  </div>
+
+                  <div className="mt-4 flex flex-wrap items-center justify-end gap-3">
+                    <button
+                      type="button"
+                      onClick={() => setSelectedNotebook(null)}
+                      className="px-4 py-2 border border-gray-300 text-gray-700 rounded-lg hover:bg-gray-50 text-sm"
+                    >
+                      Close
+                    </button>
+                    <button
+                      type="button"
+                      onClick={saveSelectedNotebook}
+                      disabled={updateNotebookMutation.isLoading}
+                      className={clsx(
+                        'px-4 py-2 rounded-lg text-sm font-medium text-white',
+                        updateNotebookMutation.isLoading
+                          ? 'bg-blue-400 cursor-not-allowed'
+                          : 'bg-blue-600 hover:bg-blue-700'
+                      )}
+                    >
+                      {updateNotebookMutation.isLoading ? 'Saving...' : 'Save Notebook'}
+                    </button>
                   </div>
                 </div>
               </div>

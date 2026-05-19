@@ -310,6 +310,7 @@ async def trigger_monitor_scan(
 
     scanner = DarkWebScanner()
     try:
+        marketplaces = []
         if scan_request.scan_type == "quick":
             # Quick = only breach DB (HIBP) since it's the cheapest
             pastes = []
@@ -321,9 +322,10 @@ async def trigger_monitor_scan(
             breaches = await scanner.search_breach_databases()
             forums = await scanner.search_forums()
             channels = await scanner.search_telegram_channels()
+            marketplaces = await scanner.search_marketplaces()
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"Dark web scan engine call failed: {exc}")
-        pastes, breaches, forums, channels = [], [], [], []
+        pastes, breaches, forums, channels, marketplaces = [], [], [], [], []
 
     persisted_findings: list[DarkWebFinding] = []
 
@@ -397,6 +399,15 @@ async def trigger_monitor_scan(
             c.get("message_id", "")[:500],
             severity="medium",
             raw=c,
+        )
+    for m in marketplaces:
+        _add_finding(
+            "marketplace_listing",
+            m.get("source", "marketplace"),
+            m.get("title", "Marketplace listing")[:500],
+            m.get("description", "")[:1000],
+            severity="critical" if (m.get("confidence", 50) or 50) >= 75 else "medium",
+            raw=m,
         )
 
     await db.flush()
