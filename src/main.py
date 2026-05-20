@@ -139,9 +139,10 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         from src.siem.ingest_queue import init as _ingest_init, start as _ingest_start
         from src.core.database import async_session_factory as _async_session_factory
         redis_url = _os.getenv("REDIS_URL")
+        workers = int(_os.getenv("INGEST_WORKERS", "1"))
         _ingest_init(db_session_factory=_async_session_factory, redis_url=redis_url)
-        _ingest_start()
-        logger.info("SIEM ingest queue started", redis=bool(redis_url))
+        _ingest_start(worker_count=workers)
+        logger.info("SIEM ingest queue started", redis=bool(redis_url), workers=workers)
     except Exception as e:  # noqa: BLE001
         logger.warning("SIEM ingest queue failed to start", error=str(e))
 
