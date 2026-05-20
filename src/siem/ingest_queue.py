@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 # Internal state: either an in-memory asyncio.Queue or a Redis-backed list.
 _queue: Optional[asyncio.Queue] = None
-_worker_task: Optional[asyncio.Task] = None
+_worker_tasks: list[asyncio.Task] | None = None
 _db_session_factory = None
 _redis_client = None
 _redis_key = "pysoar:siem:ingest"
@@ -142,43 +142,42 @@ async def _worker_loop():
     logger.info("SIEM ingest queue worker stopped")
 
 
-def start(loop: Optional[asyncio.AbstractEventLoop] = None):
-    global _worker_task, _queue
+def start(loop: Optional[asyncio.AbstractEventLoop] = None, worker_count: int = 1):
+    """Start one or more ingest worker tasks.
+
+    `worker_count` controls how many concurrent consumers are created.
+    In Redis mode multiple BRPOP consumers scale throughput; in-memory
+    mode multiple tasks share the same asyncio.Queue.
+    """
+    global _worker_tasks, _queue
     if _redis_client is None and _queue is None:
         init()
-    if _worker_task is None:
+    if _worker_tasks is None:
         loop = loop or asyncio.get_event_loop()
-        _worker_task = loop.create_task(_worker_loop())
-    return _worker_task
+        _worker_tasks = [loop.create_task(_worker_loop()) for _ in range(max(1, worker_count))]
+    return _worker_tasks
 
 
 async def stop():
-    global _queue, _worker_task, _redis_client
-    if _redis_client is not None:
-        # Nothing to do for redis-backed queue; cancelling the worker
-        # task is sufficient.
-        if _worker_task:
-            _worker_task.cancel()
+    global _queue, _worker_tasks, _redis_client
+    if _worker_tasks:
+        for t in list(_worker_tasks):
+            t.cancel()
+        for t in list(_worker_tasks):
             try:
-                await _worker_task
+                await t
             except Exception:
                 pass
-        _worker_task = None
+    _worker_tasks = None
+    if _redis_client is not None:
         return
     if _queue is None:
         return
-    # Signal shutdown
+    # Signal shutdown for in-memory queue
     try:
         await _queue.put(None)
     except Exception:
         pass
-    if _worker_task:
-        _worker_task.cancel()
-        try:
-            await _worker_task
-        except Exception:
-            pass
-    _worker_task = None
     _queue = None
 
 
