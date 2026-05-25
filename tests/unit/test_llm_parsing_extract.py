@@ -6,6 +6,7 @@ from src.core.llm_parsing import (
     LLMUnavailableError,
     LLMTransportError,
     _balanced_brace_extract,
+    extract_json,
 )
 
 
@@ -71,3 +72,45 @@ class TestBalancedBraceExtract:
 
     def test_start_past_end_returns_none(self):
         assert _balanced_brace_extract('{}', 99) is None
+
+
+class TestExtractJsonBare:
+    def test_empty_string_returns_fail(self):
+        r = extract_json("")
+        assert r.ok is False
+        assert "empty" in r.error.lower()
+        assert "empty" in r.attempt_log
+
+    def test_pure_prose_no_object(self):
+        r = extract_json("the model said hello but emitted no JSON at all")
+        assert r.ok is False
+        assert "no JSON object" in r.error
+        assert "no_object" in r.attempt_log
+
+    def test_bare_object(self):
+        r = extract_json('{"verdict": "true_positive", "confidence": 90}')
+        assert r.ok is True
+        assert r.data == {"verdict": "true_positive", "confidence": 90}
+        assert "bare_object" in r.attempt_log
+        assert "json.loads" in r.attempt_log
+
+    def test_bare_object_surrounded_by_prose(self):
+        r = extract_json('The model thought: {"verdict": "benign"} so we are done.')
+        assert r.ok is True
+        assert r.data == {"verdict": "benign"}
+
+    def test_bare_object_nested(self):
+        r = extract_json('{"a": {"b": [1, 2, {"c": 3}]}}')
+        assert r.ok is True
+        assert r.data == {"a": {"b": [1, 2, {"c": 3}]}}
+
+    def test_array_only_is_not_object(self):
+        r = extract_json('[1, 2, 3]')
+        assert r.ok is False
+        assert "no JSON object" in r.error
+
+    def test_parsed_array_inside_object_rejected_top_level(self):
+        # extract_json is for objects — a top-level array shouldn't sneak through
+        r = extract_json('[{"verdict": "x"}]')
+        # The bare-object regex requires {"<word>": pattern; this won't match.
+        assert r.ok is False

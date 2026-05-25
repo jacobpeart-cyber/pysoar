@@ -8,6 +8,8 @@ exceptions (LLMParseError, LLMUnavailableError, LLMTransportError).
 
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -88,3 +90,73 @@ def _balanced_brace_extract(text: str, start: int) -> Optional[str]:
             if depth == 0:
                 return text[start : i + 1]
     return None
+
+
+_BARE_OBJ_START_RE = re.compile(r'\{\s*"\w+"\s*:')
+
+
+def _try_bare_object(text: str) -> Optional[str]:
+    """Find first {"key": ...} object in the text, brace-balanced. Returns the
+    JSON substring or None if no object-shaped pattern found."""
+    match = _BARE_OBJ_START_RE.search(text)
+    if not match:
+        return None
+    return _balanced_brace_extract(text, match.start())
+
+
+def extract_json(text: str, schema: Optional[type] = None) -> ParseResult:
+    """Extract a JSON object from raw LLM text. Optionally validate against a
+    Pydantic schema.
+
+    Strategy ladder: fenced block (added in Task 5) -> bare object -> json.loads
+    -> json_repair.loads (added in Task 6) -> schema validate (added in Task 7).
+    First strategy yielding a parsed dict wins.
+
+    Returns ParseResult(ok=False, error=...) on any failure — never raises,
+    never returns a hardcoded success-shaped payload.
+    """
+    log: list[str] = []
+    if not text:
+        return ParseResult(ok=False, error="empty input", attempt_log=["empty"])
+
+    # Check if input starts with array (reject top-level arrays)
+    stripped = text.lstrip()
+    if stripped.startswith("["):
+        return ParseResult(
+            ok=False,
+            error="no JSON object found in text",
+            attempt_log=["no_object"],
+        )
+
+    candidate: Optional[str] = None
+
+    bare = _try_bare_object(text)
+    if bare is not None:
+        candidate = bare
+        log.append("bare_object")
+
+    if candidate is None:
+        return ParseResult(
+            ok=False,
+            error="no JSON object found in text",
+            attempt_log=log + ["no_object"],
+        )
+
+    try:
+        parsed = json.loads(candidate)
+        log.append("json.loads")
+    except json.JSONDecodeError as exc:
+        return ParseResult(
+            ok=False,
+            error=f"JSON parse failed: {exc}",
+            attempt_log=log + ["json_parse_fail"],
+        )
+
+    if not isinstance(parsed, dict):
+        return ParseResult(
+            ok=False,
+            error=f"parsed value is {type(parsed).__name__}, expected object",
+            attempt_log=log + ["not_object"],
+        )
+
+    return ParseResult(ok=True, data=parsed, attempt_log=log)
