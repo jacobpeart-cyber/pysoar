@@ -54,3 +54,37 @@ class ParseResult:
     data: Optional[Any] = None
     error: Optional[str] = None
     attempt_log: list[str] = field(default_factory=list)
+
+
+def _balanced_brace_extract(text: str, start: int) -> Optional[str]:
+    """Given text[start] == '{', return the substring through the matching '}'.
+
+    Returns None if start is past end, start char isn't '{', or braces never
+    balance. Handles strings: braces inside double-quoted strings (with
+    backslash escapes) do not affect nesting depth.
+    """
+    if start >= len(text) or text[start] != "{":
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for i in range(start, len(text)):
+        ch = text[i]
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+            continue
+        if in_string:
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : i + 1]
+    return None
