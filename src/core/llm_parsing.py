@@ -104,6 +104,31 @@ def _try_bare_object(text: str) -> Optional[str]:
     return _balanced_brace_extract(text, match.start())
 
 
+_FENCE_RE = re.compile(r"```(?:json)?\s*\n?(.*?)```", re.DOTALL)
+
+
+def _try_fenced_block(text: str) -> Optional[str]:
+    """Extract the JSON object body from a ```json ... ``` (or bare ```) fenced
+    block. Uses balanced-brace scan inside the fence — NOT lazy regex (which
+    truncates on nested objects). Returns the first parseable candidate
+    across all fences, or None if no fence yields one."""
+    for match in _FENCE_RE.finditer(text):
+        body = match.group(1).strip()
+        first_brace = body.find("{")
+        if first_brace < 0:
+            continue
+        candidate = _balanced_brace_extract(body, first_brace)
+        if candidate is None:
+            continue
+        # Quick parseability check so we skip fences that look JSON-ish but aren't
+        try:
+            json.loads(candidate)
+            return candidate
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
 def extract_json(text: str, schema: Optional[type] = None) -> ParseResult:
     """Extract a JSON object from raw LLM text. Optionally validate against a
     Pydantic schema.
@@ -130,10 +155,15 @@ def extract_json(text: str, schema: Optional[type] = None) -> ParseResult:
 
     candidate: Optional[str] = None
 
-    bare = _try_bare_object(text)
-    if bare is not None:
-        candidate = bare
-        log.append("bare_object")
+    fenced = _try_fenced_block(text)
+    if fenced is not None:
+        candidate = fenced
+        log.append("fenced_block")
+    else:
+        bare = _try_bare_object(text)
+        if bare is not None:
+            candidate = bare
+            log.append("bare_object")
 
     if candidate is None:
         return ParseResult(

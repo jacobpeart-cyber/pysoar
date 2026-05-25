@@ -114,3 +114,57 @@ class TestExtractJsonBare:
         r = extract_json('[{"verdict": "x"}]')
         # The bare-object regex requires {"<word>": pattern; this won't match.
         assert r.ok is False
+
+
+class TestExtractJsonFenced:
+    def test_fenced_block_with_json_tag(self):
+        text = 'Here is my answer:\n```json\n{"verdict": "benign"}\n```\nDone.'
+        r = extract_json(text)
+        assert r.ok is True
+        assert r.data == {"verdict": "benign"}
+        assert "fenced_block" in r.attempt_log
+
+    def test_fenced_block_without_tag(self):
+        text = '```\n{"verdict": "benign"}\n```'
+        r = extract_json(text)
+        assert r.ok is True
+        assert r.data == {"verdict": "benign"}
+
+    def test_fenced_block_with_nested_object_REGRESSION(self):
+        """Regression: the old lazy-regex extractor truncated at the first '}'.
+        With nested objects, the inner '}' would close the match too early
+        and the outer JSON would never parse."""
+        text = '```json\n{"verdict": "true_positive", "evidence": {"alert_id": "abc", "host": "h1"}}\n```'
+        r = extract_json(text)
+        assert r.ok is True
+        assert r.data == {
+            "verdict": "true_positive",
+            "evidence": {"alert_id": "abc", "host": "h1"},
+        }
+
+    def test_fenced_block_with_array_of_objects(self):
+        text = '```json\n{"actions": [{"type": "block", "ip": "1.2.3.4"}, {"type": "isolate", "host": "h1"}]}\n```'
+        r = extract_json(text)
+        assert r.ok is True
+        assert r.data["actions"][0]["type"] == "block"
+        assert r.data["actions"][1]["host"] == "h1"
+
+    def test_multiple_fenced_blocks_picks_first_parseable(self):
+        text = (
+            'Reasoning:\n'
+            '```\nnot json at all\n```\n'
+            'Verdict:\n'
+            '```json\n{"verdict": "benign"}\n```\n'
+        )
+        r = extract_json(text)
+        assert r.ok is True
+        assert r.data == {"verdict": "benign"}
+
+    def test_fenced_block_prefers_over_bare(self):
+        """If both a fenced block and a bare object exist, fenced wins (more
+        intentional from the model's perspective)."""
+        text = '{"old": "value"} but the real answer is ```json\n{"new": "value"}\n```'
+        r = extract_json(text)
+        assert r.ok is True
+        assert r.data == {"new": "value"}
+        assert "fenced_block" in r.attempt_log
