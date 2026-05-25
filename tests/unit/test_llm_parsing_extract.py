@@ -168,3 +168,39 @@ class TestExtractJsonFenced:
         assert r.ok is True
         assert r.data == {"new": "value"}
         assert "fenced_block" in r.attempt_log
+
+
+class TestExtractJsonRepair:
+    def test_trailing_comma_in_object(self):
+        r = extract_json('{"a": 1, "b": 2,}')
+        assert r.ok is True
+        assert r.data == {"a": 1, "b": 2}
+        assert "json_repair" in r.attempt_log
+
+    def test_trailing_comma_in_array(self):
+        r = extract_json('{"items": [1, 2, 3,]}')
+        assert r.ok is True
+        assert r.data == {"items": [1, 2, 3]}
+
+    def test_single_quotes_in_fenced_block(self):
+        # bare-object regex requires double-quoted keys; single quotes
+        # only flow through when wrapped in a fenced block
+        r = extract_json("```json\n{'verdict': 'benign'}\n```")
+        assert r.ok is True
+        assert r.data == {"verdict": "benign"}
+
+    def test_smart_quotes(self):
+        # "smart" / curly quotes that json.loads chokes on
+        # Using actual curly quotes (U+201C and U+201D)
+        r = extract_json('{“verdict”: “benign”}')
+        assert r.ok is True
+        assert r.data == {"verdict": "benign"}
+
+    def test_truncated_unrepairable(self):
+        # Truncated mid-object with no recoverable structure. json_repair
+        # MAY silently complete it (acceptable) or fail (acceptable).
+        # The contract is: no crash, and if ok=False, error is populated.
+        r = extract_json('{"verdict": "true_positive", "evidence":')
+        if not r.ok:
+            assert r.error
+            assert len(r.error) > 0
