@@ -13,6 +13,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+import json_repair
+
 from src.core.exceptions import PySOARException
 
 
@@ -166,21 +168,38 @@ def extract_json(text: str, schema: Optional[type] = None) -> ParseResult:
             log.append("bare_object")
 
     if candidate is None:
+        # Last-resort: try the very first '{' in the text, even without the
+        # key-shape signature. json_repair downstream will tell us if it's
+        # garbage. Avoids missing smart-quoted or otherwise non-standard
+        # objects that the key regex won't match.
+        first_brace = text.find("{")
+        if first_brace >= 0:
+            last_resort = _balanced_brace_extract(text, first_brace)
+            if last_resort is not None:
+                candidate = last_resort
+                log.append("first_brace_fallback")
+
+    if candidate is None:
         return ParseResult(
             ok=False,
             error="no JSON object found in text",
             attempt_log=log + ["no_object"],
         )
 
+    parsed: Optional[Any] = None
     try:
         parsed = json.loads(candidate)
         log.append("json.loads")
-    except json.JSONDecodeError as exc:
-        return ParseResult(
-            ok=False,
-            error=f"JSON parse failed: {exc}",
-            attempt_log=log + ["json_parse_fail"],
-        )
+    except json.JSONDecodeError:
+        try:
+            parsed = json_repair.loads(candidate)
+            log.append("json_repair")
+        except Exception as exc:  # noqa: BLE001
+            return ParseResult(
+                ok=False,
+                error=f"JSON parse failed even with json_repair: {exc}",
+                attempt_log=log + ["json_repair_fail"],
+            )
 
     if not isinstance(parsed, dict):
         return ParseResult(
