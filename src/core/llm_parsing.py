@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Optional, Protocol
 
 import json_repair
 from pydantic import BaseModel, ValidationError
@@ -221,3 +221,54 @@ def extract_json(text: str, schema: Optional[type[BaseModel]] = None) -> ParseRe
             )
 
     return ParseResult(ok=True, data=parsed, attempt_log=log)
+
+
+class StructuredProvider(Protocol):
+    """Interface request_structured uses to call the underlying LLM.
+
+    Implementations are responsible for using their native structured-output
+    mode where available (Gemini response_mime_type, Anthropic tool_use shim,
+    OpenAI response_format) and for falling back to prompt-enforced JSON where
+    not. They MUST raise LLMTransportError on HTTP/network failure, not
+    return a fake response.
+    """
+
+    async def acomplete_structured(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        schema: type[BaseModel],
+        tools: Optional[list[dict]] = None,
+        history: Optional[list[dict]] = None,
+    ) -> str:
+        """Return the raw LLM text. The caller will extract JSON from it."""
+        ...
+
+
+async def request_structured(
+    provider: StructuredProvider,
+    *,
+    system_prompt: str,
+    user_prompt: str,
+    schema: type[BaseModel],
+    retries: int = 2,
+    tools: Optional[list[dict]] = None,
+    history: Optional[list[dict]] = None,
+) -> ParseResult:
+    """LLM-call orchestrator. Calls provider.acomplete_structured, runs the
+    response through extract_json(schema=...), returns the ParseResult.
+
+    Retry loop is added in Task 9; this initial version is single-attempt.
+
+    Transport failures (LLMTransportError) propagate — they are outages, not
+    parse failures. NEVER returns a hardcoded success-shaped payload.
+    """
+    raw = await provider.acomplete_structured(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        schema=schema,
+        tools=tools,
+        history=history,
+    )
+    return extract_json(raw, schema)
