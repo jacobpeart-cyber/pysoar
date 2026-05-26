@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import json_repair
+from pydantic import BaseModel, ValidationError
 
 from src.core.exceptions import PySOARException
 
@@ -131,7 +132,7 @@ def _try_fenced_block(text: str) -> Optional[str]:
     return None
 
 
-def extract_json(text: str, schema: Optional[type] = None) -> ParseResult:
+def extract_json(text: str, schema: Optional[type[BaseModel]] = None) -> ParseResult:
     """Extract a JSON object from raw LLM text. Optionally validate against a
     Pydantic schema.
 
@@ -207,5 +208,16 @@ def extract_json(text: str, schema: Optional[type] = None) -> ParseResult:
             error=f"parsed value is {type(parsed).__name__}, expected object",
             attempt_log=log + ["not_object"],
         )
+
+    if schema is not None:
+        try:
+            validated = schema.model_validate(parsed)
+            return ParseResult(ok=True, data=validated, attempt_log=log + ["schema_ok"])
+        except ValidationError as exc:
+            return ParseResult(
+                ok=False,
+                error=str(exc),
+                attempt_log=log + ["schema_fail"],
+            )
 
     return ParseResult(ok=True, data=parsed, attempt_log=log)
