@@ -256,19 +256,37 @@ async def request_structured(
     tools: Optional[list[dict]] = None,
     history: Optional[list[dict]] = None,
 ) -> ParseResult:
-    """LLM-call orchestrator. Calls provider.acomplete_structured, runs the
-    response through extract_json(schema=...), returns the ParseResult.
+    """LLM-call orchestrator with parse-fail retry loop.
 
-    Retry loop is added in Task 9; this initial version is single-attempt.
+    On parse/validate failure: append the validation error to the user prompt
+    and retry. Total attempts = retries + 1. Transport failures
+    (LLMTransportError) propagate — they are outages, not parse failures.
 
-    Transport failures (LLMTransportError) propagate — they are outages, not
-    parse failures. NEVER returns a hardcoded success-shaped payload.
+    Returns ParseResult — caller decides what to do with ok=False (raise
+    LLMUnavailableError, return 503, etc.). NEVER returns a hardcoded
+    success-shaped payload.
     """
-    raw = await provider.acomplete_structured(
-        system_prompt=system_prompt,
-        user_prompt=user_prompt,
-        schema=schema,
-        tools=tools,
-        history=history,
-    )
-    return extract_json(raw, schema)
+    current_prompt = user_prompt
+    last_result: Optional[ParseResult] = None
+    for attempt in range(retries + 1):
+        raw = await provider.acomplete_structured(
+            system_prompt=system_prompt,
+            user_prompt=current_prompt,
+            schema=schema,
+            tools=tools,
+            history=history,
+        )
+        result = extract_json(raw, schema)
+        if result.ok:
+            return result
+        last_result = result
+        if attempt == retries:
+            break
+        current_prompt = (
+            user_prompt
+            + f"\n\nYour previous response failed validation: {result.error}\n"
+            "Return ONLY the JSON object matching the schema, no prose, no fences."
+        )
+    # Must not be None — loop runs at least once
+    assert last_result is not None
+    return last_result
