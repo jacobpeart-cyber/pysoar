@@ -2,6 +2,7 @@
 
 from typing import Literal, Optional
 
+import pytest
 from pydantic import BaseModel, Field
 
 from src.core.llm_parsing import (
@@ -129,3 +130,35 @@ class TestRequestStructuredRetry:
         )
         assert result.ok is False
         assert len(provider.calls) == 1
+
+
+class TestRequestStructuredTransport:
+    async def test_transport_error_propagates_not_swallowed(self):
+        """LLMTransportError from the provider must bubble up — never be
+        caught and turned into a fake ParseResult."""
+        provider = FakeProvider([LLMTransportError("connection reset")])
+        with pytest.raises(LLMTransportError, match="connection reset"):
+            await request_structured(
+                provider,
+                system_prompt="sys",
+                user_prompt="orig",
+                schema=VerdictFixture,
+                retries=2,
+            )
+        assert len(provider.calls) == 1  # didn't retry on transport error
+
+    async def test_transport_error_on_retry_propagates(self):
+        """If the FIRST attempt parses badly and the SECOND attempt is a
+        transport failure, the transport error still propagates and is not
+        masked by the prior parse failure."""
+        bad_parse = "no JSON"
+        provider = FakeProvider([bad_parse, LLMTransportError("timeout")])
+        with pytest.raises(LLMTransportError, match="timeout"):
+            await request_structured(
+                provider,
+                system_prompt="sys",
+                user_prompt="orig",
+                schema=VerdictFixture,
+                retries=2,
+            )
+        assert len(provider.calls) == 2
