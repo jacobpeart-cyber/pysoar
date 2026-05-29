@@ -26,7 +26,7 @@ Plus five naked `json.loads(response.content)` sites in [src/agentic/llm.py](../
 
 ## Non-Goals
 
-- Adding new action handlers (block_ip, isolate_host, etc.) — this sub-project only uses what's already verified to exist.
+- Adding new action handlers (firewall_block, host_isolate, etc.) — this sub-project only uses what's already verified to exist. Enum values match the canonical `RemediationAction.action_type` strings in the codebase; PR 2's capability gate is the proof.
 - Replacing the LLM provider (Gemini stays).
 - Touching the older heuristic `agentic/engine.py` path that the LLM-driven investigator already replaced.
 
@@ -223,13 +223,13 @@ Replacement: one batched `request_structured` call after the verdict is finalize
 
 ```python
 class ActionType(str, Enum):
-    BLOCK_IP = "block_ip"                    # → remediation.engine.block_ip
-    ISOLATE_HOST = "isolate_host"            # → agent command, capability=ir
-    DISABLE_USER = "disable_user"            # → remediation.engine.disable_user
-    RESET_CREDENTIALS = "reset_credentials"  # → remediation.engine.reset_credentials
-    QUARANTINE_FILE = "quarantine_file"      # → agent command, capability=ir
-    KILL_PROCESS = "kill_process"            # → agent command, capability=ir
-    COLLECT_FORENSICS = "collect_forensics"  # → agent command, capability=ir
+    FIREWALL_BLOCK = "firewall_block"          # → remediation.engine.FirewallBlockExecutor
+    HOST_ISOLATE = "host_isolate"              # → remediation.engine.HostIsolationExecutor
+    ACCOUNT_DISABLE = "account_disable"        # → remediation.engine.AccountActionExecutor(action=disable)
+    PASSWORD_RESET = "password_reset"          # → remediation.engine.AccountActionExecutor(action=password_reset)
+    PROCESS_KILL = "process_kill"              # → remediation.engine.ProcessActionExecutor (issues agent_commands row)
+    FILE_QUARANTINE = "file_quarantine"        # → remediation.engine.FileActionExecutor (issues agent_commands row)
+    COLLECT_FORENSICS = "collect_forensics"    # → remediation.engine.ForensicsCollectionExecutor (composite, 3 agent_commands)
 
 class ClassifiedAction(BaseModel):
     recommendation_text: str

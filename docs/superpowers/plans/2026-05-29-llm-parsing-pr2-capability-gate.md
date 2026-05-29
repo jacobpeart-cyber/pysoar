@@ -30,14 +30,16 @@
 
 | File | State | Responsibility |
 | --- | --- | --- |
-| `alembic/versions/018_password_reset_token.py` | Create | Add `password_reset_token: str | None` and `password_reset_token_expires_at: datetime | None` to `users` table |
+| `alembic/versions/018_password_reset_token.py` | Create | Add `password_reset_token` (nullable str) and `password_reset_token_expires_at` (nullable datetime) to `users` table; unique index on the token. |
 | `src/models/user.py` | Modify | Mirror the migration: add the two `Mapped[Optional[...]]` fields |
-| `src/agents/service.py` | Modify | Add `async def resolve_for_target(self, target: str, organization_id: str | None = None) -> EndpointAgent | None` method on `AgentService` |
+| `src/agents/service.py` | Modify | Add `async def resolve_for_target(self, target: str, *, organization_id: str) -> Optional[EndpointAgent]` method on `AgentService`. `organization_id` is MANDATORY keyword-only — prevents cross-tenant leaks via forgotten arg. |
 | `src/remediation/engine.py` | Modify | Rewrite `ProcessActionExecutor.execute` to use `AgentService.issue_command`. Add `FileActionExecutor` for `file_quarantine`. Add `ForensicsCollectionExecutor` for `collect_forensics`. Harden `AccountActionExecutor` `password_reset` branch to generate a real token. |
+| `src/api/v1/endpoints/auth.py` | Modify | Append `POST /password-reset/validate` (read-only token check) and `POST /password-reset/consume` (burn token + set new password). Completes the URL-flow side of the reset feature. |
 | `src/agentic/action_classifier.py` | Create | Closed `ActionType` enum + `ClassifiedAction` + `ActionClassification` Pydantic schemas. No caller in this PR — PR 3 wires it. |
 | `tests/integration/__init__.py` | Verify exists | (Should already exist; if not, create empty file.) |
 | `tests/integration/conftest.py` | Create if missing | Reuses session fixture from `tests/conftest.py` plus a fixture that creates a default org + user + endpoint agent enrolled with all capabilities. |
 | `tests/integration/test_action_executors.py` | Create | TDD tests for each fixed executor (firewall_block, host_isolate, account_disable, password_reset, process_kill, file_quarantine, collect_forensics) — one test class per executor. |
+| `tests/integration/test_password_reset_endpoints.py` | Create | End-to-end tests for `/validate` and `/consume` — issue-burn-reuse cycle, weak-password rejection, expiry handling, no-enumeration error wording. |
 | `tests/integration/test_action_handlers_are_real.py` | Create | The capability gate. For each of 7 ActionType enum values, invoke the executor through a uniform interface and assert observable DB state change. This is the test that the enum's contract is real. |
 
 ---
@@ -261,11 +263,14 @@ def upgrade() -> None:
         "users",
         sa.Column("password_reset_token_expires_at", sa.DateTime(timezone=True), nullable=True),
     )
+    # unique=True: two users CANNOT share a reset token. With 48-byte
+    # url-safe tokens the collision probability is vanishingly small, but
+    # the DB-layer guarantee removes "what if?" doubt from the URL handler.
     op.create_index(
         "ix_users_password_reset_token",
         "users",
         ["password_reset_token"],
-        unique=False,
+        unique=True,
     )
 
 
@@ -347,48 +352,79 @@ from src.models.organization import Organization
 
 class TestResolveForTarget:
     async def test_resolves_by_hostname(
-        self, db_session: AsyncSession, test_agent: EndpointAgent
+        self,
+        db_session: AsyncSession,
+        test_agent: EndpointAgent,
+        test_org: Organization,
     ):
-        svc = AgentService(db_session)
-        resolved = await svc.resolve_for_target(test_agent.hostname)
-        assert resolved is not None
-        assert resolved.id == test_agent.id
-
-    async def test_resolves_by_ip(
-        self, db_session: AsyncSession, test_agent: EndpointAgent
-    ):
-        # Set an IP on the agent
-        test_agent.ip_address = "10.0.0.42"
-        await db_session.flush()
-        svc = AgentService(db_session)
-        resolved = await svc.resolve_for_target("10.0.0.42")
-        assert resolved is not None
-        assert resolved.id == test_agent.id
-
-    async def test_returns_none_for_unknown_target(
-        self, db_session: AsyncSession, test_agent: EndpointAgent
-    ):
-        svc = AgentService(db_session)
-        resolved = await svc.resolve_for_target("nonexistent-host-99")
-        assert resolved is None
-
-    async def test_scopes_to_org_when_provided(
-        self, db_session: AsyncSession, test_agent: EndpointAgent, test_org: Organization
-    ):
-        # Create a second org with a same-hostname agent
-        other_org = Organization(
-            name="OtherOrg", slug="other-org", plan="enterprise", is_active=True
-        )
-        db_session.add(other_org)
-        await db_session.flush()
-        # Re-resolve scoped to the first org — must NOT return the other org's agent
-        # even if hostname matches
         svc = AgentService(db_session)
         resolved = await svc.resolve_for_target(
             test_agent.hostname, organization_id=test_org.id
         )
         assert resolved is not None
-        assert resolved.organization_id == test_org.id
+        assert resolved.id == test_agent.id
+
+    async def test_resolves_by_ip(
+        self,
+        db_session: AsyncSession,
+        test_agent: EndpointAgent,
+        test_org: Organization,
+    ):
+        # Set an IP on the agent
+        test_agent.ip_address = "10.0.0.42"
+        await db_session.flush()
+        svc = AgentService(db_session)
+        resolved = await svc.resolve_for_target(
+            "10.0.0.42", organization_id=test_org.id
+        )
+        assert resolved is not None
+        assert resolved.id == test_agent.id
+
+    async def test_returns_none_for_unknown_target(
+        self,
+        db_session: AsyncSession,
+        test_agent: EndpointAgent,
+        test_org: Organization,
+    ):
+        svc = AgentService(db_session)
+        resolved = await svc.resolve_for_target(
+            "nonexistent-host-99", organization_id=test_org.id
+        )
+        assert resolved is None
+
+    async def test_scopes_to_caller_org(
+        self,
+        db_session: AsyncSession,
+        test_agent: EndpointAgent,
+        test_org: Organization,
+    ):
+        """The agent belongs to test_org. Resolving the same hostname under a
+        DIFFERENT org's id MUST return None — never leak across tenants."""
+        from src.models.organization import Organization as OrgModel
+
+        other_org = OrgModel(
+            name="OtherOrg", slug="other-org", plan="enterprise", is_active=True
+        )
+        db_session.add(other_org)
+        await db_session.flush()
+        svc = AgentService(db_session)
+        # Hostname matches but org doesn't — must NOT return the agent
+        resolved = await svc.resolve_for_target(
+            test_agent.hostname, organization_id=other_org.id
+        )
+        assert resolved is None
+
+    async def test_organization_id_is_keyword_only(
+        self,
+        db_session: AsyncSession,
+        test_org: Organization,
+    ):
+        """organization_id MUST be keyword-only — protects against positional
+        argument shuffling that could silently drop the tenant filter."""
+        svc = AgentService(db_session)
+        with pytest.raises(TypeError):
+            # Passing organization_id positionally must fail
+            await svc.resolve_for_target("some-host", test_org.id)  # type: ignore[misc]
 ```
 
 Note: This test references `test_agent.ip_address` — only proceed past Step 2 if `EndpointAgent` actually has an `ip_address` field. Check by reading `src/agents/models.py`. If the field is named differently (e.g. `ip`), update the test field name to match. If there is NO IP field, drop `test_resolves_by_ip` and document in the commit.
@@ -409,13 +445,15 @@ In `src/agents/service.py`, find the `AgentService` class. Add this method (plac
     async def resolve_for_target(
         self,
         target: str,
-        organization_id: Optional[str] = None,
+        *,
+        organization_id: str,
     ) -> Optional[EndpointAgent]:
         """Resolve a target string (hostname or IP) to a registered EndpointAgent.
 
-        Tries hostname match first, then IP. Returns None if no agent matches.
-        When organization_id is provided, restricts the lookup to that tenant
-        (prevents cross-org targeting via a guessed hostname).
+        Tries hostname match first, then IP. Always scoped to organization_id —
+        the parameter is keyword-only and mandatory so a caller can't silently
+        drop the tenant filter via positional argument shuffling. Returns None
+        if no agent matches in that tenant.
 
         Used by remediation executors that need an agent to dispatch to.
         Callers must handle None as 'no agent enrolled for this target' —
@@ -423,9 +461,11 @@ In `src/agents/service.py`, find the `AgentService` class. Add this method (plac
         """
         from sqlalchemy import select
 
-        stmt = select(EndpointAgent).where(EndpointAgent.hostname == target)
-        if organization_id:
-            stmt = stmt.where(EndpointAgent.organization_id == organization_id)
+        stmt = (
+            select(EndpointAgent)
+            .where(EndpointAgent.hostname == target)
+            .where(EndpointAgent.organization_id == organization_id)
+        )
         result = await self.session.execute(stmt)
         agent = result.scalars().first()
         if agent:
@@ -433,9 +473,11 @@ In `src/agents/service.py`, find the `AgentService` class. Add this method (plac
 
         # Hostname miss — try IP. Only proceed if the model has an IP field.
         if hasattr(EndpointAgent, "ip_address"):
-            stmt = select(EndpointAgent).where(EndpointAgent.ip_address == target)
-            if organization_id:
-                stmt = stmt.where(EndpointAgent.organization_id == organization_id)
+            stmt = (
+                select(EndpointAgent)
+                .where(EndpointAgent.ip_address == target)
+                .where(EndpointAgent.organization_id == organization_id)
+            )
             result = await self.session.execute(stmt)
             return result.scalars().first()
 
@@ -554,8 +596,7 @@ class TestPasswordResetGeneratesRealToken:
         test_user: User,
     ):
         """The plaintext token must not leak through the executor's return
-        value — only the User row carries it. Audit consumers see a hash
-        suffix at most."""
+        value — only the User row carries it."""
         executor = AccountActionExecutor(db_session)
         result = await executor.execute(
             target=test_user.email,
@@ -566,6 +607,55 @@ class TestPasswordResetGeneratesRealToken:
         # The full plaintext token must not be in the result dict
         result_str = str(result)
         assert test_user.password_reset_token not in result_str
+
+    async def test_audit_row_carries_no_token_material(
+        self,
+        db_session: AsyncSession,
+        test_org: Organization,
+        test_user: User,
+    ):
+        """The TicketActivity audit row must contain NO token-identifying
+        material — not the plaintext token, not a sha256 prefix, not a
+        suffix, not anything an attacker with audit-log read access could
+        correlate to the specific token."""
+        import hashlib
+        import json
+        from src.tickethub.models import TicketActivity
+
+        executor = AccountActionExecutor(db_session)
+        result = await executor.execute(
+            target=test_user.email,
+            parameters={"action": "password_reset"},
+            context=_context_for(test_user.id, test_org.id),
+        )
+        await db_session.refresh(test_user)
+
+        # Fetch the most recent activity row for this execution
+        stmt = (
+            select(TicketActivity)
+            .where(TicketActivity.source_id == _context_for(test_user.id, test_org.id)["execution_id"])
+            .order_by(TicketActivity.created_at.desc())
+        )
+        activity = (await db_session.execute(stmt)).scalars().first()
+        assert activity is not None
+
+        # Serialize the whole row to a string and assert no token derivatives
+        row_dump = json.dumps(
+            {
+                "description": activity.description,
+                "extra_metadata": activity.extra_metadata,
+            },
+            default=str,
+        )
+        token = test_user.password_reset_token
+        assert token not in row_dump
+        # Common partial-leak patterns the team might be tempted to add later:
+        sha_full = hashlib.sha256(token.encode()).hexdigest()
+        for length in (8, 16, 24, 32, 64):
+            assert sha_full[:length] not in row_dump
+            assert sha_full[-length:] not in row_dump
+        assert token[:8] not in row_dump
+        assert token[-8:] not in row_dump
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -599,7 +689,9 @@ Replace with:
 
 `utc_now` is already imported in `engine.py`. `secrets` and `timedelta` are stdlib and imported locally to keep the change scoped.
 
-Also update the `extra_metadata` in the `_log_ticket_activity` call within this method's `password_reset` path. Add `token_id` (a SAFE identifier — NOT the token itself). Find the call to `_log_ticket_activity` after the action branches. The current `extra_metadata` looks like:
+Also update the `extra_metadata` in the `_log_ticket_activity` call to include the reset expiry (a non-secret value) but **nothing token-identifying**. No `token_id`, no `sha256(token)[:N]`, no `token[-4:]`, no hint that would let an attacker correlate audit rows to specific tokens.
+
+Find the call to `_log_ticket_activity` after the action branches. The current `extra_metadata` is:
 
 ```python
             extra_metadata={
@@ -611,22 +703,17 @@ Also update the `extra_metadata` in the `_log_ticket_activity` call within this 
             },
 ```
 
-Right BEFORE the `_log_ticket_activity` call, after the action branches, add this conditional augmentation so the metadata captures a safe reset-token reference without leaking the token:
+Right BEFORE that `_log_ticket_activity` call, add this conditional that augments only with the expiry timestamp:
 
 ```python
-        import hashlib
         reset_meta = {}
-        if action == "password_reset" and user.password_reset_token:
-            # Audit ID is a hash prefix of the token, not the token itself,
-            # so this row can appear in logs/SIEM without leaking the secret.
-            token_id = hashlib.sha256(
-                user.password_reset_token.encode("utf-8")
-            ).hexdigest()[:16]
+        if action == "password_reset" and user.password_reset_token_expires_at:
+            # Record ONLY the expiry timestamp. The token itself and any
+            # hash/prefix of it stays out of the audit row — an attacker
+            # with read access to ticket_activities can't correlate to a
+            # specific token.
             reset_meta = {
-                "reset_token_id": token_id,
-                "reset_expires_at": user.password_reset_token_expires_at.isoformat()
-                if user.password_reset_token_expires_at
-                else None,
+                "reset_expires_at": user.password_reset_token_expires_at.isoformat(),
             }
 ```
 
@@ -675,7 +762,418 @@ EOF
 
 ---
 
-## Task 6: Rewrite `ProcessActionExecutor` to use real agent dispatch
+## Task 6: Password-reset token validation endpoint
+
+Task 5 makes the token exist on the User row. Without an endpoint that consumes it, the token does nothing — that's still a stub at the system level. This task adds `POST /api/v1/auth/password-reset/validate` that takes a token and reports whether it's valid + unexpired, **without consuming it**. The frontend uses this on page-load of the reset URL to decide whether to render the new-password form or an "expired link" message.
+
+**Files:**
+
+- Modify: `src/api/v1/endpoints/auth.py` (append the endpoint)
+- Create: `tests/integration/test_password_reset_endpoints.py`
+
+- [ ] **Step 1: Write the failing tests**
+
+Create `tests/integration/test_password_reset_endpoints.py`:
+
+```python
+"""End-to-end tests for the password-reset URL consumption flow.
+
+Tests both /validate and /consume endpoints (consume comes in Task 7).
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+import pytest
+from httpx import ASGITransport, AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.main import app
+from src.models.organization import Organization
+from src.models.user import User
+from src.remediation.engine import AccountActionExecutor
+
+
+def _ctx(user_id: str, org_id: str) -> dict:
+    return {
+        "execution_id": f"reset-test-{org_id[:8]}",
+        "organization_id": org_id,
+        "initiated_by": user_id,
+        "trigger_data": {},
+    }
+
+
+@pytest.fixture
+async def issued_reset_token(
+    db_session: AsyncSession, test_org: Organization, test_user: User
+) -> tuple[User, str]:
+    """Run the executor to create a real token on test_user. Returns the user
+    and the plaintext token so the endpoint tests can submit it."""
+    executor = AccountActionExecutor(db_session)
+    await executor.execute(
+        target=test_user.email,
+        parameters={"action": "password_reset"},
+        context=_ctx(test_user.id, test_org.id),
+    )
+    await db_session.commit()
+    await db_session.refresh(test_user)
+    return test_user, test_user.password_reset_token
+
+
+class TestPasswordResetValidate:
+    async def test_valid_token_returns_200(self, issued_reset_token):
+        user, token = issued_reset_token
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            r = await client.post(
+                "/api/v1/auth/password-reset/validate",
+                json={"token": token},
+            )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["valid"] is True
+        assert "expires_at" in body
+        # Email must NOT come back from this endpoint — disclosing which
+        # email a token belongs to is an enumeration leak. Only valid/expiry.
+        assert "email" not in body
+        assert "user_id" not in body
+
+    async def test_unknown_token_returns_404(self):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            r = await client.post(
+                "/api/v1/auth/password-reset/validate",
+                json={"token": "no-such-token-xxxxxxxxxxxxxxxx"},
+            )
+        assert r.status_code == 404
+        body = r.json()
+        # Generic error — must NOT confirm "no such token" vs "expired"
+        # because that differential helps an attacker probe token space.
+        assert "detail" in body
+        assert "invalid" in body["detail"].lower() or "expired" in body["detail"].lower()
+
+    async def test_expired_token_returns_410(
+        self, db_session: AsyncSession, issued_reset_token
+    ):
+        user, token = issued_reset_token
+        # Backdate the expiry
+        user.password_reset_token_expires_at = datetime.now(timezone.utc) - timedelta(hours=1)
+        await db_session.commit()
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            r = await client.post(
+                "/api/v1/auth/password-reset/validate",
+                json={"token": token},
+            )
+        assert r.status_code == 410
+        body = r.json()
+        assert "expired" in body["detail"].lower()
+
+    async def test_validate_does_NOT_invalidate(
+        self, db_session: AsyncSession, issued_reset_token
+    ):
+        """Validation is read-only. Repeated calls return 200 each time. The
+        token only burns on /consume, not on /validate."""
+        user, token = issued_reset_token
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            for _ in range(3):
+                r = await client.post(
+                    "/api/v1/auth/password-reset/validate",
+                    json={"token": token},
+                )
+                assert r.status_code == 200
+
+        await db_session.refresh(user)
+        assert user.password_reset_token == token  # still on the row
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+```bash
+python -m pytest tests/integration/test_password_reset_endpoints.py::TestPasswordResetValidate -v
+```
+
+Expected: All FAIL with 404 (endpoint doesn't exist yet).
+
+- [ ] **Step 3: Add the endpoint**
+
+In `src/api/v1/endpoints/auth.py`, near the top, ensure these imports exist (add what's missing):
+
+```python
+from datetime import datetime, timezone
+from pydantic import BaseModel, Field
+from sqlalchemy import select
+from src.models.user import User
+```
+
+At the bottom of the file, append:
+
+```python
+class PasswordResetTokenRequest(BaseModel):
+    token: str = Field(min_length=20, max_length=256)
+
+
+class PasswordResetValidateResponse(BaseModel):
+    valid: bool
+    expires_at: datetime
+
+
+@router.post(
+    "/password-reset/validate",
+    response_model=PasswordResetValidateResponse,
+    summary="Validate a password-reset token without consuming it",
+)
+async def password_reset_validate(
+    payload: PasswordResetTokenRequest,
+    db: AsyncSession = Depends(get_db),
+) -> PasswordResetValidateResponse:
+    """Look up the token. Return 200 with the expiry if valid and unexpired,
+    410 if expired, 404 if unknown. Generic error wording avoids confirming
+    whether a guessed token exists in the system (enumeration defense)."""
+    stmt = select(User).where(User.password_reset_token == payload.token)
+    user = (await db.execute(stmt)).scalars().first()
+    if user is None:
+        raise HTTPException(status_code=404, detail="Invalid or expired token")
+    if (
+        user.password_reset_token_expires_at is None
+        or user.password_reset_token_expires_at < datetime.now(timezone.utc)
+    ):
+        raise HTTPException(status_code=410, detail="Token has expired")
+    return PasswordResetValidateResponse(
+        valid=True,
+        expires_at=user.password_reset_token_expires_at,
+    )
+```
+
+If `HTTPException`, `Depends`, `get_db`, `AsyncSession`, or `router` aren't already imported at the top of `auth.py`, add them.
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+```bash
+python -m pytest tests/integration/test_password_reset_endpoints.py::TestPasswordResetValidate -v
+```
+
+Expected: 4 tests PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/api/v1/endpoints/auth.py tests/integration/test_password_reset_endpoints.py
+git commit -m "$(cat <<'EOF'
+auth: POST /password-reset/validate — read-only token check
+
+Lets the frontend page-load the reset URL and decide whether to render
+the new-password form or an "expired link" message without burning the
+token. 200 on valid+unexpired, 410 on expired, 404 on unknown — generic
+wording so an attacker probing token space can't differentiate "no such
+token" from "expired" via response content.
+
+Response carries valid + expires_at. NO email, NO user_id — disclosing
+which user a token belongs to would be an enumeration leak.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+EOF
+)"
+```
+
+---
+
+## Task 7: Password-reset token consumption endpoint
+
+Completes the URL flow — accepts a token + new password, validates the token, applies the new password hash, invalidates the token, returns 200. After this task lands, password_reset is a real end-to-end flow.
+
+**Files:**
+
+- Modify: `src/api/v1/endpoints/auth.py` (append the endpoint)
+- Modify: `tests/integration/test_password_reset_endpoints.py` (append new test class)
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `tests/integration/test_password_reset_endpoints.py`:
+
+```python
+class TestPasswordResetConsume:
+    async def test_valid_token_changes_password(
+        self,
+        db_session: AsyncSession,
+        issued_reset_token,
+    ):
+        user, token = issued_reset_token
+        old_hash = user.hashed_password
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            r = await client.post(
+                "/api/v1/auth/password-reset/consume",
+                json={"token": token, "new_password": "NewStr0ng!Pass2026"},
+            )
+        assert r.status_code == 200
+
+        await db_session.refresh(user)
+        assert user.hashed_password != old_hash
+        # Token is burned
+        assert user.password_reset_token is None
+        assert user.password_reset_token_expires_at is None
+        # force_password_change flag cleared (user just did exactly that)
+        assert user.force_password_change is False
+
+    async def test_token_only_works_once(
+        self,
+        db_session: AsyncSession,
+        issued_reset_token,
+    ):
+        user, token = issued_reset_token
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            r1 = await client.post(
+                "/api/v1/auth/password-reset/consume",
+                json={"token": token, "new_password": "NewStr0ng!Pass2026"},
+            )
+            assert r1.status_code == 200
+
+            # Second attempt must fail because the token was burned
+            r2 = await client.post(
+                "/api/v1/auth/password-reset/consume",
+                json={"token": token, "new_password": "AnotherStr0ng!Pass"},
+            )
+            assert r2.status_code in (404, 410)
+
+    async def test_expired_token_returns_410(
+        self,
+        db_session: AsyncSession,
+        issued_reset_token,
+    ):
+        user, token = issued_reset_token
+        user.password_reset_token_expires_at = datetime.now(timezone.utc) - timedelta(hours=1)
+        await db_session.commit()
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            r = await client.post(
+                "/api/v1/auth/password-reset/consume",
+                json={"token": token, "new_password": "NewStr0ng!Pass2026"},
+            )
+        assert r.status_code == 410
+
+    async def test_weak_password_rejected(
+        self,
+        db_session: AsyncSession,
+        issued_reset_token,
+    ):
+        """The endpoint must enforce a minimum password length — otherwise
+        the reset flow becomes the cheapest path to set a one-character
+        password, defeating any account-level policy elsewhere."""
+        user, token = issued_reset_token
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            r = await client.post(
+                "/api/v1/auth/password-reset/consume",
+                json={"token": token, "new_password": "x"},  # too short
+            )
+        assert r.status_code == 422  # Pydantic validation failure
+
+        await db_session.refresh(user)
+        # Token must NOT be burned on validation failure
+        assert user.password_reset_token == token
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+```bash
+python -m pytest tests/integration/test_password_reset_endpoints.py::TestPasswordResetConsume -v
+```
+
+Expected: All FAIL with 404 (endpoint doesn't exist yet).
+
+- [ ] **Step 3: Add the endpoint**
+
+Make sure `get_password_hash` is imported at the top of `auth.py`. If not, add:
+
+```python
+from src.core.security import get_password_hash
+```
+
+Append to the bottom of `src/api/v1/endpoints/auth.py`:
+
+```python
+class PasswordResetConsumeRequest(BaseModel):
+    token: str = Field(min_length=20, max_length=256)
+    new_password: str = Field(min_length=12, max_length=256)
+
+
+@router.post(
+    "/password-reset/consume",
+    summary="Consume a password-reset token and set a new password",
+)
+async def password_reset_consume(
+    payload: PasswordResetConsumeRequest,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Burn the token, set the new password hash, clear force_password_change.
+
+    Returns 200 with a generic body — never echoes the email or user_id so a
+    successful response doesn't leak account identity to whoever submits the
+    token. The downstream login flow is where the user proves identity."""
+    stmt = select(User).where(User.password_reset_token == payload.token)
+    user = (await db.execute(stmt)).scalars().first()
+    if user is None:
+        raise HTTPException(status_code=404, detail="Invalid or expired token")
+    if (
+        user.password_reset_token_expires_at is None
+        or user.password_reset_token_expires_at < datetime.now(timezone.utc)
+    ):
+        raise HTTPException(status_code=410, detail="Token has expired")
+
+    user.hashed_password = get_password_hash(payload.new_password)
+    user.password_reset_token = None
+    user.password_reset_token_expires_at = None
+    user.force_password_change = False
+    await db.commit()
+
+    return {"status": "password_updated"}
+```
+
+- [ ] **Step 4: Run all reset-endpoint tests**
+
+```bash
+python -m pytest tests/integration/test_password_reset_endpoints.py -v
+```
+
+Expected: All 8 PASS (4 validate + 4 consume).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/api/v1/endpoints/auth.py tests/integration/test_password_reset_endpoints.py
+git commit -m "$(cat <<'EOF'
+auth: POST /password-reset/consume — burn token + set new password
+
+Completes the reset URL flow. Validates the token, sets the new password
+hash, clears the token + expiry + force_password_change flag in a single
+transaction so a repeated submission of the same token gets 404 (token
+already burned).
+
+Generic 200 body — no email, no user_id echoed back. Login is where
+identity is proven, not here.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+EOF
+)"
+```
+
+---
+
+## Task 8: Rewrite `ProcessActionExecutor` to use real agent dispatch
 
 **Files:**
 
@@ -887,7 +1385,7 @@ EOF
 
 ---
 
-## Task 7: New `FileActionExecutor` for file_quarantine
+## Task 9: New `FileActionExecutor` for file_quarantine
 
 **Files:**
 
@@ -1066,7 +1564,7 @@ EOF
 
 ---
 
-## Task 8: `ForensicsCollectionExecutor` (composite)
+## Task 10: `ForensicsCollectionExecutor` (composite)
 
 **Files:**
 
@@ -1095,32 +1593,80 @@ class TestForensicsCollectionIssuesThreeCommands:
             context=_context_for(test_user.id, test_org.id),
         )
 
-        assert result["success"] is True
-        assert "command_ids" in result
-        assert isinstance(result["command_ids"], list)
-        assert len(result["command_ids"]) == 3
+        # Per-sub-result reporting: each sub-command reports independently
+        assert "sub_results" in result
+        assert isinstance(result["sub_results"], list)
+        assert len(result["sub_results"]) == 3
 
-        # All three commands should exist in agent_commands
-        stmt = select(AgentCommand).where(
-            AgentCommand.id.in_(result["command_ids"])
-        )
-        cmd_rows = (await db_session.execute(stmt)).scalars().all()
-        actions = sorted(c.action for c in cmd_rows)
+        # All three should have queued cleanly (agent enrolled with all capabilities)
+        for sub in result["sub_results"]:
+            assert sub["success"] is True
+            assert sub["command_id"] is not None
+            assert sub["error"] is None
+        actions = sorted(sub["sub_action"] for sub in result["sub_results"])
         assert actions == sorted([
             "collect_process_list",
             "collect_network_connections",
             "collect_memory_dump",
         ])
-        # Chain integrity: each command has a distinct chain_hash
+
+        # All three commands should exist in agent_commands with distinct chain hashes
+        cmd_ids = [sub["command_id"] for sub in result["sub_results"]]
+        stmt = select(AgentCommand).where(AgentCommand.id.in_(cmd_ids))
+        cmd_rows = (await db_session.execute(stmt)).scalars().all()
         chain_hashes = {c.chain_hash for c in cmd_rows}
         assert len(chain_hashes) == 3
 
-    async def test_returns_failure_when_no_agent(
+    async def test_partial_success_when_capability_rejected(
         self,
         db_session: AsyncSession,
         test_org: Organization,
         test_user: User,
     ):
+        """Build an agent enrolled with ONLY `bas` (no ir). Each sub-action
+        is reported on its own merits — collect_process_list might queue
+        while collect_memory_dump gets rejected. The executor reports both
+        truthfully, doesn't roll the partial into a single misleading
+        composite verdict."""
+        from src.remediation.engine import ForensicsCollectionExecutor
+
+        partial_agent = EndpointAgent(
+            hostname="partial-cap-host",
+            platform="linux",
+            agent_version="0.1.0",
+            capabilities=["bas"],  # no ir
+            status="online",
+            organization_id=test_org.id,
+        )
+        db_session.add(partial_agent)
+        await db_session.flush()
+
+        executor = ForensicsCollectionExecutor(db_session)
+        result = await executor.execute(
+            target=partial_agent.hostname,
+            parameters={},
+            context=_context_for(test_user.id, test_org.id),
+        )
+
+        assert "sub_results" in result
+        assert len(result["sub_results"]) == 3
+        # At least one queued, at least one rejected — exact mix depends on
+        # the capability_allows() rules. Each sub-result is honest.
+        successes = [s for s in result["sub_results"] if s["success"]]
+        failures = [s for s in result["sub_results"] if not s["success"]]
+        assert len(successes) + len(failures) == 3
+        for f in failures:
+            assert f["command_id"] is None
+            assert f["error"]  # non-empty error string
+
+    async def test_reports_failure_when_no_agent(
+        self,
+        db_session: AsyncSession,
+        test_org: Organization,
+        test_user: User,
+    ):
+        """No agent enrolled → each sub_result reports the same 'no agent'
+        error. The composite doesn't pretend any sub-command queued."""
         from src.remediation.engine import ForensicsCollectionExecutor
 
         executor = ForensicsCollectionExecutor(db_session)
@@ -1129,9 +1675,12 @@ class TestForensicsCollectionIssuesThreeCommands:
             parameters={},
             context=_context_for(test_user.id, test_org.id),
         )
-        assert result["success"] is False
-        assert "no agent" in result["error"].lower()
-        assert result.get("command_ids", []) == []
+        assert "sub_results" in result
+        assert len(result["sub_results"]) == 3
+        for sub in result["sub_results"]:
+            assert sub["success"] is False
+            assert sub["command_id"] is None
+            assert "no agent" in sub["error"].lower()
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -1152,10 +1701,12 @@ class ForensicsCollectionExecutor(ActionExecutor):
     collect_network_connections, and collect_memory_dump as three separate
     agent commands so each can be tracked individually in the audit chain.
 
-    Partial-success policy: if any sub-command is rejected by the agent
-    service (e.g. capability allowlist refuses it), the composite reports
-    success=False but still returns the list of command IDs that DID get
-    queued, so the operator can see what was dispatched."""
+    Per-sub-result reporting: each sub-command reports its own success
+    independently in ``sub_results``. NO composite success/failure flag —
+    that would conflate "all queued" with "two queued, one rejected" and
+    hide the partial-execution reality from the caller. Callers that need
+    a roll-up should compute it from sub_results themselves.
+    """
 
     SUB_COMMANDS = (
         "collect_process_list",
@@ -1170,6 +1721,7 @@ class ForensicsCollectionExecutor(ActionExecutor):
 
         svc = AgentService(self.db)
         agent = await svc.resolve_for_target(target, organization_id=org_id)
+
         if agent is None:
             await _log_ticket_activity(
                 self.db,
@@ -1180,16 +1732,23 @@ class ForensicsCollectionExecutor(ActionExecutor):
                 organization_id=org_id,
                 extra_metadata={"host": target},
             )
+            no_agent_err = "no agent enrolled for target"
             return {
-                "success": False,
                 "action": "collect_forensics",
                 "target": target,
-                "error": "no agent enrolled for target",
-                "command_ids": [],
+                "agent_id": None,
+                "sub_results": [
+                    {
+                        "sub_action": sub,
+                        "success": False,
+                        "command_id": None,
+                        "error": no_agent_err,
+                    }
+                    for sub in self.SUB_COMMANDS
+                ],
             }
 
-        command_ids: list[str] = []
-        errors: list[str] = []
+        sub_results: list[dict] = []
         for sub_action in self.SUB_COMMANDS:
             try:
                 cmd = await svc.issue_command(
@@ -1198,36 +1757,44 @@ class ForensicsCollectionExecutor(ActionExecutor):
                     payload=parameters or {},
                     issued_by=actor_id,
                 )
-                command_ids.append(cmd.id)
+                sub_results.append({
+                    "sub_action": sub_action,
+                    "success": True,
+                    "command_id": cmd.id,
+                    "error": None,
+                })
             except AgentServiceError as exc:
-                errors.append(f"{sub_action}: {exc}")
+                sub_results.append({
+                    "sub_action": sub_action,
+                    "success": False,
+                    "command_id": None,
+                    "error": str(exc),
+                })
 
+        queued = sum(1 for s in sub_results if s["success"])
+        rejected = len(self.SUB_COMMANDS) - queued
         await _log_ticket_activity(
             self.db,
             source_id=execution_id,
-            activity_type="collect_forensics_queued",
+            activity_type="collect_forensics_dispatched",
             description=(
-                f"Forensics queued on {agent.hostname}: "
-                f"{len(command_ids)}/{len(self.SUB_COMMANDS)} sub-commands accepted"
+                f"Forensics dispatched on {agent.hostname}: "
+                f"{queued} queued, {rejected} rejected (per sub-command, see metadata)"
             ),
             actor_id=actor_id,
             organization_id=org_id,
             extra_metadata={
                 "host": target,
                 "agent_id": agent.id,
-                "command_ids": command_ids,
-                "errors": errors,
+                "sub_results": sub_results,
             },
         )
 
-        success = len(errors) == 0
         return {
-            "success": success,
             "action": "collect_forensics",
             "target": target,
-            "command_ids": command_ids,
-            "errors": errors,
             "agent_id": agent.id,
+            "sub_results": sub_results,
         }
 ```
 
@@ -1260,7 +1827,7 @@ EOF
 
 ---
 
-## Task 9: Closed `ActionType` enum + Pydantic schemas in `src/agentic/action_classifier.py`
+## Task 11: Closed `ActionType` enum + Pydantic schemas in `src/agentic/action_classifier.py`
 
 **Files:**
 
@@ -1464,7 +2031,7 @@ EOF
 
 ---
 
-## Task 10: Capability gate integration test — proves every enum value is real
+## Task 12: Capability gate integration test — proves every enum value is real
 
 **Files:**
 
@@ -1659,9 +2226,15 @@ class TestCapabilityGate:
             parameters={},
             context=_ctx(test_user.id, test_org.id),
         )
-        assert result["success"] is True
-        assert len(result["command_ids"]) == 3
-        stmt = select(AgentCommand).where(AgentCommand.id.in_(result["command_ids"]))
+        # Per-sub-result reporting — each sub-command is independent
+        assert "sub_results" in result
+        assert len(result["sub_results"]) == 3
+        # Gate asserts all three queued for the all-capabilities agent
+        for sub in result["sub_results"]:
+            assert sub["success"] is True
+            assert sub["command_id"] is not None
+        cmd_ids = [sub["command_id"] for sub in result["sub_results"]]
+        stmt = select(AgentCommand).where(AgentCommand.id.in_(cmd_ids))
         cmds = (await db_session.execute(stmt)).scalars().all()
         actions = {c.action for c in cmds}
         assert actions == {
@@ -1730,14 +2303,14 @@ EOF
 
 ---
 
-## Task 11: Full-suite verification + PR-2 commit summary
+## Task 13: Full-suite verification + PR-2 commit summary
 
 **Files:** none (verification only)
 
 - [ ] **Step 1: Run the new PR 2 tests in isolation**
 
 ```bash
-python -m pytest tests/integration/test_agent_service_resolve.py tests/integration/test_action_executors.py tests/integration/test_action_handlers_are_real.py tests/unit/test_action_classifier_schemas.py -v
+python -m pytest tests/integration/test_agent_service_resolve.py tests/integration/test_action_executors.py tests/integration/test_password_reset_endpoints.py tests/integration/test_action_handlers_are_real.py tests/unit/test_action_classifier_schemas.py -v
 ```
 
 Expected: All PASS. Count and report.
@@ -1756,7 +2329,7 @@ Confirm: the PR-1 tests (48 in test_llm_parsing_*) all still pass. Pre-existing 
 git log --oneline a359498..HEAD
 ```
 
-Expected: 10-11 commits, one per task. Confirm each commit message scopes correctly: `db(users)`, `agents`, `remediation(...)`, `agentic`, `test(integration)`.
+Expected: 12-13 commits, one per task (Task 1 is verification-only; Tasks 2-12 each commit). Confirm each commit message scopes correctly: `db(users)`, `agents`, `remediation(...)`, `auth`, `agentic`, `test(integration)`.
 
 - [ ] **Step 4: Report**
 
@@ -1778,6 +2351,7 @@ Named explicitly so they can't smuggle back in:
 - **Investigator integration** (action classifier wired into verdict finalization) — PR 3.
 - **`unsupported_recommendations` migration on Investigation** — PR 3.
 - **`/agentic/capability-gaps` endpoint** — PR 5.
-- **Password reset URL handler** (consumes the token, lets the user pick a new password) — separate sub-project.
-- **Email/SMS dispatch of reset link** — separate sub-project; this PR creates the token, downstream system delivers it.
+- **Email/SMS dispatch of reset link** — separate sub-project; this PR creates the token and exposes `/validate` + `/consume` endpoints, but the notification channel that ships the URL to the user runs elsewhere.
+- **Frontend reset-link landing page** — out of scope for backend PR. The endpoints exist; the React page that calls them is a separate UI sub-project.
+- **Token rate-limit / brute-force protection** — neither endpoint throttles. With 256-bit tokens online brute-force is infeasible, but production deployment should layer rate-limit middleware at the gateway (separate hardening sub-project).
 - **Agent autonomy beyond capabilities allowlist** (e.g. expanding `bas`/`ir`/`purple` to new capability strings) — separate sub-project; the gate uses the existing allowlist.
