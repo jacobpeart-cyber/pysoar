@@ -136,9 +136,13 @@ def extract_json(text: str, schema: Optional[type[BaseModel]] = None) -> ParseRe
     """Extract a JSON object from raw LLM text. Optionally validate against a
     Pydantic schema.
 
-    Strategy ladder: fenced block (added in Task 5) -> bare object -> json.loads
-    -> json_repair.loads (added in Task 6) -> schema validate (added in Task 7).
-    First strategy yielding a parsed dict wins.
+    Strategy ladder (first success wins):
+        1. Fenced block: ```json ... ``` or ``` ... ``` with brace-balanced scan.
+        2. Bare object: first {"key": ...} pattern, brace-balanced.
+        3. First-brace fallback: any '{' in text (handles smart-quoted objects).
+        4. json.loads on the candidate.
+        5. json_repair.loads if json.loads rejects (trailing commas, single quotes).
+        6. Pydantic model_validate if a schema is provided.
 
     Returns ParseResult(ok=False, error=...) on any failure — never raises,
     never returns a hardcoded success-shaped payload.
@@ -287,6 +291,13 @@ async def request_structured(
             + f"\n\nYour previous response failed validation: {result.error}\n"
             "Return ONLY the JSON object matching the schema, no prose, no fences."
         )
-    # Must not be None — loop runs at least once
-    assert last_result is not None
+    if last_result is None:
+        # Defensive: the loop is `range(retries + 1)` with retries >= 0, so
+        # last_result is always assigned before this point. If we ever hit
+        # this branch, something has corrupted the invariant — raise rather
+        # than return a possibly-None ParseResult to the caller.
+        raise AssertionError(
+            "request_structured: loop exited without producing a ParseResult "
+            "(retries must be >= 0)"
+        )
     return last_result
