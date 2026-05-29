@@ -195,6 +195,7 @@ class TestExtractJsonRepair:
         r = extract_json('{“verdict”: “benign”}')
         assert r.ok is True
         assert r.data == {"verdict": "benign"}
+        assert "json_repair" in r.attempt_log
 
     def test_truncated_unrepairable(self):
         # Truncated mid-object with no recoverable structure. json_repair

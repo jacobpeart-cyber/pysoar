@@ -57,9 +57,9 @@ class TestNoFakeSuccessPayloads:
         # As of this PR there is exactly one documented broad catch wrapping
         # json_repair.loads (which may raise non-JSONDecodeError). If the
         # count grows, the new site needs justification in the spec.
-        assert broad_catches <= 1, (
+        assert broad_catches == 1, (
             f"src/core/llm_parsing.py has {broad_catches} broad `except Exception` "
-            f"sites. Only one is allowed (json_repair fallback). New broad "
-            f"catches risk silently swallowing failures — document and "
+            f"sites. EXACTLY ONE is required (json_repair fallback). If you "
+            f"removed it, update this guard. If you added one, document and "
             f"justify before adding."
         )
