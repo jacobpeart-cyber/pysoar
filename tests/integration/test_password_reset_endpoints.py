@@ -60,7 +60,7 @@ class TestPasswordResetValidate:
     async def test_unknown_token_returns_404(self, client: AsyncClient):
         r = await client.post(
             "/api/v1/auth/password-reset/validate",
-            json={"token": "no-such-token-xxxxxxxxxxxxxxxx"},
+            json={"token": "no-such-token-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx12"},
         )
         assert r.status_code == 404
         body = r.json()

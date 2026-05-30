@@ -335,7 +335,7 @@ async def mfa_verify_alias(
 
 
 class PasswordResetTokenRequest(BaseModel):
-    token: str = Field(min_length=20, max_length=256)
+    token: str = Field(min_length=48, max_length=256)
 
 
 class PasswordResetValidateResponse(BaseModel):
@@ -359,13 +359,15 @@ async def password_reset_validate(
     user = (await db.execute(stmt)).scalars().first()
     if user is None:
         raise HTTPException(status_code=404, detail="Invalid or expired token")
-    # SQLite stores naive datetime; convert UTC now to naive for comparison
-    now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
-    if (
-        user.password_reset_token_expires_at is None
-        or user.password_reset_token_expires_at < now_naive
-    ):
-        raise HTTPException(status_code=410, detail="Token has expired")
+    now_utc = datetime.now(timezone.utc)
+    expires_at = user.password_reset_token_expires_at
+    # SQLite returns naive datetimes from tz-aware columns; Postgres returns
+    # aware. Normalize the stored value to tz-aware UTC so the comparison
+    # works on both backends without crashing.
+    if expires_at is not None and expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if expires_at is None or expires_at < now_utc:
+        raise HTTPException(status_code=410, detail="Invalid or expired token")
     return PasswordResetValidateResponse(
         valid=True,
         expires_at=user.password_reset_token_expires_at,
