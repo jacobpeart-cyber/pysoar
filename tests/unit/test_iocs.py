@@ -47,13 +47,13 @@ class TestIOCEndpoints:
         # Create test IOCs
         ioc1 = IOC(
             value="10.0.0.1",
-            ioc_type="ip_address",
-            threat_level="medium",
+            indicator_type="ipv4",
+            severity="medium",
         )
         ioc2 = IOC(
             value="malware.exe",
-            ioc_type="file_hash",
-            threat_level="high",
+            indicator_type="sha256",
+            severity="high",
         )
         db_session.add(ioc1)
         db_session.add(ioc2)
@@ -73,8 +73,8 @@ class TestIOCEndpoints:
         """Test getting a specific IOC"""
         ioc = IOC(
             value="evil.com",
-            ioc_type="domain",
-            threat_level="critical",
+            indicator_type="domain",
+            severity="critical",
         )
         db_session.add(ioc)
         await db_session.commit()
@@ -94,8 +94,8 @@ class TestIOCEndpoints:
         """Test updating an IOC"""
         ioc = IOC(
             value="suspicious.com",
-            ioc_type="domain",
-            threat_level="low",
+            indicator_type="domain",
+            severity="low",
         )
         db_session.add(ioc)
         await db_session.commit()
@@ -115,8 +115,8 @@ class TestIOCEndpoints:
         """Test deleting an IOC"""
         ioc = IOC(
             value="delete-me.com",
-            ioc_type="domain",
-            threat_level="low",
+            indicator_type="domain",
+            severity="low",
         )
         db_session.add(ioc)
         await db_session.commit()
@@ -133,8 +133,8 @@ class TestIOCEndpoints:
         """Test searching IOCs"""
         ioc = IOC(
             value="searchme.evil.com",
-            ioc_type="domain",
-            threat_level="high",
+            indicator_type="domain",
+            severity="high",
         )
         db_session.add(ioc)
         await db_session.commit()
