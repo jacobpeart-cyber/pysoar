@@ -655,7 +655,7 @@ class FirewallBlockExecutor(ActionExecutor):
                 "target_ip": target,
                 "duration_hours": duration_hours,
                 "ioc_id": ioc.id,
-                "expires_at": expires_at,
+                "expires_at": expires_at.isoformat(),
             },
         )
 

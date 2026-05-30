@@ -17,13 +17,14 @@ from src.core.security import get_password_hash
 from src.models.base import Base
 from src.models.user import User
 
-# Test database URL
-TEST_DATABASE_URL = "sqlite+aiosqlite:///./test.db"
+# Test database URL (use in-memory for tests to avoid locking issues)
+TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 
 # Create test engine
 test_engine = create_async_engine(
     TEST_DATABASE_URL,
     echo=False,
+    connect_args={"timeout": 30, "check_same_thread": False},
 )
 
 # Create test session factory
