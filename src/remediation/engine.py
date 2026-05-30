@@ -56,7 +56,7 @@ class RemediationEngine:
             "password_reset": AccountActionExecutor(self.db),
             "session_terminate": AccountActionExecutor(self.db),
             "process_kill": ProcessActionExecutor(self.db),
-            "file_quarantine": ProcessActionExecutor(self.db),
+            "file_quarantine": FileActionExecutor(self.db),
             "patch_deploy": PatchExecutor(self.db),
             "dns_sinkhole": NetworkActionExecutor(self.db),
             "email_quarantine": NotificationExecutor(self.db),
@@ -926,6 +926,110 @@ class ProcessActionExecutor(ActionExecutor):
         return {
             "success": True,
             "action": action,
+            "target": target,
+            "command_id": cmd.id,
+            "command_status": cmd.status,
+            "agent_id": agent.id,
+        }
+
+
+class FileActionExecutor(ActionExecutor):
+    """File-level actions queued for endpoint agent execution (quarantine_file)."""
+
+    async def execute(self, target: str, parameters: dict, context: dict) -> dict:
+        from src.agents.service import AgentService, AgentServiceError
+
+        execution_id, org_id, actor_id = _get_execution_context(context)
+        file_path = parameters.get("file_path")
+        file_hash = parameters.get("file_hash")
+
+        self.logger.info(
+            "Dispatching file quarantine to endpoint agent",
+            extra={"target": target, "file_path": file_path},
+        )
+
+        svc = AgentService(self.db)
+        agent = await svc.resolve_for_target(target, organization_id=org_id)
+        if agent is None:
+            await _log_ticket_activity(
+                self.db,
+                source_id=execution_id,
+                activity_type="file_quarantine_no_agent",
+                description=(
+                    f"File quarantine requested for {file_path} on {target} "
+                    f"but no endpoint agent is enrolled"
+                ),
+                actor_id=actor_id,
+                organization_id=org_id,
+                extra_metadata={
+                    "host": target,
+                    "file_path": file_path,
+                    "file_hash": file_hash,
+                },
+            )
+            return {
+                "success": False,
+                "action": "file_quarantine",
+                "target": target,
+                "error": "no agent enrolled for target",
+            }
+
+        try:
+            cmd = await svc.issue_command(
+                agent=agent,
+                action="quarantine_file",
+                payload={
+                    "file_path": file_path,
+                    "file_hash": file_hash,
+                },
+                issued_by=actor_id,
+            )
+        except AgentServiceError as exc:
+            await _log_ticket_activity(
+                self.db,
+                source_id=execution_id,
+                activity_type="file_quarantine_rejected",
+                description=f"Agent service rejected file quarantine: {exc}",
+                actor_id=actor_id,
+                organization_id=org_id,
+                extra_metadata={
+                    "host": target,
+                    "file_path": file_path,
+                    "file_hash": file_hash,
+                    "agent_id": agent.id,
+                    "rejection_reason": str(exc),
+                },
+            )
+            return {
+                "success": False,
+                "action": "file_quarantine",
+                "target": target,
+                "error": str(exc),
+            }
+
+        await _log_ticket_activity(
+            self.db,
+            source_id=execution_id,
+            activity_type="file_quarantine_queued",
+            description=(
+                f"Quarantine queued for {file_path} on {agent.hostname} "
+                f"(command_id={cmd.id})"
+            ),
+            actor_id=actor_id,
+            organization_id=org_id,
+            extra_metadata={
+                "host": target,
+                "file_path": file_path,
+                "file_hash": file_hash,
+                "agent_id": agent.id,
+                "command_id": cmd.id,
+                "command_status": cmd.status,
+            },
+        )
+
+        return {
+            "success": True,
+            "action": "file_quarantine",
             "target": target,
             "command_id": cmd.id,
             "command_status": cmd.status,
