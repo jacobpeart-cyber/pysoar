@@ -1,9 +1,10 @@
 """User model for authentication and authorization"""
 
+from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
-from sqlalchemy import Boolean, ForeignKey, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.core.encryption import EncryptedType, EncryptedJSON
@@ -44,6 +45,12 @@ class User(BaseModel):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     is_superuser: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     force_password_change: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    password_reset_token: Mapped[Optional[str]] = mapped_column(
+        String(128), nullable=True, index=True
+    )
+    password_reset_token_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     mfa_enabled: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
 
     # Organization
