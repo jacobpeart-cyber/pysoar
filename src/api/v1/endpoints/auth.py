@@ -1,13 +1,16 @@
 """Authentication endpoints with enhanced security"""
 
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel, Field
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DatabaseSession, RedisClient
+from src.models.user import User
 from src.core.account_lockout import AccountLockoutManager
 from src.core.config import settings
 from src.core.password_policy import PasswordValidator
@@ -329,3 +332,41 @@ async def mfa_verify_alias(
         "message": "MFA successfully enabled",
         "backup_codes": backup_codes,
     }
+
+
+class PasswordResetTokenRequest(BaseModel):
+    token: str = Field(min_length=20, max_length=256)
+
+
+class PasswordResetValidateResponse(BaseModel):
+    valid: bool
+    expires_at: datetime
+
+
+@router.post(
+    "/password-reset/validate",
+    response_model=PasswordResetValidateResponse,
+    summary="Validate a password-reset token without consuming it",
+)
+async def password_reset_validate(
+    payload: PasswordResetTokenRequest,
+    db: DatabaseSession = None,
+) -> PasswordResetValidateResponse:
+    """Look up the token. Return 200 with the expiry if valid and unexpired,
+    410 if expired, 404 if unknown. Generic error wording avoids confirming
+    whether a guessed token exists in the system (enumeration defense)."""
+    stmt = select(User).where(User.password_reset_token == payload.token)
+    user = (await db.execute(stmt)).scalars().first()
+    if user is None:
+        raise HTTPException(status_code=404, detail="Invalid or expired token")
+    # SQLite stores naive datetime; convert UTC now to naive for comparison
+    now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+    if (
+        user.password_reset_token_expires_at is None
+        or user.password_reset_token_expires_at < now_naive
+    ):
+        raise HTTPException(status_code=410, detail="Token has expired")
+    return PasswordResetValidateResponse(
+        valid=True,
+        expires_at=user.password_reset_token_expires_at,
+    )
