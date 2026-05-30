@@ -270,3 +270,113 @@ class TestFileQuarantineIssuesAgentCommand:
         # ProcessActionExecutor only handles process_kill now
         assert isinstance(engine.executors["process_kill"], ProcessActionExecutor)
         assert not isinstance(engine.executors["process_kill"], FileActionExecutor)
+
+
+class TestForensicsCollectionIssuesThreeCommands:
+    async def test_three_commands_queued(
+        self,
+        db_session: AsyncSession,
+        default_org: Organization,
+        default_user: User,
+        default_agent: EndpointAgent,
+    ):
+        from src.remediation.engine import ForensicsCollectionExecutor
+
+        executor = ForensicsCollectionExecutor(db_session)
+        result = await executor.execute(
+            target=default_agent.hostname,
+            parameters={},
+            context=_context_for(default_user.id, default_org.id),
+        )
+
+        # Per-sub-result reporting: each sub-command reports independently
+        assert "sub_results" in result
+        assert isinstance(result["sub_results"], list)
+        assert len(result["sub_results"]) == 3
+
+        # All three should have queued cleanly (agent enrolled with all capabilities)
+        for sub in result["sub_results"]:
+            assert sub["success"] is True
+            assert sub["command_id"] is not None
+            assert sub["error"] is None
+        actions = sorted(sub["sub_action"] for sub in result["sub_results"])
+        assert actions == sorted([
+            "collect_process_list",
+            "collect_network_connections",
+            "collect_memory_dump",
+        ])
+
+        # All three commands should exist in agent_commands with distinct chain hashes
+        cmd_ids = [sub["command_id"] for sub in result["sub_results"]]
+        stmt = select(AgentCommand).where(AgentCommand.id.in_(cmd_ids))
+        cmd_rows = (await db_session.execute(stmt)).scalars().all()
+        chain_hashes = {c.chain_hash for c in cmd_rows}
+        assert len(chain_hashes) == 3
+
+    async def test_partial_success_when_capability_rejected(
+        self,
+        db_session: AsyncSession,
+        default_org: Organization,
+        default_user: User,
+    ):
+        """Build an agent enrolled with ONLY `purple` — that capability
+        permits COLLECT_PROCESS_LIST but NOT the other two forensics
+        actions (per src/agents/capabilities.py CAPABILITY_ACTIONS map).
+        So the executor MUST report exactly one success and two failures,
+        proving partial outcomes survive the per-sub-result reporting."""
+        from src.remediation.engine import ForensicsCollectionExecutor
+
+        partial_agent = EndpointAgent(
+            hostname="partial-cap-host",
+            os_type="linux",
+            agent_version="0.1.0",
+            capabilities=["purple"],  # permits ONLY collect_process_list
+            status="active",
+            organization_id=default_org.id,
+        )
+        db_session.add(partial_agent)
+        await db_session.flush()
+
+        executor = ForensicsCollectionExecutor(db_session)
+        result = await executor.execute(
+            target=partial_agent.hostname,
+            parameters={},
+            context=_context_for(default_user.id, default_org.id),
+        )
+
+        assert "sub_results" in result
+        assert len(result["sub_results"]) == 3
+
+        # Indexed assertion: exactly the process_list sub queues
+        by_action = {s["sub_action"]: s for s in result["sub_results"]}
+        assert by_action["collect_process_list"]["success"] is True
+        assert by_action["collect_process_list"]["command_id"] is not None
+        assert by_action["collect_network_connections"]["success"] is False
+        assert by_action["collect_network_connections"]["command_id"] is None
+        assert by_action["collect_network_connections"]["error"]
+        assert by_action["collect_memory_dump"]["success"] is False
+        assert by_action["collect_memory_dump"]["command_id"] is None
+        assert by_action["collect_memory_dump"]["error"]
+
+    async def test_reports_failure_when_no_agent(
+        self,
+        db_session: AsyncSession,
+        default_org: Organization,
+        default_user: User,
+    ):
+        """No agent enrolled → each sub_result reports the same 'no agent'
+        error. The composite doesn't pretend any sub-command queued."""
+        from src.remediation.engine import ForensicsCollectionExecutor
+
+        executor = ForensicsCollectionExecutor(db_session)
+        result = await executor.execute(
+            target="no-such-host-12345",
+            parameters={},
+            context=_context_for(default_user.id, default_org.id),
+        )
+        assert "sub_results" in result
+        assert len(result["sub_results"]) == 3
+        for sub in result["sub_results"]:
+            assert sub["success"] is False
+            assert sub["command_id"] is None
+            assert "no agent" in sub["error"].lower()
