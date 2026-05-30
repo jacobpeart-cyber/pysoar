@@ -114,7 +114,7 @@ from src.agents.models import EndpointAgent
 
 
 @pytest_asyncio.fixture
-async def test_org(db_session: AsyncSession) -> Organization:
+async def default_org(db_session: AsyncSession) -> Organization:
     org = Organization(
         name="ExecutorTestOrg",
         slug="executor-test-org",
@@ -127,14 +127,14 @@ async def test_org(db_session: AsyncSession) -> Organization:
 
 
 @pytest_asyncio.fixture
-async def test_user(db_session: AsyncSession, test_org: Organization) -> User:
+async def default_user(db_session: AsyncSession, default_org: Organization) -> User:
     user = User(
         email="target@executor-test.local",
         hashed_password=get_password_hash("not-used-in-tests"),
         full_name="Executor Test Target",
         is_active=True,
         is_superuser=False,
-        organization_id=test_org.id,
+        organization_id=default_org.id,
     )
     db_session.add(user)
     await db_session.flush()
@@ -142,7 +142,7 @@ async def test_user(db_session: AsyncSession, test_org: Organization) -> User:
 
 
 @pytest_asyncio.fixture
-async def test_agent(db_session: AsyncSession, test_org: Organization) -> EndpointAgent:
+async def default_agent(db_session: AsyncSession, default_org: Organization) -> EndpointAgent:
     """Endpoint agent enrolled with all capabilities the executors might need."""
     agent = EndpointAgent(
         hostname="executor-test-host-01",
@@ -150,7 +150,7 @@ async def test_agent(db_session: AsyncSession, test_org: Organization) -> Endpoi
         agent_version="0.1.0",
         capabilities=["bas", "ir", "purple"],
         status="online",
-        organization_id=test_org.id,
+        organization_id=default_org.id,
         last_command_hash=None,  # genesis
     )
     db_session.add(agent)
@@ -331,11 +331,11 @@ This is the target-string → EndpointAgent resolver that the fixed executors ca
 **Files:**
 
 - Modify: `src/agents/service.py`
-- Create: `tests/integration/test_agent_service_resolve.py`
+- Create: `tests/integration/default_agent_service_resolve.py`
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `tests/integration/test_agent_service_resolve.py`:
+Create `tests/integration/default_agent_service_resolve.py`:
 
 ```python
 """Tests for AgentService.resolve_for_target."""
@@ -354,51 +354,51 @@ class TestResolveForTarget:
     async def test_resolves_by_hostname(
         self,
         db_session: AsyncSession,
-        test_agent: EndpointAgent,
-        test_org: Organization,
+        default_agent: EndpointAgent,
+        default_org: Organization,
     ):
         svc = AgentService(db_session)
         resolved = await svc.resolve_for_target(
-            test_agent.hostname, organization_id=test_org.id
+            default_agent.hostname, organization_id=default_org.id
         )
         assert resolved is not None
-        assert resolved.id == test_agent.id
+        assert resolved.id == default_agent.id
 
     async def test_resolves_by_ip(
         self,
         db_session: AsyncSession,
-        test_agent: EndpointAgent,
-        test_org: Organization,
+        default_agent: EndpointAgent,
+        default_org: Organization,
     ):
         # Set an IP on the agent
-        test_agent.ip_address = "10.0.0.42"
+        default_agent.ip_address = "10.0.0.42"
         await db_session.flush()
         svc = AgentService(db_session)
         resolved = await svc.resolve_for_target(
-            "10.0.0.42", organization_id=test_org.id
+            "10.0.0.42", organization_id=default_org.id
         )
         assert resolved is not None
-        assert resolved.id == test_agent.id
+        assert resolved.id == default_agent.id
 
     async def test_returns_none_for_unknown_target(
         self,
         db_session: AsyncSession,
-        test_agent: EndpointAgent,
-        test_org: Organization,
+        default_agent: EndpointAgent,
+        default_org: Organization,
     ):
         svc = AgentService(db_session)
         resolved = await svc.resolve_for_target(
-            "nonexistent-host-99", organization_id=test_org.id
+            "nonexistent-host-99", organization_id=default_org.id
         )
         assert resolved is None
 
     async def test_scopes_to_caller_org(
         self,
         db_session: AsyncSession,
-        test_agent: EndpointAgent,
-        test_org: Organization,
+        default_agent: EndpointAgent,
+        default_org: Organization,
     ):
-        """The agent belongs to test_org. Resolving the same hostname under a
+        """The agent belongs to default_org. Resolving the same hostname under a
         DIFFERENT org's id MUST return None — never leak across tenants."""
         from src.models.organization import Organization as OrgModel
 
@@ -410,29 +410,29 @@ class TestResolveForTarget:
         svc = AgentService(db_session)
         # Hostname matches but org doesn't — must NOT return the agent
         resolved = await svc.resolve_for_target(
-            test_agent.hostname, organization_id=other_org.id
+            default_agent.hostname, organization_id=other_org.id
         )
         assert resolved is None
 
-    async def test_organization_id_is_keyword_only(
+    async def default_organization_id_is_keyword_only(
         self,
         db_session: AsyncSession,
-        test_org: Organization,
+        default_org: Organization,
     ):
         """organization_id MUST be keyword-only — protects against positional
         argument shuffling that could silently drop the tenant filter."""
         svc = AgentService(db_session)
         with pytest.raises(TypeError):
             # Passing organization_id positionally must fail
-            await svc.resolve_for_target("some-host", test_org.id)  # type: ignore[misc]
+            await svc.resolve_for_target("some-host", default_org.id)  # type: ignore[misc]
 ```
 
-Note: This test references `test_agent.ip_address` — only proceed past Step 2 if `EndpointAgent` actually has an `ip_address` field. Check by reading `src/agents/models.py`. If the field is named differently (e.g. `ip`), update the test field name to match. If there is NO IP field, drop `test_resolves_by_ip` and document in the commit.
+Note: This test references `default_agent.ip_address` — only proceed past Step 2 if `EndpointAgent` actually has an `ip_address` field. Check by reading `src/agents/models.py`. If the field is named differently (e.g. `ip`), update the test field name to match. If there is NO IP field, drop `test_resolves_by_ip` and document in the commit.
 
 - [ ] **Step 2: Run tests to verify they fail**
 
 ```bash
-python -m pytest tests/integration/test_agent_service_resolve.py -v
+python -m pytest tests/integration/default_agent_service_resolve.py -v
 ```
 
 Expected: All FAIL with `AttributeError: 'AgentService' object has no attribute 'resolve_for_target'`.
@@ -489,7 +489,7 @@ If imports for `Optional`, `select`, or `EndpointAgent` aren't already at the to
 - [ ] **Step 4: Run tests to verify they pass**
 
 ```bash
-python -m pytest tests/integration/test_agent_service_resolve.py -v
+python -m pytest tests/integration/default_agent_service_resolve.py -v
 ```
 
 Expected: All tests PASS (or 3 PASS + the IP test skipped if the model has no IP field).
@@ -497,7 +497,7 @@ Expected: All tests PASS (or 3 PASS + the IP test skipped if the model has no IP
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/agents/service.py tests/integration/test_agent_service_resolve.py
+git add src/agents/service.py tests/integration/default_agent_service_resolve.py
 git commit -m "$(cat <<'EOF'
 agents: add AgentService.resolve_for_target for executor dispatch
 
@@ -567,52 +567,52 @@ class TestPasswordResetGeneratesRealToken:
     async def test_token_is_set_and_indexed(
         self,
         db_session: AsyncSession,
-        test_org: Organization,
-        test_user: User,
+        default_org: Organization,
+        default_user: User,
     ):
         executor = AccountActionExecutor(db_session)
         result = await executor.execute(
-            target=test_user.email,
+            target=default_user.email,
             parameters={"action": "password_reset"},
-            context=_context_for(test_user.id, test_org.id),
+            context=_context_for(default_user.id, default_org.id),
         )
 
         assert result["success"] is True
 
-        await db_session.refresh(test_user)
-        assert test_user.password_reset_token is not None
-        assert len(test_user.password_reset_token) >= 40  # 48-byte url-safe is ~64 chars
-        assert test_user.password_reset_token_expires_at is not None
-        assert test_user.password_reset_token_expires_at > datetime.now(timezone.utc)
-        assert test_user.password_reset_token_expires_at < (
+        await db_session.refresh(default_user)
+        assert default_user.password_reset_token is not None
+        assert len(default_user.password_reset_token) >= 40  # 48-byte url-safe is ~64 chars
+        assert default_user.password_reset_token_expires_at is not None
+        assert default_user.password_reset_token_expires_at > datetime.now(timezone.utc)
+        assert default_user.password_reset_token_expires_at < (
             datetime.now(timezone.utc) + timedelta(hours=25)
         )
-        assert test_user.force_password_change is True
+        assert default_user.force_password_change is True
 
     async def test_token_is_NOT_returned_in_result(
         self,
         db_session: AsyncSession,
-        test_org: Organization,
-        test_user: User,
+        default_org: Organization,
+        default_user: User,
     ):
         """The plaintext token must not leak through the executor's return
         value — only the User row carries it."""
         executor = AccountActionExecutor(db_session)
         result = await executor.execute(
-            target=test_user.email,
+            target=default_user.email,
             parameters={"action": "password_reset"},
-            context=_context_for(test_user.id, test_org.id),
+            context=_context_for(default_user.id, default_org.id),
         )
-        await db_session.refresh(test_user)
+        await db_session.refresh(default_user)
         # The full plaintext token must not be in the result dict
         result_str = str(result)
-        assert test_user.password_reset_token not in result_str
+        assert default_user.password_reset_token not in result_str
 
     async def test_audit_row_carries_no_token_material(
         self,
         db_session: AsyncSession,
-        test_org: Organization,
-        test_user: User,
+        default_org: Organization,
+        default_user: User,
         monkeypatch,
     ):
         """The TicketActivity audit row must contain NO token-identifying
@@ -639,17 +639,17 @@ class TestPasswordResetGeneratesRealToken:
 
         executor = AccountActionExecutor(db_session)
         await executor.execute(
-            target=test_user.email,
+            target=default_user.email,
             parameters={"action": "password_reset"},
-            context=_context_for(test_user.id, test_org.id),
+            context=_context_for(default_user.id, default_org.id),
         )
-        await db_session.refresh(test_user)
-        assert test_user.password_reset_token == FIXED_TOKEN
+        await db_session.refresh(default_user)
+        assert default_user.password_reset_token == FIXED_TOKEN
 
         # Fetch the most recent activity row for this execution
         stmt = (
             select(TicketActivity)
-            .where(TicketActivity.source_id == _context_for(test_user.id, test_org.id)["execution_id"])
+            .where(TicketActivity.source_id == _context_for(default_user.id, default_org.id)["execution_id"])
             .order_by(TicketActivity.created_at.desc())
         )
         activity = (await db_session.execute(stmt)).scalars().first()
@@ -682,7 +682,7 @@ class TestPasswordResetGeneratesRealToken:
 python -m pytest tests/integration/test_action_executors.py::TestPasswordResetGeneratesRealToken -v
 ```
 
-Expected: FAIL — `test_user.password_reset_token` is None after execute (the current code only sets `force_password_change`).
+Expected: FAIL — `default_user.password_reset_token` is None after execute (the current code only sets `force_password_change`).
 
 - [ ] **Step 3: Modify `AccountActionExecutor.execute` password_reset branch**
 
@@ -823,19 +823,19 @@ def _ctx(user_id: str, org_id: str) -> dict:
 
 @pytest.fixture
 async def issued_reset_token(
-    db_session: AsyncSession, test_org: Organization, test_user: User
+    db_session: AsyncSession, default_org: Organization, default_user: User
 ) -> tuple[User, str]:
-    """Run the executor to create a real token on test_user. Returns the user
+    """Run the executor to create a real token on default_user. Returns the user
     and the plaintext token so the endpoint tests can submit it."""
     executor = AccountActionExecutor(db_session)
     await executor.execute(
-        target=test_user.email,
+        target=default_user.email,
         parameters={"action": "password_reset"},
-        context=_ctx(test_user.id, test_org.id),
+        context=_ctx(default_user.id, default_org.id),
     )
     await db_session.commit()
-    await db_session.refresh(test_user)
-    return test_user, test_user.password_reset_token
+    await db_session.refresh(default_user)
+    return default_user, default_user.password_reset_token
 
 
 class TestPasswordResetValidate:
@@ -1302,17 +1302,17 @@ class TestProcessKillIssuesAgentCommand:
     async def test_writes_agent_commands_row(
         self,
         db_session: AsyncSession,
-        test_org: Organization,
-        test_user: User,
-        test_agent: EndpointAgent,
+        default_org: Organization,
+        default_user: User,
+        default_agent: EndpointAgent,
     ):
         from src.remediation.engine import ProcessActionExecutor
 
         executor = ProcessActionExecutor(db_session)
         result = await executor.execute(
-            target=test_agent.hostname,
+            target=default_agent.hostname,
             parameters={"action": "kill", "pid": 1234, "process_name": "malware.exe"},
-            context=_context_for(test_user.id, test_org.id),
+            context=_context_for(default_user.id, default_org.id),
         )
 
         assert result["success"] is True
@@ -1322,7 +1322,7 @@ class TestProcessKillIssuesAgentCommand:
         cmd_row = (await db_session.execute(stmt)).scalars().first()
         assert cmd_row is not None
         assert cmd_row.action == "kill_process"
-        assert cmd_row.agent_id == test_agent.id
+        assert cmd_row.agent_id == default_agent.id
         assert cmd_row.payload.get("pid") == 1234
         assert cmd_row.payload.get("process_name") == "malware.exe"
         # Hash chain must be populated
@@ -1334,8 +1334,8 @@ class TestProcessKillIssuesAgentCommand:
     async def test_returns_failure_when_no_agent(
         self,
         db_session: AsyncSession,
-        test_org: Organization,
-        test_user: User,
+        default_org: Organization,
+        default_user: User,
     ):
         """No agent enrolled for the target → executor returns success=False
         with a real error. Never returns success=True with a placeholder."""
@@ -1345,7 +1345,7 @@ class TestProcessKillIssuesAgentCommand:
         result = await executor.execute(
             target="no-such-host-12345",
             parameters={"action": "kill", "pid": 1, "process_name": "x"},
-            context=_context_for(test_user.id, test_org.id),
+            context=_context_for(default_user.id, default_org.id),
         )
         assert result["success"] is False
         assert "no agent" in result["error"].lower()
@@ -1514,17 +1514,17 @@ class TestFileQuarantineIssuesAgentCommand:
     async def test_writes_agent_commands_row(
         self,
         db_session: AsyncSession,
-        test_org: Organization,
-        test_user: User,
-        test_agent: EndpointAgent,
+        default_org: Organization,
+        default_user: User,
+        default_agent: EndpointAgent,
     ):
         from src.remediation.engine import FileActionExecutor
 
         executor = FileActionExecutor(db_session)
         result = await executor.execute(
-            target=test_agent.hostname,
+            target=default_agent.hostname,
             parameters={"file_path": "/tmp/malware.bin", "file_hash": "abc123"},
-            context=_context_for(test_user.id, test_org.id),
+            context=_context_for(default_user.id, default_org.id),
         )
 
         assert result["success"] is True
@@ -1538,8 +1538,8 @@ class TestFileQuarantineIssuesAgentCommand:
     async def test_returns_failure_when_no_agent(
         self,
         db_session: AsyncSession,
-        test_org: Organization,
-        test_user: User,
+        default_org: Organization,
+        default_user: User,
     ):
         from src.remediation.engine import FileActionExecutor
 
@@ -1547,7 +1547,7 @@ class TestFileQuarantineIssuesAgentCommand:
         result = await executor.execute(
             target="no-such-host-12345",
             parameters={"file_path": "/tmp/x"},
-            context=_context_for(test_user.id, test_org.id),
+            context=_context_for(default_user.id, default_org.id),
         )
         assert result["success"] is False
         assert "no agent" in result["error"].lower()
@@ -1693,17 +1693,17 @@ class TestForensicsCollectionIssuesThreeCommands:
     async def test_three_commands_queued(
         self,
         db_session: AsyncSession,
-        test_org: Organization,
-        test_user: User,
-        test_agent: EndpointAgent,
+        default_org: Organization,
+        default_user: User,
+        default_agent: EndpointAgent,
     ):
         from src.remediation.engine import ForensicsCollectionExecutor
 
         executor = ForensicsCollectionExecutor(db_session)
         result = await executor.execute(
-            target=test_agent.hostname,
+            target=default_agent.hostname,
             parameters={},
-            context=_context_for(test_user.id, test_org.id),
+            context=_context_for(default_user.id, default_org.id),
         )
 
         # Per-sub-result reporting: each sub-command reports independently
@@ -1733,8 +1733,8 @@ class TestForensicsCollectionIssuesThreeCommands:
     async def test_partial_success_when_capability_rejected(
         self,
         db_session: AsyncSession,
-        test_org: Organization,
-        test_user: User,
+        default_org: Organization,
+        default_user: User,
     ):
         """Build an agent enrolled with ONLY `purple` — that capability
         permits COLLECT_PROCESS_LIST but NOT the other two forensics
@@ -1749,7 +1749,7 @@ class TestForensicsCollectionIssuesThreeCommands:
             agent_version="0.1.0",
             capabilities=["purple"],  # permits ONLY collect_process_list
             status="online",
-            organization_id=test_org.id,
+            organization_id=default_org.id,
         )
         db_session.add(partial_agent)
         await db_session.flush()
@@ -1758,7 +1758,7 @@ class TestForensicsCollectionIssuesThreeCommands:
         result = await executor.execute(
             target=partial_agent.hostname,
             parameters={},
-            context=_context_for(test_user.id, test_org.id),
+            context=_context_for(default_user.id, default_org.id),
         )
 
         assert "sub_results" in result
@@ -1778,8 +1778,8 @@ class TestForensicsCollectionIssuesThreeCommands:
     async def test_reports_failure_when_no_agent(
         self,
         db_session: AsyncSession,
-        test_org: Organization,
-        test_user: User,
+        default_org: Organization,
+        default_user: User,
     ):
         """No agent enrolled → each sub_result reports the same 'no agent'
         error. The composite doesn't pretend any sub-command queued."""
@@ -1789,7 +1789,7 @@ class TestForensicsCollectionIssuesThreeCommands:
         result = await executor.execute(
             target="no-such-host-12345",
             parameters={},
-            context=_context_for(test_user.id, test_org.id),
+            context=_context_for(default_user.id, default_org.id),
         )
         assert "sub_results" in result
         assert len(result["sub_results"]) == 3
@@ -2203,15 +2203,15 @@ class TestCapabilityGate:
     async def test_firewall_block(
         self,
         db_session: AsyncSession,
-        test_org: Organization,
-        test_user: User,
+        default_org: Organization,
+        default_user: User,
     ):
         assert ActionType.FIREWALL_BLOCK.value == "firewall_block"
         executor = FirewallBlockExecutor(db_session)
         result = await executor.execute(
             target="203.0.113.42",
             parameters={"duration_hours": 12},
-            context=_ctx(test_user.id, test_org.id),
+            context=_ctx(default_user.id, default_org.id),
         )
         assert result["success"] is True
         # Verify the ThreatIndicator was written
@@ -2227,8 +2227,8 @@ class TestCapabilityGate:
     async def test_host_isolate(
         self,
         db_session: AsyncSession,
-        test_org: Organization,
-        test_user: User,
+        default_org: Organization,
+        default_user: User,
     ):
         assert ActionType.HOST_ISOLATE.value == "host_isolate"
         # Need an Asset to isolate
@@ -2237,7 +2237,7 @@ class TestCapabilityGate:
             hostname="gate-test-host",
             asset_type="server",
             status="active",
-            organization_id=test_org.id,
+            organization_id=default_org.id,
         )
         db_session.add(asset)
         await db_session.flush()
@@ -2245,7 +2245,7 @@ class TestCapabilityGate:
         result = await executor.execute(
             target="gate-test-host",
             parameters={},
-            context=_ctx(test_user.id, test_org.id),
+            context=_ctx(default_user.id, default_org.id),
         )
         assert result["success"] is True
         await db_session.refresh(asset)
@@ -2254,44 +2254,44 @@ class TestCapabilityGate:
     async def test_account_disable(
         self,
         db_session: AsyncSession,
-        test_org: Organization,
-        test_user: User,
+        default_org: Organization,
+        default_user: User,
     ):
         assert ActionType.ACCOUNT_DISABLE.value == "account_disable"
         executor = AccountActionExecutor(db_session)
         result = await executor.execute(
-            target=test_user.email,
+            target=default_user.email,
             parameters={"action": "disable"},
-            context=_ctx(test_user.id, test_org.id),
+            context=_ctx(default_user.id, default_org.id),
         )
         assert result["success"] is True
-        await db_session.refresh(test_user)
-        assert test_user.is_active is False
+        await db_session.refresh(default_user)
+        assert default_user.is_active is False
 
     async def test_password_reset(
         self,
         db_session: AsyncSession,
-        test_org: Organization,
-        test_user: User,
+        default_org: Organization,
+        default_user: User,
     ):
         assert ActionType.PASSWORD_RESET.value == "password_reset"
         executor = AccountActionExecutor(db_session)
         result = await executor.execute(
-            target=test_user.email,
+            target=default_user.email,
             parameters={"action": "password_reset"},
-            context=_ctx(test_user.id, test_org.id),
+            context=_ctx(default_user.id, default_org.id),
         )
         assert result["success"] is True
-        await db_session.refresh(test_user)
-        assert test_user.password_reset_token is not None
-        assert test_user.password_reset_token_expires_at is not None
-        assert test_user.password_reset_token_expires_at > datetime.now(timezone.utc)
+        await db_session.refresh(default_user)
+        assert default_user.password_reset_token is not None
+        assert default_user.password_reset_token_expires_at is not None
+        assert default_user.password_reset_token_expires_at > datetime.now(timezone.utc)
 
     async def test_password_reset_end_to_end_through_endpoints(
         self,
         db_session: AsyncSession,
-        test_org: Organization,
-        test_user: User,
+        default_org: Organization,
+        default_user: User,
     ):
         """End-to-end gate for password_reset: executor issues a token,
         /validate sees it as valid, /consume burns it and changes the
@@ -2304,14 +2304,14 @@ class TestCapabilityGate:
         # Step 1: executor sets the token
         executor = AccountActionExecutor(db_session)
         await executor.execute(
-            target=test_user.email,
+            target=default_user.email,
             parameters={"action": "password_reset"},
-            context=_ctx(test_user.id, test_org.id),
+            context=_ctx(default_user.id, default_org.id),
         )
         await db_session.commit()
-        await db_session.refresh(test_user)
-        token = test_user.password_reset_token
-        original_hash = test_user.hashed_password
+        await db_session.refresh(default_user)
+        token = default_user.password_reset_token
+        original_hash = default_user.hashed_password
         assert token is not None
 
         async with AsyncClient(
@@ -2338,23 +2338,23 @@ class TestCapabilityGate:
             )
             assert r.status_code in (404, 410)
 
-        await db_session.refresh(test_user)
-        assert test_user.password_reset_token is None
-        assert test_user.hashed_password != original_hash
+        await db_session.refresh(default_user)
+        assert default_user.password_reset_token is None
+        assert default_user.hashed_password != original_hash
 
     async def test_process_kill(
         self,
         db_session: AsyncSession,
-        test_org: Organization,
-        test_user: User,
-        test_agent: EndpointAgent,
+        default_org: Organization,
+        default_user: User,
+        default_agent: EndpointAgent,
     ):
         assert ActionType.PROCESS_KILL.value == "process_kill"
         executor = ProcessActionExecutor(db_session)
         result = await executor.execute(
-            target=test_agent.hostname,
+            target=default_agent.hostname,
             parameters={"action": "kill", "pid": 999, "process_name": "evil.exe"},
-            context=_ctx(test_user.id, test_org.id),
+            context=_ctx(default_user.id, default_org.id),
         )
         assert result["success"] is True
         stmt = select(AgentCommand).where(AgentCommand.id == result["command_id"])
@@ -2366,16 +2366,16 @@ class TestCapabilityGate:
     async def test_file_quarantine(
         self,
         db_session: AsyncSession,
-        test_org: Organization,
-        test_user: User,
-        test_agent: EndpointAgent,
+        default_org: Organization,
+        default_user: User,
+        default_agent: EndpointAgent,
     ):
         assert ActionType.FILE_QUARANTINE.value == "file_quarantine"
         executor = FileActionExecutor(db_session)
         result = await executor.execute(
-            target=test_agent.hostname,
+            target=default_agent.hostname,
             parameters={"file_path": "/tmp/evil.bin"},
-            context=_ctx(test_user.id, test_org.id),
+            context=_ctx(default_user.id, default_org.id),
         )
         assert result["success"] is True
         stmt = select(AgentCommand).where(AgentCommand.id == result["command_id"])
@@ -2386,16 +2386,16 @@ class TestCapabilityGate:
     async def test_collect_forensics(
         self,
         db_session: AsyncSession,
-        test_org: Organization,
-        test_user: User,
-        test_agent: EndpointAgent,
+        default_org: Organization,
+        default_user: User,
+        default_agent: EndpointAgent,
     ):
         assert ActionType.COLLECT_FORENSICS.value == "collect_forensics"
         executor = ForensicsCollectionExecutor(db_session)
         result = await executor.execute(
-            target=test_agent.hostname,
+            target=default_agent.hostname,
             parameters={},
-            context=_ctx(test_user.id, test_org.id),
+            context=_ctx(default_user.id, default_org.id),
         )
         # Per-sub-result reporting — each sub-command is independent
         assert "sub_results" in result
@@ -2481,7 +2481,7 @@ EOF
 - [ ] **Step 1: Run the new PR 2 tests in isolation**
 
 ```bash
-python -m pytest tests/integration/test_agent_service_resolve.py tests/integration/test_action_executors.py tests/integration/test_password_reset_endpoints.py tests/integration/test_action_handlers_are_real.py tests/unit/test_action_classifier_schemas.py -v
+python -m pytest tests/integration/default_agent_service_resolve.py tests/integration/test_action_executors.py tests/integration/test_password_reset_endpoints.py tests/integration/test_action_handlers_are_real.py tests/unit/test_action_classifier_schemas.py -v
 ```
 
 Expected: All PASS. Count and report.

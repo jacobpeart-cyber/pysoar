@@ -17,7 +17,7 @@ from src.agents.models import EndpointAgent
 
 
 @pytest_asyncio.fixture
-async def test_org(db_session: AsyncSession) -> Organization:
+async def default_org(db_session: AsyncSession) -> Organization:
     org = Organization(
         name="ExecutorTestOrg",
         slug="executor-test-org",
@@ -30,14 +30,14 @@ async def test_org(db_session: AsyncSession) -> Organization:
 
 
 @pytest_asyncio.fixture
-async def test_user(db_session: AsyncSession, test_org: Organization) -> User:
+async def default_user(db_session: AsyncSession, default_org: Organization) -> User:
     user = User(
         email="target@executor-test.local",
         hashed_password=get_password_hash("not-used-in-tests"),
         full_name="Executor Test Target",
         is_active=True,
         is_superuser=False,
-        organization_id=test_org.id,
+        organization_id=default_org.id,
     )
     db_session.add(user)
     await db_session.flush()
@@ -45,7 +45,7 @@ async def test_user(db_session: AsyncSession, test_org: Organization) -> User:
 
 
 @pytest_asyncio.fixture
-async def test_agent(db_session: AsyncSession, test_org: Organization) -> EndpointAgent:
+async def default_agent(db_session: AsyncSession, default_org: Organization) -> EndpointAgent:
     """Endpoint agent enrolled with all capabilities the executors might need."""
     agent = EndpointAgent(
         hostname="executor-test-host-01",
@@ -53,7 +53,7 @@ async def test_agent(db_session: AsyncSession, test_org: Organization) -> Endpoi
         agent_version="0.1.0",
         capabilities=["bas", "ir", "purple"],
         status="active",
-        organization_id=test_org.id,
+        organization_id=default_org.id,
         last_command_hash=None,  # genesis
     )
     db_session.add(agent)
