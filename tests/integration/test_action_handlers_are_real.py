@@ -131,17 +131,28 @@ class TestCapabilityGate:
             expires_at = expires_at.replace(tzinfo=timezone.utc)
         assert expires_at > datetime.now(timezone.utc)
 
-    async def test_password_reset_end_to_end_token_lifecycle(
+    async def test_password_reset_end_to_end_through_endpoints(
         self,
+        client,
         db_session: AsyncSession,
         default_org: Organization,
         default_user: User,
     ):
-        """End-to-end gate for password_reset: executor issues a token that
-        can be used to change the password. This proves the token is real,
-        not just an artifact that the rest of the system can't use."""
-        from src.core.security import verify_password, get_password_hash
+        """End-to-end gate for password_reset: executor issues a token,
+        /validate sees it as valid, /consume burns it and changes the
+        password, repeated /consume gets 404/410. This is the proof that
+        the full reset flow is real, not just that the executor wrote a
+        token the rest of the system can't actually do anything with.
 
+        Manually replicating /consume's logic in a test would prove the
+        executor's token is well-formed but NOT prove the URL flow works
+        end-to-end. The gate exists to catch the case where the executor
+        is right but the consumption endpoints are broken or missing.
+
+        Uses the `client` fixture from tests/conftest.py which overrides
+        get_db so the endpoint sees the same in-memory session as the
+        test (StaticPool keeps connections to the same :memory: DB).
+        """
         # Step 1: executor sets the token
         executor = AccountActionExecutor(db_session)
         await executor.execute(
@@ -155,24 +166,30 @@ class TestCapabilityGate:
         original_hash = default_user.hashed_password
         assert token is not None
 
-        # Step 2: Token is valid (not expired)
-        expires_at = default_user.password_reset_token_expires_at
-        if expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=timezone.utc)
-        assert expires_at > datetime.now(timezone.utc)
+        # Step 2: /validate returns 200
+        r = await client.post(
+            "/api/v1/auth/password-reset/validate",
+            json={"token": token},
+        )
+        assert r.status_code == 200, r.text
 
-        # Step 3: Simulate consuming the token by updating password
-        new_password = "GateTestStr0ng!2026"
-        default_user.hashed_password = get_password_hash(new_password)
-        default_user.password_reset_token = None
-        default_user.password_reset_token_expires_at = None
-        await db_session.flush()
+        # Step 3: /consume burns the token + sets new password
+        r = await client.post(
+            "/api/v1/auth/password-reset/consume",
+            json={"token": token, "new_password": "GateTestStr0ng!2026"},
+        )
+        assert r.status_code == 200, r.text
 
-        # Step 4: Verify password was changed
+        # Step 4: second /consume must fail (token burned)
+        r = await client.post(
+            "/api/v1/auth/password-reset/consume",
+            json={"token": token, "new_password": "DifferentStr0ng!2026"},
+        )
+        assert r.status_code in (404, 410)
+
         await db_session.refresh(default_user)
         assert default_user.password_reset_token is None
         assert default_user.hashed_password != original_hash
-        assert verify_password(new_password, default_user.hashed_password)
 
     async def test_process_kill(
         self,
