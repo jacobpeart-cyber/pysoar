@@ -613,22 +613,38 @@ class TestPasswordResetGeneratesRealToken:
         db_session: AsyncSession,
         test_org: Organization,
         test_user: User,
+        monkeypatch,
     ):
         """The TicketActivity audit row must contain NO token-identifying
         material — not the plaintext token, not a sha256 prefix, not a
         suffix, not anything an attacker with audit-log read access could
-        correlate to the specific token."""
+        correlate to the specific token.
+
+        Uses monkeypatch to force the executor's token to a recognizable
+        deterministic value. This removes the flake risk of asserting that
+        a random base64 slice doesn't coincidentally appear in audit text —
+        the test now checks an exact, never-coincidentally-present string.
+        """
         import hashlib
         import json
         from src.tickethub.models import TicketActivity
 
+        # Force the token to a known recognizable value so the absence
+        # assertion below is exact, not probabilistic.
+        FIXED_TOKEN = "GUARD-CANARY-NEVER-IN-AUDIT-ROWS-" + "Z" * 30
+        monkeypatch.setattr(
+            "secrets.token_urlsafe",
+            lambda nbytes=None: FIXED_TOKEN,
+        )
+
         executor = AccountActionExecutor(db_session)
-        result = await executor.execute(
+        await executor.execute(
             target=test_user.email,
             parameters={"action": "password_reset"},
             context=_context_for(test_user.id, test_org.id),
         )
         await db_session.refresh(test_user)
+        assert test_user.password_reset_token == FIXED_TOKEN
 
         # Fetch the most recent activity row for this execution
         stmt = (
@@ -647,15 +663,17 @@ class TestPasswordResetGeneratesRealToken:
             },
             default=str,
         )
-        token = test_user.password_reset_token
-        assert token not in row_dump
-        # Common partial-leak patterns the team might be tempted to add later:
-        sha_full = hashlib.sha256(token.encode()).hexdigest()
+        # Exact deterministic-token assertions (no random-slice false positives)
+        assert FIXED_TOKEN not in row_dump
+        assert "GUARD-CANARY" not in row_dump
+        sha_full = hashlib.sha256(FIXED_TOKEN.encode()).hexdigest()
         for length in (8, 16, 24, 32, 64):
             assert sha_full[:length] not in row_dump
             assert sha_full[-length:] not in row_dump
-        assert token[:8] not in row_dump
-        assert token[-8:] not in row_dump
+        # And the prefix/suffix slices specifically — won't coincide because
+        # the canary contains "GUARD-CANARY" which appears nowhere else.
+        assert FIXED_TOKEN[:16] not in row_dump
+        assert FIXED_TOKEN[-16:] not in row_dump
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
@@ -1021,8 +1039,45 @@ class TestPasswordResetConsume:
         # Token is burned
         assert user.password_reset_token is None
         assert user.password_reset_token_expires_at is None
-        # force_password_change flag cleared (user just did exactly that)
-        assert user.force_password_change is False
+
+    async def test_does_not_touch_force_password_change(
+        self,
+        db_session: AsyncSession,
+        issued_reset_token,
+    ):
+        """The reset flow has no business deciding whether the new password
+        also needs to change on next login. Other policy code owns
+        force_password_change. The reset endpoint must leave it untouched."""
+        user, token = issued_reset_token
+        # Force-set both possible starting states and confirm the endpoint
+        # respects each one
+        for starting_value in (True, False):
+            user.force_password_change = starting_value
+            await db_session.commit()
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://test"
+            ) as client:
+                # Issue a fresh token so /consume succeeds again
+                executor = AccountActionExecutor(db_session)
+                await executor.execute(
+                    target=user.email,
+                    parameters={"action": "password_reset"},
+                    context=_ctx(user.id, user.organization_id),
+                )
+                await db_session.commit()
+                await db_session.refresh(user)
+                fresh_token = user.password_reset_token
+
+                r = await client.post(
+                    "/api/v1/auth/password-reset/consume",
+                    json={"token": fresh_token, "new_password": "NewStr0ng!Pass2026"},
+                )
+            assert r.status_code == 200
+            await db_session.refresh(user)
+            assert user.force_password_change is starting_value, (
+                f"reset flow changed force_password_change from "
+                f"{starting_value} to {user.force_password_change}"
+            )
 
     async def test_token_only_works_once(
         self,
@@ -1085,6 +1140,49 @@ class TestPasswordResetConsume:
         await db_session.refresh(user)
         # Token must NOT be burned on validation failure
         assert user.password_reset_token == token
+
+    async def test_failure_paths_take_similar_time_as_success(
+        self,
+        db_session: AsyncSession,
+        issued_reset_token,
+    ):
+        """Timing-defense smoke test: bcrypt runs on ALL paths (valid token,
+        invalid token, expired token) so the response latency for invalid
+        guesses doesn't differ measurably from the legitimate-token path.
+        Without the up-front hash, an attacker probing token space could
+        detect a 'token found but expired' latency spike and use it to
+        narrow the search.
+
+        Not a hard real-time assertion (CI noise makes that fragile) — we
+        only assert the failure path isn't ORDERS OF MAGNITUDE faster than
+        success, which would indicate the bcrypt was skipped."""
+        import time
+        user, token = issued_reset_token
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            t0 = time.perf_counter()
+            await client.post(
+                "/api/v1/auth/password-reset/consume",
+                json={"token": "no-such-token-xxxxxxxxxxxxxxx", "new_password": "ValidPass12345!"},
+            )
+            invalid_dt = time.perf_counter() - t0
+
+            t0 = time.perf_counter()
+            await client.post(
+                "/api/v1/auth/password-reset/consume",
+                json={"token": token, "new_password": "ValidPass12345!"},
+            )
+            valid_dt = time.perf_counter() - t0
+
+        # bcrypt at default cost takes ~50-200ms. If the failure path skipped
+        # bcrypt, it would be <5ms — a >10x gap. Assert the ratio is bounded.
+        assert invalid_dt > valid_dt * 0.25, (
+            f"invalid-token path was suspiciously faster than valid-token "
+            f"path: invalid={invalid_dt*1000:.1f}ms valid={valid_dt*1000:.1f}ms — "
+            f"check that bcrypt runs on failure paths"
+        )
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -1119,11 +1217,22 @@ async def password_reset_consume(
     payload: PasswordResetConsumeRequest,
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """Burn the token, set the new password hash, clear force_password_change.
+    """Burn the token, set the new password hash.
 
     Returns 200 with a generic body — never echoes the email or user_id so a
     successful response doesn't leak account identity to whoever submits the
-    token. The downstream login flow is where the user proves identity."""
+    token. The downstream login flow is where the user proves identity.
+
+    Timing-equalization: bcrypt the supplied password BEFORE the validity
+    branch so the response latency for invalid/expired tokens matches the
+    successful path. Without this, an attacker probing token space sees
+    a measurable latency spike on the rare 'token found but expired' case
+    that would help them differentiate valid tokens.
+    """
+    # Compute the new hash up-front so failure paths spend the same cycles
+    # as the success path. The dummy result is discarded on failure.
+    new_hash = get_password_hash(payload.new_password)
+
     stmt = select(User).where(User.password_reset_token == payload.token)
     user = (await db.execute(stmt)).scalars().first()
     if user is None:
@@ -1134,10 +1243,14 @@ async def password_reset_consume(
     ):
         raise HTTPException(status_code=410, detail="Token has expired")
 
-    user.hashed_password = get_password_hash(payload.new_password)
+    user.hashed_password = new_hash
     user.password_reset_token = None
     user.password_reset_token_expires_at = None
-    user.force_password_change = False
+    # NOTE: do NOT touch force_password_change here. Other policy code
+    # (90-day rotation, post-incident force-change, etc.) owns that flag;
+    # the reset flow has no business overriding their decisions. If a
+    # downstream policy decides this fresh password also needs to change
+    # on next login, that's not our call.
     await db.commit()
 
     return {"status": "password_updated"}
@@ -1623,18 +1736,18 @@ class TestForensicsCollectionIssuesThreeCommands:
         test_org: Organization,
         test_user: User,
     ):
-        """Build an agent enrolled with ONLY `bas` (no ir). Each sub-action
-        is reported on its own merits — collect_process_list might queue
-        while collect_memory_dump gets rejected. The executor reports both
-        truthfully, doesn't roll the partial into a single misleading
-        composite verdict."""
+        """Build an agent enrolled with ONLY `purple` — that capability
+        permits COLLECT_PROCESS_LIST but NOT the other two forensics
+        actions (per src/agents/capabilities.py CAPABILITY_ACTIONS map).
+        So the executor MUST report exactly one success and two failures,
+        proving partial outcomes survive the per-sub-result reporting."""
         from src.remediation.engine import ForensicsCollectionExecutor
 
         partial_agent = EndpointAgent(
             hostname="partial-cap-host",
             platform="linux",
             agent_version="0.1.0",
-            capabilities=["bas"],  # no ir
+            capabilities=["purple"],  # permits ONLY collect_process_list
             status="online",
             organization_id=test_org.id,
         )
@@ -1650,14 +1763,17 @@ class TestForensicsCollectionIssuesThreeCommands:
 
         assert "sub_results" in result
         assert len(result["sub_results"]) == 3
-        # At least one queued, at least one rejected — exact mix depends on
-        # the capability_allows() rules. Each sub-result is honest.
-        successes = [s for s in result["sub_results"] if s["success"]]
-        failures = [s for s in result["sub_results"] if not s["success"]]
-        assert len(successes) + len(failures) == 3
-        for f in failures:
-            assert f["command_id"] is None
-            assert f["error"]  # non-empty error string
+
+        # Indexed assertion: exactly the process_list sub queues
+        by_action = {s["sub_action"]: s for s in result["sub_results"]}
+        assert by_action["collect_process_list"]["success"] is True
+        assert by_action["collect_process_list"]["command_id"] is not None
+        assert by_action["collect_network_connections"]["success"] is False
+        assert by_action["collect_network_connections"]["command_id"] is None
+        assert by_action["collect_network_connections"]["error"]
+        assert by_action["collect_memory_dump"]["success"] is False
+        assert by_action["collect_memory_dump"]["command_id"] is None
+        assert by_action["collect_memory_dump"]["error"]
 
     async def test_reports_failure_when_no_agent(
         self,
@@ -2170,6 +2286,61 @@ class TestCapabilityGate:
         assert test_user.password_reset_token is not None
         assert test_user.password_reset_token_expires_at is not None
         assert test_user.password_reset_token_expires_at > datetime.now(timezone.utc)
+
+    async def test_password_reset_end_to_end_through_endpoints(
+        self,
+        db_session: AsyncSession,
+        test_org: Organization,
+        test_user: User,
+    ):
+        """End-to-end gate for password_reset: executor issues a token,
+        /validate sees it as valid, /consume burns it and changes the
+        password, repeated /consume gets 404. This is the proof that the
+        full reset flow is real, not just that the executor wrote a token
+        the rest of the system can't actually do anything with."""
+        from httpx import ASGITransport, AsyncClient
+        from src.main import app
+
+        # Step 1: executor sets the token
+        executor = AccountActionExecutor(db_session)
+        await executor.execute(
+            target=test_user.email,
+            parameters={"action": "password_reset"},
+            context=_ctx(test_user.id, test_org.id),
+        )
+        await db_session.commit()
+        await db_session.refresh(test_user)
+        token = test_user.password_reset_token
+        original_hash = test_user.hashed_password
+        assert token is not None
+
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            # Step 2: /validate returns 200
+            r = await client.post(
+                "/api/v1/auth/password-reset/validate",
+                json={"token": token},
+            )
+            assert r.status_code == 200, r.text
+
+            # Step 3: /consume burns the token + sets new password
+            r = await client.post(
+                "/api/v1/auth/password-reset/consume",
+                json={"token": token, "new_password": "GateTestStr0ng!2026"},
+            )
+            assert r.status_code == 200, r.text
+
+            # Step 4: second /consume must fail (token burned)
+            r = await client.post(
+                "/api/v1/auth/password-reset/consume",
+                json={"token": token, "new_password": "DifferentStr0ng!2026"},
+            )
+            assert r.status_code in (404, 410)
+
+        await db_session.refresh(test_user)
+        assert test_user.password_reset_token is None
+        assert test_user.hashed_password != original_hash
 
     async def test_process_kill(
         self,
