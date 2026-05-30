@@ -57,6 +57,7 @@ class RemediationEngine:
             "session_terminate": AccountActionExecutor(self.db),
             "process_kill": ProcessActionExecutor(self.db),
             "file_quarantine": FileActionExecutor(self.db),
+            "collect_forensics": ForensicsCollectionExecutor(self.db),
             "patch_deploy": PatchExecutor(self.db),
             "dns_sinkhole": NetworkActionExecutor(self.db),
             "email_quarantine": NotificationExecutor(self.db),
@@ -1036,6 +1037,108 @@ class FileActionExecutor(ActionExecutor):
             "command_id": cmd.id,
             "command_status": cmd.status,
             "agent_id": agent.id,
+        }
+
+
+class ForensicsCollectionExecutor(ActionExecutor):
+    """Composite forensics collection: issues collect_process_list,
+    collect_network_connections, and collect_memory_dump as three separate
+    agent commands so each can be tracked individually in the audit chain.
+
+    Per-sub-result reporting: each sub-command reports its own success
+    independently in ``sub_results``. NO composite success/failure flag —
+    that would conflate "all queued" with "two queued, one rejected" and
+    hide the partial-execution reality from the caller. Callers that need
+    a roll-up should compute it from sub_results themselves.
+    """
+
+    SUB_COMMANDS = (
+        "collect_process_list",
+        "collect_network_connections",
+        "collect_memory_dump",
+    )
+
+    async def execute(self, target: str, parameters: dict, context: dict) -> dict:
+        from src.agents.service import AgentService, AgentServiceError
+
+        execution_id, org_id, actor_id = _get_execution_context(context)
+
+        svc = AgentService(self.db)
+        agent = await svc.resolve_for_target(target, organization_id=org_id)
+
+        if agent is None:
+            await _log_ticket_activity(
+                self.db,
+                source_id=execution_id,
+                activity_type="collect_forensics_no_agent",
+                description=f"Forensics collection requested for {target} but no agent enrolled",
+                actor_id=actor_id,
+                organization_id=org_id,
+                extra_metadata={"host": target},
+            )
+            no_agent_err = "no agent enrolled for target"
+            return {
+                "action": "collect_forensics",
+                "target": target,
+                "agent_id": None,
+                "sub_results": [
+                    {
+                        "sub_action": sub,
+                        "success": False,
+                        "command_id": None,
+                        "error": no_agent_err,
+                    }
+                    for sub in self.SUB_COMMANDS
+                ],
+            }
+
+        sub_results: list[dict] = []
+        for sub_action in self.SUB_COMMANDS:
+            try:
+                cmd = await svc.issue_command(
+                    agent=agent,
+                    action=sub_action,
+                    payload=parameters or {},
+                    issued_by=actor_id,
+                )
+                sub_results.append({
+                    "sub_action": sub_action,
+                    "success": True,
+                    "command_id": cmd.id,
+                    "error": None,
+                })
+            except AgentServiceError as exc:
+                sub_results.append({
+                    "sub_action": sub_action,
+                    "success": False,
+                    "command_id": None,
+                    "error": str(exc),
+                })
+
+        queued = sum(1 for s in sub_results if s["success"])
+        rejected = len(self.SUB_COMMANDS) - queued
+        await _log_ticket_activity(
+            self.db,
+            source_id=execution_id,
+            activity_type="collect_forensics_dispatched",
+            description=(
+                f"Forensics dispatched on {agent.hostname}: "
+                f"{queued} queued, {rejected} rejected (per sub-command, see metadata)"
+            ),
+            actor_id=actor_id,
+            organization_id=org_id,
+            extra_metadata={
+                "host": target,
+                "agent_id": agent.id,
+                "sub_results": sub_results,
+            },
+        )
+
+        return {
+            "action": "collect_forensics",
+            "target": target,
+            "agent_id": agent.id,
+            "sub_results": sub_results,
         }
 
 
