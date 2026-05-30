@@ -380,3 +380,18 @@ class TestForensicsCollectionIssuesThreeCommands:
             assert sub["success"] is False
             assert sub["command_id"] is None
             assert "no agent" in sub["error"].lower()
+
+    async def test_router_dispatches_collect_forensics_to_forensics_executor(
+        self,
+        db_session: AsyncSession,
+    ):
+        """The RemediationEngine's executors dict must map 'collect_forensics'
+        to ForensicsCollectionExecutor — otherwise policies authored against
+        that action_type get routed to the wrong handler."""
+        from src.remediation.engine import (
+            ForensicsCollectionExecutor,
+            RemediationEngine,
+        )
+
+        engine = RemediationEngine(db_session)
+        assert isinstance(engine.executors["collect_forensics"], ForensicsCollectionExecutor)
