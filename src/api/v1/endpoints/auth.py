@@ -18,6 +18,7 @@ from src.core.security import (
     create_access_token,
     create_refresh_token,
     decode_token_full,
+    get_password_hash,
     verify_token,
 )
 from src.core.token_blacklist import TokenBlacklist
@@ -372,3 +373,58 @@ async def password_reset_validate(
         valid=True,
         expires_at=user.password_reset_token_expires_at,
     )
+
+
+class PasswordResetConsumeRequest(BaseModel):
+    token: str = Field(min_length=48, max_length=256)
+    new_password: str = Field(min_length=12, max_length=256)
+
+
+@router.post(
+    "/password-reset/consume",
+    summary="Consume a password-reset token and set a new password",
+)
+async def password_reset_consume(
+    payload: PasswordResetConsumeRequest,
+    db: DatabaseSession = None,
+) -> dict:
+    """Burn the token, set the new password hash.
+
+    Returns 200 with a generic body — never echoes the email or user_id so a
+    successful response doesn't leak account identity to whoever submits the
+    token. The downstream login flow is where the user proves identity.
+
+    Timing-equalization: bcrypt the supplied password BEFORE the validity
+    branch so the response latency for invalid/expired tokens matches the
+    successful path. Without this, an attacker probing token space sees
+    a measurable latency spike on the rare 'token found but expired' case
+    that would help them differentiate valid tokens.
+    """
+    # Compute the new hash up-front so failure paths spend the same cycles
+    # as the success path. The dummy result is discarded on failure.
+    new_hash = get_password_hash(payload.new_password)
+
+    stmt = select(User).where(User.password_reset_token == payload.token)
+    user = (await db.execute(stmt)).scalars().first()
+    if user is None:
+        raise HTTPException(status_code=404, detail="Invalid or expired token")
+
+    # SQLite returns naive datetime from tz-aware columns; Postgres returns
+    # aware. Normalize so the comparison works on both backends without
+    # crashing with TypeError("can't compare offset-naive and offset-aware").
+    now_utc = datetime.now(timezone.utc)
+    expires_at = user.password_reset_token_expires_at
+    if expires_at is not None and expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    if expires_at is None or expires_at < now_utc:
+        raise HTTPException(status_code=410, detail="Invalid or expired token")
+
+    user.hashed_password = new_hash
+    user.password_reset_token = None
+    user.password_reset_token_expires_at = None
+    # NOTE: do NOT touch force_password_change here. Other policy code
+    # (90-day rotation, post-incident force-change, etc.) owns that flag;
+    # the reset flow has no business overriding their decisions.
+    await db.commit()
+
+    return {"status": "password_updated"}
