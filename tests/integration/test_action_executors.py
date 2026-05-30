@@ -203,3 +203,66 @@ class TestProcessKillIssuesAgentCommand:
         )
         assert result["success"] is False
         assert "no agent" in result["error"].lower()
+
+
+class TestFileQuarantineIssuesAgentCommand:
+    async def test_writes_agent_commands_row(
+        self,
+        db_session: AsyncSession,
+        default_org: Organization,
+        default_user: User,
+        default_agent: EndpointAgent,
+    ):
+        from src.remediation.engine import FileActionExecutor
+
+        executor = FileActionExecutor(db_session)
+        result = await executor.execute(
+            target=default_agent.hostname,
+            parameters={"file_path": "/tmp/malware.bin", "file_hash": "abc123"},
+            context=_context_for(default_user.id, default_org.id),
+        )
+
+        assert result["success"] is True
+        assert "command_id" in result
+        stmt = select(AgentCommand).where(AgentCommand.id == result["command_id"])
+        cmd_row = (await db_session.execute(stmt)).scalars().first()
+        assert cmd_row is not None
+        assert cmd_row.action == "quarantine_file"
+        assert cmd_row.payload.get("file_path") == "/tmp/malware.bin"
+
+    async def test_returns_failure_when_no_agent(
+        self,
+        db_session: AsyncSession,
+        default_org: Organization,
+        default_user: User,
+    ):
+        from src.remediation.engine import FileActionExecutor
+
+        executor = FileActionExecutor(db_session)
+        result = await executor.execute(
+            target="no-such-host-12345",
+            parameters={"file_path": "/tmp/x"},
+            context=_context_for(default_user.id, default_org.id),
+        )
+        assert result["success"] is False
+        assert "no agent" in result["error"].lower()
+
+    async def test_router_dispatches_file_quarantine_to_file_executor(
+        self,
+        db_session: AsyncSession,
+        default_org: Organization,
+    ):
+        """The RemediationEngine's executors dict must map 'file_quarantine'
+        to FileActionExecutor (not ProcessActionExecutor) — otherwise the
+        Task 8 rewrite of ProcessActionExecutor would break file_quarantine."""
+        from src.remediation.engine import (
+            FileActionExecutor,
+            ProcessActionExecutor,
+            RemediationEngine,
+        )
+
+        engine = RemediationEngine(db_session)
+        assert isinstance(engine.executors["file_quarantine"], FileActionExecutor)
+        # ProcessActionExecutor only handles process_kill now
+        assert isinstance(engine.executors["process_kill"], ProcessActionExecutor)
+        assert not isinstance(engine.executors["process_kill"], FileActionExecutor)
