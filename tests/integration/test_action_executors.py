@@ -228,7 +228,11 @@ class TestFileQuarantineIssuesAgentCommand:
         cmd_row = (await db_session.execute(stmt)).scalars().first()
         assert cmd_row is not None
         assert cmd_row.action == "quarantine_file"
-        assert cmd_row.payload.get("file_path") == "/tmp/malware.bin"
+        assert cmd_row.payload.get("path") == "/tmp/malware.bin"
+        # file_hash is intentionally NOT in the payload — agent computes
+        # its own sha256 after quarantine, so passing it would be a dead
+        # field. Asserting absence documents that.
+        assert "file_hash" not in cmd_row.payload
 
     async def test_returns_failure_when_no_agent(
         self,
