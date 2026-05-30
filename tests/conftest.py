@@ -1,5 +1,16 @@
 """Pytest configuration and fixtures"""
 
+import os
+
+# CRITICAL — must run BEFORE any `from src.core.config import settings` import
+# anywhere in the test process. Force the production engine's database_url to
+# point at the same SQLite file the test fixtures write to. Without this, the
+# Zero Trust session-gate middleware (and any other code that uses
+# async_session_factory directly instead of Depends(get_db)) hits ./pysoar.db
+# while the test fixtures write to ./test.db — same-machine but DIFFERENT
+# files, so the middleware sees stale or missing schema and returns 503.
+os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///./test.db")
+
 import asyncio
 from datetime import datetime
 from typing import AsyncGenerator, Generator
@@ -16,6 +27,44 @@ from src.core.database import get_db
 from src.core.security import get_password_hash
 from src.models.base import Base
 from src.models.user import User
+
+# Force-import every model module so Base.metadata.create_all stamps all
+# their tables into the test DB. Without these, code that runs outside the
+# Depends(get_db) override (e.g. the Zero Trust session-gate middleware
+# calling async_session_factory directly) gets "no such table: ..." errors
+# on the test SQLite file. Each import is side-effect-only; the Base
+# metaclass registers tables on import. F401 suppresses the unused warning.
+import src.agentic.models  # noqa: F401
+import src.agents.models  # noqa: F401
+import src.ai.models  # noqa: F401
+import src.api_security.models  # noqa: F401
+import src.audit_evidence.models  # noqa: F401
+import src.collaboration.models  # noqa: F401
+import src.compliance.models  # noqa: F401
+import src.container_security.models  # noqa: F401
+import src.darkweb.models  # noqa: F401
+import src.data_lake.models  # noqa: F401
+import src.deception.models  # noqa: F401
+import src.dfir.models  # noqa: F401
+import src.dlp.models  # noqa: F401
+import src.exposure.models  # noqa: F401
+import src.hunting.models  # noqa: F401
+import src.integrations.models  # noqa: F401
+import src.intel.models  # noqa: F401
+import src.itdr.models  # noqa: F401
+import src.ot_security.models  # noqa: F401
+import src.phishing_sim.models  # noqa: F401
+import src.playbook_builder.models  # noqa: F401
+import src.privacy.models  # noqa: F401
+import src.remediation.models  # noqa: F401
+import src.risk_quant.models  # noqa: F401
+import src.siem.models  # noqa: F401
+import src.simulation.models  # noqa: F401
+import src.stig.models  # noqa: F401
+import src.supplychain.models  # noqa: F401
+import src.threat_modeling.models  # noqa: F401
+import src.tickethub.models  # noqa: F401
+import src.zerotrust.models  # noqa: F401
 
 # Test database URL
 TEST_DATABASE_URL = "sqlite+aiosqlite:///./test.db"
@@ -59,16 +108,29 @@ async def db_session() -> AsyncGenerator[AsyncSession, None]:
 
 
 @pytest_asyncio.fixture(scope="function")
-async def client(db_session: AsyncSession) -> AsyncGenerator[AsyncClient, None]:
-    """Create test client with database session override"""
+async def client(
+    db_session: AsyncSession, redis_mock: AsyncMock
+) -> AsyncGenerator[AsyncClient, None]:
+    """Create test client with database session + Redis client overrides.
+
+    The Redis override is critical: get_current_user (src/api/deps.py:84)
+    does Redis-based JWT blacklist + revocation checks and FAILS CLOSED
+    with 503 on Redis errors. Without overriding get_redis_client, every
+    authenticated request 503s after a 5-second Redis-connect timeout.
+    """
 
     async def override_get_db():
         yield db_session
 
-    # Import `app` lazily to avoid importing heavy modules during test collection
+    async def override_get_redis_client():
+        yield redis_mock
+
+    # Import `app` and the Redis dep lazily to avoid heavy collection imports.
     from src.main import app
+    from src.api.deps import get_redis_client
 
     app.dependency_overrides[get_db] = override_get_db
+    app.dependency_overrides[get_redis_client] = override_get_redis_client
 
     async with AsyncClient(
         transport=ASGITransport(app=app),
