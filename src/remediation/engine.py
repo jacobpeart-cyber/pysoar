@@ -829,24 +829,86 @@ class ProcessActionExecutor(ActionExecutor):
     """Process and file actions: queued for endpoint agent execution."""
 
     async def execute(self, target: str, parameters: dict, context: dict) -> dict:
+        from src.agents.service import AgentService, AgentServiceError
+
         execution_id, org_id, actor_id = _get_execution_context(context)
         action = parameters.get("action", "kill")
         process_name = parameters.get("process_name")
         pid = parameters.get("pid")
-        file_path = parameters.get("file_path")
 
         self.logger.info(
-            "Queuing process/file action for endpoint agent",
+            "Dispatching process action to endpoint agent",
             extra={"target": target, "action": action},
         )
 
-        activity = await _log_ticket_activity(
+        svc = AgentService(self.db)
+        agent = await svc.resolve_for_target(target, organization_id=org_id)
+        if agent is None:
+            await _log_ticket_activity(
+                self.db,
+                source_id=execution_id,
+                activity_type=f"process_{action}_no_agent",
+                description=(
+                    f"Process action '{action}' requested for {target} "
+                    f"but no endpoint agent is enrolled for that target"
+                ),
+                actor_id=actor_id,
+                organization_id=org_id,
+                extra_metadata={
+                    "host": target,
+                    "action": action,
+                    "process_name": process_name,
+                    "pid": pid,
+                },
+            )
+            return {
+                "success": False,
+                "action": action,
+                "target": target,
+                "error": "no agent enrolled for target",
+            }
+
+        agent_action = "kill_process" if action == "kill" else action
+        payload = {
+            "pid": pid,
+            "process_name": process_name,
+        }
+        try:
+            cmd = await svc.issue_command(
+                agent=agent,
+                action=agent_action,
+                payload=payload,
+                issued_by=actor_id,
+            )
+        except AgentServiceError as exc:
+            await _log_ticket_activity(
+                self.db,
+                source_id=execution_id,
+                activity_type=f"process_{action}_rejected",
+                description=f"Agent service rejected {action}: {exc}",
+                actor_id=actor_id,
+                organization_id=org_id,
+                extra_metadata={
+                    "host": target,
+                    "action": action,
+                    "agent_id": agent.id,
+                    "rejection_reason": str(exc),
+                },
+            )
+            return {
+                "success": False,
+                "action": action,
+                "target": target,
+                "error": str(exc),
+            }
+
+        await _log_ticket_activity(
             self.db,
             source_id=execution_id,
-            activity_type=f"process_{action}",
+            activity_type=f"process_{action}_queued",
             description=(
-                f"Queued process action '{action}' on {target} "
-                f"(requires endpoint agent)"
+                f"Process action '{action}' queued to agent {agent.hostname} "
+                f"(command_id={cmd.id}, status={cmd.status})"
             ),
             actor_id=actor_id,
             organization_id=org_id,
@@ -855,8 +917,9 @@ class ProcessActionExecutor(ActionExecutor):
                 "action": action,
                 "process_name": process_name,
                 "pid": pid,
-                "file_path": file_path,
-                "requires_agent": True,
+                "agent_id": agent.id,
+                "command_id": cmd.id,
+                "command_status": cmd.status,
             },
         )
 
@@ -864,9 +927,9 @@ class ProcessActionExecutor(ActionExecutor):
             "success": True,
             "action": action,
             "target": target,
-            "activity_id": activity.id,
-            "status": "queued",
-            "note": "Requires endpoint agent to execute",
+            "command_id": cmd.id,
+            "command_status": cmd.status,
+            "agent_id": agent.id,
         }
 
 

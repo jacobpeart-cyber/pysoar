@@ -150,3 +150,56 @@ class TestPasswordResetGeneratesRealToken:
         # the canary contains "GUARD-CANARY" which appears nowhere else.
         assert FIXED_TOKEN[:16] not in row_dump
         assert FIXED_TOKEN[-16:] not in row_dump
+
+
+class TestProcessKillIssuesAgentCommand:
+    async def test_writes_agent_commands_row(
+        self,
+        db_session: AsyncSession,
+        default_org: Organization,
+        default_user: User,
+        default_agent: EndpointAgent,
+    ):
+        from src.remediation.engine import ProcessActionExecutor
+
+        executor = ProcessActionExecutor(db_session)
+        result = await executor.execute(
+            target=default_agent.hostname,
+            parameters={"action": "kill", "pid": 1234, "process_name": "malware.exe"},
+            context=_context_for(default_user.id, default_org.id),
+        )
+
+        assert result["success"] is True
+        assert "command_id" in result
+        # Now verify a real agent_commands row was written
+        stmt = select(AgentCommand).where(AgentCommand.id == result["command_id"])
+        cmd_row = (await db_session.execute(stmt)).scalars().first()
+        assert cmd_row is not None
+        assert cmd_row.action == "kill_process"
+        assert cmd_row.agent_id == default_agent.id
+        assert cmd_row.payload.get("pid") == 1234
+        assert cmd_row.payload.get("process_name") == "malware.exe"
+        # Hash chain must be populated
+        assert cmd_row.command_hash
+        assert cmd_row.chain_hash
+        # Status: queued or awaiting_approval (high-blast); never "fake-success"
+        assert cmd_row.status in ("queued", "awaiting_approval")
+
+    async def test_returns_failure_when_no_agent(
+        self,
+        db_session: AsyncSession,
+        default_org: Organization,
+        default_user: User,
+    ):
+        """No agent enrolled for the target → executor returns success=False
+        with a real error. Never returns success=True with a placeholder."""
+        from src.remediation.engine import ProcessActionExecutor
+
+        executor = ProcessActionExecutor(db_session)
+        result = await executor.execute(
+            target="no-such-host-12345",
+            parameters={"action": "kill", "pid": 1, "process_name": "x"},
+            context=_context_for(default_user.id, default_org.id),
+        )
+        assert result["success"] is False
+        assert "no agent" in result["error"].lower()
