@@ -1,0 +1,152 @@
+"""Per-executor integration tests for the fixed action executors in PR 2.
+
+Each test class corresponds to one ActionType enum value (PR 3 will add).
+Tests assert observable DB side-effects, never just that the function returned
+success=True.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone, timedelta
+import pytest
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.agents.models import EndpointAgent, AgentCommand
+from src.models.base import utc_now
+from src.models.organization import Organization
+from src.models.user import User
+from src.remediation.engine import (
+    AccountActionExecutor,
+    FirewallBlockExecutor,
+    HostIsolationExecutor,
+)
+
+
+def _context_for(user_id: str, org_id: str) -> dict:
+    """Shared helper to build the executor context dict."""
+    return {
+        "execution_id": "test-exec-" + org_id[:8],
+        "organization_id": org_id,
+        "initiated_by": user_id,
+        "trigger_data": {},
+    }
+
+
+class TestPasswordResetGeneratesRealToken:
+    async def test_token_is_set_and_indexed(
+        self,
+        db_session: AsyncSession,
+        default_org: Organization,
+        default_user: User,
+    ):
+        executor = AccountActionExecutor(db_session)
+        result = await executor.execute(
+            target=default_user.email,
+            parameters={"action": "password_reset"},
+            context=_context_for(default_user.id, default_org.id),
+        )
+
+        assert result["success"] is True
+
+        await db_session.refresh(default_user)
+        assert default_user.password_reset_token is not None
+        assert len(default_user.password_reset_token) >= 40  # 48-byte url-safe is ~64 chars
+        assert default_user.password_reset_token_expires_at is not None
+
+        # Compare as datetime objects, making both naive for SQLite compatibility
+        expires = default_user.password_reset_token_expires_at
+        if expires.tzinfo is not None:
+            expires = expires.replace(tzinfo=None)
+        now = utc_now().replace(tzinfo=None)
+        later = (utc_now() + timedelta(hours=25)).replace(tzinfo=None)
+
+        assert expires > now
+        assert expires < later
+        assert default_user.force_password_change is True
+
+    async def test_token_is_NOT_returned_in_result(
+        self,
+        db_session: AsyncSession,
+        default_org: Organization,
+        default_user: User,
+    ):
+        """The plaintext token must not leak through the executor's return
+        value — only the User row carries it."""
+        executor = AccountActionExecutor(db_session)
+        result = await executor.execute(
+            target=default_user.email,
+            parameters={"action": "password_reset"},
+            context=_context_for(default_user.id, default_org.id),
+        )
+        await db_session.refresh(default_user)
+        # The full plaintext token must not be in the result dict
+        result_str = str(result)
+        assert default_user.password_reset_token not in result_str
+
+    async def test_audit_row_carries_no_token_material(
+        self,
+        db_session: AsyncSession,
+        default_org: Organization,
+        default_user: User,
+        monkeypatch,
+    ):
+        """The TicketActivity audit row must contain NO token-identifying
+        material — not the plaintext token, not a sha256 prefix, not a
+        suffix, not anything an attacker with audit-log read access could
+        correlate to the specific token.
+
+        Uses monkeypatch to force the executor's token to a recognizable
+        deterministic value. This removes the flake risk of asserting that
+        a random base64 slice doesn't coincidentally appear in audit text —
+        the test now checks an exact, never-coincidentally-present string.
+        """
+        import hashlib
+        import json
+        from src.tickethub.models import TicketActivity
+
+        # Force the token to a known recognizable value so the absence
+        # assertion below is exact, not probabilistic.
+        FIXED_TOKEN = "GUARD-CANARY-NEVER-IN-AUDIT-ROWS-" + "Z" * 30
+        monkeypatch.setattr(
+            "secrets.token_urlsafe",
+            lambda nbytes=None: FIXED_TOKEN,
+        )
+
+        executor = AccountActionExecutor(db_session)
+        await executor.execute(
+            target=default_user.email,
+            parameters={"action": "password_reset"},
+            context=_context_for(default_user.id, default_org.id),
+        )
+        await db_session.refresh(default_user)
+        assert default_user.password_reset_token == FIXED_TOKEN
+
+        # Fetch the most recent activity row for this execution
+        stmt = (
+            select(TicketActivity)
+            .where(TicketActivity.source_id == _context_for(default_user.id, default_org.id)["execution_id"])
+            .order_by(TicketActivity.created_at.desc())
+        )
+        activity = (await db_session.execute(stmt)).scalars().first()
+        assert activity is not None
+
+        # Serialize the whole row to a string and assert no token derivatives
+        row_dump = json.dumps(
+            {
+                "description": activity.description,
+                "extra_metadata": activity.extra_metadata,
+            },
+            default=str,
+        )
+        # Exact deterministic-token assertions (no random-slice false positives)
+        assert FIXED_TOKEN not in row_dump
+        assert "GUARD-CANARY" not in row_dump
+        sha_full = hashlib.sha256(FIXED_TOKEN.encode()).hexdigest()
+        for length in (8, 16, 24, 32, 64):
+            assert sha_full[:length] not in row_dump
+            assert sha_full[-length:] not in row_dump
+        # And the prefix/suffix slices specifically — won't coincide because
+        # the canary contains "GUARD-CANARY" which appears nowhere else.
+        assert FIXED_TOKEN[:16] not in row_dump
+        assert FIXED_TOKEN[-16:] not in row_dump

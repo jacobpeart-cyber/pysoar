@@ -781,9 +781,23 @@ class AccountActionExecutor(ActionExecutor):
         elif action in ("lock", "session_terminate", "token_revoke"):
             user.force_password_change = True
         elif action == "password_reset":
+            import secrets
+
             user.force_password_change = True
+            user.password_reset_token = secrets.token_urlsafe(48)
+            user.password_reset_token_expires_at = utc_now() + timedelta(hours=24)
 
         await self.db.flush()
+
+        reset_meta = {}
+        if action == "password_reset" and user.password_reset_token_expires_at:
+            # Record ONLY the expiry timestamp. The token itself and any
+            # hash/prefix of it stays out of the audit row — an attacker
+            # with read access to ticket_activities can't correlate to a
+            # specific token.
+            reset_meta = {
+                "reset_expires_at": user.password_reset_token_expires_at.isoformat(),
+            }
 
         await _log_ticket_activity(
             self.db,
@@ -798,6 +812,7 @@ class AccountActionExecutor(ActionExecutor):
                 "action": action,
                 "previous_is_active": previous_active,
                 "new_is_active": user.is_active,
+                **reset_meta,
             },
         )
 
