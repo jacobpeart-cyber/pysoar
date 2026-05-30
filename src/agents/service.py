@@ -242,6 +242,49 @@ class AgentService:
         return len(stale)
 
     # ------------------------------------------------------------------
+    # Target resolution (for executor dispatch)
+    # ------------------------------------------------------------------
+
+    async def resolve_for_target(
+        self,
+        target: str,
+        *,
+        organization_id: str,
+    ) -> Optional[EndpointAgent]:
+        """Resolve a target string (hostname or IP) to a registered EndpointAgent.
+
+        Tries hostname match first, then IP. Always scoped to organization_id —
+        the parameter is keyword-only and mandatory so a caller can't silently
+        drop the tenant filter via positional argument shuffling. Returns None
+        if no agent matches in that tenant.
+
+        Used by remediation executors that need an agent to dispatch to.
+        Callers must handle None as 'no agent enrolled for this target' —
+        NOT as a transient error to retry.
+        """
+        stmt = (
+            select(EndpointAgent)
+            .where(EndpointAgent.hostname == target)
+            .where(EndpointAgent.organization_id == organization_id)
+        )
+        result = await self.session.execute(stmt)
+        agent = result.scalars().first()
+        if agent:
+            return agent
+
+        # Hostname miss — try IP. Only proceed if the model has an IP field.
+        if hasattr(EndpointAgent, "ip_address"):
+            stmt = (
+                select(EndpointAgent)
+                .where(EndpointAgent.ip_address == target)
+                .where(EndpointAgent.organization_id == organization_id)
+            )
+            result = await self.session.execute(stmt)
+            return result.scalars().first()
+
+        return None
+
+    # ------------------------------------------------------------------
     # Command dispatch
     # ------------------------------------------------------------------
 
