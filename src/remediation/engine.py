@@ -975,12 +975,14 @@ class FileActionExecutor(ActionExecutor):
             }
 
         try:
+            # Agent-side handler reads payload["path"]. The executor's
+            # PARAMETERS still come in as file_path (policy author convention)
+            # — we remap to path here for the agent contract.
             cmd = await svc.issue_command(
                 agent=agent,
                 action="quarantine_file",
                 payload={
-                    "file_path": file_path,
-                    "file_hash": file_hash,
+                    "path": file_path,
                 },
                 issued_by=actor_id,
             )
