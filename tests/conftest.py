@@ -91,6 +91,23 @@ def event_loop() -> Generator:
     loop.close()
 
 
+@pytest_asyncio.fixture(scope="function", autouse=True)
+async def _ensure_schema_on_disk() -> AsyncGenerator[None, None]:
+    """Ensure all tables exist on the shared SQLite file BEFORE every test —
+    including tests that don't request the `db_session` fixture (e.g. the
+    synchronous DLP discovery scanner tests that go through the production
+    async_session_factory directly).
+
+    `db_session` does its own drop_all + create_all for transactional
+    isolation. This fixture runs second (autouse) and re-creates any tables
+    that may have been dropped, so non-db_session tests still find the
+    schema. `create_all(checkfirst=True)` is idempotent — no harm on the
+    common path."""
+    async with test_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield
+
+
 @pytest_asyncio.fixture(scope="function")
 async def db_session() -> AsyncGenerator[AsyncSession, None]:
     """Create a fresh database session for each test"""
