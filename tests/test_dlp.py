@@ -3,9 +3,15 @@
 Real tests importing and testing actual DLP engine classes.
 """
 
+import json
+import uuid
+
 import pytest
+import pytest_asyncio
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
+
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.dlp.engine import (
     DLPEngine,
@@ -14,6 +20,7 @@ from src.dlp.engine import (
     DiscoveryScanner,
     BreachAssessor,
 )
+from src.dlp.models import SensitiveDataDiscovery
 
 
 @pytest.fixture
@@ -38,6 +45,52 @@ def exfiltration_detector():
 def discovery_scanner():
     """Create discovery scanner instance"""
     return DiscoveryScanner()
+
+
+@pytest_asyncio.fixture
+async def discovery_scanner_with_session(db_session: AsyncSession):
+    """Create discovery scanner WITHOUT passing the test session.
+
+    The scanner's public methods are sync (they wrap the async query in
+    asyncio.run), so we cannot share the test's async session — instead
+    each scan call opens a throwaway session via async_session_factory.
+    Because the conftest forces DATABASE_URL to ./test.db and an autouse
+    fixture creates Base.metadata on that file, the production session
+    factory sees the same schema and any rows the test committed.
+
+    Tests must call the scanner via asyncio.to_thread() to avoid the
+    'event loop already running' error from asyncio.run inside pytest-
+    asyncio's loop."""
+    return DiscoveryScanner()
+
+
+async def _seed_discovery(
+    db_session: AsyncSession,
+    *,
+    scan_type: str,
+    target: str,
+    organization_id: str = "00000000-0000-0000-0000-000000000001",
+    total_files_scanned: int = 100,
+    sensitive_files_found: int = 7,
+    findings: list[dict] | None = None,
+) -> SensitiveDataDiscovery:
+    """Seed a SensitiveDataDiscovery row so the scanner's _query_scans
+    finds non-empty results for (scan_type, target) and returns
+    status='completed' with real metrics."""
+    row = SensitiveDataDiscovery(
+        organization_id=organization_id,
+        scan_id=str(uuid.uuid4()),
+        scan_type=scan_type,
+        target=target,
+        status="completed",
+        total_files_scanned=total_files_scanned,
+        sensitive_files_found=sensitive_files_found,
+        findings=json.dumps(findings or [{"type": "pii", "matches": sensitive_files_found}]),
+        completed_at=datetime.now(timezone.utc),
+    )
+    db_session.add(row)
+    await db_session.commit()
+    return row
 
 
 @pytest.fixture
@@ -442,38 +495,104 @@ class TestDiscoveryScanner:
         """Test scanner initializes correctly"""
         assert discovery_scanner is not None
 
-    def test_scan_endpoint(self, discovery_scanner):
-        """Test scanning endpoint"""
-        result = discovery_scanner.scan_endpoint("endpoint_123")
+    async def test_scan_endpoint(
+        self,
+        db_session: AsyncSession,
+        discovery_scanner_with_session: DiscoveryScanner,
+    ):
+        """Test scanning endpoint: seeds a real SensitiveDataDiscovery row
+        so the scanner returns status=completed with the row's metrics."""
+        await _seed_discovery(
+            db_session,
+            scan_type="endpoint",
+            target="endpoint_123",
+            total_files_scanned=42,
+            sensitive_files_found=3,
+        )
+        import asyncio
+        result = await asyncio.to_thread(
+            discovery_scanner_with_session.scan_endpoint, "endpoint_123"
+        )
         assert result["endpoint_id"] == "endpoint_123"
         assert result["scan_type"] == "endpoint"
         assert result["status"] == "completed"
-        assert result["files_scanned"] > 0
-        assert result["sensitive_files_found"] > 0
+        assert result["files_scanned"] == 42
+        assert result["sensitive_files_found"] == 3
 
-    def test_scan_cloud_storage(self, discovery_scanner):
-        """Test scanning cloud storage"""
-        result = discovery_scanner.scan_cloud_storage("storage_123")
+    async def test_scan_cloud_storage(
+        self,
+        db_session: AsyncSession,
+        discovery_scanner_with_session: DiscoveryScanner,
+    ):
+        """Test scanning cloud storage: same seed pattern."""
+        await _seed_discovery(
+            db_session,
+            scan_type="cloud_storage",
+            target="storage_123",
+            total_files_scanned=200,
+            sensitive_files_found=12,
+        )
+        import asyncio
+        result = await asyncio.to_thread(
+            discovery_scanner_with_session.scan_cloud_storage, "storage_123"
+        )
         assert result["storage_id"] == "storage_123"
         assert result["scan_type"] == "cloud_storage"
         assert result["status"] == "completed"
-        assert result["objects_scanned"] > 0
+        assert result["objects_scanned"] == 200
+        assert result["sensitive_objects_found"] == 12
 
-    def test_scan_database(self, discovery_scanner):
-        """Test scanning database"""
-        result = discovery_scanner.scan_database("db_123")
+    async def test_scan_database(
+        self,
+        db_session: AsyncSession,
+        discovery_scanner_with_session: DiscoveryScanner,
+    ):
+        """Test scanning database: same seed pattern."""
+        await _seed_discovery(
+            db_session,
+            scan_type="database",
+            target="db_123",
+            total_files_scanned=5000,
+            sensitive_files_found=87,
+        )
+        import asyncio
+        result = await asyncio.to_thread(
+            discovery_scanner_with_session.scan_database, "db_123"
+        )
         assert result["database_id"] == "db_123"
         assert result["scan_type"] == "database"
         assert result["status"] == "completed"
-        assert "tables_with_sensitive_data" in result
+        assert result["rows_scanned"] == 5000
+        assert result["sensitive_rows_found"] == 87
 
-    def test_scan_code_repository(self, discovery_scanner):
-        """Test scanning code repository"""
-        result = discovery_scanner.scan_code_repository("repo_123")
+    async def test_scan_code_repository(
+        self,
+        db_session: AsyncSession,
+        discovery_scanner_with_session: DiscoveryScanner,
+    ):
+        """Test scanning code repository: same seed pattern."""
+        await _seed_discovery(
+            db_session,
+            scan_type="code_repository",
+            target="repo_123",
+            total_files_scanned=1200,
+            sensitive_files_found=4,
+            findings=[
+                {"type": "secret", "kind": "aws_access_key"},
+                {"type": "secret", "kind": "github_token"},
+            ],
+        )
+        import asyncio
+        result = await asyncio.to_thread(
+            discovery_scanner_with_session.scan_code_repository, "repo_123"
+        )
         assert result["repo_id"] == "repo_123"
         assert result["scan_type"] == "code_repository"
         assert result["status"] == "completed"
-        assert result["secrets_found"] > 0
+        # The code_repository result uses domain-specific keys:
+        # commits_scanned = files_scanned, secrets_found = sensitive_files_found.
+        assert result["commits_scanned"] == 1200
+        assert result["secrets_found"] == 4
 
     def test_generate_data_map(self, discovery_scanner):
         """Test generating data map"""
