@@ -187,6 +187,20 @@ class AgentToolRegistry:
             category="query",
             handler=self._search_alerts,
         ))
+        self._register(Tool(
+            name="list_playbooks",
+            description="List enabled response playbooks (read-only). Use to find the SOP matching the current alert/incident type before concluding.",
+            parameters={"keyword": "optional string - filter by name/description", "category": "optional string", "limit": "optional int, default 20"},
+            category="query",
+            handler=self._list_playbooks,
+        ))
+        self._register(Tool(
+            name="get_playbook",
+            description="Get a playbook's full definition including its ordered steps (read-only — does NOT execute it)",
+            parameters={"playbook_id": "string - playbook UUID"},
+            category="query",
+            handler=self._get_playbook,
+        ))
 
         # ===== ACTION TOOLS =====
         self._register(Tool(
@@ -609,6 +623,43 @@ class AgentToolRegistry:
         result = await self.db.execute(q)
         iocs = result.scalars().all()
         return [{"id": i.id, "value": i.value, "type": i.indicator_type, "threat_level": i.severity, "source": i.source} for i in iocs]
+
+    async def _list_playbooks(self, keyword=None, category=None, limit=20):
+        from src.models.playbook import Playbook
+        q = select(Playbook).where(Playbook.is_enabled == True).order_by(Playbook.name)  # noqa: E712
+        if keyword:
+            like = f"%{keyword}%"
+            q = q.where(Playbook.name.ilike(like) | Playbook.description.ilike(like))
+        if category:
+            q = q.where(Playbook.category == category)
+        q = q.limit(int(limit))
+        result = await self.db.execute(q)
+        playbooks = result.scalars().all()
+        return [
+            {
+                "id": p.id, "name": p.name, "description": p.description,
+                "category": p.category, "status": p.status,
+                "trigger_type": p.trigger_type, "version": p.version,
+            }
+            for p in playbooks
+        ]
+
+    async def _get_playbook(self, playbook_id):
+        from src.models.playbook import Playbook
+        result = await self.db.execute(select(Playbook).where(Playbook.id == playbook_id))
+        p = result.scalar_one_or_none()
+        if not p:
+            return {"error": "Playbook not found"}
+        try:
+            steps = json.loads(p.steps) if p.steps else []
+        except (TypeError, json.JSONDecodeError):
+            steps = p.steps  # surface raw text rather than hide it
+        return {
+            "id": p.id, "name": p.name, "description": p.description,
+            "category": p.category, "status": p.status,
+            "trigger_type": p.trigger_type, "version": p.version,
+            "is_enabled": p.is_enabled, "steps": steps,
+        }
 
     async def _get_alert(self, alert_id):
         from src.models.alert import Alert
