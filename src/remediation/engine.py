@@ -1143,35 +1143,87 @@ class ForensicsCollectionExecutor(ActionExecutor):
 
 
 class NetworkActionExecutor(ActionExecutor):
-    """Network actions (sinkhole, block URL, DNS sinkhole)."""
+    """Network actions (sinkhole, block URL, DNS sinkhole).
+
+    PySOAR has no enforcement point for network-level blocks (no firewall
+    or DNS integration dispatches from here, and the endpoint agent has
+    no block action). What this executor CAN honestly do is detective:
+    register the target as an active IOC so SIEM correlation and IOC
+    matching flag any traffic to it. The result says so explicitly —
+    ``mode: detection_only`` — instead of claiming the network changed.
+    """
 
     async def execute(self, target: str, parameters: dict, context: dict) -> dict:
         execution_id, org_id, actor_id = _get_execution_context(context)
         action = parameters.get("action", "sinkhole")
 
         self.logger.info(
-            "Executing network action",
+            "Executing network action (detection-only)",
             extra={"target": target, "action": action},
         )
+
+        # Pick an indicator type that matches the target shape.
+        indicator_type = "ipv4"
+        if "://" in target:
+            indicator_type = "url"
+        elif any(c.isalpha() for c in target.replace(".", "")):
+            indicator_type = "domain"
+
+        now = utc_now()
+        ioc = ThreatIndicator(
+            id=str(uuid4()),
+            value=target,
+            indicator_type=indicator_type,
+            is_active=True,
+            is_whitelisted=False,
+            severity="high",
+            confidence=85,
+            source="remediation_engine",
+            tags=["network_action", action, "detection_only"],
+            context={
+                "description": (
+                    f"Network action '{action}' recorded for {target}. "
+                    "Detection-only: no enforcement point is integrated, "
+                    "traffic is flagged via IOC matching but NOT blocked."
+                ),
+                "source_reference": execution_id,
+                "category": "network_action",
+            },
+            first_seen=now,
+            last_seen=now,
+        )
+        self.db.add(ioc)
+        await self.db.flush()
 
         activity = await _log_ticket_activity(
             self.db,
             source_id=execution_id,
             activity_type=f"network_{action}",
-            description=f"Network action '{action}' applied to {target}",
+            description=(
+                f"Network action '{action}' recorded for {target} "
+                "(detection-only — no enforcement point integrated)"
+            ),
             actor_id=actor_id,
             organization_id=org_id,
             extra_metadata={
                 "target": target,
                 "action": action,
                 "parameters": parameters,
+                "ioc_id": ioc.id,
+                "mode": "detection_only",
             },
         )
 
         return {
             "success": True,
             "action": action,
+            "mode": "detection_only",
+            "detail": (
+                "Target registered as active IOC for detection; no network "
+                "enforcement performed (no firewall/DNS integration configured)"
+            ),
             "target": target,
+            "ioc_id": ioc.id,
             "activity_id": activity.id,
         }
 

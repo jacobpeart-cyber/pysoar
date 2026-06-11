@@ -444,9 +444,16 @@ class CredentialMonitor:
             try:
                 known_exposed_emails = asyncio.run(_load_leaked())
             except RuntimeError:
-                pass
+                self.logger.warning(
+                    "Credential exposure check SKIPPED: breach lookup cannot "
+                    "run from an active event loop — results will not include "
+                    "leak-database matches"
+                )
         except ImportError:
-            self.logger.debug("CredentialLeak model not available, skipping breach lookup")
+            self.logger.warning(
+                "Credential exposure check SKIPPED: CredentialLeak model "
+                "unavailable — results will not include leak-database matches"
+            )
 
         for cred in credentials:
             user = cred.get("user", "")

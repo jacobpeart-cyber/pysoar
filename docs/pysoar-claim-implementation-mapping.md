@@ -1,75 +1,66 @@
 # PySOAR Claim vs Implementation Mapping
 
-This document maps high-level PySOAR product claims to code and architecture evidence in the repository. It is intended to make gap remediation concrete and prioritize work from the top of the gap list.
+Refreshed 2026-06-11 by a six-track code audit (workers/automation,
+integrations/remediation, detection, IR/forensics, GRC/infra, data/AI/
+simulation). Supersedes the 2026-05-19 version. Purpose: make gap
+remediation concrete, working from the top down.
 
-## 1. Verified implementation
+Status legend: REAL (computes from actual data) · FAKE (fabricates or
+no-ops while reporting success) · OVERSTATED (real core, claim stretches
+it) · HONEST-EMPTY (returns nothing + says why, acceptable).
 
-| Claim | Evidence / Code | Status |
-|---|---|---|
-| Native SIEM log ingestion | `src/siem/storage.py`, `src/siem/pipeline.py`, `src/api/v1/endpoints/siem.py`, `src/main.py` | Implemented |
-| Playbook engine core | `src/playbooks/engine.py` | Implemented |
-| Playbook action primitives | `src/playbooks/actions.py` | Implemented |
-| Visual playbook builder schema/API | `src/playbook_builder/models.py`, `src/api/v1/endpoints/playbook_builder.py` | Implemented |
-| Endpoint agent platform | `agent/pysoar_agent.py`, `src/agents/models.py`, `src/api/v1/endpoints/agents.py` | Implemented |
-| Capability-gated commands | `agent/pysoar_agent.py` allowlist, `src/agents/models.py` | Implemented |
-| Tamper-evident command chain | `src/agents/models.py` `AgentCommand`, hash chain semantics in agent code | Implemented |
-| Agentic autonomous investigator | `src/agentic/investigator.py`, `src/agentic/tasks.py`, `src/agentic/tools.py` | Implemented (prototype) |
-| Threat intel platform (IOC storage/enrichment) | `src/intel/models.py`, `src/playbooks/actions.py`, `connectors/virustotal.py`, `src/services/agent_tools.py` | Partially implemented |
-| Dark web monitoring module | `src/darkweb/models.py`, `src/darkweb/tasks.py`, `src/api/v1/endpoints/darkweb.py`, agentic darkweb tools | Implemented |
-| Zero Trust engine / NIST 800-207 module | `src/zerotrust/engine.py`, `src/zerotrust/models.py`, `src/api/v1/endpoints/zerotrust.py` | Implemented |
-| Compliance / FedRAMP modules | `src/fedramp/`, `src/compliance/`, `src/api/v1/endpoints/audit_evidence.py` | Implemented |
-| Privacy / DSR workflow | `src/privacy/`, `src/api/v1/endpoints/aliases.py` | Implemented |
-| Attack simulation API | `src/api/v1/endpoints/simulation.py` | Implemented (partial) |
-| Threat hunting task stub | `src/agentic/tasks.py`, `src/agentic/llm.py` | Implemented (prototype) |
+## 1. Tier 1 gaps — advertised features that silently no-op or fabricate
 
-## 2. Partial support / prototype-level
+| # | Claim | Reality | Where |
+| --- | --- | --- | --- |
+| 1 | Alert processing pipeline (dedupe, enrich, trigger playbooks) | `process_alert_task` logs and returns `{"processed": true}` — body is a "This would…" comment | `src/workers/tasks.py` |
+| 2 | IOC enrichment refresh (beat-scheduled daily) | `refresh_ioc_enrichments` returns `{"refreshed": 0}` forever | `src/workers/tasks.py` + beat entry |
+| 3 | Alert ingestion from external sources | `ingest_alerts_from_source` stub returns `{"imported": 0}` | `src/workers/tasks.py` |
+| 4 | Report generation (CSV/JSON/PDF) | `generate_report` returns `{"generated": true, "url": null}`; PDF/CSV handlers don't exist anywhere | `src/workers/tasks.py`, compliance export only does JSON/Markdown |
+| 5 | Network remediation (sinkhole, block URL, DNS block) | `NetworkActionExecutor.execute` writes an activity row and returns success — configures nothing, dispatches nothing | `src/remediation/engine.py:1148` |
+| 6 | STIG findings enter automation (alerts → incidents → playbooks) | `on_stig_finding` creates the Alert but never calls `on_alert_created`, so the automation pipeline is skipped | `src/services/automation.py:873` |
+| 7 | Data lake ingestion/pipeline metrics | Hardcoded: 125,000,000 events, 5,432 eps, 456 GB/day, 52,083 throughput — no DB reads | `src/data_lake/engine.py:331,1286` |
+| 8 | Data lake event enrichment (geo, intel, asset) | Hardcoded geo (US/CA/Mountain View) and reputation_score 85 | `src/data_lake/engine.py:209` |
+| 9 | Honeypots/decoys "deployed" with automated alerting | `deploy_honeypot` creates a DB record; no listener is ever started. Orchestrator effectiveness/coverage return zeros/fixed maps | `src/deception/engine.py:104,700` |
 
-| Claim | Evidence / Code | Gap |
-|---|---|---|
-| Threat hunting / MITRE attack simulation | `src/agentic/tasks.py` threat hunt returns mock summary; `src/api/v1/endpoints/simulation.py` attack simulation endpoints | Needs real hunting engine, adversary emulation execution, and correlation outputs |
-| Deep integration connector library | `src/integrations/engine.py` connector registry, generic HTTP fallback, some connector wrapper classes | Needs actual adapter implementations for most high-value connectors |
-| EDR telemetry | endpoint agent exists, but no native sensor data model or streaming ingestion of processes/network/file artifacts | Missing endpoint event ingestion and EDR visibility |
-| Live response / host containment | `agent/pysoar_agent.py` has kill/isolate handlers, but server/API-driven dispatch flow is not fully validated | Needs end-to-end approval/test coverage |
-| Playbook action schema validation | `src/playbooks/engine.py` executes actions dynamically, but action parameter typing and validation are minimal | Needs stronger typed action contracts |
-| Unified Ticket Hub | `frontend/src/pages/TicketHub.tsx`, `src/api/v1/endpoints/tickethub.py`, `src/tickethub/engine.py`, `src/tickethub/models.py` | Implemented |
-| Notebook support | README claims notebooks; codebase includes no explicit notebook backend or integration tooling | Missing Jupyter/notebook support |
+## 2. Tier 2 — overstated or degraded
 
-## 3. Claims not verified or missing
+| # | Claim | Reality | Where |
+| --- | --- | --- | --- |
+| 10 | "20+ pre-built integrations" | 46 declared, 10 real adapters (slack, crowdstrike, servicenow, jira, pagerduty, virustotal, shodan, abuseipdb, aws_security_hub, microsoft_sentinel); other 36 fall back to a generic HTTP guesser | `src/integrations/engine.py`, `src/integrations/connectors/` |
+| 11 | Tenant-scoped real-time KPIs | `/metrics` queries real counts but has NO organization_id filter — cross-tenant aggregates | `src/api/v1/endpoints/monitoring.py:95` |
+| 12 | Purple team "correlate the SIEM/EDR response timeline" | Detection score = does any active rule list the technique ID. No temporal correlation with actually-fired alerts | `src/simulation/engine.py:513` |
+| 13 | Hunt finding scoring | Fixed constants by type (lateral_movement=0.85 …), thresholds map score→severity | `src/hunting/engine.py:525,748` |
+| 14 | Dark web actor attribution / campaign mapping | 8 hardcoded keyword signatures; `_map_campaign` and `_get_historical_context` return null/zeros | `src/darkweb/engine.py:926-1071` |
+| 15 | Enrichment via VT/AbuseIPDB/Shodan/GreyNoise | Real API calls when keys exist; silent `[]` when missing (UI shows nothing instead of "no key configured") | `src/intel/enrichment.py:63-83` |
+| 16 | ITDR credential exposure check | Silently returns `[]` if CredentialLeak import fails | `src/itdr/engine.py:449` |
+| 17 | Patch deployment | Marks vulnerability rows PATCHED; never talks to a patch system | `src/remediation/engine.py:1182` |
+| 18 | `IntegrationManager.install_connector` | Dead code — returns success without persisting; the API endpoint does the real work | `src/integrations/engine.py:722` |
 
-| Claim | Notes | Gap severity |
-|---|---|---|
-| Dark Web scanning for marketplaces and paste sites | module exists, but no connector or scraper implementation was confirmed in code review | Medium |
-| 1000+ prebuilt integrations / automation packs | registry is declarative; only a small set of connectors/adapters are actually implemented | High |
-| Full incident lifecycle with SLA/workflow | incident/case models exist, but advanced workflow and analyst assignment are not clearly visible | Medium |
-| Real-time analytic dashboards | frontend/back-end visualization not fully validated from backend code | Medium |
-| Full EDR sensor model | absent; only endpoint agent command execution is present | High |
-| Parallel playbook execution / rollback / approval workflow | engine supports sequential steps and continue_on_error, but not parallelism/rollback | High |
-| Metrics/operational resilience | some Redis/celery/worker tasks exist, but explicit HA metrics and recovery are not fully implemented | High |
+## 3. Verified real (sampled, no action needed)
 
-## 4. Top-priority gaps to fix first
+SIEM collectors + correlation (z-scores, attack chains), rule engine,
+threat-intel feeds + composite scoring, UEBA (baselines, impossible
+travel, peer groups), ITDR detections, dark-web feed scanning
+(URLhaus/HIBP/ThreatFox/OTX), exposure scoring + CISA KEV + EPSS,
+FAIR Monte Carlo (scipy PERT), STRIDE/PASTA generation, STIG/SCAP
+parse+remediation scripts, compliance attester (live-state queries),
+zero trust PDP + session gate, DFIR chain of custody + IOC extraction,
+phishing send (gated on SMTP config, no fake success), war room +
+post-mortems, DSR workflows, endpoint agent (hash chain, two-person
+approval, real iptables/netsh isolation), BAS agent dispatch (21
+techniques, honest coverage-only fallback), Gemini LLM integration,
+playbook execution loop (fixed 2026-06-11).
 
-1. **Connector execution**
-   - Make at least one real connector end-to-end: VirusTotal + Slack, or EDR + ITSM.
-   - Ensure `src/integrations/engine.py` uses real adapters, not only generic HTTP fallback.
+## 4. Remediation order
 
-2. **EDR / endpoint visibility**
-   - Add endpoint telemetry ingestion beyond heartbeat.
-   - Model process/network/file artifacts and store them for correlation.
-
-3. **Playbook hardening**
-   - Add action schema validation, retry, approval, and safe execution semantics.
-
-4. **Agentic robustness**
-   - Harden JSON extraction, evidence boundaries, and error recovery in `src/agentic/investigator.py`.
-   - Treat the LLM investigator as advisory until action flows are safe.
-
-5. **Threat hunting / simulation**
-   - Turn the current mock threat hunt into a real query/search-based hunt.
-   - Tie simulation endpoints to actual telemetry/correlation evidence.
-
-## 5. Recommended next step
-
-Start by adding a concrete mapping table from README product claims to code support, then immediately close the highest-confidence gap:
-- implement a real connector workflow through the integration runtime and playbook/agent tool layer.
-
-This doc is the first deliverable for the gap list; the next step is a focused code fix for the highest-priority gap: real connector execution and EDR telemetry.
+1. **Quick wins (bugs + honesty):** #6 STIG pipeline, #11 tenant-scope
+   /metrics, #2 implement enrichment refresh, #1/#3 delete-or-implement
+   stub tasks, #16 surface ITDR failure, #18 delete dead code.
+2. **Stop fabricating:** #7/#8 data-lake metrics + enrichment from real
+   tables (or honest nulls), #5 NetworkActionExecutor → dispatch via
+   agent/integration or return `recorded_only`.
+3. **Deliver claimed outputs:** #4 real CSV + PDF report export.
+4. **Close the loop:** #12 purple-team temporal correlation.
+5. **Bigger builds:** #9 deception listeners via endpoint agent, #10
+   connector adapter expansion, #13/#14 statistical scoring.
