@@ -65,23 +65,6 @@ def enrich_ioc_task(
 
 
 @shared_task
-def process_alert_task(alert_data: dict[str, Any]) -> dict[str, Any]:
-    """Process an incoming alert"""
-    logger.info("Processing alert", alert_id=alert_data.get("id"))
-
-    # This would typically:
-    # 1. Deduplicate alerts
-    # 2. Enrich IOCs found in the alert
-    # 3. Check for matching playbook triggers
-    # 4. Update alert with enrichment data
-
-    return {
-        "alert_id": alert_data.get("id"),
-        "processed": True,
-    }
-
-
-@shared_task
 def send_notification_task(
     channel: str,
     recipients: list[str],
@@ -197,52 +180,66 @@ def cleanup_old_executions() -> dict[str, Any]:
     }
 
 
-@shared_task
-def refresh_ioc_enrichments() -> dict[str, Any]:
-    """Refresh stale IOC enrichments"""
-    logger.info("Running IOC enrichment refresh task")
+async def _refresh_stale_enrichments(
+    staleness_days: int = 7,
+    batch_limit: int = 100,
+) -> dict[str, Any]:
+    """Re-enrich active indicators whose enrichment is stale.
 
-    # This would find IOCs with stale enrichment data and re-enrich them
+    "Stale" = ``last_seen`` (bumped on every enrichment) is older than
+    ``staleness_days`` or has never been set. Whitelisted indicators are
+    skipped — re-scoring them wastes provider quota. ``batch_limit``
+    bounds external API usage per daily run.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy import or_, select
+
+    from src.core.database import async_session_factory
+    from src.intel.enrichment import IndicatorEnricher
+    from src.intel.models import ThreatIndicator
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=staleness_days)
+
+    async with async_session_factory() as session:
+        result = await session.execute(
+            select(ThreatIndicator.id)
+            .where(
+                ThreatIndicator.is_active == True,  # noqa: E712
+                ThreatIndicator.is_whitelisted == False,  # noqa: E712
+                or_(
+                    ThreatIndicator.last_seen == None,  # noqa: E711
+                    ThreatIndicator.last_seen < cutoff,
+                ),
+            )
+            .order_by(ThreatIndicator.last_seen.asc().nulls_first())
+            .limit(batch_limit)
+        )
+        stale_ids = [row[0] for row in result.all()]
+
+    enricher = IndicatorEnricher()
+    refreshed = 0
+    for indicator_id in stale_ids:
+        try:
+            await enricher.enrich_indicator(indicator_id)
+            refreshed += 1
+        except Exception as e:
+            logger.warning(
+                "Enrichment refresh failed for indicator",
+                indicator_id=indicator_id,
+                error=str(e),
+            )
 
     return {
-        "refreshed": 0,
+        "refreshed": refreshed,
+        "candidates": len(stale_ids),
+        "staleness_days": staleness_days,
         "task": "refresh_ioc_enrichments",
     }
 
 
 @shared_task
-def ingest_alerts_from_source(
-    source: str,
-    config: dict[str, Any],
-) -> dict[str, Any]:
-    """Ingest alerts from an external source"""
-    logger.info(f"Ingesting alerts from {source}")
-
-    # This would connect to SIEM, EDR, or other sources
-    # and import alerts
-
-    return {
-        "source": source,
-        "imported": 0,
-    }
-
-
-@shared_task
-def generate_report_task(
-    report_type: str,
-    parameters: dict[str, Any],
-) -> dict[str, Any]:
-    """Generate a report"""
-    logger.info(f"Generating {report_type} report")
-
-    # This would generate various reports:
-    # - Daily/weekly summary
-    # - Incident timeline
-    # - IOC report
-    # - Metrics dashboard
-
-    return {
-        "report_type": report_type,
-        "generated": True,
-        "url": None,  # Would contain report URL/path
-    }
+def refresh_ioc_enrichments() -> dict[str, Any]:
+    """Re-enrich IOCs whose enrichment data has gone stale (daily beat)."""
+    logger.info("Running IOC enrichment refresh task")
+    return asyncio.run(_refresh_stale_enrichments())

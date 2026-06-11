@@ -888,6 +888,7 @@ class AutomationService:
         )
         self.db.add(alert)
         await self.db.flush()
+        await self.on_alert_created(alert, organization_id)
         return alert
 
     async def on_data_lake_anomaly(

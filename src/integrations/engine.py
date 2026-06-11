@@ -719,38 +719,11 @@ class IntegrationManager:
         """Initialize integration manager"""
         self.registry = registry
 
-    async def install_connector(
-        self,
-        organization_id: str,
-        connector_name: str,
-        display_name: str,
-        config: dict[str, Any],
-        credentials: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Install and configure a connector"""
-        # Validate connector exists
-        connector_meta = self.registry.get_connector_details(connector_name)
-        if not connector_meta:
-            raise ValueError(f"Connector not found: {connector_name}")
-
-        # Validate configuration
-        if not self.registry.validate_connector_schema(connector_name, config):
-            raise ValueError(f"Invalid configuration for {connector_name}")
-
-        from src.core.security import get_password_hash
-        config_encrypted = json.dumps(config)
-        creds_encrypted = get_password_hash(json.dumps(credentials)) if credentials else ""
-
-        logger.info(
-            f"Installed {connector_name} for organization {organization_id}",
-        )
-
-        return {
-            "status": "success",
-            "connector": connector_name,
-            "display_name": display_name,
-            "organization_id": organization_id,
-        }
+    # NOTE: connector installation/persistence lives in the API endpoint
+    # (src/api/v1/endpoints/integrations.py), which writes the
+    # InstalledIntegration row. A previous install_connector method here
+    # returned success without persisting anything and had no callers —
+    # deleted 2026-06-11 so nobody wires it up by accident.
 
     async def configure_integration(
         self,

@@ -189,55 +189,6 @@ class DataIngestionEngine:
             self.logger.error(f"Normalization error for {source_id}: {str(e)}")
             return raw_event
 
-    def enrich_event(self, event: Dict[str, Any], enrichment_sources: List[str] = None) -> Dict[str, Any]:
-        """
-        Enrich event with geo, threat intel, and asset context.
-
-        Args:
-            event: Event to enrich
-            enrichment_sources: List of enrichment sources to use
-
-        Returns:
-            Enriched event
-        """
-        enriched = event.copy()
-        enriched["enrichment"] = {}
-
-        try:
-            # Geo enrichment
-            if event.get("data", {}).get("source_ip"):
-                enriched["enrichment"]["geo"] = {
-                    "country": "US",
-                    "region": "CA",
-                    "city": "Mountain View",
-                    "lat": 37.42,
-                    "lon": -122.08,
-                }
-
-            # Threat intelligence enrichment
-            if event.get("data", {}).get("domain"):
-                enriched["enrichment"]["threat_intel"] = {
-                    "reputation_score": 85,
-                    "malware_family": None,
-                    "is_known_c2": False,
-                }
-
-            # Asset context enrichment
-            if event.get("data", {}).get("hostname"):
-                enriched["enrichment"]["asset"] = {
-                    "asset_id": "ASSET-001",
-                    "owner": "Security Team",
-                    "criticality": "high",
-                    "last_patch_date": "2024-03-20",
-                }
-
-            enriched["enriched_at"] = datetime.now(timezone.utc).isoformat()
-            return enriched
-
-        except Exception as e:
-            self.logger.error(f"Enrichment error: {str(e)}")
-            return enriched
-
     def route_to_partition(
         self,
         source_id: str,
@@ -311,40 +262,12 @@ class DataIngestionEngine:
             self.logger.error(f"Backpressure handling error: {str(e)}")
             raise
 
-    def calculate_ingestion_metrics(
-        self, source_id: str, time_window_seconds: int = 3600
-    ) -> Dict[str, Any]:
-        """
-        Calculate ingestion metrics for a source.
-
-        Args:
-            source_id: Source to calculate metrics for
-            time_window_seconds: Time window for metrics (default 1 hour)
-
-        Returns:
-            Ingestion metrics
-        """
-        try:
-            if source_id not in self.active_sources:
-                raise ValueError(f"Source {source_id} not found")
-
-            source_info = self.active_sources[source_id]
-
-            return {
-                "source_id": source_id,
-                "status": source_info.get("status"),
-                "events_per_second": 5432,
-                "total_events": 125000000,
-                "daily_ingestion_gb": 456,
-                "success_rate": 99.98,
-                "error_rate": 0.02,
-                "avg_latency_ms": 234,
-                "time_window_seconds": time_window_seconds,
-            }
-
-        except Exception as e:
-            self.logger.error(f"Metrics calculation error: {str(e)}")
-            raise
+    # NOTE: calculate_ingestion_metrics and enrich_event were deleted
+    # 2026-06-11. They fabricated metrics (125M events, 5432 eps) and
+    # enrichment (hardcoded Mountain View geo, reputation 85) and had no
+    # callers — the API serves real DataSource/DataPartition rows
+    # directly. Real per-source metrics, if needed, should sum
+    # DataPartition.record_count / size_bytes for the source.
 
     @staticmethod
     def _normalize_ip(ip: Any) -> str:
@@ -1265,38 +1188,9 @@ class PipelineOrchestrator:
             self.logger.error(f"Error handling failed: {str(e)}")
             raise
 
-    def generate_pipeline_metrics(self, pipeline_id: str) -> Dict[str, Any]:
-        """
-        Generate comprehensive pipeline metrics.
-
-        Args:
-            pipeline_id: Pipeline identifier
-
-        Returns:
-            Pipeline metrics
-        """
-        self.logger.info(f"Generating metrics for pipeline: {pipeline_id}")
-
-        try:
-            if pipeline_id not in self.pipelines:
-                raise ValueError(f"Pipeline {pipeline_id} not found")
-
-            pipeline = self.pipelines[pipeline_id]
-
-            return {
-                "pipeline_id": pipeline_id,
-                "name": pipeline["name"],
-                "type": pipeline["type"],
-                "total_executions": len(pipeline["executions"]),
-                "total_records_processed": 125000000,
-                "avg_throughput_records_per_sec": 52083,
-                "uptime_percentage": 99.95,
-                "error_rate": 0.05,
-            }
-
-        except Exception as e:
-            self.logger.error(f"Metrics generation error: {str(e)}")
-            raise
+    # NOTE: generate_pipeline_metrics was deleted 2026-06-11. It returned
+    # fabricated numbers (125M records, 52083/sec, 99.95% uptime) and had
+    # no callers — pipeline rows are served from the DB by the API.
 
     @staticmethod
     def _apply_transform(

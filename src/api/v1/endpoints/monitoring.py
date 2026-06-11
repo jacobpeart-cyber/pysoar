@@ -10,7 +10,7 @@ import psutil
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Response
+from fastapi import APIRouter, Header, HTTPException, Response
 from sqlalchemy import select, func
 
 from src.core.database import async_session_factory
@@ -29,13 +29,25 @@ _start_time = time.time()
 
 
 @router.get("/metrics")
-async def prometheus_metrics():
+async def prometheus_metrics(
+    x_forwarded_for: Optional[str] = Header(None),
+):
     """
     Export metrics in Prometheus text exposition format.
 
-    Scraped by Prometheus at configurable interval.
-    No authentication required (Prometheus needs direct access).
+    Internal-only: Prometheus scrapes the api container directly inside
+    the docker network, which never carries X-Forwarded-For. Both nginx
+    proxies always set that header, so its presence means the request
+    came from the public side — reject it rather than leak platform-wide
+    counts to the internet.
+    No authentication required for direct (in-network) access.
     """
+    if x_forwarded_for:
+        raise HTTPException(
+            status_code=403,
+            detail="Metrics are internal-only (direct scrape access)",
+        )
+
     lines = []
 
     # --- System Metrics ---
