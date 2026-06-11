@@ -24,7 +24,9 @@ services:
       - pysoar-network
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost/"]
+      # 127.0.0.1, not localhost: busybox wget resolves localhost to ::1
+      # but nginx only binds IPv4, so the check always failed.
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1/"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -96,6 +98,11 @@ services:
     networks:
       - pysoar-network
     restart: unless-stopped
+    # Hard ceiling so a leaking worker OOMs THIS container (which
+    # auto-restarts) instead of exhausting the 4 GB host and freezing
+    # the whole box (outage of 2026-05-20 → 2026-06-11).
+    mem_limit: 1536m
+    memswap_limit: 1536m
     healthcheck:
       test: ["CMD-SHELL", "celery -A src.workers.celery_app inspect ping --timeout 10 2>/dev/null | grep -q pong || exit 1"]
       interval: 30s
@@ -121,7 +128,10 @@ services:
       - pysoar-network
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "pgrep -f 'celery.*beat' || exit 1"]
+      # pgrep doesn't exist in the production image and celery 5 beat
+      # writes no pidfile unless daemonized. Beat is PID 1 here, so
+      # verify the main process is actually beat.
+      test: ["CMD-SHELL", "grep -q beat /proc/1/cmdline"]
       interval: 30s
       timeout: 10s
       retries: 3
