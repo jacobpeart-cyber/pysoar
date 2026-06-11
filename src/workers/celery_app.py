@@ -57,6 +57,13 @@ celery_app.conf.update(
     task_soft_time_limit=3300,  # 55 minutes soft limit
     worker_prefetch_multiplier=1,
     worker_concurrency=2,
+    # Memory-leak containment (prod incident 2026-05-20: leaking workers
+    # grew to 1-1.5 GB RSS each, kernel OOM-killed them for weeks, then
+    # froze the 4 GB host outright). Recycle each child after a bounded
+    # number of tasks AND whenever its RSS crosses 500 MB — well below
+    # the ~700 MB+ where the kernel started shooting workers.
+    worker_max_tasks_per_child=50,
+    worker_max_memory_per_child=500_000,  # KB == 500 MB
     task_acks_late=True,
     task_reject_on_worker_lost=True,
     result_expires=86400,  # Results expire after 1 day
