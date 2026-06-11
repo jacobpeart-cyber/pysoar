@@ -13,6 +13,9 @@ celery_app = Celery(
     backend=settings.celery_result_backend,
     include=[
         "src.workers.tasks",
+        # Playbook execution loop — the runner that consumes pending
+        # PlaybookExecution rows and the scheduled-trigger sweep.
+        "src.playbooks.tasks",
         "src.tasks.automation_tasks",
         "src.intel.tasks",
         "src.phishing_sim.tasks",
@@ -80,7 +83,7 @@ celery_app.conf.beat_schedule = {
         "schedule": 86400.0,  # Every 24 hours
     },
     "check-scheduled-playbooks": {
-        "task": "src.workers.tasks.check_scheduled_playbooks",
+        "task": "playbooks.check_scheduled_playbooks",
         "schedule": 60.0,  # Every minute
     },
     # --- Scheduled automation tasks (src.tasks.automation_tasks) ---

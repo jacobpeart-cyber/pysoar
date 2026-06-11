@@ -21,52 +21,6 @@ def run_async(coro):
 
 
 @shared_task(bind=True, max_retries=3)
-def execute_playbook_task(
-    self,
-    execution_id: str,
-    playbook_id: str,
-    steps: list[dict[str, Any]],
-    input_data: Optional[dict[str, Any]] = None,
-) -> dict[str, Any]:
-    """Execute a playbook asynchronously"""
-    logger.info(
-        "Starting playbook execution task",
-        execution_id=execution_id,
-        playbook_id=playbook_id,
-    )
-
-    try:
-        # Import here to avoid circular imports
-        from src.playbooks.engine import PlaybookEngine
-        from src.models.playbook import PlaybookExecution
-
-        # Create execution object
-        execution = PlaybookExecution(
-            id=execution_id,
-            playbook_id=playbook_id,
-        )
-
-        # Run the playbook
-        engine = PlaybookEngine()
-        result = run_async(engine.execute(execution, steps, input_data))
-
-        return {
-            "execution_id": execution_id,
-            "status": result.status,
-            "steps_completed": result.current_step,
-            "error": result.error_message,
-        }
-
-    except Exception as e:
-        logger.error(
-            "Playbook execution task failed",
-            execution_id=execution_id,
-            error=str(e),
-        )
-        raise self.retry(exc=e, countdown=60)
-
-
-@shared_task(bind=True, max_retries=3)
 def enrich_ioc_task(
     self,
     ioc_id: str,
@@ -253,20 +207,6 @@ def refresh_ioc_enrichments() -> dict[str, Any]:
     return {
         "refreshed": 0,
         "task": "refresh_ioc_enrichments",
-    }
-
-
-@shared_task
-def check_scheduled_playbooks() -> dict[str, Any]:
-    """Check for playbooks that need to run on schedule"""
-    logger.info("Checking for scheduled playbooks")
-
-    # This would check playbooks with trigger_type="scheduled"
-    # and execute them if their schedule matches
-
-    return {
-        "executed": 0,
-        "task": "check_scheduled_playbooks",
     }
 
 

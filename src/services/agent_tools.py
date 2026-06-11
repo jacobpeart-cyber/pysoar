@@ -777,6 +777,7 @@ class AgentToolRegistry:
 
     async def _execute_playbook(self, playbook_id, input_data=None):
         from src.models.playbook import Playbook, PlaybookExecution, ExecutionStatus
+        from src.playbooks.tasks import run_playbook_execution
         result = await self.db.execute(select(Playbook).where(Playbook.id == playbook_id))
         pb = result.scalar_one_or_none()
         if not pb:
@@ -788,7 +789,10 @@ class AgentToolRegistry:
             trigger_source="agent",
         )
         self.db.add(execution)
-        await self.db.flush()
+        # Commit (not just flush) before dispatch: the worker reads this
+        # row from its own connection, so it must be durable first.
+        await self.db.commit()
+        run_playbook_execution.delay(execution.id)
         return {"execution_id": execution.id, "playbook": pb.name, "status": "queued"}
 
     async def _block_ip(self, ip, reason):
