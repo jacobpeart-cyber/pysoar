@@ -410,6 +410,18 @@ def extract_json(text: str, schema: Optional[type] = None) -> ParseResult:
     if not text:
         return ParseResult(ok=False, error="empty input", attempt_log=["empty"])
 
+    # Reject top-level JSON arrays. The bare-object regex would otherwise
+    # match an object nested inside an array (e.g. `[{"x": 1}]`) and return
+    # the inner object — surprising behavior for a function whose contract
+    # is "extract a JSON object." Whitespace-stripped startswith("[") is
+    # the simplest unambiguous signal.
+    if text.lstrip().startswith("["):
+        return ParseResult(
+            ok=False,
+            error="no JSON object found in text",
+            attempt_log=["no_object"],
+        )
+
     candidate: Optional[str] = None
 
     bare = _try_bare_object(text)
