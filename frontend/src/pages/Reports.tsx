@@ -12,7 +12,7 @@ import {
   Shield,
   Loader2,
 } from 'lucide-react';
-import { alertsApi, incidentsApi } from '../lib/api';
+import { alertsApi, incidentsApi, reportsApi } from '../lib/api';
 import clsx from 'clsx';
 
 type ReportType = 'alerts' | 'incidents' | 'executive';
@@ -38,6 +38,15 @@ export default function Reports() {
     setIsExporting(true);
 
     try {
+      // CSV and PDF are generated server-side (full row-level data,
+      // tenant-scoped). JSON stays client-side over the stats blobs.
+      if (format === 'csv' || format === 'pdf') {
+        const days = dateRange === '7d' ? 7 : dateRange === '90d' ? 90 : 30;
+        const blob = await reportsApi.export(reportType, format, days);
+        downloadBlob(blob, `pysoar-${reportType}-${dateRange}.${format}`);
+        return;
+      }
+
       // Create report data based on report type
       let data: any;
       let filename: string;
@@ -79,24 +88,9 @@ export default function Reports() {
         filename = `executive-summary-${dateRange}`;
       }
 
-      // Export based on format
-      if (format === 'json') {
-        const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-        downloadBlob(blob, `${filename}.json`);
-      } else if (format === 'csv') {
-        const csv = convertToCSV(data);
-        const blob = new Blob([csv], { type: 'text/csv' });
-        downloadBlob(blob, `${filename}.csv`);
-      } else {
-        // Generate printable HTML report for PDF (use browser print dialog)
-        const reportHtml = `<!DOCTYPE html><html><head><title>${filename}</title><style>body{font-family:Arial,sans-serif;margin:40px;color:#333}h1{color:#1e40af}table{width:100%;border-collapse:collapse;margin:20px 0}th,td{border:1px solid #ddd;padding:8px;text-align:left}th{background:#f3f4f6}pre{background:#f9fafb;padding:16px;border-radius:4px;overflow:auto;font-size:12px}</style></head><body><h1>PySOAR Report: ${filename}</h1><p>Generated: ${new Date().toISOString()}</p><pre>${JSON.stringify(data, null, 2)}</pre></body></html>`;
-        const printWindow = window.open('', '_blank');
-        if (printWindow) {
-          printWindow.document.write(reportHtml);
-          printWindow.document.close();
-          printWindow.print();
-        }
-      }
+      // JSON export over the stats blobs (CSV/PDF returned above)
+      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+      downloadBlob(blob, `${filename}.json`);
     } finally {
       setIsExporting(false);
     }
@@ -111,30 +105,6 @@ export default function Reports() {
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
-  };
-
-  const convertToCSV = (data: any): string => {
-    const rows: string[] = [];
-    rows.push(`Report Type,${data.report_type}`);
-    rows.push(`Date Range,${data.date_range}`);
-    rows.push(`Generated At,${data.generated_at}`);
-    rows.push('');
-
-    if (data.summary) {
-      rows.push('Summary');
-      Object.entries(data.summary).forEach(([key, value]) => {
-        if (typeof value === 'object') {
-          rows.push(key);
-          Object.entries(value as Record<string, number>).forEach(([k, v]) => {
-            rows.push(`${k},${v}`);
-          });
-        } else {
-          rows.push(`${key},${value}`);
-        }
-      });
-    }
-
-    return rows.join('\n');
   };
 
   return (
