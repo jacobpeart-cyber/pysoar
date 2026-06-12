@@ -55,6 +55,7 @@ from src.api.v1.endpoints import (
     backup,
     fedramp,
     monitoring,
+    reports,
     websocket,
 )
 
@@ -126,6 +127,9 @@ api_router.include_router(fedramp.router, tags=["fedramp"])
 
 # --- Monitoring ---
 api_router.include_router(monitoring.router, tags=["monitoring"])
+
+# --- Report export (CSV/PDF downloads) ---
+api_router.include_router(reports.router, tags=["reports"])
 api_router.include_router(websocket.router, tags=["websocket"])
 
 # --- Agent Platform (unified BAS execution + Live Response + Purple Team) ---

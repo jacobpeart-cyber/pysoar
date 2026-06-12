@@ -180,6 +180,21 @@ export const alertsApi = {
   },
 };
 
+// Reports API — server-generated CSV/PDF downloads (tenant-scoped)
+export const reportsApi = {
+  export: async (
+    reportType: 'alerts' | 'incidents' | 'executive',
+    format: 'csv' | 'pdf',
+    days: number,
+  ): Promise<Blob> => {
+    const response = await api.get(`/reports/${reportType}/export`, {
+      params: { format, days },
+      responseType: 'blob',
+    });
+    return response.data;
+  },
+};
+
 // Incidents API
 export const incidentsApi = {
   list: async (params?: {
