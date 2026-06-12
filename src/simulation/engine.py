@@ -8,12 +8,12 @@ and security posture scoring for attack simulations.
 import asyncio
 import json
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, List, Any
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, update, and_
+from sqlalchemy import select, update, and_, or_
 
 from src.core.logging import get_logger
 from src.core.config import settings
@@ -510,23 +510,107 @@ class SimulationOrchestrator:
             )
             return None
 
+    # Clock-skew allowance when correlating agent execution time against
+    # SIEM ingest timestamps (agent clock vs server clock).
+    DETECTION_WINDOW_SKEW_SECONDS = 120
+
+    @staticmethod
+    def _parse_ts(value) -> Optional[datetime]:
+        """Parse an ISO timestamp (string or datetime) to aware-UTC."""
+        if value is None:
+            return None
+        if isinstance(value, datetime):
+            dt = value
+        else:
+            try:
+                dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            except (ValueError, TypeError):
+                return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+
+    async def _find_fired_evidence(
+        self,
+        mitre_id: str,
+        rule_ids: list[str],
+        window_start: datetime,
+    ) -> Optional[dict]:
+        """Find the earliest evidence that detection actually FIRED in the
+        execution window: a rule match recorded on an ingested log entry,
+        or a correlation event carrying this technique.
+
+        Returns ``{"fired_at", "source", "ref_id"}`` or None.
+        """
+        from src.siem.models import CorrelationEvent, LogEntry
+
+        search_start = window_start - timedelta(seconds=self.DETECTION_WINDOW_SKEW_SECONDS)
+        hits: list[tuple[datetime, str, str]] = []
+
+        # Rule matches stamped onto ingested logs. rule_matches is a JSON
+        # array in a Text column; LIKE pre-filters, the window check is
+        # done in Python because received_at is a string column.
+        if rule_ids:
+            like_clauses = [LogEntry.rule_matches.like(f'%{rid}%') for rid in rule_ids]
+            stmt = (
+                select(LogEntry)
+                .where(LogEntry.rule_matches.is_not(None), or_(*like_clauses))
+                .order_by(LogEntry.received_at.desc())
+                .limit(500)
+            )
+            for log in (await self.session.execute(stmt)).scalars().all():
+                fired_at = self._parse_ts(log.received_at) or self._parse_ts(log.timestamp)
+                if fired_at and fired_at >= search_start:
+                    hits.append((fired_at, "log_rule_match", log.id))
+
+        # Correlation events that identified this technique in the window.
+        stmt = (
+            select(CorrelationEvent)
+            .where(
+                CorrelationEvent.mitre_techniques.is_not(None),
+                CorrelationEvent.mitre_techniques.like(f"%{mitre_id}%"),
+                CorrelationEvent.created_at >= search_start.replace(tzinfo=None),
+            )
+            .limit(100)
+        )
+        for event in (await self.session.execute(stmt)).scalars().all():
+            try:
+                techniques = json.loads(event.mitre_techniques or "[]")
+            except (ValueError, TypeError):
+                continue
+            if mitre_id not in techniques:
+                continue
+            fired_at = self._parse_ts(event.created_at)
+            if fired_at and fired_at >= search_start:
+                hits.append((fired_at, "correlation_event", event.id))
+
+        if not hits:
+            return None
+        fired_at, source, ref_id = min(hits, key=lambda h: h[0])
+        return {"fired_at": fired_at, "source": source, "ref_id": ref_id}
+
     async def _check_detection(
         self,
         test: SimulationTest,
         technique: "AttackTechnique",
     ) -> bool:
         """
-        Determine whether this technique is covered by the org's detection rules.
+        Score whether the blue team detected this technique.
 
-        This is the scoring heart of the BAS engine. It is **deterministic**
-        (the same technique always scores the same way for a given ruleset)
-        and it reflects the *real* coverage of the platform's DetectionRule
-        table. That way the security posture score actually measures
-        something — "do you have a rule that claims to detect this MITRE
-        technique?" — instead of random noise.
+        Two modes, recorded in ``detection_details["correlation"]``:
 
-        Detection is granted if ANY active detection rule lists this
-        technique's mitre_id in its ``mitre_techniques`` JSON array.
+        - **real execution** (an agent actually ran the technique):
+          detection requires evidence that something FIRED inside the
+          execution window — a rule match stamped on an ingested log, or
+          a correlation event carrying this technique. Latency is
+          measured from test start to first evidence. A rule that merely
+          claims coverage but did not fire scores NOT detected and is
+          surfaced as ``coverage_only_not_fired`` — the classic purple
+          team gap finding.
+
+        - **coverage-only** (no agent enrolled, nothing executed):
+          legacy deterministic scoring — detected if any active rule
+          lists this technique's mitre_id. Labeled ``coverage_mapping``.
         """
         from src.siem.models import DetectionRule, RuleStatus
 
@@ -546,24 +630,71 @@ class SimulationOrchestrator:
             )
         )
         result = await self.session.execute(stmt)
-        candidates = list(result.scalars().all())
-
-        matching_rule = None
-        for rule in candidates:
+        matching_rules = []
+        for rule in result.scalars().all():
             try:
                 rule_techniques = json.loads(rule.mitre_techniques or "[]")
             except (ValueError, TypeError):
                 continue
             if isinstance(rule_techniques, list) and mitre_id in rule_techniques:
-                matching_rule = rule
-                break
+                matching_rules.append(rule)
 
+        details = dict(test.detection_details or {})
+        execution_mode = details.get("execution_mode")
+        matching_rule = matching_rules[0] if matching_rules else None
+
+        if execution_mode == "real":
+            window_start = self._parse_ts(test.started_at) or utc_now()
+            evidence = await self._find_fired_evidence(
+                mitre_id, [r.id for r in matching_rules], window_start
+            )
+            if evidence:
+                latency = max(0, int((evidence["fired_at"] - window_start).total_seconds()))
+                test.detection_time_seconds = latency
+                test.detection_source = f"{evidence['source']}:{evidence['ref_id']}"
+                test.detection_details = {
+                    **details,
+                    "correlation": "fired",
+                    "fired_at": evidence["fired_at"].isoformat(),
+                    "evidence_source": evidence["source"],
+                    "evidence_ref_id": evidence["ref_id"],
+                    "detection_latency_seconds": latency,
+                    "rule_id": matching_rule.id if matching_rule else None,
+                    "rule_name": matching_rule.name if matching_rule else None,
+                    "match_type": "temporal_correlation",
+                }
+                return True
+
+            # Technique genuinely executed and nothing fired. If a rule
+            # claims coverage, that's the headline purple-team finding.
+            test.detection_time_seconds = None
+            test.detection_details = {
+                **details,
+                "correlation": "coverage_only_not_fired",
+                "coverage_rule_id": matching_rule.id if matching_rule else None,
+                "coverage_rule_name": matching_rule.name if matching_rule else None,
+                "match_type": "temporal_correlation",
+                "note": (
+                    "Technique executed on a real endpoint but no rule match "
+                    "or correlation event fired within the detection window"
+                    + (
+                        " — a rule claims coverage for this technique but did not fire"
+                        if matching_rule
+                        else ""
+                    )
+                ),
+            }
+            return False
+
+        # Coverage-only mode: deterministic mapping score (labeled).
         if matching_rule is None:
             return False
 
-        test.detection_time_seconds = 0  # instantaneous: we're scoring coverage, not latency
+        test.detection_time_seconds = 0  # scoring coverage, not latency
         test.detection_source = f"detection_rule:{matching_rule.name}"
         test.detection_details = {
+            **details,
+            "correlation": "coverage_mapping",
             "rule_id": matching_rule.id,
             "rule_name": matching_rule.name,
             "rule_title": matching_rule.title,
