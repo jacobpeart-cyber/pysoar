@@ -58,6 +58,30 @@ async def test_alerts_csv_contains_rows_and_headers(db_session, test_user, seede
 
 
 @pytest.mark.asyncio
+async def test_csv_neutralizes_formula_injection(db_session, test_user):
+    # Alert titles derive from ingested log data — attacker-influenced.
+    # A title starting with '=' must not execute when a SOC analyst
+    # opens the export in Excel/Sheets.
+    from src.services.report_generator import ReportGenerator
+
+    db_session.add(Alert(
+        title='=HYPERLINK("http://evil.example","click")',
+        severity="high",
+        status="new",
+        source="siem",
+        organization_id=test_user.organization_id,
+    ))
+    await db_session.commit()
+
+    out = await ReportGenerator(db_session).alerts_csv(
+        organization_id=test_user.organization_id, days=30
+    )
+    rows = list(csv.DictReader(io.StringIO(out)))
+    title = next(r["title"] for r in rows if "HYPERLINK" in r["title"])
+    assert title.startswith("'="), "formula prefix not neutralized"
+
+
+@pytest.mark.asyncio
 async def test_alerts_csv_is_tenant_scoped(db_session, test_user, seeded_alerts):
     from src.services.report_generator import ReportGenerator
 
