@@ -32,13 +32,26 @@ INCIDENT_COLUMNS = [
 ]
 
 
+# Cell values that start with these become formulas when the CSV is
+# opened in Excel/Sheets. Alert titles are built from ingested log data
+# (attacker-influenced), and the people opening these exports are SOC
+# analysts — the exact audience a formula-injection payload targets.
+_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
+
+
+def _sanitize_csv(value: str) -> str:
+    if value and value[0] in _FORMULA_PREFIXES:
+        return "'" + value
+    return value
+
+
 def _cell(obj, column: str) -> str:
     value = getattr(obj, column, None)
     if value is None:
         return ""
     if isinstance(value, datetime):
         return value.isoformat()
-    return str(value)
+    return _sanitize_csv(str(value))
 
 
 class ReportGenerator:
@@ -200,7 +213,8 @@ class ReportGenerator:
         buf = io.StringIO()
         writer = csv.writer(buf)
         writer.writerow(["metric", "bucket", "count"])
-        writer.writerows(await self._executive_rows(organization_id, days))
+        for row in await self._executive_rows(organization_id, days):
+            writer.writerow([_sanitize_csv(str(cell)) for cell in row])
         return buf.getvalue()
 
     async def executive_pdf(self, organization_id: Optional[str], days: int = 30) -> bytes:
