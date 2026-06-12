@@ -42,9 +42,16 @@ class IndicatorEnricher:
         enrichment_data = {
             "indicator_id": indicator_id,
             "sources": [],
+            # Providers that were applicable but NOT queried, with the
+            # reason — so "no data" is distinguishable from "checked and
+            # clean" in the UI (audit gap #15: silent no-op without keys).
+            "skipped": [],
             "composite_score": 0,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
+
+        def _skip(provider: str, reason: str) -> None:
+            enrichment_data["skipped"].append({"provider": provider, "reason": reason})
 
         async with async_session_factory() as session:
             result = await session.execute(
@@ -60,7 +67,29 @@ class IndicatorEnricher:
             # Query external providers based on indicator type
             import httpx
 
-            if indicator.indicator_type in ("ipv4", "ipv6") and self.vt_available:
+            is_ip = indicator.indicator_type in ("ipv4", "ipv6")
+
+            # Providers PySOAR declares but has no query implementation
+            # for. With a key set, the analyst must be told it's the code
+            # that's missing — not left wondering why nothing happens.
+            if is_ip:
+                for provider, available in (
+                    ("shodan", self.shodan_available),
+                    ("greynoise", self.greynoise_available),
+                ):
+                    if available:
+                        _skip(provider, "API key configured but provider not implemented in PySOAR yet")
+                    else:
+                        _skip(provider, "no API key configured")
+
+            if is_ip and not self.vt_available:
+                _skip("virustotal", "no API key configured")
+            if indicator.indicator_type == "ipv4" and not self.abuseipdb_available:
+                _skip("abuseipdb", "no API key configured")
+            if indicator.indicator_type == "domain" and not self.vt_available:
+                _skip("virustotal", "no API key configured")
+
+            if is_ip and self.vt_available:
                 try:
                     async with httpx.AsyncClient() as client:
                         resp = await client.get(
@@ -81,6 +110,7 @@ class IndicatorEnricher:
                             })
                 except Exception as e:
                     self.logger.warning("VirusTotal enrichment failed", error=str(e))
+                    _skip("virustotal", f"query failed: {e}")
 
             if indicator.indicator_type in ("ipv4",) and self.abuseipdb_available:
                 try:
@@ -102,6 +132,7 @@ class IndicatorEnricher:
                             })
                 except Exception as e:
                     self.logger.warning("AbuseIPDB enrichment failed", error=str(e))
+                    _skip("abuseipdb", f"query failed: {e}")
 
             if indicator.indicator_type == "domain" and self.vt_available:
                 try:
@@ -124,16 +155,22 @@ class IndicatorEnricher:
                             })
                 except Exception as e:
                     self.logger.warning("VirusTotal domain enrichment failed", error=str(e))
+                    _skip("virustotal", f"query failed: {e}")
 
             # Calculate composite score from all provider results
             if enrichment_data["sources"]:
                 scores = [s["score"] for s in enrichment_data["sources"] if "score" in s]
                 enrichment_data["composite_score"] = int(sum(scores) / len(scores)) if scores else 0
 
-            # Persist enrichment data back to the indicator
+            # Persist enrichment data back to the indicator, including
+            # what was skipped and why — the UI reads context.
             existing_context = indicator.context or {}
             for source in enrichment_data["sources"]:
                 existing_context[source["provider"]] = source
+            existing_context["enrichment_status"] = {
+                "skipped": enrichment_data["skipped"],
+                "checked_at": enrichment_data["updated_at"],
+            }
             indicator.context = existing_context
             indicator.last_seen = datetime.now(timezone.utc)
             await session.commit()

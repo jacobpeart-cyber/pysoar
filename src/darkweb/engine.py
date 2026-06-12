@@ -978,97 +978,15 @@ class ThreatIntelCorrelator:
 
         return correlations
 
-    async def enrich_findings(
-        self, findings: list[dict[str, Any]]
-    ) -> list[dict[str, Any]]:
-        """Enrich findings with contextual intelligence"""
-        enriched = []
-
-        for finding in findings:
-            enrichment = {
-                "finding": finding,
-                "actor_attribution": self._attribute_actor(finding),
-                "campaign_mapping": self._map_campaign(finding),
-                "historical_context": self._get_historical_context(finding),
-                "enrichment_timestamp": datetime.now(timezone.utc).isoformat(),
-            }
-            enriched.append(enrichment)
-
-        return enriched
-
-    def _attribute_actor(self, finding: dict[str, Any]) -> Optional[dict[str, Any]]:
-        """Attribute finding to threat actor based on available evidence"""
-        actor_name = "Unknown"
-        confidence = 0
-        aliases = []
-
-        # Extract attribution signals from the finding
-        source_platform = finding.get("source_platform", "")
-        finding_type = finding.get("finding_type", "") or finding.get("type", "")
-        content = str(finding.get("content", "")) + str(finding.get("description", ""))
-        tags = finding.get("tags", []) if isinstance(finding.get("tags"), list) else []
-
-        # Known actor keyword signatures (common threat groups and their indicators)
-        actor_signatures = {
-            "LockBit": {"keywords": ["lockbit", "lockbit3", "lockbit 3.0"], "aliases": ["LockBit 3.0", "LockBitSupp"], "platforms": ["ransomware_forum", "tor"]},
-            "BlackCat/ALPHV": {"keywords": ["alphv", "blackcat", "noberus"], "aliases": ["ALPHV", "Noberus", "BlackCat"], "platforms": ["ransomware_forum", "tor"]},
-            "Cl0p": {"keywords": ["cl0p", "clop", "ta505"], "aliases": ["TA505", "FIN11"], "platforms": ["ransomware_forum", "tor"]},
-            "Lazarus Group": {"keywords": ["lazarus", "hidden cobra", "apt38", "bluenoroff"], "aliases": ["Hidden Cobra", "APT38", "BlueNoroff"], "platforms": ["paste_site", "forum"]},
-            "FIN7": {"keywords": ["fin7", "carbanak", "anunak"], "aliases": ["Carbanak", "Anunak"], "platforms": ["forum", "marketplace"]},
-            "APT28": {"keywords": ["apt28", "fancy bear", "sofacy", "pawn storm"], "aliases": ["Fancy Bear", "Sofacy", "Pawn Storm"], "platforms": ["forum", "paste_site"]},
-            "APT29": {"keywords": ["apt29", "cozy bear", "nobelium"], "aliases": ["Cozy Bear", "Nobelium", "The Dukes"], "platforms": ["forum", "paste_site"]},
-        }
-
-        content_lower = content.lower()
-        best_match_confidence = 0
-
-        for actor, signature in actor_signatures.items():
-            match_score = 0
-            # Check keyword matches
-            for keyword in signature["keywords"]:
-                if keyword in content_lower:
-                    match_score += 40
-            # Check tags
-            for tag in tags:
-                for keyword in signature["keywords"]:
-                    if keyword in tag.lower():
-                        match_score += 30
-            # Platform correlation
-            if source_platform in signature["platforms"]:
-                match_score += 10
-
-            if match_score > best_match_confidence:
-                best_match_confidence = match_score
-                actor_name = actor
-                aliases = signature["aliases"]
-                confidence = min(95, match_score)
-
-        if best_match_confidence == 0:
-            actor_name = "Unattributed"
-            confidence = 0
-            aliases = []
-
-        return {
-            "actor_name": actor_name,
-            "confidence": confidence,
-            "known_aliases": aliases,
-        }
-
-    def _map_campaign(self, finding: dict[str, Any]) -> Optional[dict[str, Any]]:
-        """Map finding to known campaign"""
-        return {
-            "campaign_id": None,
-            "campaign_name": "Unattributed",
-            "confidence": 0,
-        }
-
-    def _get_historical_context(self, finding: dict[str, Any]) -> dict[str, Any]:
-        """Get historical context for finding"""
-        return {
-            "previous_occurrences": 0,
-            "first_seen": datetime.now(timezone.utc).isoformat(),
-            "last_activity": datetime.now(timezone.utc).isoformat(),
-        }
+    # NOTE: enrich_findings and its helpers (_attribute_actor,
+    # _map_campaign, _get_historical_context) were deleted 2026-06-11.
+    # They had zero callers and fabricated analysis: campaign mapping
+    # always returned "Unattributed", historical context returned
+    # hardcoded zeros with now() timestamps, and actor attribution was
+    # an 8-entry keyword table presented as intelligence. The real
+    # correlation path is correlate_with_iocs / correlate_with_incidents
+    # (used by darkweb tasks). Reimplement attribution against stored
+    # ThreatActor/ThreatCampaign rows if the feature is wanted.
 
     async def generate_intelligence_report(
         self, findings: list[dict[str, Any]], organization_name: str

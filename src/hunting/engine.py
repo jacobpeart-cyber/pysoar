@@ -555,7 +555,7 @@ class HuntAnalyzer:
                         "title": f"High frequency of {field}: {value}",
                         "description": f"{field} value '{value}' appeared {count} times (threshold: {threshold})",
                         "affected_assets": [value],
-                        "evidence": [{"type": "frequency", "value": count, "field": field}],
+                        "evidence": [{"type": "frequency", "value": count, "field": field, "threshold": threshold}],
                     }
                 )
 
@@ -591,7 +591,7 @@ class HuntAnalyzer:
                         "title": f"Rare {field}: {value}",
                         "description": f"{field} value '{value}' appeared only {count} time(s)",
                         "affected_assets": [value],
-                        "evidence": [{"type": "rare_value", "value": count}],
+                        "evidence": [{"type": "rare_value", "value": count, "max_occurrences": max_occurrences}],
                     }
                 )
 
@@ -668,7 +668,7 @@ class HuntAnalyzer:
                     "type": "time_cluster",
                     "title": f"Temporal cluster: {len(cluster)} events",
                     "description": f"Detected temporal clustering of {len(cluster)} events",
-                    "evidence": [{"type": "cluster_size", "value": len(cluster)}],
+                    "evidence": [{"type": "cluster_size", "value": len(cluster), "threshold": 5}],
                 }
             )
 
@@ -737,45 +737,76 @@ class HuntAnalyzer:
                         "title": f"Large data transfer: {bytes_transferred} bytes",
                         "description": f"Detected data transfer of {bytes_transferred} bytes",
                         "evidence": [
-                            {"type": "data_volume", "bytes": bytes_transferred}
+                            {"type": "data_volume", "bytes": bytes_transferred, "threshold": threshold_bytes}
                         ],
                     }
                 )
 
         return findings
 
+    # Type priors: how dangerous this finding KIND is when confirmed.
+    # The final score scales the prior by the evidence magnitude, so a
+    # hostname seen 600x scores higher than one seen 6x (previously both
+    # got the same constant).
+    _TYPE_PRIORS = {
+        "lateral_movement": 0.80,
+        "large_transfer": 0.70,
+        "frequency_anomaly": 0.62,
+        "time_cluster": 0.55,
+        "rare_value": 0.38,
+    }
+
+    @staticmethod
+    def _evidence_magnitude(item: dict) -> float:
+        """Normalize one evidence item to a 0..1 strength factor.
+
+        Threshold-relative measures saturate at 4x their analyzer's own
+        threshold; rarity inverts (rarer = stronger). Legacy evidence
+        without threshold metadata gets a neutral mid factor.
+        """
+        etype = item.get("type", "")
+        if etype == "rare_value":
+            max_occ = item.get("max_occurrences")
+            count = item.get("value")
+            if max_occ and count:
+                return max(0.0, min(1.0, (max_occ - count + 1) / max_occ))
+            return 0.5
+        if etype == "lateral_movement":
+            hosts = item.get("host_count") or 0
+            # 2 hosts is the detection floor; ~8+ distinct hosts is max signal
+            return max(0.0, min(1.0, (hosts - 1) / 7))
+        if etype == "data_volume":
+            value, threshold = item.get("bytes"), item.get("threshold")
+        else:  # frequency, cluster_size, and future threshold-relative kinds
+            value, threshold = item.get("value"), item.get("threshold")
+        if value and threshold:
+            return max(0.0, min(1.0, (value / threshold) / 4))
+        return 0.5
+
     @staticmethod
     def score_finding(finding_data: dict) -> float:
-        """Score a potential finding 0.0-1.0 based on severity indicators
-
-        Args:
-            finding_data: Dict with finding details
-
-        Returns:
-            Score from 0.0 to 1.0
-        """
-        score = 0.5  # Base score
-
+        """Score a finding 0.0-1.0 from its type prior scaled by how
+        strong the actual evidence is, plus a corroboration bump when
+        multiple distinct evidence kinds agree."""
         finding_type = finding_data.get("type", "")
+        prior = HuntAnalyzer._TYPE_PRIORS.get(finding_type, 0.5)
 
-        # Adjust score by finding type
-        if finding_type == "lateral_movement":
-            score = 0.85
-        elif finding_type == "large_transfer":
-            score = 0.75
-        elif finding_type == "frequency_anomaly":
-            score = 0.70
-        elif finding_type == "time_cluster":
-            score = 0.60
-        elif finding_type == "rare_value":
-            score = 0.40
+        evidence = finding_data.get("evidence", []) or []
+        if not evidence:
+            return round(prior * 0.6, 3)  # unsubstantiated: discount the prior
 
-        # Adjust by evidence count
-        evidence_count = len(finding_data.get("evidence", []))
-        if evidence_count >= 3:
-            score = min(1.0, score + 0.15)
+        strongest = max(HuntAnalyzer._evidence_magnitude(e) for e in evidence)
+        # Map magnitude 0..1 onto 0.6..1.3 of the prior: weak evidence
+        # discounts, saturated evidence boosts past the prior.
+        score = prior * (0.6 + 0.7 * strongest)
 
-        return min(1.0, max(0.0, score))
+        distinct_kinds = {e.get("type") for e in evidence if e.get("type")}
+        if len(distinct_kinds) >= 2:
+            score += 0.10
+        if len(evidence) >= 3:
+            score += 0.05
+
+        return round(min(1.0, max(0.0, score)), 3)
 
 
 class HuntTemplateManager:
