@@ -62,6 +62,23 @@ async def test_network_action_types_urls_and_domains(db_session):
     assert types["evil.example"] == "domain"
 
 
+def test_darkweb_fabricators_are_gone():
+    import src.darkweb.engine as dwe
+
+    fabricators = [
+        f"{klass.__name__}.{name}"
+        for klass in vars(dwe).values()
+        if isinstance(klass, type)
+        for name in ("enrich_findings", "_map_campaign", "_get_historical_context")
+        if name in vars(klass)
+    ]
+    assert not fabricators, (
+        f"fabricating dark-web enrichment is back: {fabricators} — it "
+        "returned canned campaign/history data with zero callers; "
+        "reimplement against ThreatActor/ThreatCampaign rows instead"
+    )
+
+
 def test_data_lake_fabricators_are_gone():
     import src.data_lake.engine as dle
 
