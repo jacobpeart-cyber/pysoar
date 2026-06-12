@@ -13,14 +13,14 @@ it) · HONEST-EMPTY (returns nothing + says why, acceptable).
 
 | # | Claim | Reality | Where |
 | --- | --- | --- | --- |
-| 1 | Alert processing pipeline (dedupe, enrich, trigger playbooks) | `process_alert_task` logs and returns `{"processed": true}` — body is a "This would…" comment | `src/workers/tasks.py` |
-| 2 | IOC enrichment refresh (beat-scheduled daily) | `refresh_ioc_enrichments` returns `{"refreshed": 0}` forever | `src/workers/tasks.py` + beat entry |
-| 3 | Alert ingestion from external sources | `ingest_alerts_from_source` stub returns `{"imported": 0}` | `src/workers/tasks.py` |
-| 4 | Report generation (CSV/JSON/PDF) | `generate_report` returns `{"generated": true, "url": null}`; PDF/CSV handlers don't exist anywhere | `src/workers/tasks.py`, compliance export only does JSON/Markdown |
-| 5 | Network remediation (sinkhole, block URL, DNS block) | `NetworkActionExecutor.execute` writes an activity row and returns success — configures nothing, dispatches nothing | `src/remediation/engine.py:1148` |
-| 6 | STIG findings enter automation (alerts → incidents → playbooks) | `on_stig_finding` creates the Alert but never calls `on_alert_created`, so the automation pipeline is skipped | `src/services/automation.py:873` |
-| 7 | Data lake ingestion/pipeline metrics | Hardcoded: 125,000,000 events, 5,432 eps, 456 GB/day, 52,083 throughput — no DB reads | `src/data_lake/engine.py:331,1286` |
-| 8 | Data lake event enrichment (geo, intel, asset) | Hardcoded geo (US/CA/Mountain View) and reputation_score 85 | `src/data_lake/engine.py:209` |
+| 1 | Alert processing pipeline (dedupe, enrich, trigger playbooks) | **FIXED 2026-06-11**: zero-caller stub deleted (honest absence beats fake success); real processing lives in the SIEM pipeline + automation service | `src/workers/tasks.py` |
+| 2 | IOC enrichment refresh (beat-scheduled daily) | **FIXED 2026-06-11**: re-enriches active non-whitelisted indicators stale 7+ days (100/run) via IndicatorEnricher, which persists results | `src/workers/tasks.py` |
+| 3 | Alert ingestion from external sources | **FIXED 2026-06-11**: zero-caller stub deleted; real ingestion is the SIEM collectors + cloud pollers | `src/workers/tasks.py` |
+| 4 | Report generation (CSV/JSON/PDF) | **FIXED 2026-06-11**: real tenant-scoped CSV+PDF via `src/services/report_generator.py` + `GET /reports/{type}/export`; frontend downloads server files | `src/api/v1/endpoints/reports.py` |
+| 5 | Network remediation (sinkhole, block URL, DNS block) | **FIXED 2026-06-11**: now registers target as active IOC (detective control) and honestly reports `mode: detection_only`; enforcement still needs a firewall integration | `src/remediation/engine.py` |
+| 6 | STIG findings enter automation (alerts → incidents → playbooks) | **FIXED 2026-06-11**: `on_stig_finding` now calls `on_alert_created` like every other source | `src/services/automation.py` |
+| 7 | Data lake ingestion/pipeline metrics | **FIXED 2026-06-11**: fabricating dead methods deleted (zero callers); API serves real rows | `src/data_lake/engine.py` |
+| 8 | Data lake event enrichment (geo, intel, asset) | **FIXED 2026-06-11**: fabricating dead method deleted (zero callers) | `src/data_lake/engine.py` |
 | 9 | Honeypots/decoys "deployed" with automated alerting | `deploy_honeypot` creates a DB record; no listener is ever started. Orchestrator effectiveness/coverage return zeros/fixed maps | `src/deception/engine.py:104,700` |
 
 ## 2. Tier 2 — overstated or degraded
@@ -28,14 +28,14 @@ it) · HONEST-EMPTY (returns nothing + says why, acceptable).
 | # | Claim | Reality | Where |
 | --- | --- | --- | --- |
 | 10 | "20+ pre-built integrations" | 46 declared, 10 real adapters (slack, crowdstrike, servicenow, jira, pagerduty, virustotal, shodan, abuseipdb, aws_security_hub, microsoft_sentinel); other 36 fall back to a generic HTTP guesser | `src/integrations/engine.py`, `src/integrations/connectors/` |
-| 11 | Tenant-scoped real-time KPIs | `/metrics` queries real counts but has NO organization_id filter — cross-tenant aggregates | `src/api/v1/endpoints/monitoring.py:95` |
-| 12 | Purple team "correlate the SIEM/EDR response timeline" | Detection score = does any active rule list the technique ID. No temporal correlation with actually-fired alerts | `src/simulation/engine.py:513` |
+| 11 | Tenant-scoped real-time KPIs | **FIXED 2026-06-11** (re-read: /metrics is a Prometheus exposition endpoint, platform totals are correct semantics; the dashboard IS tenant-scoped) — public access now 403s via X-Forwarded-For gate | `src/api/v1/endpoints/monitoring.py` |
+| 12 | Purple team "correlate the SIEM/EDR response timeline" | **FIXED 2026-06-11**: real executions now require fired evidence (log rule-match or correlation event) inside the execution window, with measured latency; "rule claims coverage but didn't fire" surfaced as `coverage_only_not_fired` | `src/simulation/engine.py` `_check_detection` |
 | 13 | Hunt finding scoring | Fixed constants by type (lateral_movement=0.85 …), thresholds map score→severity | `src/hunting/engine.py:525,748` |
 | 14 | Dark web actor attribution / campaign mapping | 8 hardcoded keyword signatures; `_map_campaign` and `_get_historical_context` return null/zeros | `src/darkweb/engine.py:926-1071` |
 | 15 | Enrichment via VT/AbuseIPDB/Shodan/GreyNoise | Real API calls when keys exist; silent `[]` when missing (UI shows nothing instead of "no key configured") | `src/intel/enrichment.py:63-83` |
-| 16 | ITDR credential exposure check | Silently returns `[]` if CredentialLeak import fails | `src/itdr/engine.py:449` |
+| 16 | ITDR credential exposure check | **FIXED 2026-06-11**: skipped lookups now log explicit warnings instead of silently returning clean results | `src/itdr/engine.py` |
 | 17 | Patch deployment | Marks vulnerability rows PATCHED; never talks to a patch system | `src/remediation/engine.py:1182` |
-| 18 | `IntegrationManager.install_connector` | Dead code — returns success without persisting; the API endpoint does the real work | `src/integrations/engine.py:722` |
+| 18 | `IntegrationManager.install_connector` | **FIXED 2026-06-11**: dead fake-success method deleted; API endpoint owns persistence | `src/integrations/engine.py` |
 
 ## 3. Verified real (sampled, no action needed)
 
