@@ -171,6 +171,11 @@ async def process_log(
                     hostname=norm_dict.get("hostname"),
                     raw_data=json.dumps(match.to_dict()),
                     tags=json.dumps(match.mitre_techniques) if match.mitre_techniques else None,
+                    # Carry tenant scope from the log so the per-org
+                    # autonomous investigator (auto_triage) picks it up.
+                    # Without this, SIEM alerts were NULL-org and never
+                    # investigated.
+                    organization_id=organization_id,
                     created_at=datetime.now(timezone.utc),
                     updated_at=datetime.now(timezone.utc),
                 )

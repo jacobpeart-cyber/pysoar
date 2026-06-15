@@ -36,6 +36,7 @@ class AgentCapability(str, Enum):
     LIVE_RESPONSE = "ir"     # Incident response actions: kill/isolate/collect
     PURPLE_TEAM = "purple"   # Orchestrated red+blue live correlation
     COMPLIANCE = "compliance"  # DISA STIG / CIS benchmark checks
+    DECEPTION = "deception"  # Hosts honeypot listeners, reports interactions
 
 
 class AgentAction(str, Enum):
@@ -70,6 +71,10 @@ class AgentAction(str, Enum):
     RUN_STIG_CHECK = "run_stig_check"   # payload = {rule_id, check_content, os_type}
     RUN_CIS_CHECK = "run_cis_check"     # payload = {rule_id, check_content, os_type}
 
+    # --- Deception ---
+    DEPLOY_HONEYPOT = "deploy_honeypot"  # payload = {decoy_id, port, banner, service}
+    STOP_HONEYPOT = "stop_honeypot"      # payload = {decoy_id}
+
 
 # Which actions each capability unlocks
 CAPABILITY_ACTIONS: dict[AgentCapability, set[AgentAction]] = {
@@ -96,6 +101,10 @@ CAPABILITY_ACTIONS: dict[AgentCapability, set[AgentAction]] = {
     AgentCapability.COMPLIANCE: {
         AgentAction.RUN_STIG_CHECK,
         AgentAction.RUN_CIS_CHECK,
+    },
+    AgentCapability.DECEPTION: {
+        AgentAction.DEPLOY_HONEYPOT,
+        AgentAction.STOP_HONEYPOT,
     },
 }
 

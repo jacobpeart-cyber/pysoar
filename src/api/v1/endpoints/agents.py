@@ -40,6 +40,7 @@ from src.schemas.agents import (
     CommandResultRequest,
     CommandSummary,
     HeartbeatRequest,
+    HoneypotInteractionsRequest,
     IssueCommandRequest,
 )
 from src.api.v1.schemas.agent_events import HostEventsRequest
@@ -686,6 +687,57 @@ async def agent_post_result(
     except AgentServiceError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {"status": "accepted", "command_id": command_id}
+
+
+@router.post("/_agent/honeypot-interactions")
+async def agent_honeypot_interactions(
+    interactions_request: HoneypotInteractionsRequest,
+    agent: EndpointAgent = Depends(_require_agent),
+    session: DatabaseSession = None,
+) -> dict:
+    """Accept honeypot interaction reports from a deception agent.
+
+    Creates DecoyInteraction rows (tenant-bound to the agent's org).
+    The agentic broad sweep already watches that table, so reported
+    hits flow into the autonomous investigator automatically.
+    """
+    from sqlalchemy import select as _select
+
+    from src.deception.models import Decoy, DecoyInteraction
+
+    created = 0
+    skipped = 0
+    for item in interactions_request.interactions[:200]:
+        decoy = (
+            await session.execute(_select(Decoy).where(Decoy.id == item.decoy_id))
+        ).scalar_one_or_none()
+        # Tenant boundary: an agent may only report against decoys in
+        # its own organization.
+        if decoy is None or (
+            decoy.organization_id
+            and decoy.organization_id != agent.organization_id
+        ):
+            skipped += 1
+            logger.warning(
+                "Honeypot interaction skipped: unknown or cross-tenant decoy",
+                extra={"decoy_id": item.decoy_id, "agent_id": agent.id},
+            )
+            continue
+        session.add(
+            DecoyInteraction(
+                decoy_id=decoy.id,
+                interaction_type=item.interaction_type or "connection",
+                source_ip=item.source_ip,
+                source_port=item.source_port,
+                protocol=item.protocol or "tcp",
+                payloads_captured=[item.data_sample] if item.data_sample else [],
+                threat_assessment="high",
+                organization_id=agent.organization_id or decoy.organization_id,
+            )
+        )
+        created += 1
+    await session.commit()
+    return {"status": "accepted", "created": created, "skipped": skipped}
 
 
 @router.post("/_agent/host_events")

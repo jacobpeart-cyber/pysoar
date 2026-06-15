@@ -217,3 +217,91 @@ def cleanup_expired_tokens(self):
     except Exception as exc:
         logger.error(f"Error cleaning up expired tokens: {exc}")
         raise self.retry(exc=exc, countdown=60)
+
+
+# ---------------------------------------------------------------------------
+# Honeypot dispatch reconciliation (2026-06-11)
+#
+# deploy_honeypot dispatches an agent command and leaves the decoy in
+# status="deploying" with the command id stored in configuration. This
+# beat task closes the loop: when the agent's result arrives the decoy
+# flips to active (listener confirmed) or failed (bind error etc).
+# ---------------------------------------------------------------------------
+
+import asyncio
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import NullPool
+
+from src.core.config import settings
+
+_engine = create_async_engine(settings.database_url, echo=False, poolclass=NullPool)
+_AsyncSessionLocal = sessionmaker(_engine, class_=AsyncSession, expire_on_commit=False)
+
+
+async def _reconcile_honeypot_dispatches() -> dict:
+    from src.agents.models import AgentCommand, AgentResult
+    from src.deception.models import Decoy
+
+    async with _AsyncSessionLocal() as db:
+        decoys = (
+            await db.execute(
+                select(Decoy).where(
+                    Decoy.decoy_type == "honeypot",
+                    Decoy.status == "deploying",
+                )
+            )
+        ).scalars().all()
+
+        activated = failed = pending = 0
+        for decoy in decoys:
+            config = dict(decoy.configuration or {})
+            listener = dict(config.get("listener") or {})
+            command_id = listener.get("command_id")
+            if not command_id:
+                continue
+
+            result = (
+                await db.execute(
+                    select(AgentResult).where(AgentResult.command_id == command_id)
+                )
+            ).scalar_one_or_none()
+
+            if result is not None:
+                if result.status == "success":
+                    decoy.status = "active"
+                    listener["state"] = "listening"
+                    activated += 1
+                else:
+                    decoy.status = "failed"
+                    listener["state"] = "failed"
+                    listener["error"] = (result.stderr or result.status or "")[:300]
+                    failed += 1
+            else:
+                cmd = (
+                    await db.execute(
+                        select(AgentCommand).where(AgentCommand.id == command_id)
+                    )
+                ).scalar_one_or_none()
+                if cmd is not None and cmd.status in ("rejected", "expired", "failed"):
+                    decoy.status = "failed"
+                    listener["state"] = "failed"
+                    listener["error"] = f"command {cmd.status}"
+                    failed += 1
+                else:
+                    pending += 1
+                    continue
+
+            config["listener"] = listener
+            decoy.configuration = config
+
+        await db.commit()
+        return {"activated": activated, "failed": failed, "pending": pending}
+
+
+@shared_task(name="deception.reconcile_honeypot_dispatches")
+def reconcile_honeypot_dispatches() -> dict:
+    """Flip deploying honeypots to active/failed from agent results."""
+    return asyncio.run(_reconcile_honeypot_dispatches())

@@ -84,21 +84,26 @@ def schedule_is_due(
     if cron_expr:
         try:
             minute, hour, dom, month, dow = str(cron_expr).split()
+            # nowfun pins evaluation to the caller's `now`. Without it,
+            # crontab.remaining_estimate() uses real wall-clock time,
+            # which silently couples due-ness to the actual date.
             spec = crontab(
                 minute=minute,
                 hour=hour,
                 day_of_month=dom,
                 month_of_year=month,
                 day_of_week=dow,
+                nowfun=lambda: now,
             )
         except (ValueError, TypeError) as exc:
             logger.warning("Invalid cron expression", cron=cron_expr, error=str(exc))
             return False
         if last_run is None:
             return True
-        # Due if the first fire-time after the last run has already passed.
-        remaining = spec.remaining_estimate(last_run)
-        return last_run + remaining <= now
+        # remaining_estimate(last_run) = (first fire strictly after
+        # last_run) - now. Due once that fire time has reached `now`,
+        # i.e. the remaining time is zero or negative.
+        return spec.remaining_estimate(last_run) <= timedelta(0)
 
     return False
 

@@ -1406,6 +1406,43 @@ _collector_instance = None
 _collector_task = None
 
 
+async def _resolve_default_siem_org() -> Optional[str]:
+    """Resolve the org to stamp on syslog-received logs/alerts.
+
+    The syslog receiver has no per-message authentication (a firewall
+    shipping RFC 3164 can't present an API key), so logs would otherwise
+    land NULL-org and the per-org autonomous investigator would never
+    triage them. Resolution order:
+
+      1. ``SIEM_DEFAULT_ORG_ID`` env (explicit operator choice).
+      2. The sole superuser's organization (single-owner deployments —
+         the common case for a self-hosted PySOAR).
+
+    Returns None if neither resolves (multi-superuser with no env set);
+    the operator must then set SIEM_DEFAULT_ORG_ID explicitly.
+    """
+    import os
+
+    env_org = os.getenv("SIEM_DEFAULT_ORG_ID")
+    if env_org:
+        return env_org
+
+    from src.core.database import async_session_factory
+    from src.models.user import User
+
+    try:
+        async with async_session_factory() as db:
+            supers = (
+                await db.execute(select(User).where(User.is_superuser == True))  # noqa: E712
+            ).scalars().all()
+            orgs = {u.organization_id for u in supers if u.organization_id}
+            if len(orgs) == 1:
+                return orgs.pop()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Default SIEM org resolution failed", error=str(exc))
+    return None
+
+
 async def _syslog_batch_handler(messages: list):
     """Process a batch of syslog messages through the SIEM pipeline.
 
@@ -1419,6 +1456,8 @@ async def _syslog_batch_handler(messages: list):
     """
     from src.siem.pipeline import process_log
     from src.core.database import async_session_factory
+
+    org_id = await _resolve_default_siem_org()
 
     async with async_session_factory() as db:
         for msg in messages:
@@ -1445,6 +1484,7 @@ async def _syslog_batch_handler(messages: list):
                     source_name=source_name,
                     source_ip=source_ip,
                     db=db,
+                    organization_id=org_id,
                 )
             except Exception as e:
                 logger.error(f"Syslog pipeline error: {e}")

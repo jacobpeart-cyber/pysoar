@@ -153,6 +153,14 @@ async def deploy_decoy(
         await db.flush()
         await db.refresh(decoy)
 
+        # Honeypots become real listeners on a deception-capable endpoint
+        # agent; without one the decoy is honestly marked record_only
+        # instead of pretending to be live (audit gap #9).
+        if decoy.decoy_type == "honeypot":
+            from src.deception.engine import dispatch_honeypot_to_agent
+            await dispatch_honeypot_to_agent(db, decoy)
+            await db.flush()
+
         logger.info(
             f"Deployed decoy: {decoy.name}",
             extra={
