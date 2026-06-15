@@ -779,3 +779,89 @@ class DeceptionOrchestrator:
             },
             "total_coverage_percentage": 75.0,
         }
+
+
+# ---------------------------------------------------------------------------
+# Agent-hosted honeypot dispatch (2026-06-11)
+#
+# Decoys of type "honeypot" become REAL listeners by dispatching a
+# deploy_honeypot command to an active deception-capable endpoint agent.
+# Without such an agent the decoy is honestly labeled record_only
+# instead of pretending to be deployed (audit gap #9).
+# ---------------------------------------------------------------------------
+
+_SERVICE_DEFAULT_PORTS = {
+    "SSH": 2222, "HTTP": 8080, "FTP": 2121, "TELNET": 2323,
+    "MYSQL": 13306, "RDP": 13389, "SMB": 14445,
+}
+
+
+async def dispatch_honeypot_to_agent(db, decoy: Decoy) -> dict[str, Any]:
+    """Dispatch a honeypot decoy to a deception-capable endpoint agent.
+
+    Mutates ``decoy.status`` and ``decoy.configuration`` in place (caller
+    commits). Returns a summary dict describing what happened.
+    """
+    from sqlalchemy import select
+
+    from src.agents.capabilities import AgentAction, AgentCapability
+    from src.agents.models import EndpointAgent
+    from src.agents.service import AgentService
+
+    query = select(EndpointAgent).where(EndpointAgent.status == "active")
+    if decoy.organization_id:
+        query = query.where(EndpointAgent.organization_id == decoy.organization_id)
+    agents = [
+        a for a in (await db.execute(query)).scalars().all()
+        if AgentCapability.DECEPTION.value in (a.capabilities or [])
+    ]
+
+    agent = None
+    if decoy.deployment_target:
+        agent = next((a for a in agents if a.hostname == decoy.deployment_target), None)
+    if agent is None and agents:
+        agent = agents[0]
+
+    config = dict(decoy.configuration or {})
+    if agent is None:
+        decoy.status = "record_only"
+        config["listener"] = {
+            "state": "no_deception_agent",
+            "note": (
+                "No active deception-capable agent enrolled in this org — "
+                "decoy is a record only, no listener is running."
+            ),
+        }
+        decoy.configuration = config
+        logger.warning(f"Honeypot {decoy.id} has no deception agent; marked record_only")
+        return {"dispatched": False, "reason": "no_deception_agent"}
+
+    service = (decoy.emulated_service or "SSH").upper()
+    port = config.get("port") or _SERVICE_DEFAULT_PORTS.get(service, 2222)
+    payload = {
+        "decoy_id": decoy.id,
+        "port": int(port),
+        "service": service.lower(),
+        "banner": config.get("banner"),
+    }
+    svc = AgentService(db)
+    cmd = await svc.issue_command(
+        agent=agent,
+        action=AgentAction.DEPLOY_HONEYPOT.value,
+        payload=payload,
+    )
+    decoy.status = "deploying"
+    config["listener"] = {
+        "state": "dispatched",
+        "agent_id": agent.id,
+        "agent_hostname": agent.hostname,
+        "command_id": cmd.id,
+        "port": int(port),
+        "dispatched_at": datetime.utcnow().isoformat(),
+    }
+    decoy.configuration = config
+    logger.info(
+        f"Honeypot {decoy.id} dispatched to agent {agent.hostname} "
+        f"({service} on :{port}, command {cmd.id})"
+    )
+    return {"dispatched": True, "agent_id": agent.id, "command_id": cmd.id, "port": int(port)}

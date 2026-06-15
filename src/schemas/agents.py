@@ -119,6 +119,25 @@ class CommandResultRequest(BaseModel):
     artifacts: dict[str, Any] = Field(default_factory=dict)
 
 
+class HoneypotInteraction(BaseModel):
+    """One observed connection to an agent-hosted honeypot listener."""
+
+    decoy_id: str
+    source_ip: str
+    source_port: Optional[int] = None
+    protocol: Optional[str] = "tcp"
+    service: Optional[str] = None
+    interaction_type: str = "connection"
+    data_sample: Optional[str] = Field(None, max_length=1024)
+    observed_at: Optional[str] = None
+
+
+class HoneypotInteractionsRequest(BaseModel):
+    """Agent -> PySOAR: batch of honeypot interactions since last poll."""
+
+    interactions: list[HoneypotInteraction] = Field(default_factory=list, max_length=200)
+
+
 class ApprovalRequest(BaseModel):
     reason: Optional[str] = None
 

@@ -31,6 +31,7 @@ import platform
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -595,6 +596,160 @@ def _handle_collect_memory_dump(payload: dict[str, Any]) -> dict[str, Any]:
 # returns ``rejected: action not in local allowlist`` at line 276.
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Deception: honeypot listeners hosted by the agent.
+#
+# Each deployed honeypot is a thread running a TCP accept loop. On
+# connection it records the peer, reads up to 1 KB of whatever the
+# client sends (2s budget), answers with the configured banner, and
+# closes. Interactions queue in memory and are flushed to the server on
+# the regular poll cycle. Listeners are deliberately NOT persisted
+# across agent restarts — the server re-deploys on demand.
+# ---------------------------------------------------------------------------
+
+_HONEYPOT_DEFAULT_BANNERS = {
+    "ssh": "SSH-2.0-OpenSSH_8.9p1 Ubuntu-3ubuntu0.1\r\n",
+    "http": "HTTP/1.1 200 OK\r\nServer: Apache/2.4.41 (Ubuntu)\r\nContent-Length: 0\r\n\r\n",
+    "ftp": "220 ProFTPD Server ready.\r\n",
+    "telnet": "Ubuntu 22.04 LTS\r\nlogin: ",
+    "mysql": "5.7.42-0ubuntu0.18.04.1\x00",
+    "rdp": "",
+}
+
+_MAX_QUEUED_INTERACTIONS = 500
+
+
+class HoneypotManager:
+    """Runs honeypot TCP listeners and queues interaction reports."""
+
+    def __init__(self) -> None:
+        self._listeners: dict[str, dict[str, Any]] = {}
+        self._interactions: list[dict[str, Any]] = []
+        self._lock = threading.Lock()
+
+    def deploy(self, decoy_id: str, port: int, service: str = "ssh",
+               banner: Optional[str] = None) -> dict[str, Any]:
+        if not decoy_id:
+            return {"status": "error", "stderr": "decoy_id is required", "exit_code": 2}
+        try:
+            port = int(port)
+        except (TypeError, ValueError):
+            return {"status": "error", "stderr": f"invalid port: {port}", "exit_code": 2}
+        if not (1024 < port <= 65535):
+            return {"status": "error", "stderr": f"port {port} out of allowed range (1025-65535)", "exit_code": 2}
+        with self._lock:
+            if decoy_id in self._listeners:
+                return {"status": "error", "stderr": f"decoy {decoy_id} already deployed", "exit_code": 2}
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("0.0.0.0", port))
+            sock.listen(5)
+        except OSError as e:
+            sock.close()
+            return {"status": "error", "stderr": f"cannot bind port {port}: {e}", "exit_code": 1}
+        sock.settimeout(1.0)
+
+        stop_event = threading.Event()
+        banner_text = banner if banner is not None else _HONEYPOT_DEFAULT_BANNERS.get(service, "")
+        thread = threading.Thread(
+            target=self._accept_loop,
+            args=(decoy_id, sock, stop_event, banner_text, service),
+            name=f"honeypot-{decoy_id[:8]}-{port}",
+            daemon=True,
+        )
+        with self._lock:
+            self._listeners[decoy_id] = {
+                "thread": thread, "sock": sock, "stop": stop_event,
+                "port": port, "service": service,
+            }
+        thread.start()
+        print(f"[pysoar-agent] honeypot listening: {service} on :{port} (decoy={decoy_id})")
+        return {"status": "success", "stdout": json.dumps({"listening": True, "port": port, "service": service})}
+
+    def stop(self, decoy_id: str) -> dict[str, Any]:
+        with self._lock:
+            entry = self._listeners.pop(decoy_id, None)
+        if entry is None:
+            return {"status": "error", "stderr": f"decoy {decoy_id} not deployed on this agent", "exit_code": 1}
+        entry["stop"].set()
+        try:
+            entry["sock"].close()
+        except OSError:
+            pass
+        entry["thread"].join(timeout=3)
+        print(f"[pysoar-agent] honeypot stopped: :{entry['port']} (decoy={decoy_id})")
+        return {"status": "success", "stdout": json.dumps({"stopped": True, "port": entry["port"]})}
+
+    def _accept_loop(self, decoy_id: str, sock: socket.socket,
+                     stop_event: threading.Event, banner: str, service: str) -> None:
+        while not stop_event.is_set():
+            try:
+                conn, addr = sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break  # socket closed by stop()
+            try:
+                conn.settimeout(2.0)
+                received = b""
+                try:
+                    received = conn.recv(1024)
+                except (socket.timeout, OSError):
+                    pass
+                if banner:
+                    try:
+                        conn.sendall(banner.encode("utf-8", errors="replace"))
+                    except OSError:
+                        pass
+            finally:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+            interaction = {
+                "decoy_id": decoy_id,
+                "source_ip": addr[0],
+                "source_port": addr[1],
+                "protocol": "tcp",
+                "service": service,
+                "interaction_type": "connection",
+                "data_sample": received[:512].decode("utf-8", errors="replace"),
+                "observed_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()),
+            }
+            with self._lock:
+                if len(self._interactions) < _MAX_QUEUED_INTERACTIONS:
+                    self._interactions.append(interaction)
+            print(f"[pysoar-agent] honeypot HIT {service}:{addr[0]}:{addr[1]} (decoy={decoy_id})")
+
+    def drain_interactions(self) -> list[dict[str, Any]]:
+        with self._lock:
+            drained, self._interactions = self._interactions, []
+        return drained
+
+    def requeue_interactions(self, interactions: list[dict[str, Any]]) -> None:
+        with self._lock:
+            space = _MAX_QUEUED_INTERACTIONS - len(self._interactions)
+            self._interactions = interactions[:space] + self._interactions
+
+
+HONEYPOTS = HoneypotManager()
+
+
+def _handle_deploy_honeypot(payload: dict[str, Any]) -> dict[str, Any]:
+    return HONEYPOTS.deploy(
+        decoy_id=payload.get("decoy_id"),
+        port=payload.get("port"),
+        service=payload.get("service", "ssh"),
+        banner=payload.get("banner"),
+    )
+
+
+def _handle_stop_honeypot(payload: dict[str, Any]) -> dict[str, Any]:
+    return HONEYPOTS.stop(payload.get("decoy_id"))
+
+
 BAS_HANDLERS: dict[str, Any] = {
     "run_atomic_test": _handle_run_atomic_test,
     "collect_process_list": _handle_collect_process_list,
@@ -620,6 +775,11 @@ PURPLE_HANDLERS: dict[str, Any] = {
     "collect_process_list": _handle_collect_process_list,
 }
 
+DECEPTION_HANDLERS: dict[str, Any] = {
+    "deploy_honeypot": _handle_deploy_honeypot,
+    "stop_honeypot": _handle_stop_honeypot,
+}
+
 
 def build_action_handlers(capabilities: list[str]) -> dict[str, Any]:
     """Return the merged handler table for a given capability set."""
@@ -630,6 +790,8 @@ def build_action_handlers(capabilities: list[str]) -> dict[str, Any]:
         table.update(IR_HANDLERS)
     if "purple" in capabilities:
         table.update(PURPLE_HANDLERS)
+    if "deception" in capabilities:
+        table.update(DECEPTION_HANDLERS)
     return table
 
 
@@ -861,6 +1023,7 @@ def cmd_poll(args: argparse.Namespace) -> int:
     poll_url = f"{args.server.rstrip('/')}/api/v1/agents/_agent/poll"
     hb_url = f"{args.server.rstrip('/')}/api/v1/agents/_agent/heartbeat"
     result_base = f"{args.server.rstrip('/')}/api/v1/agents/_agent/commands"
+    interactions_url = f"{args.server.rstrip('/')}/api/v1/agents/_agent/honeypot-interactions"
 
     print(f"[pysoar-agent] polling {poll_url} every {POLL_INTERVAL_SECONDS}s")
     # Send initial posture heartbeat, then re-send every
@@ -937,6 +1100,20 @@ def cmd_poll(args: argparse.Namespace) -> int:
                     f"[pysoar-agent] result POST failed for {cmd_id}: "
                     f"{post_status} {post_resp.get('detail')}"
                 )
+
+        # Flush honeypot interactions captured since the last cycle.
+        # On failure they're re-queued (bounded) for the next attempt.
+        pending = HONEYPOTS.drain_interactions()
+        if pending:
+            flush_status, _ = _http_request(
+                interactions_url,
+                method="POST",
+                token=token,
+                body={"interactions": pending},
+            )
+            if flush_status != 200:
+                print(f"[pysoar-agent] interaction flush failed ({flush_status}); re-queueing {len(pending)}")
+                HONEYPOTS.requeue_interactions(pending)
 
         time.sleep(POLL_INTERVAL_SECONDS)
 

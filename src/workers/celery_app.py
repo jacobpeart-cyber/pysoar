@@ -16,6 +16,9 @@ celery_app = Celery(
         # Playbook execution loop — the runner that consumes pending
         # PlaybookExecution rows and the scheduled-trigger sweep.
         "src.playbooks.tasks",
+        # Deception — honeypot dispatch reconciliation (deploying →
+        # active/failed once the agent reports its listener result).
+        "src.deception.tasks",
         "src.tasks.automation_tasks",
         "src.intel.tasks",
         "src.phishing_sim.tasks",
@@ -85,6 +88,13 @@ celery_app.conf.beat_schedule = {
     "check-scheduled-playbooks": {
         "task": "playbooks.check_scheduled_playbooks",
         "schedule": 60.0,  # Every minute
+    },
+    # --- Honeypot dispatch reconciliation ---
+    # Flips honeypot decoys from "deploying" to active/failed once the
+    # deception agent posts its listener deploy result.
+    "deception-honeypot-reconcile": {
+        "task": "deception.reconcile_honeypot_dispatches",
+        "schedule": 60.0,
     },
     # --- Scheduled automation tasks (src.tasks.automation_tasks) ---
     "auto-escalate-stale-alerts": {
