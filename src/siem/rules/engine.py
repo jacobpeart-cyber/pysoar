@@ -421,7 +421,11 @@ class DetectionRuleInstance:
         self.title = rule_data.get('title', 'Untitled')
         self.description = rule_data.get('description', '')
         self.author = rule_data.get('author', '')
-        self.severity = rule_data.get('severity', 'medium')
+        # Accept Sigma's `level` as a fallback — the DB rule loader
+        # (_build_yaml_from_logic) and real Sigma rules express severity
+        # as `level`. Without this, every such rule defaulted to medium
+        # and high/critical rules silently never reached auto-triage.
+        self.severity = rule_data.get('severity') or rule_data.get('level') or 'medium'
         self.logtypes = rule_data.get('logtypes', [])
         self.tags = rule_data.get('tags', [])
         self.references = rule_data.get('references', [])
