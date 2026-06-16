@@ -87,3 +87,23 @@ async def test_benign_syslog_does_not_alert(db_session):
         organization_id="org-owner",
     )
     assert not alerts, "benign cron line should not fire an auth rule"
+
+
+def test_rule_severity_falls_back_to_sigma_level():
+    """_build_yaml_from_logic emits Sigma 'level'; the engine must read it
+    so high/critical rules don't silently fire as medium (which would keep
+    them out of auto-triage)."""
+    from src.siem.rules.engine import DetectionRuleInstance
+
+    rule = DetectionRuleInstance({
+        "id": "t", "title": "T", "level": "high",
+        "detection": {"selection": {"raw_log": {"contains": "x"}}, "condition": "selection"},
+    })
+    assert rule.severity == "high"
+
+    # explicit `severity` still wins when present
+    rule2 = DetectionRuleInstance({
+        "id": "t2", "title": "T2", "severity": "critical", "level": "low",
+        "detection": {"selection": {"raw_log": {"contains": "x"}}, "condition": "selection"},
+    })
+    assert rule2.severity == "critical"
