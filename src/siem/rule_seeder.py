@@ -258,6 +258,77 @@ BUILTIN_RULES: list[dict[str, Any]] = [
         "threshold": 3,
         "group_by": [],
     },
+
+    # --- Forwarded host syslog (Linux auth.log) ---
+    # The rules above match PySOAR's own structured audit events
+    # (source_type="audit"). Real host syslog arrives as
+    # source_type="syslog" with no normalized `action`, so these match
+    # on raw_log content — the actual text sshd/sudo/PAM emit. Without
+    # them, forwarded auth logs produce zero detections.
+    {
+        "name": "ssh-failed-password",
+        "title": "SSH Failed Password",
+        "description": (
+            "A failed SSH password attempt on a host shipping syslog to "
+            "PySOAR. Single failures are normal noise (severity medium); "
+            "correlated bursts from one IP indicate brute force."
+        ),
+        "severity": "medium",
+        "log_types": ["authentication"],
+        "mitre_tactics": ["TA0006"],
+        "mitre_techniques": ["T1110.001"],
+        "tags": ["ssh", "authentication", "syslog"],
+        "detection_logic": {"raw_log": {"contains": "Failed password"}},
+        "condition": "selection",
+    },
+    {
+        "name": "ssh-invalid-user",
+        "title": "SSH Login Attempt for Invalid User",
+        "description": (
+            "An SSH login attempt for a username that does not exist on "
+            "the host — strong signal of username enumeration or "
+            "automated brute force rather than a fat-fingered password."
+        ),
+        "severity": "high",
+        "log_types": ["authentication"],
+        "mitre_tactics": ["TA0006"],
+        "mitre_techniques": ["T1110.001", "T1589.001"],
+        "tags": ["ssh", "recon", "syslog"],
+        "detection_logic": {"raw_log": {"contains": "Invalid user"}},
+        "condition": "selection",
+    },
+    {
+        "name": "ssh-possible-breakin",
+        "title": "SSH Possible Break-In Attempt",
+        "description": (
+            "sshd flagged a reverse-DNS mismatch for a connecting host "
+            "(POSSIBLE BREAK-IN ATTEMPT) — commonly logged when an IP's "
+            "PTR record doesn't match, typical of scanning infrastructure."
+        ),
+        "severity": "high",
+        "log_types": ["authentication"],
+        "mitre_tactics": ["TA0001"],
+        "mitre_techniques": ["T1133"],
+        "tags": ["ssh", "syslog"],
+        "detection_logic": {"raw_log": {"contains": "POSSIBLE BREAK-IN ATTEMPT"}},
+        "condition": "selection",
+    },
+    {
+        "name": "sudo-auth-failure",
+        "title": "Sudo Authentication Failure",
+        "description": (
+            "A PAM authentication failure during a sudo attempt — a user "
+            "failing to escalate privileges. Repeated failures may "
+            "indicate a compromised account probing for sudo rights."
+        ),
+        "severity": "medium",
+        "log_types": ["authentication"],
+        "mitre_tactics": ["TA0004"],
+        "mitre_techniques": ["T1548.003"],
+        "tags": ["sudo", "privilege_escalation", "syslog"],
+        "detection_logic": {"raw_log": {"contains": "authentication failure"}},
+        "condition": "selection",
+    },
 ]
 
 
