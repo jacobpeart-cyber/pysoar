@@ -26,6 +26,9 @@ _parser = LogParserManager()
 _normalizer = LogNormalizer()
 
 
+_VALID_SEVERITIES = {"critical", "high", "medium", "low", "informational", "info"}
+
+
 async def process_log(
     raw_log: str,
     source_type: str,
@@ -34,6 +37,7 @@ async def process_log(
     db: AsyncSession,
     organization_id: Optional[str] = None,
     tags: Optional[List[str]] = None,
+    severity: Optional[str] = None,
 ) -> Tuple[LogEntry, List[Dict], List[Dict]]:
     """
     Process a single log through the full SIEM pipeline.
@@ -85,11 +89,20 @@ async def process_log(
         norm_dict = {}
         normalized = None
 
+    # Caller-supplied severity wins for structured sources that already
+    # know it (e.g. the Windows forwarder maps event Level -> severity).
+    # Captured before the local `severity` is reassigned by derivation.
+    severity_override = severity
+
     # Extract normalized fields
     severity = getattr(normalized, "severity", None)
     if severity and hasattr(severity, "value"):
         severity = severity.value
     severity = severity or "informational"
+
+    if severity_override and str(severity_override).lower() in _VALID_SEVERITIES:
+        sev = str(severity_override).lower()
+        severity = "informational" if sev == "info" else sev
 
     log_type = getattr(normalized, "log_type", None)
     if log_type and hasattr(log_type, "value"):

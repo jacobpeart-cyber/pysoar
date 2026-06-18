@@ -266,6 +266,7 @@ async def bulk_ingest_logs_apikey(
         src_name = rec.get("source_name") or rec.get("host") or "external-forwarder"
         src_ip = rec.get("source_ip") or source_ip
         tags = rec.get("tags") if isinstance(rec.get("tags"), list) else None
+        rec_severity = rec.get("severity")  # authoritative for structured shippers
         try:
             _log_entry, alerts, correlations = await process_log(
                 raw_log=raw_log,
@@ -275,6 +276,7 @@ async def bulk_ingest_logs_apikey(
                 db=db,
                 organization_id=org_id,
                 tags=tags,
+                severity=rec_severity,
             )
             processed += 1
             total_alerts += len(alerts)
