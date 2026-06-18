@@ -74,6 +74,39 @@ router = APIRouter(prefix="/agentic", tags=["Agentic"])
 
 
 # ============================================================================
+# Structured Threat Hunt (PY-HUNT-001)
+# ============================================================================
+
+from pydantic import BaseModel, Field
+
+
+class StructuredHuntRequest(BaseModel):
+    hypothesis: str = Field(..., min_length=4, description="The hunt hypothesis / question")
+    timeframe_hours: int = Field(24, ge=1, le=720)
+
+
+@router.post("/hunts")
+async def run_structured_hunt_endpoint(
+    req: StructuredHuntRequest,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+):
+    """Run a structured PY-HUNT-001 threat hunt by hypothesis.
+
+    Validates the hypothesis against the MITRE ATT&CK KB, runs the real
+    multi-source scan, maps findings to ATT&CK, scores a verdict, and
+    returns a structured report. Recommendations are advisory and always
+    flagged for human approval — the hunt never remediates.
+    """
+    from src.agentic.structured_hunt import run_structured_hunt
+    org_id = getattr(current_user, "organization_id", None)
+    return await run_structured_hunt(
+        db, hypothesis=req.hypothesis, organization_id=org_id,
+        timeframe_hours=req.timeframe_hours,
+    )
+
+
+# ============================================================================
 # Agent Management Endpoints
 # ============================================================================
 

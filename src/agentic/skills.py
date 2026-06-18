@@ -190,6 +190,20 @@ async def ioc_contextualization(tool_executor: Any, db: Any = None, indicator: s
     return results
 
 
+@registry.register("structured_threat_hunt")
+async def structured_threat_hunt(tool_executor: Any, db: Any = None, hypothesis: str = "", timeframe_hours: int = 24) -> Dict[str, Any]:
+    """Run the PY-HUNT-001 structured hunt and return the report.
+
+    Thin wrapper over src.agentic.structured_hunt so the engine/skill
+    registry and the API endpoint share one implementation.
+    """
+    if db is None:
+        return {"status": "error", "error": "db_session_required"}
+    from src.agentic.structured_hunt import run_structured_hunt
+    org_id = getattr(db, "organization_id", None)
+    return await run_structured_hunt(db, hypothesis=hypothesis, organization_id=org_id, timeframe_hours=timeframe_hours)
+
+
 @registry.register("incident_response_recommendation")
 async def incident_response_recommendation(tool_executor: Any, db: Any = None, incident_summary: str = "", severity: str = "medium") -> Dict[str, Any]:
     """Recommend response actions based on incident severity and summary."""
