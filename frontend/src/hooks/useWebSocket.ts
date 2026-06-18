@@ -65,6 +65,7 @@ export function useWebSocket(): UseWebSocketReturn {
   const mountedRef = useRef(true);
   const pollingIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const pollingFallbackActiveRef = useRef(false);
+  const connectRef = useRef<(() => void) | null>(null);
 
   const startPollingFallback = useCallback(() => {
     if (pollingFallbackActiveRef.current) return;
@@ -216,7 +217,7 @@ export function useWebSocket(): UseWebSocketReturn {
 
           reconnectTimeoutRef.current = setTimeout(() => {
             if (mountedRef.current) {
-              connect();
+              connectRef.current?.();
             }
           }, delay);
         }
@@ -238,14 +239,27 @@ export function useWebSocket(): UseWebSocketReturn {
   }, [token, getReconnectDelay, startHeartbeat, stopHeartbeat, queryClient, startPollingFallback, stopPollingFallback]);
 
   useEffect(() => {
+    connectRef.current = connect;
+  }, [connect]);
+
+  useEffect(() => {
     mountedRef.current = true;
 
+    let initialConnectTimeout: ReturnType<typeof setTimeout> | null = null;
     if (token) {
-      connect();
+      initialConnectTimeout = setTimeout(() => {
+        if (mountedRef.current) {
+          connect();
+        }
+      }, 0);
     }
 
     return () => {
       mountedRef.current = false;
+
+      if (initialConnectTimeout) {
+        clearTimeout(initialConnectTimeout);
+      }
 
       if (reconnectTimeoutRef.current) {
         clearTimeout(reconnectTimeoutRef.current);
