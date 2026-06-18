@@ -81,14 +81,67 @@ foreach ($log in $cfg.logs) {
 
 if ($batch.Count -eq 0) { Write-Output "no new events"; return }
 
-# POST as NDJSON. PS7 has -SkipCertificateCheck for the self-signed cert.
+# POST as NDJSON. TLS is verified by pinning the server cert thumbprint
+# (config.cert_thumbprint) — MITM-safe even with the self-signed cert, so
+# the API key + log contents can't be intercepted. Falls back to normal
+# CA validation when no thumbprint is set; only skips verification if the
+# operator explicitly opts in via insecure_skip_tls_verify (default off).
 $body = ($batch -join "`n")
-$headers = @{ "X-API-Key" = $cfg.api_key; "Content-Type" = "application/x-ndjson" }
+$pinned = ("$($cfg.cert_thumbprint)" -replace '[^0-9A-Fa-f]', '')
+$insecure = [bool]$cfg.insecure_skip_tls_verify
+
+# Thumbprint validation is done in a compiled (C#) callback rather than a
+# PowerShell scriptblock: .NET invokes the cert callback on a thread with
+# no PowerShell runspace, where scriptblock delegates fail. The compiled
+# static method runs reliably on any thread.
+if (-not ([System.Management.Automation.PSTypeName]'PySoarPinnedTls').Type) {
+  $refAsms = @(
+    [System.Net.Http.HttpRequestMessage].Assembly.Location,
+    [System.Security.Cryptography.X509Certificates.X509Certificate2].Assembly.Location,
+    [System.Net.Security.SslPolicyErrors].Assembly.Location,
+    [System.Net.Http.HttpClientHandler].Assembly.Location
+  ) | Select-Object -Unique
+  Add-Type -TypeDefinition @"
+using System.Net.Http;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
+public static class PySoarPinnedTls {
+    public static string Expected = "";
+    public static bool Insecure = false;
+    public static bool Validate(HttpRequestMessage m, X509Certificate2 cert, X509Chain chain, SslPolicyErrors errors) {
+        if (Insecure) return true;
+        if (string.IsNullOrEmpty(Expected)) return errors == SslPolicyErrors.None;
+        return cert != null && cert.Thumbprint != null &&
+               cert.Thumbprint.Equals(Expected, System.StringComparison.OrdinalIgnoreCase);
+    }
+}
+"@ -ReferencedAssemblies $refAsms
+}
+[PySoarPinnedTls]::Expected = $pinned
+[PySoarPinnedTls]::Insecure = $insecure
+if ($insecure) { Write-Warning "TLS verification disabled (insecure_skip_tls_verify=true) — set cert_thumbprint instead." }
+
+$cbType = [System.Func[System.Net.Http.HttpRequestMessage, `
+  System.Security.Cryptography.X509Certificates.X509Certificate2, `
+  System.Security.Cryptography.X509Certificates.X509Chain, `
+  System.Net.Security.SslPolicyErrors, bool]]
+$handler = [System.Net.Http.HttpClientHandler]::new()
+$handler.ServerCertificateCustomValidationCallback = [System.Delegate]::CreateDelegate($cbType, [PySoarPinnedTls].GetMethod("Validate"))
+
+$client = [System.Net.Http.HttpClient]::new($handler)
+$client.Timeout = [TimeSpan]::FromSeconds(60)
+$content = [System.Net.Http.StringContent]::new($body, [System.Text.Encoding]::UTF8, "application/x-ndjson")
+$client.DefaultRequestHeaders.Add("X-API-Key", $cfg.api_key)
 try {
-  $resp = Invoke-RestMethod -Uri $ingestUrl -Method Post -Headers $headers -Body $body `
-            -SkipCertificateCheck -TimeoutSec 60
-  Write-Output "forwarded $($batch.Count) events -> success=$($resp.success_count) alerts=$($resp.alerts_generated)"
+  $resp = $client.PostAsync($ingestUrl, $content).GetAwaiter().GetResult()
+  $text = $resp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+  if (-not $resp.IsSuccessStatusCode) {
+    Write-Error "ingest POST failed: HTTP $([int]$resp.StatusCode) $text"; exit 1
+  }
+  $parsed = $text | ConvertFrom-Json
+  Write-Output "forwarded $($batch.Count) events -> success=$($parsed.success_count) alerts=$($parsed.alerts_generated)"
 } catch {
-  Write-Error "ingest POST failed: $($_.Exception.Message)"
-  exit 1
+  Write-Error "ingest POST failed: $($_.Exception.Message)"; exit 1
+} finally {
+  $content.Dispose(); $client.Dispose(); $handler.Dispose()
 }
