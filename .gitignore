@@ -120,3 +120,7 @@ site/
 /fedramp*.png
 /stig*.png
 /page-*.png
+
+# Claude Code harness runtime state (not project code)
+.claude/scheduled_tasks.lock
+.claude/*.lock
