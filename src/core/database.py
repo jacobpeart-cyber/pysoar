@@ -12,14 +12,36 @@ from src.core.config import settings
 def _create_engine():
     """Create async engine with pool configuration"""
     if "sqlite" in settings.database_url:
+        url = settings.database_url
+        is_memory = ":memory:" in url or "mode=memory" in url
+        if is_memory:
+            # In-memory SQLite (tests). Use a SHARED-CACHE named DB
+            # (`file:...?mode=memory&cache=shared`) so EVERY engine in the
+            # process, including the per-task engines that modules create
+            # with their own NullPool, attaches to ONE in-memory database
+            # instead of each NullPool connection getting a separate empty
+            # one. This engine uses StaticPool to hold a single connection
+            # open for the whole process, which keeps the shared in-memory
+            # DB alive (it would vanish when the last connection closes).
+            # Net: fixtures + app code + task code all see one schema/data
+            # set, with no cross-connection DDL "schema has changed" races.
+            from sqlalchemy.pool import StaticPool
+
+            return create_async_engine(
+                url,
+                echo=settings.debug and not settings.is_production,
+                future=True,
+                poolclass=StaticPool,
+                connect_args={"check_same_thread": False},
+            )
         return create_async_engine(
-            settings.database_url,
+            url,
             echo=settings.debug and not settings.is_production,
             future=True,
             poolclass=NullPool,
         )
     else:
-        # asyncpg manages its own internal pool — do not pass a poolclass
+        # asyncpg manages its own internal pool; do not pass a poolclass
         return create_async_engine(
             settings.database_url,
             echo=settings.debug and not settings.is_production,
@@ -67,15 +89,16 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
 
 async def init_db() -> None:
     """Initialize the database (create tables)"""
-    from src.models.base import Base
     import sqlalchemy.exc
+
+    from src.models.base import Base
 
     try:
         async with engine.begin() as conn:
             await conn.run_sync(Base.metadata.create_all)
     except sqlalchemy.exc.ProgrammingError as e:
         if "already exists" in str(e):
-            # Tables/indexes already exist — ignore, schema is up to date
+            # Tables/indexes already exist; ignore, schema is up to date
             pass
         else:
             raise
