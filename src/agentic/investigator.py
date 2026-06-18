@@ -90,6 +90,9 @@ INVESTIGATOR_READONLY_TOOLS = {
     # to consult the matching SOP before a verdict; execute_playbook
     # stays blocked above.
     "list_playbooks", "get_playbook",
+    # MITRE ATT&CK knowledge base — authoritative technique lookup,
+    # search, and real detection-rule coverage to ground ATT&CK mapping.
+    "lookup_attack_technique", "search_attack", "get_attack_coverage",
 }
 
 

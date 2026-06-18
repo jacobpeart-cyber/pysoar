@@ -249,6 +249,24 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     except Exception as e:  # noqa: BLE001
         logger.warning("Simulation agent seeding failed", error=str(e))
 
+    # ATT&CK KB readiness check (does NOT download — that's POST /attack/sync
+    # or `python -m src.attack.sync`, too heavy for boot). Just surfaces an
+    # unsynced KB so the gap is discoverable.
+    try:
+        from sqlalchemy import func, select
+        from src.core.database import async_session_factory
+        from src.attack.models import AttackTechnique
+        async with async_session_factory() as _attack_db:
+            tech_n = (await _attack_db.execute(
+                select(func.count()).select_from(AttackTechnique)
+            )).scalar() or 0
+        if tech_n == 0:
+            logger.warning("ATT&CK knowledge base is empty — run POST /attack/sync to load it")
+        else:
+            logger.info("ATT&CK knowledge base loaded", techniques=tech_n)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("ATT&CK KB readiness check failed", error=str(e))
+
     yield
 
     # Shutdown

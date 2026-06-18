@@ -201,6 +201,27 @@ class AgentToolRegistry:
             category="query",
             handler=self._get_playbook,
         ))
+        self._register(Tool(
+            name="lookup_attack_technique",
+            description="Look up a MITRE ATT&CK technique by id (e.g. T1110 or T1110.001). Returns authoritative name, tactics, detection guidance, data sources, mitigations, threat groups, and software that use it.",
+            parameters={"technique_id": "string - ATT&CK technique id like T1110 or T1110.001"},
+            category="query",
+            handler=self._lookup_attack_technique,
+        ))
+        self._register(Tool(
+            name="search_attack",
+            description="Search the MITRE ATT&CK knowledge base for techniques, threat groups, or software by name/alias/id.",
+            parameters={"query": "string - keyword, name, alias, or id", "limit": "optional int, default 25"},
+            category="query",
+            handler=self._search_attack,
+        ))
+        self._register(Tool(
+            name="get_attack_coverage",
+            description="For a list of ATT&CK technique ids, report how many active detection rules cover each — the real detection blind-spot map.",
+            parameters={"technique_ids": "list of ATT&CK technique ids (e.g. [\"T1110\",\"T1059.001\"])"},
+            category="query",
+            handler=self._get_attack_coverage,
+        ))
 
         # ===== ACTION TOOLS =====
         self._register(Tool(
@@ -660,6 +681,24 @@ class AgentToolRegistry:
             "trigger_type": p.trigger_type, "version": p.version,
             "is_enabled": p.is_enabled, "steps": steps,
         }
+
+    async def _lookup_attack_technique(self, technique_id):
+        from src.attack.service import AttackService
+        tech = await AttackService(self.db).get_technique(str(technique_id).upper())
+        if tech is None:
+            return {"error": f"ATT&CK technique {technique_id} not found (KB may be unsynced — run /attack/sync)"}
+        return tech
+
+    async def _search_attack(self, query, limit=25):
+        from src.attack.service import AttackService
+        return await AttackService(self.db).search(query, limit=int(limit))
+
+    async def _get_attack_coverage(self, technique_ids):
+        from src.attack.service import AttackService
+        if isinstance(technique_ids, str):
+            technique_ids = [t.strip() for t in technique_ids.replace("[", "").replace("]", "").replace('"', "").split(",") if t.strip()]
+        ids = [str(t).upper() for t in (technique_ids or [])]
+        return await AttackService(self.db).coverage(ids)
 
     async def _get_alert(self, alert_id):
         from src.models.alert import Alert
