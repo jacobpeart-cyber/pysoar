@@ -53,6 +53,7 @@ from src.api.v1.endpoints import (
     zerotrust,
     tickethub,
     backup,
+    attack,
     fedramp,
     monitoring,
     reports,
@@ -130,6 +131,9 @@ api_router.include_router(monitoring.router, tags=["monitoring"])
 
 # --- Report export (CSV/PDF downloads) ---
 api_router.include_router(reports.router, tags=["reports"])
+
+# --- MITRE ATT&CK knowledge base ---
+api_router.include_router(attack.router, tags=["mitre-attack"])
 api_router.include_router(websocket.router, tags=["websocket"])
 
 # --- Agent Platform (unified BAS execution + Live Response + Purple Team) ---

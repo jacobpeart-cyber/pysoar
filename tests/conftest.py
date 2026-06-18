@@ -36,6 +36,7 @@ from src.models.user import User
 # metaclass registers tables on import. F401 suppresses the unused warning.
 import src.agentic.models  # noqa: F401
 import src.agents.models  # noqa: F401
+import src.attack.models  # noqa: F401
 import src.ai.models  # noqa: F401
 import src.api_security.models  # noqa: F401
 import src.audit_evidence.models  # noqa: F401

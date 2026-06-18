@@ -26,54 +26,29 @@ logger = get_logger(__name__)
 
 
 class HuntQueryBuilder:
-    """Builds log search queries from hunt hypotheses and parameters"""
+    """Builds log search queries from hunt hypotheses and parameters.
 
-    # MITRE Technique to log field mapping
-    MITRE_TECHNIQUE_PATTERNS = {
-        "T1087": {
-            "fields": ["message", "raw_log"],
-            "patterns": ["account enumeration", "net user", "Get-ADUser"],
-        },
-        "T1110": {
-            "fields": ["message"],
-            "patterns": ["brute force", "failed logon", "login attempt"],
-        },
-        "T1021": {
-            "fields": ["destination_ip", "hostname"],
-            "patterns": ["remote access", "rdp", "ssh", "winrm"],
-        },
-        "T1041": {
-            "fields": ["destination_ip", "message"],
-            "patterns": ["exfiltration", "data transfer", "outbound"],
-        },
-        "T1566": {
-            "fields": ["message"],
-            "patterns": ["phishing", "email", "attachment", "suspicious link"],
-        },
-        "T1204": {
-            "fields": ["message"],
-            "patterns": ["user execution", "clicked", "ran", "executed"],
-        },
-        "T1086": {
-            "fields": ["message"],
-            "patterns": ["powershell", "script", "execution"],
-        },
-        "T1547": {
-            "fields": ["message"],
-            "patterns": ["persistence", "startup", "boot", "registry run"],
-        },
-    }
+    The former 8-entry MITRE_TECHNIQUE_PATTERNS keyword dict is retired —
+    technique search terms now come from the real ATT&CK KB (technique
+    names), resolved by the async caller and passed as ``technique_terms``.
+    """
 
     def __init__(self):
         """Initialize query builder"""
         pass
 
-    def build_log_query(self, hypothesis: dict, parameters: dict) -> SearchQuery:
+    def build_log_query(
+        self, hypothesis: dict, parameters: dict, technique_terms=None
+    ) -> SearchQuery:
         """Build a log search query from hypothesis details and runtime parameters
 
         Args:
             hypothesis: Dict with title, description, mitre_techniques, data_sources
             parameters: Runtime params like time_range, target_hosts, scope
+            technique_terms: Authoritative ATT&CK technique names (from the
+                KB) to use as search terms. When absent, the technique ids
+                themselves are used as a fallback rather than expanding to
+                nothing (the old dict's silent-miss failure mode).
 
         Returns:
             SearchQuery object configured for log search
@@ -95,16 +70,16 @@ class HuntQueryBuilder:
             search_terms.append(hypothesis["description"])
         query.query_text = " ".join(search_terms)
 
-        # Map MITRE techniques to search patterns
+        # Expand MITRE techniques into search terms. Prefer authoritative
+        # ATT&CK technique names (resolved from the KB by the caller);
+        # fall back to the technique ids so an unresolved/unknown id still
+        # contributes a term instead of silently expanding to nothing.
         if hypothesis.get("mitre_techniques"):
-            patterns = []
-            for technique in hypothesis["mitre_techniques"]:
-                if technique in self.MITRE_TECHNIQUE_PATTERNS:
-                    patterns.extend(
-                        self.MITRE_TECHNIQUE_PATTERNS[technique]["patterns"]
-                    )
-            if patterns:
-                query.query_text = " OR ".join(patterns)
+            terms = list(technique_terms) if technique_terms else []
+            if not terms:
+                terms = list(hypothesis["mitre_techniques"])
+            if terms:
+                query.query_text = " OR ".join(terms)
 
         # Filter by data sources if specified
         if hypothesis.get("data_sources"):
@@ -292,8 +267,24 @@ class HuntExecutor:
         session.started_at = datetime.now(timezone.utc)
 
         try:
+            # Resolve technique ids → authoritative ATT&CK names from the
+            # KB so the search uses real technique names, not guesses.
+            technique_terms = []
+            if hypothesis_data.get("mitre_techniques") and getattr(self, "db", None) is not None:
+                try:
+                    from src.attack.service import AttackService
+                    svc = AttackService(self.db)
+                    for tid in hypothesis_data["mitre_techniques"]:
+                        tech = await svc.get_technique(str(tid).upper())
+                        if tech and tech.get("name"):
+                            technique_terms.append(tech["name"])
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(f"ATT&CK term resolution failed: {exc}")
+
             # Build and execute queries
-            query = self.query_builder.build_log_query(hypothesis_data, parameters)
+            query = self.query_builder.build_log_query(
+                hypothesis_data, parameters, technique_terms=technique_terms or None
+            )
             results = await self._run_queries(session, [query])
 
             # Analyze results
