@@ -346,6 +346,13 @@ class AgentToolRegistry:
             handler=self._run_threat_hunt,
         ))
         self._register(Tool(
+            name="scope_hunt",
+            description="PY-HUNT-001 Phase 1: validate a hunt hypothesis against the ATT&CK KB. Returns the techniques in scope (validated, with detection-rule coverage and the telemetry that detects them), which of those log sources PySOAR actually collects, and asset criticality for named hosts. Run this BEFORE run_threat_hunt to know what's hunt-able.",
+            parameters={"hypothesis": "string - the hunt hypothesis / question"},
+            category="analyze",
+            handler=self._scope_hunt,
+        ))
+        self._register(Tool(
             name="simulate_attack",
             description="Run an attack simulation for a MITRE ATT&CK technique",
             parameters={"technique_id": "string (e.g. T1059)", "target": "string"},
@@ -1048,6 +1055,94 @@ class AgentToolRegistry:
         await self.db.commit()
         await self.db.refresh(user)
         return user
+
+    async def _scope_hunt(self, hypothesis):
+        """PY-HUNT-001 Phase 1: validate a hypothesis against the ATT&CK KB.
+
+        Honest by construction: reports the telemetry each in-scope
+        technique needs, which sources PySOAR actually collects, and
+        flags that EDR/DNS streaming telemetry is not integrated.
+        """
+        from datetime import datetime, timedelta, timezone
+        from src.attack.service import AttackService
+        from src.models.asset import Asset
+        from src.siem.models import LogEntry
+
+        svc = AttackService(self.db)
+        extracted = await svc.extract_technique_ids(hypothesis or "")
+
+        # Per valid technique: name, tactics, coverage, detecting telemetry.
+        covered = await svc.coverage(extracted["valid"]) if extracted["valid"] else []
+        cov_by_id = {c["technique"]: c for c in covered}
+        techniques_in_scope = []
+        needed_log_sources: set[str] = set()
+        for tid in extracted["valid"]:
+            tech = await svc.get_technique(tid)
+            if not tech:
+                continue
+            ls = tech.get("log_sources") or []
+            needed_log_sources.update(ls)
+            techniques_in_scope.append({
+                "technique": tid,
+                "name": tech.get("name"),
+                "tactics": tech.get("tactics") or [],
+                "detection_rule_count": cov_by_id.get(tid, {}).get("rule_count", 0),
+                "covered": cov_by_id.get(tid, {}).get("covered", False),
+                "log_sources": ls[:12],
+            })
+
+        # What telemetry PySOAR actually has (distinct source types in the
+        # last 30 days). ATT&CK log-source names are vendor-channel strings
+        # (e.g. linux:syslog); we surface both sides honestly rather than
+        # pretend a perfect mapping.
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        collected = (await self.db.execute(
+            select(LogEntry.source_type).where(LogEntry.received_at >= cutoff).distinct()
+        )).scalars().all()
+        collected = sorted({s for s in collected if s})
+
+        # Asset criticality for hostnames mentioned in the hypothesis.
+        assets_in_scope = []
+        words = {w.strip(".,;:'\"()").lower() for w in (hypothesis or "").split()}
+        if words:
+            asset_rows = (await self.db.execute(select(Asset).limit(500))).scalars().all()
+            for a in asset_rows:
+                hn = (a.hostname or "").lower()
+                nm = (a.name or "").lower()
+                if (hn and hn in words) or (nm and nm in words):
+                    assets_in_scope.append({
+                        "hostname": a.hostname or a.name,
+                        "asset_type": a.asset_type,
+                        "criticality": a.criticality,
+                    })
+
+        uncovered = [t["technique"] for t in techniques_in_scope if not t["covered"]]
+        notes = [
+            "Telemetry availability is heuristic: ATT&CK log-source names are vendor channels; "
+            "compare them against collected_source_types manually.",
+            "EDR streaming telemetry (process trees, module loads) and a DNS sensor are NOT "
+            "integrated in PySOAR — techniques relying solely on those cannot be hunted here.",
+        ]
+        if extracted["deprecated"]:
+            notes.append(f"Deprecated technique ids cited: {extracted['deprecated']} — map to current ids.")
+        if uncovered:
+            notes.append(f"No detection rule covers: {uncovered} — hunt is the compensating control.")
+
+        return {
+            "hypothesis": hypothesis,
+            "techniques_in_scope": techniques_in_scope,
+            "deprecated_techniques": extracted["deprecated"],
+            "unknown_techniques": extracted["unknown"],
+            "needed_log_sources": sorted(needed_log_sources)[:25],
+            "collected_source_types": collected,
+            "assets_in_scope": assets_in_scope,
+            "coverage_summary": {
+                "techniques": len(techniques_in_scope),
+                "covered": sum(1 for t in techniques_in_scope if t["covered"]),
+                "uncovered": len(uncovered),
+            },
+            "notes": notes,
+        }
 
     async def _run_threat_hunt(self, hypothesis, timeframe_hours=24):
         from src.hunting.models import HuntHypothesis, HuntSession, HuntFinding

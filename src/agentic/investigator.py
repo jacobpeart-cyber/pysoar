@@ -93,6 +93,8 @@ INVESTIGATOR_READONLY_TOOLS = {
     # MITRE ATT&CK knowledge base — authoritative technique lookup,
     # search, and real detection-rule coverage to ground ATT&CK mapping.
     "lookup_attack_technique", "search_attack", "get_attack_coverage",
+    # PY-HUNT-001 Phase 1 — validate a hunt hypothesis against the KB.
+    "scope_hunt",
 }
 
 
