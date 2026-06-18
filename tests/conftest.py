@@ -2,14 +2,35 @@
 
 import os
 
-# CRITICAL — must run BEFORE any `from src.core.config import settings` import
-# anywhere in the test process. Force the production engine's database_url to
-# point at the same SQLite file the test fixtures write to. Without this, the
-# Zero Trust session-gate middleware (and any other code that uses
-# async_session_factory directly instead of Depends(get_db)) hits ./pysoar.db
-# while the test fixtures write to ./test.db — same-machine but DIFFERENT
-# files, so the middleware sees stale or missing schema and returns 503.
-os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///./test.db")
+# CRITICAL: must run BEFORE any `from src.core.config import settings` import
+# anywhere in the test process. The production engine and the test fixtures
+# MUST share one database. We use in-memory SQLite via a StaticPool single
+# shared connection (see src/core/database._create_engine): one connection
+# for the whole process means the Zero Trust middleware, app code using
+# async_session_factory directly, and the test fixtures all see the same
+# schema/data, and there are no cross-connection DDL races (the old
+# file-backed ./test.db threw "database schema has changed" /
+# "table already exists" when many connections did drop/create concurrently).
+os.environ.setdefault(
+    "DATABASE_URL",
+    "sqlite+aiosqlite:///file:pysoar_test?mode=memory&cache=shared&uri=true",
+)
+os.environ["DEBUG"] = os.environ.get("DEBUG", "false")
+if os.environ["DEBUG"].lower() not in {
+    "1",
+    "true",
+    "t",
+    "yes",
+    "y",
+    "on",
+    "0",
+    "false",
+    "f",
+    "no",
+    "n",
+    "off",
+}:
+    os.environ["DEBUG"] = "false"
 
 import asyncio
 from datetime import datetime
@@ -19,14 +40,10 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from redis.asyncio import Redis
-
-from src.core.config import settings
-from src.core.database import get_db
-from src.core.security import get_password_hash
-from src.models.base import Base
-from src.models.user import User
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.schema import DropTable
 
 # Force-import every model module so Base.metadata.create_all stamps all
 # their tables into the test DB. Without these, code that runs outside the
@@ -36,9 +53,9 @@ from src.models.user import User
 # metaclass registers tables on import. F401 suppresses the unused warning.
 import src.agentic.models  # noqa: F401
 import src.agents.models  # noqa: F401
-import src.attack.models  # noqa: F401
 import src.ai.models  # noqa: F401
 import src.api_security.models  # noqa: F401
+import src.attack.models  # noqa: F401
 import src.audit_evidence.models  # noqa: F401
 import src.collaboration.models  # noqa: F401
 import src.compliance.models  # noqa: F401
@@ -67,21 +84,28 @@ import src.threat_modeling.models  # noqa: F401
 import src.tickethub.models  # noqa: F401
 import src.zerotrust.models  # noqa: F401
 
-# Test database URL
-TEST_DATABASE_URL = "sqlite+aiosqlite:///./test.db"
+# Use the PRODUCTION engine + session factory directly (now pointed at the
+# shared in-memory DB by the DATABASE_URL above) so fixtures and app code
+# share one connection. No separate file engine, no DDL races.
+from src.core.database import async_session_factory as TestSessionLocal  # noqa: E402
+from src.core.database import engine as test_engine  # noqa: E402
+from src.core.database import get_db
+from src.core.security import get_password_hash
+from src.models.base import Base
+from src.models.user import User
 
-# Create test engine
-test_engine = create_async_engine(
-    TEST_DATABASE_URL,
-    echo=False,
-)
 
-# Create test session factory
-TestSessionLocal = async_sessionmaker(
-    test_engine,
-    class_=AsyncSession,
-    expire_on_commit=False,
-)
+def _drop_all_tables(connection) -> None:
+    """Drop every ORM table, tolerating SQLite's fragile FK/drop ordering."""
+    if connection.dialect.name == "sqlite":
+        foreign_keys_enabled = bool(connection.exec_driver_sql("PRAGMA foreign_keys").scalar())
+        connection.execute(text("PRAGMA foreign_keys=OFF"))
+        for table in reversed(list(Base.metadata.tables.values())):
+            connection.execute(DropTable(table, if_exists=True))
+        if foreign_keys_enabled:
+            connection.execute(text("PRAGMA foreign_keys=ON"))
+        return
+    Base.metadata.drop_all(connection)
 
 
 @pytest.fixture(scope="session")
@@ -93,8 +117,8 @@ def event_loop() -> Generator:
 
 
 @pytest_asyncio.fixture(scope="function", autouse=True)
-async def _ensure_schema_on_disk() -> AsyncGenerator[None, None]:
-    """Ensure all tables exist on the shared SQLite file BEFORE every test —
+async def _ensure_schema_exists() -> AsyncGenerator[None, None]:
+    """Ensure all tables exist on the shared SQLite DB BEFORE every test,
     including tests that don't request the `db_session` fixture (e.g. the
     synchronous DLP discovery scanner tests that go through the production
     async_session_factory directly).
@@ -102,7 +126,7 @@ async def _ensure_schema_on_disk() -> AsyncGenerator[None, None]:
     `db_session` does its own drop_all + create_all for transactional
     isolation. This fixture runs second (autouse) and re-creates any tables
     that may have been dropped, so non-db_session tests still find the
-    schema. `create_all(checkfirst=True)` is idempotent — no harm on the
+    schema. `create_all(checkfirst=True)` is idempotent; no harm on the
     common path."""
     async with test_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -114,7 +138,7 @@ async def db_session() -> AsyncGenerator[AsyncSession, None]:
     """Create a fresh database session for each test"""
     # Drop first to clear stale indexes from prior failed tests
     async with test_engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
+        await conn.run_sync(_drop_all_tables)
     async with test_engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
@@ -122,13 +146,11 @@ async def db_session() -> AsyncGenerator[AsyncSession, None]:
         yield session
 
     async with test_engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
+        await conn.run_sync(_drop_all_tables)
 
 
 @pytest_asyncio.fixture(scope="function")
-async def client(
-    db_session: AsyncSession, redis_mock: AsyncMock
-) -> AsyncGenerator[AsyncClient, None]:
+async def client(db_session: AsyncSession, redis_mock: AsyncMock) -> AsyncGenerator[AsyncClient, None]:
     """Create test client with database session + Redis client overrides.
 
     The Redis override is critical: get_current_user (src/api/deps.py:84)
@@ -138,17 +160,24 @@ async def client(
     """
 
     async def override_get_db():
-        yield db_session
+        try:
+            yield db_session
+            await db_session.commit()
+        except Exception:
+            await db_session.rollback()
+            raise
 
     async def override_get_redis_client():
         yield redis_mock
 
     # Import `app` and the Redis dep lazily to avoid heavy collection imports.
-    from src.main import app
     from src.api.deps import get_redis_client
+    from src.main import app
+    from src.zerotrust import session_gate as zt_session_gate
 
     app.dependency_overrides[get_db] = override_get_db
     app.dependency_overrides[get_redis_client] = override_get_redis_client
+    zt_session_gate._redis_client = redis_mock
 
     async with AsyncClient(
         transport=ASGITransport(app=app),
@@ -156,6 +185,7 @@ async def client(
     ) as ac:
         yield ac
 
+    zt_session_gate._redis_client = None
     app.dependency_overrides.clear()
 
 
