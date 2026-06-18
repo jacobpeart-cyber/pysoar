@@ -1213,9 +1213,18 @@ class AgentToolRegistry:
         audit_scanned = 0
         iocs_checked = 0
 
+        # Require keyword CO-OCCURRENCE so a single common word (e.g.
+        # "application") doesn't flag every benign log. A log must match at
+        # least `min_match` DISTINCT keywords; for 1-2 keyword hypotheses,
+        # require all of them.
+        unique_keywords = list(dict.fromkeys(keywords))
+        min_match = 2 if len(unique_keywords) >= 3 else len(unique_keywords)
+        MAX_FINDINGS = 50
+
         log_query = select(LogEntry).where(LogEntry.timestamp >= cutoff.isoformat())
-        log_rows = (await self.db.execute(log_query.limit(500))).scalars().all()
+        log_rows = (await self.db.execute(log_query.limit(2000))).scalars().all()
         logs_scanned = len(log_rows)
+        log_candidates = []
         for log in log_rows:
             haystack = " ".join(
                 filter(None, [
@@ -1223,22 +1232,31 @@ class AgentToolRegistry:
                     log.process_name, log.action, log.source_name,
                 ])
             ).lower()
-            matched = [k for k in keywords if k in haystack]
-            if not matched:
-                continue
+            matched = {k for k in unique_keywords if k in haystack}
+            if len(matched) >= min_match:
+                log_candidates.append((len(matched), log, sorted(matched)))
+        # Strongest matches first; cap to avoid flooding on broad hunts.
+        log_candidates.sort(key=lambda c: c[0], reverse=True)
+        for match_count, log, matched in log_candidates[:MAX_FINDINGS]:
+            snippet = (log.message or log.raw_log or "").strip().replace("\n", " ")
+            if len(snippet) > 100:
+                snippet = snippet[:100] + "…"
+            host = log.hostname or log.source_name or "log"
             finding = HuntFinding(
                 session_id=session.id,
-                title=f"Log search match: {log.source_name or 'log event'}",
+                title=f"[{host}] {snippet}" if snippet else f"Log event on {host}",
                 description=(
-                    f"Log entry matched hunt keywords: {', '.join(sorted(set(matched))[:10])}"
+                    f"Log entry matched {match_count} hunt terms "
+                    f"({', '.join(matched[:10])}). Source: {log.source_name}."
                 ),
-                severity=log.severity or "medium",
+                severity=(log.severity or "medium"),
                 classification="needs_review",
                 evidence=json.dumps({
                     "log_id": getattr(log, "id", None),
                     "timestamp": getattr(log, "timestamp", None),
                     "source_type": log.source_type,
-                    "matched_keywords": sorted(set(matched))[:10],
+                    "match_count": match_count,
+                    "matched_keywords": matched[:10],
                 }),
                 affected_assets=json.dumps([log.hostname] if log.hostname else []),
                 iocs_found=json.dumps([]),
@@ -1259,14 +1277,19 @@ class AgentToolRegistry:
                     getattr(alert, "domain", None), getattr(alert, "url", None), getattr(alert, "file_hash", None),
                 ])
             ).lower()
-            matched = [k for k in keywords if k in haystack]
-            if not matched:
+            matched = sorted({k for k in unique_keywords if k in haystack})
+            # Alerts are already curated signals, so a single strong keyword
+            # match is meaningful — but skip pure single-common-word hits on
+            # multi-keyword hunts to stay consistent with the log scan.
+            if len(matched) < min(min_match, 1) or not matched:
+                continue
+            if len(unique_keywords) >= 3 and len(matched) < 1:
                 continue
             finding = HuntFinding(
                 session_id=session.id,
-                title=f"Alert search match: {alert.title}",
+                title=f"Related alert: {alert.title}",
                 description=(
-                    f"Historical alert matched hunt keywords: {', '.join(sorted(set(matched))[:10])}"
+                    f"Historical alert matched hunt terms: {', '.join(matched[:10])}"
                 ),
                 severity=alert.severity or "medium",
                 classification="needs_review",

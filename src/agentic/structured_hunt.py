@@ -70,13 +70,21 @@ async def run_structured_hunt(
     max_rank = max((_SEVERITY_RANK.get(f["severity"], 0) for f in findings), default=-1)
     severity = next((s for s, r in _SEVERITY_RANK.items() if r == max_rank), "informational") if findings else "none"
 
-    has_findings = len(findings) > 0
+    # Only findings of medium severity or higher constitute a positive
+    # result. Low/informational matches are context/noise — surfacing
+    # them is useful, but they must NOT drive a "suspicious" verdict, or
+    # the hunt cries wolf on every benign keyword co-occurrence.
+    strong_findings = [f for f in findings if _SEVERITY_RANK.get(f["severity"], 0) >= 2]
     uncovered = scope.get("coverage_summary", {}).get("uncovered", 0)
-    if has_findings and max_rank >= 3:
+    collected = scope.get("collected_source_types")
+    if strong_findings and max_rank >= 3:
         verdict, confidence = "suspicious_activity", 75
-    elif has_findings:
+    elif strong_findings:
         verdict, confidence = "suspicious_activity", 55
-    elif uncovered and not scope.get("collected_source_types"):
+    elif findings:
+        # we looked and matched only low/informational events
+        verdict, confidence = "benign", 55
+    elif uncovered and not collected:
         # nothing found, but we also lacked the telemetry to find it
         verdict, confidence = "inconclusive", 30
     else:
