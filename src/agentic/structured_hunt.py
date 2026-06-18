@@ -92,13 +92,26 @@ async def run_structured_hunt(
 
     # --- Phase 6/7: Recommendations (advisory, ALWAYS approval-gated) ---
     recommendations = []
-    for f in findings[:10]:
-        if _SEVERITY_RANK.get(f["severity"], 0) >= 3:
-            recommendations.append({
-                "action": f"Open an incident to investigate finding: {f['title']}",
-                "rationale": f"{f['severity']} severity hunt finding",
-                "requires_approval": True,
-            })
+    high_findings = [f for f in findings if _SEVERITY_RANK.get(f["severity"], 0) >= 3]
+    for f in high_findings[:10]:
+        recommendations.append({
+            "action": f"Open an incident to investigate finding: {f['title']}",
+            "rationale": f"{f['severity']} severity hunt finding",
+            "requires_approval": True,
+        })
+    # A suspicious verdict driven by medium-severity findings still needs a
+    # triage recommendation — never "no action" when the hunt flagged
+    # something. Reference the affected hosts so the analyst can act.
+    if verdict == "suspicious_activity" and not high_findings and strong_findings:
+        techs = ", ".join(sorted(techniques)) if techniques else "the cited techniques"
+        recommendations.append({
+            "action": (
+                f"Triage the {len(strong_findings)} suspicious finding(s) for {techs} "
+                "and confirm true/false positive"
+            ),
+            "rationale": "hunt surfaced medium-severity activity matching the hypothesis",
+            "requires_approval": True,
+        })
     for t in scope.get("techniques_in_scope", []):
         if not t.get("covered"):
             recommendations.append({
@@ -115,7 +128,7 @@ async def run_structured_hunt(
     if not recommendations:
         recommendations.append({
             "action": "No action required; document the hunt as a negative result",
-            "rationale": "no findings and adequate coverage",
+            "rationale": "no suspicious findings and adequate coverage",
             "requires_approval": True,
         })
 
