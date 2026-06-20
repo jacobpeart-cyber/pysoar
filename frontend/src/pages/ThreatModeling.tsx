@@ -333,7 +333,6 @@ export default function ThreatModeling() {
       queryClient.invalidateQueries({ queryKey: ['threat-model-dashboard', selectedModelId] });
     },
     onError: (err: any) => {
-      // eslint-disable-next-line no-console
       console.error('Run STRIDE failed:', err?.response?.data ?? err?.message ?? err);
     },
   });
@@ -377,7 +376,6 @@ export default function ThreatModeling() {
       setComponentForm(emptyComponentForm);
     },
     onError: (err: any) => {
-      // eslint-disable-next-line no-console
       console.error('Create component failed:', err?.response?.data ?? err?.message ?? err);
     },
   });
@@ -397,7 +395,6 @@ export default function ThreatModeling() {
       setComponentForm(emptyComponentForm);
     },
     onError: (err: any) => {
-      // eslint-disable-next-line no-console
       console.error('Update component failed:', err?.response?.data ?? err?.message ?? err);
     },
   });
@@ -410,7 +407,6 @@ export default function ThreatModeling() {
       queryClient.invalidateQueries({ queryKey: ['threat-model-components', selectedModelId] });
     },
     onError: (err: any) => {
-      // eslint-disable-next-line no-console
       console.error('Delete component failed:', err?.response?.data ?? err?.message ?? err);
     },
   });
