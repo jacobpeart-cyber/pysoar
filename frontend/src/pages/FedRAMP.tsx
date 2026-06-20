@@ -804,9 +804,15 @@ function POAMTab() {
   if (!data) return <EmptyState icon={<ClipboardList className="w-10 h-10" />} title="No POA&Ms" description="No plan of action and milestones items found." />;
 
   const items: any[] = Array.isArray(data?.items) ? data.items : [];
-  const summary = data?.summary ?? { total: 0, open: 0, inProgress: 0, in_progress: 0, closed: 0, delayed: 0, overdue: 0 };
-  // Normalize in_progress vs inProgress
-  if (summary.inProgress === undefined) summary.inProgress = summary.in_progress ?? 0;
+  const rawSummary = data?.summary ?? {};
+  const summary = {
+    total: rawSummary.total ?? 0,
+    open: rawSummary.open ?? 0,
+    inProgress: rawSummary.inProgress ?? rawSummary.in_progress ?? 0,
+    closed: rawSummary.closed ?? 0,
+    delayed: rawSummary.delayed ?? 0,
+    overdue: rawSummary.overdue ?? 0,
+  };
   const timelineData: any[] = Array.isArray(data?.timelineData ?? data?.timeline_data) ? (data.timelineData ?? data.timeline_data) : [];
   const maxTimelineValue = timelineData.length > 0 ? Math.max(...timelineData.flatMap((t: any) => [t.open ?? 0, t.closed ?? 0, t.new ?? 0]), 1) : 1;
 
@@ -960,13 +966,11 @@ function EvidenceTab() {
     },
     onSuccess: (data: any) => {
       const count = Array.isArray(data?.results) ? data.results.length : 0;
-      // eslint-disable-next-line no-alert
       alert(`Evidence collection completed. ${count} rule(s) run.`);
       queryClient.invalidateQueries({ queryKey: ['fedramp', 'evidence', 'status'] });
     },
     onError: (err: any) => {
       const msg = err?.response?.data?.detail || err?.message || 'Evidence collection failed';
-      // eslint-disable-next-line no-alert
       alert(msg);
     },
   });

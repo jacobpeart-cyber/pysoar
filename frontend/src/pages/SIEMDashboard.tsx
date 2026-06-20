@@ -106,9 +106,6 @@ export default function SIEMDashboard() {
   const [showImportRuleModal, setShowImportRuleModal] = useState(false);
   const [importYaml, setImportYaml] = useState('');
 
-  // Collector state
-  const [collectorStatus, setCollectorStatus] = useState<any>(null);
-
   const queryClient = useQueryClient();
   const [collectorError, setCollectorError] = useState<string | null>(null);
 
@@ -259,9 +256,7 @@ export default function SIEMDashboard() {
     enabled: activeTab === 'sources',
   });
 
-  useEffect(() => {
-    if (collectorData) setCollectorStatus(collectorData);
-  }, [collectorData]);
+  const collectorStatus = collectorData;
 
   // Collector start/stop mutations
   const collectorStartMutation = useMutation({
@@ -317,11 +312,15 @@ export default function SIEMDashboard() {
   }, []);
 
   useEffect(() => {
+    let initialFetchTimeout: ReturnType<typeof setTimeout> | null = null;
     if (isTailing && activeTab === 'live') {
-      fetchLiveLogs();
+      initialFetchTimeout = setTimeout(fetchLiveLogs, 0);
       tailIntervalRef.current = setInterval(fetchLiveLogs, 3000);
     }
     return () => {
+      if (initialFetchTimeout) {
+        clearTimeout(initialFetchTimeout);
+      }
       if (tailIntervalRef.current) {
         clearInterval(tailIntervalRef.current);
         tailIntervalRef.current = null;
@@ -1118,7 +1117,9 @@ export default function SIEMDashboard() {
                                   a.click();
                                   document.body.removeChild(a);
                                   URL.revokeObjectURL(url);
-                                } catch {}
+                                } catch (err) {
+                                  console.error('Rule export failed:', err);
+                                }
                               }}
                               className="flex items-center gap-1 px-2 py-1 text-sm bg-gray-50 text-gray-600 rounded hover:bg-gray-100"
                               title="Export as YAML"
@@ -1138,7 +1139,9 @@ export default function SIEMDashboard() {
                                   try {
                                     await api.delete(`/siem/rules/${rule.id}`);
                                     queryClient.invalidateQueries({ queryKey: ['siem-rules'] });
-                                  } catch {}
+                                  } catch (err) {
+                                    console.error('Rule delete failed:', err);
+                                  }
                                 }
                               }}
                               className="flex items-center gap-1 px-3 py-1 text-sm bg-red-50 text-red-600 rounded hover:bg-red-100"
@@ -1236,7 +1239,9 @@ export default function SIEMDashboard() {
                           await api.post('/siem/rules', newRuleForm);
                           setShowCreateRuleModal(false);
                           queryClient.invalidateQueries({ queryKey: ['siem-rules'] });
-                        } catch {}
+                        } catch (err) {
+                          console.error('Rule creation failed:', err);
+                        }
                       }}
                       className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
                     >
@@ -1303,7 +1308,9 @@ export default function SIEMDashboard() {
                         try {
                           const response = await api.post(`/siem/rules/${selectedRule.id}/test`, { sample_logs: testLogs.split('\n').filter((l: string) => l.trim()) });
                           setTestResult(response.data);
-                        } catch {}
+                        } catch (err) {
+                          console.error('Rule test failed:', err);
+                        }
                       }}
                       className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
                     >
@@ -1572,7 +1579,9 @@ export default function SIEMDashboard() {
                                   try {
                                     await api.put(`/siem/sources/${selectedSource.id}`, { enabled: !selectedSource.enabled });
                                     setSelectedSource({ ...selectedSource, enabled: !selectedSource.enabled });
-                                  } catch {}
+                                  } catch (err) {
+                                    console.error('Source toggle failed:', err);
+                                  }
                                 }}
                                 className={clsx('px-3 py-1 rounded-full text-xs font-medium', selectedSource.enabled !== false ? 'bg-green-100 text-green-700' : 'bg-gray-100 text-gray-600')}
                               >
@@ -1592,7 +1601,9 @@ export default function SIEMDashboard() {
                                 }
                                 setSelectedSource(null);
                                 queryClient.invalidateQueries({ queryKey: ['siem-sources'] });
-                              } catch {}
+                              } catch (err) {
+                                console.error('Source save failed:', err);
+                              }
                             }}
                             disabled={!newSourceForm.name}
                             className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg text-sm font-medium hover:bg-blue-700 disabled:opacity-50"
