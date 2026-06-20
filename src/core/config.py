@@ -1,8 +1,8 @@
 """Application configuration using Pydantic Settings"""
 
-from functools import lru_cache
-from typing import List, Optional, Literal
 import math
+from functools import lru_cache
+from typing import List, Literal, Optional
 
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -49,7 +49,7 @@ class Settings(BaseSettings):
     api_v1_prefix: str = "/api/v1"
 
     # Server
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
     port: int = 8000
     workers: int = 1
 
@@ -83,11 +83,23 @@ class Settings(BaseSettings):
     # CORS
     cors_origins: List[str] = ["http://localhost:3000", "http://localhost:8000"]
 
+    @field_validator("debug", mode="before")
+    @classmethod
+    def parse_debug(cls, v):
+        if isinstance(v, str):
+            normalized = v.strip().lower()
+            if normalized in {"release", "prod", "production"}:
+                return False
+            if normalized in {"debug", "dev", "development"}:
+                return True
+        return v
+
     @field_validator("cors_origins", mode="before")
     @classmethod
     def parse_cors_origins(cls, v):
         if isinstance(v, str):
             import json
+
             try:
                 return json.loads(v)
             except json.JSONDecodeError:
@@ -100,7 +112,7 @@ class Settings(BaseSettings):
         if info.data.get("app_env") == "production":
             if v not in ["require", "verify-full", "disable"]:
                 raise ValueError(
-                    f"In production, database_ssl_mode must be 'require', 'verify-full', or 'disable', got '{v}'"
+                    f"In production, database_ssl_mode must be 'require', 'verify-full', or 'disable', got '{v}'",
                 )
         return v
 
@@ -163,14 +175,14 @@ class Settings(BaseSettings):
         secret_entropy = _estimate_entropy(self.secret_key)
         if secret_entropy < 3.0:
             warnings.append(
-                f"secret_key entropy is {secret_entropy:.2f} bits (< 3.0). Consider using a more random value."
+                f"secret_key entropy is {secret_entropy:.2f} bits (< 3.0). Consider using a more random value.",
             )
 
         # Check jwt_secret_key entropy
         jwt_entropy = _estimate_entropy(self.jwt_secret_key)
         if jwt_entropy < 3.0:
             warnings.append(
-                f"jwt_secret_key entropy is {jwt_entropy:.2f} bits (< 3.0). Consider using a more random value."
+                f"jwt_secret_key entropy is {jwt_entropy:.2f} bits (< 3.0). Consider using a more random value.",
             )
 
         # Check for weak patterns in secrets
@@ -179,21 +191,21 @@ class Settings(BaseSettings):
             for pattern in weak_patterns:
                 if pattern in secret_lower:
                     warnings.append(
-                        f"{secret_name} contains weak pattern '{pattern}'. Use a cryptographically random secret."
+                        f"{secret_name} contains weak pattern '{pattern}'. Use a cryptographically random secret.",
                     )
                     break
 
         # Check encryption_master_key is set
         if not self.encryption_master_key:
             warnings.append(
-                "encryption_master_key is not set. Data encryption will not be available."
+                "encryption_master_key is not set. Data encryption will not be available.",
             )
 
         # Check first_admin_password entropy
         first_admin_entropy = _estimate_entropy(self.first_admin_password)
         if first_admin_entropy < 3.0:
             warnings.append(
-                f"first_admin_password entropy is {first_admin_entropy:.2f} bits (< 3.0). Set a stronger initial admin password."
+                f"first_admin_password entropy is {first_admin_entropy:.2f} bits (< 3.0). Set a stronger initial admin password.",
             )
 
         return warnings

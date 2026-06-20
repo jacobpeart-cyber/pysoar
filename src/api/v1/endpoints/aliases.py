@@ -19,7 +19,7 @@ from datetime import datetime, timedelta, timezone
 from ipaddress import ip_network
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Body, HTTPException, Query, status
+from fastapi import APIRouter, Body, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, desc, func, select
@@ -87,7 +87,7 @@ async def _safe_list(
             "size": size,
             "pages": (total + size - 1) // size if size else 1,
         }
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning(
             "alias list query failed",
             model=getattr(model, "__name__", str(model)),
@@ -109,14 +109,10 @@ def _row_to_dict(row: Any) -> Dict[str, Any]:
                 else:
                     d[col.key] = val
             return d
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:
+        logger.debug("SQLAlchemy row mapping failed; falling back to public attrs", error=str(exc))
     # Fallback: pull public attrs
-    return {
-        k: v
-        for k, v in vars(row).items()
-        if not k.startswith("_") and not callable(v)
-    }
+    return {k: v for k, v in vars(row).items() if not k.startswith("_") and not callable(v)}
 
 
 # --------------------------------------------------------------------------
@@ -139,7 +135,8 @@ async def fedramp_documents(
 
         gen = FedRAMPGenerator()
         controls = await gen.get_control_implementation_status(
-            db, organization_id=_org_id(current_user)
+            db,
+            organization_id=_org_id(current_user),
         )
         docs: List[Dict[str, Any]] = []
         for ctrl in controls or []:
@@ -150,10 +147,10 @@ async def fedramp_documents(
                         "family": ctrl.get("family"),
                         "title": (art.get("title") if isinstance(art, dict) else str(art)),
                         "artifact": art,
-                    }
+                    },
                 )
         return {"items": docs, "total": len(docs)}
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("fedramp_documents failed", error=str(exc))
         return {"items": [], "total": 0}
 
@@ -174,7 +171,11 @@ async def stig_remediations(
     from src.stig.models import STIGScanResult
 
     return await _safe_list(
-        db, STIGScanResult, org_id=_org_id(current_user), page=page, size=size
+        db,
+        STIGScanResult,
+        org_id=_org_id(current_user),
+        page=page,
+        size=size,
     )
 
 
@@ -193,7 +194,11 @@ async def privacy_dsr_flat(
     from src.privacy.models import DataSubjectRequest
 
     return await _safe_list(
-        db, DataSubjectRequest, org_id=_org_id(current_user), page=page, size=size
+        db,
+        DataSubjectRequest,
+        org_id=_org_id(current_user),
+        page=page,
+        size=size,
     )
 
 
@@ -207,7 +212,11 @@ async def privacy_pia_flat(
     from src.privacy.models import PrivacyImpactAssessment
 
     return await _safe_list(
-        db, PrivacyImpactAssessment, org_id=_org_id(current_user), page=page, size=size
+        db,
+        PrivacyImpactAssessment,
+        org_id=_org_id(current_user),
+        page=page,
+        size=size,
     )
 
 
@@ -221,7 +230,11 @@ async def privacy_consent_flat(
     from src.privacy.models import ConsentRecord
 
     return await _safe_list(
-        db, ConsentRecord, org_id=_org_id(current_user), page=page, size=size
+        db,
+        ConsentRecord,
+        org_id=_org_id(current_user),
+        page=page,
+        size=size,
     )
 
 
@@ -235,7 +248,11 @@ async def privacy_ropa_flat(
     from src.privacy.models import DataProcessingRecord
 
     return await _safe_list(
-        db, DataProcessingRecord, org_id=_org_id(current_user), page=page, size=size
+        db,
+        DataProcessingRecord,
+        org_id=_org_id(current_user),
+        page=page,
+        size=size,
     )
 
 
@@ -249,7 +266,11 @@ async def privacy_incidents_flat(
     from src.privacy.models import PrivacyIncident
 
     return await _safe_list(
-        db, PrivacyIncident, org_id=_org_id(current_user), page=page, size=size
+        db,
+        PrivacyIncident,
+        org_id=_org_id(current_user),
+        page=page,
+        size=size,
     )
 
 
@@ -269,7 +290,11 @@ async def risk_quant_analysis_flat(
     from src.risk_quant.models import FAIRAnalysis
 
     return await _safe_list(
-        db, FAIRAnalysis, org_id=_org_id(current_user), page=page, size=size
+        db,
+        FAIRAnalysis,
+        org_id=_org_id(current_user),
+        page=page,
+        size=size,
     )
 
 
@@ -307,7 +332,11 @@ async def intel_feeds_flat(
     from src.intel.models import ThreatFeed
 
     return await _safe_list(
-        db, ThreatFeed, org_id=_org_id(current_user), page=page, size=size
+        db,
+        ThreatFeed,
+        org_id=_org_id(current_user),
+        page=page,
+        size=size,
     )
 
 
@@ -329,7 +358,11 @@ async def threat_modeling_models_flat(
     from src.threat_modeling.models import ThreatModel
 
     return await _safe_list(
-        db, ThreatModel, org_id=_org_id(current_user), page=page, size=size
+        db,
+        ThreatModel,
+        org_id=_org_id(current_user),
+        page=page,
+        size=size,
     )
 
 
@@ -349,7 +382,11 @@ async def dfir_evidence_flat(
     from src.dfir.models import ForensicEvidence
 
     return await _safe_list(
-        db, ForensicEvidence, org_id=_org_id(current_user), page=page, size=size
+        db,
+        ForensicEvidence,
+        org_id=_org_id(current_user),
+        page=page,
+        size=size,
     )
 
 
@@ -364,7 +401,11 @@ async def dfir_legal_holds_flat(
     from src.dfir.models import LegalHold
 
     return await _safe_list(
-        db, LegalHold, org_id=_org_id(current_user), page=page, size=size
+        db,
+        LegalHold,
+        org_id=_org_id(current_user),
+        page=page,
+        size=size,
     )
 
 
@@ -386,7 +427,7 @@ async def simulation_posture_trend(
         org_id = _org_id(current_user)
         since = datetime.utcnow() - timedelta(days=days)
         stmt = select(SecurityPostureScore).where(
-            SecurityPostureScore.created_at >= since
+            SecurityPostureScore.created_at >= since,
         )
         if org_id and hasattr(SecurityPostureScore, "organization_id"):
             stmt = stmt.where(SecurityPostureScore.organization_id == org_id)
@@ -397,7 +438,7 @@ async def simulation_posture_trend(
             "total": len(rows),
             "window_days": days,
         }
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("simulation_posture_trend failed", error=str(exc))
         return {"items": [], "total": 0, "window_days": days}
 
@@ -424,7 +465,7 @@ async def playbooks_executions_recent(
         stmt = stmt.order_by(desc(PlaybookExecution.created_at)).limit(limit)
         rows = list((await db.execute(stmt)).scalars().all())
         return {"items": [_row_to_dict(r) for r in rows], "total": len(rows)}
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("playbooks_executions_recent failed", error=str(exc))
         return {"items": [], "total": 0}
 
@@ -453,12 +494,13 @@ async def agentic_reasoning_chain_flat(
             stmt = stmt.where(ReasoningStep.investigation_id == investigation_id)
         elif org_id and hasattr(Investigation, "organization_id"):
             stmt = stmt.join(
-                Investigation, Investigation.id == ReasoningStep.investigation_id
+                Investigation,
+                Investigation.id == ReasoningStep.investigation_id,
             ).where(Investigation.organization_id == org_id)
         stmt = stmt.order_by(desc(ReasoningStep.created_at)).limit(limit)
         rows = list((await db.execute(stmt)).scalars().all())
         return {"items": [_row_to_dict(r) for r in rows], "total": len(rows)}
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("agentic_reasoning_chain_flat failed", error=str(exc))
         return {"items": [], "total": 0}
 
@@ -475,14 +517,14 @@ async def agentic_approvals(
     try:
         org_id = _org_id(current_user)
         stmt = select(AgentAction).where(
-            AgentAction.execution_status == "pending_approval"
+            AgentAction.execution_status == "pending_approval",
         )
         if org_id and hasattr(AgentAction, "organization_id"):
             stmt = stmt.where(AgentAction.organization_id == org_id)
         stmt = stmt.order_by(desc(AgentAction.created_at)).limit(limit)
         rows = list((await db.execute(stmt)).scalars().all())
         return {"items": [_row_to_dict(r) for r in rows], "total": len(rows)}
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("agentic_approvals failed", error=str(exc))
         return {"items": [], "total": 0}
 
@@ -514,7 +556,7 @@ async def agentic_triaged_alerts(
         stmt = stmt.order_by(desc(Alert.created_at)).limit(limit)
         rows = list((await db.execute(stmt)).scalars().all())
         return {"items": [_row_to_dict(r) for r in rows], "total": len(rows)}
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("agentic_triaged_alerts failed", error=str(exc))
         return {"items": [], "total": 0}
 
@@ -531,10 +573,14 @@ async def agentic_anomalies(
 
         org_id = _org_id(current_user)
         result = await _safe_list(
-            db, AnomalyDetection, org_id=org_id, page=1, size=limit
+            db,
+            AnomalyDetection,
+            org_id=org_id,
+            page=1,
+            size=limit,
         )
         return result
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("agentic_anomalies failed", error=str(exc))
         return {"items": [], "total": 0}
 
@@ -551,9 +597,13 @@ async def agentic_predictions(
 
         org_id = _org_id(current_user)
         return await _safe_list(
-            db, ThreatPrediction, org_id=org_id, page=1, size=limit
+            db,
+            ThreatPrediction,
+            org_id=org_id,
+            page=1,
+            size=limit,
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("agentic_predictions failed", error=str(exc))
         return {"items": [], "total": 0}
 
@@ -569,7 +619,11 @@ async def agentic_models(
     from src.agentic.models import SOCAgent
 
     return await _safe_list(
-        db, SOCAgent, org_id=_org_id(current_user), page=1, size=limit
+        db,
+        SOCAgent,
+        org_id=_org_id(current_user),
+        page=1,
+        size=limit,
     )
 
 
@@ -592,14 +646,14 @@ async def agents_commands_pending(
         # See src/agents/models.py: the "pending human approval" status is
         # spelled `awaiting_approval` on the real model.
         stmt = select(AgentCommand).where(
-            AgentCommand.status == "awaiting_approval"
+            AgentCommand.status == "awaiting_approval",
         )
         if org_id and hasattr(AgentCommand, "organization_id"):
             stmt = stmt.where(AgentCommand.organization_id == org_id)
         stmt = stmt.order_by(desc(AgentCommand.created_at)).limit(limit)
         rows = list((await db.execute(stmt)).scalars().all())
         return {"items": [_row_to_dict(r) for r in rows], "total": len(rows)}
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("agents_commands_pending failed", error=str(exc))
         return {"items": [], "total": 0}
 
@@ -640,8 +694,12 @@ async def siem_dashboard(
 
         # Last 24h logs
         since = datetime.utcnow() - timedelta(hours=24)
-        stmt = select(func.count()).select_from(LogEntry).where(
-            LogEntry.created_at >= since
+        stmt = (
+            select(func.count())
+            .select_from(LogEntry)
+            .where(
+                LogEntry.created_at >= since,
+            )
         )
         if org_id and hasattr(LogEntry, "organization_id"):
             stmt = stmt.where(LogEntry.organization_id == org_id)
@@ -654,7 +712,7 @@ async def siem_dashboard(
             "total_correlations": total_correlations,
             "generated_at": datetime.utcnow().isoformat() + "Z",
         }
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("siem_dashboard failed", error=str(exc))
         return {
             "total_logs": 0,
@@ -681,7 +739,11 @@ async def itdr_access_anomalies_alias(
     from src.itdr.models import AccessAnomaly
 
     return await _safe_list(
-        db, AccessAnomaly, org_id=_org_id(current_user), page=page, size=size
+        db,
+        AccessAnomaly,
+        org_id=_org_id(current_user),
+        page=page,
+        size=size,
     )
 
 
@@ -701,7 +763,11 @@ async def container_security_alerts(
     from src.container_security.models import RuntimeAlert
 
     return await _safe_list(
-        db, RuntimeAlert, org_id=_org_id(current_user), page=page, size=size
+        db,
+        RuntimeAlert,
+        org_id=_org_id(current_user),
+        page=page,
+        size=size,
     )
 
 
@@ -724,7 +790,11 @@ async def ot_security_assets_dash(
     from src.ot_security.models import OTAsset
 
     return await _safe_list(
-        db, OTAsset, org_id=_org_id(current_user), page=page, size=size
+        db,
+        OTAsset,
+        org_id=_org_id(current_user),
+        page=page,
+        size=size,
     )
 
 
@@ -738,7 +808,11 @@ async def ot_security_alerts_dash(
     from src.ot_security.models import OTAlert
 
     return await _safe_list(
-        db, OTAlert, org_id=_org_id(current_user), page=page, size=size
+        db,
+        OTAlert,
+        org_id=_org_id(current_user),
+        page=page,
+        size=size,
     )
 
 
@@ -752,7 +826,11 @@ async def ot_security_zones_dash(
     from src.ot_security.models import OTZone
 
     return await _safe_list(
-        db, OTZone, org_id=_org_id(current_user), page=page, size=size
+        db,
+        OTZone,
+        org_id=_org_id(current_user),
+        page=page,
+        size=size,
     )
 
 
@@ -805,7 +883,7 @@ async def ot_security_purdue_map_dash(
             "total_assets": len(assets),
             "total_zones": len(zones),
         }
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.warning("ot_security_purdue_map_dash failed", error=str(exc))
         return {"levels": [], "total_assets": 0, "total_zones": 0}
 
@@ -826,7 +904,11 @@ async def supplychain_vendor_assessments_alias(
     from src.supplychain.models import VendorAssessment
 
     return await _safe_list(
-        db, VendorAssessment, org_id=_org_id(current_user), page=page, size=size
+        db,
+        VendorAssessment,
+        org_id=_org_id(current_user),
+        page=page,
+        size=size,
     )
 
 
@@ -846,7 +928,11 @@ async def integrations_executions_flat(
     from src.integrations.models import IntegrationExecution
 
     return await _safe_list(
-        db, IntegrationExecution, org_id=_org_id(current_user), page=page, size=size
+        db,
+        IntegrationExecution,
+        org_id=_org_id(current_user),
+        page=page,
+        size=size,
     )
 
 
@@ -861,7 +947,11 @@ async def integrations_webhooks_flat(
     from src.integrations.models import WebhookEndpoint
 
     return await _safe_list(
-        db, WebhookEndpoint, org_id=_org_id(current_user), page=page, size=size
+        db,
+        WebhookEndpoint,
+        org_id=_org_id(current_user),
+        page=page,
+        size=size,
     )
 
 
@@ -877,8 +967,7 @@ class OTDiscoverRequest(BaseModel):
     probe_ports: Optional[List[int]] = Field(
         default=None,
         description=(
-            "Optional list of TCP ports to probe. If omitted the engine's "
-            "standard OT/ICS protocol port set is used."
+            "Optional list of TCP ports to probe. If omitted the engine's " "standard OT/ICS protocol port set is used."
         ),
     )
 
@@ -918,7 +1007,7 @@ async def ot_security_bulk_discover(
     try:
         net = ip_network(payload.cidr, strict=False)
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=f"Invalid CIDR: {exc}")
+        raise HTTPException(status_code=400, detail=f"Invalid CIDR: {exc}") from exc
 
     if net.prefixlen < MAX_DISCOVERY_PREFIX:
         raise HTTPException(
@@ -953,9 +1042,7 @@ async def ot_security_bulk_discover(
                 detail=f"Invalid TCP port(s): {bad}",
             )
         original_ports = dict(ot_engine.OT_PROBE_PORTS)
-        ot_engine.OT_PROBE_PORTS = {
-            p: OT_PROBE_PORTS.get(p, "unknown") for p in payload.probe_ports
-        }
+        ot_engine.OT_PROBE_PORTS = {p: OT_PROBE_PORTS.get(p, "unknown") for p in payload.probe_ports}
 
     try:
         discovered = await monitor.discover_assets(payload.cidr)
@@ -969,10 +1056,15 @@ async def ot_security_bulk_discover(
     # propagate it as-is. Otherwise refetch the canonical OTAsset rows so
     # we return real DB state (with IDs and any enrichment that may have
     # already been applied by earlier runs).
-    if discovered and isinstance(discovered[0], dict) and discovered[0].get("status") in {
-        "rejected",
-        "skipped",
-    }:
+    if (
+        discovered
+        and isinstance(discovered[0], dict)
+        and discovered[0].get("status")
+        in {
+            "rejected",
+            "skipped",
+        }
+    ):
         return {
             "status": discovered[0]["status"],
             "reason": discovered[0].get("reason"),
@@ -989,8 +1081,8 @@ async def ot_security_bulk_discover(
                 and_(
                     OTAsset.organization_id == org_id,
                     OTAsset.ip_address.in_(ips),
-                )
-            )
+                ),
+            ),
         )
         rows = [_row_to_dict(a) for a in res.scalars().all()]
 
@@ -1011,7 +1103,7 @@ def _asset_last_seen_iso(asset: Any) -> str:
 
 @router.get("/ot-security/export")
 async def ot_security_export(
-    format: str = Query("json", regex="^(json|csv)$"),
+    export_format: str = Query("json", alias="format", pattern="^(json|csv)$"),
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
 ):
@@ -1033,23 +1125,17 @@ async def ot_security_export(
     generated_at = now.isoformat()
 
     assets_res = await db.execute(
-        select(OTAsset).where(OTAsset.organization_id == org_id)
-        if org_id
-        else select(OTAsset)
+        select(OTAsset).where(OTAsset.organization_id == org_id) if org_id else select(OTAsset),
     )
     assets = list(assets_res.scalars().all())
 
     alerts_res = await db.execute(
-        select(OTAlert).where(OTAlert.organization_id == org_id)
-        if org_id
-        else select(OTAlert)
+        select(OTAlert).where(OTAlert.organization_id == org_id) if org_id else select(OTAlert),
     )
     alerts = list(alerts_res.scalars().all())
 
     zones_res = await db.execute(
-        select(OTZone).where(OTZone.organization_id == org_id)
-        if org_id
-        else select(OTZone)
+        select(OTZone).where(OTZone.organization_id == org_id) if org_id else select(OTZone),
     )
     zones = list(zones_res.scalars().all())
 
@@ -1061,32 +1147,36 @@ async def ot_security_export(
         if a.status in open_alert_states:
             open_alert_counts[a.asset_id] = open_alert_counts.get(a.asset_id, 0) + 1
 
-    if format == "csv":
+    if export_format == "csv":
         buf = io.StringIO()
         writer = csv.writer(buf)
-        writer.writerow([
-            "hostname",
-            "ip",
-            "vendor",
-            "protocol",
-            "zone",
-            "purdue_level",
-            "criticality",
-            "last_seen",
-            "open_alerts",
-        ])
+        writer.writerow(
+            (
+                "hostname",
+                "ip",
+                "vendor",
+                "protocol",
+                "zone",
+                "purdue_level",
+                "criticality",
+                "last_seen",
+                "open_alerts",
+            ),
+        )
         for a in assets:
-            writer.writerow([
-                a.name or "",
-                a.ip_address or "",
-                a.vendor or "",
-                a.protocol or "",
-                a.zone or "",
-                a.purdue_level or "",
-                a.criticality or "",
-                _asset_last_seen_iso(a),
-                open_alert_counts.get(a.id, 0),
-            ])
+            writer.writerow(
+                (
+                    a.name or "",
+                    a.ip_address or "",
+                    a.vendor or "",
+                    a.protocol or "",
+                    a.zone or "",
+                    a.purdue_level or "",
+                    a.criticality or "",
+                    _asset_last_seen_iso(a),
+                    open_alert_counts.get(a.id, 0),
+                ),
+            )
         buf.seek(0)
         filename = f"ot-security-report-{now.strftime('%Y%m%d-%H%M%S')}.csv"
         return StreamingResponse(
@@ -1116,8 +1206,7 @@ async def ot_security_export(
 
     purdue_map = {
         "levels": [
-            {"level": lvl, "devices": buckets[lvl], "device_count": len(buckets[lvl])}
-            for lvl in sorted(buckets.keys())
+            {"level": lvl, "devices": buckets[lvl], "device_count": len(buckets[lvl])} for lvl in sorted(buckets.keys())
         ],
         "total_devices": sum(len(v) for v in buckets.values()),
         "segmentation_complete": sum(1 for v in buckets.values() if v) >= 4,
@@ -1125,10 +1214,7 @@ async def ot_security_export(
 
     total_assets = len(assets)
     online_assets = sum(1 for a in assets if a.is_online)
-    active_alerts = sum(
-        1 for a in alerts
-        if a.status not in ("resolved", "contained", "false_positive")
-    )
+    active_alerts = sum(1 for a in alerts if a.status not in ("resolved", "contained", "false_positive"))
     critical_alerts = sum(1 for a in alerts if a.severity == "critical")
 
     report: Dict[str, Any] = {

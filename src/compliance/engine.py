@@ -5,36 +5,34 @@ Core compliance assessment, scoring, and reporting engine.
 Implements assessment logic, control mapping, and automated checks for all frameworks.
 """
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Any, Optional, Tuple
-from dataclasses import dataclass, asdict
-import logging
+from typing import Any, Dict, List, Optional
 
+from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_, func
 
-from src.core.logging import get_logger
-from src.core.config import settings
 from src.compliance.models import (
-    ComplianceFramework,
-    ComplianceControl,
     POAM,
-    ComplianceEvidence,
-    ComplianceAssessment,
-    CUIMarking,
     CISADirective,
+    ComplianceAssessment,
+    ComplianceControl,
+    ComplianceEvidence,
+    ComplianceFramework,
+    CUIMarking,
 )
+from src.core.logging import get_logger
 
 logger = get_logger(__name__)
 
 __all__ = [
+    "BuiltinFrameworks",
+    "CISAComplianceManager",
+    "CMMCManager",
     "ComplianceEngine",
+    "ControlCheckResult",
     "FedRAMPManager",
     "NISTManager",
-    "CMMCManager",
-    "CISAComplianceManager",
-    "BuiltinFrameworks",
-    "ControlCheckResult",
 ]
 
 
@@ -69,9 +67,9 @@ class ComplianceEngine:
         Returns:
             Assessment results with control status, score, and findings
         """
-        framework = (await self.db.execute(
-            select(ComplianceFramework).where(ComplianceFramework.id == framework_id)
-        )).scalar_one_or_none()
+        framework = (
+            await self.db.execute(select(ComplianceFramework).where(ComplianceFramework.id == framework_id))
+        ).scalar_one_or_none()
         if not framework:
             raise ValueError(f"Framework {framework_id} not found")
 
@@ -80,14 +78,12 @@ class ComplianceEngine:
             and_(
                 ComplianceControl.framework_id == framework_id,
                 ComplianceControl.organization_id == self.org_id,
-            )
+            ),
         )
         result = await self.db.execute(stmt)
         controls = result.scalars().all()
 
-        implemented = sum(
-            1 for c in controls if c.status in ["implemented", "partially_implemented"]
-        )
+        implemented = sum(1 for c in controls if c.status in ["implemented", "partially_implemented"])
         satisfied = sum(1 for c in controls if c.last_assessment_result == "satisfied")
 
         score = await self.calculate_compliance_score(framework_id)
@@ -130,7 +126,7 @@ class ComplianceEngine:
             and_(
                 ComplianceControl.framework_id == framework_id,
                 ComplianceControl.organization_id == self.org_id,
-            )
+            ),
         )
         result = await self.db.execute(stmt)
         controls = result.scalars().all()
@@ -172,7 +168,7 @@ class ComplianceEngine:
                 ComplianceControl.framework_id == framework_id,
                 ComplianceControl.organization_id == self.org_id,
                 ComplianceControl.status != "implemented",
-            )
+            ),
         )
         result = await self.db.execute(stmt)
         gaps = result.scalars().all()
@@ -198,7 +194,7 @@ class ComplianceEngine:
             key=lambda x: (
                 risk_order.get(x["risk_level"], 99),
                 priority_order.get(x["priority"], 99),
-            )
+            ),
         )
 
         return gap_list
@@ -212,9 +208,9 @@ class ComplianceEngine:
         The returned structure is the authoritative JSON SSP — a
         markdown rendering is produced by ``ssp_to_markdown(ssp_doc)``.
         """
-        framework = (await self.db.execute(
-            select(ComplianceFramework).where(ComplianceFramework.id == framework_id)
-        )).scalar_one_or_none()
+        framework = (
+            await self.db.execute(select(ComplianceFramework).where(ComplianceFramework.id == framework_id))
+        ).scalar_one_or_none()
         if not framework:
             raise ValueError(f"Framework {framework_id} not found")
 
@@ -224,16 +220,17 @@ class ComplianceEngine:
             # on every /ssp request.
             try:
                 from src.compliance.attester import ControlAutoAttester
+
                 attester = ControlAutoAttester(self.db, self.org_id)
                 await attester.attest_all(framework_id=framework_id)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning(f"SSP auto-attester failed: {exc}")
 
         stmt = select(ComplianceControl).where(
             and_(
                 ComplianceControl.framework_id == framework_id,
                 ComplianceControl.organization_id == self.org_id,
-            )
+            ),
         )
         result = await self.db.execute(stmt)
         controls = result.scalars().all()
@@ -256,7 +253,8 @@ class ComplianceEngine:
             "implementation_counts": counts,
             "compliance_score": (
                 (counts["implemented"] + 0.5 * counts["partially_implemented"]) / len(controls) * 100
-                if controls else 0.0
+                if controls
+                else 0.0
             ),
             "control_families": {},
         }
@@ -305,6 +303,248 @@ class ComplianceEngine:
 
         return ssp_doc
 
+    async def generate_poam_report(self, framework_id: str) -> Dict[str, Any]:
+        """
+        Generate POA&M (Plan of Action & Milestones) report.
+
+        Returns:
+            POA&M summary with open items, deadlines, and status
+        """
+        stmt = select(ComplianceControl).where(
+            and_(
+                ComplianceControl.framework_id == framework_id,
+                ComplianceControl.organization_id == self.org_id,
+            ),
+        )
+        result = await self.db.execute(stmt)
+        controls = result.scalars().all()
+        control_ids = [c.id for c in controls]
+
+        if not control_ids:
+            return {
+                "poams": [],
+                "summary": {
+                    "total": 0,
+                    "open": 0,
+                    "overdue": 0,
+                    "completed": 0,
+                },
+            }
+
+        stmt = select(POAM).where(
+            and_(
+                POAM.control_id_ref.in_(control_ids),
+                POAM.organization_id == self.org_id,
+            ),
+        )
+        result = await self.db.execute(stmt)
+        poams = result.scalars().all()
+
+        now = datetime.now(timezone.utc)
+        naive_now = now.replace(tzinfo=None)
+
+        def _is_overdue(poam: POAM) -> bool:
+            due = poam.scheduled_completion_date
+            if due is None or poam.status == "completed":
+                return False
+            if due.tzinfo is None:
+                return due < naive_now
+            return due < now
+
+        overdue = [p for p in poams if _is_overdue(p)]
+        open_items = [p for p in poams if p.status in ["open", "in_progress"]]
+
+        return {
+            "poams": [
+                {
+                    "id": str(p.id),
+                    "control_id": str(p.control_id_ref),
+                    "weakness_name": p.weakness_name,
+                    "risk_level": p.risk_level,
+                    "status": p.status,
+                    "scheduled_completion": (
+                        p.scheduled_completion_date.isoformat() if p.scheduled_completion_date else None
+                    ),
+                    "assigned_to": p.assigned_to or "unassigned",
+                }
+                for p in poams
+            ],
+            "summary": {
+                "total": len(poams),
+                "open": len(open_items),
+                "overdue": len(overdue),
+                "completed": len([p for p in poams if p.status == "completed"]),
+            },
+        }
+
+    async def cross_map_controls(self, source_framework_id: str, target_framework_id: str) -> Dict[str, Any]:
+        """
+        Map controls from one framework to another for gap analysis.
+
+        Example: map NIST 800-53 controls to CMMC or PCI-DSS.
+
+        Returns:
+            Control mapping with alignment percentages
+        """
+        source_stmt = select(ComplianceControl).where(
+            and_(
+                ComplianceControl.framework_id == source_framework_id,
+                ComplianceControl.organization_id == self.org_id,
+            ),
+        )
+        source_result = await self.db.execute(source_stmt)
+        source_controls = source_result.scalars().all()
+
+        target_framework = await self._get_framework(target_framework_id)
+        target_stmt = select(ComplianceControl).where(
+            and_(
+                ComplianceControl.framework_id == target_framework_id,
+                ComplianceControl.organization_id == self.org_id,
+            ),
+        )
+        target_result = await self.db.execute(target_stmt)
+        target_controls = target_result.scalars().all()
+
+        target_keys = {target_framework_id}
+        if target_framework:
+            target_keys.update(
+                key
+                for key in (
+                    str(target_framework.id),
+                    target_framework.short_name,
+                    target_framework.name,
+                    target_framework.authority,
+                )
+                if key
+            )
+        normalized_key_map = {key.lower(): key for key in target_keys}
+        target_ids = {control.control_id for control in target_controls}
+
+        mapping = {
+            "source_framework": source_framework_id,
+            "target_framework": target_framework_id,
+            "mapped_controls": [],
+            "unmapped_source_controls": [],
+            "coverage_percentage": 0.0,
+        }
+
+        mapped_count = 0
+        for source_control in source_controls:
+            related = source_control.related_controls or {}
+            target_refs: list[str] = []
+
+            if isinstance(related, dict):
+                for key, refs in related.items():
+                    if str(key).lower() in normalized_key_map:
+                        if isinstance(refs, list):
+                            target_refs.extend(str(ref) for ref in refs)
+                        elif refs:
+                            target_refs.append(str(refs))
+            elif isinstance(related, list):
+                target_refs.extend(str(ref) for ref in related)
+
+            target_refs = [ref for ref in target_refs if ref in target_ids]
+
+            if target_refs:
+                mapping["mapped_controls"].append(
+                    {
+                        "source_id": source_control.control_id,
+                        "target_ids": target_refs,
+                        "alignment": "direct",
+                    },
+                )
+                mapped_count += 1
+            else:
+                mapping["unmapped_source_controls"].append(source_control.control_id)
+
+        if source_controls:
+            mapping["coverage_percentage"] = round(
+                (mapped_count / len(source_controls)) * 100,
+                2,
+            )
+
+        return mapping
+
+    async def run_live_cloud_checks(self, cloud_provider: str, region: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Run live cloud compliance checks and update controls with results.
+
+        Args:
+            cloud_provider: "aws", "azure", or "gcp"
+            region: Cloud region (for AWS)
+
+        Returns:
+            Aggregated check results mapped to compliance controls
+        """
+        from src.compliance.cloud_checks import (
+            CloudCheckStatus,
+            CloudComplianceOrchestrator,
+        )
+
+        orchestrator = CloudComplianceOrchestrator(
+            aws_region=region if cloud_provider == "aws" else None,
+            azure_subscription_id=None if cloud_provider != "azure" else region,
+            gcp_project_id=None if cloud_provider != "gcp" else region,
+        )
+
+        check_results = await orchestrator.run_all_checks(provider=cloud_provider)
+        aggregated = await orchestrator.aggregate_results(check_results)
+
+        for control_id, result in check_results.items():
+            stmt = select(ComplianceControl).where(
+                and_(
+                    ComplianceControl.control_id == control_id,
+                    ComplianceControl.organization_id == self.org_id,
+                ),
+            )
+            result_set = await self.db.execute(stmt)
+            control = result_set.scalar_one_or_none()
+
+            if control:
+                if result.status == CloudCheckStatus.PASS:
+                    control.status = "implemented"
+                    control.last_assessment_result = "satisfied"
+                    control.implementation_status = 100.0
+                elif result.status == CloudCheckStatus.PARTIAL:
+                    control.status = "partially_implemented"
+                    control.last_assessment_result = "partially_satisfied"
+                    control.implementation_status = 50.0
+                else:
+                    control.status = "not_implemented"
+                    control.last_assessment_result = "unsatisfied"
+                    control.implementation_status = 0.0
+
+                control.last_assessed_at = datetime.now(timezone.utc)
+                self.db.add(control)
+
+        await self.db.commit()
+
+        return {
+            "provider": cloud_provider,
+            "region": region,
+            "checks_completed": len(check_results),
+            "aggregated_results": aggregated,
+            "check_details": {
+                k: {
+                    "status": v.status.value,
+                    "findings": v.findings,
+                    "evidence": v.evidence,
+                }
+                for k, v in check_results.items()
+            },
+        }
+
+    async def _get_framework(self, framework_id: str) -> Optional[ComplianceFramework]:
+        """Internal: Get framework by ID."""
+        stmt = select(ComplianceFramework).where(
+            and_(
+                ComplianceFramework.id == framework_id,
+                ComplianceFramework.organization_id == self.org_id,
+            ),
+        )
+        result = await self.db.execute(stmt)
+        return result.scalar_one_or_none()
+
 
 def ssp_to_markdown(ssp_doc: Dict[str, Any]) -> str:
     """Render an SSP JSON document as a FedRAMP-style markdown narrative.
@@ -322,7 +562,7 @@ def ssp_to_markdown(ssp_doc: Dict[str, Any]) -> str:
     push(f"**Framework version**: {ssp_doc.get('framework_version', 'n/a')}  ")
     push(f"**Authority**: {ssp_doc.get('framework_authority', 'n/a')}  ")
     push(f"**Generated**: {ssp_doc.get('generated_at', '')}  ")
-    push(f"**Generator**: PySOAR Control Auto-Attester")
+    push("**Generator**: PySOAR Control Auto-Attester")
     push("")
     push("---")
     push("")
@@ -337,7 +577,7 @@ def ssp_to_markdown(ssp_doc: Dict[str, Any]) -> str:
         "workers, PostgreSQL database, Redis cache, SIEM pipeline, and "
         "enrolled endpoint agents. External interfaces: authenticated REST "
         "API over TLS 1.2+, WebSocket updates, and outbound webhooks to "
-        "ITSM/notification providers."
+        "ITSM/notification providers.",
     )
     push("")
     push("## 2. Control Implementation Summary")
@@ -389,7 +629,7 @@ def ssp_to_markdown(ssp_doc: Dict[str, Any]) -> str:
                     "_No implementation narrative recorded. This control is "
                     "tracked as " + status + " in the compliance register. A "
                     "POAM must be opened if this control is required by the "
-                    "baseline._"
+                    "baseline._",
                 )
             push("")
         push("---")
@@ -400,218 +640,9 @@ def ssp_to_markdown(ssp_doc: Dict[str, Any]) -> str:
         "which inspects live platform state (code paths, database rows, "
         "middleware registrations, scan results) to populate each "
         "control's implementation narrative. Claims marked 'implemented' "
-        "are evidence-backed and verifiable by a 3PAO auditor.*"
+        "are evidence-backed and verifiable by a 3PAO auditor.*",
     )
     return "\n".join(lines)
-
-    async def generate_poam_report(self, framework_id: str) -> Dict[str, Any]:
-        """
-        Generate POA&M (Plan of Action & Milestones) report.
-
-        Returns:
-            POA&M summary with open items, deadlines, and status
-        """
-        # Get framework-related controls
-        stmt = select(ComplianceControl).where(
-            and_(
-                ComplianceControl.framework_id == framework_id,
-                ComplianceControl.organization_id == self.org_id,
-            )
-        )
-        result = await self.db.execute(stmt)
-        controls = result.scalars().all()
-        control_ids = [c.id for c in controls]
-
-        if not control_ids:
-            return {"poams": [], "summary": {}}
-
-        # Get POA&Ms
-        stmt = select(POAM).where(
-            and_(
-                POAM.control_id_ref.in_(control_ids),
-                POAM.organization_id == self.org_id,
-            )
-        )
-        result = await self.db.execute(stmt)
-        poams = result.scalars().all()
-
-        now = datetime.now(timezone.utc)
-        overdue = [p for p in poams if p.scheduled_completion_date < now and p.status != "completed"]
-        open_items = [p for p in poams if p.status in ["open", "in_progress"]]
-
-        poam_report = {
-            "poams": [
-                {
-                    "id": str(p.id),
-                    "weakness_name": p.weakness_name,
-                    "risk_level": p.risk_level,
-                    "status": p.status,
-                    "scheduled_completion": p.scheduled_completion_date.isoformat(),
-                    "assigned_to": p.assigned_to or "unassigned",
-                }
-                for p in poams
-            ],
-            "summary": {
-                "total": len(poams),
-                "open": len(open_items),
-                "overdue": len(overdue),
-                "completed": len([p for p in poams if p.status == "completed"]),
-            },
-        }
-
-        return poam_report
-
-    async def cross_map_controls(
-        self, source_framework_id: str, target_framework_id: str
-    ) -> Dict[str, Any]:
-        """
-        Map controls from one framework to another for gap analysis.
-
-        Example: Map NIST 800-53 controls to CMMC or PCI-DSS
-
-        Returns:
-            Control mapping with alignment percentages
-        """
-        source_stmt = select(ComplianceControl).where(
-            and_(
-                ComplianceControl.framework_id == source_framework_id,
-                ComplianceControl.organization_id == self.org_id,
-            )
-        )
-        source_result = await self.db.execute(source_stmt)
-        source_controls = source_result.scalars().all()
-
-        target_stmt = select(ComplianceControl).where(
-            and_(
-                ComplianceControl.framework_id == target_framework_id,
-                ComplianceControl.organization_id == self.org_id,
-            )
-        )
-        target_result = await self.db.execute(target_stmt)
-        target_controls = target_result.scalars().all()
-
-        mapping = {
-            "source_framework": source_framework_id,
-            "target_framework": target_framework_id,
-            "mapped_controls": [],
-            "unmapped_source_controls": [],
-            "coverage_percentage": 0.0,
-        }
-
-        # Build mapping based on control relationships
-        source_ids = {c.control_id: c for c in source_controls}
-        target_ids = {c.control_id: c for c in target_controls}
-
-        mapped_count = 0
-        for source_control in source_controls:
-            # Use related_controls field if available
-            related = source_control.related_controls or {}
-            target_refs = related.get(target_framework_id, [])
-
-            if target_refs:
-                mapping["mapped_controls"].append(
-                    {
-                        "source_id": source_control.control_id,
-                        "target_ids": target_refs,
-                        "alignment": "direct",
-                    }
-                )
-                mapped_count += 1
-            else:
-                mapping["unmapped_source_controls"].append(source_control.control_id)
-
-        if source_controls:
-            mapping["coverage_percentage"] = (mapped_count / len(source_controls)) * 100
-
-        return mapping
-
-    async def run_live_cloud_checks(
-        self, cloud_provider: str, region: Optional[str] = None
-    ) -> Dict[str, Any]:
-        """
-        Run live cloud compliance checks and update controls with results.
-
-        Args:
-            cloud_provider: "aws", "azure", or "gcp"
-            region: Cloud region (for AWS)
-
-        Returns:
-            Aggregated check results mapped to compliance controls
-        """
-        from src.compliance.cloud_checks import (
-            CloudComplianceOrchestrator,
-            CloudCheckStatus,
-        )
-
-        # Initialize orchestrator
-        orchestrator = CloudComplianceOrchestrator(
-            aws_region=region if cloud_provider == "aws" else None,
-            azure_subscription_id=None if cloud_provider != "azure" else region,
-            gcp_project_id=None if cloud_provider != "gcp" else region,
-        )
-
-        # Run checks for specified provider
-        check_results = await orchestrator.run_all_checks(provider=cloud_provider)
-
-        # Aggregate results
-        aggregated = await orchestrator.aggregate_results(check_results)
-
-        # Update compliance controls with results
-        for control_id, result in check_results.items():
-            stmt = select(ComplianceControl).where(
-                and_(
-                    ComplianceControl.control_id == control_id,
-                    ComplianceControl.organization_id == self.org_id,
-                )
-            )
-            result_set = await self.db.execute(stmt)
-            control = result_set.scalar_one_or_none()
-
-            if control:
-                # Map cloud check status to compliance status
-                if result.status == CloudCheckStatus.PASS:
-                    control.status = "implemented"
-                    control.last_assessment_result = "satisfied"
-                    control.implementation_status = 100.0
-                elif result.status == CloudCheckStatus.PARTIAL:
-                    control.status = "partially_implemented"
-                    control.last_assessment_result = "partially_satisfied"
-                    control.implementation_status = 50.0
-                else:
-                    control.status = "not_implemented"
-                    control.last_assessment_result = "unsatisfied"
-                    control.implementation_status = 0.0
-
-                control.last_assessment_date = datetime.now(timezone.utc)
-                self.db.add(control)
-
-        await self.db.commit()
-
-        return {
-            "provider": cloud_provider,
-            "region": region,
-            "checks_completed": len(check_results),
-            "aggregated_results": aggregated,
-            "check_details": {
-                k: {
-                    "status": v.status.value,
-                    "findings": v.findings,
-                    "evidence": v.evidence,
-                }
-                for k, v in check_results.items()
-            },
-        }
-
-    async def _get_framework(self, framework_id: str) -> Optional[ComplianceFramework]:
-        """Internal: Get framework by ID"""
-        stmt = select(ComplianceFramework).where(
-            and_(
-                ComplianceFramework.id == framework_id,
-                ComplianceFramework.organization_id == self.org_id,
-            )
-        )
-        result = await self.db.execute(stmt)
-        return result.scalar_one_or_none()
 
 
 class FedRAMPManager:
@@ -643,7 +674,7 @@ class FedRAMPManager:
                 ComplianceFramework.short_name == "fedramp",
                 ComplianceFramework.certification_level.ilike(f"%{baseline}%"),
                 ComplianceFramework.organization_id == self.org_id,
-            )
+            ),
         )
         result = await self.db.execute(stmt)
         framework = result.scalar_one_or_none()
@@ -669,7 +700,7 @@ class FedRAMPManager:
                 ComplianceFramework.short_name == "fedramp",
                 ComplianceFramework.certification_level.ilike(f"%{baseline}%"),
                 ComplianceFramework.organization_id == self.org_id,
-            )
+            ),
         )
         result = await self.db.execute(stmt)
         framework = result.scalar_one_or_none()
@@ -694,7 +725,7 @@ class FedRAMPManager:
             and_(
                 ComplianceFramework.short_name == "fedramp",
                 ComplianceFramework.organization_id == self.org_id,
-            )
+            ),
         )
         result = await self.db.execute(stmt)
         frameworks = result.scalars().all()
@@ -723,7 +754,7 @@ class FedRAMPManager:
                 ComplianceFramework.short_name == "fedramp",
                 ComplianceFramework.certification_level.ilike(f"%{baseline}%"),
                 ComplianceFramework.organization_id == self.org_id,
-            )
+            ),
         )
         result = await self.db.execute(stmt)
         framework = result.scalar_one_or_none()
@@ -736,7 +767,7 @@ class FedRAMPManager:
                 ComplianceControl.framework_id == framework.id,
                 ComplianceControl.organization_id == self.org_id,
                 ComplianceControl.automated_check_id.isnot(None),
-            )
+            ),
         )
         result = await self.db.execute(stmt)
         automatable_controls = result.scalars().all()
@@ -762,9 +793,7 @@ class FedRAMPManager:
             "high": {"total_controls": 420, "families": 17},
         }
 
-    async def _run_automated_control_check(
-        self, control: ComplianceControl
-    ) -> Dict[str, Any]:
+    async def _run_automated_control_check(self, control: ComplianceControl) -> Dict[str, Any]:
         """Internal: Run automated check for a control.
 
         Evidence query is org-scoped so a tenant can't inherit
@@ -781,7 +810,7 @@ class FedRAMPManager:
                 ComplianceEvidence.control_id_ref == str(control.id),
                 ComplianceEvidence.collected_at >= evidence_cutoff,
                 ComplianceEvidence.organization_id == self.org_id,
-            )
+            ),
         )
         result = await self.db.execute(stmt)
         recent_evidence = result.scalars().all()
@@ -799,9 +828,9 @@ class FedRAMPManager:
             "evidence_count": len(recent_evidence),
             "implementation_status": control.implementation_status,
             "reason": (
-                "passed" if check_passed
-                else "no_recent_evidence" if not has_recent_evidence
-                else "implementation_incomplete"
+                "passed"
+                if check_passed
+                else "no_recent_evidence" if not has_recent_evidence else "implementation_incomplete"
             ),
         }
 
@@ -858,7 +887,7 @@ class NISTManager:
                 ComplianceControl.framework_id == framework_id,
                 ComplianceControl.control_family == family,
                 ComplianceControl.organization_id == self.org_id,
-            )
+            ),
         )
         result = await self.db.execute(stmt)
         controls = result.scalars().all()
@@ -871,9 +900,7 @@ class NISTManager:
             "total_controls": len(controls),
             "implemented": implemented,
             "satisfied": satisfied,
-            "completion_percentage": (
-                (implemented / len(controls) * 100) if controls else 0
-            ),
+            "completion_percentage": ((implemented / len(controls) * 100) if controls else 0),
         }
 
     async def automated_control_check(self, control_id: str) -> Dict[str, Any]:
@@ -885,9 +912,7 @@ class NISTManager:
         Returns:
             Automated check result
         """
-        stmt = select(ComplianceControl).where(
-            ComplianceControl.control_id == control_id
-        )
+        stmt = select(ComplianceControl).where(ComplianceControl.control_id == control_id)
         result = await self.db.execute(stmt)
         control = result.scalar_one_or_none()
 
@@ -931,20 +956,19 @@ class NISTManager:
     async def _check_account_management(self) -> Dict[str, Any]:
         """AC-2: Account management — inactive accounts, orphaned users (tenant-scoped)."""
         from sqlalchemy import func as _func
+
         from src.models.user import User
 
         findings: list[str] = []
-        total_q = await self.db.execute(
-            select(_func.count(User.id)).where(User.organization_id == self.org_id)
-        )
+        total_q = await self.db.execute(select(_func.count(User.id)).where(User.organization_id == self.org_id))
         total = total_q.scalar() or 0
         inactive_q = await self.db.execute(
             select(_func.count(User.id)).where(
                 and_(
                     User.organization_id == self.org_id,
                     User.is_active == False,  # noqa: E712
-                )
-            )
+                ),
+            ),
         )
         inactive = inactive_q.scalar() or 0
 
@@ -956,7 +980,7 @@ class NISTManager:
         if total > 0 and inactive / max(total, 1) > 0.5:
             findings.append(
                 f"{inactive}/{total} users are inactive ({(inactive/total)*100:.0f}%). "
-                "Review for accounts that should be disabled or deleted."
+                "Review for accounts that should be disabled or deleted.",
             )
 
         return {
@@ -970,44 +994,48 @@ class NISTManager:
 
     async def _check_failed_login_attempts(self) -> Dict[str, Any]:
         """AC-7: Unsuccessful login attempts — look at recent failed auth in audit trail."""
+        from importlib import import_module
+
         from sqlalchemy import func as _func
+
         try:
-            from src.models.audit_log import AuditLog as _AuditLog
-        except Exception:  # noqa: BLE001
-            _AuditLog = None
+            audit_log_model = import_module("src.models.audit_log").AuditLog
+        except Exception:
+            audit_log_model = None
 
         findings: list[str] = []
         failed_logins_7d = 0
-        if _AuditLog is not None:
+        if audit_log_model is not None:
             cutoff = datetime.now(timezone.utc) - timedelta(days=7)
             # AuditLog is typically scoped via users.organization_id through
             # the user_id FK. Scope by subquery to avoid leaking login
             # failures across tenants.
-            from src.models.user import User as _User
+            user_model = import_module("src.models.user").User
+
             try:
-                org_user_ids = select(_User.id).where(_User.organization_id == self.org_id)
+                org_user_ids = select(user_model.id).where(user_model.organization_id == self.org_id)
                 q = await self.db.execute(
-                    select(_func.count(_AuditLog.id)).where(
+                    select(_func.count(audit_log_model.id)).where(
                         and_(
-                            _AuditLog.action == "login_failed",
-                            _AuditLog.created_at >= cutoff,
-                            _AuditLog.user_id.in_(org_user_ids),
-                        )
-                    )
+                            audit_log_model.action == "login_failed",
+                            audit_log_model.created_at >= cutoff,
+                            audit_log_model.user_id.in_(org_user_ids),
+                        ),
+                    ),
                 )
                 failed_logins_7d = q.scalar() or 0
-            except Exception:  # noqa: BLE001
+            except Exception:
                 failed_logins_7d = -1  # table exists but column mismatch — record unknown
 
         if failed_logins_7d == -1:
             findings.append(
                 "Audit log schema did not expose a ``login_failed`` action; "
-                "AC-7 cannot be assessed automatically. Verify audit middleware records login failures."
+                "AC-7 cannot be assessed automatically. Verify audit middleware records login failures.",
             )
         elif failed_logins_7d > 100:
             findings.append(
                 f"{failed_logins_7d} failed login attempts in last 7 days — "
-                "possible brute-force attempts; verify lockout policy is enforced."
+                "possible brute-force attempts; verify lockout policy is enforced.",
             )
 
         return {
@@ -1021,37 +1049,39 @@ class NISTManager:
 
     async def _check_audit_events(self) -> Dict[str, Any]:
         """AU-2: Audit events — audit log is populated and actively recording."""
+        from importlib import import_module
+
         from sqlalchemy import func as _func
+
         try:
-            from src.models.audit_log import AuditLog as _AuditLog
-        except Exception:  # noqa: BLE001
-            _AuditLog = None
+            audit_log_model = import_module("src.models.audit_log").AuditLog
+        except Exception:
+            audit_log_model = None
 
         findings: list[str] = []
         count_24h = 0
-        if _AuditLog is not None:
-            from src.models.user import User as _User
+        if audit_log_model is not None:
+            user_model = import_module("src.models.user").User
+
             cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
             try:
-                org_user_ids = select(_User.id).where(_User.organization_id == self.org_id)
+                org_user_ids = select(user_model.id).where(user_model.organization_id == self.org_id)
                 q = await self.db.execute(
-                    select(_func.count(_AuditLog.id)).where(
+                    select(_func.count(audit_log_model.id)).where(
                         and_(
-                            _AuditLog.created_at >= cutoff,
-                            _AuditLog.user_id.in_(org_user_ids),
-                        )
-                    )
+                            audit_log_model.created_at >= cutoff,
+                            audit_log_model.user_id.in_(org_user_ids),
+                        ),
+                    ),
                 )
                 count_24h = q.scalar() or 0
-            except Exception:  # noqa: BLE001
-                pass
+            except Exception as exc:
+                self.logger.debug("audit event count check failed", error=str(exc))
 
-        if _AuditLog is None:
+        if audit_log_model is None:
             findings.append("No audit_log model found — AU-2 cannot be satisfied.")
         elif count_24h == 0:
-            findings.append(
-                "Zero audit events recorded in last 24h. Audit middleware may be disabled."
-            )
+            findings.append("Zero audit events recorded in last 24h. Audit middleware may be disabled.")
 
         return {
             "control_id": "AU-2",
@@ -1065,6 +1095,7 @@ class NISTManager:
     async def _check_mfa(self) -> Dict[str, Any]:
         """IA-2: MFA — every active user should have mfa_enabled=True."""
         from sqlalchemy import func as _func
+
         from src.models.user import User
 
         findings: list[str] = []
@@ -1073,8 +1104,8 @@ class NISTManager:
                 and_(
                     User.organization_id == self.org_id,
                     User.is_active == True,  # noqa: E712
-                )
-            )
+                ),
+            ),
         )
         active_total = active_q.scalar() or 0
 
@@ -1084,8 +1115,8 @@ class NISTManager:
                     User.organization_id == self.org_id,
                     User.is_active == True,  # noqa: E712
                     User.mfa_enabled == True,  # noqa: E712
-                )
-            )
+                ),
+            ),
         )
         mfa_enrolled = mfa_q.scalar() or 0
 
@@ -1096,7 +1127,7 @@ class NISTManager:
             findings.append(
                 f"{missing}/{active_total} active users do not have MFA enabled. "
                 "FedRAMP Moderate and NIST 800-171 both require MFA for all privileged "
-                "and non-local access."
+                "and non-local access.",
             )
 
         return {
@@ -1121,9 +1152,7 @@ class NISTManager:
         # NIST SP 800-63B minimum for memorized secrets is 8; FedRAMP
         # Moderate typically requires 12 for privileged accounts. We use 12.
         if min_length < 12:
-            findings.append(
-                f"password_min_length is {min_length}; FedRAMP Moderate expects ≥12 characters."
-            )
+            findings.append(f"password_min_length is {min_length}; FedRAMP Moderate expects ≥12 characters.")
 
         return {
             "control_id": "IA-5",
@@ -1142,30 +1171,27 @@ class NISTManager:
         scans_30d = 0
         open_vulns = 0
         try:
-            from src.vulnmgmt.models import VulnScan, Vulnerability
+            from src.vulnmgmt.models import Vulnerability, VulnScan
+
             cutoff = datetime.now(timezone.utc) - timedelta(days=30)
             scans_q = await self.db.execute(
                 select(_func.count(VulnScan.id)).where(
                     and_(
                         VulnScan.organization_id == self.org_id,
                         VulnScan.created_at >= cutoff,
-                    )
-                )
+                    ),
+                ),
             )
             scans_30d = scans_q.scalar() or 0
             vulns_q = await self.db.execute(
-                select(_func.count(Vulnerability.id)).where(
-                    Vulnerability.organization_id == self.org_id
-                )
+                select(_func.count(Vulnerability.id)).where(Vulnerability.organization_id == self.org_id),
             )
             open_vulns = vulns_q.scalar() or 0
-        except Exception:  # noqa: BLE001
+        except Exception:
             findings.append("Vulnerability management module not reachable — RA-5 cannot be verified.")
 
         if scans_30d == 0:
-            findings.append(
-                "No vulnerability scans recorded in last 30 days. RA-5 requires at least monthly scanning."
-            )
+            findings.append("No vulnerability scans recorded in last 30 days. RA-5 requires at least monthly scanning.")
 
         return {
             "control_id": "RA-5",
@@ -1184,19 +1210,18 @@ class NISTManager:
         zt_policy_count = 0
         try:
             from src.zerotrust.models import ZeroTrustPolicy
+
             q = await self.db.execute(
-                select(_func.count(ZeroTrustPolicy.id)).where(
-                    ZeroTrustPolicy.organization_id == self.org_id
-                )
+                select(_func.count(ZeroTrustPolicy.id)).where(ZeroTrustPolicy.organization_id == self.org_id),
             )
             zt_policy_count = q.scalar() or 0
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:
+            self.logger.debug("zero-trust policy count check failed", error=str(exc))
 
         if zt_policy_count == 0:
             findings.append(
                 "No zero-trust policies defined. SC-7 requires managed interfaces and "
-                "boundary enforcement between security zones."
+                "boundary enforcement between security zones.",
             )
 
         return {
@@ -1214,15 +1239,16 @@ class NISTManager:
         encryption_initialized = False
         try:
             from src.core.encryption import get_encryption_service
+
             svc = get_encryption_service()
             encryption_initialized = svc is not None
-        except Exception:  # noqa: BLE001
+        except Exception:
             encryption_initialized = False
 
         if not encryption_initialized:
             findings.append(
                 "Encryption service not initialized. SC-28 requires AES-256 (or equivalent) "
-                "encryption at rest for CUI and PII."
+                "encryption at rest for CUI and PII.",
             )
 
         return {
@@ -1242,23 +1268,24 @@ class NISTManager:
         patches_30d = 0
         try:
             from src.vulnmgmt.models import PatchOperation
+
             cutoff = datetime.now(timezone.utc) - timedelta(days=30)
             q = await self.db.execute(
                 select(_func.count(PatchOperation.id)).where(
                     and_(
                         PatchOperation.organization_id == self.org_id,
                         PatchOperation.created_at >= cutoff,
-                    )
-                )
+                    ),
+                ),
             )
             patches_30d = q.scalar() or 0
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:
+            self.logger.debug("patch operation count check failed", error=str(exc))
 
         if patches_30d == 0:
             findings.append(
                 "No patch operations recorded in last 30 days. SI-2 expects flaws to be "
-                "identified, reported, and corrected per a documented timeline."
+                "identified, reported, and corrected per a documented timeline.",
             )
 
         return {
@@ -1279,13 +1306,14 @@ class NISTManager:
         logs_24h = 0
         try:
             from src.siem.models import DetectionRule, LogEntry, RuleStatus
+
             rules_q = await self.db.execute(
                 select(_func.count(DetectionRule.id)).where(
                     and_(
                         DetectionRule.organization_id == self.org_id,
                         DetectionRule.status == RuleStatus.ACTIVE.value,
-                    )
-                )
+                    ),
+                ),
             )
             active_rules = rules_q.scalar() or 0
             cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
@@ -1294,21 +1322,17 @@ class NISTManager:
                     and_(
                         LogEntry.organization_id == self.org_id,
                         LogEntry.created_at >= cutoff,
-                    )
-                )
+                    ),
+                ),
             )
             logs_24h = logs_q.scalar() or 0
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as exc:
+            self.logger.debug("log ingestion count check failed", error=str(exc))
 
         if active_rules == 0:
-            findings.append(
-                "No active SIEM detection rules. SI-4 requires monitoring for unauthorized activity."
-            )
+            findings.append("No active SIEM detection rules. SI-4 requires monitoring for unauthorized activity.")
         if logs_24h == 0:
-            findings.append(
-                "Zero log entries ingested in last 24h — log pipeline may be broken."
-            )
+            findings.append("Zero log entries ingested in last 24h — log pipeline may be broken.")
 
         return {
             "control_id": "SI-4",
@@ -1350,15 +1374,17 @@ class CMMCManager:
             and_(
                 ComplianceFramework.short_name == "cmmc",
                 ComplianceFramework.organization_id == self.org_id,
-            )
+            ),
         )
         result = await self.db.execute(stmt)
         framework = result.scalar_one_or_none()
 
         if not framework:
-            return {"error": "CMMC framework not found"}
+            return {"error": f"CMMC level {target_level} framework not found"}
 
-        return await self.engine.assess_framework(str(framework.id))
+        assessment = await self.engine.assess_framework(str(framework.id))
+        assessment["target_level"] = target_level
+        return assessment
 
     async def load_cmmc_practices(self) -> int:
         """
@@ -1381,7 +1407,7 @@ class CMMCManager:
             and_(
                 ComplianceFramework.short_name == "cmmc",
                 ComplianceFramework.organization_id == self.org_id,
-            )
+            ),
         )
         cmmc_result = await self.db.execute(stmt)
         cmmc_framework = cmmc_result.scalar_one_or_none()
@@ -1390,7 +1416,7 @@ class CMMCManager:
             and_(
                 ComplianceFramework.short_name == "nist_800_171",
                 ComplianceFramework.organization_id == self.org_id,
-            )
+            ),
         )
         nist_result = await self.db.execute(stmt)
         nist_framework = nist_result.scalar_one_or_none()
@@ -1398,9 +1424,7 @@ class CMMCManager:
         if not cmmc_framework or not nist_framework:
             return {"error": "Required frameworks not found"}
 
-        return await self.engine.cross_map_controls(
-            str(cmmc_framework.id), str(nist_framework.id)
-        )
+        return await self.engine.cross_map_controls(str(cmmc_framework.id), str(nist_framework.id))
 
     async def check_cui_handling(self) -> Dict[str, Any]:
         """
@@ -1419,7 +1443,7 @@ class CMMCManager:
         return {
             "total_cui_assets": total_cui,
             "active_cui_assets": active_cui,
-            "cui_categories": list(set(m.cui_category for m in cui_markings)),
+            "cui_categories": list({m.cui_category for m in cui_markings}),
             "compliance_status": "compliant" if active_cui == total_cui else "review_required",
         }
 
@@ -1463,7 +1487,7 @@ class CISAComplianceManager:
             and_(
                 CISADirective.status == "active",
                 CISADirective.organization_id == self.org_id,
-            )
+            ),
         )
         result = await self.db.execute(stmt)
         directives = result.scalars().all()
@@ -1483,7 +1507,7 @@ class CISAComplianceManager:
             and_(
                 CISADirective.directive_id == directive_id,
                 CISADirective.organization_id == self.org_id,
-            )
+            ),
         )
         result = await self.db.execute(stmt)
         directive = result.scalar_one_or_none()
@@ -1526,7 +1550,7 @@ class CISAComplianceManager:
             and_(
                 CISADirective.directive_id == directive_id,
                 CISADirective.organization_id == self.org_id,
-            )
+            ),
         )
         result = await self.db.execute(stmt)
         directive = result.scalar_one_or_none()
