@@ -1191,6 +1191,67 @@ class AutomationService:
 
         return stored_ids
 
+    def _incident_artifacts_from_alert(self, alert: Alert) -> dict[str, list[str]]:
+        """Pull the containment-relevant artifacts off an alert.
+
+        An auto-created incident must inherit *what to act on* from its
+        source alert, otherwise downstream remediation (the Agentic SOC's
+        ``remediate_incident``, ``_queue_incident_containment``, policy
+        engines) has nothing to isolate or block and silently no-ops.
+
+        Returns three lists:
+          * ``affected_systems`` — internal hostnames to isolate.
+          * ``affected_users``   — accounts to scope / disable.
+          * ``indicators``       — *external* IOCs to block. Private/
+            reserved IPs are excluded: the internal host is contained by
+            hostname, not by blocking its RFC1918 address at the firewall.
+
+        Both structured alert columns (source_ip, hostname, …) and any
+        IOCs harvested from free text are considered, so an alert whose
+        only signal is in its title still yields actionable artifacts.
+        """
+        hosts: list[str] = []
+        users: list[str] = []
+        indicators: list[str] = []
+
+        def _add(seq: list[str], val) -> None:
+            if not val:
+                return
+            v = str(val).strip()
+            if v and v not in seq:
+                seq.append(v)
+
+        # Structured columns the source pipeline already classified.
+        _add(hosts, getattr(alert, "hostname", None))
+        _add(users, getattr(alert, "username", None))
+
+        for ip in (getattr(alert, "source_ip", None), getattr(alert, "destination_ip", None)):
+            if not ip:
+                continue
+            ip = str(ip).strip()
+            if ip and not self._is_private_or_reserved_ipv4(ip):
+                _add(indicators, ip)
+
+        _add(indicators, getattr(alert, "domain", None))
+        _add(indicators, getattr(alert, "url", None))
+        fh = getattr(alert, "file_hash", None)
+        if fh:
+            fh = str(fh).strip()
+            if len(fh) in (32, 40, 64) and re.fullmatch(r"[a-fA-F0-9]+", fh):
+                _add(indicators, fh)
+
+        # Free-text harvest — only public IPs, to catch cases where the
+        # signal lives in the title/description rather than a typed column.
+        text_blob = "\n".join(
+            str(getattr(alert, f, "") or "") for f in ("title", "description")
+        )
+        if text_blob:
+            for m in self._IOC_IPV4_RE.findall(text_blob):
+                if not self._is_private_or_reserved_ipv4(m):
+                    _add(indicators, m)
+
+        return {"affected_systems": hosts, "affected_users": users, "indicators": indicators}
+
     async def _auto_create_incident(
         self, alert: Alert, org_id: Optional[str], created_by: Optional[str]
     ) -> Optional[Incident]:
@@ -1222,12 +1283,21 @@ class AutomationService:
         if not should_create:
             return None
 
+        # Inherit containment artifacts from the source alert so the
+        # incident is actionable the moment it's created — otherwise
+        # remediate_incident / containment has nothing to isolate or block.
+        artifacts = self._incident_artifacts_from_alert(alert)
+
         incident = Incident(
             title=f"[Auto] {alert.title}",
             description=f"Auto-created from alert: {alert.title}. {getattr(alert, 'description', '') or ''}",
             severity=severity,
             status="open",
             incident_type=category or "other",
+            organization_id=org_id,
+            affected_systems=json.dumps(artifacts["affected_systems"]) if artifacts["affected_systems"] else None,
+            affected_users=json.dumps(artifacts["affected_users"]) if artifacts["affected_users"] else None,
+            indicators=json.dumps(artifacts["indicators"]) if artifacts["indicators"] else None,
         )
         self.db.add(incident)
         await self.db.flush()
