@@ -201,6 +201,43 @@ class AgentToolRegistry:
             category="query",
             handler=self._get_playbook,
         ))
+        # --- Incident response (NIST 800-61 lifecycle: triage -> contain
+        #     -> eradicate -> recover -> close). State-changing; gated.
+        self._register(Tool(
+            name="update_incident_status",
+            description="Advance an incident through its lifecycle: open -> investigating -> containment -> eradication -> recovery -> closed. Records the transition on the incident timeline.",
+            parameters={"incident_id": "string", "status": "open|investigating|containment|eradication|recovery|closed", "note": "optional string - reason for the transition"},
+            category="action",
+            handler=self._update_incident_status,
+        ))
+        self._register(Tool(
+            name="assign_incident",
+            description="Assign an incident to an analyst (by email) or to yourself ('me'). Use to take ownership before working it.",
+            parameters={"incident_id": "string", "assignee": "string - user email, user id, or 'me'"},
+            category="action",
+            handler=self._assign_incident,
+        ))
+        self._register(Tool(
+            name="add_incident_note",
+            description="Append an investigation note to an incident's record (documentation / handoff).",
+            parameters={"incident_id": "string", "note": "string - the note content"},
+            category="action",
+            handler=self._add_incident_note,
+        ))
+        self._register(Tool(
+            name="update_incident_findings",
+            description="Document the post-incident findings on an incident: root cause, resolution, lessons learned, recommendations.",
+            parameters={"incident_id": "string", "root_cause": "optional string", "resolution": "optional string", "lessons_learned": "optional string", "recommendations": "optional string"},
+            category="action",
+            handler=self._update_incident_findings,
+        ))
+        self._register(Tool(
+            name="remediate_incident",
+            description="Orchestrate NIST containment for an incident: isolate its affected hosts and block its indicator IPs (real actions via the remediation path), then advance the incident to 'containment'. Host isolation / IP blocks are recorded as remediation activity. Use after triage to actually contain the threat.",
+            parameters={"incident_id": "string", "isolate_hosts": "optional bool, default true", "block_indicators": "optional bool, default true"},
+            category="action",
+            handler=self._remediate_incident,
+        ))
         self._register(Tool(
             name="lookup_attack_technique",
             description="Look up a MITRE ATT&CK technique by id (e.g. T1110 or T1110.001). Returns authoritative name, tactics, detection guidance, data sources, mitigations, threat groups, and software that use it.",
@@ -475,8 +512,8 @@ class AgentToolRegistry:
         # ===== ASSETS =====
         self._register(Tool(
             name="list_assets",
-            description="List inventoried assets (hosts, endpoints, cloud resources)",
-            parameters={"asset_type": "optional string", "status": "optional string", "keyword": "optional string", "limit": "optional int, default 20"},
+            description="List inventoried assets (hosts, endpoints, cloud resources). Filter by criticality (critical/high/medium/low) to find the most important/exposed assets, or by status/type/keyword.",
+            parameters={"criticality": "optional string (critical/high/medium/low) — business importance", "asset_type": "optional string", "status": "optional string", "keyword": "optional string", "limit": "optional int, default 20"},
             category="query",
             handler=self._list_assets,
         ))
@@ -730,6 +767,156 @@ class AgentToolRegistry:
             "id": i.id, "title": i.title, "description": getattr(i, "description", None),
             "severity": i.severity, "status": i.status, "incident_type": getattr(i, "incident_type", None),
             "created_at": i.created_at.isoformat() if i.created_at else None,
+        }
+
+    # ---- Incident response handlers (NIST 800-61 lifecycle) ----
+
+    async def _incident_or_error(self, incident_id):
+        from src.models.incident import Incident
+        inc = (await self.db.execute(select(Incident).where(Incident.id == incident_id))).scalar_one_or_none()
+        return inc
+
+    async def _add_timeline(self, incident, event_type, title, description=None, old_value=None, new_value=None):
+        from src.models.case import CaseTimeline
+        self.db.add(CaseTimeline(
+            incident_id=incident.id, event_type=event_type, title=title,
+            description=description, old_value=old_value, new_value=new_value,
+        ))
+
+    async def _update_incident_status(self, incident_id, status, note=None):
+        from src.models.incident import IncidentStatus
+        inc = await self._incident_or_error(incident_id)
+        if not inc:
+            return {"error": "Incident not found"}
+        valid = {s.value for s in IncidentStatus}
+        new = str(status).lower().strip()
+        if new not in valid:
+            return {"error": f"'{status}' is not a valid status. Valid: {sorted(valid)}"}
+        old = inc.status
+        inc.status = new
+        await self._add_timeline(
+            inc, "status_change", f"Status: {old} -> {new}",
+            description=note, old_value=old, new_value=new,
+        )
+        await self.db.commit()
+        return {"incident_id": inc.id, "old_status": old, "new_status": new, "note": note}
+
+    async def _assign_incident(self, incident_id, assignee):
+        from src.models.user import User
+        inc = await self._incident_or_error(incident_id)
+        if not inc:
+            return {"error": "Incident not found"}
+        ref = str(assignee).strip()
+        user = None
+        if ref.lower() == "me":
+            # No caller identity in this context; assign by the sole
+            # superuser fallback so 'me' still resolves to a real user.
+            user = (await self.db.execute(
+                select(User).where(User.is_superuser == True)  # noqa: E712
+            )).scalars().first()
+        elif "@" in ref:
+            user = (await self.db.execute(select(User).where(User.email == ref))).scalar_one_or_none()
+        else:
+            user = (await self.db.execute(select(User).where(User.id == ref))).scalar_one_or_none()
+        if not user:
+            return {"error": f"Could not resolve assignee '{assignee}' to a user"}
+        inc.assigned_to = user.id
+        await self._add_timeline(inc, "assignment", f"Assigned to {user.email}", new_value=user.email)
+        await self.db.commit()
+        return {"incident_id": inc.id, "assigned_to": user.email}
+
+    async def _add_incident_note(self, incident_id, note):
+        from src.models.case import CaseNote
+        inc = await self._incident_or_error(incident_id)
+        if not inc:
+            return {"error": "Incident not found"}
+        author = await self._get_or_create_system_user(inc.organization_id)
+        n = CaseNote(incident_id=inc.id, content=str(note), note_type="investigation",
+                     is_internal=True, author_id=author.id)
+        self.db.add(n)
+        await self._add_timeline(inc, "note", "Investigation note added")
+        await self.db.commit()
+        return {"incident_id": inc.id, "note_id": n.id, "status": "added"}
+
+    async def _update_incident_findings(self, incident_id, root_cause=None, resolution=None,
+                                        lessons_learned=None, recommendations=None):
+        inc = await self._incident_or_error(incident_id)
+        if not inc:
+            return {"error": "Incident not found"}
+        updated = []
+        for field, val in (("root_cause", root_cause), ("resolution", resolution),
+                           ("lessons_learned", lessons_learned), ("recommendations", recommendations)):
+            if val:
+                setattr(inc, field, str(val))
+                updated.append(field)
+        if not updated:
+            return {"error": "No findings provided to update"}
+        await self._add_timeline(inc, "findings", f"Findings updated: {', '.join(updated)}")
+        await self.db.commit()
+        return {"incident_id": inc.id, "updated_fields": updated}
+
+    async def _remediate_incident(self, incident_id, isolate_hosts=True, block_indicators=True):
+        """NIST short-term containment: isolate affected hosts + block
+        indicator IPs via the real remediation handlers, then advance the
+        incident to 'containment'. Honest when there's nothing to act on."""
+        inc = await self._incident_or_error(incident_id)
+        if not inc:
+            return {"error": "Incident not found"}
+
+        def _parse(jsonish):
+            if not jsonish:
+                return []
+            try:
+                v = json.loads(jsonish) if isinstance(jsonish, str) else jsonish
+                return [str(x) for x in v] if isinstance(v, list) else ([str(v)] if v else [])
+            except (TypeError, json.JSONDecodeError):
+                return [s.strip() for s in str(jsonish).split(",") if s.strip()]
+
+        reason = f"Containment for incident {inc.id}: {inc.title}"
+        hosts_isolated, indicators_blocked = [], []
+
+        if isolate_hosts in (True, "true", "True", 1):
+            for host in _parse(inc.affected_systems):
+                res = await self._isolate_host(host, reason)
+                if res.get("status") == "isolated":
+                    hosts_isolated.append(host)
+
+        if block_indicators in (True, "true", "True", 1):
+            import re as _re
+            for ind in _parse(inc.indicators):
+                # only IPs are blockable via the firewall path
+                if _re.match(r"^\d{1,3}(\.\d{1,3}){3}$", ind):
+                    res = await self._block_ip(ind, reason)
+                    if res.get("status") == "blocked":
+                        indicators_blocked.append(ind)
+
+        acted = bool(hosts_isolated or indicators_blocked)
+        old = inc.status
+        if acted and inc.status in ("open", "investigating"):
+            inc.status = "containment"
+
+        if acted:
+            summary = (
+                f"Containment initiated: isolated {len(hosts_isolated)} host(s) "
+                f"{hosts_isolated}, blocked {len(indicators_blocked)} indicator IP(s) "
+                f"{indicators_blocked}. Incident moved {old} -> {inc.status}."
+            )
+        else:
+            summary = (
+                "No containable artifacts on this incident (no affected_systems "
+                "hosts and no indicator IPs). Triage it and document affected "
+                "systems first, or remediate manually."
+            )
+        await self._add_timeline(
+            inc, "remediation", "Containment actions executed", description=summary,
+        )
+        await self.db.commit()
+        return {
+            "incident_id": inc.id,
+            "hosts_isolated": hosts_isolated,
+            "indicators_blocked": indicators_blocked,
+            "new_status": inc.status,
+            "summary": summary,
         }
 
     async def _platform_stats(self):
@@ -1648,9 +1835,15 @@ class AgentToolRegistry:
 
     # ---- ASSETS ----
 
-    async def _list_assets(self, asset_type=None, status=None, keyword=None, limit=20):
+    async def _list_assets(self, criticality=None, asset_type=None, status=None, keyword=None, limit=20):
         from src.models.asset import Asset
-        q = select(Asset).order_by(Asset.created_at.desc())
+        # Order most-critical-first so "most exposed/important assets" is
+        # answerable. criticality is the business-importance field — distinct
+        # from status (active/isolated/...). 'critical' belongs here, NOT status.
+        _crit_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+        q = select(Asset)
+        if criticality:
+            q = q.where(Asset.criticality == str(criticality).lower())
         if asset_type:
             q = q.where(Asset.asset_type == asset_type)
         if status:
@@ -1659,11 +1852,12 @@ class AgentToolRegistry:
             pat = f"%{keyword}%"
             from sqlalchemy import or_
             q = q.where(or_(Asset.name.ilike(pat), Asset.hostname.ilike(pat), Asset.ip_address.ilike(pat)))
-        rows = (await self.db.execute(q.limit(int(limit)))).scalars().all()
+        rows = (await self.db.execute(q.limit(500))).scalars().all()
+        rows = sorted(rows, key=lambda a: (_crit_rank.get((a.criticality or "").lower(), 9),))[: int(limit)]
         return [{
             "id": a.id, "name": a.name, "hostname": a.hostname,
             "asset_type": a.asset_type, "status": a.status,
-            "ip_address": a.ip_address,
+            "criticality": a.criticality, "ip_address": a.ip_address,
         } for a in rows]
 
     async def _get_asset(self, asset_ref):
