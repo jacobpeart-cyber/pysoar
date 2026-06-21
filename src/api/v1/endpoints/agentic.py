@@ -942,11 +942,37 @@ async def chat_with_agent(
         )
         db.add(session)
         await db.flush()
+    # Load prior conversation turns BEFORE storing the current message, so
+    # multi-turn references ("them", "go ahead", "do it") resolve to what
+    # was discussed earlier (e.g. the incidents just listed). Without this
+    # the agent is amnesiac per-message and falls back to filler replies.
+    conversation_context = ""
+    if session is not None:
+        prior = (await db.execute(
+            select(AgentChatMessage)
+            .where(AgentChatMessage.session_id == session.id)
+            .order_by(AgentChatMessage.created_at.desc())
+            .limit(12)
+        )).scalars().all()
+        prior = list(reversed(prior))
+        if prior:
+            transcript = "\n".join(
+                f"{(m.role or 'user').upper()}: {(m.content or '')[:1500]}" for m in prior
+            )
+            conversation_context = (
+                "Conversation so far (most recent last) — use it to resolve "
+                "references like 'them', 'those', 'go ahead', 'do it':\n"
+                f"{transcript}\n\n"
+            )
+
     if session is not None:
         db.add(AgentChatMessage(
             session_id=session.id, role="user", content=query_data.query, tool_calls=None,
         ))
         await db.flush()
+
+    # Effective prompt the LLM sees = prior transcript + current request.
+    effective_query = f"{conversation_context}CURRENT REQUEST: {query_data.query}"
 
     tool_registry = AgentToolRegistry(db)
     tool_declarations = tool_registry.gemini_function_declarations()
@@ -993,13 +1019,13 @@ async def chat_with_agent(
         if step == 0:
             llm_result = analyzer.call_llm_with_tools(
                 system_prompt=system_prompt,
-                user_prompt=query_data.query,
+                user_prompt=effective_query,
                 tools=tool_declarations,
             )
         else:
             llm_result = analyzer.call_llm_with_tools_chain(
                 system_prompt=system_prompt,
-                user_prompt=query_data.query,
+                user_prompt=effective_query,
                 tools=tool_declarations,
                 history=history,
             )
