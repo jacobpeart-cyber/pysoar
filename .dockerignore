@@ -1,0 +1,43 @@
+# Keep the api image build context small. The root Dockerfile does
+# `COPY . .`, which without this dragged the entire repo — including
+# frontend/node_modules (~hundreds of MB) — into the api image,
+# filling the build host's disk mid-extraction. The api needs none of it.
+
+# Frontend (served by its own container/image)
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+
+# Python local env + caches
+venv/
+.venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# VCS + local state
+.git/
+.gitignore
+.claude/
+.remember/
+
+# Local databases / artifacts
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+backups/
+*.sql.gz
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Docs / tests are not needed in the runtime image
+docs/
+tests/
