@@ -73,6 +73,37 @@ from src.schemas.agentic import (
 router = APIRouter(prefix="/agentic", tags=["Agentic"])
 
 
+# NIST AC-3: state-changing / outward-facing tools require explicit caller
+# authorization (authorize_actions=True). Without it the chat agent is
+# read-only and these tools return blocked:true instead of executing.
+#
+# This is the single source of truth for the gate. The invariant
+# (enforced by tests/unit/test_destructive_tool_gate.py) is: EVERY tool the
+# registry registers under category="action" must be listed here, EXCEPT the
+# documentation-only tools in UNGATED_ACTION_TOOLS — an analyst should always
+# be able to record notes/findings. A new action tool that lands in neither
+# set fails the test, so the gate can't silently drift again.
+UNGATED_ACTION_TOOLS = frozenset({
+    # Pure documentation — append a note / record post-incident findings.
+    # No external effect, no irreversible state change.
+    "add_incident_note",
+    "update_incident_findings",
+})
+
+DESTRUCTIVE_TOOLS = frozenset({
+    "block_ip", "isolate_host", "disable_user", "execute_playbook",
+    "create_incident", "create_alert", "create_ioc", "create_war_room",
+    "create_remediation_ticket", "update_alert_status", "assign_alert",
+    "create_action_item", "create_forensic_case", "queue_endpoint_command",
+    # Fires connector-specific API actions on a third-party integration
+    # (EDR isolate, firewall block, notify, etc.) — outward-facing and
+    # state-changing, so it must require explicit authorization.
+    "execute_integration_action",
+    # Incident lifecycle / response (state-changing + containment actions).
+    "update_incident_status", "assign_incident", "remediate_incident",
+})
+
+
 # ============================================================================
 # Structured Threat Hunt (PY-HUNT-001)
 # ============================================================================
@@ -978,18 +1009,8 @@ async def chat_with_agent(
     tool_declarations = tool_registry.gemini_function_declarations()
     analyzer = AIAnalyzer()
 
-    # NIST AC-3: Destructive action tools require explicit caller authorization.
-    # Without `authorize_actions=True`, the agent is read-only.
-    DESTRUCTIVE_TOOLS = {
-        "block_ip", "isolate_host", "disable_user", "execute_playbook",
-        "create_incident", "create_alert", "create_ioc", "create_war_room",
-        "create_remediation_ticket", "update_alert_status", "assign_alert",
-        "create_action_item", "create_forensic_case", "queue_endpoint_command",
-        # Incident lifecycle / response (state-changing + containment actions).
-        # add_incident_note / update_incident_findings stay ungated — they're
-        # documentation, the analyst should always be able to record findings.
-        "update_incident_status", "assign_incident", "remediate_incident",
-    }
+    # Destructive/outward-facing tools require authorize_actions=True; the
+    # gate is the module-level DESTRUCTIVE_TOOLS (single source of truth).
 
     system_prompt = (
         "You are an autonomous SOC analyst for PySOAR with direct tool access to the security platform. "
