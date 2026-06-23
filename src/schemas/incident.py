@@ -1,10 +1,11 @@
 """Incident schemas for API request/response validation"""
 
+import json
 from datetime import datetime
 from typing import Any, Optional
 
 from src.schemas.base import DBModel
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class IncidentBase(BaseModel):
@@ -65,8 +66,10 @@ class IncidentResponse(IncidentBase, DBModel):
     resolution: Optional[str] = None
     lessons_learned: Optional[str] = None
     recommendations: Optional[str] = None
-    indicators: Optional[dict[str, Any]] = None
-    evidence: Optional[dict[str, Any]] = None
+    # indicators/evidence are stored as JSON in the column and may hold either
+    # a list (e.g. IOC values) or a dict (structured evidence), so accept both.
+    indicators: Optional[Any] = None
+    evidence: Optional[Any] = None
     tags: Optional[list[str]] = None
     mitre_tactics: Optional[list[str]] = None
     mitre_techniques: Optional[list[str]] = None
@@ -75,6 +78,29 @@ class IncidentResponse(IncidentBase, DBModel):
     ticket_url: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+
+    # The ORM persists these columns as JSON strings (Text). With
+    # from_attributes=True the raw string reaches the validator, so parse it
+    # back into a list/dict before field validation. Tolerant by design: an
+    # already-parsed value passes through and an unparseable string becomes
+    # None rather than 500-ing the incident list (this regressed once when
+    # affected_systems/indicators first started getting populated).
+    @field_validator(
+        "affected_systems", "affected_users", "tags",
+        "mitre_tactics", "mitre_techniques", "indicators", "evidence",
+        mode="before",
+    )
+    @classmethod
+    def _parse_json_column(cls, v):
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return None
+            try:
+                return json.loads(s)
+            except (ValueError, TypeError):
+                return None
+        return v
 
     class Config:
         from_attributes = True
