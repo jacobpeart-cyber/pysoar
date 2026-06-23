@@ -28,91 +28,39 @@ from src.container_security.models import (
 logger = get_logger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Known vulnerability catalog — checked against image repository+tag.
-# In production this would be fetched from NVD/OSV/Grype feeds; here we
-# maintain a curated set that grows as users add images.
-# ---------------------------------------------------------------------------
-_KNOWN_VULNS: Dict[str, List[Dict[str, Any]]] = {
-    "nginx": [
-        {"cve_id": "CVE-2024-24795", "package": "openssl", "version": "3.0.13",
-         "severity": "critical", "cvss": 9.8, "description": "HTTP/2 CONTINUATION flood allows DoS",
-         "exploit_available": True, "fixed_version": "3.0.14"},
-        {"cve_id": "CVE-2024-2511", "package": "openssl", "version": "3.0.13",
-         "severity": "high", "cvss": 7.5, "description": "Unbounded memory growth processing TLSv1.3 sessions",
-         "exploit_available": False, "fixed_version": "3.0.14"},
-    ],
-    "node": [
-        {"cve_id": "CVE-2024-22019", "package": "nodejs", "version": "18.19.0",
-         "severity": "high", "cvss": 7.5, "description": "HTTP request smuggling via chunk extension",
-         "exploit_available": False, "fixed_version": "18.19.1"},
-        {"cve_id": "CVE-2024-21892", "package": "nodejs", "version": "18.19.0",
-         "severity": "high", "cvss": 7.8, "description": "Prototype pollution via .env file parsing",
-         "exploit_available": True, "fixed_version": "18.19.1"},
-    ],
-    "python": [
-        {"cve_id": "CVE-2024-0450", "package": "cpython", "version": "3.10.13",
-         "severity": "medium", "cvss": 6.2, "description": "Zipfile module zip-bomb protection bypass",
-         "exploit_available": False, "fixed_version": "3.10.14"},
-    ],
-    "redis": [
-        {"cve_id": "CVE-2024-31449", "package": "redis-server", "version": "7.2.4",
-         "severity": "high", "cvss": 8.8, "description": "Lua library stack buffer overflow",
-         "exploit_available": True, "fixed_version": "7.2.5"},
-    ],
-    "postgres": [
-        {"cve_id": "CVE-2024-0985", "package": "postgresql", "version": "16.1",
-         "severity": "high", "cvss": 8.0, "description": "REFRESH MATERIALIZED VIEW CONCURRENTLY privilege escalation",
-         "exploit_available": False, "fixed_version": "16.2"},
-    ],
-    "alpine": [
-        {"cve_id": "CVE-2024-4603", "package": "openssl", "version": "3.1.4",
-         "severity": "medium", "cvss": 5.3, "description": "Excessive time checking DSA keys / parameters",
-         "exploit_available": False, "fixed_version": "3.1.6"},
-    ],
-    "ubuntu": [
-        {"cve_id": "CVE-2024-2961", "package": "glibc", "version": "2.35",
-         "severity": "critical", "cvss": 9.8, "description": "Buffer overflow in iconv ISO-2022-CN-EXT",
-         "exploit_available": True, "fixed_version": "2.35-0ubuntu3.7"},
-    ],
-    "debian": [
-        {"cve_id": "CVE-2024-2961", "package": "glibc", "version": "2.36",
-         "severity": "critical", "cvss": 9.8, "description": "Buffer overflow in iconv ISO-2022-CN-EXT",
-         "exploit_available": True, "fixed_version": "2.36-9+deb12u7"},
-    ],
-}
-
-
 class ImageScanner:
-    """Container image vulnerability scanning based on known CVE catalog
-    and existing ImageVulnerability records in the database."""
+    """Container image vulnerability reporting.
 
-    def _match_vulns(self, repository: str, tag: str) -> List[Dict[str, Any]]:
-        """Match image against known vulnerability catalog.
+    PySOAR does not ship a real image-scanning backend (no Trivy/Grype/Clair
+    and no registry pull). This class therefore does NOT *discover*
+    vulnerabilities itself. The previous implementation matched an image's
+    *name* against a hardcoded CVE catalog — so every '*nginx*' image was
+    flagged with the same canned CVEs regardless of its actual layers, and
+    those fabricated findings were persisted to ImageVulnerability and even
+    triggered automation/incidents. That is removed.
 
-        Matches on repository base name (e.g. 'library/nginx' matches 'nginx').
-        """
-        repo_base = repository.rsplit("/", 1)[-1].lower()
-        matched: List[Dict[str, Any]] = []
-        for key, vulns in _KNOWN_VULNS.items():
-            if key in repo_base:
-                matched.extend(vulns)
-        return matched
+    It now reports ONLY vulnerabilities that a real scanner integration has
+    already written to the ImageVulnerability table. Wire a real engine to
+    populate that table to get real results.
+    """
 
     async def scan_image(
         self, registry: str, repository: str, tag: str, digest: str,
         db: Optional[AsyncSession] = None,
     ) -> Dict[str, Any]:
-        """Scan image for vulnerabilities using known catalog + DB records.
+        """Report known vulnerabilities for an image from the DB.
 
-        If a DB session is provided, also queries existing ImageVulnerability
-        records for this image.
+        No scanner backend is configured, so this does not discover new
+        vulnerabilities — it surfaces ImageVulnerability rows already
+        recorded for this image (e.g. by a future real-scanner integration).
         """
-        logger.info(f"Scanning image {registry}/{repository}:{tag}")
+        logger.info(f"Reporting known vulnerabilities for {registry}/{repository}:{tag}")
 
-        vulnerabilities = self._match_vulns(repository, tag)
+        # We do NOT fabricate findings from the image name. Start empty and
+        # report only what a real scanner has already persisted.
+        vulnerabilities: List[Dict[str, Any]] = []
 
-        # Also pull any existing vulnerabilities from the DB
+        # Pull any existing vulnerabilities from the DB
         if db is not None:
             try:
                 stmt = (
@@ -147,7 +95,15 @@ class ImageScanner:
         low = sum(1 for v in vulnerabilities if v["severity"] == "low")
 
         return {
-            "status": "completed",
+            # Honest status: no scanner backend ran. We only report what was
+            # already recorded, so callers don't mistake this for a real scan.
+            "status": "no_scanner_backend",
+            "scanner_backend": None,
+            "message": (
+                "No container image-scanning backend (e.g. Trivy/Grype) is "
+                "configured; reporting only vulnerabilities already recorded "
+                "for this image."
+            ),
             "image": f"{registry}/{repository}:{tag}",
             "digest": digest,
             "vulnerabilities": vulnerabilities,

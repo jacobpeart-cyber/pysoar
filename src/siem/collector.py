@@ -341,6 +341,11 @@ class SyslogUDPProtocol(asyncio.DatagramProtocol):
     def __init__(self, collector: "SyslogCollector"):
         self.collector = collector
         self.transport = None
+        # Retain references to in-flight processing tasks. The event loop only
+        # keeps a weak reference to a bare create_task(), so under load the
+        # task could be garbage-collected mid-flight and the syslog event
+        # silently dropped. Holding the ref until completion prevents that.
+        self._tasks: set = set()
 
     def connection_made(self, transport):
         self.transport = transport
@@ -349,7 +354,9 @@ class SyslogUDPProtocol(asyncio.DatagramProtocol):
         """Handle incoming UDP syslog message"""
         try:
             message = data.decode().strip()
-            asyncio.create_task(self.collector._process_syslog_message(message))
+            task = asyncio.create_task(self.collector._process_syslog_message(message))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
         except Exception as e:
             logger.error(f"Error processing UDP syslog: {e}")
 
