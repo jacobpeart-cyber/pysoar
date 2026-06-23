@@ -14,8 +14,19 @@ logger = get_logger(__name__)
 
 
 def run_async(coro):
-    """Helper to run async code in sync context"""
-    loop = asyncio.get_event_loop()
+    """Helper to run async code in sync context.
+
+    A Celery prefork worker thread has no event loop, and once any prior
+    ``asyncio.run()`` in the process has cleared it, ``get_event_loop()``
+    raises ``RuntimeError`` (Python 3.10+ no longer auto-creates one).
+    Create a fresh loop in that case so beat-scheduled tasks don't fail
+    every run with "There is no current event loop in thread 'MainThread'".
+    """
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
     if loop.is_running():
         import nest_asyncio
         nest_asyncio.apply()
