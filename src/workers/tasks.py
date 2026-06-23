@@ -179,9 +179,21 @@ def cleanup_old_executions() -> dict[str, Any]:
         logger.info(f"Cleaned up {cleaned_up} old executions (older than {retention_days} days)")
 
     except Exception as e:
-        logger.error(f"Cleanup task failed: {e}")
+        # The delete/commit failed — the cleanup did NOT happen. Report an
+        # error status instead of returning a success-shaped result that
+        # makes the task look like it succeeded.
+        logger.error(f"Cleanup task failed: {e}", exc_info=True)
+        return {
+            "status": "error",
+            "error": str(e),
+            "cleaned_up": 0,
+            "task": "cleanup_old_executions",
+            "retention_days": retention_days,
+            "cutoff": cutoff.isoformat(),
+        }
 
     return {
+        "status": "success",
         "cleaned_up": cleaned_up,
         "task": "cleanup_old_executions",
         "retention_days": retention_days,

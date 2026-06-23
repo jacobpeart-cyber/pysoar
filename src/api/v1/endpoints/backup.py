@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, Body
-from src.api.deps import CurrentUser, DatabaseSession
+from src.api.deps import AdminUser, CurrentUser, DatabaseSession
 from src.core.config import settings
 from src.core.logging import get_logger
 
@@ -16,6 +16,23 @@ logger = get_logger(__name__)
 router = APIRouter(prefix="/backup", tags=["backup-restore"])
 
 BACKUP_DIR = os.environ.get("BACKUP_DIR", "/app/backups")
+
+
+def _safe_backup_path(filename: str) -> str:
+    """Resolve a backup filename to an absolute path strictly inside
+    BACKUP_DIR, rejecting path traversal (e.g. '../../etc/passwd').
+
+    Backups are flat files in BACKUP_DIR, so any directory separator or
+    relative component is invalid — this prevents a caller from reading,
+    restoring from, or deleting arbitrary files on the host.
+    """
+    if not filename or "/" in filename or "\\" in filename or filename in (".", ".."):
+        raise HTTPException(status_code=400, detail="Invalid backup filename")
+    backup_root = os.path.normpath(BACKUP_DIR)
+    candidate = os.path.normpath(os.path.join(backup_root, filename))
+    if os.path.dirname(candidate) != backup_root:
+        raise HTTPException(status_code=400, detail="Invalid backup filename")
+    return candidate
 
 
 @router.get("/status")
@@ -45,8 +62,9 @@ async def get_backup_status(current_user: CurrentUser = None):
 
 
 @router.post("/create")
-async def create_backup(current_user: CurrentUser = None):
-    """Trigger an immediate database backup."""
+async def create_backup(current_user: AdminUser = None):
+    """Trigger an immediate database backup. Admin-only — dumps the entire
+    multi-tenant database."""
     os.makedirs(BACKUP_DIR, exist_ok=True)
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -152,14 +170,15 @@ async def create_backup(current_user: CurrentUser = None):
 @router.post("/restore")
 async def restore_backup(
     data: dict = Body(...),
-    current_user: CurrentUser = None,
+    current_user: AdminUser = None,
 ):
-    """Restore database from a backup file."""
+    """Restore database from a backup file. Admin-only — this REPLACES the
+    entire database (pg_restore --clean) for ALL tenants."""
     filename = data.get("filename")
     if not filename:
         raise HTTPException(status_code=400, detail="filename is required")
 
-    filepath = os.path.join(BACKUP_DIR, filename)
+    filepath = _safe_backup_path(filename)
     if not os.path.exists(filepath):
         raise HTTPException(status_code=404, detail=f"Backup file not found: {filename}")
 
@@ -209,10 +228,10 @@ async def restore_backup(
 @router.delete("/backups/{filename}")
 async def delete_backup(
     filename: str,
-    current_user: CurrentUser = None,
+    current_user: AdminUser = None,
 ):
-    """Delete a backup file."""
-    filepath = os.path.join(BACKUP_DIR, filename)
+    """Delete a backup file. Admin-only."""
+    filepath = _safe_backup_path(filename)
     if not os.path.exists(filepath):
         raise HTTPException(status_code=404, detail="Backup not found")
 

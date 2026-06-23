@@ -205,10 +205,12 @@ async def scan_image(
     current_user: CurrentUser = None,
 ):
     """
-    Trigger image vulnerability scan.
+    Refresh an image's vulnerability summary.
 
-    Runs the scanner against the known CVE catalog and any existing DB
-    vulnerability records, then updates the image's vuln counts and risk score.
+    No real scanning backend (Trivy/Grype) is configured, so this does not
+    discover new vulnerabilities — it recomputes the image's vuln counts,
+    risk score, and compliance status from ImageVulnerability records already
+    recorded for it. Response status is "no_scanner_backend" to make that clear.
     """
     org_id = getattr(current_user, "organization_id", None)
     stmt = select(ContainerImage).where(
@@ -322,7 +324,7 @@ async def scan_image(
     )
 
     return ImageScanResponse(
-        status="completed",
+        status=scan_result.get("status", "completed"),
         image_id=image_id,
         vulnerabilities=scan_result["total_vulnerabilities"],
         risk_score=image.risk_score,

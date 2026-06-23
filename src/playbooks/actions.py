@@ -140,7 +140,10 @@ class SendNotificationAction(PlaybookAction):
             message = message.replace(f"{{{{{key}}}}}", str(value))
             subject = subject.replace(f"{{{{{key}}}}}", str(value))
 
-        # Send notification via Celery task
+        # Send notification via Celery task. If the enqueue fails (broker
+        # down, serialization error), the notification was NOT sent — report
+        # success=False so the playbook step reflects reality instead of
+        # silently claiming on-call was paged.
         try:
             from src.workers.tasks import send_notification_task
             send_notification_task.delay(
@@ -152,6 +155,13 @@ class SendNotificationAction(PlaybookAction):
             logger.info(f"Notification queued via {channel} to {recipients}")
         except Exception as e:
             logger.error(f"Failed to queue notification: {e}")
+            return {
+                "success": False,
+                "channel": channel,
+                "recipients": recipients,
+                "subject": subject,
+                "error": f"notification not sent: {e}",
+            }
 
         return {
             "success": True,
