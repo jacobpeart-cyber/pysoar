@@ -73,9 +73,9 @@ router = APIRouter(prefix="/dfir", tags=["DFIR"])
 # ============================================================================
 
 
-async def get_case_or_404(db: AsyncSession, case_id: str) -> ForensicCase:
+async def get_case_or_404(db: AsyncSession, case_id: str, org_id: Optional[str] = None) -> ForensicCase:
     """Get forensic case by ID or raise 404"""
-    result = await db.execute(
+    stmt = (
         select(ForensicCase)
         .options(
             selectinload(ForensicCase.evidence),
@@ -85,6 +85,9 @@ async def get_case_or_404(db: AsyncSession, case_id: str) -> ForensicCase:
         )
         .where(ForensicCase.id == case_id)
     )
+    if org_id is not None:
+        stmt = stmt.where(ForensicCase.organization_id == org_id)
+    result = await db.execute(stmt)
     case = result.scalar_one_or_none()
     if not case:
         raise HTTPException(
@@ -94,13 +97,16 @@ async def get_case_or_404(db: AsyncSession, case_id: str) -> ForensicCase:
     return case
 
 
-async def get_evidence_or_404(db: AsyncSession, evidence_id: str) -> ForensicEvidence:
+async def get_evidence_or_404(db: AsyncSession, evidence_id: str, org_id: Optional[str] = None) -> ForensicEvidence:
     """Get forensic evidence by ID or raise 404"""
-    result = await db.execute(
+    stmt = (
         select(ForensicEvidence)
         .options(selectinload(ForensicEvidence.case))
         .where(ForensicEvidence.id == evidence_id)
     )
+    if org_id is not None:
+        stmt = stmt.where(ForensicEvidence.organization_id == org_id)
+    result = await db.execute(stmt)
     evidence = result.scalar_one_or_none()
     if not evidence:
         raise HTTPException(
@@ -195,7 +201,8 @@ async def get_case(
     db: DatabaseSession = None,
 ):
     """Get a specific forensic case"""
-    case = await get_case_or_404(db, case_id)
+    org_id = getattr(current_user, "organization_id", None)
+    case = await get_case_or_404(db, case_id, org_id)
     return ForensicCaseResponse.model_validate(case)
 
 
@@ -244,7 +251,8 @@ async def update_case(
     db: DatabaseSession = None,
 ):
     """Update a forensic case"""
-    case = await get_case_or_404(db, case_id)
+    org_id = getattr(current_user, "organization_id", None)
+    case = await get_case_or_404(db, case_id, org_id)
 
     update_data = case_data.model_dump(exclude_unset=True)
 
@@ -270,7 +278,8 @@ async def close_case(
     conclusion: Optional[str] = None,
 ):
     """Close a forensic case"""
-    case = await get_case_or_404(db, case_id)
+    org_id = getattr(current_user, "organization_id", None)
+    case = await get_case_or_404(db, case_id, org_id)
 
     case.status = CaseStatus.CLOSED.value
     case.updated_at = datetime.now(timezone.utc)
@@ -297,13 +306,14 @@ async def list_evidence(
     is_verified: Optional[bool] = None,
 ):
     """List evidence for a forensic case"""
+    # Filter by organization
+    org_id = getattr(current_user, "organization_id", None)
+
     # Verify case exists
-    await get_case_or_404(db, case_id)
+    await get_case_or_404(db, case_id, org_id)
 
     query = select(ForensicEvidence).where(ForensicEvidence.case_id == case_id)
 
-    # Filter by organization
-    org_id = getattr(current_user, "organization_id", None)
     if org_id:
         query = query.where(ForensicEvidence.organization_id == org_id)
 
@@ -344,7 +354,8 @@ async def get_evidence(
     db: DatabaseSession = None,
 ):
     """Get a specific evidence item"""
-    evidence = await get_evidence_or_404(db, evidence_id)
+    org_id = getattr(current_user, "organization_id", None)
+    evidence = await get_evidence_or_404(db, evidence_id, org_id)
     return ForensicEvidenceResponse.model_validate(evidence)
 
 
@@ -365,7 +376,8 @@ async def download_evidence(
     import os
     from fastapi.responses import FileResponse, RedirectResponse
 
-    evidence = await get_evidence_or_404(db, evidence_id)
+    org_id = getattr(current_user, "organization_id", None)
+    evidence = await get_evidence_or_404(db, evidence_id, org_id)
 
     if not evidence.storage_location:
         raise HTTPException(
@@ -412,8 +424,9 @@ async def collect_evidence(
     db: DatabaseSession = None,
 ):
     """Collect and register forensic evidence"""
+    org_id = getattr(current_user, "organization_id", None)
     # Verify case exists
-    await get_case_or_404(db, evidence_data.case_id)
+    await get_case_or_404(db, evidence_data.case_id, org_id)
 
     evidence = ForensicEvidence(
         case_id=evidence_data.case_id,
@@ -491,8 +504,9 @@ async def upload_evidence_file(
     - Transactional: if the DB insert fails the on-disk file is deleted so we
       never leave an orphan.
     """
-    case = await get_case_or_404(db, case_id)
-    org_id = getattr(current_user, "organization_id", None) or case.organization_id or "default"
+    org_id = getattr(current_user, "organization_id", None)
+    case = await get_case_or_404(db, case_id, org_id)
+    org_id = org_id or case.organization_id or "default"
 
     # Determine final storage path
     target_dir = os.path.join(DFIR_UPLOAD_ROOT, str(org_id), str(case_id))
@@ -625,7 +639,8 @@ async def verify_evidence_integrity(
     db: DatabaseSession = None,
 ):
     """Verify evidence integrity through hash comparison"""
-    evidence = await get_evidence_or_404(db, evidence_id)
+    org_id = getattr(current_user, "organization_id", None)
+    evidence = await get_evidence_or_404(db, evidence_id, org_id)
 
     # Verify hash
     is_valid = True
@@ -655,7 +670,8 @@ async def update_chain_of_custody(
     db: DatabaseSession = None,
 ):
     """Update chain of custody log"""
-    evidence = await get_evidence_or_404(db, evidence_id)
+    org_id = getattr(current_user, "organization_id", None)
+    evidence = await get_evidence_or_404(db, evidence_id, org_id)
 
     # Parse existing log
     coc_log = evidence.chain_of_custody_log or {"entries": []}
@@ -699,12 +715,13 @@ async def get_timeline(
     is_pivotal: Optional[bool] = None,
 ):
     """Get case timeline"""
-    await get_case_or_404(db, case_id)
+    # Filter by organization
+    org_id = getattr(current_user, "organization_id", None)
+
+    await get_case_or_404(db, case_id, org_id)
 
     query = select(ForensicTimeline).where(ForensicTimeline.case_id == case_id)
 
-    # Filter by organization
-    org_id = getattr(current_user, "organization_id", None)
     if org_id:
         query = query.where(ForensicTimeline.organization_id == org_id)
 
@@ -746,7 +763,8 @@ async def add_timeline_event(
     db: DatabaseSession = None,
 ):
     """Add event to case timeline"""
-    await get_case_or_404(db, case_id)
+    org_id = getattr(current_user, "organization_id", None)
+    await get_case_or_404(db, case_id, org_id)
 
     event = ForensicTimeline(
         case_id=case_id,
@@ -776,13 +794,17 @@ async def export_timeline(
     db: DatabaseSession = None,
 ):
     """Export case timeline"""
-    case = await get_case_or_404(db, case_id)
+    org_id = getattr(current_user, "organization_id", None)
+    case = await get_case_or_404(db, case_id, org_id)
 
-    result = await db.execute(
+    timeline_stmt = (
         select(ForensicTimeline)
         .where(ForensicTimeline.case_id == case_id)
         .order_by(ForensicTimeline.event_timestamp.asc())
     )
+    if org_id:
+        timeline_stmt = timeline_stmt.where(ForensicTimeline.organization_id == org_id)
+    result = await db.execute(timeline_stmt)
     events = list(result.scalars().all())
 
     return TimelineExportResponse(
@@ -809,12 +831,13 @@ async def list_artifacts(
     min_risk_score: float = Query(0.0, ge=0.0, le=10.0),
 ):
     """List artifacts for a case"""
-    await get_case_or_404(db, case_id)
+    # Filter by organization
+    org_id = getattr(current_user, "organization_id", None)
+
+    await get_case_or_404(db, case_id, org_id)
 
     query = select(ForensicArtifact).where(ForensicArtifact.case_id == case_id)
 
-    # Filter by organization
-    org_id = getattr(current_user, "organization_id", None)
     if org_id:
         query = query.where(ForensicArtifact.organization_id == org_id)
 
@@ -856,8 +879,9 @@ async def create_artifact(
     db: DatabaseSession = None,
 ):
     """Create forensic artifact"""
-    await get_case_or_404(db, case_id)
-    await get_evidence_or_404(db, artifact_data.evidence_id)
+    org_id = getattr(current_user, "organization_id", None)
+    await get_case_or_404(db, case_id, org_id)
+    await get_evidence_or_404(db, artifact_data.evidence_id, org_id)
 
     artifact = ForensicArtifact(
         case_id=case_id,
@@ -922,11 +946,13 @@ async def extract_case_iocs(
     db: DatabaseSession = None,
 ):
     """Extract all IOCs from case artifacts"""
-    await get_case_or_404(db, case_id)
+    org_id = getattr(current_user, "organization_id", None)
+    await get_case_or_404(db, case_id, org_id)
 
-    result = await db.execute(
-        select(ForensicArtifact).where(ForensicArtifact.case_id == case_id)
-    )
+    artifact_stmt = select(ForensicArtifact).where(ForensicArtifact.case_id == case_id)
+    if org_id:
+        artifact_stmt = artifact_stmt.where(ForensicArtifact.organization_id == org_id)
+    result = await db.execute(artifact_stmt)
     artifacts = list(result.scalars().all())
 
     analyzer = ArtifactAnalyzer()
@@ -973,12 +999,13 @@ async def list_legal_holds(
     size: int = Query(20, ge=1, le=100),
 ):
     """List legal holds for a case"""
-    await get_case_or_404(db, case_id)
+    # Filter by organization
+    org_id = getattr(current_user, "organization_id", None)
+
+    await get_case_or_404(db, case_id, org_id)
 
     query = select(LegalHold).where(LegalHold.case_id == case_id)
 
-    # Filter by organization
-    org_id = getattr(current_user, "organization_id", None)
     if org_id:
         query = query.where(LegalHold.organization_id == org_id)
 
@@ -1012,7 +1039,8 @@ async def create_legal_hold(
     db: DatabaseSession = None,
 ):
     """Create a legal hold"""
-    case = await get_case_or_404(db, case_id)
+    org_id = getattr(current_user, "organization_id", None)
+    case = await get_case_or_404(db, case_id, org_id)
 
     hold = LegalHold(
         case_id=case_id,
@@ -1042,7 +1070,11 @@ async def update_legal_hold(
     db: DatabaseSession = None,
 ):
     """Update legal hold"""
-    result = await db.execute(select(LegalHold).where(LegalHold.id == hold_id))
+    org_id = getattr(current_user, "organization_id", None)
+    hold_stmt = select(LegalHold).where(LegalHold.id == hold_id)
+    if org_id is not None:
+        hold_stmt = hold_stmt.where(LegalHold.organization_id == org_id)
+    result = await db.execute(hold_stmt)
     hold = result.scalar_one_or_none()
 
     if not hold:
@@ -1071,7 +1103,8 @@ async def generate_case_report(
     db: DatabaseSession = None,
 ):
     """Generate comprehensive case report"""
-    case = await get_case_or_404(db, case_id)
+    org_id = getattr(current_user, "organization_id", None)
+    case = await get_case_or_404(db, case_id, org_id)
 
     # Get counts
     evidence_count = len(case.evidence or [])
@@ -1097,7 +1130,8 @@ async def get_chain_of_custody_report(
     db: DatabaseSession = None,
 ):
     """Get chain of custody report"""
-    evidence = await get_evidence_or_404(db, evidence_id)
+    org_id = getattr(current_user, "organization_id", None)
+    evidence = await get_evidence_or_404(db, evidence_id, org_id)
 
     coc_log = evidence.chain_of_custody_log or {}
     if isinstance(coc_log, str):
@@ -1200,7 +1234,8 @@ async def get_case_metrics(
     db: DatabaseSession = None,
 ):
     """Get metrics for a specific case"""
-    case = await get_case_or_404(db, case_id)
+    org_id = getattr(current_user, "organization_id", None)
+    case = await get_case_or_404(db, case_id, org_id)
 
     evidence_count = len(case.evidence or [])
     artifact_count = len(case.artifacts or [])

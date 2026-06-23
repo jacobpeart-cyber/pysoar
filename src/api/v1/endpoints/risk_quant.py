@@ -69,9 +69,14 @@ router = APIRouter(prefix="/risk-quantification", tags=["Risk Quantification"])
 
 
 # Helper Functions
-async def get_risk_scenario_or_404(db: AsyncSession, scenario_id: str) -> RiskScenario:
+async def get_risk_scenario_or_404(
+    db: AsyncSession, scenario_id: str, org_id: Optional[str] = None
+) -> RiskScenario:
     """Get RiskScenario by ID or raise 404"""
-    result = await db.execute(select(RiskScenario).where(RiskScenario.id == scenario_id))
+    stmt = select(RiskScenario).where(RiskScenario.id == scenario_id)
+    if org_id is not None:
+        stmt = stmt.where(RiskScenario.organization_id == org_id)
+    result = await db.execute(stmt)
     scenario = result.scalar_one_or_none()
     if not scenario:
         raise HTTPException(
@@ -81,9 +86,14 @@ async def get_risk_scenario_or_404(db: AsyncSession, scenario_id: str) -> RiskSc
     return scenario
 
 
-async def get_fair_analysis_or_404(db: AsyncSession, analysis_id: str) -> FAIRAnalysis:
+async def get_fair_analysis_or_404(
+    db: AsyncSession, analysis_id: str, org_id: Optional[str] = None
+) -> FAIRAnalysis:
     """Get FAIRAnalysis by ID or raise 404"""
-    result = await db.execute(select(FAIRAnalysis).where(FAIRAnalysis.id == analysis_id))
+    stmt = select(FAIRAnalysis).where(FAIRAnalysis.id == analysis_id)
+    if org_id is not None:
+        stmt = stmt.where(FAIRAnalysis.organization_id == org_id)
+    result = await db.execute(stmt)
     analysis = result.scalar_one_or_none()
     if not analysis:
         raise HTTPException(
@@ -93,11 +103,14 @@ async def get_fair_analysis_or_404(db: AsyncSession, analysis_id: str) -> FAIRAn
     return analysis
 
 
-async def get_risk_register_or_404(db: AsyncSession, register_id: str) -> RiskRegister:
+async def get_risk_register_or_404(
+    db: AsyncSession, register_id: str, org_id: Optional[str] = None
+) -> RiskRegister:
     """Get RiskRegister by ID or raise 404"""
-    result = await db.execute(
-        select(RiskRegister).where(RiskRegister.id == register_id)
-    )
+    stmt = select(RiskRegister).where(RiskRegister.id == register_id)
+    if org_id is not None:
+        stmt = stmt.where(RiskRegister.organization_id == org_id)
+    result = await db.execute(stmt)
     register = result.scalar_one_or_none()
     if not register:
         raise HTTPException(
@@ -107,9 +120,14 @@ async def get_risk_register_or_404(db: AsyncSession, register_id: str) -> RiskRe
     return register
 
 
-async def get_risk_control_or_404(db: AsyncSession, control_id: str) -> RiskControl:
+async def get_risk_control_or_404(
+    db: AsyncSession, control_id: str, org_id: Optional[str] = None
+) -> RiskControl:
     """Get RiskControl by ID or raise 404"""
-    result = await db.execute(select(RiskControl).where(RiskControl.id == control_id))
+    stmt = select(RiskControl).where(RiskControl.id == control_id)
+    if org_id is not None:
+        stmt = stmt.where(RiskControl.organization_id == org_id)
+    result = await db.execute(stmt)
     control = result.scalar_one_or_none()
     if not control:
         raise HTTPException(
@@ -120,13 +138,15 @@ async def get_risk_control_or_404(db: AsyncSession, control_id: str) -> RiskCont
 
 
 async def get_bia_or_404(
-    bia_id: str,
     db: AsyncSession,
+    bia_id: str,
+    org_id: Optional[str] = None,
 ) -> BusinessImpactAssessment:
     """Get BusinessImpactAssessment by ID or raise 404"""
-    result = await db.execute(
-        select(BusinessImpactAssessment).where(BusinessImpactAssessment.id == bia_id)
-    )
+    stmt = select(BusinessImpactAssessment).where(BusinessImpactAssessment.id == bia_id)
+    if org_id is not None:
+        stmt = stmt.where(BusinessImpactAssessment.organization_id == org_id)
+    result = await db.execute(stmt)
     bia = result.scalar_one_or_none()
     if not bia:
         raise HTTPException(
@@ -243,7 +263,9 @@ async def get_risk_scenario(
     db: DatabaseSession = None,
 ):
     """Get a risk scenario by ID"""
-    scenario = await get_risk_scenario_or_404(db, scenario_id)
+    scenario = await get_risk_scenario_or_404(
+        db, scenario_id, getattr(current_user, "organization_id", None)
+    )
     return RiskScenarioResponse.model_validate(scenario)
 
 
@@ -255,7 +277,9 @@ async def update_risk_scenario(
     db: DatabaseSession = None,
 ):
     """Update a risk scenario"""
-    scenario = await get_risk_scenario_or_404(db, scenario_id)
+    scenario = await get_risk_scenario_or_404(
+        db, scenario_id, getattr(current_user, "organization_id", None)
+    )
 
     update_data = scenario_data.model_dump(exclude_unset=True, exclude_none=True)
     for key, value in update_data.items():
@@ -274,7 +298,9 @@ async def delete_risk_scenario(
     db: DatabaseSession = None,
 ):
     """Delete a risk scenario"""
-    scenario = await get_risk_scenario_or_404(db, scenario_id)
+    scenario = await get_risk_scenario_or_404(
+        db, scenario_id, getattr(current_user, "organization_id", None)
+    )
     await db.delete(scenario)
     await db.flush()
 
@@ -330,7 +356,9 @@ async def create_fair_analysis(
 ):
     """Create a new FAIR analysis"""
     # Verify scenario exists
-    scenario = await get_risk_scenario_or_404(db, analysis_data.scenario_id)
+    scenario = await get_risk_scenario_or_404(
+        db, analysis_data.scenario_id, getattr(current_user, "organization_id", None)
+    )
 
     analysis = FAIRAnalysis(
         organization_id=getattr(current_user, "organization_id", None),
@@ -377,7 +405,9 @@ async def get_fair_analysis(
     db: DatabaseSession = None,
 ):
     """Get a FAIR analysis by ID"""
-    analysis = await get_fair_analysis_or_404(db, analysis_id)
+    analysis = await get_fair_analysis_or_404(
+        db, analysis_id, getattr(current_user, "organization_id", None)
+    )
     return FAIRAnalysisResponse.model_validate(analysis)
 
 
@@ -391,7 +421,9 @@ async def run_fair_simulation_endpoint(
     db: DatabaseSession = None,
 ):
     """Run FAIR Monte Carlo simulation"""
-    analysis = await get_fair_analysis_or_404(db, analysis_id)
+    analysis = await get_fair_analysis_or_404(
+        db, analysis_id, getattr(current_user, "organization_id", None)
+    )
 
     # Prepare analysis data
     analysis_data = {
@@ -453,7 +485,9 @@ async def get_loss_exceedance_curve(
     db: DatabaseSession = None,
 ):
     """Get loss exceedance curve for FAIR analysis"""
-    analysis = await get_fair_analysis_or_404(db, analysis_id)
+    analysis = await get_fair_analysis_or_404(
+        db, analysis_id, getattr(current_user, "organization_id", None)
+    )
 
     if not analysis.loss_exceedance_curve:
         raise HTTPException(
@@ -552,7 +586,9 @@ async def get_risk_register(
     db: DatabaseSession = None,
 ):
     """Get a risk register entry by ID"""
-    register = await get_risk_register_or_404(db, register_id)
+    register = await get_risk_register_or_404(
+        db, register_id, getattr(current_user, "organization_id", None)
+    )
     return RiskRegisterResponse.model_validate(register)
 
 
@@ -564,7 +600,9 @@ async def update_risk_register(
     db: DatabaseSession = None,
 ):
     """Update a risk register entry"""
-    register = await get_risk_register_or_404(db, register_id)
+    register = await get_risk_register_or_404(
+        db, register_id, getattr(current_user, "organization_id", None)
+    )
 
     update_data = register_data.model_dump(exclude_unset=True, exclude_none=True)
 
@@ -589,7 +627,9 @@ async def delete_risk_register(
     db: DatabaseSession = None,
 ):
     """Delete a risk register entry"""
-    register = await get_risk_register_or_404(db, register_id)
+    register = await get_risk_register_or_404(
+        db, register_id, getattr(current_user, "organization_id", None)
+    )
     await db.delete(register)
     await db.flush()
 
@@ -675,7 +715,9 @@ async def get_risk_control(
     db: DatabaseSession = None,
 ):
     """Get a risk control by ID"""
-    control = await get_risk_control_or_404(db, control_id)
+    control = await get_risk_control_or_404(
+        db, control_id, getattr(current_user, "organization_id", None)
+    )
     return RiskControlResponse.model_validate(control)
 
 
@@ -687,7 +729,9 @@ async def update_risk_control(
     db: DatabaseSession = None,
 ):
     """Update a risk control"""
-    control = await get_risk_control_or_404(db, control_id)
+    control = await get_risk_control_or_404(
+        db, control_id, getattr(current_user, "organization_id", None)
+    )
 
     update_data = control_data.model_dump(exclude_unset=True, exclude_none=True)
 
@@ -707,7 +751,9 @@ async def delete_risk_control(
     db: DatabaseSession = None,
 ):
     """Delete a risk control"""
-    control = await get_risk_control_or_404(db, control_id)
+    control = await get_risk_control_or_404(
+        db, control_id, getattr(current_user, "organization_id", None)
+    )
     await db.delete(control)
     await db.flush()
 
@@ -719,8 +765,9 @@ async def audit_control_effectiveness(
     db: DatabaseSession = None,
 ):
     """Audit control effectiveness and calculate ROI"""
-    control = await get_risk_control_or_404(db, control_id)
-    register = await get_risk_register_or_404(db, control.risk_register_id)
+    org_id = getattr(current_user, "organization_id", None)
+    control = await get_risk_control_or_404(db, control_id, org_id)
+    register = await get_risk_register_or_404(db, control.risk_register_id, org_id)
 
     analyzer = ControlEffectivenessAnalyzer()
 
@@ -833,7 +880,9 @@ async def get_bia(
     db: DatabaseSession = None,
 ):
     """Get a BIA by ID"""
-    bia = await get_bia_or_404(db, bia_id)
+    bia = await get_bia_or_404(
+        db, bia_id, getattr(current_user, "organization_id", None)
+    )
     return BusinessImpactAssessmentResponse.model_validate(bia)
 
 
@@ -845,7 +894,9 @@ async def update_bia(
     db: DatabaseSession = None,
 ):
     """Update a BIA"""
-    bia = await get_bia_or_404(db, bia_id)
+    bia = await get_bia_or_404(
+        db, bia_id, getattr(current_user, "organization_id", None)
+    )
 
     update_data = bia_data.model_dump(exclude_unset=True, exclude_none=True)
 
@@ -868,7 +919,9 @@ async def delete_bia(
     db: DatabaseSession = None,
 ):
     """Delete a BIA"""
-    bia = await get_bia_or_404(db, bia_id)
+    bia = await get_bia_or_404(
+        db, bia_id, getattr(current_user, "organization_id", None)
+    )
     await db.delete(bia)
     await db.flush()
 

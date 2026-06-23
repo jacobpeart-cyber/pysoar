@@ -84,27 +84,42 @@ assessor = BreachAssessor()
 
 # Helper functions
 
-async def get_policy_or_404(db: AsyncSession, policy_id: str) -> DLPPolicy:
+async def get_policy_or_404(
+    db: AsyncSession, policy_id: str, org_id: Optional[str] = None
+) -> DLPPolicy:
     """Get policy by ID or raise 404"""
-    result = await db.execute(select(DLPPolicy).where(DLPPolicy.id == policy_id))
+    stmt = select(DLPPolicy).where(DLPPolicy.id == policy_id)
+    if org_id is not None:
+        stmt = stmt.where(DLPPolicy.organization_id == org_id)
+    result = await db.execute(stmt)
     policy = result.scalar_one_or_none()
     if not policy:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Policy not found")
     return policy
 
 
-async def get_violation_or_404(db: AsyncSession, violation_id: str) -> DLPViolation:
+async def get_violation_or_404(
+    db: AsyncSession, violation_id: str, org_id: Optional[str] = None
+) -> DLPViolation:
     """Get violation by ID or raise 404"""
-    result = await db.execute(select(DLPViolation).where(DLPViolation.id == violation_id))
+    stmt = select(DLPViolation).where(DLPViolation.id == violation_id)
+    if org_id is not None:
+        stmt = stmt.where(DLPViolation.organization_id == org_id)
+    result = await db.execute(stmt)
     violation = result.scalar_one_or_none()
     if not violation:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Violation not found")
     return violation
 
 
-async def get_classification_or_404(db: AsyncSession, class_id: str) -> DataClassification:
+async def get_classification_or_404(
+    db: AsyncSession, class_id: str, org_id: Optional[str] = None
+) -> DataClassification:
     """Get classification by ID or raise 404"""
-    result = await db.execute(select(DataClassification).where(DataClassification.id == class_id))
+    stmt = select(DataClassification).where(DataClassification.id == class_id)
+    if org_id is not None:
+        stmt = stmt.where(DataClassification.organization_id == org_id)
+    result = await db.execute(stmt)
     classification = result.scalar_one_or_none()
     if not classification:
         raise HTTPException(
@@ -114,9 +129,14 @@ async def get_classification_or_404(db: AsyncSession, class_id: str) -> DataClas
     return classification
 
 
-async def get_incident_or_404(db: AsyncSession, incident_id: str) -> DLPIncident:
+async def get_incident_or_404(
+    db: AsyncSession, incident_id: str, org_id: Optional[str] = None
+) -> DLPIncident:
     """Get incident by ID or raise 404"""
-    result = await db.execute(select(DLPIncident).where(DLPIncident.id == incident_id))
+    stmt = select(DLPIncident).where(DLPIncident.id == incident_id)
+    if org_id is not None:
+        stmt = stmt.where(DLPIncident.organization_id == org_id)
+    result = await db.execute(stmt)
     incident = result.scalar_one_or_none()
     if not incident:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Incident not found")
@@ -215,7 +235,7 @@ async def get_policy(
     db: DatabaseSession = None,
 ):
     """Get DLP policy by ID"""
-    policy = await get_policy_or_404(db, policy_id)
+    policy = await get_policy_or_404(db, policy_id, getattr(current_user, "organization_id", None))
     return convert_json_fields(policy)
 
 
@@ -227,7 +247,7 @@ async def update_policy(
     db: DatabaseSession = None,
 ):
     """Update a DLP policy"""
-    policy = await get_policy_or_404(db, policy_id)
+    policy = await get_policy_or_404(db, policy_id, getattr(current_user, "organization_id", None))
 
     update_data = policy_data.model_dump(exclude_unset=True, exclude_none=True)
 
@@ -253,7 +273,7 @@ async def delete_policy(
     db: DatabaseSession = None,
 ):
     """Delete a DLP policy"""
-    policy = await get_policy_or_404(db, policy_id)
+    policy = await get_policy_or_404(db, policy_id, getattr(current_user, "organization_id", None))
     await db.delete(policy)
     await db.flush()
 
@@ -265,7 +285,7 @@ async def enable_policy(
     db: DatabaseSession = None,
 ):
     """Enable a DLP policy"""
-    policy = await get_policy_or_404(db, policy_id)
+    policy = await get_policy_or_404(db, policy_id, getattr(current_user, "organization_id", None))
     policy.enabled = True
     await db.flush()
     await db.refresh(policy)
@@ -279,7 +299,7 @@ async def disable_policy(
     db: DatabaseSession = None,
 ):
     """Disable a DLP policy"""
-    policy = await get_policy_or_404(db, policy_id)
+    policy = await get_policy_or_404(db, policy_id, getattr(current_user, "organization_id", None))
     policy.enabled = False
     await db.flush()
     await db.refresh(policy)
@@ -294,7 +314,7 @@ async def test_policy(
     db: DatabaseSession = None,
 ):
     """Test a policy against sample data"""
-    policy = await get_policy_or_404(db, policy_id)
+    policy = await get_policy_or_404(db, policy_id, getattr(current_user, "organization_id", None))
 
     # Evaluate content
     evaluation = dlp_engine.evaluate_content(
@@ -402,7 +422,7 @@ async def get_violation(
     db: DatabaseSession = None,
 ):
     """Get a DLP violation by ID"""
-    violation = await get_violation_or_404(db, violation_id)
+    violation = await get_violation_or_404(db, violation_id, getattr(current_user, "organization_id", None))
     return convert_json_fields(violation)
 
 
@@ -414,7 +434,7 @@ async def investigate_violation(
     db: DatabaseSession = None,
 ):
     """Investigate and resolve a violation"""
-    violation = await get_violation_or_404(db, violation_id)
+    violation = await get_violation_or_404(db, violation_id, getattr(current_user, "organization_id", None))
 
     violation.status = investigation.status
     violation.justification = investigation.justification
@@ -434,7 +454,10 @@ async def bulk_action_violations(
 ):
     """Perform bulk actions on violations"""
     result = await db.execute(
-        select(DLPViolation).where(DLPViolation.id.in_(bulk_request.violation_ids))
+        select(DLPViolation).where(
+            DLPViolation.id.in_(bulk_request.violation_ids),
+            DLPViolation.organization_id == getattr(current_user, "organization_id", None),
+        )
     )
     violations = result.scalars().all()
 
@@ -541,7 +564,7 @@ async def get_classification(
     db: DatabaseSession = None,
 ):
     """Get a data classification by ID"""
-    classification = await get_classification_or_404(db, classification_id)
+    classification = await get_classification_or_404(db, classification_id, getattr(current_user, "organization_id", None))
     return convert_json_fields(classification)
 
 
@@ -553,7 +576,7 @@ async def update_classification(
     db: DatabaseSession = None,
 ):
     """Update a data classification"""
-    classification = await get_classification_or_404(db, classification_id)
+    classification = await get_classification_or_404(db, classification_id, getattr(current_user, "organization_id", None))
 
     update_data = classification_data.model_dump(exclude_unset=True, exclude_none=True)
 
@@ -609,7 +632,7 @@ async def get_handling_requirements(
     db: DatabaseSession = None,
 ):
     """Get data handling requirements for a classification"""
-    classification = await get_classification_or_404(db, classification_id)
+    classification = await get_classification_or_404(db, classification_id, getattr(current_user, "organization_id", None))
 
     requirements = classifier.get_handling_requirements(classification.classification_level)
 
@@ -691,7 +714,10 @@ async def get_discovery_scan(
 ):
     """Get discovery scan results"""
     result = await db.execute(
-        select(SensitiveDataDiscovery).where(SensitiveDataDiscovery.id == scan_id)
+        select(SensitiveDataDiscovery).where(
+            SensitiveDataDiscovery.id == scan_id,
+            SensitiveDataDiscovery.organization_id == getattr(current_user, "organization_id", None),
+        )
     )
     scan = result.scalar_one_or_none()
     if not scan:
@@ -759,12 +785,18 @@ async def create_incident(
         if incident_data.violation_ids:
             try:
                 first_violation_result = await db.execute(
-                    select(DLPViolation).where(DLPViolation.id == incident_data.violation_ids[0])
+                    select(DLPViolation).where(
+                        DLPViolation.id == incident_data.violation_ids[0],
+                        DLPViolation.organization_id == org_id,
+                    )
                 )
                 first_violation = first_violation_result.scalar_one_or_none()
                 if first_violation and first_violation.policy_id:
                     policy_result = await db.execute(
-                        select(DLPPolicy).where(DLPPolicy.id == first_violation.policy_id)
+                        select(DLPPolicy).where(
+                            DLPPolicy.id == first_violation.policy_id,
+                            DLPPolicy.organization_id == org_id,
+                        )
                     )
                     linked_policy = policy_result.scalar_one_or_none()
                     if linked_policy:
@@ -826,7 +858,7 @@ async def get_incident(
     db: DatabaseSession = None,
 ):
     """Get a DLP incident by ID"""
-    incident = await get_incident_or_404(db, incident_id)
+    incident = await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
     return convert_json_fields(incident)
 
 
@@ -838,7 +870,7 @@ async def update_incident(
     db: DatabaseSession = None,
 ):
     """Update a DLP incident"""
-    incident = await get_incident_or_404(db, incident_id)
+    incident = await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
 
     update_data = incident_data.model_dump(exclude_unset=True, exclude_none=True)
 
@@ -863,7 +895,7 @@ async def assess_breach(
     db: DatabaseSession = None,
 ):
     """Assess breach incident and determine regulatory obligations"""
-    incident = await get_incident_or_404(db, incident_id)
+    incident = await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
 
     assessment = assessor.assess_breach(
         {

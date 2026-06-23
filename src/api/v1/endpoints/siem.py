@@ -57,9 +57,12 @@ async def ingest_status(
     return status_info
 
 
-async def get_log_or_404(db: AsyncSession, log_id: str) -> LogEntry:
+async def get_log_or_404(db: AsyncSession, log_id: str, org_id: Optional[str] = None) -> LogEntry:
     """Get log entry by ID or raise 404"""
-    result = await db.execute(select(LogEntry).where(LogEntry.id == log_id))
+    stmt = select(LogEntry).where(LogEntry.id == log_id)
+    if org_id is not None:
+        stmt = stmt.where(LogEntry.organization_id == org_id)
+    result = await db.execute(stmt)
     log_entry = result.scalar_one_or_none()
     if not log_entry:
         raise HTTPException(
@@ -69,9 +72,12 @@ async def get_log_or_404(db: AsyncSession, log_id: str) -> LogEntry:
     return log_entry
 
 
-async def get_rule_or_404(db: AsyncSession, rule_id: str) -> DetectionRule:
+async def get_rule_or_404(db: AsyncSession, rule_id: str, org_id: Optional[str] = None) -> DetectionRule:
     """Get detection rule by ID or raise 404"""
-    result = await db.execute(select(DetectionRule).where(DetectionRule.id == rule_id))
+    stmt = select(DetectionRule).where(DetectionRule.id == rule_id)
+    if org_id is not None:
+        stmt = stmt.where(DetectionRule.organization_id == org_id)
+    result = await db.execute(stmt)
     rule = result.scalar_one_or_none()
     if not rule:
         raise HTTPException(
@@ -81,9 +87,12 @@ async def get_rule_or_404(db: AsyncSession, rule_id: str) -> DetectionRule:
     return rule
 
 
-async def get_correlation_or_404(db: AsyncSession, correlation_id: str) -> CorrelationEvent:
+async def get_correlation_or_404(db: AsyncSession, correlation_id: str, org_id: Optional[str] = None) -> CorrelationEvent:
     """Get correlation event by ID or raise 404"""
-    result = await db.execute(select(CorrelationEvent).where(CorrelationEvent.id == correlation_id))
+    stmt = select(CorrelationEvent).where(CorrelationEvent.id == correlation_id)
+    if org_id is not None:
+        stmt = stmt.where(CorrelationEvent.organization_id == org_id)
+    result = await db.execute(stmt)
     correlation = result.scalar_one_or_none()
     if not correlation:
         raise HTTPException(
@@ -93,9 +102,12 @@ async def get_correlation_or_404(db: AsyncSession, correlation_id: str) -> Corre
     return correlation
 
 
-async def get_source_or_404(db: AsyncSession, source_id: str) -> SIEMDataSource:
+async def get_source_or_404(db: AsyncSession, source_id: str, org_id: Optional[str] = None) -> SIEMDataSource:
     """Get data source by ID or raise 404"""
-    result = await db.execute(select(SIEMDataSource).where(SIEMDataSource.id == source_id))
+    stmt = select(SIEMDataSource).where(SIEMDataSource.id == source_id)
+    if org_id is not None:
+        stmt = stmt.where(SIEMDataSource.organization_id == org_id)
+    result = await db.execute(stmt)
     source = result.scalar_one_or_none()
     if not source:
         raise HTTPException(
@@ -650,7 +662,8 @@ async def get_log(
     db: DatabaseSession = None,
 ):
     """Get a log entry by ID"""
-    log_entry = await get_log_or_404(db, log_id)
+    org_id = getattr(current_user, "organization_id", None)
+    log_entry = await get_log_or_404(db, log_id, org_id)
     return LogEntryResponse.model_validate(log_entry)
 
 
@@ -761,7 +774,8 @@ async def get_rule(
     db: DatabaseSession = None,
 ):
     """Get a detection rule by ID"""
-    rule = await get_rule_or_404(db, rule_id)
+    org_id = getattr(current_user, "organization_id", None)
+    rule = await get_rule_or_404(db, rule_id, org_id)
     return DetectionRuleResponse.model_validate(rule)
 
 
@@ -773,7 +787,8 @@ async def update_rule(
     db: DatabaseSession = None,
 ):
     """Update a detection rule"""
-    rule = await get_rule_or_404(db, rule_id)
+    org_id = getattr(current_user, "organization_id", None)
+    rule = await get_rule_or_404(db, rule_id, org_id)
 
     update_data = rule_data.model_dump(exclude_unset=True, exclude_none=True)
 
@@ -802,7 +817,8 @@ async def delete_rule(
     db: DatabaseSession = None,
 ):
     """Delete a detection rule"""
-    rule = await get_rule_or_404(db, rule_id)
+    org_id = getattr(current_user, "organization_id", None)
+    rule = await get_rule_or_404(db, rule_id, org_id)
     await db.delete(rule)
     await db.flush()
 
@@ -834,7 +850,8 @@ async def test_rule(
     from src.siem.engine_manager import _build_yaml_from_logic
     from src.core.utils import safe_json_loads
 
-    rule = await get_rule_or_404(db, rule_id)
+    org_id = getattr(current_user, "organization_id", None)
+    rule = await get_rule_or_404(db, rule_id, org_id)
     sample_logs = test_data.get("sample_logs", []) or []
 
     # Build a one-rule engine instance loaded with this specific rule.
@@ -968,7 +985,8 @@ async def get_correlation(
     db: DatabaseSession = None,
 ):
     """Get a correlation event by ID"""
-    correlation = await get_correlation_or_404(db, correlation_id)
+    org_id = getattr(current_user, "organization_id", None)
+    correlation = await get_correlation_or_404(db, correlation_id, org_id)
     return CorrelationEventResponse.model_validate(correlation)
 
 
@@ -980,7 +998,8 @@ async def update_correlation_status(
     db: DatabaseSession = None,
 ):
     """Update correlation event status"""
-    correlation = await get_correlation_or_404(db, correlation_id)
+    org_id = getattr(current_user, "organization_id", None)
+    correlation = await get_correlation_or_404(db, correlation_id, org_id)
 
     if "status" in status_update:
         correlation.status = status_update["status"]
@@ -1044,7 +1063,8 @@ async def update_source(
     db: DatabaseSession = None,
 ):
     """Update a data source"""
-    source = await get_source_or_404(db, source_id)
+    org_id = getattr(current_user, "organization_id", None)
+    source = await get_source_or_404(db, source_id, org_id)
 
     source.name = source_data.name
     source.description = source_data.description
@@ -1066,7 +1086,8 @@ async def delete_source(
     db: DatabaseSession = None,
 ):
     """Delete a data source"""
-    source = await get_source_or_404(db, source_id)
+    org_id = getattr(current_user, "organization_id", None)
+    source = await get_source_or_404(db, source_id, org_id)
     await db.delete(source)
     await db.flush()
 
@@ -1128,7 +1149,11 @@ async def delete_saved_search(
 ):
     """Delete a saved search"""
     from src.siem.models import SavedSearch
-    result = await db.execute(select(SavedSearch).where(SavedSearch.id == search_id))
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(SavedSearch).where(SavedSearch.id == search_id)
+    if org_id is not None:
+        stmt = stmt.where(SavedSearch.organization_id == org_id)
+    result = await db.execute(stmt)
     search = result.scalar_one_or_none()
     if not search:
         raise HTTPException(status_code=404, detail="Saved search not found")
@@ -1144,13 +1169,19 @@ async def run_saved_search(
 ):
     """Execute a saved search and return results"""
     from src.siem.models import SavedSearch
-    result = await db.execute(select(SavedSearch).where(SavedSearch.id == search_id))
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(SavedSearch).where(SavedSearch.id == search_id)
+    if org_id is not None:
+        stmt = stmt.where(SavedSearch.organization_id == org_id)
+    result = await db.execute(stmt)
     search = result.scalar_one_or_none()
     if not search:
         raise HTTPException(status_code=404, detail="Saved search not found")
 
     # Execute the search query
     query = select(LogEntry)
+    if org_id is not None:
+        query = query.where(LogEntry.organization_id == org_id)
     if search.query:
         search_filter = f"%{search.query}%"
         query = query.where(
@@ -1320,7 +1351,8 @@ async def export_rule_yaml(
     db: DatabaseSession = None,
 ):
     """Export a detection rule as YAML"""
-    rule = await get_rule_or_404(db, rule_id)
+    org_id = getattr(current_user, "organization_id", None)
+    rule = await get_rule_or_404(db, rule_id, org_id)
 
     if rule.rule_yaml:
         return {"yaml": rule.rule_yaml, "title": rule.title}

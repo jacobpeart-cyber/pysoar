@@ -360,10 +360,11 @@ async def get_threat_intel_stats(
     """
     org_id = getattr(current_user, "organization_id", None)
 
-    # Build org filter - if no org_id, query all
+    # Build org filter - scope to the caller's organization when present.
     def org_filter(model):
-        # PySOAR is single-tenant per deployment; data is not org-scoped.
-        return True
+        if org_id is None:
+            return True
+        return model.organization_id == org_id
 
     total_indicators = (
         await db.execute(
@@ -470,7 +471,10 @@ async def lookup_ioc(
         )
 
     # Query matching indicators in the local DB
-    org_clause = True
+    org_id = getattr(current_user, "organization_id", None)
+    org_clause = (
+        ThreatIndicator.organization_id == org_id if org_id is not None else True
+    )
     query = select(ThreatIndicator).where(
         and_(
             org_clause,
@@ -672,6 +676,10 @@ async def list_threat_feeds(
     """
     query = select(ThreatFeed)
 
+    org_id = getattr(current_user, "organization_id", None)
+    if org_id is not None:
+        query = query.where(ThreatFeed.organization_id == org_id)
+
     if is_enabled is not None:
         query = query.where(ThreatFeed.is_enabled == is_enabled)
     if provider:
@@ -723,11 +731,11 @@ async def get_threat_feed(
     """
     Get threat feed details.
     """
-    result = await db.execute(
-        select(ThreatFeed).where(
-            ThreatFeed.id == feed_id
-        )
-    )
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(ThreatFeed).where(ThreatFeed.id == feed_id)
+    if org_id is not None:
+        stmt = stmt.where(ThreatFeed.organization_id == org_id)
+    result = await db.execute(stmt)
     feed = result.scalars().first()
     if not feed:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Feed not found")
@@ -748,11 +756,11 @@ async def update_threat_feed(
     """
     # Use current_user directly (admin check handled by dependency injection)
 
-    result = await db.execute(
-        select(ThreatFeed).where(
-            ThreatFeed.id == feed_id
-        )
-    )
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(ThreatFeed).where(ThreatFeed.id == feed_id)
+    if org_id is not None:
+        stmt = stmt.where(ThreatFeed.organization_id == org_id)
+    result = await db.execute(stmt)
     feed = result.scalars().first()
     if not feed:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Feed not found")
@@ -778,11 +786,11 @@ async def delete_threat_feed(
     """
     # Use current_user directly (admin check handled by dependency injection)
 
-    result = await db.execute(
-        select(ThreatFeed).where(
-            ThreatFeed.id == feed_id
-        )
-    )
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(ThreatFeed).where(ThreatFeed.id == feed_id)
+    if org_id is not None:
+        stmt = stmt.where(ThreatFeed.organization_id == org_id)
+    result = await db.execute(stmt)
     feed = result.scalars().first()
     if not feed:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Feed not found")
@@ -807,9 +815,11 @@ async def poll_threat_feed(
     the ingestion runs against its own session and writes real rows
     into ``threat_indicators``.
     """
-    result = await db.execute(
-        select(ThreatFeed).where(ThreatFeed.id == feed_id)
-    )
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(ThreatFeed).where(ThreatFeed.id == feed_id)
+    if org_id is not None:
+        stmt = stmt.where(ThreatFeed.organization_id == org_id)
+    result = await db.execute(stmt)
     feed = result.scalars().first()
     if not feed:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Feed not found")
@@ -910,17 +920,14 @@ async def register_builtin_feeds(
         },
     ]
 
+    org_id = getattr(current_user, "organization_id", None)
     registered_count = 0
     for feed_def in builtin_feeds:
         # Check if already registered
-        existing = await db.execute(
-            select(ThreatFeed).where(
-                and_(
-                    ThreatFeed.name == feed_def["name"],
-                    
-                )
-            )
-        )
+        existing_stmt = select(ThreatFeed).where(ThreatFeed.name == feed_def["name"])
+        if org_id is not None:
+            existing_stmt = existing_stmt.where(ThreatFeed.organization_id == org_id)
+        existing = await db.execute(existing_stmt)
         if existing.scalars().first():
             continue
 
@@ -945,11 +952,11 @@ async def get_feed_stats(
     """
     Get statistics for a threat feed.
     """
-    result = await db.execute(
-        select(ThreatFeed).where(
-            ThreatFeed.id == feed_id
-        )
-    )
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(ThreatFeed).where(ThreatFeed.id == feed_id)
+    if org_id is not None:
+        stmt = stmt.where(ThreatFeed.organization_id == org_id)
+    result = await db.execute(stmt)
     feed = result.scalars().first()
     if not feed:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Feed not found")
@@ -1074,6 +1081,10 @@ async def list_indicators(
     """
     query = select(ThreatIndicator)
 
+    org_id = getattr(current_user, "organization_id", None)
+    if org_id is not None:
+        query = query.where(ThreatIndicator.organization_id == org_id)
+
     if indicator_type:
         type_values = [t.strip() for t in indicator_type.split(",") if t.strip()]
         if len(type_values) == 1:
@@ -1140,11 +1151,11 @@ async def get_indicator(
     """
     Get a specific threat indicator.
     """
-    result = await db.execute(
-        select(ThreatIndicator).where(
-            ThreatIndicator.id == indicator_id
-        )
-    )
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(ThreatIndicator).where(ThreatIndicator.id == indicator_id)
+    if org_id is not None:
+        stmt = stmt.where(ThreatIndicator.organization_id == org_id)
+    result = await db.execute(stmt)
     indicator = result.scalars().first()
     if not indicator:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Indicator not found")
@@ -1161,11 +1172,11 @@ async def update_indicator(
     """
     Update a threat indicator.
     """
-    result = await db.execute(
-        select(ThreatIndicator).where(
-            ThreatIndicator.id == indicator_id
-        )
-    )
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(ThreatIndicator).where(ThreatIndicator.id == indicator_id)
+    if org_id is not None:
+        stmt = stmt.where(ThreatIndicator.organization_id == org_id)
+    result = await db.execute(stmt)
     indicator = result.scalars().first()
     if not indicator:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Indicator not found")
@@ -1187,11 +1198,11 @@ async def delete_indicator(
     """
     Delete a threat indicator.
     """
-    result = await db.execute(
-        select(ThreatIndicator).where(
-            ThreatIndicator.id == indicator_id
-        )
-    )
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(ThreatIndicator).where(ThreatIndicator.id == indicator_id)
+    if org_id is not None:
+        stmt = stmt.where(ThreatIndicator.organization_id == org_id)
+    result = await db.execute(stmt)
     indicator = result.scalars().first()
     if not indicator:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Indicator not found")
@@ -1209,11 +1220,11 @@ async def enrich_indicator(
     """
     Trigger enrichment for a threat indicator.
     """
-    result = await db.execute(
-        select(ThreatIndicator).where(
-            ThreatIndicator.id == indicator_id
-        )
-    )
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(ThreatIndicator).where(ThreatIndicator.id == indicator_id)
+    if org_id is not None:
+        stmt = stmt.where(ThreatIndicator.organization_id == org_id)
+    result = await db.execute(stmt)
     indicator = result.scalars().first()
     if not indicator:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Indicator not found")
@@ -1242,11 +1253,11 @@ async def whitelist_indicator(
     """
     Whitelist a threat indicator.
     """
-    result = await db.execute(
-        select(ThreatIndicator).where(
-            ThreatIndicator.id == indicator_id
-        )
-    )
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(ThreatIndicator).where(ThreatIndicator.id == indicator_id)
+    if org_id is not None:
+        stmt = stmt.where(ThreatIndicator.organization_id == org_id)
+    result = await db.execute(stmt)
     indicator = result.scalars().first()
     if not indicator:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Indicator not found")
@@ -1269,21 +1280,26 @@ async def get_indicator_timeline(
     Get the timeline/history for a threat indicator.
     """
     # Verify indicator exists and belongs to user's org
-    result = await db.execute(
-        select(ThreatIndicator).where(
-            ThreatIndicator.id == indicator_id
-        )
-    )
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(ThreatIndicator).where(ThreatIndicator.id == indicator_id)
+    if org_id is not None:
+        stmt = stmt.where(ThreatIndicator.organization_id == org_id)
+    result = await db.execute(stmt)
     indicator = result.scalars().first()
     if not indicator:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Indicator not found")
 
     # Get sightings as timeline events
-    sightings_result = await db.execute(
+    sightings_query = (
         select(IndicatorSighting)
         .where(IndicatorSighting.indicator_id == indicator_id)
         .order_by(desc(IndicatorSighting.created_at))
     )
+    if org_id is not None:
+        sightings_query = sightings_query.where(
+            IndicatorSighting.organization_id == org_id
+        )
+    sightings_result = await db.execute(sightings_query)
     sightings = sightings_result.scalars().all()
 
     timeline = []
@@ -1323,6 +1339,10 @@ async def advanced_search_indicators(
     Perform advanced search on threat indicators.
     """
     query = select(ThreatIndicator)
+
+    org_id = getattr(current_user, "organization_id", None)
+    if org_id is not None:
+        query = query.where(ThreatIndicator.organization_id == org_id)
 
     if search_request.query:
         query = query.where(
@@ -1372,9 +1392,13 @@ async def record_sighting(
     Record a new sighting for a threat indicator.
     """
     # Verify the indicator exists
-    result = await db.execute(
-        select(ThreatIndicator).where(ThreatIndicator.id == sighting_data.indicator_id)
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(ThreatIndicator).where(
+        ThreatIndicator.id == sighting_data.indicator_id
     )
+    if org_id is not None:
+        stmt = stmt.where(ThreatIndicator.organization_id == org_id)
+    result = await db.execute(stmt)
     indicator = result.scalars().first()
     if not indicator:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Indicator not found")
@@ -1408,11 +1432,11 @@ async def get_indicator_sightings(
     Get sightings for a specific threat indicator.
     """
     # Verify the indicator exists and belongs to user's org
-    ind_result = await db.execute(
-        select(ThreatIndicator).where(
-            ThreatIndicator.id == indicator_id
-        )
-    )
+    org_id = getattr(current_user, "organization_id", None)
+    ind_stmt = select(ThreatIndicator).where(ThreatIndicator.id == indicator_id)
+    if org_id is not None:
+        ind_stmt = ind_stmt.where(ThreatIndicator.organization_id == org_id)
+    ind_result = await db.execute(ind_stmt)
     if not ind_result.scalars().first():
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Indicator not found")
 
@@ -1423,6 +1447,8 @@ async def get_indicator_sightings(
         .offset((page - 1) * size)
         .limit(size)
     )
+    if org_id is not None:
+        query = query.where(IndicatorSighting.organization_id == org_id)
     result = await db.execute(query)
     sightings = result.scalars().all()
     return sightings
@@ -1469,6 +1495,10 @@ async def list_actors(
     """
     query = select(ThreatActor)
 
+    org_id = getattr(current_user, "organization_id", None)
+    if org_id is not None:
+        query = query.where(ThreatActor.organization_id == org_id)
+
     if search:
         query = query.where(
             or_(
@@ -1501,11 +1531,11 @@ async def get_actor(
     """
     Get threat actor details with associated campaigns and indicators.
     """
-    result = await db.execute(
-        select(ThreatActor).where(
-            ThreatActor.id == actor_id
-        )
-    )
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(ThreatActor).where(ThreatActor.id == actor_id)
+    if org_id is not None:
+        stmt = stmt.where(ThreatActor.organization_id == org_id)
+    result = await db.execute(stmt)
     actor = result.scalars().first()
     if not actor:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Actor not found")
@@ -1522,11 +1552,11 @@ async def update_actor(
     """
     Update a threat actor.
     """
-    result = await db.execute(
-        select(ThreatActor).where(
-            ThreatActor.id == actor_id
-        )
-    )
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(ThreatActor).where(ThreatActor.id == actor_id)
+    if org_id is not None:
+        stmt = stmt.where(ThreatActor.organization_id == org_id)
+    result = await db.execute(stmt)
     actor = result.scalars().first()
     if not actor:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Actor not found")
@@ -1548,11 +1578,11 @@ async def delete_actor(
     """
     Delete a threat actor.
     """
-    result = await db.execute(
-        select(ThreatActor).where(
-            ThreatActor.id == actor_id
-        )
-    )
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(ThreatActor).where(ThreatActor.id == actor_id)
+    if org_id is not None:
+        stmt = stmt.where(ThreatActor.organization_id == org_id)
+    result = await db.execute(stmt)
     actor = result.scalars().first()
     if not actor:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Actor not found")
@@ -1601,6 +1631,10 @@ async def list_campaigns(
     """
     query = select(ThreatCampaign)
 
+    org_id = getattr(current_user, "organization_id", None)
+    if org_id is not None:
+        query = query.where(ThreatCampaign.organization_id == org_id)
+
     if status:
         query = query.where(ThreatCampaign.status == status)
     if search:
@@ -1631,11 +1665,11 @@ async def get_campaign(
     """
     Get threat campaign details.
     """
-    result = await db.execute(
-        select(ThreatCampaign).where(
-            ThreatCampaign.id == campaign_id
-        )
-    )
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(ThreatCampaign).where(ThreatCampaign.id == campaign_id)
+    if org_id is not None:
+        stmt = stmt.where(ThreatCampaign.organization_id == org_id)
+    result = await db.execute(stmt)
     campaign = result.scalars().first()
     if not campaign:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Campaign not found")
@@ -1652,11 +1686,11 @@ async def update_campaign(
     """
     Update a threat campaign.
     """
-    result = await db.execute(
-        select(ThreatCampaign).where(
-            ThreatCampaign.id == campaign_id
-        )
-    )
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(ThreatCampaign).where(ThreatCampaign.id == campaign_id)
+    if org_id is not None:
+        stmt = stmt.where(ThreatCampaign.organization_id == org_id)
+    result = await db.execute(stmt)
     campaign = result.scalars().first()
     if not campaign:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Campaign not found")
@@ -1678,11 +1712,11 @@ async def delete_campaign(
     """
     Delete a threat campaign.
     """
-    result = await db.execute(
-        select(ThreatCampaign).where(
-            ThreatCampaign.id == campaign_id
-        )
-    )
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(ThreatCampaign).where(ThreatCampaign.id == campaign_id)
+    if org_id is not None:
+        stmt = stmt.where(ThreatCampaign.organization_id == org_id)
+    result = await db.execute(stmt)
     campaign = result.scalars().first()
     if not campaign:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Campaign not found")
@@ -1734,6 +1768,10 @@ async def list_reports(
     """
     query = select(IntelReport)
 
+    org_id = getattr(current_user, "organization_id", None)
+    if org_id is not None:
+        query = query.where(IntelReport.organization_id == org_id)
+
     if report_type:
         query = query.where(IntelReport.report_type == report_type)
     if status:
@@ -1766,11 +1804,11 @@ async def get_report(
     """
     Get a specific intel report.
     """
-    result = await db.execute(
-        select(IntelReport).where(
-            IntelReport.id == report_id
-        )
-    )
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(IntelReport).where(IntelReport.id == report_id)
+    if org_id is not None:
+        stmt = stmt.where(IntelReport.organization_id == org_id)
+    result = await db.execute(stmt)
     report = result.scalars().first()
     if not report:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Report not found")
@@ -1787,11 +1825,11 @@ async def update_report(
     """
     Update an intel report.
     """
-    result = await db.execute(
-        select(IntelReport).where(
-            IntelReport.id == report_id
-        )
-    )
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(IntelReport).where(IntelReport.id == report_id)
+    if org_id is not None:
+        stmt = stmt.where(IntelReport.organization_id == org_id)
+    result = await db.execute(stmt)
     report = result.scalars().first()
     if not report:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Report not found")
@@ -1813,11 +1851,11 @@ async def publish_report(
     """
     Publish an intel report.
     """
-    result = await db.execute(
-        select(IntelReport).where(
-            IntelReport.id == report_id
-        )
-    )
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(IntelReport).where(IntelReport.id == report_id)
+    if org_id is not None:
+        stmt = stmt.where(IntelReport.organization_id == org_id)
+    result = await db.execute(stmt)
     report = result.scalars().first()
     if not report:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Report not found")
@@ -1839,11 +1877,11 @@ async def delete_report(
     """
     Delete an intel report.
     """
-    result = await db.execute(
-        select(IntelReport).where(
-            IntelReport.id == report_id
-        )
-    )
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(IntelReport).where(IntelReport.id == report_id)
+    if org_id is not None:
+        stmt = stmt.where(IntelReport.organization_id == org_id)
+    result = await db.execute(stmt)
     report = result.scalars().first()
     if not report:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Report not found")
@@ -1865,38 +1903,59 @@ async def get_dashboard_stats(
     """
     Get threat intelligence dashboard statistics.
 
-    PySOAR is single-tenant per deployment — org_id filters removed so
-    every admin in the deployment sees the full platform data.
+    Scoped to the caller's organization so each tenant only sees its
+    own intel posture.
     """
+    org_id = getattr(current_user, "organization_id", None)
+
+    def _scope(stmt, model):
+        if org_id is not None:
+            return stmt.where(model.organization_id == org_id)
+        return stmt
+
     total_indicators = (
-        await db.execute(select(func.count(ThreatIndicator.id)))
+        await db.execute(_scope(select(func.count(ThreatIndicator.id)), ThreatIndicator))
     ).scalar() or 0
 
     active_indicators = (
         await db.execute(
-            select(func.count(ThreatIndicator.id)).where(ThreatIndicator.is_active == True)
+            _scope(
+                select(func.count(ThreatIndicator.id)).where(
+                    ThreatIndicator.is_active == True
+                ),
+                ThreatIndicator,
+            )
         )
     ).scalar() or 0
 
-    feeds_total = (await db.execute(select(func.count(ThreatFeed.id)))).scalar() or 0
+    feeds_total = (
+        await db.execute(_scope(select(func.count(ThreatFeed.id)), ThreatFeed))
+    ).scalar() or 0
 
     feeds_enabled = (
         await db.execute(
-            select(func.count(ThreatFeed.id)).where(ThreatFeed.is_enabled == True)
+            _scope(
+                select(func.count(ThreatFeed.id)).where(ThreatFeed.is_enabled == True),
+                ThreatFeed,
+            )
         )
     ).scalar() or 0
 
     # Indicators by type
     type_result = await db.execute(
-        select(ThreatIndicator.indicator_type, func.count(ThreatIndicator.id))
-        .group_by(ThreatIndicator.indicator_type)
+        _scope(
+            select(ThreatIndicator.indicator_type, func.count(ThreatIndicator.id)),
+            ThreatIndicator,
+        ).group_by(ThreatIndicator.indicator_type)
     )
     indicators_by_type = dict(type_result.all())
 
     # Indicators by severity
     severity_result = await db.execute(
-        select(ThreatIndicator.severity, func.count(ThreatIndicator.id))
-        .group_by(ThreatIndicator.severity)
+        _scope(
+            select(ThreatIndicator.severity, func.count(ThreatIndicator.id)),
+            ThreatIndicator,
+        ).group_by(ThreatIndicator.severity)
     )
     indicators_by_severity = dict(severity_result.all())
 
@@ -1905,21 +1964,29 @@ async def get_dashboard_stats(
     seven_days_ago = datetime.now(timezone.utc) - timedelta(days=7)
     recent_sightings = (
         await db.execute(
-            select(func.count(IndicatorSighting.id)).where(
-                IndicatorSighting.created_at >= seven_days_ago
+            _scope(
+                select(func.count(IndicatorSighting.id)).where(
+                    IndicatorSighting.created_at >= seven_days_ago
+                ),
+                IndicatorSighting,
             )
         )
     ).scalar() or 0
 
     # Actors tracked
     actors_tracked = (
-        await db.execute(select(func.count(ThreatActor.id)))
+        await db.execute(_scope(select(func.count(ThreatActor.id)), ThreatActor))
     ).scalar() or 0
 
     # Active campaigns
     active_campaigns = (
         await db.execute(
-            select(func.count(ThreatCampaign.id)).where(ThreatCampaign.status == "active")
+            _scope(
+                select(func.count(ThreatCampaign.id)).where(
+                    ThreatCampaign.status == "active"
+                ),
+                ThreatCampaign,
+            )
         )
     ).scalar() or 0
 
@@ -1960,6 +2027,10 @@ async def export_indicators(
         )
 
     query = select(ThreatIndicator)
+
+    org_id = getattr(current_user, "organization_id", None)
+    if org_id is not None:
+        query = query.where(ThreatIndicator.organization_id == org_id)
 
     if indicator_types:
         query = query.where(ThreatIndicator.indicator_type.in_(indicator_types))

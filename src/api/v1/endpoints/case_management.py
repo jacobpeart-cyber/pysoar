@@ -175,11 +175,14 @@ class TimelineCreate(BaseModel):
 # =============================================================================
 
 
-async def get_incident_or_404(db: AsyncSession, incident_id: str) -> Incident:
+async def get_incident_or_404(
+    db: AsyncSession, incident_id: str, org_id: Optional[str] = None
+) -> Incident:
     """Get incident by ID or raise 404"""
-    result = await db.execute(
-        select(Incident).where(Incident.id == incident_id)
-    )
+    stmt = select(Incident).where(Incident.id == incident_id)
+    if org_id is not None:
+        stmt = stmt.where(Incident.organization_id == org_id)
+    result = await db.execute(stmt)
     incident = result.scalar_one_or_none()
     if not incident:
         raise HTTPException(
@@ -228,7 +231,7 @@ async def list_notes(
     include_internal: bool = Query(default=True),
 ):
     """List all notes for an incident"""
-    await get_incident_or_404(db, incident_id)
+    await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
 
     query = (
         select(CaseNote)
@@ -273,7 +276,7 @@ async def create_note(
     current_user: CurrentUser = None,
 ):
     """Create a new note for an incident"""
-    await get_incident_or_404(db, incident_id)
+    await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
 
     # Validate note type
     valid_types = [t.value for t in NoteType]
@@ -329,7 +332,7 @@ async def update_note(
     current_user: CurrentUser = None,
 ):
     """Update a note"""
-    await get_incident_or_404(db, incident_id)
+    await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
 
     result = await db.execute(
         select(CaseNote)
@@ -388,7 +391,7 @@ async def delete_note(
     current_user: CurrentUser = None,
 ):
     """Delete a note"""
-    await get_incident_or_404(db, incident_id)
+    await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
 
     result = await db.execute(
         select(CaseNote).where(
@@ -428,7 +431,7 @@ async def list_tasks(
     assigned_to: Optional[str] = None,
 ):
     """List all tasks for an incident"""
-    await get_incident_or_404(db, incident_id)
+    await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
 
     query = (
         select(Task)
@@ -479,7 +482,7 @@ async def create_task(
     current_user: CurrentUser = None,
 ):
     """Create a new task for an incident"""
-    await get_incident_or_404(db, incident_id)
+    await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
 
     # Validate assignee if provided
     assignee = None
@@ -546,7 +549,7 @@ async def update_task(
     current_user: CurrentUser = None,
 ):
     """Update a task"""
-    await get_incident_or_404(db, incident_id)
+    await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
 
     result = await db.execute(
         select(Task)
@@ -618,7 +621,7 @@ async def delete_task(
     current_user: CurrentUser = None,
 ):
     """Delete a task"""
-    await get_incident_or_404(db, incident_id)
+    await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
 
     result = await db.execute(
         select(Task).where(Task.id == task_id, Task.incident_id == incident_id)
@@ -649,7 +652,7 @@ async def list_attachments(
     current_user: CurrentUser = None,
 ):
     """List all attachments for an incident"""
-    await get_incident_or_404(db, incident_id)
+    await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
 
     result = await db.execute(
         select(CaseAttachment)
@@ -694,7 +697,7 @@ async def upload_attachment(
     description: Optional[str] = Form(default=None),
 ):
     """Upload an attachment for an incident"""
-    await get_incident_or_404(db, incident_id)
+    await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
 
     # Validate attachment type
     valid_types = [t.value for t in AttachmentType]
@@ -803,7 +806,7 @@ async def download_attachment(
     """
     from fastapi.responses import FileResponse
 
-    await get_incident_or_404(db, incident_id)
+    await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
 
     result = await db.execute(
         select(CaseAttachment).where(
@@ -843,7 +846,7 @@ async def delete_attachment(
     current_user: CurrentUser = None,
 ):
     """Delete an attachment"""
-    await get_incident_or_404(db, incident_id)
+    await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
 
     result = await db.execute(
         select(CaseAttachment).where(
@@ -888,7 +891,7 @@ async def get_timeline(
     limit: int = Query(default=50, ge=1, le=200),
 ):
     """Get timeline events for an incident"""
-    await get_incident_or_404(db, incident_id)
+    await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
 
     query = (
         select(CaseTimeline)
@@ -934,7 +937,7 @@ async def create_timeline_event(
     current_user: CurrentUser = None,
 ):
     """Create a custom timeline event"""
-    await get_incident_or_404(db, incident_id)
+    await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
 
     event = await add_timeline_event(
         db=db,

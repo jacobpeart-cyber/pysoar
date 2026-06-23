@@ -103,15 +103,19 @@ executor = ActionExecutor()
 
 # Helper functions
 async def get_installed_integration_or_404(
-    integration_id: str,
     db: AsyncSession,
+    integration_id: str,
+    org_id: Optional[str] = None,
 ) -> InstalledIntegration:
     """Get installed integration by ID or raise 404"""
-    result = await db.execute(
+    stmt = (
         select(InstalledIntegration)
         .options(selectinload(InstalledIntegration.connector))
-        .where(InstalledIntegration.id == integration_id),
+        .where(InstalledIntegration.id == integration_id)
     )
+    if org_id is not None:
+        stmt = stmt.where(InstalledIntegration.organization_id == org_id)
+    result = await db.execute(stmt)
     integration = result.scalar_one_or_none()
     if not integration:
         raise HTTPException(
@@ -122,13 +126,23 @@ async def get_installed_integration_or_404(
 
 
 async def get_action_or_404(
-    action_id: str,
     db: AsyncSession,
+    action_id: str,
+    connector_id: Optional[str] = None,
 ) -> IntegrationAction:
-    """Get action by ID or raise 404"""
-    result = await db.execute(
-        select(IntegrationAction).where(IntegrationAction.id == action_id),
-    )
+    """Get action by ID or raise 404.
+
+    IntegrationAction is a global, connector-scoped definition with no
+    own ``organization_id`` column. Tenant isolation is enforced by the
+    caller resolving the action through an org-scoped InstalledIntegration
+    and passing that integration's ``connector_id`` here, so an action
+    belonging to a different connector can't be executed against this
+    install.
+    """
+    stmt = select(IntegrationAction).where(IntegrationAction.id == action_id)
+    if connector_id is not None:
+        stmt = stmt.where(IntegrationAction.connector_id == connector_id)
+    result = await db.execute(stmt)
     action = result.scalar_one_or_none()
     if not action:
         raise HTTPException(
@@ -381,7 +395,9 @@ async def get_installed_integration(
     integration_id: str = Path(...),
 ):
     """Get details of installed integration"""
-    integration = await get_installed_integration_or_404(db, integration_id)
+    integration = await get_installed_integration_or_404(
+        db, integration_id, getattr(current_user, "organization_id", None)
+    )
 
     # Check authorization
     if integration.organization_id != getattr(current_user, "organization_id", None):
@@ -415,7 +431,9 @@ async def update_installed_integration(
     integration_id: str = Path(...),
 ):
     """Update installed integration configuration"""
-    integration = await get_installed_integration_or_404(db, integration_id)
+    integration = await get_installed_integration_or_404(
+        db, integration_id, getattr(current_user, "organization_id", None)
+    )
 
     # Check authorization
     if integration.organization_id != getattr(current_user, "organization_id", None):
@@ -459,7 +477,9 @@ async def test_integration(
     integration_id: str = Path(...),
 ):
     """Test connection to installed integration"""
-    integration = await get_installed_integration_or_404(db, integration_id)
+    integration = await get_installed_integration_or_404(
+        db, integration_id, getattr(current_user, "organization_id", None)
+    )
 
     # Check authorization
     if integration.organization_id != getattr(current_user, "organization_id", None):
@@ -531,7 +551,9 @@ async def enable_integration(
     integration_id: str = Path(...),
 ):
     """Enable integration"""
-    integration = await get_installed_integration_or_404(db, integration_id)
+    integration = await get_installed_integration_or_404(
+        db, integration_id, getattr(current_user, "organization_id", None)
+    )
 
     # Check authorization
     if integration.organization_id != getattr(current_user, "organization_id", None):
@@ -562,7 +584,9 @@ async def disable_integration(
     integration_id: str = Path(...),
 ):
     """Disable integration"""
-    integration = await get_installed_integration_or_404(db, integration_id)
+    integration = await get_installed_integration_or_404(
+        db, integration_id, getattr(current_user, "organization_id", None)
+    )
 
     # Check authorization
     if integration.organization_id != getattr(current_user, "organization_id", None):
@@ -593,7 +617,9 @@ async def uninstall_integration(
     integration_id: str = Path(...),
 ):
     """Uninstall integration"""
-    integration = await get_installed_integration_or_404(db, integration_id)
+    integration = await get_installed_integration_or_404(
+        db, integration_id, getattr(current_user, "organization_id", None)
+    )
 
     # Check authorization
     if integration.organization_id != getattr(current_user, "organization_id", None):
@@ -616,7 +642,9 @@ async def list_integration_actions(
     size: int = Query(20, ge=1, le=100),
 ):
     """List available actions for integration"""
-    integration = await get_installed_integration_or_404(db, integration_id)
+    integration = await get_installed_integration_or_404(
+        db, integration_id, getattr(current_user, "organization_id", None)
+    )
 
     # Check authorization
     if integration.organization_id != getattr(current_user, "organization_id", None):
@@ -687,7 +715,9 @@ async def execute_action(
     action_id: str = Path(...),
 ):
     """Execute an integration action"""
-    integration = await get_installed_integration_or_404(db, integration_id)
+    integration = await get_installed_integration_or_404(
+        db, integration_id, getattr(current_user, "organization_id", None)
+    )
 
     # Check authorization
     if integration.organization_id != getattr(current_user, "organization_id", None):
@@ -696,8 +726,9 @@ async def execute_action(
             detail="Access denied",
         )
 
-    # Get action
-    action = await get_action_or_404(db, action_id)
+    # Get action — scoped to the installed integration's connector so an
+    # action belonging to a different connector can't be executed here.
+    action = await get_action_or_404(db, action_id, integration.connector_id)
 
     # Execute action
     execution_result = await executor.execute_action(
@@ -756,7 +787,9 @@ async def get_execution_history(
     status: Optional[str] = None,
 ):
     """Get execution history for integration"""
-    integration = await get_installed_integration_or_404(db, integration_id)
+    integration = await get_installed_integration_or_404(
+        db, integration_id, getattr(current_user, "organization_id", None)
+    )
 
     # Check authorization
     if integration.organization_id != getattr(current_user, "organization_id", None):
@@ -831,7 +864,9 @@ async def register_webhook(
     integration_id: str = Path(...),
 ):
     """Register webhook for integration"""
-    integration = await get_installed_integration_or_404(db, integration_id)
+    integration = await get_installed_integration_or_404(
+        db, integration_id, getattr(current_user, "organization_id", None)
+    )
 
     # Check authorization
     if integration.organization_id != getattr(current_user, "organization_id", None):
@@ -881,7 +916,9 @@ async def list_webhooks(
     size: int = Query(20, ge=1, le=100),
 ):
     """List webhooks for integration"""
-    integration = await get_installed_integration_or_404(db, integration_id)
+    integration = await get_installed_integration_or_404(
+        db, integration_id, getattr(current_user, "organization_id", None)
+    )
 
     # Check authorization
     if integration.organization_id != getattr(current_user, "organization_id", None):
@@ -951,7 +988,9 @@ async def test_webhook(
     ``last_received`` / ``received_count`` counters. Returns the synthetic
     payload so the UI can display what was fired.
     """
-    integration = await get_installed_integration_or_404(db, integration_id)
+    integration = await get_installed_integration_or_404(
+        db, integration_id, getattr(current_user, "organization_id", None)
+    )
     if integration.organization_id != getattr(current_user, "organization_id", None):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -1007,7 +1046,9 @@ async def delete_webhook(
     webhook_id: str = Path(...),
 ):
     """Delete webhook"""
-    integration = await get_installed_integration_or_404(db, integration_id)
+    integration = await get_installed_integration_or_404(
+        db, integration_id, getattr(current_user, "organization_id", None)
+    )
 
     # Check authorization
     if integration.organization_id != getattr(current_user, "organization_id", None):
@@ -1016,9 +1057,15 @@ async def delete_webhook(
             detail="Access denied",
         )
 
-    # Get webhook
+    # Get webhook — scoped to this installed integration so a webhook
+    # belonging to another tenant's install can't be deleted by id.
     result = await db.execute(
-        select(WebhookEndpoint).where(WebhookEndpoint.id == webhook_id),
+        select(WebhookEndpoint).where(
+            and_(
+                WebhookEndpoint.id == webhook_id,
+                WebhookEndpoint.installed_id == integration_id,
+            )
+        ),
     )
     webhook = result.scalar_one_or_none()
     if not webhook:

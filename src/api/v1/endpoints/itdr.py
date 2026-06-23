@@ -67,11 +67,14 @@ logger = get_logger(__name__)
 router = APIRouter(prefix="/itdr", tags=["ITDR"])
 
 
-async def get_identity_or_404(db: AsyncSession, identity_id: str) -> IdentityProfile:
+async def get_identity_or_404(
+    db: AsyncSession, identity_id: str, org_id: Optional[str] = None
+) -> IdentityProfile:
     """Get identity profile by ID or raise 404"""
-    result = await db.execute(
-        select(IdentityProfile).where(IdentityProfile.id == identity_id)
-    )
+    stmt = select(IdentityProfile).where(IdentityProfile.id == identity_id)
+    if org_id is not None:
+        stmt = stmt.where(IdentityProfile.organization_id == org_id)
+    result = await db.execute(stmt)
     identity = result.scalar_one_or_none()
     if not identity:
         raise HTTPException(
@@ -81,11 +84,14 @@ async def get_identity_or_404(db: AsyncSession, identity_id: str) -> IdentityPro
     return identity
 
 
-async def get_threat_or_404(db: AsyncSession, threat_id: str) -> IdentityThreat:
+async def get_threat_or_404(
+    db: AsyncSession, threat_id: str, org_id: Optional[str] = None
+) -> IdentityThreat:
     """Get identity threat by ID or raise 404"""
-    result = await db.execute(
-        select(IdentityThreat).where(IdentityThreat.id == threat_id)
-    )
+    stmt = select(IdentityThreat).where(IdentityThreat.id == threat_id)
+    if org_id is not None:
+        stmt = stmt.where(IdentityThreat.organization_id == org_id)
+    result = await db.execute(stmt)
     threat = result.scalar_one_or_none()
     if not threat:
         raise HTTPException(
@@ -177,7 +183,9 @@ async def get_identity(
     db: DatabaseSession = None,
 ):
     """Get identity profile details"""
-    identity = await get_identity_or_404(db, identity_id)
+    identity = await get_identity_or_404(
+        db, identity_id, getattr(current_user, "organization_id", None)
+    )
     return IdentityProfileResponse.model_validate(identity)
 
 
@@ -207,7 +215,9 @@ async def update_identity(
     db: DatabaseSession = None,
 ):
     """Update identity profile"""
-    identity = await get_identity_or_404(db, identity_id)
+    identity = await get_identity_or_404(
+        db, identity_id, getattr(current_user, "organization_id", None)
+    )
     update_data = data.dict(exclude_unset=True)
     for field, value in update_data.items():
         setattr(identity, field, value)
@@ -224,7 +234,9 @@ async def get_identity_risk_score(
     db: DatabaseSession = None,
 ):
     """Get identity risk score breakdown"""
-    identity = await get_identity_or_404(db, identity_id)
+    identity = await get_identity_or_404(
+        db, identity_id, getattr(current_user, "organization_id", None)
+    )
 
     # Count threats
     threat_result = await db.execute(
@@ -345,7 +357,9 @@ async def get_threat(
     db: DatabaseSession = None,
 ):
     """Get identity threat details"""
-    threat = await get_threat_or_404(db, threat_id)
+    threat = await get_threat_or_404(
+        db, threat_id, getattr(current_user, "organization_id", None)
+    )
     return IdentityThreatResponse.model_validate(threat)
 
 
@@ -393,7 +407,9 @@ async def update_threat(
     db: DatabaseSession = None,
 ):
     """Update identity threat status and details"""
-    threat = await get_threat_or_404(db, threat_id)
+    threat = await get_threat_or_404(
+        db, threat_id, getattr(current_user, "organization_id", None)
+    )
     update_data = data.dict(exclude_unset=True)
     for field, value in update_data.items():
         setattr(threat, field, value)
@@ -411,7 +427,9 @@ async def investigate_threat(
     db: DatabaseSession = None,
 ):
     """Start threat investigation"""
-    threat = await get_threat_or_404(db, threat_id)
+    threat = await get_threat_or_404(
+        db, threat_id, getattr(current_user, "organization_id", None)
+    )
     threat.status = "investigating"
     await db.commit()
     await db.refresh(threat)
@@ -450,8 +468,8 @@ async def respond_to_threat(
     from src.services.agent_tools import AgentToolRegistry
     import json as _json
 
-    threat = await get_threat_or_404(db, threat_id)
     org_id = getattr(current_user, "organization_id", None)
+    threat = await get_threat_or_404(db, threat_id, org_id)
     action = (data.action_type or "contain").lower()
 
     registry = AgentToolRegistry(db)
@@ -460,7 +478,13 @@ async def respond_to_threat(
 
     identity_row = None
     try:
-        identity_row = await db.get(IdentityProfile, threat.identity_id)
+        if threat.identity_id:
+            id_stmt = select(IdentityProfile).where(
+                IdentityProfile.id == threat.identity_id
+            )
+            if org_id is not None:
+                id_stmt = id_stmt.where(IdentityProfile.organization_id == org_id)
+            identity_row = (await db.execute(id_stmt)).scalar_one_or_none()
     except Exception:
         identity_row = None
     username = getattr(identity_row, "username", None)
@@ -811,9 +835,11 @@ async def get_exposure(
     db: DatabaseSession = None,
 ):
     """Get credential exposure details"""
-    result = await db.execute(
-        select(CredentialExposure).where(CredentialExposure.id == exposure_id)
-    )
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(CredentialExposure).where(CredentialExposure.id == exposure_id)
+    if org_id is not None:
+        stmt = stmt.where(CredentialExposure.organization_id == org_id)
+    result = await db.execute(stmt)
     exposure = result.scalar_one_or_none()
     if not exposure:
         raise HTTPException(
@@ -842,8 +868,8 @@ async def check_credential_exposure(
     """
     from src.darkweb.models import CredentialLeak
 
-    identity = await get_identity_or_404(db, identity_id)
     org_id = getattr(current_user, "organization_id", None)
+    identity = await get_identity_or_404(db, identity_id, org_id)
 
     # Match leaks by email OR username (case-insensitive)
     email = (identity.email or "").lower()
@@ -1075,9 +1101,11 @@ async def get_anomaly(
     db: DatabaseSession = None,
 ):
     """Get access anomaly details"""
-    result = await db.execute(
-        select(AccessAnomaly).where(AccessAnomaly.id == anomaly_id)
-    )
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(AccessAnomaly).where(AccessAnomaly.id == anomaly_id)
+    if org_id is not None:
+        stmt = stmt.where(AccessAnomaly.organization_id == org_id)
+    result = await db.execute(stmt)
     anomaly = result.scalar_one_or_none()
     if not anomaly:
         raise HTTPException(
@@ -1095,9 +1123,11 @@ async def review_anomaly(
     db: DatabaseSession = None,
 ):
     """Review anomaly as legitimate or suspicious"""
-    result = await db.execute(
-        select(AccessAnomaly).where(AccessAnomaly.id == anomaly_id)
-    )
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(AccessAnomaly).where(AccessAnomaly.id == anomaly_id)
+    if org_id is not None:
+        stmt = stmt.where(AccessAnomaly.organization_id == org_id)
+    result = await db.execute(stmt)
     anomaly = result.scalar_one_or_none()
     if not anomaly:
         raise HTTPException(
@@ -1187,7 +1217,9 @@ async def request_elevation(
     db: DatabaseSession = None,
 ):
     """Request privilege elevation"""
-    identity = await get_identity_or_404(db, data.identity_id)
+    identity = await get_identity_or_404(
+        db, data.identity_id, getattr(current_user, "organization_id", None)
+    )
 
     event = PrivilegedAccessEvent(
         organization_id=getattr(current_user, "organization_id", None),
@@ -1218,9 +1250,11 @@ async def approve_elevation(
     db: DatabaseSession = None,
 ):
     """Approve privilege elevation request"""
-    result = await db.execute(
-        select(PrivilegedAccessEvent).where(PrivilegedAccessEvent.id == event_id)
-    )
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(PrivilegedAccessEvent).where(PrivilegedAccessEvent.id == event_id)
+    if org_id is not None:
+        stmt = stmt.where(PrivilegedAccessEvent.organization_id == org_id)
+    result = await db.execute(stmt)
     event = result.scalar_one_or_none()
     if not event:
         raise HTTPException(
@@ -1253,9 +1287,11 @@ async def revoke_access(
     db: DatabaseSession = None,
 ):
     """Revoke privileged access"""
-    result = await db.execute(
-        select(PrivilegedAccessEvent).where(PrivilegedAccessEvent.id == event_id)
-    )
+    org_id = getattr(current_user, "organization_id", None)
+    stmt = select(PrivilegedAccessEvent).where(PrivilegedAccessEvent.id == event_id)
+    if org_id is not None:
+        stmt = stmt.where(PrivilegedAccessEvent.organization_id == org_id)
+    result = await db.execute(stmt)
     event = result.scalar_one_or_none()
     if not event:
         raise HTTPException(
