@@ -64,11 +64,14 @@ router = APIRouter(prefix="/darkweb", tags=["Dark Web Monitoring"])
 logger = get_logger(__name__)
 
 
-async def get_monitor_or_404(db: AsyncSession, monitor_id: str) -> DarkWebMonitor:
+async def get_monitor_or_404(
+    db: AsyncSession, monitor_id: str, org_id: Optional[str] = None
+) -> DarkWebMonitor:
     """Get monitor by ID or raise 404"""
-    result = await db.execute(
-        select(DarkWebMonitor).where(DarkWebMonitor.id == monitor_id)
-    )
+    stmt = select(DarkWebMonitor).where(DarkWebMonitor.id == monitor_id)
+    if org_id is not None:
+        stmt = stmt.where(DarkWebMonitor.organization_id == org_id)
+    result = await db.execute(stmt)
     monitor = result.scalar_one_or_none()
     if not monitor:
         raise HTTPException(
@@ -78,11 +81,14 @@ async def get_monitor_or_404(db: AsyncSession, monitor_id: str) -> DarkWebMonito
     return monitor
 
 
-async def get_finding_or_404(db: AsyncSession, finding_id: str) -> DarkWebFinding:
+async def get_finding_or_404(
+    db: AsyncSession, finding_id: str, org_id: Optional[str] = None
+) -> DarkWebFinding:
     """Get finding by ID or raise 404"""
-    result = await db.execute(
-        select(DarkWebFinding).where(DarkWebFinding.id == finding_id)
-    )
+    stmt = select(DarkWebFinding).where(DarkWebFinding.id == finding_id)
+    if org_id is not None:
+        stmt = stmt.where(DarkWebFinding.organization_id == org_id)
+    result = await db.execute(stmt)
     finding = result.scalar_one_or_none()
     if not finding:
         raise HTTPException(
@@ -92,11 +98,14 @@ async def get_finding_or_404(db: AsyncSession, finding_id: str) -> DarkWebFindin
     return finding
 
 
-async def get_credential_or_404(db: AsyncSession, credential_id: str) -> CredentialLeak:
+async def get_credential_or_404(
+    db: AsyncSession, credential_id: str, org_id: Optional[str] = None
+) -> CredentialLeak:
     """Get credential leak by ID or raise 404"""
-    result = await db.execute(
-        select(CredentialLeak).where(CredentialLeak.id == credential_id)
-    )
+    stmt = select(CredentialLeak).where(CredentialLeak.id == credential_id)
+    if org_id is not None:
+        stmt = stmt.where(CredentialLeak.organization_id == org_id)
+    result = await db.execute(stmt)
     credential = result.scalar_one_or_none()
     if not credential:
         raise HTTPException(
@@ -202,10 +211,9 @@ async def get_monitor(
     monitor_id: str = Path(...),
 ):
     """Get monitor by ID"""
-    monitor = await get_monitor_or_404(db, monitor_id)
-
-    if monitor.organization_id != getattr(current_user, "organization_id", None):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    monitor = await get_monitor_or_404(
+        db, monitor_id, getattr(current_user, "organization_id", None)
+    )
 
     return DarkWebMonitorResponse.model_validate(monitor)
 
@@ -218,10 +226,9 @@ async def update_monitor(
     monitor_id: str = Path(...),
 ):
     """Update monitor configuration"""
-    monitor = await get_monitor_or_404(db, monitor_id)
-
-    if monitor.organization_id != getattr(current_user, "organization_id", None):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    monitor = await get_monitor_or_404(
+        db, monitor_id, getattr(current_user, "organization_id", None)
+    )
 
     # Update fields
     if update.name is not None:
@@ -256,10 +263,9 @@ async def delete_monitor(
     monitor_id: str = Path(...),
 ):
     """Delete monitor"""
-    monitor = await get_monitor_or_404(db, monitor_id)
-
-    if monitor.organization_id != getattr(current_user, "organization_id", None):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    monitor = await get_monitor_or_404(
+        db, monitor_id, getattr(current_user, "organization_id", None)
+    )
 
     await db.delete(monitor)
     await db.commit()
@@ -299,11 +305,8 @@ async def trigger_monitor_scan(
     from src.darkweb.engine import DarkWebScanner
     import hashlib as _hashlib
 
-    monitor = await get_monitor_or_404(db, monitor_id)
     org_id = getattr(current_user, "organization_id", None)
-
-    if monitor.organization_id != org_id:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    monitor = await get_monitor_or_404(db, monitor_id, org_id)
 
     start_time = datetime.now(timezone.utc)
     logger.info(f"Running inline dark web scan for monitor: {monitor_id}")
@@ -570,10 +573,9 @@ async def get_finding(
     finding_id: str = Path(...),
 ):
     """Get finding details with related data"""
-    finding = await get_finding_or_404(db, finding_id)
-
-    if finding.organization_id != getattr(current_user, "organization_id", None):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    finding = await get_finding_or_404(
+        db, finding_id, getattr(current_user, "organization_id", None)
+    )
 
     return DarkWebFindingDetailResponse.model_validate(finding)
 
@@ -586,10 +588,9 @@ async def update_finding(
     finding_id: str = Path(...),
 ):
     """Update finding status and notes"""
-    finding = await get_finding_or_404(db, finding_id)
-
-    if finding.organization_id != getattr(current_user, "organization_id", None):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    finding = await get_finding_or_404(
+        db, finding_id, getattr(current_user, "organization_id", None)
+    )
 
     if update.status is not None:
         finding.status = update.status
@@ -623,16 +624,17 @@ async def escalate_finding(
     """
     from src.models.incident import Incident
     from src.models.base import generate_uuid, utc_now
-    finding = await get_finding_or_404(db, finding_id)
-
-    if finding.organization_id != getattr(current_user, "organization_id", None):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    org_id = getattr(current_user, "organization_id", None)
+    finding = await get_finding_or_404(db, finding_id, org_id)
 
     # Idempotency: if already escalated and an Incident exists for this
     # finding, return the existing incident rather than creating a dup.
     existing = (await db.execute(
         select(Incident).where(
-            Incident.external_id == f"darkweb:{finding_id}"
+            and_(
+                Incident.external_id == f"darkweb:{finding_id}",
+                Incident.organization_id == org_id,
+            )
         )
     )).scalar_one_or_none()
     if existing is not None:
@@ -691,9 +693,9 @@ async def notify_stakeholders(
     """
     from src.services.notifications import send_incident_notifications
 
-    finding = await get_finding_or_404(db, finding_id)
-    if finding.organization_id != getattr(current_user, "organization_id", None):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    finding = await get_finding_or_404(
+        db, finding_id, getattr(current_user, "organization_id", None)
+    )
 
     event = {
         "title": f"Dark Web: {finding.title or finding.finding_type}",
@@ -851,10 +853,9 @@ async def update_credential(
     credential_id: str = Path(...),
 ):
     """Update credential leak remediation status"""
-    credential = await get_credential_or_404(db, credential_id)
-
-    if credential.organization_id != getattr(current_user, "organization_id", None):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    credential = await get_credential_or_404(
+        db, credential_id, getattr(current_user, "organization_id", None)
+    )
 
     if update.is_valid is not None:
         credential.is_valid = update.is_valid
@@ -985,15 +986,17 @@ async def update_brand_threat(
 ):
     """Update brand threat takedown status"""
     result = await db.execute(
-        select(BrandThreat).where(BrandThreat.id == threat_id)
+        select(BrandThreat).where(
+            and_(
+                BrandThreat.id == threat_id,
+                BrandThreat.organization_id == getattr(current_user, "organization_id", None),
+            )
+        )
     )
     threat = result.scalar_one_or_none()
 
     if not threat:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-
-    if threat.organization_id != getattr(current_user, "organization_id", None):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
 
     if update.takedown_status is not None:
         threat.takedown_status = update.takedown_status
@@ -1015,15 +1018,17 @@ async def initiate_takedown(
 ):
     """Initiate takedown for brand threat"""
     result = await db.execute(
-        select(BrandThreat).where(BrandThreat.id == threat_id)
+        select(BrandThreat).where(
+            and_(
+                BrandThreat.id == threat_id,
+                BrandThreat.organization_id == getattr(current_user, "organization_id", None),
+            )
+        )
     )
     threat = result.scalar_one_or_none()
 
     if not threat:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-
-    if threat.organization_id != getattr(current_user, "organization_id", None):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
 
     # Queue background task
     background_tasks.add_task(

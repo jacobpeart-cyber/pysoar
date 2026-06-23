@@ -87,9 +87,14 @@ def ioc_to_response(ioc: ThreatIndicator) -> IOCResponse:
     )
 
 
-async def get_ioc_or_404(db: AsyncSession, ioc_id: str) -> ThreatIndicator:
+async def get_ioc_or_404(
+    db: AsyncSession, ioc_id: str, org_id: Optional[str] = None
+) -> ThreatIndicator:
     """Get IOC by ID or raise 404."""
-    result = await db.execute(select(ThreatIndicator).where(ThreatIndicator.id == ioc_id))
+    stmt = select(ThreatIndicator).where(ThreatIndicator.id == ioc_id)
+    if org_id is not None:
+        stmt = stmt.where(ThreatIndicator.organization_id == org_id)
+    result = await db.execute(stmt)
     ioc = result.scalar_one_or_none()
     if not ioc:
         raise HTTPException(
@@ -297,7 +302,7 @@ async def get_ioc(
     db: DatabaseSession = None,
 ):
     """Get an IOC by ID."""
-    ioc = await get_ioc_or_404(db, ioc_id)
+    ioc = await get_ioc_or_404(db, ioc_id, getattr(current_user, "organization_id", None))
     return ioc_to_response(ioc)
 
 
@@ -309,7 +314,7 @@ async def update_ioc(
     db: DatabaseSession = None,
 ):
     """Update an IOC."""
-    ioc = await get_ioc_or_404(db, ioc_id)
+    ioc = await get_ioc_or_404(db, ioc_id, getattr(current_user, "organization_id", None))
 
     update_data = ioc_data.model_dump(exclude_unset=True, exclude_none=True)
     ctx = dict(ioc.context) if isinstance(ioc.context, dict) else {}
@@ -351,7 +356,7 @@ async def delete_ioc(
     db: DatabaseSession = None,
 ):
     """Delete an IOC."""
-    ioc = await get_ioc_or_404(db, ioc_id)
+    ioc = await get_ioc_or_404(db, ioc_id, getattr(current_user, "organization_id", None))
     await db.delete(ioc)
     await db.flush()
 
@@ -392,7 +397,7 @@ async def enrich_ioc(
     means "look for other rows with the same value across different feeds
     and fold their context together."
     """
-    ioc = await get_ioc_or_404(db, ioc_id)
+    ioc = await get_ioc_or_404(db, ioc_id, getattr(current_user, "organization_id", None))
 
     sibling_result = await db.execute(
         select(ThreatIndicator).where(

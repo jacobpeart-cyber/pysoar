@@ -720,10 +720,12 @@ async def escalate_alert(
     created_new = False
 
     if incident_id:
-        # Link to an existing incident — verify it exists
-        inc_result = await db.execute(
-            select(Incident).where(Incident.id == incident_id)
-        )
+        # Link to an existing incident — verify it exists and belongs
+        # to the caller's organization (cross-tenant IDOR guard).
+        inc_stmt = select(Incident).where(Incident.id == incident_id)
+        if org_id is not None:
+            inc_stmt = inc_stmt.where(Incident.organization_id == org_id)
+        inc_result = await db.execute(inc_stmt)
         target_incident = inc_result.scalar_one_or_none()
         if not target_incident:
             raise HTTPException(

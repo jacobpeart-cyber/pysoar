@@ -47,11 +47,14 @@ from src.schemas.hunting import (
 router = APIRouter(prefix="/hunting", tags=["hunting"])
 
 
-async def get_hypothesis_or_404(db: AsyncSession, hypothesis_id: str) -> HuntHypothesis:
-    """Get hypothesis by ID or raise 404"""
-    result = await db.execute(
-        select(HuntHypothesis).where(HuntHypothesis.id == hypothesis_id)
-    )
+async def get_hypothesis_or_404(
+    db: AsyncSession, hypothesis_id: str, org_id: Optional[str] = None
+) -> HuntHypothesis:
+    """Get hypothesis by ID or raise 404 (org-scoped when org_id given)"""
+    stmt = select(HuntHypothesis).where(HuntHypothesis.id == hypothesis_id)
+    if org_id is not None:
+        stmt = stmt.where(HuntHypothesis.organization_id == org_id)
+    result = await db.execute(stmt)
     hypothesis = result.scalar_one_or_none()
     if not hypothesis:
         raise HTTPException(
@@ -61,11 +64,14 @@ async def get_hypothesis_or_404(db: AsyncSession, hypothesis_id: str) -> HuntHyp
     return hypothesis
 
 
-async def get_session_or_404(db: AsyncSession, session_id: str) -> HuntSession:
-    """Get hunt session by ID or raise 404"""
-    result = await db.execute(
-        select(HuntSession).where(HuntSession.id == session_id)
-    )
+async def get_session_or_404(
+    db: AsyncSession, session_id: str, org_id: Optional[str] = None
+) -> HuntSession:
+    """Get hunt session by ID or raise 404 (org-scoped when org_id given)"""
+    stmt = select(HuntSession).where(HuntSession.id == session_id)
+    if org_id is not None:
+        stmt = stmt.where(HuntSession.organization_id == org_id)
+    result = await db.execute(stmt)
     session = result.scalar_one_or_none()
     if not session:
         raise HTTPException(
@@ -75,11 +81,14 @@ async def get_session_or_404(db: AsyncSession, session_id: str) -> HuntSession:
     return session
 
 
-async def get_finding_or_404(db: AsyncSession, finding_id: str) -> HuntFinding:
-    """Get finding by ID or raise 404"""
-    result = await db.execute(
-        select(HuntFinding).where(HuntFinding.id == finding_id)
-    )
+async def get_finding_or_404(
+    db: AsyncSession, finding_id: str, org_id: Optional[str] = None
+) -> HuntFinding:
+    """Get finding by ID or raise 404 (org-scoped when org_id given)"""
+    stmt = select(HuntFinding).where(HuntFinding.id == finding_id)
+    if org_id is not None:
+        stmt = stmt.where(HuntFinding.organization_id == org_id)
+    result = await db.execute(stmt)
     finding = result.scalar_one_or_none()
     if not finding:
         raise HTTPException(
@@ -491,7 +500,9 @@ async def get_hypothesis(
     db: DatabaseSession = None,
 ):
     """Get a hypothesis by ID"""
-    hypothesis = await get_hypothesis_or_404(db, hypothesis_id)
+    hypothesis = await get_hypothesis_or_404(
+        db, hypothesis_id, getattr(current_user, "organization_id", None)
+    )
     return await hypothesis_to_response(db, hypothesis)
 
 
@@ -503,7 +514,9 @@ async def update_hypothesis(
     db: DatabaseSession = None,
 ):
     """Update a hypothesis"""
-    hypothesis = await get_hypothesis_or_404(db, hypothesis_id)
+    hypothesis = await get_hypothesis_or_404(
+        db, hypothesis_id, getattr(current_user, "organization_id", None)
+    )
 
     update_data = hypothesis_data.model_dump(exclude_unset=True, exclude_none=True)
 
@@ -540,7 +553,9 @@ async def delete_hypothesis(
     db: DatabaseSession = None,
 ):
     """Delete a hypothesis (only if DRAFT)"""
-    hypothesis = await get_hypothesis_or_404(db, hypothesis_id)
+    hypothesis = await get_hypothesis_or_404(
+        db, hypothesis_id, getattr(current_user, "organization_id", None)
+    )
 
     if hypothesis.status != "DRAFT":
         raise HTTPException(
@@ -559,7 +574,9 @@ async def activate_hypothesis(
     db: DatabaseSession = None,
 ):
     """Activate a hypothesis (set status to ACTIVE)"""
-    hypothesis = await get_hypothesis_or_404(db, hypothesis_id)
+    hypothesis = await get_hypothesis_or_404(
+        db, hypothesis_id, getattr(current_user, "organization_id", None)
+    )
 
     if hypothesis.status != "DRAFT":
         raise HTTPException(
@@ -583,7 +600,9 @@ async def activate_hypothesis(
 @router.post("/sessions", response_model=HuntSessionResponse, status_code=status.HTTP_201_CREATED)
 async def create_session(session_data: HuntSessionCreate, current_user: CurrentUser = None, db: DatabaseSession = None, background_tasks: BackgroundTasks = None):
     """Create and start a hunt session"""
-    hypothesis = await get_hypothesis_or_404(db, session_data.hypothesis_id)
+    hypothesis = await get_hypothesis_or_404(
+        db, session_data.hypothesis_id, getattr(current_user, "organization_id", None)
+    )
 
     hunt_session = HuntSession(
         hypothesis_id=session_data.hypothesis_id,
@@ -669,7 +688,9 @@ async def get_session(
     db: DatabaseSession = None,
 ):
     """Get a hunt session by ID"""
-    session = await get_session_or_404(db, session_id)
+    session = await get_session_or_404(
+        db, session_id, getattr(current_user, "organization_id", None)
+    )
     return HuntSessionResponse.model_validate(session)
 
 
@@ -680,7 +701,9 @@ async def pause_session(
     db: DatabaseSession = None,
 ):
     """Pause a hunt session"""
-    session = await get_session_or_404(db, session_id)
+    session = await get_session_or_404(
+        db, session_id, getattr(current_user, "organization_id", None)
+    )
 
     if session.status != "RUNNING":
         raise HTTPException(
@@ -702,7 +725,9 @@ async def resume_session(
     db: DatabaseSession = None,
 ):
     """Resume a paused hunt session"""
-    session = await get_session_or_404(db, session_id)
+    session = await get_session_or_404(
+        db, session_id, getattr(current_user, "organization_id", None)
+    )
 
     if session.status != "PAUSED":
         raise HTTPException(
@@ -724,7 +749,9 @@ async def cancel_session(
     db: DatabaseSession = None,
 ):
     """Cancel a hunt session"""
-    session = await get_session_or_404(db, session_id)
+    session = await get_session_or_404(
+        db, session_id, getattr(current_user, "organization_id", None)
+    )
 
     if session.status in ["COMPLETED", "FAILED", "CANCELLED"]:
         raise HTTPException(
@@ -810,7 +837,9 @@ async def create_finding(
 ):
     """Create a new hunt finding"""
     # Verify session exists
-    session = await get_session_or_404(db, finding_data.session_id)
+    session = await get_session_or_404(
+        db, finding_data.session_id, getattr(current_user, "organization_id", None)
+    )
 
     finding = HuntFinding(
         session_id=finding_data.session_id,
@@ -850,7 +879,9 @@ async def get_finding(
     db: DatabaseSession = None,
 ):
     """Get a finding by ID"""
-    finding = await get_finding_or_404(db, finding_id)
+    finding = await get_finding_or_404(
+        db, finding_id, getattr(current_user, "organization_id", None)
+    )
     return HuntFindingResponse.model_validate(finding)
 
 
@@ -862,7 +893,9 @@ async def update_finding(
     db: DatabaseSession = None,
 ):
     """Update a finding"""
-    finding = await get_finding_or_404(db, finding_id)
+    finding = await get_finding_or_404(
+        db, finding_id, getattr(current_user, "organization_id", None)
+    )
 
     update_data = finding_data.model_dump(exclude_unset=True, exclude_none=True)
 
@@ -891,7 +924,9 @@ async def escalate_finding(
     """
     from src.models.incident import Incident, IncidentStatus
 
-    finding = await get_finding_or_404(db, finding_id)
+    finding = await get_finding_or_404(
+        db, finding_id, getattr(current_user, "organization_id", None)
+    )
 
     if finding.escalated_to_case and finding.case_id:
         # Idempotent — return the existing incident link
@@ -1114,7 +1149,9 @@ async def create_notebook(
 ):
     """Create a new hunt notebook"""
     # Verify session exists
-    session = await get_session_or_404(db, notebook_data.session_id)
+    session = await get_session_or_404(
+        db, notebook_data.session_id, getattr(current_user, "organization_id", None)
+    )
 
     notebook = HuntNotebook(
         session_id=notebook_data.session_id,

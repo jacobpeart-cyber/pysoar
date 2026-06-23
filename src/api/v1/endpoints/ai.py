@@ -114,7 +114,9 @@ def _parse_json_field(raw: Any) -> Any:
     return None
 
 
-async def _load_incident_context(db: AsyncSession, incident_id: str) -> dict[str, Any]:
+async def _load_incident_context(
+    db: AsyncSession, incident_id: str, org_id: str | None = None
+) -> dict[str, Any]:
     """
     Load an incident plus its linked alerts and derived facts from the DB.
 
@@ -122,11 +124,18 @@ async def _load_incident_context(db: AsyncSession, incident_id: str) -> dict[str
     affected_systems (list[str]), affected_users (list[str]), tags (list[str]),
     mitre_techniques (list[str]), mitre_tactics (list[str]),
     earliest_alert_at (datetime|None), dwell_time_days (int|None).
+
+    When ``org_id`` is provided the incident lookup is scoped to that
+    organization (cross-tenant IDOR guard); when None the filter is
+    skipped so system/internal callers still work.
     """
     from src.models.alert import Alert
     from src.models.incident import Incident
 
-    inc_result = await db.execute(select(Incident).where(Incident.id == incident_id))
+    inc_stmt = select(Incident).where(Incident.id == incident_id)
+    if org_id is not None:
+        inc_stmt = inc_stmt.where(Incident.organization_id == org_id)
+    inc_result = await db.execute(inc_stmt)
     incident = inc_result.scalar_one_or_none()
 
     alerts: list[Any] = []
@@ -915,10 +924,15 @@ async def triage_single_alert(
     try:
         logger.info(f"Triaging alert {alert_id}")
 
-        # Try to fetch the real alert for context
+        # Try to fetch the real alert for context — scoped to the
+        # caller's organization (cross-tenant IDOR guard).
         from src.models.alert import Alert
 
-        alert_result = await db.execute(select(Alert).where(Alert.id == alert_id))
+        alert_stmt = select(Alert).where(Alert.id == alert_id)
+        _org_id = getattr(current_user, "organization_id", None)
+        if _org_id is not None:
+            alert_stmt = alert_stmt.where(Alert.organization_id == _org_id)
+        alert_result = await db.execute(alert_stmt)
         alert = alert_result.scalar_one_or_none()
 
         if alert:
@@ -1195,7 +1209,9 @@ async def analyze_incident(
     """
     logger.info(f"Analyzing incident {incident_id}")
 
-    ctx = await _load_incident_context(db, incident_id)
+    ctx = await _load_incident_context(
+        db, incident_id, getattr(current_user, "organization_id", None)
+    )
     incident = ctx["incident"]
     if incident is None:
         raise HTTPException(
@@ -1317,7 +1333,9 @@ async def analyze_root_cause(
     """
     logger.info(f"Analyzing root cause for incident {incident_id}")
 
-    ctx = await _load_incident_context(db, incident_id)
+    ctx = await _load_incident_context(
+        db, incident_id, getattr(current_user, "organization_id", None)
+    )
     incident = ctx["incident"]
     if incident is None:
         raise HTTPException(
@@ -1422,7 +1440,9 @@ async def recommend_response(
     """
     logger.info(f"Generating response recommendations for incident {incident_id}")
 
-    ctx = await _load_incident_context(db, incident_id)
+    ctx = await _load_incident_context(
+        db, incident_id, getattr(current_user, "organization_id", None)
+    )
     incident = ctx["incident"]
     if incident is None:
         raise HTTPException(

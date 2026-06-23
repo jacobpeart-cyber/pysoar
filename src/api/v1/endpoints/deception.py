@@ -60,11 +60,14 @@ router = APIRouter(prefix="/deception", tags=["deception"])
 # ============================================================================
 
 
-async def get_decoy_or_404(db: AsyncSession, decoy_id: UUID) -> Decoy:
-    """Get decoy by ID or raise 404."""
-    result = await db.execute(
-        select(Decoy).where(Decoy.id == str(decoy_id))
-    )
+async def get_decoy_or_404(
+    db: AsyncSession, decoy_id: UUID, org_id: Optional[str] = None
+) -> Decoy:
+    """Get decoy by ID or raise 404 (org-scoped when org_id given)."""
+    stmt = select(Decoy).where(Decoy.id == str(decoy_id))
+    if org_id is not None:
+        stmt = stmt.where(Decoy.organization_id == org_id)
+    result = await db.execute(stmt)
     decoy = result.scalar_one_or_none()
     if not decoy:
         raise HTTPException(
@@ -74,11 +77,14 @@ async def get_decoy_or_404(db: AsyncSession, decoy_id: UUID) -> Decoy:
     return decoy
 
 
-async def get_token_or_404(db: AsyncSession, token_id: UUID) -> HoneyToken:
-    """Get honey token by ID or raise 404."""
-    result = await db.execute(
-        select(HoneyToken).where(HoneyToken.id == str(token_id))
-    )
+async def get_token_or_404(
+    db: AsyncSession, token_id: UUID, org_id: Optional[str] = None
+) -> HoneyToken:
+    """Get honey token by ID or raise 404 (org-scoped when org_id given)."""
+    stmt = select(HoneyToken).where(HoneyToken.id == str(token_id))
+    if org_id is not None:
+        stmt = stmt.where(HoneyToken.organization_id == org_id)
+    result = await db.execute(stmt)
     token = result.scalar_one_or_none()
     if not token:
         raise HTTPException(
@@ -89,14 +95,15 @@ async def get_token_or_404(db: AsyncSession, token_id: UUID) -> HoneyToken:
 
 
 async def get_interaction_or_404(
-    db: AsyncSession, interaction_id: UUID
+    db: AsyncSession, interaction_id: UUID, org_id: Optional[str] = None
 ) -> DecoyInteraction:
-    """Get interaction by ID or raise 404."""
-    result = await db.execute(
-        select(DecoyInteraction).where(
-            DecoyInteraction.id == str(interaction_id)
-        )
+    """Get interaction by ID or raise 404 (org-scoped when org_id given)."""
+    stmt = select(DecoyInteraction).where(
+        DecoyInteraction.id == str(interaction_id)
     )
+    if org_id is not None:
+        stmt = stmt.where(DecoyInteraction.organization_id == org_id)
+    result = await db.execute(stmt)
     interaction = result.scalar_one_or_none()
     if not interaction:
         raise HTTPException(
@@ -107,14 +114,15 @@ async def get_interaction_or_404(
 
 
 async def get_campaign_or_404(
-    db: AsyncSession, campaign_id: UUID
+    db: AsyncSession, campaign_id: UUID, org_id: Optional[str] = None
 ) -> DeceptionCampaign:
-    """Get campaign by ID or raise 404."""
-    result = await db.execute(
-        select(DeceptionCampaign).where(
-            DeceptionCampaign.id == str(campaign_id)
-        )
+    """Get campaign by ID or raise 404 (org-scoped when org_id given)."""
+    stmt = select(DeceptionCampaign).where(
+        DeceptionCampaign.id == str(campaign_id)
     )
+    if org_id is not None:
+        stmt = stmt.where(DeceptionCampaign.organization_id == org_id)
+    result = await db.execute(stmt)
     campaign = result.scalar_one_or_none()
     if not campaign:
         raise HTTPException(
@@ -250,7 +258,9 @@ async def get_decoy_detail(
 ):
     """Get detailed information about a specific decoy."""
     try:
-        decoy = await get_decoy_or_404(db, decoy_id)
+        decoy = await get_decoy_or_404(
+            db, decoy_id, getattr(current_user, "organization_id", None)
+        )
 
         # Fetch recent interactions for this decoy
         interactions_result = await db.execute(
@@ -297,7 +307,9 @@ async def update_decoy(
 ):
     """Update decoy configuration."""
     try:
-        decoy = await get_decoy_or_404(db, decoy_id)
+        decoy = await get_decoy_or_404(
+            db, decoy_id, getattr(current_user, "organization_id", None)
+        )
 
         update_data = request.model_dump(exclude_unset=True)
         for key, value in update_data.items():
@@ -331,7 +343,9 @@ async def disable_decoy(
 ):
     """Disable a decoy."""
     try:
-        decoy = await get_decoy_or_404(db, decoy_id)
+        decoy = await get_decoy_or_404(
+            db, decoy_id, getattr(current_user, "organization_id", None)
+        )
         decoy.status = "disabled"
 
         await db.flush()
@@ -359,7 +373,9 @@ async def rotate_decoy(
 ):
     """Rotate/refresh a decoy to avoid fingerprinting."""
     try:
-        decoy = await get_decoy_or_404(db, decoy_id)
+        decoy = await get_decoy_or_404(
+            db, decoy_id, getattr(current_user, "organization_id", None)
+        )
 
         decoy.status = "active"
         decoy.deployed_at = datetime.now(timezone.utc)
@@ -411,7 +427,9 @@ async def record_decoy_interaction(
     import json as _json
 
     try:
-        decoy = await get_decoy_or_404(db, decoy_id)
+        decoy = await get_decoy_or_404(
+            db, decoy_id, getattr(current_user, "organization_id", None)
+        )
 
         interaction = DecoyInteraction(
             id=str(uuid.uuid4()),
@@ -501,7 +519,9 @@ async def undeploy_decoy(
 ):
     """Undeploy and delete a decoy."""
     try:
-        decoy = await get_decoy_or_404(db, decoy_id)
+        decoy = await get_decoy_or_404(
+            db, decoy_id, getattr(current_user, "organization_id", None)
+        )
         await db.delete(decoy)
         await db.flush()
 
@@ -650,7 +670,9 @@ async def get_token(
 ):
     """Get details about a specific honeytoken."""
     try:
-        token = await get_token_or_404(db, token_id)
+        token = await get_token_or_404(
+            db, token_id, getattr(current_user, "organization_id", None)
+        )
 
         logger.info(f"Retrieved token: {token_id}")
 
@@ -674,7 +696,9 @@ async def check_token(
 ):
     """Check if a honeytoken has been used/triggered."""
     try:
-        token = await get_token_or_404(db, token_id)
+        token = await get_token_or_404(
+            db, token_id, getattr(current_user, "organization_id", None)
+        )
 
         logger.info(
             f"Checked token usage: {token_id}",
@@ -711,7 +735,9 @@ async def delete_token(
 ):
     """Disable/delete a honeytoken."""
     try:
-        token = await get_token_or_404(db, token_id)
+        token = await get_token_or_404(
+            db, token_id, getattr(current_user, "organization_id", None)
+        )
         await db.delete(token)
         await db.flush()
 
@@ -938,7 +964,9 @@ async def get_interaction(
 ):
     """Get details about a specific interaction."""
     try:
-        interaction = await get_interaction_or_404(db, interaction_id)
+        interaction = await get_interaction_or_404(
+            db, interaction_id, getattr(current_user, "organization_id", None)
+        )
 
         logger.info(f"Retrieved interaction: {interaction_id}")
 
@@ -966,7 +994,9 @@ async def investigate_interaction(
 ):
     """Trigger deep investigation of an interaction."""
     try:
-        interaction = await get_interaction_or_404(db, interaction_id)
+        interaction = await get_interaction_or_404(
+            db, interaction_id, getattr(current_user, "organization_id", None)
+        )
 
         # Find correlated interactions (same source IP)
         correlated_result = await db.execute(
@@ -1165,7 +1195,9 @@ async def get_campaign_detail(
 ):
     """Get detailed information about a campaign."""
     try:
-        campaign = await get_campaign_or_404(db, campaign_id)
+        campaign = await get_campaign_or_404(
+            db, campaign_id, getattr(current_user, "organization_id", None)
+        )
 
         # Fetch associated decoys
         decoys = []
@@ -1209,7 +1241,9 @@ async def update_campaign_status(
 ):
     """Update campaign status (pause/resume/complete)."""
     try:
-        campaign = await get_campaign_or_404(db, campaign_id)
+        campaign = await get_campaign_or_404(
+            db, campaign_id, getattr(current_user, "organization_id", None)
+        )
 
         campaign.status = request.status
         if request.status == "completed":
@@ -1250,7 +1284,9 @@ async def get_campaign_effectiveness(
 ):
     """Get effectiveness assessment of a campaign."""
     try:
-        campaign = await get_campaign_or_404(db, campaign_id)
+        campaign = await get_campaign_or_404(
+            db, campaign_id, getattr(current_user, "organization_id", None)
+        )
 
         # Count interactions across campaign decoys
         total_interactions = 0
