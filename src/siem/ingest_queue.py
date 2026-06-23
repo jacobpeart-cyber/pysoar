@@ -42,7 +42,15 @@ def init(queue_maxsize: int = 10000, db_session_factory=None, redis_url: Optiona
         try:
             import redis.asyncio as _redis  # type: ignore
 
-            _redis_client = _redis.from_url(redis_url)
+            # Liveness options: keepalive + periodic health checks keep idle
+            # connections fresh, and retry_on_timeout smooths transient blips
+            # rather than surfacing them to callers.
+            _redis_client = _redis.from_url(
+                redis_url,
+                socket_keepalive=True,
+                health_check_interval=30,
+                retry_on_timeout=True,
+            )
             logger.info("SIEM ingest queue configured with Redis", redis_url=redis_url)
             return
         except Exception as e:  # noqa: BLE001
@@ -83,13 +91,19 @@ async def _worker_loop():
 
     # If Redis client is configured, use BRPOP to consume items.
     if _redis_client is not None:
+        # A blocking BRPOP can hit the connection's socket_timeout before its
+        # own block timeout elapses — redis-py raises TimeoutError for that.
+        # For a queue consumer that simply means "no items yet", so it must be
+        # treated as an idle tick, not logged as a traceback on every empty
+        # poll (which spammed the api log ~once per cycle).
+        from redis.exceptions import TimeoutError as RedisTimeoutError
         try:
             while True:
                 try:
                     # BRPOP returns (key, value) or None
-                    item = await _redis_client.brpop(_redis_key, timeout=5)
+                    item = await _redis_client.brpop(_redis_key, timeout=2)
                     if not item:
-                        await asyncio.sleep(0.1)
+                        await asyncio.sleep(0.05)
                         continue
                     raw = item[1]
                     try:
@@ -108,10 +122,16 @@ async def _worker_loop():
                                 logger.debug(f"process_host_event error: {e}")
                     except Exception as e:
                         logger.debug(f"ingest worker db session failed: {e}")
+                except (RedisTimeoutError, asyncio.TimeoutError):
+                    # Queue idle longer than the socket read window — normal
+                    # for a consumer; keep polling without logging.
+                    await asyncio.sleep(0.1)
+                    continue
                 except asyncio.CancelledError:
                     break
                 except Exception as exc:  # noqa: BLE001
                     logger.exception(f"ingest worker loop failed: {exc}")
+                    await asyncio.sleep(0.5)
         finally:
             logger.info("SIEM ingest queue worker stopped (redis mode)")
         return
