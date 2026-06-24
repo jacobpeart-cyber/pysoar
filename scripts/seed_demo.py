@@ -180,11 +180,11 @@ async def seed():
             ioc = IOC(
                 id=str(uuid.uuid4()),
                 value=value,
-                ioc_type=ioc_type,
-                threat_level=threat_level,
-                description=desc,
+                indicator_type=ioc_type,
+                severity=threat_level,
                 source="threat_feed",
-                status="active",
+                confidence=70,
+                is_active=True,
                 created_at=rand_date(60),
                 updated_at=datetime.now(timezone.utc),
             )

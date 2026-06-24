@@ -37,6 +37,7 @@ class UserService:
         role: str = UserRole.ANALYST.value,
         is_superuser: bool = False,
         organization_id: Optional[str] = None,
+        force_password_change: bool = False,
     ) -> User:
         """Create a new user"""
         # Check if email already exists
@@ -52,6 +53,7 @@ class UserService:
             is_superuser=is_superuser,
             is_active=True,
             organization_id=organization_id,
+            force_password_change=force_password_change,
         )
 
         self.db.add(user)

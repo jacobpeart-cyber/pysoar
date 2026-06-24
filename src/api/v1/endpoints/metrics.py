@@ -1,6 +1,6 @@
 """Metrics and Analytics API endpoints"""
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
@@ -23,7 +23,7 @@ async def get_metrics_overview(
     days: int = Query(default=30, ge=1, le=365),
 ):
     """Get overview metrics for the dashboard"""
-    start_date = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    start_date = datetime.now(timezone.utc) - timedelta(days=days)
 
     # Total counts
     alerts_total = await db.scalar(select(func.count(Alert.id)))
@@ -91,7 +91,7 @@ async def get_alerts_by_severity(
     days: int = Query(default=30, ge=1, le=365),
 ):
     """Get alert counts grouped by severity"""
-    start_date = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    start_date = datetime.now(timezone.utc) - timedelta(days=days)
 
     result = await db.execute(
         select(Alert.severity, func.count(Alert.id))
@@ -120,7 +120,7 @@ async def get_alerts_by_source(
     days: int = Query(default=30, ge=1, le=365),
 ):
     """Get alert counts grouped by source"""
-    start_date = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    start_date = datetime.now(timezone.utc) - timedelta(days=days)
 
     result = await db.execute(
         select(Alert.source, func.count(Alert.id))
@@ -143,7 +143,7 @@ async def get_alerts_by_status(
     days: int = Query(default=30, ge=1, le=365),
 ):
     """Get alert counts grouped by status"""
-    start_date = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    start_date = datetime.now(timezone.utc) - timedelta(days=days)
 
     result = await db.execute(
         select(Alert.status, func.count(Alert.id))
@@ -164,7 +164,7 @@ async def get_alerts_trend(
     days: int = Query(default=30, ge=1, le=365),
 ):
     """Get daily alert trend"""
-    start_date = datetime.utcnow() - timedelta(days=days)
+    start_date = datetime.now(timezone.utc) - timedelta(days=days)
 
     # Generate date range
     date_range = [
@@ -178,7 +178,7 @@ async def get_alerts_trend(
             func.date(Alert.created_at).label("date"),
             func.count(Alert.id).label("count"),
         )
-        .where(Alert.created_at >= start_date.isoformat())
+        .where(Alert.created_at >= start_date)
         .group_by(func.date(Alert.created_at))
         .order_by(func.date(Alert.created_at))
     )
@@ -203,7 +203,7 @@ async def get_incidents_by_type(
     days: int = Query(default=30, ge=1, le=365),
 ):
     """Get incident counts grouped by type"""
-    start_date = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    start_date = datetime.now(timezone.utc) - timedelta(days=days)
 
     result = await db.execute(
         select(Incident.incident_type, func.count(Incident.id))
@@ -225,7 +225,7 @@ async def get_mean_time_to_resolve(
     days: int = Query(default=30, ge=1, le=365),
 ):
     """Get Mean Time To Resolve (MTTR) for incidents"""
-    start_date = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    start_date = datetime.now(timezone.utc) - timedelta(days=days)
 
     # Get closed incidents with resolution time
     result = await db.execute(
@@ -285,7 +285,7 @@ async def get_playbook_execution_stats(
     days: int = Query(default=30, ge=1, le=365),
 ):
     """Get playbook execution statistics"""
-    start_date = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    start_date = datetime.now(timezone.utc) - timedelta(days=days)
 
     # Total executions
     total = await db.scalar(
@@ -359,7 +359,7 @@ async def get_top_attackers(
     limit: int = Query(default=10, ge=1, le=100),
 ):
     """Get top attacking source IPs"""
-    start_date = (datetime.utcnow() - timedelta(days=days)).isoformat()
+    start_date = datetime.now(timezone.utc) - timedelta(days=days)
 
     result = await db.execute(
         select(Alert.source_ip, func.count(Alert.id))

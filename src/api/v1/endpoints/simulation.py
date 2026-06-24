@@ -845,7 +845,16 @@ async def get_current_posture(
         score = result.scalar_one_or_none()
 
         if not score:
-            raise HTTPException(status_code=404, detail="No posture scores found")
+            # No assessment has run yet. Return an empty/zero posture (200) so
+            # the dashboard renders a "no posture yet" state instead of erroring
+            # on a fresh environment.
+            return PostureScoreResponse(
+                score_type="overall",
+                score=0.0,
+                max_score=100.0,
+                breakdown={},
+                recommendations=[],
+            )
 
         return PostureScoreResponse(
             simulation_id=score.simulation_id,
