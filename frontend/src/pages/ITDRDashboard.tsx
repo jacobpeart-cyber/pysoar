@@ -280,7 +280,7 @@ export default function ITDRDashboard() {
         itdrApi.getCredentialExposures().catch(() => null),
         itdrApi.getAccessAnomalies().catch(() => null),
         itdrApi.getPrivilegedAccess().catch(() => null),
-        itdrApi.getIdentities({ size: 500 } as any).catch(() => null),
+        itdrApi.getIdentities({ size: 100 } as any).catch(() => null),
         api.get('/itdr/dashboard/metrics').then(r => r.data).catch(() => null),
       ]);
       setIdentityThreats(threatsData?.items ?? []);
