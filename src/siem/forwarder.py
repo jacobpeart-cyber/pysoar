@@ -9,6 +9,8 @@ from datetime import datetime
 from enum import Enum
 from typing import Dict, List, Optional
 
+import httpx
+
 from src.core.logging import get_logger
 
 logger = get_logger(__name__)
@@ -243,7 +245,16 @@ class SyslogForwarder:
 
 
 class WebhookForwarder:
-    """Forward logs via HTTP POST webhooks."""
+    """Forward logs via HTTP POST webhooks.
+
+    Buffers entries up to ``batch_size`` and POSTs the whole batch as a
+    JSON body. On delivery failure the batch is retained (bounded by
+    ``max_buffer_size`` — oldest entries are evicted beyond the cap) so
+    the next flush retries it instead of silently dropping logs.
+    """
+
+    DEFAULT_MAX_BUFFER_SIZE = 1000
+    DEFAULT_TIMEOUT_SECONDS = 10.0
 
     def __init__(self, destination: ForwardingDestination):
         """
@@ -256,6 +267,13 @@ class WebhookForwarder:
         self.last_error = None
         self.batch_buffer = []
         self.batch_size = destination.filter_rules.get("batch_size", 10)
+        self.max_buffer_size = destination.filter_rules.get(
+            "max_buffer_size", self.DEFAULT_MAX_BUFFER_SIZE
+        )
+        self.timeout = float(
+            destination.filter_rules.get("timeout_seconds", self.DEFAULT_TIMEOUT_SECONDS)
+        )
+        self.verify_tls = bool(destination.filter_rules.get("verify_tls", True))
 
     async def forward(self, log_entry: dict) -> bool:
         """
@@ -274,9 +292,53 @@ class WebhookForwarder:
 
         return True
 
+    def _build_url(self) -> str:
+        """Build the webhook URL from the destination config.
+
+        ``host`` may be a full URL (``https://collector.example.com/ingest``)
+        or a bare hostname combined with ``port``/``protocol``/``tls_enabled``
+        and an optional ``filter_rules["path"]``.
+        """
+        host = self.destination.host
+        if host.startswith("http://") or host.startswith("https://"):
+            return host
+
+        scheme = (
+            "https"
+            if self.destination.protocol == "https" or self.destination.tls_enabled
+            else "http"
+        )
+        path = self.destination.filter_rules.get("path", "/")
+        if not path.startswith("/"):
+            path = f"/{path}"
+        return f"{scheme}://{host}:{self.destination.port}{path}"
+
+    def _build_headers(self) -> Dict[str, str]:
+        """Build request headers including configured auth."""
+        headers = {"Content-Type": "application/json"}
+        auth_config = self.destination.auth_config
+        token = auth_config.get("bearer_token") or auth_config.get("api_key")
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        return headers
+
+    def _enforce_buffer_cap(self) -> None:
+        """Drop oldest buffered entries beyond ``max_buffer_size``."""
+        overflow = len(self.batch_buffer) - self.max_buffer_size
+        if overflow > 0:
+            del self.batch_buffer[:overflow]
+            logger.warning(
+                f"Webhook buffer for {self.destination.name} hit its cap of "
+                f"{self.max_buffer_size}; dropped {overflow} oldest log(s)"
+            )
+
     async def flush(self) -> bool:
         """
-        Flush buffered logs to webhook.
+        Flush buffered logs to webhook via HTTP POST.
+
+        Only clears the buffer on a 2xx response; on any failure the
+        buffer is retained (capped at ``max_buffer_size``) so the batch
+        is retried on the next flush.
 
         Returns:
             True if successful, False otherwise.
@@ -284,27 +346,46 @@ class WebhookForwarder:
         if not self.batch_buffer:
             return True
 
+        url = self._build_url()
+        headers = self._build_headers()
+        auth_config = self.destination.auth_config
+        auth = None
+        if auth_config.get("username") and auth_config.get("password"):
+            auth = (auth_config["username"], auth_config["password"])
+
+        payload = {"logs": list(self.batch_buffer)}
+
         try:
-            message = LogFormatter.to_json({"logs": self.batch_buffer})
-
-            # Build headers with auth if configured
-            headers = {"Content-Type": "application/json"}
-            if "api_key" in self.destination.auth_config:
-                headers["Authorization"] = f"Bearer {self.destination.auth_config['api_key']}"
-
-            # Note: In real implementation, would use aiohttp or httpx
-            logger.debug(
-                f"Would forward {len(self.batch_buffer)} logs to "
-                f"webhook {self.destination.host}:{self.destination.port}"
-            )
-
-            self.batch_buffer.clear()
-            self.last_error = None
-            return True
+            async with httpx.AsyncClient(
+                timeout=self.timeout, verify=self.verify_tls
+            ) as client:
+                response = await client.post(
+                    url, json=payload, headers=headers, auth=auth
+                )
         except Exception as e:
             self.last_error = str(e)
-            logger.error(f"Webhook forwarding failed: {e}")
+            logger.error(
+                f"Webhook forwarding to {url} failed: {e}; "
+                f"keeping {len(self.batch_buffer)} log(s) buffered for retry"
+            )
+            self._enforce_buffer_cap()
             return False
+
+        if 200 <= response.status_code < 300:
+            sent = len(self.batch_buffer)
+            self.batch_buffer.clear()
+            self.last_error = None
+            logger.debug(f"Forwarded {sent} logs to webhook {url}")
+            return True
+
+        body_excerpt = (response.text or "")[:200]
+        self.last_error = f"HTTP {response.status_code}: {body_excerpt}"
+        logger.error(
+            f"Webhook forwarding to {url} failed with HTTP {response.status_code} "
+            f"({body_excerpt}); keeping {len(self.batch_buffer)} log(s) buffered for retry"
+        )
+        self._enforce_buffer_cap()
+        return False
 
 
 class FileForwarder:
@@ -541,12 +622,17 @@ class ForwardingManager:
         result = []
         for dest_id, dest in self.destinations.items():
             stats = self.stats.get(dest_id, {})
+            forwarder = self.forwarders.get(dest_id)
             result.append(
                 {
                     "id": dest_id,
                     "name": dest.name,
                     "type": dest.dest_type.value,
                     "enabled": dest.enabled,
+                    # Surface the forwarder's last delivery error so the
+                    # destination's health reflects reality instead of
+                    # only ever-green counters.
+                    "last_error": getattr(forwarder, "last_error", None),
                     **stats,
                 }
             )

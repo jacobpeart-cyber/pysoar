@@ -48,6 +48,12 @@ celery_app = Celery(
         # on_darkweb_finding for criticals. Without this entry the beat
         # sweep below wouldn't be able to resolve the task.
         "src.darkweb.tasks",
+        # Integration housekeeping — health-probes every installed
+        # integration (persisting health_status), expires old
+        # integration_executions / deactivated webhook endpoints, and
+        # clears lapsed rate-limit windows. Without this entry the beat
+        # entries below can't resolve the task names.
+        "src.integrations.tasks",
     ],
 )
 
@@ -185,6 +191,28 @@ celery_app.conf.beat_schedule = {
     "darkweb-cross-org-sweep": {
         "task": "src.darkweb.tasks.darkweb_cross_org_sweep",
         "schedule": 1800.0,  # Every 30 min
+    },
+    # --- Integration housekeeping (src.integrations.tasks) ---
+    # Hourly: real HTTP health probes against every installed
+    # integration's third-party API (persists health_status /
+    # last_health_check) and clearing of lapsed rate-limit windows.
+    # Daily: retention cleanup of integration execution history and
+    # deactivated webhook endpoints.
+    "integrations-health-check": {
+        "task": "src.integrations.tasks.health_check_all_integrations",
+        "schedule": 3600.0,  # Every hour
+    },
+    "integrations-rate-limit-reset": {
+        "task": "src.integrations.tasks.rate_limit_reset",
+        "schedule": 3600.0,  # Every hour
+    },
+    "integrations-execution-cleanup": {
+        "task": "src.integrations.tasks.execution_cleanup",
+        "schedule": 86400.0,  # Daily — 30-day retention by default
+    },
+    "integrations-webhook-cleanup": {
+        "task": "src.integrations.tasks.webhook_cleanup",
+        "schedule": 86400.0,  # Daily — 90-day retention of inactive endpoints
     },
     # --- Weekly STIG fleet sweep (src.stig.tasks.scheduled_fleet_stig_sweep) ---
     # FedRAMP/NIST SP 800-137 continuous monitoring: every active endpoint

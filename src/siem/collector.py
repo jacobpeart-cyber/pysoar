@@ -483,74 +483,52 @@ class FileCollector(Collector):
 
 
 class CloudCollector(Collector):
-    """Collect logs from cloud providers"""
+    """DEPRECATED legacy cloud collector — refuses to start.
+
+    This class used to run a poll loop whose ``_poll_aws`` /
+    ``_poll_azure`` / ``_poll_gcp`` methods were stubs that logged a
+    debug line and ingested nothing, so a configured cloud collector
+    silently no-oped forever. Real cloud ingestion lives in
+    ``src.siem.cloud_poller.poll_all_cloud_integrations`` (boto3 /
+    azure-mgmt-monitor / google-cloud-logging), driven every 5 minutes
+    by the ``siem.poll_cloud_integrations`` Celery beat task and the
+    manual ``/siem/cloud/poll-all`` endpoint, with credentials from the
+    installed-integrations table.
+
+    Nothing in the live codebase instantiates this class; it is kept
+    only so any out-of-tree caller gets an explicit, visible error
+    (``enabled=False`` + ``last_error`` in collector health) instead of
+    a green-looking collector that ingests nothing.
+    """
+
+    # Legacy provider name -> connector id operators should install instead.
+    _CONNECTOR_HINTS = {
+        "aws": "aws_cloudtrail",
+        "azure": "azure_activity_log",
+        "gcp": "gcp_cloud_logging",
+    }
 
     def __init__(self, provider: str, config: Dict[str, Any]):
         super().__init__(f"Cloud Collector ({provider})")
         self.provider = provider
         self.config = config
-        self.poll_interval = config.get("poll_interval", 60)
-        self.task: Optional[asyncio.Task] = None
 
     async def start(self):
-        """Start cloud collector"""
-        self.enabled = True
-        self.task = asyncio.create_task(self._poll_cloud())
-        logger.info(f"CloudCollector started for {self.provider}")
+        """Refuse to start — this path never ingested anything."""
+        self.enabled = False
+        connector_hint = self._CONNECTOR_HINTS.get(self.provider, self.provider)
+        self.last_error = (
+            f"CloudCollector for '{self.provider}' is a deprecated no-op path "
+            "and will not start. Cloud log ingestion runs through "
+            "src.siem.cloud_poller (Celery beat task 'siem.poll_cloud_integrations'); "
+            f"install a '{connector_hint}' integration via the Integrations page instead."
+        )
+        logger.error(self.last_error)
 
     async def stop(self):
-        """Stop cloud collector"""
+        """Stop cloud collector (never running)."""
         self.enabled = False
-        if self.task:
-            self.task.cancel()
-            try:
-                await self.task
-            except asyncio.CancelledError:
-                pass
         logger.info("CloudCollector stopped")
-
-    async def _poll_cloud(self):
-        """Poll cloud provider for logs"""
-        try:
-            while self.enabled:
-                if self.provider == "aws":
-                    await self._poll_aws()
-                elif self.provider == "azure":
-                    await self._poll_azure()
-                elif self.provider == "gcp":
-                    await self._poll_gcp()
-
-                await asyncio.sleep(self.poll_interval)
-
-        except asyncio.CancelledError:
-            pass
-
-    async def _poll_aws(self):
-        """Poll AWS CloudTrail (stub)"""
-        try:
-            # Implementation would use boto3
-            logger.debug("Polling AWS CloudTrail")
-        except Exception as e:
-            logger.error(f"Error polling AWS: {e}")
-            self.last_error = str(e)
-
-    async def _poll_azure(self):
-        """Poll Azure Activity Logs (stub)"""
-        try:
-            # Implementation would use azure-monitor-query
-            logger.debug("Polling Azure Activity Logs")
-        except Exception as e:
-            logger.error(f"Error polling Azure: {e}")
-            self.last_error = str(e)
-
-    async def _poll_gcp(self):
-        """Poll GCP Cloud Logging (stub)"""
-        try:
-            # Implementation would use google-cloud-logging
-            logger.debug("Polling GCP Cloud Logging")
-        except Exception as e:
-            logger.error(f"Error polling GCP: {e}")
-            self.last_error = str(e)
 
 
 class CollectorManager:
