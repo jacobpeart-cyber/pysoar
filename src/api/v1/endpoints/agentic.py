@@ -862,7 +862,29 @@ async def rollback_action(
     db: DatabaseSession = None,
     action_id: str = Path(...),
 ):
-    """Rollback executed action"""
+    """Rollback an executed action by actually reversing what it did.
+
+    Agentic actions execute through the AgentToolRegistry (see
+    approve_action), so the inverse is dispatched per tool:
+
+    - ``block_ip``       → the tool created an active ThreatIndicator
+                           for the target; find and deactivate it.
+    - ``disable_account``/``disable_user`` → the tool set
+                           ``User.is_active = False``; re-enable.
+    - ``isolate_host``   → the tool is detection-only (it records a
+                           ticket activity, no enforcement point); the
+                           record is negated with a compensating
+                           release entry and the response says so via
+                           ``mode: detection_only``.
+
+    Anything else has no automated inverse — the endpoint reports
+    ``status: not_reversible`` with the reason and marks the action so,
+    instead of returning a fabricated success.
+    """
+    from src.intel.models import ThreatIndicator
+    from src.models.user import User
+    from src.tickethub.models import TicketActivity
+
     action = await db.get(AgentAction, action_id)
 
     if not action or action.organization_id != getattr(current_user, "organization_id", None):
@@ -877,12 +899,151 @@ async def rollback_action(
             detail="Action does not support rollback",
         )
 
+    if action.rollback_executed or action.execution_status == ActionExecutionStatus.ROLLED_BACK.value:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Action has already been rolled back",
+        )
+
+    if action.execution_status != ActionExecutionStatus.COMPLETED.value:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Action is in status '{action.execution_status}'; only "
+                "completed actions have executed effects to reverse"
+            ),
+        )
+
+    # parameters may be a JSON string (investigator/tools write
+    # json.dumps) or a dict (skills write dicts) — normalize.
+    try:
+        params = action.parameters if isinstance(action.parameters, dict) else json.loads(action.parameters or "{}")
+    except (ValueError, TypeError):
+        params = {}
+    tool_name = params.get("_tool")
+    action_key = (action.action_type or "").lower()
+
+    rollback_detail: dict
+    if action_key == "block_ip" or tool_name == "block_ip":
+        # Forward effect: ThreatIndicator rows created for the target.
+        result = await db.execute(
+            select(ThreatIndicator).where(
+                and_(
+                    ThreatIndicator.value == action.target,
+                    ThreatIndicator.is_active == True,  # noqa: E712
+                )
+            )
+        )
+        iocs = list(result.scalars().all())
+        if not iocs:
+            return {
+                "status": "failed",
+                "action_id": action_id,
+                "reason": (
+                    f"no active threat indicator found for {action.target}; "
+                    "nothing to deactivate"
+                ),
+            }
+        for ioc in iocs:
+            ioc.is_active = False
+        rollback_detail = {
+            "reversed": "block_ip",
+            "indicators_deactivated": [ioc.id for ioc in iocs],
+        }
+
+    elif action_key in ("disable_account", "disable_user") or tool_name == "disable_user":
+        target_email = params.get("user_email") or action.target
+        result = await db.execute(select(User).where(User.email == target_email))
+        user = result.scalar_one_or_none()
+        if not user:
+            return {
+                "status": "failed",
+                "action_id": action_id,
+                "reason": f"user {target_email} not found; cannot re-enable account",
+            }
+        if user.is_active:
+            rollback_detail = {
+                "reversed": "disable_account",
+                "user_id": user.id,
+                "note": "account was already active",
+            }
+        else:
+            user.is_active = True
+            rollback_detail = {
+                "reversed": "disable_account",
+                "user_id": user.id,
+                "is_active": True,
+            }
+
+    elif action_key == "isolate_host" or tool_name == "isolate_host":
+        # The forward isolate_host tool is detection-only: it records a
+        # ticket activity but performs no network enforcement. Reversal
+        # is the compensating record — and we say so.
+        db.add(TicketActivity(
+            source_type="remediation",
+            source_id=action.target,
+            activity_type="release_host",
+            description=(
+                f"Host {action.target} isolation rolled back "
+                f"(detection-only record; no network enforcement existed to reverse)"
+            ),
+            organization_id=action.organization_id,
+        ))
+        rollback_detail = {
+            "reversed": "isolate_host",
+            "mode": "detection_only",
+            "detail": (
+                "forward isolation was a detection-only record; "
+                "compensating release entry logged, no network change to reverse"
+            ),
+        }
+
+    else:
+        # No automated inverse exists for this action type. Report
+        # honestly and remember that so the UI stops offering rollback.
+        action.rollback_available = False
+        await db.commit()
+        return {
+            "status": "not_reversible",
+            "action_id": action_id,
+            "reason": (
+                f"action type '{action.action_type}' has no automated inverse; "
+                "manual remediation required"
+            ),
+        }
+
     action.rollback_executed = True
     action.execution_status = ActionExecutionStatus.ROLLED_BACK.value
+    # Persist the rollback outcome alongside the execution result.
+    try:
+        result_data = json.loads(action.result) if action.result else {}
+        if not isinstance(result_data, dict):
+            result_data = {"execution_result": result_data}
+    except (ValueError, TypeError):
+        result_data = {}
+    result_data["rollback"] = rollback_detail
+    action.result = json.dumps(result_data, default=str)[:8000]
+
+    # AU-2 audit: record the rollback with what was actually reversed.
+    db.add(TicketActivity(
+        source_type="agent_action",
+        source_id=action.id,
+        activity_type="action_rolled_back",
+        description=(
+            f"user={getattr(current_user, 'email', 'system')} "
+            f"action_type={action.action_type} target={action.target} "
+            f"detail={json.dumps(rollback_detail, default=str)[:400]}"
+        ),
+        organization_id=action.organization_id,
+    ))
 
     await db.commit()
 
-    return {"status": "rolled_back", "action_id": action_id}
+    return {
+        "status": "rolled_back",
+        "action_id": action_id,
+        "detail": rollback_detail,
+    }
 
 
 # ============================================================================

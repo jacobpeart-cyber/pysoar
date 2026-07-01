@@ -724,7 +724,7 @@ async def rollback_execution(
 
     return {
         "execution_id": execution_id,
-        "rollback_status": "in_progress",
+        "rollback_status": result.get("rollback_status"),
         "details": result,
     }
 

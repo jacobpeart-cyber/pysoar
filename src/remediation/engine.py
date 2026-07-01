@@ -17,7 +17,7 @@ from uuid import uuid4
 
 import httpx
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, func
 
 from src.core.logging import get_logger
 from src.core.config import settings
@@ -36,6 +36,19 @@ from src.remediation.models import (
 )
 
 logger = get_logger(__name__)
+
+
+def _json_safe(value: Any) -> Any:
+    """Recursively convert datetimes to ISO strings so action results can
+    be persisted into JSON columns (no custom json_serializer is
+    configured on the engine)."""
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {k: _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
 
 
 class RemediationEngine:
@@ -258,8 +271,40 @@ class RemediationEngine:
                         "trigger_data": execution.trigger_details,
                     }
                 )
+
+                # Bounded retry: re-invoke the executor with a small
+                # backoff, recording every attempt so the execution row
+                # tells the truth about how many times we tried.
+                if not result.get("success") and action_def.get("on_failure") == "retry":
+                    max_retries = max(0, int(action_def.get("max_retries", 2)))
+                    backoff_seconds = float(action_def.get("retry_backoff_seconds", 1.0))
+                    attempts = 1
+                    while not result.get("success") and attempts <= max_retries:
+                        await asyncio.sleep(backoff_seconds * attempts)
+                        logger.info(f"Retrying failed action", extra={
+                            "execution_id": execution_id,
+                            "action": action_def.get("type"),
+                            "attempt": attempts + 1,
+                            "max_retries": max_retries,
+                        })
+                        result = await self._execute_single_action(
+                            action_def,
+                            execution.target_entity,
+                            {
+                                "execution_id": execution_id,
+                                "trigger_data": execution.trigger_details,
+                            }
+                        )
+                        attempts += 1
+                    result["attempts"] = attempts
+                    if not result.get("success"):
+                        result["retries_exhausted"] = True
+
+                result = _json_safe(result)
                 results.append(result)
-                execution.actions_completed.append(result)
+                # Reassign (not append in place) so SQLAlchemy sees the
+                # JSON column as dirty and actually persists the result.
+                execution.actions_completed = [*(execution.actions_completed or []), result]
 
                 if not result.get("success"):
                     logger.warning(f"Action failed", extra={
@@ -267,12 +312,8 @@ class RemediationEngine:
                         "action": action_def.get("type"),
                         "error": result.get("error"),
                     })
-                    # Decide whether to continue, retry, or abort
                     if action_def.get("on_failure") == "abort":
                         break
-                    elif action_def.get("on_failure") == "retry":
-                        # Retry logic would go here
-                        pass
 
             except Exception as e:
                 logger.error(f"Action execution error", extra={
@@ -280,12 +321,14 @@ class RemediationEngine:
                     "action": action_def.get("type"),
                     "error": str(e),
                 })
-                results.append({
+                error_result = {
                     "action_type": action_def.get("type"),
                     "success": False,
                     "error": str(e),
-                    "timestamp": utc_now(),
-                })
+                    "timestamp": utc_now().isoformat(),
+                }
+                results.append(error_result)
+                execution.actions_completed = [*(execution.actions_completed or []), error_result]
                 if action_def.get("on_failure") == "abort":
                     break
 
@@ -369,15 +412,40 @@ class RemediationEngine:
                 "timestamp": utc_now(),
             }
 
+    # Action types that have no automated inverse in this platform.
+    # Each maps to the honest reason we report instead of a fake success.
+    IRREVERSIBLE_ACTIONS: dict[str, str] = {
+        "process_kill": "a terminated process cannot be restarted by the platform",
+        "collect_forensics": "forensic collection is a read-only capture; there is nothing to reverse",
+        "notification": "a delivered notification cannot be unsent",
+        "ticket_create": "a delivered notification/ticket cannot be unsent",
+        "email_quarantine": "email quarantine is handled by the notification path; no reversible state was recorded",
+        "webhook": "the remote side effect of a webhook is outside PySOAR's control",
+        "script": "queued script side effects are outside PySOAR's control",
+    }
+
     async def rollback_execution(self, execution_id: str) -> dict:
         """
-        Rollback a completed execution by reversing actions.
+        Rollback a completed execution by actually reversing each
+        completed action, in reverse order.
+
+        Per-action outcomes are truthful:
+        - ``rolled_back: True`` only when the inverse operation really
+          mutated state (IOC deactivated, asset status restored, account
+          re-enabled, unquarantine command queued, ...).
+        - ``rolled_back: False, reversible: False`` for action types
+          with no automated inverse (process kill, notifications, ...).
+        - ``rolled_back: False`` with an ``error``/``reason`` when the
+          inverse was attempted but could not be applied.
+
+        Overall ``rollback_status`` is "completed", "partial", or
+        "failed" based on the real outcomes.
 
         Args:
             execution_id: RemediationExecution ID
 
         Returns:
-            Rollback result
+            Rollback result with per-action details
         """
         execution = await self.db.get(RemediationExecution, execution_id)
         if not execution:
@@ -386,25 +454,356 @@ class RemediationEngine:
         execution.rollback_status = "in_progress"
         await self.db.commit()
 
+        completed_actions = execution.actions_completed or []
         logger.info(f"Starting rollback", extra={
             "execution_id": execution_id,
-            "action_count": len(execution.actions_completed),
+            "action_count": len(completed_actions),
         })
 
-        # Execute reverse actions in reverse order
+        # Reverse actions in reverse order of execution
         results = []
-        for action_result in reversed(execution.actions_completed):
-            # Reverse action logic would go here
-            results.append({"action": action_result.get("action_type"), "rolled_back": True})
+        reversed_count = 0
+        irreversible_count = 0
+        failed_count = 0
+        for action_result in reversed(completed_actions):
+            action_type = action_result.get("action_type")
 
-        execution.rollback_status = "completed"
+            # collect_forensics reports per-sub-command results with no
+            # composite success flag — route it straight to the handler
+            # (it is irreversible either way and reported as such).
+            if not action_result.get("success") and action_type != "collect_forensics":
+                # Forward action never succeeded — nothing to reverse.
+                results.append({
+                    "action": action_type,
+                    "rolled_back": False,
+                    "skipped": True,
+                    "reason": "forward action did not succeed; nothing to reverse",
+                })
+                continue
+
+            try:
+                outcome = await self._rollback_single_action(
+                    action_type, action_result, execution
+                )
+            except Exception as e:
+                logger.error(f"Rollback action error", extra={
+                    "execution_id": execution_id,
+                    "action": action_type,
+                    "error": str(e),
+                })
+                outcome = {
+                    "action": action_type,
+                    "rolled_back": False,
+                    "error": str(e),
+                }
+
+            results.append(outcome)
+            if outcome.get("rolled_back"):
+                reversed_count += 1
+            elif outcome.get("reversible") is False:
+                irreversible_count += 1
+            else:
+                failed_count += 1
+
+        attempted = reversed_count + irreversible_count + failed_count
+        if attempted == 0 or (failed_count == 0 and irreversible_count == 0):
+            rollback_status = "completed"
+        elif reversed_count > 0:
+            rollback_status = "partial"
+        else:
+            rollback_status = "failed"
+
+        execution.rollback_status = rollback_status
         execution.rolled_back_at = utc_now()
+        if rollback_status == "completed" and reversed_count > 0:
+            execution.status = "rolled_back"
+        metrics = dict(execution.metrics or {})
+        metrics["rollback_results"] = results
+        execution.metrics = metrics
         await self.db.commit()
 
-        logger.info(f"Rollback completed", extra={
+        logger.info(f"Rollback finished", extra={
             "execution_id": execution_id,
+            "rollback_status": rollback_status,
+            "reversed": reversed_count,
+            "irreversible": irreversible_count,
+            "failed": failed_count,
         })
-        return {"execution_id": execution_id, "results": results}
+        return {
+            "execution_id": execution_id,
+            "rollback_status": rollback_status,
+            "results": results,
+        }
+
+    async def _rollback_single_action(
+        self,
+        action_type: str | None,
+        action_result: dict,
+        execution: RemediationExecution,
+    ) -> dict:
+        """Dispatch the inverse of one completed action.
+
+        Reads the artifacts each forward executor recorded in its result
+        (``details``) to find exactly what state to restore.
+        """
+        details = action_result.get("details") or {}
+        target = action_result.get("target") or execution.target_entity
+
+        # --- IOC-backed actions: deactivate the indicator ---------------
+        if action_type in ("firewall_block", "dns_sinkhole"):
+            ioc = None
+            ioc_id = details.get("ioc_id")
+            if ioc_id:
+                ioc = await self.db.get(ThreatIndicator, ioc_id)
+            if ioc is None and target:
+                # Legacy executions that predate ioc_id recording
+                stmt = select(ThreatIndicator).where(
+                    and_(
+                        ThreatIndicator.value == target,
+                        ThreatIndicator.is_active == True,
+                        ThreatIndicator.source == "remediation_engine",
+                    )
+                )
+                ioc = (await self.db.execute(stmt)).scalars().first()
+            if ioc is None:
+                return {
+                    "action": action_type,
+                    "rolled_back": False,
+                    "reason": f"IOC for {target} not found; cannot deactivate",
+                }
+            if not ioc.is_active:
+                return {
+                    "action": action_type,
+                    "rolled_back": True,
+                    "ioc_id": ioc.id,
+                    "detail": "IOC was already inactive",
+                }
+            ioc.is_active = False
+            if "rolled_back" not in (ioc.tags or []):
+                ioc.tags = [*(ioc.tags or []), "rolled_back"]
+            await self.db.flush()
+            await _log_ticket_activity(
+                self.db,
+                source_id=execution.id,
+                activity_type=f"rollback_{action_type}",
+                description=f"Rollback: deactivated IOC {ioc.id} for {target}",
+                organization_id=execution.organization_id,
+                extra_metadata={"ioc_id": ioc.id, "target": target},
+            )
+            return {
+                "action": action_type,
+                "rolled_back": True,
+                "ioc_id": ioc.id,
+                "detail": f"IOC {ioc.id} deactivated",
+            }
+
+        # --- Host isolation: restore previous asset status --------------
+        if action_type == "host_isolate":
+            asset = None
+            asset_id = details.get("asset_id")
+            if asset_id:
+                asset = await self.db.get(Asset, asset_id)
+            if asset is None and target:
+                stmt = select(Asset).where(
+                    (Asset.hostname == target)
+                    | (Asset.name == target)
+                    | (Asset.ip_address == target)
+                )
+                asset = (await self.db.execute(stmt)).scalars().first()
+            if asset is None:
+                return {
+                    "action": action_type,
+                    "rolled_back": False,
+                    "reason": f"Asset for {target} not found; cannot restore status",
+                }
+            previous_status = details.get("previous_status") or AssetStatus.ACTIVE.value
+            asset.status = previous_status
+            try:
+                tags = json.loads(asset.tags) if asset.tags else []
+                if isinstance(tags, list) and "isolated" in tags:
+                    tags.remove("isolated")
+                    asset.tags = json.dumps(tags)
+            except (ValueError, TypeError):
+                pass
+            await self.db.flush()
+            await _log_ticket_activity(
+                self.db,
+                source_id=execution.id,
+                activity_type="rollback_host_isolate",
+                description=(
+                    f"Rollback: restored asset {asset.name} to status "
+                    f"'{previous_status}' and removed isolation tag"
+                ),
+                organization_id=execution.organization_id,
+                extra_metadata={"asset_id": asset.id, "restored_status": previous_status},
+            )
+            return {
+                "action": action_type,
+                "rolled_back": True,
+                "asset_id": asset.id,
+                "restored_status": previous_status,
+            }
+
+        # --- Account actions: re-enable / clear forced resets -----------
+        if action_type in (
+            "account_disable", "account_lock", "password_reset",
+            "session_terminate", "token_revoke",
+        ):
+            user = None
+            user_id = details.get("user_id")
+            if user_id:
+                user = await self.db.get(User, user_id)
+            if user is None and target:
+                stmt = select(User).where(User.email == target)
+                user = (await self.db.execute(stmt)).scalars().first()
+            if user is None:
+                return {
+                    "action": action_type,
+                    "rolled_back": False,
+                    "reason": f"User {target} not found; cannot restore account state",
+                }
+            applied = details.get("action") or action_type.replace("account_", "")
+            if applied == "disable":
+                # Restore the recorded prior state; legacy records
+                # (no previous_is_active) default to re-enabling.
+                user.is_active = bool(details.get("previous_is_active", True))
+                user.force_password_change = False
+            elif applied == "password_reset":
+                user.password_reset_token = None
+                user.password_reset_token_expires_at = None
+                user.force_password_change = False
+            else:  # lock / session_terminate / token_revoke
+                user.force_password_change = False
+            await self.db.flush()
+            await _log_ticket_activity(
+                self.db,
+                source_id=execution.id,
+                activity_type=f"rollback_{action_type}",
+                description=f"Rollback: reversed account action '{applied}' for {user.email}",
+                organization_id=execution.organization_id,
+                extra_metadata={
+                    "user_id": user.id,
+                    "reversed_action": applied,
+                    "is_active": user.is_active,
+                },
+            )
+            return {
+                "action": action_type,
+                "rolled_back": True,
+                "user_id": user.id,
+                "is_active": user.is_active,
+            }
+
+        # --- File quarantine: queue the inverse agent command -----------
+        if action_type == "file_quarantine":
+            from src.agents.service import AgentService, AgentServiceError
+            from src.agents.models import EndpointAgent
+
+            agent_id = details.get("agent_id")
+            file_path = details.get("file_path")
+            if not agent_id or not file_path:
+                return {
+                    "action": action_type,
+                    "rolled_back": False,
+                    "reason": (
+                        "quarantine record lacks agent_id/file_path; "
+                        "cannot dispatch unquarantine command"
+                    ),
+                }
+            agent = await self.db.get(EndpointAgent, agent_id)
+            if agent is None:
+                return {
+                    "action": action_type,
+                    "rolled_back": False,
+                    "reason": f"agent {agent_id} no longer enrolled",
+                }
+            svc = AgentService(self.db)
+            try:
+                cmd = await svc.issue_command(
+                    agent=agent,
+                    action="unquarantine_file",
+                    payload={"path": file_path},
+                )
+            except AgentServiceError as exc:
+                return {
+                    "action": action_type,
+                    "rolled_back": False,
+                    "reason": f"agent rejected unquarantine: {exc}",
+                }
+            await _log_ticket_activity(
+                self.db,
+                source_id=execution.id,
+                activity_type="rollback_file_quarantine",
+                description=(
+                    f"Rollback: unquarantine queued for {file_path} "
+                    f"(command_id={cmd.id})"
+                ),
+                organization_id=execution.organization_id,
+                extra_metadata={
+                    "agent_id": agent.id,
+                    "file_path": file_path,
+                    "command_id": cmd.id,
+                },
+            )
+            return {
+                "action": action_type,
+                "rolled_back": True,
+                "command_id": cmd.id,
+                "detail": (
+                    "unquarantine_file command queued to agent; "
+                    "completion depends on agent execution"
+                ),
+            }
+
+        # --- Patch deploy: restore per-instance prior statuses ----------
+        if action_type == "patch_deploy":
+            instances = details.get("instances")
+            if not instances:
+                return {
+                    "action": action_type,
+                    "rolled_back": False,
+                    "reason": (
+                        "no per-instance prior status recorded; "
+                        "cannot restore vulnerability instance statuses"
+                    ),
+                }
+            restored = 0
+            for entry in instances:
+                inst = await self.db.get(VulnerabilityInstance, entry.get("instance_id"))
+                if inst is not None and entry.get("previous_status"):
+                    inst.status = entry["previous_status"]
+                    restored += 1
+            await self.db.flush()
+            await _log_ticket_activity(
+                self.db,
+                source_id=execution.id,
+                activity_type="rollback_patch_deploy",
+                description=f"Rollback: restored {restored} vulnerability instance status(es)",
+                organization_id=execution.organization_id,
+                extra_metadata={"instances_restored": restored},
+            )
+            return {
+                "action": action_type,
+                "rolled_back": restored > 0,
+                "instances_restored": restored,
+                **({} if restored else {"reason": "no matching instances found"}),
+            }
+
+        # --- Known-irreversible actions: report honestly ----------------
+        if action_type in self.IRREVERSIBLE_ACTIONS:
+            return {
+                "action": action_type,
+                "rolled_back": False,
+                "reversible": False,
+                "reason": f"not reversible: {self.IRREVERSIBLE_ACTIONS[action_type]}",
+            }
+
+        return {
+            "action": action_type,
+            "rolled_back": False,
+            "reversible": False,
+            "reason": f"not reversible: no rollback handler for action type '{action_type}'",
+        }
 
     async def approve_execution(
         self,
@@ -503,11 +902,24 @@ class RemediationEngine:
         return elapsed >= policy.cooldown_minutes
 
     async def _check_rate_limit(self, policy: RemediationPolicy) -> bool:
-        """Check if policy execution rate limit is exceeded."""
-        if policy.execution_count >= policy.max_executions_per_hour:
-            return False
-        # In practice, would check executions in last hour
-        return True
+        """Check if policy execution rate limit is exceeded.
+
+        Counts real execution records for this policy created in the
+        last hour rather than the lifetime execution_count.
+        """
+        window_start = utc_now() - timedelta(hours=1)
+        stmt = (
+            select(func.count())
+            .select_from(RemediationExecution)
+            .where(
+                and_(
+                    RemediationExecution.policy_id == policy.id,
+                    RemediationExecution.created_at >= window_start,
+                )
+            )
+        )
+        recent_count = (await self.db.execute(stmt)).scalar() or 0
+        return recent_count < policy.max_executions_per_hour
 
 
 class ActionExecutor:
@@ -609,7 +1021,14 @@ async def _log_ticket_activity(
 
 
 class FirewallBlockExecutor(ActionExecutor):
-    """Firewall blocking executor: creates an active IOC for the IP."""
+    """Firewall blocking executor: creates an active IOC for the IP.
+
+    Like NetworkActionExecutor, this has no enforcement point — no
+    firewall integration is dispatched from here. The IOC write is real
+    (SIEM correlation and IOC matching will flag traffic to the target)
+    but nothing is blocked on the wire, and the result says so
+    explicitly via ``mode: detection_only``.
+    """
 
     async def execute(self, target: str, parameters: dict, context: dict) -> dict:
         execution_id, org_id, actor_id = _get_execution_context(context)
@@ -662,6 +1081,11 @@ class FirewallBlockExecutor(ActionExecutor):
         return {
             "success": True,
             "action": "firewall_block",
+            "mode": "detection_only",
+            "detail": (
+                "Target registered as active IOC for detection; no network "
+                "enforcement performed (no firewall integration configured)"
+            ),
             "target": target,
             "ioc_id": ioc.id,
             "duration_hours": duration_hours,
@@ -823,6 +1247,8 @@ class AccountActionExecutor(ActionExecutor):
             "target": target,
             "user_id": user.id,
             "is_active": user.is_active,
+            # Recorded so rollback can restore the exact prior state
+            "previous_is_active": previous_active,
         }
 
 
@@ -1034,6 +1460,8 @@ class FileActionExecutor(ActionExecutor):
             "success": True,
             "action": "file_quarantine",
             "target": target,
+            # file_path recorded so rollback can queue unquarantine_file
+            "file_path": file_path,
             "command_id": cmd.id,
             "command_status": cmd.status,
             "agent_id": agent.id,
@@ -1285,7 +1713,13 @@ class PatchExecutor(ActionExecutor):
         instances = inst_result.scalars().all()
 
         updated_ids: list[str] = []
+        # Per-instance prior statuses recorded so rollback can restore them
+        updated_instances: list[dict] = []
         for inst in instances:
+            updated_instances.append({
+                "instance_id": inst.id,
+                "previous_status": inst.status,
+            })
             inst.status = new_status
             updated_ids.append(inst.id)
 
@@ -1317,6 +1751,7 @@ class PatchExecutor(ActionExecutor):
             "vulnerability_id": vuln.id,
             "cve_id": cve_id,
             "instances_updated": len(updated_ids),
+            "instances": updated_instances,
             "new_status": new_status,
         }
 
