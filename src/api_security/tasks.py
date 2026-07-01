@@ -6,7 +6,9 @@ compliance checking, and shadow API detection.
 """
 
 from datetime import datetime, timedelta
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple
+
+import httpx
 from celery import shared_task
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
@@ -251,7 +253,12 @@ def compliance_check(self, endpoint_id: str, org_id: str):
 
                 results = {}
                 for check_type in checks_to_run:
-                    passed = await _run_check(endpoint, check_type)
+                    details = {"endpoint": f"{endpoint.method} {endpoint.path}"}
+                    if check_type == "header_check":
+                        passed, header_details = await _check_security_headers(endpoint)
+                        details.update(header_details)
+                    else:
+                        passed = await _run_check(endpoint, check_type)
                     results[check_type] = passed
 
                     # Save to database
@@ -259,7 +266,7 @@ def compliance_check(self, endpoint_id: str, org_id: str):
                         endpoint_id=endpoint_id,
                         check_type=check_type,
                         passed=passed,
-                        details={"endpoint": f"{endpoint.method} {endpoint.path}"},
+                        details=details,
                         organization_id=org_id,
                     )
                     db.add(check_record)
@@ -369,10 +376,68 @@ async def _run_check(endpoint: APIEndpointInventory, check_type: str) -> bool:
         "authorization_check": lambda e: e.authorization_model is not None or e.is_public,
         "rate_limit_check": lambda e: e.rate_limit_configured,
         "tls_check": lambda e: endpoint.base_url.startswith("https"),
-        "header_check": lambda e: True,  # Would check actual headers
     }
+
+    if check_type == "header_check":
+        passed, _ = await _check_security_headers(endpoint)
+        return passed
 
     try:
         return checks[check_type](endpoint)
     except Exception:
         return False
+
+
+# Security headers every endpoint response is expected to carry.
+# HSTS is only meaningful over TLS, so it is required for https URLs only.
+REQUIRED_SECURITY_HEADERS = (
+    "X-Content-Type-Options",
+    "X-Frame-Options",
+    "Content-Security-Policy",
+)
+HSTS_HEADER = "Strict-Transport-Security"
+
+
+async def _check_security_headers(
+    endpoint: APIEndpointInventory,
+) -> Tuple[bool, Dict[str, Any]]:
+    """
+    Check response security headers for an endpoint via a live HTTP request.
+
+    The inventory model does not store observed response headers, so this
+    fetches the endpoint with a short timeout and inspects the response.
+    When the endpoint has no resolvable URL or is unreachable, the check
+    fails with an explicit reason -- it never passes without real header
+    data.
+
+    Returns:
+        (passed: bool, details: Dict with checked_url/missing_headers/reason)
+    """
+    base_url = (endpoint.base_url or "").strip()
+    if not base_url.lower().startswith(("http://", "https://")):
+        return False, {
+            "reason": "no header data available: endpoint has no resolvable URL",
+            "base_url": endpoint.base_url,
+        }
+
+    url = f"{base_url.rstrip('/')}/{(endpoint.path or '').lstrip('/')}"
+    try:
+        async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as client:
+            response = await client.get(url)
+    except httpx.HTTPError as exc:
+        return False, {
+            "reason": f"no header data available: endpoint unreachable ({exc})",
+            "checked_url": url,
+        }
+
+    required = list(REQUIRED_SECURITY_HEADERS)
+    if url.lower().startswith("https://"):
+        required.append(HSTS_HEADER)
+
+    # httpx header lookup is case-insensitive
+    missing = [h for h in required if h not in response.headers]
+    return len(missing) == 0, {
+        "checked_url": url,
+        "status_code": response.status_code,
+        "missing_headers": missing,
+    }

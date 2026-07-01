@@ -13,6 +13,9 @@ from typing import Dict, Any, List, Optional, Tuple
 from collections import defaultdict
 import hashlib
 
+import httpx
+import yaml
+
 from src.core.logging import get_logger
 from src.api_security.models import (
     APIEndpointInventory,
@@ -132,9 +135,7 @@ class APIDiscoveryEngine:
 
         documented = []
         try:
-            # In real implementation, would fetch and parse spec
-            # This is a simplified version
-            spec_endpoints = self._parse_openapi_spec(spec_url)
+            spec_endpoints = await self._parse_openapi_spec(spec_url)
 
             for endpoint in spec_endpoints:
                 endpoint_key = f"{service_name}:{endpoint['method']}:{endpoint['path']}"
@@ -300,21 +301,142 @@ class APIDiscoveryEngine:
         else:
             return "internal"
 
-    def _parse_openapi_spec(self, spec_url: str) -> List[Dict[str, Any]]:
-        """Parse OpenAPI specification (simplified)"""
-        # In real implementation, would fetch and parse actual spec
-        return [
-            {
-                "path": "/api/users",
-                "method": "GET",
-                "authentication_type": AuthenticationTypeEnum.JWT.value,
-            },
-            {
-                "path": "/api/users",
-                "method": "POST",
-                "authentication_type": AuthenticationTypeEnum.JWT.value,
-            },
-        ]
+    # HTTP methods recognized inside an OpenAPI path item
+    _OPENAPI_METHODS = ("get", "post", "put", "patch", "delete", "head", "options")
+
+    async def _parse_openapi_spec(self, spec_url: str) -> List[Dict[str, Any]]:
+        """
+        Fetch and parse an OpenAPI 3.x / Swagger 2.0 specification.
+
+        Fetches the spec over HTTP, parses it as JSON (with YAML fallback),
+        and extracts one endpoint dict (path, method, authentication_type)
+        per operation. Raises ValueError when the spec cannot be fetched or
+        is not a valid OpenAPI/Swagger document, so a failed fetch is never
+        mistaken for an empty documented set (which would mark every real
+        endpoint as shadow).
+        """
+        try:
+            async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
+                response = await client.get(spec_url)
+        except httpx.HTTPError as e:
+            raise ValueError(f"Failed to fetch OpenAPI spec from {spec_url}: {e}") from e
+
+        if not (200 <= response.status_code < 300):
+            raise ValueError(
+                f"OpenAPI spec fetch from {spec_url} returned HTTP {response.status_code}"
+            )
+
+        spec = self._load_spec_document(response.text)
+
+        if "openapi" not in spec and "swagger" not in spec:
+            raise ValueError(
+                "Document is not an OpenAPI 3.x or Swagger 2.0 spec "
+                "(missing 'openapi'/'swagger' version field)"
+            )
+
+        paths = spec.get("paths")
+        if not isinstance(paths, dict):
+            raise ValueError("OpenAPI spec has no 'paths' object")
+
+        security_schemes = self._extract_security_schemes(spec)
+        root_security = spec.get("security")
+
+        endpoints = []
+        for path, path_item in paths.items():
+            if not isinstance(path_item, dict):
+                continue
+            for method in self._OPENAPI_METHODS:
+                operation = path_item.get(method)
+                if not isinstance(operation, dict):
+                    continue
+                # Operation-level security overrides the spec root default
+                security = operation.get("security", root_security)
+                endpoints.append(
+                    {
+                        "path": path,
+                        "method": method.upper(),
+                        "authentication_type": self._resolve_spec_auth(
+                            security, security_schemes
+                        ),
+                    }
+                )
+
+        return endpoints
+
+    def _load_spec_document(self, raw: str) -> Dict[str, Any]:
+        """Parse raw spec text as JSON, falling back to YAML"""
+        try:
+            document = json.loads(raw)
+        except json.JSONDecodeError:
+            try:
+                document = yaml.safe_load(raw)
+            except yaml.YAMLError as e:
+                raise ValueError(
+                    f"OpenAPI spec is neither valid JSON nor valid YAML: {e}"
+                ) from e
+
+        if not isinstance(document, dict):
+            raise ValueError("OpenAPI spec did not parse to an object")
+        return document
+
+    def _extract_security_schemes(self, spec: Dict[str, Any]) -> Dict[str, Any]:
+        """Collect security schemes from OpenAPI 3.x and Swagger 2.0 locations"""
+        schemes: Dict[str, Any] = {}
+        components = spec.get("components")
+        if isinstance(components, dict) and isinstance(
+            components.get("securitySchemes"), dict
+        ):
+            schemes.update(components["securitySchemes"])
+        # Swagger 2.0
+        if isinstance(spec.get("securityDefinitions"), dict):
+            schemes.update(spec["securityDefinitions"])
+        return schemes
+
+    def _resolve_spec_auth(
+        self,
+        security: Optional[List[Dict[str, Any]]],
+        security_schemes: Dict[str, Any],
+    ) -> str:
+        """Map an OpenAPI security requirement to the inventory auth vocabulary"""
+        if not security:
+            return AuthenticationTypeEnum.NONE.value
+
+        references_unknown_scheme = False
+        for requirement in security:
+            # An empty requirement object ({}) means auth is optional
+            if not isinstance(requirement, dict) or not requirement:
+                continue
+            for scheme_name in requirement:
+                scheme = security_schemes.get(scheme_name)
+                if isinstance(scheme, dict):
+                    return self._map_security_scheme(scheme)
+                references_unknown_scheme = True
+
+        if references_unknown_scheme:
+            # Auth is required but the referenced scheme is not defined
+            return AuthenticationTypeEnum.CUSTOM.value
+        return AuthenticationTypeEnum.NONE.value
+
+    def _map_security_scheme(self, scheme: Dict[str, Any]) -> str:
+        """Map a securityScheme/securityDefinition object to an auth type"""
+        scheme_type = (scheme.get("type") or "").lower()
+
+        if scheme_type == "apikey":
+            return AuthenticationTypeEnum.API_KEY.value
+        if scheme_type in ("oauth2", "openidconnect"):
+            return AuthenticationTypeEnum.OAUTH2.value
+        if scheme_type == "mutualtls":
+            return AuthenticationTypeEnum.MTLS.value
+        if scheme_type == "basic":  # Swagger 2.0
+            return AuthenticationTypeEnum.BASIC.value
+        if scheme_type == "http":  # OpenAPI 3.x
+            http_scheme = (scheme.get("scheme") or "").lower()
+            if http_scheme == "bearer":
+                return AuthenticationTypeEnum.JWT.value
+            if http_scheme == "basic":
+                return AuthenticationTypeEnum.BASIC.value
+            return AuthenticationTypeEnum.CUSTOM.value
+        return AuthenticationTypeEnum.CUSTOM.value
 
 
 class APISecurityScanner:
