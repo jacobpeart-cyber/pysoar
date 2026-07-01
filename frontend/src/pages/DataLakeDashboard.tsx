@@ -203,11 +203,24 @@ export default function DataLakeDashboard() {
 
   const STORAGE_COLORS = ['#3B82F6', '#10B981', '#F59E0B', '#8B5CF6'];
 
-  // Ingest trend: backend `/data-lake/dashboard/metrics` is the real
-  // source. Until that query is wired we show an empty state instead
-  // of fabricating a 5-point line by multiplying base rate × random
-  // jitter ([0.9, 0.95, 1.0] rotating pattern).
-  const ingestTrendData: Array<{ time: string; rate: number }> = useMemo(() => [], []);
+  // Real ingest trend from /data-lake/dashboard/ingestion-trend:
+  // hourly ingested-record counts over the last 24h, summed across the
+  // built-in ingest surfaces and org-scoped on the backend. Replaces
+  // the fabricated 5-point line (base rate × [0.9, 0.95, 1.0] jitter).
+  // No ingested rows → empty array → the chart's empty state.
+  const { data: ingestTrendRaw } = useQuery({
+    queryKey: ['dl-ingestion-trend'],
+    queryFn: () => datalakeApi.getIngestionTrend(24),
+  });
+  const ingestTrendData: Array<{ time: string; rate: number }> = useMemo(() => {
+    const points = (ingestTrendRaw as any)?.points;
+    if (!Array.isArray(points)) return [];
+    return points.map((p: any) => ({
+      // "2026-07-01T13:00:00" -> "13:00"
+      time: typeof p.time === 'string' ? p.time.slice(11, 16) : String(p.time ?? ''),
+      rate: Number(p.count) || 0,
+    }));
+  }, [ingestTrendRaw]);
 
   const pipelineHealthData = useMemo(() => {
     return pipelines.map((p: Pipeline) => ({
@@ -318,7 +331,7 @@ export default function DataLakeDashboard() {
 
             <div className="mb-8">
               <div className="bg-gray-800 border border-gray-700 rounded-lg p-6 dark:bg-gray-800 dark:border-gray-700">
-                <h3 className="text-lg font-semibold mb-4">Ingestion Rate Trend</h3>
+                <h3 className="text-lg font-semibold mb-4">Ingestion Rate Trend (events/hour, last 24h)</h3>
                 <ResponsiveContainer width="100%" height={300}>
                   <LineChart data={ingestTrendData}>
                     <CartesianGrid strokeDasharray="3 3" stroke="#374151" />

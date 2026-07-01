@@ -2,7 +2,7 @@
 
 import json
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, status, Body
@@ -934,6 +934,66 @@ async def get_dashboard(
             APIEndpointInventoryResponse.model_validate(e) for e in top_endpoints
         ],
     )
+
+
+@router.get("/dashboard/risk-trend")
+async def get_risk_trend(
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+    days: int = Query(30, ge=1, le=90, description="Trailing window size in days"),
+):
+    """Daily API vulnerability findings by severity over the trailing window.
+
+    Real time series for the dashboard's severity risk-trend chart:
+    counts the org's APIVulnerability rows bucketed by ``created_at``
+    day and severity (critical/high/medium/low). Org-scoped exactly like
+    the sibling /dashboard endpoint. Returns an empty ``points`` list
+    when no findings exist in the window so the UI renders an honest
+    empty state instead of a fabricated line.
+    """
+    org_id = getattr(current_user, "organization_id", None)
+    now = datetime.now(timezone.utc)
+    window_start = (now - timedelta(days=days - 1)).replace(
+        hour=0, minute=0, second=0, microsecond=0
+    )
+
+    rows = (await db.execute(
+        select(APIVulnerability.created_at, APIVulnerability.severity).where(
+            and_(
+                APIVulnerability.organization_id == org_id,
+                APIVulnerability.created_at >= window_start,
+            )
+        )
+    )).all()
+
+    severities = ("critical", "high", "medium", "low")
+    by_day: dict[str, dict[str, int]] = {}
+    total_findings = 0
+    for created_at, severity in rows:
+        if created_at is None:
+            continue
+        total_findings += 1
+        sev = str(severity or "").lower()
+        if sev not in severities:
+            continue  # unknown severity: counted in total, not in a series
+        day_key = created_at.date().isoformat()
+        bucket = by_day.setdefault(day_key, {s: 0 for s in severities})
+        bucket[sev] += 1
+
+    points: list[dict] = []
+    if total_findings > 0:
+        # Dense daily series (zero-filled) so the chart line is continuous.
+        for i in range(days):
+            day_key = (window_start + timedelta(days=i)).date().isoformat()
+            counts = by_day.get(day_key, {s: 0 for s in severities})
+            points.append({"date": day_key, **counts})
+
+    return {
+        "window_days": days,
+        "points": points,
+        "total_findings": total_findings,
+        "generated_at": now.isoformat(),
+    }
 
 
 # ============================================================================

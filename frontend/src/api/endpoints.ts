@@ -1309,6 +1309,13 @@ export const apisecurityApi = {
     const response = await api.post('/api-security/endpoints', data);
     return response.data;
   },
+
+  // Daily vulnerability findings by severity over the trailing window.
+  // Shape: { window_days, points: [{ date, critical, high, medium, low }], total_findings }
+  getRiskTrend: async (days = 30): Promise<any> => {
+    const response = await api.get('/api-security/dashboard/risk-trend', { params: { days } });
+    return response.data;
+  },
 };
 
 // Data Lake
@@ -1341,6 +1348,13 @@ export const datalakeApi = {
 
   createDataSource: async (data: { name: string; connection_string: string }): Promise<any> => {
     const response = await api.post('/data-lake/sources', data);
+    return response.data;
+  },
+
+  // Hourly ingested-record counts over the trailing window.
+  // Shape: { window_hours, points: [{ time, count }], total_events, by_source }
+  getIngestionTrend: async (hours = 24): Promise<any> => {
+    const response = await api.get('/data-lake/dashboard/ingestion-trend', { params: { hours } });
     return response.data;
   },
 };

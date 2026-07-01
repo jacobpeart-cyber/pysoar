@@ -2088,24 +2088,181 @@ async def get_storage_breakdown(
 async def get_pipeline_status(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
+    include_builtins: bool = Query(
+        True, description="Count live Celery beat pipelines as active"
+    ),
 ):
-    """Get pipeline execution status and health"""
-    try:
-        pipeline_status = {
-            "active_pipelines": 42,
-            "paused_pipelines": 3,
-            "error_pipelines": 1,
-            "recent_executions": [
-                {
-                    "pipeline_id": "pl_001",
-                    "status": "completed",
-                    "execution_time_ms": 2345,
-                    "records_processed": 125000,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                },
-            ],
-            "avg_success_rate": 99.76,
+    """Real pipeline execution status and health.
+
+    Previously returned hardcoded constants (42 active / 99.76% success /
+    one fabricated execution). Now every number is computed from the
+    caller's own DataPipeline rows (same org-scoping as the sibling
+    /dashboard/metrics endpoint), optionally plus the live Celery beat
+    schedule that /pipelines also surfaces:
+
+      * ``active/paused/error_pipelines`` — one GROUP BY over the org's
+        pipeline statuses ("error" + "failed" fold into error).
+      * ``avg_success_rate`` — (records_processed - errors) / records
+        across the org's pipelines when anything has been processed;
+        falls back to the active/total ratio; 0.0 when the org has no
+        pipelines at all.
+      * ``recent_executions`` — the org's pipelines that actually ran
+        (``last_run`` set), newest first. There is no per-run execution
+        history model, so this honestly reflects the last run per
+        pipeline and is an empty list when nothing has ever run.
+    """
+    org_id = getattr(current_user, "organization_id", None)
+
+    # Status counts in one org-scoped GROUP BY.
+    status_rows = (await db.execute(
+        select(DataPipeline.status, func.count())
+        .where(DataPipeline.organization_id == org_id)
+        .group_by(DataPipeline.status)
+    )).all()
+    by_status = {str(s or "").lower(): int(c or 0) for s, c in status_rows}
+    total_db = sum(by_status.values())
+    active = by_status.get("active", 0)
+    paused = by_status.get("paused", 0)
+    error = by_status.get("error", 0) + by_status.get("failed", 0)
+
+    # Real success rate from the pipelines' processed/error counters.
+    records_total, errors_total = (await db.execute(
+        select(
+            func.coalesce(func.sum(DataPipeline.records_processed_total), 0),
+            func.coalesce(func.sum(DataPipeline.error_count), 0),
+        ).where(DataPipeline.organization_id == org_id)
+    )).one()
+    records_total = int(records_total or 0)
+    errors_total = int(errors_total or 0)
+    if records_total > 0:
+        avg_success_rate = round(
+            max(0.0, (records_total - errors_total) / records_total) * 100.0, 2
+        )
+    elif total_db > 0:
+        avg_success_rate = round(active / total_db * 100.0, 2)
+    else:
+        avg_success_rate = 0.0
+
+    # Most recent real runs (org-scoped; empty when nothing has run).
+    ran = (await db.execute(
+        select(DataPipeline)
+        .where(
+            and_(
+                DataPipeline.organization_id == org_id,
+                DataPipeline.last_run.is_not(None),
+            )
+        )
+        .order_by(DataPipeline.last_run.desc())
+        .limit(10)
+    )).scalars().all()
+    recent_executions = [
+        {
+            "pipeline_id": p.id,
+            "pipeline_name": p.name,
+            "status": p.status,
+            "execution_time_ms": int(p.avg_processing_time_ms or 0),
+            "records_processed": int(p.records_processed_total or 0),
+            "timestamp": p.last_run,
         }
-        return pipeline_status
-    except Exception as e:
-        raise HTTPException(status_code=400, detail="Operation failed. Please try again or contact support.")
+        for p in ran
+    ]
+
+    # Live Celery beat pipelines are always "active" — same builtins the
+    # /pipelines list shows, so the two views agree.
+    builtin_active = len(_builtin_celery_pipelines(org_id)) if include_builtins else 0
+
+    return {
+        "active_pipelines": active + builtin_active,
+        "paused_pipelines": paused,
+        "error_pipelines": error,
+        "total_pipelines": total_db + builtin_active,
+        "recent_executions": recent_executions,
+        "avg_success_rate": avg_success_rate,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@router.get("/dashboard/ingestion-trend")
+async def get_ingestion_trend(
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+    hours: int = Query(24, ge=1, le=168, description="Trailing window size in hours"),
+):
+    """Hourly ingested-record counts over the trailing window.
+
+    Sums real row counts (bucketed by ``created_at`` hour) across the
+    built-in ingest surfaces from BUILTIN_DATA_SOURCES (log_entries,
+    alerts, incidents, ...). Tenant-scoped: every table is filtered by
+    the caller's organization_id, and any table that can't be filtered
+    (missing table/column) is skipped rather than leaking cross-tenant
+    rows. Returns an empty ``points`` list when nothing was ingested in
+    the window — the UI renders its empty state instead of a fabricated
+    line.
+    """
+    from sqlalchemy import text as sa_text
+
+    org_id = getattr(current_user, "organization_id", None)
+    now = datetime.now(timezone.utc)
+    window_start = (now - timedelta(hours=hours - 1)).replace(
+        minute=0, second=0, microsecond=0
+    )
+
+    dialect = db.bind.dialect.name if db.bind is not None else "postgresql"
+    if dialect == "sqlite":
+        # SQLite stores DateTime as naive-UTC text; strftime buckets it.
+        bucket_expr = "strftime('%Y-%m-%dT%H:00:00', created_at)"
+        cutoff = window_start.replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
+    else:
+        # AT TIME ZONE 'UTC' pins buckets to UTC regardless of the server's
+        # session timezone so they line up with the UTC zero-fill keys below.
+        bucket_expr = (
+            "to_char(date_trunc('hour', created_at AT TIME ZONE 'UTC'), "
+            "'YYYY-MM-DD\"T\"HH24:00:00')"
+        )
+        cutoff = window_start
+
+    buckets: dict[str, int] = {}
+    by_source: dict[str, int] = {}
+    if org_id is not None:
+        for spec in BUILTIN_DATA_SOURCES:
+            table = spec["table"]
+            if table not in DATA_LAKE_READABLE_TABLES:
+                continue
+            try:
+                rows = (await db.execute(
+                    sa_text(
+                        f"SELECT {bucket_expr} AS bucket, COUNT(*) "
+                        f"FROM {table} "
+                        f"WHERE organization_id = :org_id AND created_at >= :cutoff "
+                        f"GROUP BY 1"
+                    ),
+                    {"org_id": org_id, "cutoff": cutoff},
+                )).all()
+            except Exception:  # noqa: BLE001 — missing table/column: skip, never leak
+                await db.rollback()
+                continue
+            source_total = 0
+            for bucket, cnt in rows:
+                if bucket is None:
+                    continue
+                buckets[str(bucket)] = buckets.get(str(bucket), 0) + int(cnt or 0)
+                source_total += int(cnt or 0)
+            if source_total:
+                by_source[spec["name"]] = source_total
+
+    total_events = sum(buckets.values())
+    points: list[dict] = []
+    if total_events > 0:
+        # Dense hourly series (zero-filled) so the chart line is continuous.
+        for i in range(hours):
+            key = (window_start + timedelta(hours=i)).strftime("%Y-%m-%dT%H:00:00")
+            points.append({"time": key, "count": buckets.get(key, 0)})
+
+    return {
+        "window_hours": hours,
+        "bucket": "hour",
+        "points": points,
+        "total_events": total_events,
+        "by_source": by_source,
+        "generated_at": now.isoformat(),
+    }

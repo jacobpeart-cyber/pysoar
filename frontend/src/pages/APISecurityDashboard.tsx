@@ -102,14 +102,26 @@ export default function APISecurityDashboard() {
     return categories.map((c) => ({ category: c.slice(0, 3), pass: buckets[c].pass, fail: buckets[c].fail }));
   }, [vulnerabilities]);
 
-  // Real severity-weighted trend is not currently exposed by the
-  // backend. Until a trend endpoint exists we return [] and let the
-  // chart render an honest empty state instead of a fabricated line
-  // built by subtracting (3 - weeksAgo) from today's counts.
-  const riskTrendData: Array<{ date: string; critical: number; high: number; medium: number }> = useMemo(
-    () => [],
-    [],
-  );
+  // Real severity trend from /api-security/dashboard/risk-trend:
+  // daily vulnerability-finding counts by severity over the last 30
+  // days, org-scoped on the backend. Replaces the fabricated line
+  // built by subtracting (3 - weeksAgo) from today's counts. No
+  // findings in the window → empty array → honest empty chart.
+  const { data: riskTrendRaw } = useQuery({
+    queryKey: ['apiRiskTrend'],
+    queryFn: () => apisecurityApi.getRiskTrend(30),
+  });
+  const riskTrendData: Array<{ date: string; critical: number; high: number; medium: number }> = useMemo(() => {
+    const points = (riskTrendRaw as any)?.points;
+    if (!Array.isArray(points)) return [];
+    return points.map((p: any) => ({
+      // "2026-07-01" -> "07-01"
+      date: typeof p.date === 'string' ? p.date.slice(5) : String(p.date ?? ''),
+      critical: Number(p.critical) || 0,
+      high: Number(p.high) || 0,
+      medium: Number(p.medium) || 0,
+    }));
+  }, [riskTrendRaw]);
 
   const apiScatterData = apiInventory.map((api: APIRecord) => ({
     name: api.name,
@@ -338,7 +350,26 @@ export default function APISecurityDashboard() {
 
         {/* Vulnerabilities Tab */}
         {activeTab === 'vulnerabilities' && (
-          <div className="space-y-4">
+          <div>
+            <div className="mb-8">
+              <div className="bg-gray-800 border border-gray-700 rounded-lg p-6 dark:bg-gray-800 dark:border-gray-700">
+                <h3 className="text-lg font-semibold mb-4">Severity Risk Trend (findings/day, last 30 days)</h3>
+                <ResponsiveContainer width="100%" height={300}>
+                  <LineChart data={riskTrendData}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
+                    <XAxis dataKey="date" stroke="#9CA3AF" />
+                    <YAxis stroke="#9CA3AF" allowDecimals={false} />
+                    <Tooltip contentStyle={{ backgroundColor: '#1F2937', border: '1px solid #374151', borderRadius: '8px' }} />
+                    <Legend />
+                    <Line type="monotone" dataKey="critical" stroke="#EF4444" strokeWidth={2} />
+                    <Line type="monotone" dataKey="high" stroke="#F97316" strokeWidth={2} />
+                    <Line type="monotone" dataKey="medium" stroke="#F59E0B" strokeWidth={2} />
+                  </LineChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+
+            <div className="space-y-4">
             {vulnerabilities.map((vuln: Vulnerability) => (
               <div
                 key={vuln.id}
@@ -387,6 +418,7 @@ export default function APISecurityDashboard() {
                 </div>
               </div>
             ))}
+            </div>
           </div>
         )}
 
