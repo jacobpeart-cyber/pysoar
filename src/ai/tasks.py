@@ -620,16 +620,24 @@ def process_nl_query_async(self, query_id: str, natural_language: str, user_id: 
     """
     Process natural language query asynchronously.
 
-    Handles long-running NL query processing in background, updates results
-    when complete.
+    Runs the NL query engine in the background and persists the outcome onto
+    the existing NLQuery row identified by ``query_id`` (previously the
+    result was computed and then dropped — "In production, would update
+    database with results" — so async results were silently lost).
+
+    NOTE: nothing currently enqueues this task — the /ai/query API endpoint
+    processes queries synchronously and creates the NLQuery row itself. Any
+    future producer must create the NLQuery row first and pass its id as
+    ``query_id``; if no such row exists, this task reports
+    ``persisted: False`` rather than pretending the results were saved.
 
     Args:
-        query_id: Unique query identifier
+        query_id: Id of an existing NLQuery row to update with results
         natural_language: User's natural language query
         user_id: ID of user who submitted query
 
     Returns:
-        Dictionary with query results
+        Dictionary with query results and whether they were persisted
     """
     try:
         logger.info(f"Processing NL query {query_id}")
@@ -642,10 +650,40 @@ def process_nl_query_async(self, query_id: str, natural_language: str, user_id: 
 
         logger.info(f"NL query {query_id} complete: {result['results_count']} results")
 
-        # In production, would update database with results
+        # Persist the outcome onto the NLQuery row so query history
+        # (/api/v1/ai/queries) reflects the async result.
+        async def _persist_results() -> bool:
+            from src.core.database import async_session_factory
+            from src.ai.models import NLQuery
+
+            async with async_session_factory() as session:
+                row = (
+                    await session.execute(
+                        select(NLQuery).where(NLQuery.id == query_id)
+                    )
+                ).scalar_one_or_none()
+                if row is None:
+                    return False
+                row.interpreted_intent = result.get("intent") or "unknown"
+                row.generated_query = result.get("query_generated") or ""
+                row.results_summary = result.get("summary")
+                row.result_count = result.get("results_count", 0)
+                row.execution_time_ms = result.get("execution_time_ms", 0)
+                await session.commit()
+                return True
+
+        persisted = _run_async(_persist_results())
+        if not persisted:
+            logger.warning(
+                f"NL query {query_id}: no NLQuery row with that id — results "
+                "were returned to the Celery result backend only and are NOT "
+                "persisted to query history"
+            )
+
         return {
             "status": "success",
             "query_id": query_id,
+            "persisted": persisted,
             "results": result,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }

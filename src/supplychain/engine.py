@@ -6,6 +6,8 @@ vendor assessment, and compliance validation.
 
 import json
 import re
+import shutil
+import subprocess
 from datetime import datetime
 from typing import Any, Optional
 from xml.etree import ElementTree as ET
@@ -506,24 +508,131 @@ class DependencyScanner:
 
         return dependencies
 
-    def scan_container_image(self, image_digest: str) -> list[dict[str, Any]]:
-        """Scan container image for dependencies (mock implementation)
+    # SBOM-capable scanner backends probed on PATH, in preference order.
+    CONTAINER_SCANNER_BACKENDS = ("syft", "trivy")
+
+    def detect_scanner_backend(self) -> Optional[str]:
+        """Return the first SBOM-capable scanner binary found on PATH, if any."""
+        for backend in self.CONTAINER_SCANNER_BACKENDS:
+            if shutil.which(backend):
+                return backend
+        return None
+
+    def scan_container_image(self, image_digest: str) -> dict[str, Any]:
+        """Scan a container image for dependencies with a real scanner backend.
+
+        Previously a mock that returned one hardcoded fake dependency
+        ("base-os-package") for every image. Following the container_security
+        ImageScanner precedent, this now either invokes a real SBOM scanner
+        (syft or trivy) found on PATH and maps its output to dependency
+        objects, or honestly reports that no scanner backend is available.
 
         Args:
             image_digest: Container image digest or reference
 
         Returns:
-            List of dependency objects
+            Dict with keys: status ("completed" | "no_scanner_backend" |
+            "scan_failed"), scanner_backend, message (on non-completed
+            statuses), and dependencies (list of dependency objects — always
+            empty unless status is "completed").
         """
-        self.logger.info(f"Container image scanning initiated for {image_digest}")
-        return [
-            {
-                "name": "base-os-package",
-                "version": "1.0",
-                "package_type": "apt",
-                "purl": f"pkg:deb/debian/base@1.0",
+        backend = self.detect_scanner_backend()
+        if backend is None:
+            self.logger.info(
+                f"No container image scanner backend on PATH for {image_digest}; "
+                "returning honest no_scanner_backend status"
+            )
+            return {
+                # Honest status: no scanner ran. An empty dependency list here
+                # means "nothing was scanned", NOT "no dependencies found".
+                "status": "no_scanner_backend",
+                "scanner_backend": None,
+                "message": (
+                    "No container image-scanning backend (syft/trivy) is "
+                    "installed; the image was not scanned and no dependencies "
+                    "were discovered. This is NOT a clean scan result."
+                ),
+                "dependencies": [],
             }
-        ]
+
+        if backend == "syft":
+            cmd = ["syft", image_digest, "-o", "json", "-q"]
+        else:  # trivy
+            cmd = [
+                "trivy", "image", "--format", "json", "--list-all-pkgs",
+                "--quiet", image_digest,
+            ]
+
+        self.logger.info(f"Scanning container image {image_digest} with {backend}")
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=600
+            )
+            if proc.returncode != 0:
+                self.logger.error(
+                    f"{backend} scan of {image_digest} failed "
+                    f"(rc={proc.returncode}): {proc.stderr[:500]}"
+                )
+                return {
+                    "status": "scan_failed",
+                    "scanner_backend": backend,
+                    "message": f"{backend} exited {proc.returncode}: {proc.stderr[:500]}",
+                    "dependencies": [],
+                }
+            data = json.loads(proc.stdout)
+        except (subprocess.SubprocessError, OSError, json.JSONDecodeError) as e:
+            self.logger.error(f"{backend} scan of {image_digest} failed: {e}")
+            return {
+                "status": "scan_failed",
+                "scanner_backend": backend,
+                "message": str(e),
+                "dependencies": [],
+            }
+
+        dependencies = (
+            self._parse_syft_sbom(data)
+            if backend == "syft"
+            else self._parse_trivy_packages(data)
+        )
+        return {
+            "status": "completed",
+            "scanner_backend": backend,
+            "dependencies": dependencies,
+        }
+
+    @staticmethod
+    def _parse_syft_sbom(data: dict[str, Any]) -> list[dict[str, Any]]:
+        """Map syft JSON output artifacts to dependency objects."""
+        dependencies = []
+        for artifact in data.get("artifacts", []) or []:
+            name = artifact.get("name")
+            if not name:
+                continue
+            dependencies.append({
+                "name": name,
+                "version": artifact.get("version") or "unknown",
+                "package_type": artifact.get("type") or "unknown",
+                "purl": artifact.get("purl") or "",
+            })
+        return dependencies
+
+    @staticmethod
+    def _parse_trivy_packages(data: dict[str, Any]) -> list[dict[str, Any]]:
+        """Map trivy JSON output package lists to dependency objects."""
+        dependencies = []
+        for result in data.get("Results", []) or []:
+            pkg_type = result.get("Type") or result.get("Class") or "unknown"
+            for pkg in result.get("Packages", []) or []:
+                name = pkg.get("Name")
+                if not name:
+                    continue
+                dependencies.append({
+                    "name": name,
+                    "version": pkg.get("Version") or "unknown",
+                    "package_type": pkg_type,
+                    "purl": (pkg.get("Identifier") or {}).get("PURL") or "",
+                })
+        return dependencies
 
     def detect_outdated_dependencies(
         self, dependencies: list[dict[str, Any]], latest_versions: dict[str, str]

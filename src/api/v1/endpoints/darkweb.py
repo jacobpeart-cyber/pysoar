@@ -1040,9 +1040,22 @@ async def initiate_takedown(
     threat.takedown_status = "takedown_requested"
     await db.commit()
 
-    logger.info(f"Initiated takedown for threat: {threat_id}")
+    logger.info(f"Recorded takedown request for threat: {threat_id}")
 
-    return {"status": "takedown_requested", "threat_id": threat_id}
+    # Honest response: the request is RECORDED on the threat and brand
+    # monitoring is re-queued, but no takedown provider is integrated —
+    # nothing is submitting an abuse/takedown request on the analyst's
+    # behalf. The takedown itself must be actioned manually.
+    return {
+        "status": "takedown_requested",
+        "threat_id": threat_id,
+        "execution": "recorded_only",
+        "detail": (
+            "Takedown request recorded on the threat and brand monitoring "
+            "re-queued. No takedown provider is integrated, so the takedown "
+            "must be actioned manually (registrar/hosting abuse contact)."
+        ),
+    }
 
 
 # Dashboard endpoints

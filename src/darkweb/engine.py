@@ -619,31 +619,84 @@ class CredentialAnalyzer:
 
         return matched_users
 
+    SUPPORTED_REMEDIATION_ACTIONS = frozenset(
+        {"password_reset", "account_disabled", "mfa_enforced", "token_revoked"}
+    )
+
     async def auto_remediate(
-        self, affected_user_id: str, action: str
+        self, affected_user_id: str, action: str, db: Optional[Any] = None
     ) -> dict[str, Any]:
-        """Trigger automated remediation workflow"""
-        remediation_result = {
+        """Apply credential-leak remediation to a matching LOCAL user account.
+
+        Previously returned ``{"status": "initiated", "notification_sent":
+        True, "workflow": ...}`` without doing anything — no workflow ran and
+        no notification was ever sent. It now either performs a real account
+        action against the local User table (same semantics as remediation's
+        AccountActionExecutor: flag force_password_change; additionally
+        deactivate for account_disabled) when an AsyncSession is provided,
+        or honestly reports that nothing was executed.
+
+        Args:
+            affected_user_id: Local user id or email of the exposed account
+            action: One of SUPPORTED_REMEDIATION_ACTIONS
+            db: Optional SQLAlchemy AsyncSession; without it, no remediation
+                can be performed and the result says so
+        """
+        result: dict[str, Any] = {
             "user_id": affected_user_id,
             "action": action,
-            "status": "initiated",
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
-        if action == "password_reset":
-            remediation_result["workflow"] = "password_reset_workflow"
-            remediation_result["notification_sent"] = True
-        elif action == "account_disabled":
-            remediation_result["workflow"] = "account_disable_workflow"
-            remediation_result["notification_sent"] = True
-        elif action == "mfa_enforced":
-            remediation_result["workflow"] = "mfa_enforcement_workflow"
-            remediation_result["notification_sent"] = True
-        elif action == "token_revoked":
-            remediation_result["workflow"] = "token_revocation_workflow"
-            remediation_result["notification_sent"] = True
+        if action not in self.SUPPORTED_REMEDIATION_ACTIONS:
+            result["status"] = "unsupported_action"
+            result["detail"] = (
+                f"Unsupported action '{action}'; supported: "
+                f"{sorted(self.SUPPORTED_REMEDIATION_ACTIONS)}"
+            )
+            return result
 
-        return remediation_result
+        if db is None:
+            result["status"] = "not_executed"
+            result["detail"] = (
+                "No database session provided; no remediation was performed "
+                "and no notification was sent. Pass an AsyncSession to apply "
+                "the account action to the local user."
+            )
+            return result
+
+        from sqlalchemy import or_, select
+
+        from src.models.user import User
+
+        lookup = await db.execute(
+            select(User).where(
+                or_(User.id == affected_user_id, User.email == affected_user_id)
+            )
+        )
+        user = lookup.scalars().first()
+        if user is None:
+            result["status"] = "user_not_found"
+            result["detail"] = (
+                "No local user matches the affected user id/email; "
+                "no action was taken."
+            )
+            return result
+
+        # Same real controls AccountActionExecutor applies: every action
+        # forces a credential rotation; disabling also deactivates the login.
+        if action == "account_disabled":
+            user.is_active = False
+        user.force_password_change = True
+        await db.flush()
+
+        result["status"] = "applied"
+        result["matched_user_id"] = user.id
+        result["is_active"] = user.is_active
+        result["force_password_change"] = True
+        # Honest: nothing here sends an out-of-band notification.
+        result["notification_sent"] = False
+        return result
 
     async def generate_exposure_report(
         self, leaks: list[dict[str, Any]], organization_name: str
@@ -898,28 +951,41 @@ class BrandProtection:
     async def initiate_takedown_process(
         self, threat_id: str, threat_type: str, provider: str = "auto"
     ) -> dict[str, Any]:
-        """Initiate automated takedown process"""
+        """Record a takedown request honestly — no provider is integrated.
+
+        Previously fabricated a successful "takedown_requested" response with
+        an invented 3-day estimated_resolution. PySOAR has no takedown
+        provider integration (no registrar/hoster abuse API), so nothing is
+        executed here; the request must be actioned manually.
+        """
         return {
             "threat_id": threat_id,
             "threat_type": threat_type,
-            "provider": provider,
-            "status": "takedown_requested",
-            "initiated_at": datetime.now(timezone.utc).isoformat(),
-            "estimated_resolution": (
-                datetime.now(timezone.utc) + timedelta(days=3)
-            ).isoformat(),
+            "provider": None,
+            "status": "no_takedown_provider",
+            "detail": (
+                "No takedown provider is integrated; the takedown request is "
+                "recorded for manual action (registrar/hosting abuse contact) "
+                "and is NOT being executed automatically."
+            ),
+            "requested_at": datetime.now(timezone.utc).isoformat(),
         }
 
     async def track_takedown_status(self, takedown_id: str) -> dict[str, Any]:
-        """Track takedown request status"""
+        """Report takedown tracking honestly — no provider is integrated.
+
+        Previously fabricated status "in_progress" with progress=50 and an
+        invented 2-day estimated_completion. There is no provider to poll.
+        """
         return {
             "takedown_id": takedown_id,
-            "status": "in_progress",
+            "status": "no_takedown_provider",
+            "detail": (
+                "No takedown provider is integrated; there is no external "
+                "status to poll. Track manual takedown progress via the "
+                "threat's takedown_status field."
+            ),
             "last_updated": datetime.now(timezone.utc).isoformat(),
-            "progress": 50,
-            "estimated_completion": (
-                datetime.now(timezone.utc) + timedelta(days=2)
-            ).isoformat(),
         }
 
 

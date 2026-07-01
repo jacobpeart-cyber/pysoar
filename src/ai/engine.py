@@ -8,6 +8,7 @@ natural language query processing for security operations.
 import json
 import logging
 import os
+import time
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -1135,10 +1136,13 @@ class NaturalLanguageQueryEngine:
         """
         self.logger.info(f"Processing NL query: {natural_language[:50]}...")
 
+        started = time.perf_counter()
         intent = self._classify_intent(natural_language)
         query_params = self._generate_search_query(intent, natural_language)
         results = self._execute_query(intent, query_params)
         summary = self._summarize_results(natural_language, results)
+        # Real elapsed time — this was previously hardcoded to 150.
+        execution_time_ms = int((time.perf_counter() - started) * 1000)
 
         return {
             "intent": intent,
@@ -1146,7 +1150,7 @@ class NaturalLanguageQueryEngine:
             "results_count": len(results),
             "results": results[:10],  # Return top 10
             "summary": summary,
-            "execution_time_ms": 150,
+            "execution_time_ms": execution_time_ms,
         }
 
     def _classify_intent(self, query: str) -> str:
