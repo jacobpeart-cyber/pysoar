@@ -54,6 +54,12 @@ celery_app = Celery(
         # clears lapsed rate-limit windows. Without this entry the beat
         # entries below can't resolve the task names.
         "src.integrations.tasks",
+        # UEBA background pipeline — baseline learning, entity risk
+        # recalculation (with real 30-day decay), impossible-travel
+        # detection, peer-group rebuilds, high-risk-entity alerting, and
+        # behavior-event retention. Without this entry the beat entries
+        # below can't resolve the task names.
+        "src.ueba.tasks",
     ],
 )
 
@@ -213,6 +219,35 @@ celery_app.conf.beat_schedule = {
     "integrations-webhook-cleanup": {
         "task": "src.integrations.tasks.webhook_cleanup",
         "schedule": 86400.0,  # Daily — 90-day retention of inactive endpoints
+    },
+    # --- UEBA background pipeline (src.ueba.tasks) ---
+    # All entries run argument-less and therefore sweep every
+    # organization (each task org-scopes its per-entity queries).
+    # `process_behavior_events` is deliberately NOT scheduled — it is the
+    # on-demand ingest worker task.
+    "ueba-update-baselines": {
+        "task": "src.ueba.tasks.update_entity_baselines",
+        "schedule": crontab(hour=2, minute=0),  # Daily 02:00 UTC — learn from last 30d of events
+    },
+    "ueba-calculate-entity-risks": {
+        "task": "src.ueba.tasks.calculate_entity_risks",
+        "schedule": 3600.0,  # Hourly — real 30d alert-decay + rolling anomaly counter
+    },
+    "ueba-impossible-travel": {
+        "task": "src.ueba.tasks.detect_impossible_travel",
+        "schedule": 900.0,  # Every 15 minutes
+    },
+    "ueba-update-peer-groups": {
+        "task": "src.ueba.tasks.update_peer_groups",
+        "schedule": crontab(hour=3, minute=0),  # Daily 03:00 UTC
+    },
+    "ueba-generate-alerts": {
+        "task": "src.ueba.tasks.generate_ueba_alerts",
+        "schedule": 3600.0,  # Hourly — deduped per entity, no spam
+    },
+    "ueba-event-cleanup": {
+        "task": "src.ueba.tasks.cleanup_old_behavior_events",
+        "schedule": 86400.0,  # Daily — 90-day retention by default
     },
     # --- Weekly STIG fleet sweep (src.stig.tasks.scheduled_fleet_stig_sweep) ---
     # FedRAMP/NIST SP 800-137 continuous monitoring: every active endpoint

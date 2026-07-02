@@ -93,112 +93,13 @@ async def get_alert_or_404(db: AsyncSession, alert_id: str, organization_id: str
     return alert
 
 
-async def _score_event_anomaly(
-    db: AsyncSession,
-    entity: EntityProfile,
-    behavior_event: BehaviorEvent,
-) -> tuple[bool, list, float]:
-    """Score a behavior event for anomaly-ness against the entity's baseline.
-
-    Returns (is_anomalous, reasons, risk_contribution).
-
-    Strategy:
-    1. Look up a BehaviorBaseline for (entity, event_type). If one exists, check
-       the incoming source_ip / destination / hour against its statistical model
-       (typical_values, time_patterns).
-    2. If no baseline, fall back to comparing against the entity's own recent
-       events of the same type: a new source_ip, a never-before-seen destination,
-       or an activity at an unusual hour (before 6am or after 10pm UTC) count
-       as anomalous.
-    3. The first few events per entity (when history < 3) are *not* flagged,
-       otherwise every event on a cold entity looks anomalous. This mirrors
-       real UEBA warm-up behavior.
-    """
-    reasons: list[str] = []
-    risk_delta = 0.0
-
-    event_hour = datetime.now(timezone.utc).hour
-    unusual_hour = event_hour < 6 or event_hour >= 22
-
-    # Try baseline first
-    baseline_result = await db.execute(
-        select(BehaviorBaseline).where(
-            and_(
-                BehaviorBaseline.entity_profile_id == entity.id,
-                BehaviorBaseline.behavior_type == behavior_event.event_type,
-            )
-        ).limit(1)
-    )
-    baseline = baseline_result.scalar_one_or_none()
-
-    if baseline and baseline.confidence >= 0.3:
-        typical = baseline.typical_values or []
-        time_patterns = baseline.time_patterns or {}
-        typical_ips = set(typical) if isinstance(typical, list) else set()
-
-        if behavior_event.source_ip and behavior_event.source_ip not in typical_ips:
-            reasons.append(f"new_source_ip:{behavior_event.source_ip}")
-            risk_delta += 8.0
-
-        typical_hours = set(time_patterns.get("hours", [])) if isinstance(time_patterns, dict) else set()
-        if typical_hours and event_hour not in typical_hours:
-            reasons.append(f"unusual_hour:{event_hour}")
-            risk_delta += 5.0
-
-        if unusual_hour and not typical_hours:
-            reasons.append(f"off_hours:{event_hour}")
-            risk_delta += 3.0
-    else:
-        # Cold-start: use entity's recent history as the baseline
-        recent_result = await db.execute(
-            select(BehaviorEvent).where(
-                and_(
-                    BehaviorEvent.entity_profile_id == entity.id,
-                    BehaviorEvent.event_type == behavior_event.event_type,
-                )
-            ).order_by(desc(BehaviorEvent.created_at)).limit(50)
-        )
-        recent = list(recent_result.scalars().all())
-
-        # Warm-up: need at least 3 prior samples before flagging
-        if len(recent) < 3:
-            return (False, [], 0.0)
-
-        seen_ips = {r.source_ip for r in recent if r.source_ip}
-        seen_dests = {r.destination for r in recent if r.destination}
-
-        if behavior_event.source_ip and behavior_event.source_ip not in seen_ips:
-            reasons.append(f"new_source_ip:{behavior_event.source_ip}")
-            risk_delta += 10.0
-
-        if behavior_event.destination and behavior_event.destination not in seen_dests:
-            reasons.append(f"new_destination:{behavior_event.destination}")
-            risk_delta += 6.0
-
-        if unusual_hour:
-            reasons.append(f"off_hours:{event_hour}")
-            risk_delta += 4.0
-
-    # Geo impossibility: if geo_location differs from the entity's most recent event
-    if behavior_event.geo_location and isinstance(behavior_event.geo_location, dict):
-        new_country = behavior_event.geo_location.get("country")
-        if new_country:
-            last_geo_result = await db.execute(
-                select(BehaviorEvent.geo_location).where(
-                    and_(
-                        BehaviorEvent.entity_profile_id == entity.id,
-                        BehaviorEvent.geo_location.is_not(None),
-                    )
-                ).order_by(desc(BehaviorEvent.created_at)).limit(1)
-            )
-            last_geo = last_geo_result.scalar_one_or_none()
-            if isinstance(last_geo, dict):
-                last_country = last_geo.get("country")
-                if last_country and last_country != new_country:
-                    reasons.append(f"geo_change:{last_country}->{new_country}")
-                    risk_delta += 12.0
-
-    return (len(reasons) > 0, reasons, risk_delta)
+# Event scoring + persist logic lives in src.ueba.ingest so the REST
+# ingest endpoints and the `ueba.process_behavior_events` Celery task
+# share one implementation and cannot drift.
+from src.ueba.ingest import (  # noqa: E402
+    ingest_behavior_event,
+    score_event_anomaly as _score_event_anomaly,  # noqa: F401  (re-export for compat)
+)
 
 
 async def get_peer_group_or_404(db: AsyncSession, group_id: str, organization_id: str) -> PeerGroup:
@@ -816,75 +717,17 @@ async def ingest_event(
     org_id = getattr(current_user, "organization_id", None)
     # org_id may be None for users without organization
 
-    # Look up entity profile by entity_id field
-    entity_result = await db.execute(
-        select(EntityProfile).where(
-            and_(
-                EntityProfile.entity_id == event.entity_id,
-                _org_filter(EntityProfile, org_id),
-            )
-        )
+    # Shared with the batch endpoint and the process_behavior_events
+    # Celery task: entity lookup, anomaly scoring against the baseline,
+    # risk-counter bump, and on_ueba_anomaly automation fanout.
+    behavior_event, _alert_created = await ingest_behavior_event(
+        db, org_id, event.model_dump()
     )
-    entity = entity_result.scalar_one_or_none()
-    if not entity:
+    if behavior_event is None:
         raise HTTPException(status_code=404, detail=f"Entity {event.entity_id} not found")
 
-    behavior_event = BehaviorEvent(
-        id=str(uuid.uuid4()),
-        entity_profile_id=entity.id,
-        event_type=event.event_type,
-        event_data=event.event_data if hasattr(event, "event_data") else {},
-        source_ip=event.source_ip if hasattr(event, "source_ip") else None,
-        destination=event.destination if hasattr(event, "destination") else None,
-        geo_location=event.geo_location if hasattr(event, "geo_location") else None,
-        device_info=event.device_info if hasattr(event, "device_info") else None,
-        organization_id=org_id,
-    )
-
-    # Run anomaly detection against the entity's baseline. Without this,
-    # is_anomalous always defaulted to False and no UEBA alerts ever fired.
-    is_anomalous, reasons, risk_delta = await _score_event_anomaly(
-        db, entity, behavior_event
-    )
-    behavior_event.is_anomalous = is_anomalous
-    behavior_event.anomaly_reasons = reasons
-    behavior_event.risk_contribution = risk_delta
-
-    if is_anomalous:
-        # Bump the entity's rolling risk score and anomaly counters
-        entity.risk_score = min(100.0, (entity.risk_score or 0.0) + risk_delta)
-        entity.anomaly_count_30d = (entity.anomaly_count_30d or 0) + 1
-        entity.last_anomaly_at = datetime.now(timezone.utc)
-        entity.last_activity_at = datetime.now(timezone.utc)
-        # Recompute risk_level bucket
-        if entity.risk_score >= 80:
-            entity.risk_level = "critical"
-        elif entity.risk_score >= 60:
-            entity.risk_level = "high"
-        elif entity.risk_score >= 30:
-            entity.risk_level = "medium"
-        else:
-            entity.risk_level = "low"
-    else:
-        entity.last_activity_at = datetime.now(timezone.utc)
-
-    db.add(behavior_event)
     await db.flush()
     await db.refresh(behavior_event)
-
-    # Fire automation for UEBA anomaly if the event is anomalous
-    if behavior_event.is_anomalous:
-        try:
-            automation = AutomationService(db)
-            await automation.on_ueba_anomaly(
-                entity_type=entity.entity_type,
-                entity_id=entity.entity_id,
-                anomaly_type=event.event_type,
-                risk_score=entity.risk_score or 0.0,
-                organization_id=org_id,
-            )
-        except Exception as e:
-            logger.error(f"Automation failed for UEBA anomaly: {e}")
 
     return behavior_event
 
@@ -921,75 +764,21 @@ async def ingest_batch(
 
     for event in batch.events:
         try:
-            entity_result = await db.execute(
-                select(EntityProfile).where(
-                    and_(
-                        EntityProfile.entity_id == event.entity_id,
-                        _org_filter(EntityProfile, org_id),
-                    )
-                )
+            # Shared per-event ingest: entity lookup, baseline scoring,
+            # risk bump, and on_ueba_anomaly fanout — identical logic to
+            # single-event ingest and the process_behavior_events task.
+            behavior_event, alert_created = await ingest_behavior_event(
+                db, org_id, event.model_dump()
             )
-            entity = entity_result.scalar_one_or_none()
-            if not entity:
+            if behavior_event is None:
                 failed += 1
                 continue
 
-            behavior_event = BehaviorEvent(
-                id=str(uuid.uuid4()),
-                entity_profile_id=entity.id,
-                event_type=event.event_type,
-                event_data=event.event_data if hasattr(event, "event_data") else {},
-                source_ip=event.source_ip if hasattr(event, "source_ip") else None,
-                destination=event.destination if hasattr(event, "destination") else None,
-                geo_location=event.geo_location if hasattr(event, "geo_location") else None,
-                device_info=event.device_info if hasattr(event, "device_info") else None,
-                organization_id=org_id,
-            )
-
-            # Score every batch event against the entity baseline —
-            # previously batch ingestion skipped scoring entirely, so
-            # SIEM integrations pushing bulk events produced zero UEBA
-            # signal. Identical logic to single-event ingest.
-            is_anomalous, reasons, risk_delta = await _score_event_anomaly(
-                db, entity, behavior_event
-            )
-            behavior_event.is_anomalous = is_anomalous
-            behavior_event.anomaly_reasons = reasons
-            behavior_event.risk_contribution = risk_delta
-
-            if is_anomalous:
-                anomalies += 1
-                entity.risk_score = min(100.0, (entity.risk_score or 0.0) + risk_delta)
-                entity.anomaly_count_30d = (entity.anomaly_count_30d or 0) + 1
-                entity.last_anomaly_at = datetime.now(timezone.utc)
-                if entity.risk_score >= 80:
-                    entity.risk_level = "critical"
-                elif entity.risk_score >= 60:
-                    entity.risk_level = "high"
-                elif entity.risk_score >= 30:
-                    entity.risk_level = "medium"
-                else:
-                    entity.risk_level = "low"
-            entity.last_activity_at = datetime.now(timezone.utc)
-
-            db.add(behavior_event)
             processed += 1
-
-            # Fire automation on anomalous batch events so the downstream
-            # alert/incident fanout matches single-event behavior.
-            if is_anomalous:
-                try:
-                    automation = AutomationService(db)
-                    await automation.on_ueba_anomaly(
-                        entity_type=entity.entity_type,
-                        entity_id=entity.entity_id,
-                        anomaly_type=event.event_type,
-                        risk_score=entity.risk_score or 0.0,
-                        organization_id=org_id,
-                    )
-                    alerts_created += 1
-                except Exception as e:
-                    logger.error(f"Batch UEBA automation failed: {e}")
+            if behavior_event.is_anomalous:
+                anomalies += 1
+            if alert_created:
+                alerts_created += 1
         except Exception as exc:
             logger.error(f"Batch event ingest failed: {exc}", exc_info=True)
             failed += 1
