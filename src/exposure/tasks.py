@@ -17,12 +17,6 @@ from sqlalchemy import select, update
 from src.core.config import settings
 from src.core.database import async_session_factory
 from src.core.logging import get_logger
-from src.exposure.engine import (
-    AssetDiscovery,
-    ComplianceChecker,
-    RiskScorer,
-    VulnerabilityManager,
-)
 
 logger = get_logger(__name__)
 
@@ -45,52 +39,170 @@ def _run_async(coro):
 
 
 # ---------------------------------------------------------------------------
+# Async implementations (module-level so they are directly testable)
+# ---------------------------------------------------------------------------
+
+async def _run_asset_discovery_async(
+    organization_id: str, discovery_type: str = "siem"
+) -> dict[str, Any]:
+    """Discover assets from observed SIEM log traffic (or honestly decline
+    network discovery, which needs an unconfigured active scanner)."""
+    now = datetime.now(timezone.utc)
+
+    if discovery_type == "network":
+        # A real network sweep needs an active scanner (nmap/naabu) with
+        # network reachability, which is not integrated. Report that
+        # honestly rather than pretend to have scanned.
+        return {
+            "organization_id": organization_id,
+            "discovery_type": "network",
+            "status": "requires_scanner",
+            "assets_discovered": 0,
+            "detail": (
+                "Active network discovery requires an integrated network "
+                "scanner (nmap/naabu) with reachability; none is configured. "
+                "Use discovery_type='siem' to discover assets from observed "
+                "log traffic."
+            ),
+            "timestamp": now.isoformat(),
+        }
+
+    from src.siem.models import LogEntry
+    from src.exposure.models import ExposureAsset
+
+    cutoff_iso = (now - timedelta(hours=24)).isoformat()
+    created = 0
+
+    async with async_session_factory() as session:
+        # Distinct source IPs/hostnames observed in the last 24h.
+        stmt = (
+            select(
+                LogEntry.source_address,
+                LogEntry.source_ip,
+                LogEntry.hostname,
+            )
+            .where(
+                LogEntry.organization_id == organization_id,
+                LogEntry.received_at >= cutoff_iso,
+            )
+            .distinct()
+        )
+        rows = (await session.execute(stmt)).all()
+
+        # Known asset IPs for this org (dedupe target).
+        known = (
+            await session.execute(
+                select(ExposureAsset.ip_address).where(
+                    ExposureAsset.organization_id == organization_id
+                )
+            )
+        ).scalars().all()
+        known_ips = {ip for ip in known if ip}
+        seen: set[str] = set()
+
+        for source_address, source_ip, hostname in rows:
+            ip = source_address or source_ip
+            if not ip or ip in known_ips or ip in seen:
+                continue
+            seen.add(ip)
+            session.add(
+                ExposureAsset(
+                    hostname=hostname,
+                    ip_address=ip,
+                    asset_type="host",
+                    is_active=True,
+                    last_seen=now,
+                    tags=["auto-discovered", "siem"],
+                    extra_metadata={
+                        "discovery_source": "siem_logs",
+                        "discovered_at": now.isoformat(),
+                    },
+                    organization_id=organization_id,
+                )
+            )
+            created += 1
+
+        await session.commit()
+
+    return {
+        "organization_id": organization_id,
+        "discovery_type": "siem",
+        "assets_discovered": created,
+        "timestamp": now.isoformat(),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Tasks
 # ---------------------------------------------------------------------------
 
+async def _distinct_org_ids(column) -> list[str]:
+    """Distinct non-null organization_id values for a model column."""
+    async with async_session_factory() as session:
+        rows = (await session.execute(select(column).distinct())).scalars().all()
+    return [o for o in rows if o]
+
+
+async def _sweep_asset_discovery_async(discovery_type: str = "siem") -> dict[str, Any]:
+    """Run asset discovery for every org that has recent logs (beat mode)."""
+    from src.siem.models import LogEntry
+
+    org_ids = await _distinct_org_ids(LogEntry.organization_id)
+    total = 0
+    for oid in org_ids:
+        r = await _run_asset_discovery_async(oid, discovery_type)
+        total += r.get("assets_discovered", 0)
+    return {
+        "organizations": len(org_ids),
+        "assets_discovered": total,
+        "discovery_type": discovery_type,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+async def _sweep_attack_surface_async() -> dict[str, Any]:
+    """Detect attack-surface changes for every org that has assets."""
+    from src.exposure.models import ExposureAsset
+
+    org_ids = await _distinct_org_ids(ExposureAsset.organization_id)
+    total = 0
+    for oid in org_ids:
+        r = await _detect_attack_surface_changes_async(oid)
+        total += r.get("changes_detected", 0)
+    return {
+        "organizations": len(org_ids),
+        "changes_detected": total,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 @shared_task(bind=True, max_retries=3)
-def run_asset_discovery(self, organization_id: str, discovery_type: str = "siem") -> dict:
+def run_asset_discovery(self, organization_id: str | None = None, discovery_type: str = "siem") -> dict:
     """
     Discover new assets from SIEM logs or network scans.
 
     Args:
         self: Celery task instance
-        organization_id: UUID of the organization
+        organization_id: UUID of the organization, or None to sweep every
+            organization that has recent logs (beat-scheduled mode).
         discovery_type: "siem" or "network"
 
     Returns:
         Dictionary with discovery results
     """
     try:
-        logger.info("Starting asset discovery", organization_id=organization_id, type=discovery_type)
+        logger.info("Starting asset discovery", organization_id=organization_id or "all", type=discovery_type)
 
-        # In production, would instantiate with actual database session
-        # This is a placeholder for the task structure
-        discovered_assets = []
+        if organization_id is None:
+            result = _run_async(_sweep_asset_discovery_async(discovery_type))
+        else:
+            result = _run_async(_run_asset_discovery_async(organization_id, discovery_type))
 
-        if discovery_type == "siem":
-            # Discover from SIEM logs
-            logger.info("Discovering assets from SIEM", organization_id=organization_id)
-            # asset_discovery = AssetDiscovery(db_session)
-            # discovered_assets = asset_discovery.discover_from_siem_logs(organization_id)
-            pass
-        elif discovery_type == "network":
-            # Discover from network scans
-            logger.info("Discovering assets from network", organization_id=organization_id)
-            # cidr_ranges = get_organization_cidr_ranges(organization_id)
-            # for cidr in cidr_ranges:
-            #     discovered = asset_discovery.discover_from_network_scan(organization_id, cidr)
-            #     discovered_assets.extend(discovered)
-            pass
-
-        result = {
-            "organization_id": organization_id,
-            "discovery_type": discovery_type,
-            "assets_discovered": len(discovered_assets),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-
-        logger.info("Asset discovery complete", **result)
+        logger.info(
+            "Asset discovery complete",
+            organization_id=organization_id or "all",
+            assets_discovered=result.get("assets_discovered"),
+        )
         return result
 
     except Exception as exc:
@@ -486,22 +598,15 @@ def generate_exposure_report(self, organization_id: str, report_format: str = "p
             organization_id=organization_id,
             format=report_format,
         )
-
-        report_data = {
-            "organization_id": organization_id,
-            "report_period": "weekly",
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-        }
-
-        result = {
-            "organization_id": organization_id,
-            "report_format": report_format,
-            "status": "generated",
-            "file_path": None,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-
-        logger.info("Exposure report generation complete", **result)
+        result = _run_async(
+            _generate_exposure_report_async(organization_id, report_format)
+        )
+        logger.info(
+            "Exposure report generation complete",
+            organization_id=organization_id,
+            report_format=report_format,
+            status=result["status"],
+        )
         return result
 
     except Exception as exc:
@@ -509,33 +614,230 @@ def generate_exposure_report(self, organization_id: str, report_format: str = "p
         raise self.retry(exc=exc, countdown=300)
 
 
+async def _generate_exposure_report_async(
+    organization_id: str, report_format: str = "pdf"
+) -> dict[str, Any]:
+    """Compile a real exposure report (asset inventory, vuln summary,
+    remediation progress, top risky assets) from the org's rows."""
+    from sqlalchemy import func
+    from src.exposure.models import (
+        ExposureAsset,
+        ExposureVulnerability,
+        AssetVulnerability,
+        RemediationTicket,
+    )
+
+    now = datetime.now(timezone.utc)
+    async with async_session_factory() as session:
+        # --- Asset inventory ---
+        total_assets = (await session.execute(
+            select(func.count(ExposureAsset.id)).where(
+                ExposureAsset.organization_id == organization_id
+            )
+        )).scalar() or 0
+        internet_facing = (await session.execute(
+            select(func.count(ExposureAsset.id)).where(
+                ExposureAsset.organization_id == organization_id,
+                ExposureAsset.is_internet_facing == True,  # noqa: E712
+            )
+        )).scalar() or 0
+
+        # --- Vulnerability summary by severity ---
+        sev_rows = (await session.execute(
+            select(ExposureVulnerability.severity, func.count(ExposureVulnerability.id))
+            .where(ExposureVulnerability.organization_id == organization_id)
+            .group_by(ExposureVulnerability.severity)
+        )).all()
+        vulns_by_severity = {sev or "unknown": n for sev, n in sev_rows}
+
+        # --- Remediation progress (open vs remediated instances) ---
+        inst_rows = (await session.execute(
+            select(AssetVulnerability.status, func.count(AssetVulnerability.id))
+            .where(AssetVulnerability.organization_id == organization_id)
+            .group_by(AssetVulnerability.status)
+        )).all()
+        instances_by_status = {st or "unknown": n for st, n in inst_rows}
+
+        # --- Remediation tickets / SLA ---
+        open_tickets = (await session.execute(
+            select(func.count(RemediationTicket.id)).where(
+                RemediationTicket.organization_id == organization_id,
+                RemediationTicket.status != "resolved",
+            )
+        )).scalar() or 0
+        sla_breached = (await session.execute(
+            select(func.count(RemediationTicket.id)).where(
+                RemediationTicket.organization_id == organization_id,
+                RemediationTicket.sla_breach == True,  # noqa: E712
+            )
+        )).scalar() or 0
+
+        # --- Top risky assets ---
+        top_assets = (await session.execute(
+            select(ExposureAsset)
+            .where(ExposureAsset.organization_id == organization_id)
+            .order_by(ExposureAsset.risk_score.desc())
+            .limit(5)
+        )).scalars().all()
+        top_risky = [
+            {
+                "id": a.id,
+                "hostname": a.hostname,
+                "ip_address": a.ip_address,
+                "risk_score": a.risk_score,
+                "vulnerability_count": a.vulnerability_count,
+            }
+            for a in top_assets
+        ]
+
+        report_data = {
+            "organization_id": organization_id,
+            "report_period": "weekly",
+            "generated_at": now.isoformat(),
+            "assets": {
+                "total": total_assets,
+                "internet_facing": internet_facing,
+            },
+            "vulnerabilities": {
+                "by_severity": vulns_by_severity,
+                "total": sum(vulns_by_severity.values()),
+            },
+            "remediation": {
+                "instances_by_status": instances_by_status,
+                "open_tickets": open_tickets,
+                "sla_breached": sla_breached,
+            },
+            "top_risky_assets": top_risky,
+        }
+
+    # The report data is fully real. A rendered PDF/HTML file is not
+    # produced here (no file-render backend is wired for exposure
+    # reports), so json returns the data inline and other formats
+    # honestly say the data is available but not rendered to a file.
+    rendered = report_format == "json"
+    return {
+        "organization_id": organization_id,
+        "report_format": report_format,
+        "status": "generated" if rendered else "data_only",
+        "file_path": None,
+        "report_data": report_data,
+        "detail": (
+            None if rendered else
+            f"Report data computed; no {report_format} file was rendered "
+            "(no document-render backend is configured for exposure reports)"
+        ),
+        "timestamp": now.isoformat(),
+    }
+
+
 @shared_task(bind=True, max_retries=2)
-def detect_attack_surface_changes(self, organization_id: str) -> dict:
+def detect_attack_surface_changes(self, organization_id: str | None = None) -> dict:
     """
     Detect changes in organization's attack surface.
 
-    Compares current attack surface with previous assessment and identifies new exposures.
+    Compares the current attack surface with the previous snapshot and
+    identifies new/removed assets and vulnerabilities. ``organization_id
+    =None`` sweeps every organization that has exposure assets
+    (beat-scheduled mode).
     """
     try:
-        logger.info("Detecting attack surface changes", organization_id=organization_id)
+        logger.info("Detecting attack surface changes", organization_id=organization_id or "all")
 
-        changes = {
-            "new_assets": [],
-            "removed_assets": [],
-            "new_vulnerabilities": [],
-            "remediated_vulnerabilities": [],
-        }
+        if organization_id is None:
+            result = _run_async(_sweep_attack_surface_async())
+        else:
+            result = _run_async(_detect_attack_surface_changes_async(organization_id))
 
-        result = {
-            "organization_id": organization_id,
-            "changes_detected": len(changes["new_assets"]) + len(changes["new_vulnerabilities"]),
-            "details": changes,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-
-        logger.info("Attack surface analysis complete", **result)
+        logger.info(
+            "Attack surface analysis complete",
+            organization_id=organization_id or "all",
+            changes_detected=result.get("changes_detected"),
+        )
         return result
 
     except Exception as exc:
         logger.error("Attack surface detection failed", error=str(exc), exc_info=True)
         raise self.retry(exc=exc, countdown=300)
+
+
+async def _detect_attack_surface_changes_async(organization_id: str) -> dict[str, Any]:
+    """Diff the org's current attack surface (active assets + open vulns)
+    against the last stored snapshot, then persist a new snapshot."""
+    from src.exposure.models import (
+        ExposureAsset,
+        AssetVulnerability,
+        AttackSurface,
+    )
+
+    now = datetime.now(timezone.utc)
+    async with async_session_factory() as session:
+        # --- Current attack surface fingerprint ---
+        asset_rows = (await session.execute(
+            select(ExposureAsset.ip_address, ExposureAsset.hostname).where(
+                ExposureAsset.organization_id == organization_id,
+                ExposureAsset.is_active == True,  # noqa: E712
+            )
+        )).all()
+        current_assets = {(ip or host) for ip, host in asset_rows if (ip or host)}
+
+        vuln_rows = (await session.execute(
+            select(AssetVulnerability.asset_id, AssetVulnerability.vulnerability_id)
+            .where(
+                AssetVulnerability.organization_id == organization_id,
+                AssetVulnerability.status == "open",
+            )
+        )).all()
+        current_vulns = {f"{aid}:{vid}" for aid, vid in vuln_rows}
+
+        # --- Previous snapshot (most recent) ---
+        previous = (await session.execute(
+            select(AttackSurface)
+            .where(
+                AttackSurface.organization_id == organization_id,
+                AttackSurface.surface_type == "snapshot",
+            )
+            .order_by(AttackSurface.last_assessed_at.desc())
+            .limit(1)
+        )).scalars().first()
+
+        is_baseline = previous is None
+        prev_assets = set((previous.metrics or {}).get("asset_keys", [])) if previous else set()
+        prev_vulns = set((previous.metrics or {}).get("vuln_keys", [])) if previous else set()
+
+        changes = {
+            "new_assets": sorted(current_assets - prev_assets),
+            "removed_assets": sorted(prev_assets - current_assets),
+            "new_vulnerabilities": sorted(current_vulns - prev_vulns),
+            "remediated_vulnerabilities": sorted(prev_vulns - current_vulns),
+        }
+
+        # --- Persist the new snapshot for next time ---
+        snapshot = AttackSurface(
+            name=f"snapshot-{now.date().isoformat()}",
+            surface_type="snapshot",
+            total_assets=len(current_assets),
+            exposed_assets=len(current_assets),
+            last_assessed_at=now,
+            findings=[{"change": k, "items": v} for k, v in changes.items() if v],
+            metrics={
+                "asset_keys": sorted(current_assets),
+                "vuln_keys": sorted(current_vulns),
+                "is_baseline": is_baseline,
+            },
+            organization_id=organization_id,
+        )
+        session.add(snapshot)
+        await session.commit()
+
+    return {
+        "organization_id": organization_id,
+        "is_baseline": is_baseline,
+        "changes_detected": (
+            len(changes["new_assets"])
+            + len(changes["new_vulnerabilities"])
+            + len(changes["removed_assets"])
+            + len(changes["remediated_vulnerabilities"])
+        ),
+        "details": changes,
+        "timestamp": now.isoformat(),
+    }

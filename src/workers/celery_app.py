@@ -60,6 +60,9 @@ celery_app = Celery(
         # behavior-event retention. Without this entry the beat entries
         # below can't resolve the task names.
         "src.ueba.tasks",
+        # CTEM / exposure background pipeline — SIEM-driven asset
+        # discovery and attack-surface change detection (snapshot diffing).
+        "src.exposure.tasks",
     ],
 )
 
@@ -256,5 +259,14 @@ celery_app.conf.beat_schedule = {
     "stig-fleet-sweep": {
         "task": "src.stig.tasks.scheduled_fleet_stig_sweep",
         "schedule": crontab(day_of_week=0, hour=6, minute=0),  # Sundays 06:00 UTC
+    },
+    # --- CTEM exposure sweeps (all-org; org=None) ---
+    "exposure-asset-discovery": {
+        "task": "src.exposure.tasks.run_asset_discovery",
+        "schedule": crontab(hour=1, minute=30),  # Daily 01:30 UTC — SIEM-driven
+    },
+    "exposure-attack-surface": {
+        "task": "src.exposure.tasks.detect_attack_surface_changes",
+        "schedule": crontab(hour=4, minute=0),  # Daily 04:00 UTC — snapshot diff
     },
 }

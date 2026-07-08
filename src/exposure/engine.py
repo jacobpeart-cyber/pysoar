@@ -19,7 +19,9 @@ from src.exposure.models import (
     ExposureAsset,
     ExposureScan,
     RemediationTicket,
-    Vulnerability,
+    # AssetVulnerability.vulnerability_id FKs to exposure_vulnerabilities,
+    # so the engine's "Vulnerability" is ExposureVulnerability.
+    ExposureVulnerability as Vulnerability,
 )
 
 logger = get_logger(__name__)
