@@ -82,6 +82,138 @@ class TestFirewallBlockHonesty:
         assert ioc.value == "203.0.113.7"
 
 
+class TestFirewallBlockEnforcement:
+    """When IR-capable agents are enrolled, firewall_block must really
+    dispatch block_ip to them — and rollback must reverse it."""
+
+    async def _make_ir_agent(
+        self, db_session: AsyncSession, org: Organization,
+        capabilities=("ir",), status="active", hostname="fw-host-01",
+    ):
+        from src.agents.models import EndpointAgent
+
+        agent = EndpointAgent(
+            hostname=hostname,
+            os_type="linux",
+            agent_version="0.1.0",
+            capabilities=list(capabilities),
+            status=status,
+            organization_id=org.id,
+            last_command_hash=None,
+        )
+        db_session.add(agent)
+        await db_session.flush()
+        return agent
+
+    async def test_firewall_block_enforces_on_enrolled_agent(
+        self, db_session: AsyncSession, org: Organization
+    ):
+        from src.agents.models import AgentCommand
+
+        agent = await self._make_ir_agent(db_session, org)
+
+        executor = FirewallBlockExecutor(db_session)
+        result = await executor.execute(
+            "203.0.113.20",
+            {"duration_hours": 6},
+            {"execution_id": "unknown", "organization_id": org.id},
+        )
+
+        assert result["success"] is True
+        assert result["mode"] == "enforced"
+        assert len(result["block_commands"]) == 1
+        bc = result["block_commands"][0]
+        assert bc["success"] is True
+        assert bc["agent_id"] == agent.id
+
+        # A real block_ip command row was queued for the agent. block_ip is
+        # high-blast, so with no approval override it lands awaiting_approval.
+        cmd = await db_session.get(AgentCommand, bc["command_id"])
+        assert cmd is not None
+        assert cmd.action == "block_ip"
+        assert cmd.payload["ip"] == "203.0.113.20"
+        assert cmd.status == "awaiting_approval"
+
+    async def test_non_ir_agent_is_ineligible_detection_only(
+        self, db_session: AsyncSession, org: Organization
+    ):
+        # A BAS-only agent cannot receive IR commands → no enforcement.
+        await self._make_ir_agent(
+            db_session, org, capabilities=("bas",), hostname="bas-only-01"
+        )
+        executor = FirewallBlockExecutor(db_session)
+        result = await executor.execute(
+            "203.0.113.21",
+            {"duration_hours": 6},
+            {"execution_id": "unknown", "organization_id": org.id},
+        )
+        assert result["mode"] == "detection_only"
+        assert result["block_commands"] == []
+
+    async def test_non_ip_target_detection_only(
+        self, db_session: AsyncSession, org: Organization
+    ):
+        await self._make_ir_agent(db_session, org, hostname="fw-host-02")
+        executor = FirewallBlockExecutor(db_session)
+        result = await executor.execute(
+            "evil.example.com",
+            {"duration_hours": 6},
+            {"execution_id": "unknown", "organization_id": org.id},
+        )
+        assert result["mode"] == "detection_only"
+        assert result["block_commands"] == []
+        assert "not an ip" in result["detail"].lower()
+
+    async def test_rollback_queues_unblock_on_blocked_agent(
+        self, db_session: AsyncSession, org: Organization
+    ):
+        from src.agents.models import AgentCommand
+
+        agent = await self._make_ir_agent(db_session, org, hostname="fw-host-03")
+
+        executor = FirewallBlockExecutor(db_session)
+        fwd = await executor.execute(
+            "203.0.113.30",
+            {"duration_hours": 12},
+            {"execution_id": "unknown", "organization_id": org.id},
+        )
+        assert fwd["mode"] == "enforced"
+
+        execution = await _make_execution(db_session, org, "203.0.113.30", [{
+            "action_type": "firewall_block",
+            "target": "203.0.113.30",
+            "success": True,
+            "details": {
+                "ioc_id": fwd["ioc_id"],
+                "block_commands": fwd["block_commands"],
+            },
+        }])
+
+        engine = RemediationEngine(db_session)
+        result = await engine.rollback_execution(execution.id)
+
+        assert result["rollback_status"] == "completed"
+        action_res = result["results"][0]
+        assert action_res["rolled_back"] is True
+        assert len(action_res["unblock_commands"]) == 1
+        unblock = action_res["unblock_commands"][0]
+        assert unblock["success"] is True
+        assert unblock["agent_id"] == agent.id
+
+        # IOC deactivated (detection layer)...
+        ioc = await db_session.get(ThreatIndicator, fwd["ioc_id"])
+        assert ioc.is_active is False
+
+        # ...and a real unblock_ip command queued (enforcement layer).
+        # unblock is dispatched with approval_override, so it is queued,
+        # not left awaiting approval — the rollback itself is the authz.
+        cmd = await db_session.get(AgentCommand, unblock["command_id"])
+        assert cmd is not None
+        assert cmd.action == "unblock_ip"
+        assert cmd.payload["ip"] == "203.0.113.30"
+        assert cmd.status == "queued"
+
+
 class TestRollbackExecution:
     """rollback_execution must actually reverse state, not flip flags."""
 

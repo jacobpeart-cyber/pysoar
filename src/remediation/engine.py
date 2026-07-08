@@ -551,6 +551,7 @@ class RemediationEngine:
 
         # --- IOC-backed actions: deactivate the indicator ---------------
         if action_type in ("firewall_block", "dns_sinkhole"):
+            # Layer 1: deactivate the detection IOC.
             ioc = None
             ioc_id = details.get("ioc_id")
             if ioc_id:
@@ -565,37 +566,67 @@ class RemediationEngine:
                     )
                 )
                 ioc = (await self.db.execute(stmt)).scalars().first()
+
             if ioc is None:
-                return {
-                    "action": action_type,
-                    "rolled_back": False,
-                    "reason": f"IOC for {target} not found; cannot deactivate",
-                }
-            if not ioc.is_active:
-                return {
-                    "action": action_type,
-                    "rolled_back": True,
-                    "ioc_id": ioc.id,
-                    "detail": "IOC was already inactive",
-                }
-            ioc.is_active = False
-            if "rolled_back" not in (ioc.tags or []):
-                ioc.tags = [*(ioc.tags or []), "rolled_back"]
-            await self.db.flush()
+                ioc_ok = False
+                ioc_detail = f"IOC for {target} not found; could not deactivate"
+            elif not ioc.is_active:
+                ioc_ok = True
+                ioc_detail = "IOC was already inactive"
+            else:
+                ioc.is_active = False
+                if "rolled_back" not in (ioc.tags or []):
+                    ioc.tags = [*(ioc.tags or []), "rolled_back"]
+                await self.db.flush()
+                ioc_ok = True
+                ioc_detail = f"IOC {ioc.id} deactivated"
+
+            # Layer 2: reverse real host-firewall enforcement by queuing an
+            # unblock_ip to every agent that actually got a block_ip. The
+            # forward executor recorded these in ``block_commands``.
+            unblock_results = await self._rollback_ip_blocks(
+                details.get("block_commands") or [], target, execution
+            )
+            enforced = [u for u in unblock_results if u.get("success")]
+            enforce_failed = [u for u in unblock_results if not u.get("success")]
+
             await _log_ticket_activity(
                 self.db,
                 source_id=execution.id,
                 activity_type=f"rollback_{action_type}",
-                description=f"Rollback: deactivated IOC {ioc.id} for {target}",
+                description=(
+                    f"Rollback {target}: {ioc_detail}; "
+                    f"unblock_ip queued to {len(enforced)} agent(s)"
+                    + (f", {len(enforce_failed)} failed" if enforce_failed else "")
+                ),
                 organization_id=execution.organization_id,
-                extra_metadata={"ioc_id": ioc.id, "target": target},
+                extra_metadata={
+                    "ioc_id": ioc.id if ioc else None,
+                    "target": target,
+                    "unblock_results": unblock_results,
+                },
             )
-            return {
+
+            # Truthful outcome: reversed only if the IOC came down AND every
+            # agent that blocked has an unblock queued.
+            rolled_back = ioc_ok and not enforce_failed
+            result = {
                 "action": action_type,
-                "rolled_back": True,
-                "ioc_id": ioc.id,
-                "detail": f"IOC {ioc.id} deactivated",
+                "rolled_back": rolled_back,
+                "ioc_id": ioc.id if ioc else None,
+                "detail": ioc_detail,
+                "unblock_commands": unblock_results,
             }
+            if not rolled_back:
+                reasons = []
+                if not ioc_ok:
+                    reasons.append(ioc_detail)
+                if enforce_failed:
+                    reasons.append(
+                        f"{len(enforce_failed)} agent unblock(s) failed"
+                    )
+                result["reason"] = "; ".join(reasons)
+            return result
 
         # --- Host isolation: restore previous asset status --------------
         if action_type == "host_isolate":
@@ -868,6 +899,68 @@ class RemediationEngine:
             "rejected_by": approver_id,
         })
 
+    async def _rollback_ip_blocks(
+        self,
+        block_commands: list[dict],
+        target: str,
+        execution: RemediationExecution,
+    ) -> list[dict]:
+        """Queue an ``unblock_ip`` on every agent that got a ``block_ip``.
+
+        Reads the ``block_commands`` the FirewallBlockExecutor recorded and,
+        for each agent whose block was queued, issues the inverse command
+        through ``AgentService`` (with ``approval_override`` — the rollback
+        decision is itself the authorization). Returns one truthful result
+        per agent so the caller can report a partial rollback honestly.
+        """
+        from src.agents.models import EndpointAgent
+        from src.agents.service import AgentService, AgentServiceError
+
+        results: list[dict] = []
+        svc = AgentService(self.db)
+        for bc in block_commands:
+            # Only reverse blocks that were actually dispatched.
+            if not bc.get("success"):
+                continue
+            agent_id = bc.get("agent_id")
+            agent = (
+                await self.db.get(EndpointAgent, agent_id) if agent_id else None
+            )
+            if agent is None:
+                results.append({
+                    "agent_id": agent_id,
+                    "hostname": bc.get("hostname"),
+                    "command_id": None,
+                    "success": False,
+                    "error": "agent not found; cannot queue unblock_ip",
+                })
+                continue
+            try:
+                cmd = await svc.issue_command(
+                    agent=agent,
+                    action="unblock_ip",
+                    payload={"ip": target},
+                    issued_by=execution.created_by,
+                    approval_override=True,
+                )
+                results.append({
+                    "agent_id": agent_id,
+                    "hostname": agent.hostname,
+                    "command_id": cmd.id,
+                    "command_status": cmd.status,
+                    "success": True,
+                    "error": None,
+                })
+            except AgentServiceError as exc:
+                results.append({
+                    "agent_id": agent_id,
+                    "hostname": agent.hostname,
+                    "command_id": None,
+                    "success": False,
+                    "error": str(exc),
+                })
+        return results
+
     def _check_conditions(self, conditions: dict, data: dict) -> bool:
         """Check if data matches all conditions."""
         for key, condition in conditions.items():
@@ -1021,17 +1114,43 @@ async def _log_ticket_activity(
 
 
 class FirewallBlockExecutor(ActionExecutor):
-    """Firewall blocking executor: creates an active IOC for the IP.
+    """Firewall blocking executor: IOC write + real host-firewall enforcement.
 
-    Like NetworkActionExecutor, this has no enforcement point — no
-    firewall integration is dispatched from here. The IOC write is real
-    (SIEM correlation and IOC matching will flag traffic to the target)
-    but nothing is blocked on the wire, and the result says so
-    explicitly via ``mode: detection_only``.
+    Two layers:
+
+    1. **Detection** — registers the target as an active IOC so SIEM
+       correlation and IOC matching flag any traffic to it (as before).
+    2. **Enforcement** — dispatches a ``block_ip`` command to every
+       enrolled, dispatchable, IR-capable endpoint agent in the
+       organization. Each agent drops traffic to/from the IP at its own
+       host firewall (Windows Firewall / iptables), rules tagged
+       ``pysoar-block-<ip>`` so rollback can remove exactly them.
+
+    Command dispatch goes through ``AgentService.issue_command`` which
+    enforces capability checks, the high-blast approval gate
+    (``block_ip`` requires second-user approval), and the tamper-evident
+    hash chain. Per-agent outcomes are recorded in ``block_commands`` —
+    rollback reads that list to queue the inverse ``unblock_ip``.
+
+    When the target is not an IP or no eligible agents exist, the result
+    honestly degrades to ``mode: detection_only``.
     """
 
     async def execute(self, target: str, parameters: dict, context: dict) -> dict:
+        import ipaddress
+
+        from src.agents.capabilities import capability_allows
+        from src.agents.models import EndpointAgent
+        from src.agents.service import AgentService, AgentServiceError
+
         execution_id, org_id, actor_id = _get_execution_context(context)
+        if org_id is None and execution_id != "unknown":
+            # Context often carries only trigger_data — fall back to the
+            # execution row for the tenant scope.
+            execution = await self.db.get(RemediationExecution, execution_id)
+            if execution is not None:
+                org_id = execution.organization_id
+
         duration_hours = parameters.get("duration_hours", 24)
         now = utc_now()
         expires_at = now + timedelta(hours=duration_hours)
@@ -1063,11 +1182,85 @@ class FirewallBlockExecutor(ActionExecutor):
         self.db.add(ioc)
         await self.db.flush()
 
+        # --- Enforcement: block_ip on every eligible endpoint agent ------
+        try:
+            ipaddress.ip_address(target)
+            target_is_ip = True
+        except ValueError:
+            target_is_ip = False
+
+        block_commands: list[dict] = []
+        if target_is_ip and org_id:
+            stmt = select(EndpointAgent).where(
+                and_(
+                    EndpointAgent.organization_id == org_id,
+                    EndpointAgent.status.in_(("active", "offline")),
+                )
+            )
+            agents = (await self.db.execute(stmt)).scalars().all()
+            svc = AgentService(self.db)
+            for agent in agents:
+                if not capability_allows(agent.capabilities or [], "block_ip"):
+                    continue  # agent not IR-enrolled — ineligible, not a failure
+                try:
+                    cmd = await svc.issue_command(
+                        agent=agent,
+                        action="block_ip",
+                        payload={"ip": target},
+                        issued_by=actor_id,
+                    )
+                    block_commands.append({
+                        "agent_id": agent.id,
+                        "hostname": agent.hostname,
+                        "command_id": cmd.id,
+                        "command_status": cmd.status,
+                        "success": True,
+                        "error": None,
+                    })
+                except AgentServiceError as exc:
+                    block_commands.append({
+                        "agent_id": agent.id,
+                        "hostname": agent.hostname,
+                        "command_id": None,
+                        "command_status": None,
+                        "success": False,
+                        "error": str(exc),
+                    })
+
+        queued = sum(1 for c in block_commands if c["success"])
+        rejected = len(block_commands) - queued
+        if queued:
+            mode = "enforced"
+            detail = (
+                f"Target registered as active IOC and block_ip queued to "
+                f"{queued} endpoint agent(s)"
+                + (f" ({rejected} rejected)" if rejected else "")
+                + "; per-host firewall rules tagged pysoar-block-"
+                + target
+            )
+        elif not target_is_ip:
+            mode = "detection_only"
+            detail = (
+                "Target registered as active IOC for detection; no network "
+                "enforcement performed (target is not an IP address, so no "
+                "host-firewall block_ip could be dispatched)"
+            )
+        else:
+            mode = "detection_only"
+            detail = (
+                "Target registered as active IOC for detection; no network "
+                "enforcement performed (no IR-capable endpoint agent is "
+                "enrolled to receive a block_ip command)"
+            )
+
         await _log_ticket_activity(
             self.db,
             source_id=execution_id,
             activity_type="firewall_block",
-            description=f"Blocked IP {target} via firewall for {duration_hours}h",
+            description=(
+                f"Blocked IP {target} via firewall for {duration_hours}h "
+                f"(mode={mode}, {queued} agent block command(s) queued)"
+            ),
             actor_id=actor_id,
             organization_id=org_id,
             extra_metadata={
@@ -1075,21 +1268,23 @@ class FirewallBlockExecutor(ActionExecutor):
                 "duration_hours": duration_hours,
                 "ioc_id": ioc.id,
                 "expires_at": expires_at.isoformat(),
+                "mode": mode,
+                "block_commands": block_commands,
             },
         )
 
         return {
             "success": True,
             "action": "firewall_block",
-            "mode": "detection_only",
-            "detail": (
-                "Target registered as active IOC for detection; no network "
-                "enforcement performed (no firewall integration configured)"
-            ),
+            "mode": mode,
+            "detail": detail,
             "target": target,
             "ioc_id": ioc.id,
             "duration_hours": duration_hours,
             "expires_at": expires_at,
+            # Per-agent enforcement record — rollback reads this to queue
+            # the inverse unblock_ip command per agent.
+            "block_commands": block_commands,
         }
 
 

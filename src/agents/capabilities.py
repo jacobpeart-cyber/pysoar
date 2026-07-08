@@ -56,6 +56,8 @@ class AgentAction(str, Enum):
     KILL_PROCESS = "kill_process"              # payload = {pid or process_name}
     ISOLATE_HOST = "isolate_host"              # network quarantine
     RELEASE_HOST = "release_host"              # reverse isolate
+    BLOCK_IP = "block_ip"                      # payload = {ip} — host firewall drop
+    UNBLOCK_IP = "unblock_ip"                  # payload = {ip} — reverse block_ip
     DISABLE_ACCOUNT = "disable_account"        # payload = {username}
     COLLECT_FILE = "collect_file"              # payload = {path}
     COLLECT_PROCESS_LIST = "collect_process_list"
@@ -85,6 +87,8 @@ CAPABILITY_ACTIONS: dict[AgentCapability, set[AgentAction]] = {
         AgentAction.KILL_PROCESS,
         AgentAction.ISOLATE_HOST,
         AgentAction.RELEASE_HOST,
+        AgentAction.BLOCK_IP,
+        AgentAction.UNBLOCK_IP,
         AgentAction.DISABLE_ACCOUNT,
         AgentAction.COLLECT_FILE,
         AgentAction.COLLECT_PROCESS_LIST,
@@ -115,6 +119,8 @@ CAPABILITY_ACTIONS: dict[AgentCapability, set[AgentAction]] = {
 HIGH_BLAST_ACTIONS: set[AgentAction] = {
     AgentAction.ISOLATE_HOST,
     AgentAction.RELEASE_HOST,
+    AgentAction.BLOCK_IP,
+    AgentAction.UNBLOCK_IP,
     AgentAction.DISABLE_ACCOUNT,
     AgentAction.COLLECT_MEMORY_DUMP,
     AgentAction.KILL_PROCESS,

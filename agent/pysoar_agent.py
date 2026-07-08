@@ -359,6 +359,226 @@ def _handle_release_host(payload: dict[str, Any]) -> dict[str, Any]:
         return {"status": "error", "stderr": str(e)[:512], "exit_code": 1}
 
 
+# Tag prefix stamped on per-IP block rules so unblock_ip can find exactly
+# the rules block_ip created (and nothing else).
+_PYSOAR_BLOCK_TAG = "pysoar-block"
+
+# Resolved IP(s) of the PySOAR server this agent talks to. Populated at
+# startup from --server (see cmd_poll/cmd_enroll) so a bad playbook can
+# never block the very link used to un-block.
+_MANAGEMENT_SERVER_IPS: set[str] = set()
+
+
+def _resolve_server_ips(server_url: str) -> set[str]:
+    """Best-effort resolution of the PySOAR server hostname to IP(s).
+
+    Returns an empty set on any failure — callers treat 'unknown' as
+    'cannot protect', never as an execution error.
+    """
+    import ipaddress
+    from urllib.parse import urlparse
+
+    ips: set[str] = set()
+    try:
+        host = urlparse(server_url).hostname
+        if not host:
+            return ips
+        try:
+            # Server configured by IP literal — no DNS needed
+            ips.add(str(ipaddress.ip_address(host)))
+            return ips
+        except ValueError:
+            pass
+        for info in socket.getaddrinfo(host, None):
+            ips.add(str(info[4][0]))
+    except (socket.gaierror, OSError, ValueError):
+        pass
+    return ips
+
+
+def _parse_block_ip(raw: Any) -> tuple[Any, Optional[dict[str, Any]]]:
+    """Validate the ``ip`` payload field with the ipaddress module.
+
+    Returns ``(ip_address_object, None)`` on success or
+    ``(None, rejection_result)`` for anything that isn't a real IP.
+    """
+    import ipaddress
+
+    if raw is None or str(raw).strip() == "":
+        return None, {"status": "error", "stderr": "ip required", "exit_code": 22}
+    try:
+        return ipaddress.ip_address(str(raw).strip()), None
+    except ValueError:
+        return None, {
+            "status": "rejected",
+            "stderr": f"invalid ip: {str(raw)[:128]!r}",
+            "exit_code": 22,
+        }
+
+
+def _block_rule_name(ip: str) -> str:
+    """Windows firewall DisplayName for a per-IP block rule.
+
+    Sanitized: only [A-Za-z0-9.] survive; everything else (IPv6 colons,
+    zone indices, quotes, ...) becomes '_' so the ip can never break out
+    of the -DisplayName string.
+    """
+    import re
+
+    return f"{_PYSOAR_BLOCK_TAG}-" + re.sub(r"[^A-Za-z0-9.]", "_", ip)
+
+
+def _handle_block_ip(payload: dict[str, Any]) -> dict[str, Any]:
+    """Block all traffic to/from a single IP on this host's firewall.
+
+    Payload: ``{"ip": "..."}``. The value must parse as a real IPv4/IPv6
+    address; loopback, unspecified (0.0.0.0/::), and the PySOAR
+    management server's own IP are refused so a bad playbook can't cut
+    the agent off from the platform (or the host off from itself).
+
+    Rules are tagged ``pysoar-block-<ip>`` (Windows DisplayName /
+    iptables comment) so unblock_ip can remove exactly these rules.
+    """
+    ip_obj, rejection = _parse_block_ip(payload.get("ip"))
+    if rejection is not None:
+        return rejection
+    ip = str(ip_obj)
+
+    if ip_obj.is_loopback or ip_obj.is_unspecified:
+        return {
+            "status": "rejected",
+            "stderr": f"refusing to block {ip}: loopback/unspecified address",
+            "exit_code": 22,
+        }
+    if ip in _MANAGEMENT_SERVER_IPS:
+        return {
+            "status": "rejected",
+            "stderr": f"refusing to block {ip}: it is the PySOAR management server",
+            "exit_code": 22,
+        }
+
+    tag = f"{_PYSOAR_BLOCK_TAG}-{ip}"
+    try:
+        if platform.system() == "Linux":
+            binary = "iptables" if ip_obj.version == 4 else "ip6tables"
+            cmds = [
+                [binary, "-I", "INPUT", "-s", ip, "-j", "DROP",
+                 "-m", "comment", "--comment", tag],
+                [binary, "-I", "OUTPUT", "-d", ip, "-j", "DROP",
+                 "-m", "comment", "--comment", tag],
+            ]
+            outputs = []
+            for cmd in cmds:
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                outputs.append(f"$ {' '.join(cmd)}\n{proc.stdout}{proc.stderr}")
+                if proc.returncode != 0:
+                    return {
+                        "status": "error",
+                        "exit_code": proc.returncode,
+                        "stdout": "\n".join(outputs)[:8192],
+                        "stderr": proc.stderr[:2048],
+                    }
+            return {
+                "status": "success",
+                "exit_code": 0,
+                "stdout": "\n".join(outputs)[:8192],
+                "artifacts": {"method": binary, "ip": ip, "rule_tag": tag},
+            }
+
+        if platform.system() == "Windows":
+            rule_name = _block_rule_name(ip)
+            ps = (
+                f'New-NetFirewallRule -DisplayName "{rule_name}" '
+                f'-Direction Inbound -Action Block -RemoteAddress {ip} -Profile Any; '
+                f'New-NetFirewallRule -DisplayName "{rule_name}-out" '
+                f'-Direction Outbound -Action Block -RemoteAddress {ip} -Profile Any'
+            )
+            proc = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                capture_output=True, text=True, timeout=30,
+            )
+            return {
+                "status": "success" if proc.returncode == 0 else "error",
+                "exit_code": proc.returncode,
+                "stdout": proc.stdout[:4096],
+                "stderr": proc.stderr[:4096],
+                "artifacts": {"method": "windows_firewall", "ip": ip, "rule_name": rule_name},
+            }
+
+        return {
+            "status": "rejected",
+            "stderr": f"block_ip not supported on {platform.system()}",
+            "exit_code": 95,
+        }
+    except Exception as e:  # noqa: BLE001
+        return {"status": "error", "stderr": str(e)[:512], "exit_code": 1}
+
+
+def _handle_unblock_ip(payload: dict[str, Any]) -> dict[str, Any]:
+    """Undo a prior block_ip: remove exactly the rules tagged for that IP.
+
+    Idempotent — removing an IP that was never blocked (or already
+    unblocked) succeeds with 0 rules removed.
+    """
+    ip_obj, rejection = _parse_block_ip(payload.get("ip"))
+    if rejection is not None:
+        return rejection
+    ip = str(ip_obj)
+    tag = f"{_PYSOAR_BLOCK_TAG}-{ip}"
+
+    try:
+        if platform.system() == "Linux":
+            binary = "iptables" if ip_obj.version == 4 else "ip6tables"
+            list_proc = subprocess.run(
+                [binary, "-S"], capture_output=True, text=True, timeout=10
+            )
+            removed = 0
+            for line in list_proc.stdout.splitlines():
+                # Whole-token match (with quotes stripped) so the tag for
+                # 10.0.0.1 never matches the rule for 10.0.0.11.
+                tokens = [t.strip('"') for t in line.split()]
+                if tag not in tokens:
+                    continue
+                if line.startswith("-A "):
+                    del_args = [binary, "-D"] + tokens[1:]
+                    subprocess.run(del_args, capture_output=True, text=True, timeout=10)
+                    removed += 1
+            return {
+                "status": "success",
+                "exit_code": 0,
+                "stdout": f"removed {removed} block rule(s) for {ip}",
+                "artifacts": {"method": binary, "ip": ip, "rules_removed": removed},
+            }
+
+        if platform.system() == "Windows":
+            rule_name = _block_rule_name(ip)
+            # Exact DisplayNames (not a wildcard) so pysoar-block-10.0.0.1
+            # can never sweep up pysoar-block-10.0.0.10's rules.
+            ps = (
+                f'Get-NetFirewallRule -DisplayName "{rule_name}","{rule_name}-out" '
+                '-ErrorAction SilentlyContinue | Remove-NetFirewallRule'
+            )
+            proc = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+                capture_output=True, text=True, timeout=30,
+            )
+            return {
+                "status": "success" if proc.returncode == 0 else "error",
+                "exit_code": proc.returncode,
+                "stdout": proc.stdout[:4096],
+                "stderr": proc.stderr[:4096],
+                "artifacts": {"method": "windows_firewall", "ip": ip, "rule_name": rule_name},
+            }
+
+        return {
+            "status": "rejected",
+            "stderr": f"unblock_ip not supported on {platform.system()}",
+            "exit_code": 95,
+        }
+    except Exception as e:  # noqa: BLE001
+        return {"status": "error", "stderr": str(e)[:512], "exit_code": 1}
+
+
 def _handle_disable_account(payload: dict[str, Any]) -> dict[str, Any]:
     """Disable a local user account. Does NOT delete — reversible."""
     username = payload.get("username")
@@ -760,6 +980,8 @@ IR_HANDLERS: dict[str, Any] = {
     "kill_process": _handle_kill_process,
     "isolate_host": _handle_isolate_host,
     "release_host": _handle_release_host,
+    "block_ip": _handle_block_ip,
+    "unblock_ip": _handle_unblock_ip,
     "disable_account": _handle_disable_account,
     "collect_file": _handle_collect_file,
     "collect_process_list": _handle_collect_process_list,
@@ -1019,6 +1241,13 @@ def cmd_poll(args: argparse.Namespace) -> int:
         pass
     ACTION_HANDLERS = build_action_handlers(caps)
     print(f"[pysoar-agent] capabilities={caps} handlers={sorted(ACTION_HANDLERS.keys())}")
+
+    # Resolve the PySOAR server's IP(s) once at startup so block_ip can
+    # refuse to firewall off the management channel.
+    _MANAGEMENT_SERVER_IPS.update(_resolve_server_ips(args.server))
+    if _MANAGEMENT_SERVER_IPS:
+        print(f"[pysoar-agent] management server IPs protected from block_ip: "
+              f"{sorted(_MANAGEMENT_SERVER_IPS)}")
 
     poll_url = f"{args.server.rstrip('/')}/api/v1/agents/_agent/poll"
     hb_url = f"{args.server.rstrip('/')}/api/v1/agents/_agent/heartbeat"
