@@ -6,7 +6,7 @@ from uuid import uuid4
 import time
 
 import bcrypt
-from jose import JWTError, jwt
+import jwt
 
 from src.core.config import settings
 
@@ -109,7 +109,7 @@ def decode_token(token: str) -> Optional[dict]:
             algorithms=_JWT_ALLOWED_ALGORITHMS,
         )
         return payload
-    except JWTError:
+    except jwt.PyJWTError:
         return None
 
 
@@ -122,7 +122,7 @@ def decode_token_full(token: str) -> Optional[dict]:
             algorithms=_JWT_ALLOWED_ALGORITHMS,
         )
         return payload
-    except JWTError:
+    except jwt.PyJWTError:
         return None
 
 

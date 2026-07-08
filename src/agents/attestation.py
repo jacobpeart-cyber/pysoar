@@ -12,7 +12,7 @@ from typing import Optional
 
 from fastapi import HTTPException, Request, status
 
-from jose import jws
+from jwt import api_jws
 
 logger = logging.getLogger(__name__)
 
@@ -37,8 +37,10 @@ async def verify_request_signature(request: Request, public_key_pem: Optional[st
 
     body = await request.body()
     try:
-        # jose.jws.verify returns the payload bytes on success, raises otherwise
-        payload = jws.verify(signature, public_key_pem, algorithms=["RS256", "ES256"])  # type: ignore
+        # PyJWT's raw-JWS API: verifies the compact JWS (header.payload.signature,
+        # same RFC 7515 wire format python-jose produced/verified) and returns the
+        # payload bytes on success, raises otherwise.
+        payload = api_jws.decode(signature, public_key_pem, algorithms=["RS256", "ES256"])  # type: ignore
     except Exception as exc:  # noqa: BLE001
         logger.debug("agent jws verify failed: %s", exc)
         raise HTTPException(

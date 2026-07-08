@@ -3,8 +3,8 @@
 import json
 from typing import Optional
 
+import jwt
 from fastapi import APIRouter, Depends, Query, WebSocket, WebSocketDisconnect
-from jose import JWTError, jwt
 
 from src.core.config import settings
 from src.core.logging import get_logger
@@ -24,7 +24,7 @@ async def get_user_from_token(token: str) -> Optional[str]:
         )
         user_id: str = payload.get("sub")
         return user_id
-    except JWTError:
+    except jwt.PyJWTError:
         return None
 
 

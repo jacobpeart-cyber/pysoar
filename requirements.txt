@@ -19,9 +19,9 @@ celery>=5.3.4
 flower>=2.0.1
 
 # Authentication & Security
-python-jose[cryptography]>=3.3.0
+# JWT/JWS handled by pyjwt (see below); cryptography also used by
+# src/core/secrets.py and by pyjwt's RS256/ES256 agent-attestation verify.
 cryptography>=48.0.1,<49
-ecdsa>=0.19.2
 passlib[bcrypt]>=1.7.4
 pydantic[email]>=2.5.3
 pydantic-settings>=2.1.0

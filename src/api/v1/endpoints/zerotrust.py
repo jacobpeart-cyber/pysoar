@@ -85,7 +85,7 @@ async def evaluate_access_request(
             auth = raw_request.headers.get("Authorization", "")
             if auth.startswith("Bearer "):
                 try:
-                    from jose import jwt
+                    import jwt
                     from src.core.config import settings as _settings
                     payload = jwt.decode(
                         auth.split(" ", 1)[1].strip(),

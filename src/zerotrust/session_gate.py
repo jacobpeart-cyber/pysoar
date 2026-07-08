@@ -38,7 +38,7 @@ from typing import Optional
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
-from jose import jwt, JWTError
+import jwt
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from src.core.config import settings
@@ -143,7 +143,7 @@ class ZeroTrustSessionMiddleware(BaseHTTPMiddleware):
                 algorithms=["HS256"],
                 options={"verify_exp": False, "verify_signature": True},
             )
-        except JWTError:
+        except jwt.PyJWTError:
             return await call_next(request)
 
         jti = payload.get("jti")
