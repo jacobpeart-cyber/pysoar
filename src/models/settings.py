@@ -38,6 +38,10 @@ class AppSetting(BaseModel):
     )
     section: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
     value: Mapped[Any] = mapped_column(_JSONVariant, nullable=False, default=dict)
+    # Verbatim copy of ``value`` taken by migration 020 before secret keys
+    # were enveloped (``enc:v1:``). Lets an operator recover from a lost
+    # master key; NULL for rows written after the migration.
+    value_pre020: Mapped[Optional[Any]] = mapped_column(_JSONVariant, nullable=True)
     updated_by: Mapped[Optional[str]] = mapped_column(
         String(36),
         ForeignKey("users.id", ondelete="SET NULL"),

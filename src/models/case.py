@@ -1,9 +1,9 @@
 """Case management models for notes, attachments, and timeline"""
 
 from enum import Enum
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
-from sqlalchemy import Boolean, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, Boolean, Float, ForeignKey, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.models.base import BaseModel
@@ -40,6 +40,11 @@ class CaseNote(BaseModel):
     # Visibility
     is_internal: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
     is_pinned: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+
+    # Prompt-injection scan of the human/untrusted text on this row
+    # (design v2 §11; populated by ingest-time scanning in phase 2).
+    injection_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    injection_hits: Mapped[Optional[list[dict[str, Any]]]] = mapped_column(JSON, nullable=True)
 
     # Relationships
     incident_id: Mapped[str] = mapped_column(

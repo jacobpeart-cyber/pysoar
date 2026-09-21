@@ -1,9 +1,9 @@
 """Alert model for security alerts"""
 
 from enum import Enum
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
-from sqlalchemy import ForeignKey, Integer, String, Text
+from sqlalchemy import Float, ForeignKey, Integer, String, Text
 from sqlalchemy.dialects.postgresql import JSON
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -126,6 +126,11 @@ class Alert(BaseModel):
     # Resolution
     resolution_notes: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     resolved_at: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+
+    # Prompt-injection scan of the human/untrusted text on this row
+    # (design v2 §11; populated by ingest-time scanning in phase 2).
+    injection_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    injection_hits: Mapped[Optional[list[dict[str, Any]]]] = mapped_column(JSON, nullable=True)
 
     # Relationships
     assignee: Mapped[Optional["User"]] = relationship(

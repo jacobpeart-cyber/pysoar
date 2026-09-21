@@ -16,9 +16,53 @@ from sqlalchemy import select, update, func
 
 from src.core.logging import get_logger
 from src.core.config import settings
-from src.audit_evidence.models import AuditTrail, EvidencePackage, AutomatedEvidenceRule
+from src.audit_evidence.models import (
+    AUDIT_GENESIS_HASH,
+    AuditTrail,
+    AutomatedEvidenceRule,
+    EvidencePackage,
+    audit_row_hash,
+)
+from src.models.base import generate_uuid, utc_now
 
 logger = get_logger(__name__)
+
+# Maximum serialized size of ``old_value`` / ``new_value`` persisted on an
+# audit row (design v2 §7: "capped 2 KB with [truncated] + args_sha256").
+AUDIT_VALUE_CAP_BYTES = 2048
+
+
+class AuditWriteError(RuntimeError):
+    """Raised when an audit row cannot be written; callers must fail closed."""
+
+
+def _canonical_value_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+
+
+def cap_audit_value(value: Optional[dict[str, Any]], limit: int = AUDIT_VALUE_CAP_BYTES) -> Optional[dict[str, Any]]:
+    """Return the JSON-safe value to persist for an audit ``old_value``/``new_value``.
+
+    Values that serialize to ``limit`` bytes or fewer are stored verbatim
+    (after a JSON round-trip so non-JSON types such as datetimes become
+    strings and what is hashed equals what is stored). Larger values are
+    replaced by a marker dict carrying a truncated preview, the sha256 of
+    the full canonical serialization and the original byte length, so the
+    audit row stays bounded but the full payload remains verifiable.
+    """
+    if value is None:
+        return None
+    canonical = _canonical_value_json(value)
+    encoded = canonical.encode("utf-8")
+    if len(encoded) <= limit:
+        return json.loads(canonical)
+    preview = encoded[:limit].decode("utf-8", errors="ignore")
+    return {
+        "[truncated]": True,
+        "preview": preview,
+        "args_sha256": hashlib.sha256(encoded).hexdigest(),
+        "original_bytes": len(encoded),
+    }
 
 
 class AuditLogger:
@@ -27,12 +71,33 @@ class AuditLogger:
 
     Comprehensive audit logging for system events with support for
     different event types, risk assessment, and activity anomaly detection.
+
+    ``log_event`` only ever ``flush()``es: the caller owns the transaction
+    and commits once per unit of work (an API request, or one agent step
+    after audit + execution). It never commits or rolls back the shared
+    session. Every row is chained to its predecessor for the organization
+    via ``prev_hash``/``row_hash`` (see ``audit_row_hash``).
     """
 
     def __init__(self, session: AsyncSession, org_id: str):
         """Initialize audit logger"""
+        if not org_id:
+            raise ValueError("AuditLogger requires an organization id")
         self.session = session
         self.org_id = org_id
+
+    async def _chain_head(self) -> Optional[str]:
+        """``row_hash`` of the newest chained row for this organization."""
+        result = await self.session.execute(
+            select(AuditTrail.row_hash)
+            .where(
+                AuditTrail.organization_id == self.org_id,
+                AuditTrail.row_hash.is_not(None),
+            )
+            .order_by(AuditTrail.created_at.desc(), AuditTrail.id.desc())
+            .limit(1)
+        )
+        return result.scalar_one_or_none()
 
     async def log_event(
         self,
@@ -50,6 +115,7 @@ class AuditLogger:
         actor_ip: Optional[str] = None,
         session_id: Optional[str] = None,
         request_id: Optional[str] = None,
+        run_id: Optional[str] = None,
     ) -> AuditTrail:
         """
         Log audit event
@@ -62,19 +128,29 @@ class AuditLogger:
             resource_type: Type of resource being acted upon
             resource_id: ID of resource
             description: Event description
-            old_value: Previous value (for changes)
-            new_value: New value (for changes)
+            old_value: Previous value (for changes); capped at 2 KB
+            new_value: New value (for changes); capped at 2 KB
             result: Result of action (success, failure, denied)
             risk_level: Risk level (critical, high, medium, low, info)
             actor_ip: IP address of actor (optional)
             session_id: Session identifier (optional)
             request_id: Request identifier (optional)
+            run_id: Agent run identifier (optional); also used as
+                ``request_id`` when that is not given
 
         Returns:
-            Created AuditTrail record
+            The flushed (NOT committed) AuditTrail row. The caller commits.
+
+        Raises:
+            AuditWriteError: the row could not be flushed. The session is
+                left in whatever state SQLAlchemy put it in; the caller must
+                roll back and must not proceed with the audited action.
         """
         try:
+            prev_hash = await self._chain_head() or AUDIT_GENESIS_HASH
             audit_trail = AuditTrail(
+                id=generate_uuid(),
+                created_at=utc_now(),
                 event_type=event_type,
                 action=action,
                 actor_type=actor_type,
@@ -83,33 +159,123 @@ class AuditLogger:
                 resource_type=resource_type,
                 resource_id=resource_id,
                 description=description,
-                old_value=old_value,
-                new_value=new_value,
+                old_value=cap_audit_value(old_value),
+                new_value=cap_audit_value(new_value),
                 result=result,
                 risk_level=risk_level,
                 session_id=session_id,
-                request_id=request_id,
+                request_id=request_id or run_id,
+                run_id=run_id,
                 organization_id=self.org_id,
+                prev_hash=prev_hash,
             )
+            audit_trail.row_hash = audit_row_hash(audit_trail.chain_fields(), prev_hash)
 
             self.session.add(audit_trail)
-            await self.session.commit()
-
-            logger.info(
-                f"Audit event logged: {event_type}/{action} - {result}",
-                extra={
-                    "actor": actor_id,
-                    "resource": resource_id,
-                    "risk_level": risk_level,
-                },
+            await self.session.flush()
+        except Exception as exc:  # noqa: BLE001 - re-raised as the typed error
+            logger.error(
+                "audit_event_write_failed",
+                event_type=event_type,
+                action=action,
+                organization_id=self.org_id,
+                error=str(exc),
             )
+            raise AuditWriteError(f"audit write failed for {event_type}/{action}: {exc}") from exc
 
-            return audit_trail
+        logger.info(
+            "audit_event_logged",
+            event_type=event_type,
+            action=action,
+            result=result,
+            actor=actor_id,
+            resource=resource_id,
+            risk_level=risk_level,
+            run_id=run_id,
+        )
+        return audit_trail
 
-        except Exception as e:
-            logger.error(f"Failed to log audit event: {str(e)}")
-            await self.session.rollback()
-            raise
+    async def verify_chain(self, organization_id: Optional[str] = None) -> dict[str, Any]:
+        """Walk the hash chain for one organization and report the first break.
+
+        Returns ``{"ok": bool, "first_bad_row": str | None, "checked": int,
+        "total": int, "reason": str | None}``. A row is "bad" when its
+        recomputed hash differs from the stored ``row_hash`` (tampered
+        fields), when the chain forks or has no successor although rows
+        remain (deleted/inserted rows), or when a row has no hashes at all.
+        ``organization_id`` defaults to this logger's org and is refused
+        when it differs, so a caller cannot verify another tenant's chain.
+        """
+        org_id = organization_id or self.org_id
+        if org_id != self.org_id:
+            raise PermissionError("verify_chain is scoped to the logger's organization")
+
+        rows = list(
+            await self.session.scalars(
+                select(AuditTrail)
+                .where(AuditTrail.organization_id == org_id)
+                .order_by(AuditTrail.created_at.asc(), AuditTrail.id.asc())
+            )
+        )
+        total = len(rows)
+        if total == 0:
+            return {"ok": True, "first_bad_row": None, "checked": 0, "total": 0, "reason": None}
+
+        by_prev: dict[str, list[AuditTrail]] = defaultdict(list)
+        for row in rows:
+            if row.row_hash is None or row.prev_hash is None:
+                return {
+                    "ok": False,
+                    "first_bad_row": row.id,
+                    "checked": 0,
+                    "total": total,
+                    "reason": "row_unhashed",
+                }
+            by_prev[row.prev_hash].append(row)
+
+        checked = 0
+        expected_prev = AUDIT_GENESIS_HASH
+        while True:
+            candidates = by_prev.get(expected_prev, [])
+            if not candidates:
+                break
+            if len(candidates) > 1:
+                return {
+                    "ok": False,
+                    "first_bad_row": sorted(c.id for c in candidates)[0],
+                    "checked": checked,
+                    "total": total,
+                    "reason": "chain_fork",
+                }
+            row = candidates[0]
+            recomputed = audit_row_hash(row.chain_fields(), row.prev_hash)
+            if recomputed != row.row_hash:
+                return {
+                    "ok": False,
+                    "first_bad_row": row.id,
+                    "checked": checked,
+                    "total": total,
+                    "reason": "row_hash_mismatch",
+                }
+            checked += 1
+            expected_prev = row.row_hash
+
+        if checked != total:
+            reached: set[str] = set()
+            expected_prev = AUDIT_GENESIS_HASH
+            while expected_prev in by_prev:
+                row = by_prev[expected_prev][0]
+                reached.add(row.id)
+                expected_prev = row.row_hash or ""
+            orphan = next(r for r in rows if r.id not in reached)
+            return {
+                "ok": False,
+                "first_bad_row": orphan.id,
+                "checked": checked,
+                "total": total,
+                "reason": "chain_broken",
+            }
+        return {"ok": True, "first_bad_row": None, "checked": checked, "total": total, "reason": None}
 
     async def log_access(
         self,

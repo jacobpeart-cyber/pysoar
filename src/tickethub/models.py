@@ -1,6 +1,6 @@
 """Ticket Hub models for unified ticketing across all PySOAR modules."""
 
-from typing import Optional
+from typing import Any, Optional
 from datetime import datetime
 
 from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text
@@ -23,6 +23,11 @@ class TicketComment(BaseModel):
     is_edited: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     edited_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     organization_id: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+
+    # Prompt-injection scan of the human/untrusted text on this row
+    # (design v2 §11; populated by ingest-time scanning in phase 2).
+    injection_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    injection_hits: Mapped[Optional[list[dict[str, Any]]]] = mapped_column(JSON, nullable=True)
 
 
 class TicketActivity(BaseModel):

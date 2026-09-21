@@ -1,9 +1,10 @@
 """Models for Agentic AI SOC Analyst"""
 
+from datetime import datetime
 from enum import Enum
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
-from sqlalchemy import Float, ForeignKey, Integer, JSON, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text
 from sqlalchemy.dialects.postgresql import JSON
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -265,9 +266,20 @@ class Investigation(BaseModel):
         String(50), default=InvestigationStatus.INITIATED.value, nullable=False, index=True
     )
     priority: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
-    confidence_score: Mapped[float] = mapped_column(
-        Float, default=0.0, nullable=False
-    )  # 0-100
+    confidence_score: Mapped[Optional[float]] = mapped_column(
+        Float, nullable=True
+    )  # 0-100; NULL unless outcome == "verdict" (never a fabricated default)
+
+    # Autonomous run outcome (design v2 §8). ``outcome`` is one of
+    # verdict | inconclusive_budget | refused | provider_error |
+    # injection_suspected | queued_budget_exceeded | llm_not_configured.
+    outcome: Mapped[Optional[str]] = mapped_column(String(40), nullable=True, index=True)
+    failure_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    llm_provider: Mapped[Optional[str]] = mapped_column(String(40), nullable=True)
+    llm_model: Mapped[Optional[str]] = mapped_column(String(120), nullable=True)
+    tokens_used: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    injection_tier: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    run_ids: Mapped[Optional[list[str]]] = mapped_column(JSON, nullable=True)
 
     # Investigation data
     reasoning_chain: Mapped[Optional[str]] = mapped_column(
@@ -420,6 +432,31 @@ class AgentAction(BaseModel):
     rollback_available: Mapped[bool] = mapped_column(default=True, nullable=False)
     rollback_executed: Mapped[bool] = mapped_column(default=False, nullable=False)
 
+    # Proposal provenance (design v2 §8). ``tool_name`` is what approve
+    # executes; ``parameters['_tool']`` is no longer used.
+    run_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+    tool_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    proposed_by_user_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("users.id"), nullable=True
+    )
+    proposed_by_agent_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("soc_agents.id"), nullable=True
+    )
+    source: Mapped[Optional[str]] = mapped_column(
+        String(20), nullable=True
+    )  # chat | autonomous | skill | itdr
+    params_sha256: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    evidence_sha256: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    effective_targets: Mapped[Optional[list[dict[str, Any]]]] = mapped_column(JSON, nullable=True)
+    suspect: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    injection_tier: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Approval provenance
+    approver_role: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    approver_ip: Mapped[Optional[str]] = mapped_column(String(45), nullable=True)
+    approval_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
     # Relationships
     investigation: Mapped["Investigation"] = relationship(
         "Investigation",
@@ -496,6 +533,9 @@ class AgentChatSession(BaseModel):
     )
     title: Mapped[str] = mapped_column(String(255), nullable=False, default="New chat")
     is_archived: Mapped[bool] = mapped_column(default=False, nullable=False)
+    # Sticky per-session injection trust state (design v2 §4): serialized
+    # TrustState {tier, hits, score, contaminated_labels, first_seen_message_id}.
+    trust_state: Mapped[Optional[dict[str, Any]]] = mapped_column(JSON, nullable=True)
 
 
 class AgentChatMessage(BaseModel):
@@ -552,3 +592,9 @@ class InvestigationFeedback(BaseModel):
     # context so future investigations of similar alerts don't repeat
     # the same mistake.
     correction_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+
+# Register the transcript table with Base.metadata whenever the agentic
+# models are imported (create_all in tests, alembic autogenerate). Kept in
+# its own module because it depends on src.core.encryption.
+from src.agentic.transcript import AgentRunTranscript  # noqa: E402,F401

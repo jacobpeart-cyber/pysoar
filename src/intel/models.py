@@ -1,7 +1,7 @@
 """SQLAlchemy models for Threat Intelligence Platform"""
 
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -130,6 +130,11 @@ class ThreatIndicator(BaseModel):
     organization_id: Mapped[Optional[str]] = mapped_column(
         String(36), ForeignKey("organizations.id"), nullable=True
     )
+
+    # Prompt-injection scan of the human/untrusted text on this row
+    # (design v2 §11; populated by ingest-time scanning in phase 2).
+    injection_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    injection_hits: Mapped[Optional[list[dict[str, Any]]]] = mapped_column(JSON, nullable=True)
 
     # Relationships
     feed: Mapped[Optional["ThreatFeed"]] = relationship("ThreatFeed", back_populates="indicators")

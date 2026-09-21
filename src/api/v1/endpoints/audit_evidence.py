@@ -77,9 +77,12 @@ async def log_audit_event(
             risk_level=request.risk_level,
             actor_ip=request.actor_ip,
         )
+        # AuditLogger only flushes (design v2 §7); the request owns the commit.
+        await db.commit()
         return trail
     except Exception as e:
         logger.error(f"Error logging audit event: {str(e)}")
+        await db.rollback()
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
 
 
@@ -474,7 +477,11 @@ async def delete_evidence_item(
             risk_level="medium",
         )
     except Exception as exc:  # noqa: BLE001
-        logger.warning(f"Audit trail for evidence delete failed: {exc}")
+        # Fail closed: the soft-delete is not committed without its audit row.
+        await db.rollback()
+        logger.error(f"Audit trail for evidence delete failed: {exc}")
+        raise HTTPException(status_code=503, detail="Audit trail unavailable; evidence not deleted")
+    await db.commit()
 
     return None
 
@@ -526,7 +533,11 @@ async def approve_evidence_item(
             risk_level="low",
         )
     except Exception as exc:  # noqa: BLE001
-        logger.warning(f"Audit trail for evidence approve failed: {exc}")
+        # Fail closed: the approval is not committed without its audit row.
+        await db.rollback()
+        logger.error(f"Audit trail for evidence approve failed: {exc}")
+        raise HTTPException(status_code=503, detail="Audit trail unavailable; evidence not approved")
+    await db.commit()
 
     return {
         "id": evidence.id,

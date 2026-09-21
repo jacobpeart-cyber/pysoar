@@ -2,10 +2,10 @@
 
 import math
 from functools import lru_cache
-from typing import List, Literal, Optional
+from typing import Annotated, List, Literal, Optional
 
-from pydantic import field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import AliasChoices, Field, field_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 def _estimate_entropy(value: str) -> float:
@@ -154,6 +154,54 @@ class Settings(BaseSettings):
     aws_access_key_id: Optional[str] = None
     aws_secret_access_key: Optional[str] = None
     aws_region: str = "us-east-1"
+
+    # LLM provider layer (src/llm) -- design v2 section 6
+    # Platform-level defaults. Tenants normally bring their own key through the
+    # org ``ai`` settings section; these env values are used only when that
+    # section sets ``use_platform_default=true`` (see src/llm/factory.py).
+    llm_provider: Literal["anthropic", "gemini", "openai", "ollama"] = "gemini"
+    llm_model: Optional[str] = None
+    anthropic_api_key: Optional[str] = None
+    openai_api_key: Optional[str] = None
+    gemini_api_key: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("GEMINI_API_KEY", "gemini_api_key"),
+    )
+    # Base URLs are platform-env only (never per-tenant): see design section 6.
+    ollama_base_url: str = "http://localhost:11434"
+    openai_base_url: Optional[str] = None  # None -> https://api.openai.com/v1
+    # Token budgets and admission (per organization, per UTC day).
+    llm_daily_token_budget: int = 2_000_000
+    llm_autonomous_daily_token_budget: int = 1_000_000
+    llm_interactive_reserve_pct: int = 40
+    llm_user_runs_per_minute: int = 10
+    llm_user_concurrency: int = 2
+    llm_org_concurrency: int = 8
+    # Call log bodies are never stored unless explicitly enabled; raw rows are
+    # rolled up nightly and deleted after the retention window.
+    llm_log_bodies: bool = False
+    llm_log_retention_days: int = 90
+    # Per-model price table, USD per 1M tokens, e.g.
+    # {"claude-opus-5": {"input": 5, "output": 25, "cache_read": 0.5, "cache_write": 6.25}}
+    llm_prices: Annotated[dict[str, dict[str, float]], NoDecode] = {}
+
+    @field_validator("llm_prices", mode="before")
+    @classmethod
+    def parse_llm_prices(cls, v):
+        if isinstance(v, str):
+            import json
+
+            if not v.strip():
+                return {}
+            return json.loads(v)
+        return v
+
+    @field_validator("llm_interactive_reserve_pct")
+    @classmethod
+    def validate_reserve_pct(cls, v):
+        if not 0 <= v <= 100:
+            raise ValueError("llm_interactive_reserve_pct must be between 0 and 100")
+        return v
 
     @property
     def is_development(self) -> bool:

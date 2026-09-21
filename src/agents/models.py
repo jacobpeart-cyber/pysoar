@@ -147,6 +147,13 @@ class AgentCommand(BaseModel):
         String(36), ForeignKey("organizations.id"), nullable=True, index=True
     )
 
+    # Agent-run provenance (design v2 §7): the human principal whose agent
+    # run produced this command, and the run it belongs to.
+    initiated_by_user_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("users.id"), nullable=True
+    )
+    run_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
+
     __table_args__ = (
         Index("ix_agent_commands_agent_status", "agent_id", "status"),
     )

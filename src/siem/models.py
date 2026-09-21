@@ -1,7 +1,7 @@
 """SIEM data models for log storage, detection rules, and correlation"""
 
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 
 from sqlalchemy import BigInteger, Boolean, DateTime, Float, ForeignKey, Integer, JSON, String, Text
 from sqlalchemy.dialects.postgresql import JSON
@@ -147,6 +147,11 @@ class LogEntry(BaseModel):
     partition_key: Mapped[Optional[str]] = mapped_column(
         String(10), nullable=True
     )  # YYYY-MM-DD format for table partitioning
+
+    # Prompt-injection scan of the human/untrusted text on this row
+    # (design v2 §11; populated by ingest-time scanning in phase 2).
+    injection_score: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    injection_hits: Mapped[Optional[list[dict[str, Any]]]] = mapped_column(JSON, nullable=True)
 
     def __repr__(self) -> str:
         return f"<LogEntry {self.id}: {self.log_type}@{self.source_name}>"

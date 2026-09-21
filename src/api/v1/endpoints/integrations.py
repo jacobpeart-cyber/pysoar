@@ -11,53 +11,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from src.api.deps import CurrentUser, DatabaseSession
-from src.core.encryption import get_encryption_service
+# Credential envelope helpers live in src.core.secrets (design v2 section 10);
+# re-exported here because settings.py, main.py and siem/cloud_poller.py
+# import them from this module.
+from src.core.secrets import _decrypt_secret_json, _encrypt_secret_json  # noqa: F401
 from src.core.security import get_password_hash
 from src.core.utils import safe_json_loads
-
-
-def _encrypt_secret_json(payload: Any) -> str:
-    """Encrypt a JSON-serializable credentials blob with AES-256-GCM.
-
-    Previously integrations stored credentials as plaintext JSON in
-    columns named ``*_encrypted`` — misleading and a compliance-grade
-    defect. This helper wraps the EncryptionService so every install /
-    update path writes ciphertext.
-    """
-    if payload is None:
-        return ""
-    raw = json.dumps(payload)
-    try:
-        return get_encryption_service().encrypt_field(raw)
-    except Exception:  # noqa: BLE001
-        # As a last-resort fallback in dev (no master key), prefix the
-        # plaintext with a marker so the read path knows it wasn't
-        # encrypted and can still deserialize instead of silently
-        # returning a ciphertext-looking string as secret data.
-        return f"__plaintext__:{raw}"
-
-
-def _decrypt_secret_json(value: Optional[str]) -> dict:
-    """Best-effort decrypt + JSON-parse of a stored credentials blob.
-
-    Handles three shapes: (1) AES-256-GCM ciphertext produced by the
-    encrypt helper above, (2) ``__plaintext__:`` fallback written when
-    the encryption service wasn't available, (3) legacy plaintext JSON
-    from earlier rows that predated encryption. Never raises — returns
-    {} on any failure so callers don't have to try/except the decrypt.
-    """
-    if not value:
-        return {}
-    if value.startswith("__plaintext__:"):
-        return safe_json_loads(value[len("__plaintext__:"):], {}) or {}
-    try:
-        decrypted = get_encryption_service().decrypt_field(value)
-        return safe_json_loads(decrypted, {}) or {}
-    except Exception:
-        # Legacy row written before encryption was wired — try parsing
-        # as plain JSON so existing deployments keep working until the
-        # next install/update re-writes the row with ciphertext.
-        return safe_json_loads(value, {}) or {}
 from src.integrations.engine import ConnectorRegistry, IntegrationManager, ActionExecutor
 from src.integrations.models import (
     IntegrationAction,

@@ -81,6 +81,16 @@ class Playbook(BaseModel):
     # Author
     created_by: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
 
+    # Tenant scope (migration 020 backfills from created_by -> users.organization_id).
+    # Nullable: legacy rows whose author has no organization stay unscoped and
+    # are treated as legacy by the policy engine, never as "every org".
+    organization_id: Mapped[Optional[str]] = mapped_column(
+        String(36),
+        ForeignKey("organizations.id"),
+        nullable=True,
+        index=True,
+    )
+
     # Relationships
     executions: Mapped[list["PlaybookExecution"]] = relationship(
         "PlaybookExecution",
@@ -140,6 +150,11 @@ class PlaybookExecution(BaseModel):
     # Triggered by
     triggered_by: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
     trigger_source: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    # The human principal behind the trigger (an agent run records the
+    # analyst who asked, not the literal "agent").
+    triggered_by_user_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("users.id"), nullable=True
+    )
 
     # Relationships
     playbook: Mapped["Playbook"] = relationship(
