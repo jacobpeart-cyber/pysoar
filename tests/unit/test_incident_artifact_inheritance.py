@@ -77,7 +77,7 @@ def test_artifacts_harvest_ip_from_title_text(db_session):
 async def test_auto_created_incident_is_actionable(db_session):
     """End-to-end: an auto-created incident carries the host + IOC, so a
     downstream remediate_incident has something real to isolate/block."""
-    from src.services.agent_tools import AgentToolRegistry
+    from tests.unit.test_tool_spec_invariants import make_registry, run_tool
 
     svc = AutomationService(db_session)
     a = _alert(
@@ -101,10 +101,9 @@ async def test_auto_created_incident_is_actionable(db_session):
     assert inc.organization_id == "org-1"
 
     # And the agent's remediation now actually contains it.
-    out = await AgentToolRegistry(db_session).execute(
+    out = await run_tool(make_registry(db_session), 
         "remediate_incident", {"incident_id": inc.id}
     )
-    assert out["success"] is True
-    r = out["result"]
+    r = out
     assert "staging-api" in r["hosts_isolated"]
     assert "185.220.101.7" in r["indicators_blocked"]

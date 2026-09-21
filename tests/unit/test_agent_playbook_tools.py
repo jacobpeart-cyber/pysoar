@@ -12,7 +12,8 @@ import json
 import pytest
 
 from src.models.playbook import Playbook
-from src.services.agent_tools import AgentToolRegistry
+from src.agentic.toolspec import Tier
+from tests.unit.test_tool_spec_invariants import make_registry, run_tool
 
 
 @pytest.fixture
@@ -23,6 +24,7 @@ async def seeded_playbooks(db_session):
             description="Containment steps for credential stuffing attacks",
             status="active",
             category="identity",
+            organization_id="org-1",
             steps=json.dumps([
                 {"order": 1, "action": "Confirm failed-login pattern across IPs"},
                 {"order": 2, "action": "Force password reset for targeted accounts"},
@@ -33,6 +35,7 @@ async def seeded_playbooks(db_session):
             description="Standard phishing email triage",
             status="active",
             category="email",
+            organization_id="org-1",
             steps=json.dumps([{"order": 1, "action": "Detonate URL in sandbox"}]),
         ),
         Playbook(
@@ -40,6 +43,7 @@ async def seeded_playbooks(db_session):
             description="Unfinished draft",
             status="draft",
             is_enabled=False,
+            organization_id="org-1",
             steps=json.dumps([]),
         ),
     ]
@@ -52,37 +56,36 @@ async def seeded_playbooks(db_session):
 
 @pytest.mark.asyncio
 async def test_list_playbooks_registered_as_readonly_query(db_session):
-    registry = AgentToolRegistry(db_session)
-    tool = registry.tools.get("list_playbooks")
+    registry = make_registry(db_session)
+    tool = registry.specs.get("list_playbooks")
     assert tool is not None
     assert tool.category == "query"
+    assert tool.tier is Tier.READ
+    assert tool.effects.is_read_only
 
 
 @pytest.mark.asyncio
 async def test_list_playbooks_returns_seeded_rows(db_session, seeded_playbooks):
-    registry = AgentToolRegistry(db_session)
-    out = await registry.execute("list_playbooks", {})
-    assert out["success"] is True
-    names = {p["name"] for p in out["result"]}
+    registry = make_registry(db_session)
+    out = await run_tool(registry, "list_playbooks", {})
+    names = {p["name"] for p in out}
     assert "Credential Stuffing Response" in names
     assert "Phishing Triage" in names
 
 
 @pytest.mark.asyncio
 async def test_list_playbooks_keyword_filter(db_session, seeded_playbooks):
-    registry = AgentToolRegistry(db_session)
-    out = await registry.execute("list_playbooks", {"keyword": "credential"})
-    assert out["success"] is True
-    assert [p["name"] for p in out["result"]] == ["Credential Stuffing Response"]
+    registry = make_registry(db_session)
+    out = await run_tool(registry, "list_playbooks", {"keyword": "credential"})
+    assert [p["name"] for p in out] == ["Credential Stuffing Response"]
 
 
 @pytest.mark.asyncio
 async def test_get_playbook_returns_parsed_steps(db_session, seeded_playbooks):
-    registry = AgentToolRegistry(db_session)
+    registry = make_registry(db_session)
     pb = seeded_playbooks[0]
-    out = await registry.execute("get_playbook", {"playbook_id": pb.id})
-    assert out["success"] is True
-    detail = out["result"]
+    out = await run_tool(registry, "get_playbook", {"playbook_id": pb.id})
+    detail = out
     assert detail["name"] == "Credential Stuffing Response"
     assert isinstance(detail["steps"], list)
     assert detail["steps"][0]["action"].startswith("Confirm failed-login")
@@ -90,10 +93,9 @@ async def test_get_playbook_returns_parsed_steps(db_session, seeded_playbooks):
 
 @pytest.mark.asyncio
 async def test_get_playbook_unknown_id_is_clean_error(db_session):
-    registry = AgentToolRegistry(db_session)
-    out = await registry.execute("get_playbook", {"playbook_id": "nope"})
-    assert out["success"] is True
-    assert "error" in out["result"]
+    registry = make_registry(db_session)
+    out = await run_tool(registry, "get_playbook", {"playbook_id": "nope"})
+    assert "error" in out
 
 
 @pytest.mark.asyncio

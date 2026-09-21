@@ -61,21 +61,18 @@ async def test_sync_requires_superuser(client, auth_headers, admin_auth_headers)
 
 @pytest.mark.asyncio
 async def test_agent_lookup_and_coverage_tools(db_session):
-    from src.services.agent_tools import AgentToolRegistry
+    from tests.unit.test_tool_spec_invariants import make_registry, run_tool
     await _seed(db_session)
-    reg = AgentToolRegistry(db_session)
+    reg = make_registry(db_session)
 
-    out = await reg.execute("lookup_attack_technique", {"technique_id": "t1110"})
-    assert out["success"] is True
-    assert out["result"]["name"] == "Brute Force"
+    out = await run_tool(reg, "lookup_attack_technique", {"technique": "t1110"})
+    assert out["name"] == "Brute Force"
 
-    out = await reg.execute("get_attack_coverage", {"technique_ids": ["T1110", "T1110.001"]})
-    assert out["success"] is True
-    assert {c["technique"] for c in out["result"]} == {"T1110", "T1110.001"}
+    out = await run_tool(reg, "get_attack_coverage", {"techniques": ["T1110", "T1110.001"]})
+    assert {c["technique"] for c in out} == {"T1110", "T1110.001"}
 
-    out = await reg.execute("search_attack", {"query": "mimikatz"})
-    assert out["success"] is True
-    assert any(s["external_id"] == "S0002" for s in out["result"]["software"])
+    out = await run_tool(reg, "search_attack", {"query": "mimikatz"})
+    assert any(s["external_id"] == "S0002" for s in out["software"])
 
 
 @pytest.mark.asyncio

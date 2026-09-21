@@ -220,16 +220,14 @@ async def test_runner_unknown_execution_is_clean(db_session):
 
 @pytest.mark.asyncio
 async def test_agent_execute_playbook_dispatches_runner(db_session):
-    from src.services.agent_tools import AgentToolRegistry
+    from tests.unit.test_tool_spec_invariants import make_registry, run_tool
 
-    pb = _scheduled_playbook(trigger_type="manual")
+    pb = _scheduled_playbook(trigger_type="manual", organization_id="org-1")
     db_session.add(pb)
     await db_session.commit()
 
-    registry = AgentToolRegistry(db_session)
+    registry = make_registry(db_session)
     with patch("src.playbooks.tasks.run_playbook_execution") as task:
-        out = await registry.execute("execute_playbook", {"playbook_id": pb.id})
-
-    assert out["success"] is True
-    execution_id = out["result"]["execution_id"]
+        out = await run_tool(registry, "execute_playbook", {"playbook_id": pb.id})
+    execution_id = out["execution_id"]
     task.delay.assert_called_once_with(execution_id)
