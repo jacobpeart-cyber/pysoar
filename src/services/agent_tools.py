@@ -18,12 +18,20 @@ Tenancy rules enforced here:
   default organization and no synthetic system user.
 * :meth:`AgentToolRegistry.call` is the only entry point. Handlers are
   private methods; nothing outside this module may invoke them directly.
+* Composite handlers (``remediate_incident``) never invoke another handler
+  directly: every sub-action goes through :meth:`AgentToolRegistry._sub_call`
+  so it receives its own policy decision, rate charge and audit pair. A
+  denied sub-call aborts the composite with an honest partial result.
+* Every destructive/privileged spec declares ``effective_targets`` so the
+  policy engine (and the approval card) sees every concrete host / ip /
+  user / record the call would touch, each with its provenance.
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import re
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 
@@ -35,7 +43,7 @@ from src.agentic.context import ROLE_RANK, AgentContext, UserRole
 from src.agentic.decisions import Decision, TrustState
 from src.agentic.models import AgentAction as AgenticAction
 from src.agentic.models import Investigation
-from src.agentic.toolspec import Effects, ParamSpec, Tier, ToolSpec
+from src.agentic.toolspec import Effects, ParamSpec, Target, Tier, ToolSpec
 from src.agents.capabilities import AgentAction as EndpointAction
 from src.agents.models import AgentCommand, EndpointAgent
 from src.collaboration.models import ActionItem, WarRoom
@@ -174,6 +182,30 @@ _CASE_INSENSITIVE_COLUMNS = {"email", "hostname", "name", "fqdn"}
 _RESOLVE_LIMIT = 5
 
 _IPV4_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
+
+#: ``execute_playbook`` input keys that are always taken from the context.
+PLAYBOOK_RESERVED_KEYS: frozenset[str] = frozenset({"organization_id", "actor_user_id", "playbook_execution_id"})
+
+#: Cap on the concrete targets a composite tool may expand to (mirrors policy.MAX_EFFECTIVE_TARGETS).
+MAX_COMPOSITE_TARGETS = 25
+
+#: Endpoint agents in these states may receive a command (matches the remediation engine's eligibility rule).
+_DISPATCHABLE_AGENT_STATES: tuple[str, ...] = ("active", "offline")
+
+#: ``input_data`` keys whose values name hosts / ips / users and therefore become effective targets.
+_INPUT_HOST_KEYS: frozenset[str] = frozenset({"hostname", "host", "target_host", "asset", "asset_ref", "target"})
+_INPUT_IP_KEYS: frozenset[str] = frozenset({"ip", "ip_address", "source_ip", "destination_ip", "target_ip"})
+_INPUT_USER_KEYS: frozenset[str] = frozenset({"user", "username", "user_email", "email", "user_id", "account"})
+
+#: JSON-schema type names accepted in a ``Playbook.variables`` declaration.
+_JSON_TYPE_CHECKS: dict[str, tuple[type, ...]] = {
+    "string": (str,),
+    "integer": (int,),
+    "number": (int, float),
+    "boolean": (bool,),
+    "array": (list,),
+    "object": (dict,),
+}
 
 
 def _model_is_scopable(name: str) -> bool:
@@ -323,7 +355,16 @@ class AgentToolRegistry:
         self.db = db
         self.ctx = ctx
         self.specs: dict[str, ToolSpec] = {}
+        #: Policy bound for the registry's lifetime (``bind_policy``); used when
+        #: ``call`` is handed a pre-evaluated decision and no policy object.
+        self.policy: Any = None
+        #: Policy in force for the duration of the current ``call`` (sub-calls reuse it).
+        self._active_policy: Any = None
         self._register_all()
+
+    def bind_policy(self, policy: Any) -> None:
+        """Bind the policy engine composite handlers use for their sub-actions."""
+        self.policy = policy
 
     # ------------------------------------------------------------------
     # Public surface
@@ -353,12 +394,15 @@ class AgentToolRegistry:
             raise KeyError(tool)
         if ctx.org_id != self.ctx.org_id:
             raise PermissionError("cross_tenant_reference")
+        effective_policy = policy if policy is not None else self.policy
         if decision is None:
-            if policy is None:
+            if effective_policy is None:
                 raise ValueError("call() requires a Decision or a policy to evaluate one")
-            decision = await policy.evaluate(ctx, spec, args, TrustState())
+            decision = await effective_policy.evaluate(ctx, spec, args, TrustState())
         if decision.kind != "allow":
-            raise PermissionError(decision.reason_code)
+            # A propose/deny decision carries ``reason_code == "ok"`` only when it
+            # is a proposal; surface the kind so composites report it honestly.
+            raise PermissionError(decision.reason_code if decision.reason_code != "ok" else f"decision_{decision.kind}")
         if decision.tool != spec.name:
             raise PermissionError("invalid_arguments")
         logger.info(
@@ -369,7 +413,25 @@ class AgentToolRegistry:
             tier=spec.tier.value,
             mode=ctx.mode.value,
         )
-        return await spec.handler(**decision.resolved_args)
+        previous_policy = self._active_policy
+        self._active_policy = effective_policy
+        try:
+            return await spec.handler(**decision.resolved_args)
+        finally:
+            self._active_policy = previous_policy
+
+    async def _sub_call(self, ctx: AgentContext, tool: str, args: dict[str, Any]) -> Any:
+        """Invoke ``tool`` as a sub-action of the handler currently executing.
+
+        The sub-action is evaluated by the policy in force for the outer
+        call, so it gets its own decision, rate charge and audit pair. A
+        denied sub-call raises ``PermissionError`` (the composite must abort).
+        Without a policy in scope the composite fails closed.
+        """
+        policy = self._active_policy if self._active_policy is not None else self.policy
+        if policy is None:
+            raise PermissionError("composite_requires_policy")
+        return await self.call(ctx, tool, dict(args), policy=policy)
 
     def visible_specs(self, role: Optional[UserRole] = None) -> list[ToolSpec]:
         """Tools ``role`` (default: the bound context's role) may invoke."""
@@ -465,8 +527,165 @@ class AgentToolRegistry:
                 description=description,
                 old_value=old_value,
                 new_value=new_value,
+                # users FK: attributed to the human actor, never to another user; NULL for agents.
+                actor_id=self.ctx.actor_user_id,
             ),
         )
+
+    # ------------------------------------------------------------------
+    # Effective-target expansion (destructive / privileged tools)
+    # ------------------------------------------------------------------
+    #
+    # Each ``_targets_*`` method has the ``ToolSpec.effective_targets``
+    # signature ``(args, registry) -> list[Target]``. They never raise for a
+    # missing row: the target is returned with ``resolved_id=None`` and
+    # ``provenance="unknown"`` and the policy's ``_check_target`` decides.
+
+    @staticmethod
+    def _parse_json_list(jsonish: Any) -> list[str]:
+        """Parse a JSON-array text column (or a comma list) into strings."""
+        if not jsonish:
+            return []
+        try:
+            v = json.loads(jsonish) if isinstance(jsonish, str) else jsonish
+        except (TypeError, json.JSONDecodeError):
+            return [s.strip() for s in str(jsonish).split(",") if s.strip()]
+        if isinstance(v, list):
+            return [str(x) for x in v if x is not None and str(x).strip()]
+        return [str(v)] if v else []
+
+    async def _ip_is_structured(self, ip: str) -> bool:
+        """True when ``ip`` appears in a structured, human/system-written org field."""
+        alert_q = self._scoped(select(func.count(Alert.id)), Alert).where(
+            or_(Alert.source_ip == ip, Alert.destination_ip == ip),
+        )
+        if int((await self.db.execute(alert_q)).scalar() or 0):
+            return True
+        ioc_q = self._scoped(select(func.count(ThreatIndicator.id)), ThreatIndicator).where(ThreatIndicator.value == ip)
+        if int((await self.db.execute(ioc_q)).scalar() or 0):
+            return True
+        inc_q = self._scoped(select(func.count(Incident.id)), Incident).where(Incident.indicators.like(f'%"{ip}"%'))
+        return bool(int((await self.db.execute(inc_q)).scalar() or 0))
+
+    async def _host_is_structured(self, host: str) -> bool:
+        """True when ``host`` names an org Asset or appears on an org Alert / Incident."""
+        if await self._find_asset(host) is not None:
+            return True
+        alert_q = self._scoped(select(func.count(Alert.id)), Alert).where(func.lower(Alert.hostname) == host.lower())
+        if int((await self.db.execute(alert_q)).scalar() or 0):
+            return True
+        inc_q = self._scoped(select(func.count(Incident.id)), Incident).where(Incident.affected_systems.like(f'%"{host}"%'))
+        return bool(int((await self.db.execute(inc_q)).scalar() or 0))
+
+    async def _ip_target(self, ip: str) -> Target:
+        value = str(ip).strip()
+        structured = await self._ip_is_structured(value) if value else False
+        return Target(kind="ip", value=value, resolved_id=None, provenance="structured" if structured else "untrusted_text")
+
+    async def _host_target(self, host: str) -> Target:
+        value = str(host).strip()
+        asset = await self._find_asset(value) if value else None
+        if asset is not None:
+            return Target(kind="host", value=asset.hostname or asset.name or value, resolved_id=asset.id, provenance="structured")
+        structured = await self._host_is_structured(value) if value else False
+        return Target(kind="host", value=value, resolved_id=None, provenance="structured" if structured else "untrusted_text")
+
+    async def _user_target(self, ref: str) -> Target:
+        value = str(ref).strip()
+        user = await self._resolve_user_ref(value) if value else None
+        if user is not None:
+            return Target(kind="user", value=user.email, resolved_id=user.id, provenance="structured")
+        return Target(kind="user", value=value, resolved_id=None, provenance="unknown")
+
+    async def _row_target(self, kind: str, model_name: str, row_id: Any) -> Target:
+        value = str(row_id) if row_id is not None else ""
+        row = await self._scoped_get(model_name, value) if value else None
+        if row is None:
+            return Target(kind=kind, value=value, resolved_id=None, provenance="unknown")  # type: ignore[arg-type]
+        return Target(kind=kind, value=value, resolved_id=row.id, provenance="structured")  # type: ignore[arg-type]
+
+    async def _targets_in_input_data(self, data: Any) -> list[Target]:
+        """Hosts / ips / users named by well-known keys anywhere inside ``data``."""
+        out: list[Target] = []
+        seen: set[tuple[str, str]] = set()
+
+        async def walk(node: Any) -> None:
+            if len(out) >= MAX_COMPOSITE_TARGETS:
+                return
+            if isinstance(node, dict):
+                for key, val in node.items():
+                    k = str(key).lower()
+                    if isinstance(val, str) and val.strip():
+                        target: Optional[Target] = None
+                        if k in _INPUT_IP_KEYS:
+                            target = await self._ip_target(val)
+                        elif k in _INPUT_HOST_KEYS:
+                            target = await self._host_target(val)
+                        elif k in _INPUT_USER_KEYS:
+                            target = await self._user_target(val)
+                        if target is not None and (target.kind, target.value) not in seen:
+                            seen.add((target.kind, target.value))
+                            out.append(target)
+                    elif isinstance(val, (dict, list)):
+                        await walk(val)
+            elif isinstance(node, list):
+                for item in node:
+                    await walk(item)
+
+        await walk(data)
+        return out[:MAX_COMPOSITE_TARGETS]
+
+    async def _targets_block_ip(self, args: dict[str, Any], registry: Any = None) -> list[Target]:
+        return [await self._ip_target(args.get("ip") or "")]
+
+    async def _targets_isolate_host(self, args: dict[str, Any], registry: Any = None) -> list[Target]:
+        return [await self._host_target(args.get("hostname") or "")]
+
+    async def _targets_disable_user(self, args: dict[str, Any], registry: Any = None) -> list[Target]:
+        return [await self._user_target(args.get("user_email") or "")]
+
+    async def _targets_execute_playbook(self, args: dict[str, Any], registry: Any = None) -> list[Target]:
+        targets = [await self._row_target("playbook", "Playbook", args.get("playbook_id"))]
+        targets.extend(await self._targets_in_input_data(args.get("input_data") or {}))
+        return targets[:MAX_COMPOSITE_TARGETS]
+
+    async def _targets_execute_integration_action(self, args: dict[str, Any], registry: Any = None) -> list[Target]:
+        targets = [await self._row_target("integration", "InstalledIntegration", args.get("installation_id"))]
+        targets.extend(await self._targets_in_input_data(args.get("input_data") or {}))
+        return targets[:MAX_COMPOSITE_TARGETS]
+
+    async def _targets_remediate_incident(self, args: dict[str, Any], registry: Any = None) -> list[Target]:
+        incident_id = args.get("incident_id")
+        inc = await self._incident(str(incident_id)) if incident_id else None
+        if inc is None:
+            return [Target(kind="incident", value=str(incident_id or ""), resolved_id=None, provenance="unknown")]
+        targets: list[Target] = [Target(kind="incident", value=inc.id, resolved_id=inc.id, provenance="structured")]
+        if args.get("isolate_hosts", True) in (True, "true", "True", 1):
+            for host in self._parse_json_list(inc.affected_systems):
+                if len(targets) >= MAX_COMPOSITE_TARGETS:
+                    break
+                targets.append(await self._host_target(host))
+        if args.get("block_indicators", True) in (True, "true", "True", 1):
+            for ind in self._parse_json_list(inc.indicators):
+                if len(targets) >= MAX_COMPOSITE_TARGETS:
+                    break
+                if _IPV4_RE.match(ind):
+                    targets.append(await self._ip_target(ind))
+        return targets[:MAX_COMPOSITE_TARGETS]
+
+    async def _targets_create_remediation_ticket(self, args: dict[str, Any], registry: Any = None) -> list[Target]:
+        incident_id = args.get("incident_id")
+        if incident_id:
+            return [await self._row_target("incident", "Incident", incident_id)]
+        return [Target(kind="other", value=str(args.get("title") or "")[:200], resolved_id=None, provenance="untrusted_text")]
+
+    async def _targets_simulate_attack(self, args: dict[str, Any], registry: Any = None) -> list[Target]:
+        return [await self._host_target(args.get("target") or "")]
+
+    async def _targets_queue_endpoint_command(self, args: dict[str, Any], registry: Any = None) -> list[Target]:
+        targets = [await self._row_target("endpoint_agent", "EndpointAgent", args.get("agent_id"))]
+        targets.extend(await self._targets_in_input_data(args.get("payload") or {}))
+        return targets[:MAX_COMPOSITE_TARGETS]
 
     # ------------------------------------------------------------------
     # Registration
@@ -939,6 +1158,10 @@ class AgentToolRegistry:
             params={
                 "title": _s("Title", required=True, max_length=500),
                 "severity": _s("Severity", required=True, enum=SEVERITIES),
+                "case_type": _s(
+                    "Case type (default incident_response)",
+                    enum=["incident_response", "malware_analysis", "data_breach", "insider_threat", "legal_investigation", "compliance_audit"],
+                ),
                 "description": _s("Description", max_length=8000),
             },
             effects=WRITE, tier=Tier.WRITE, min_role=UserRole.ANALYST, models=("ForensicCase",),
@@ -973,62 +1196,79 @@ class AgentToolRegistry:
                 "block_indicators": _bool("Block indicator IPs (default true)"),
             },
             effects=Effects(writes_org=True, external=True), tier=Tier.DESTRUCTIVE, min_role=UserRole.ANALYST,
-            models=("Incident", "Asset", "ThreatIndicator", "TicketActivity", "CaseTimeline"),
+            models=("Incident", "Asset", "ThreatIndicator", "TicketActivity", "CaseTimeline", "EndpointAgent", "AgentCommand"),
             handler=self._remediate_incident, category="action",
+            effective_targets=self._targets_remediate_incident,
         ))
         self._register(ToolSpec(
             name="execute_playbook",
-            description="Queue a playbook execution by playbook id",
+            description=(
+                "Queue a playbook execution by playbook id. input_data keys must be declared in the playbook's "
+                "variables (unknown keys and wrong types are rejected); organization/actor keys always come from the caller."
+            ),
             params={
                 "playbook_id": _s("Playbook UUID", required=True, ref="Playbook"),
                 "input_data": ParamSpec(type="object", description="Playbook input variables", schema=OPEN_OBJECT_SCHEMA),
             },
             effects=Effects(writes_org=True, external=True, executes_code=True), tier=Tier.DESTRUCTIVE,
-            min_role=UserRole.ANALYST, models=("Playbook", "PlaybookExecution"),
+            min_role=UserRole.ANALYST, models=("Playbook", "PlaybookExecution", "Asset", "Alert", "Incident", "ThreatIndicator", "User"),
             handler=self._execute_playbook, category="action",
+            effective_targets=self._targets_execute_playbook,
         ))
         self._register(ToolSpec(
             name="block_ip",
-            description="Block an IP address (recorded as a blocked indicator + remediation activity)",
+            description=(
+                "Block an IP address: records it as an active blocked indicator and dispatches a host-firewall block_ip "
+                "command to every enrolled IR-capable endpoint agent (mode=enforced_via_agents), or reports mode=detection_only "
+                "when no eligible agent exists."
+            ),
             params={
                 "ip": _s("IPv4 address", required=True, max_length=45),
                 "reason": _s("Reason", required=True, max_length=2000),
             },
             effects=Effects(writes_org=True, external=True), tier=Tier.DESTRUCTIVE, min_role=UserRole.ANALYST,
-            models=("ThreatIndicator", "TicketActivity"),
+            models=("ThreatIndicator", "TicketActivity", "EndpointAgent", "AgentCommand", "Alert", "Incident"),
             handler=self._block_ip, category="action",
+            effective_targets=self._targets_block_ip,
         ))
         self._register(ToolSpec(
             name="isolate_host",
-            description="Isolate a host from the network",
+            description=(
+                "Isolate a host from the network via its enrolled endpoint agent (mode=enforced_via_agent); when the host has "
+                "no enrolled agent the request is recorded only (mode=detection_only) and must be actioned manually."
+            ),
             params={
                 "hostname": _s("Asset hostname", required=True, max_length=255, ref_by_value=("Asset", "hostname")),
                 "reason": _s("Reason", required=True, max_length=2000),
             },
             effects=Effects(writes_org=True, external=True), tier=Tier.DESTRUCTIVE, min_role=UserRole.ANALYST,
-            models=("Asset", "TicketActivity"),
+            models=("Asset", "TicketActivity", "EndpointAgent", "AgentCommand", "Alert", "Incident"),
             handler=self._isolate_host, category="action",
+            effective_targets=self._targets_isolate_host,
         ))
         self._register(ToolSpec(
             name="disable_user",
-            description="Disable a user account",
+            description="Disable a user account in this organization (never a superuser, never yourself).",
             params={
                 "user_email": _s("User email", required=True, max_length=255, ref_by_value=("User", "email")),
                 "reason": _s("Reason", required=True, max_length=2000),
             },
             effects=WRITE, tier=Tier.DESTRUCTIVE, min_role=UserRole.ANALYST, models=("User",),
             handler=self._disable_user, category="action",
+            effective_targets=self._targets_disable_user,
         ))
         self._register(ToolSpec(
             name="create_remediation_ticket",
-            description="Create a remediation ticket for a vulnerability",
+            description="Create a remediation ticket for a vulnerability, optionally linked to an incident",
             params={
                 "title": _s("Title", required=True, max_length=500),
                 "priority": _s("Priority", enum=SEVERITIES),
                 "description": _s("Description", max_length=8000),
+                "incident_id": _s("Incident to link the ticket to", ref="Incident"),
             },
-            effects=WRITE, tier=Tier.DESTRUCTIVE, min_role=UserRole.ANALYST, models=("RemediationTicket",),
+            effects=WRITE, tier=Tier.DESTRUCTIVE, min_role=UserRole.ANALYST, models=("RemediationTicket", "Incident"),
             handler=self._create_remediation_ticket, category="action",
+            effective_targets=self._targets_create_remediation_ticket,
         ))
         self._register(ToolSpec(
             name="execute_integration_action",
@@ -1039,8 +1279,9 @@ class AgentToolRegistry:
                 "input_data": ParamSpec(type="object", description="Action input", schema=OPEN_OBJECT_SCHEMA),
             },
             effects=Effects(writes_org=True, external=True), tier=Tier.DESTRUCTIVE, min_role=UserRole.ANALYST,
-            models=("InstalledIntegration",),
+            models=("InstalledIntegration", "Asset", "Alert", "Incident", "ThreatIndicator", "User"),
             handler=self._execute_integration_action, category="action", returns_sensitive=True,
+            effective_targets=self._targets_execute_integration_action,
         ))
         self._register(ToolSpec(
             name="simulate_attack",
@@ -1050,8 +1291,9 @@ class AgentToolRegistry:
                 "target": _s("Target host", required=True, max_length=255),
             },
             effects=Effects(writes_org=True, external=True, executes_code=True), tier=Tier.DESTRUCTIVE,
-            min_role=UserRole.ANALYST, models=("AttackSimulation", "SimulationTest"),
+            min_role=UserRole.ANALYST, models=("AttackSimulation", "SimulationTest", "Asset", "Alert", "Incident"),
             handler=self._simulate_attack, category="analyze",
+            effective_targets=self._targets_simulate_attack,
         ))
 
         # ===== PRIVILEGED =====
@@ -1064,8 +1306,9 @@ class AgentToolRegistry:
                 "payload": ParamSpec(type="object", description="Action parameters", schema=ENDPOINT_PAYLOAD_SCHEMA),
             },
             effects=Effects(writes_org=True, external=True, executes_code=True), tier=Tier.PRIVILEGED,
-            min_role=UserRole.ADMIN, models=("EndpointAgent", "AgentCommand"),
+            min_role=UserRole.ADMIN, models=("EndpointAgent", "AgentCommand", "Asset", "Alert", "Incident", "ThreatIndicator", "User"),
             handler=self._queue_endpoint_command, category="action",
+            effective_targets=self._targets_queue_endpoint_command,
         ))
 
         # ===== ANALYZE (read-only) =====
@@ -1601,14 +1844,23 @@ class AgentToolRegistry:
         inc = await self._incident(incident_id)
         if not inc:
             return {"error": "Incident not found"}
-        if not self.ctx.actor_user_id:
-            # CaseNote.author_id is a users FK; autonomous runs have no user actor.
-            return {"error": "add_incident_note requires a user actor (autonomous runs cannot author case notes yet)"}
-        n = CaseNote(incident_id=inc.id, content=str(note), note_type="investigation", is_internal=True, author_id=self.ctx.actor_user_id)
+        author = self._note_author_fields()
+        if author is None:
+            return {"error": "autonomous_notes_require_agent_author_column"}
+        n = CaseNote(incident_id=inc.id, content=str(note), note_type="investigation", is_internal=True, **author)
         self.db.add(n)
         self._add_timeline(inc, "note", "Investigation note added")
         await self.db.commit()
-        return {"incident_id": inc.id, "note_id": n.id, "status": "added"}
+        return {"incident_id": inc.id, "note_id": n.id, "status": "added", "author": author}
+
+    def _note_author_fields(self) -> Optional[dict[str, str]]:
+        """Author attribution for a CaseNote: the human actor, or the SOC agent
+        when the model carries an agent-author column. Never another user."""
+        if self.ctx.actor_user_id:
+            return {"author_id": self.ctx.actor_user_id}
+        if self.ctx.soc_agent_id and hasattr(CaseNote, "created_by_agent_id"):
+            return {"created_by_agent_id": self.ctx.soc_agent_id}
+        return None
 
     async def _update_incident_findings(
         self,
@@ -1621,6 +1873,9 @@ class AgentToolRegistry:
         inc = await self._incident(incident_id)
         if not inc:
             return {"error": "Incident not found"}
+        if self._note_author_fields() is None:
+            # Findings are analyst attestations; without an attributable author they are not recorded.
+            return {"error": "autonomous_notes_require_agent_author_column"}
         updated = []
         for field_name, val in (("root_cause", root_cause), ("resolution", resolution), ("lessons_learned", lessons_learned), ("recommendations", recommendations)):
             if val:
@@ -1709,9 +1964,16 @@ class AgentToolRegistry:
         await self.db.flush()
         return {"id": ioc.id, "value": value, "type": ioc_type}
 
-    async def _create_forensic_case(self, title: str, severity: str, description: str = "") -> dict[str, Any]:
+    async def _create_forensic_case(
+        self, title: str, severity: str, case_type: str = "incident_response", description: str = ""
+    ) -> dict[str, Any]:
+        # ForensicCase.case_number is NOT NULL and unique; the DFIR endpoint takes
+        # it from the analyst, so an agent-opened case mints its own: date-stamped
+        # plus a random suffix (no sequence lookup, no cross-tenant counter).
+        case_number = f"FC-{datetime.now(timezone.utc):%Y%m%d}-{uuid.uuid4().hex[:8].upper()}"
         case = ForensicCase(
-            title=title, severity=severity, status="open", description=description,
+            case_number=case_number,
+            title=title, severity=severity, status="open", case_type=case_type, description=description,
             organization_id=self.ctx.org_id, created_by=self._actor_id(),
         )
         self.db.add(case)
@@ -1725,37 +1987,65 @@ class AgentToolRegistry:
 
     async def _remediate_incident(self, incident_id: str, isolate_hosts: bool = True, block_indicators: bool = True) -> dict[str, Any]:
         """NIST short-term containment: isolate affected hosts + block indicator
-        IPs, then advance the incident to 'containment'. Honest when there is
-        nothing to act on. Part B routes the sub-actions through ``call()``."""
+        IPs, then advance the incident to 'containment'.
+
+        Every sub-action goes through ``_sub_call`` so it is separately
+        policy-checked, rate-charged and audited. A denied sub-call aborts the
+        composite and the result says exactly what completed before the abort.
+        Honest when there is nothing to act on and about enforcement mode.
+        """
         inc = await self._incident(incident_id)
         if not inc:
             return {"error": "Incident not found"}
 
-        def _parse(jsonish: Any) -> list[str]:
-            if not jsonish:
-                return []
-            try:
-                v = json.loads(jsonish) if isinstance(jsonish, str) else jsonish
-                return [str(x) for x in v] if isinstance(v, list) else ([str(v)] if v else [])
-            except (TypeError, json.JSONDecodeError):
-                return [s.strip() for s in str(jsonish).split(",") if s.strip()]
-
         reason = f"Containment for incident {inc.id}: {inc.title}"
+        completed: list[dict[str, Any]] = []
         hosts_isolated: list[str] = []
         indicators_blocked: list[str] = []
+        enforcement: dict[str, dict[str, str]] = {"hosts": {}, "ips": {}}
 
+        planned: list[tuple[str, str, dict[str, Any]]] = []
         if isolate_hosts in (True, "true", "True", 1):
-            for host in _parse(inc.affected_systems):
-                res = await self._isolate_host(host, reason)
-                if res.get("status") == "isolated":
-                    hosts_isolated.append(host)
-
+            for host in self._parse_json_list(inc.affected_systems):
+                planned.append(("isolate_host", host, {"hostname": host, "reason": reason}))
         if block_indicators in (True, "true", "True", 1):
-            for ind in _parse(inc.indicators):
+            for ind in self._parse_json_list(inc.indicators):
                 if _IPV4_RE.match(ind):
-                    res = await self._block_ip(ind, reason)
-                    if res.get("status") == "blocked":
-                        indicators_blocked.append(ind)
+                    planned.append(("block_ip", ind, {"ip": ind, "reason": reason}))
+        planned = planned[:MAX_COMPOSITE_TARGETS]
+
+        for tool, value, args in planned:
+            try:
+                res = await self._sub_call(self.ctx, tool, args)
+            except PermissionError as exc:
+                code = str(exc) or "denied"
+                logger.warning("composite_sub_call_denied", tool=tool, parent="remediate_incident", reason=code, incident_id=inc.id)
+                self._add_timeline(
+                    inc, "remediation", "Containment aborted",
+                    description=f"{tool} on {value} was denied ({code}); completed before abort: {len(completed)} action(s).",
+                )
+                await self.db.commit()
+                return {
+                    "incident_id": inc.id,
+                    "completed": completed,
+                    "aborted_at": tool,
+                    "aborted_target": value,
+                    "reason": code,
+                    "hosts_isolated": hosts_isolated,
+                    "indicators_blocked": indicators_blocked,
+                    "enforcement": enforcement,
+                    "new_status": inc.status,
+                }
+            if not isinstance(res, dict) or res.get("error"):
+                completed.append({"tool": tool, "target": value, "result": res})
+                continue
+            completed.append({"tool": tool, "target": value, "mode": res.get("mode"), "result": res})
+            if tool == "isolate_host":
+                hosts_isolated.append(value)
+                enforcement["hosts"][value] = str(res.get("mode"))
+            else:
+                indicators_blocked.append(value)
+                enforcement["ips"][value] = str(res.get("mode"))
 
         acted = bool(hosts_isolated or indicators_blocked)
         old = inc.status
@@ -1763,9 +2053,13 @@ class AgentToolRegistry:
             inc.status = "containment"
 
         if acted:
+            enforced_hosts = [h for h, m in enforcement["hosts"].items() if m == "enforced_via_agent"]
+            enforced_ips = [i for i, m in enforcement["ips"].items() if m == "enforced_via_agents"]
             summary = (
-                f"Containment initiated: isolated {len(hosts_isolated)} host(s) {hosts_isolated}, "
-                f"blocked {len(indicators_blocked)} indicator IP(s) {indicators_blocked}. "
+                f"Containment initiated: {len(hosts_isolated)} host isolation(s) {hosts_isolated} "
+                f"({len(enforced_hosts)} enforced via endpoint agent, {len(hosts_isolated) - len(enforced_hosts)} recorded only - no enrolled agent), "
+                f"{len(indicators_blocked)} indicator IP block(s) {indicators_blocked} "
+                f"({len(enforced_ips)} enforced via endpoint agents, {len(indicators_blocked) - len(enforced_ips)} detection-only). "
                 f"Incident moved {old} -> {inc.status}."
             )
         else:
@@ -1777,11 +2071,58 @@ class AgentToolRegistry:
         await self.db.commit()
         return {
             "incident_id": inc.id,
+            "completed": completed,
             "hosts_isolated": hosts_isolated,
             "indicators_blocked": indicators_blocked,
+            "enforcement": enforcement,
             "new_status": inc.status,
             "summary": summary,
         }
+
+    @staticmethod
+    def _declared_playbook_inputs(pb: Playbook) -> Optional[dict[str, Any]]:
+        """``Playbook.variables`` parsed as the declared-input map, or ``None`` when undeclared."""
+        if not pb.variables:
+            return None
+        try:
+            declared = json.loads(pb.variables)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise ValueError("playbook variables are not valid JSON; fix the playbook before executing it") from exc
+        if not isinstance(declared, dict) or not declared:
+            return None
+        return declared
+
+    @staticmethod
+    def _validate_playbook_input(declared: dict[str, Any], data: dict[str, Any]) -> None:
+        """Reject keys the playbook does not declare and values of the wrong type.
+
+        A declaration is either a default value (its Python type is the
+        contract) or a ``{"type": <json type>, ...}`` descriptor.
+        """
+        unknown = sorted(k for k in data if k not in declared)
+        if unknown:
+            raise ValueError(f"input_data has keys the playbook does not declare: {unknown}")
+        for key, value in data.items():
+            decl = declared[key]
+            expected: Optional[tuple[type, ...]] = None
+            if isinstance(decl, dict) and isinstance(decl.get("type"), str):
+                expected = _JSON_TYPE_CHECKS.get(decl["type"].lower())
+            elif isinstance(decl, bool):
+                expected = (bool,)
+            elif isinstance(decl, int):
+                expected = (int,)
+            elif isinstance(decl, float):
+                expected = (int, float)
+            elif isinstance(decl, str):
+                expected = (str,)
+            elif isinstance(decl, list):
+                expected = (list,)
+            if expected is None or value is None:
+                continue
+            if isinstance(value, bool) and bool not in expected:
+                raise ValueError(f"input_data.{key}: expected {expected[0].__name__}, got boolean")
+            if not isinstance(value, expected):
+                raise ValueError(f"input_data.{key}: expected {expected[0].__name__}, got {type(value).__name__}")
 
     async def _execute_playbook(self, playbook_id: str, input_data: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         from src.playbooks.tasks import run_playbook_execution
@@ -1789,11 +2130,16 @@ class AgentToolRegistry:
         pb = await self._scoped_get("Playbook", playbook_id)
         if not pb:
             return {"error": "Playbook not found"}
-        data = dict(input_data or {})
+        supplied = dict(input_data or {})
         # Reserved keys are always taken from the context, never from the model.
+        for key in PLAYBOOK_RESERVED_KEYS:
+            supplied.pop(key, None)
+        declared = self._declared_playbook_inputs(pb)
+        if declared is not None:
+            self._validate_playbook_input(declared, supplied)
+        data = dict(supplied)
         data["organization_id"] = self.ctx.org_id
         data["actor_user_id"] = self.ctx.actor_user_id
-        data.pop("playbook_execution_id", None)
         execution = PlaybookExecution(
             playbook_id=pb.id,
             organization_id=self.ctx.org_id,
@@ -1808,51 +2154,159 @@ class AgentToolRegistry:
         # from its own connection, so it must be durable first.
         await self.db.commit()
         run_playbook_execution.delay(execution.id)
-        return {"execution_id": execution.id, "playbook": pb.name, "status": "queued"}
+        return {"execution_id": execution.id, "playbook": pb.name, "status": "queued", "input_keys": sorted(supplied)}
+
+    async def _dispatchable_agents(self) -> list[EndpointAgent]:
+        """Enrolled endpoint agents in this org that may receive a command."""
+        q = self._scoped(select(EndpointAgent), EndpointAgent).where(EndpointAgent.status.in_(_DISPATCHABLE_AGENT_STATES))
+        return list((await self.db.execute(q)).scalars().all())
 
     async def _block_ip(self, ip: str, reason: str) -> dict[str, Any]:
+        """Detection layer (active blocked IOC) + enforcement layer (host-firewall
+        ``block_ip`` command on every enrolled IR-capable endpoint agent, the
+        same dispatch the remediation engine's FirewallBlockExecutor uses).
+        ``mode`` states honestly which layers took effect."""
+        from src.agents.capabilities import capability_allows
+        from src.agents.service import AgentService, AgentServiceError
+
         ioc = ThreatIndicator(
             value=ip, indicator_type="ipv4", severity="high", is_active=True, is_whitelisted=False,
             source="agent_block", confidence=80, context={"reason": reason, "action": "block_ip"},
             organization_id=self.ctx.org_id,
         )
         self.db.add(ioc)
+        await self.db.flush()
+
+        commands: list[dict[str, Any]] = []
+        rejected: list[dict[str, Any]] = []
+        svc = AgentService(self.db)
+        for agent in await self._dispatchable_agents():
+            if not capability_allows(list(agent.capabilities or []), "block_ip"):
+                continue  # not IR-enrolled: ineligible, not a failure
+            try:
+                # approval_override: the policy/approval flow already authorized this destructive call.
+                cmd = await svc.issue_command(
+                    agent=agent, action="block_ip", payload={"ip": ip, "reason": reason},
+                    issued_by=self.ctx.actor_user_id, approval_override=True,
+                )
+                commands.append({"agent_id": agent.id, "hostname": agent.hostname, "command_id": cmd.id, "command_status": cmd.status})
+            except AgentServiceError as exc:
+                rejected.append({"agent_id": agent.id, "hostname": agent.hostname, "error": str(exc)})
+
+        if commands:
+            mode = "enforced_via_agents"
+            note = f"block_ip queued to {len(commands)} endpoint agent(s); per-host firewall rules tagged pysoar-block-{ip}"
+        else:
+            mode = "detection_only"
+            note = (
+                "Recorded as an active blocked indicator for detection/correlation only: no enrolled, "
+                "IR-capable endpoint agent is available to enforce a host-firewall block. Block it at the perimeter manually."
+            )
         self.db.add(TicketActivity(
             source_type="remediation", source_id=ip, activity_type="block_ip",
-            description=f"IP {ip} blocked by agent. Reason: {reason}",
+            description=f"IP {ip} block ({mode}) by agent. Reason: {reason}",
             actor_id=self._actor_id(), organization_id=self.ctx.org_id,
+            extra_metadata={"ioc_id": ioc.id, "mode": mode, "agent_commands": commands, "rejected_agents": rejected},
         ))
         await self.db.flush()
-        return {"ip": ip, "status": "blocked", "reason": reason}
+        return {
+            "ip": ip, "status": "blocked" if commands else "recorded", "mode": mode, "ioc_id": ioc.id,
+            "agent_commands": commands, "rejected_agents": rejected, "note": note, "reason": reason,
+        }
+
+    async def _agent_for_host(self, asset: Optional[Asset], hostname: str) -> Optional[EndpointAgent]:
+        """The enrolled endpoint agent for ``asset`` (or the raw hostname), if any."""
+        names = {n.lower() for n in (hostname, getattr(asset, "hostname", None), getattr(asset, "name", None), getattr(asset, "fqdn", None)) if n}
+        if not names:
+            return None
+        q = self._scoped(select(EndpointAgent), EndpointAgent).where(
+            EndpointAgent.status.in_(_DISPATCHABLE_AGENT_STATES), func.lower(EndpointAgent.hostname).in_(sorted(names)),
+        ).order_by(EndpointAgent.last_heartbeat_at.desc().nullslast())
+        return (await self.db.execute(q)).scalars().first()
 
     async def _isolate_host(self, hostname: str, reason: str) -> dict[str, Any]:
+        """Network isolation through the host's enrolled endpoint agent. With no
+        agent the request is recorded only (``mode=detection_only``) - nothing is
+        simulated."""
+        from src.agents.service import AgentService, AgentServiceError
+
         # The policy resolves ``hostname`` to an in-org Asset id; accept either.
         asset = await self._find_asset(str(hostname))
-        label = asset.hostname or asset.name if asset else str(hostname)
+        label = (asset.hostname or asset.name) if asset else str(hostname)
+        agent = await self._agent_for_host(asset, str(hostname))
+
+        command_id: Optional[str] = None
+        command_status: Optional[str] = None
+        error: Optional[str] = None
+        if agent is not None:
+            try:
+                # approval_override: the policy/approval flow already authorized this destructive call.
+                cmd = await AgentService(self.db).issue_command(
+                    agent=agent, action="isolate_host", payload={"hostname": label, "reason": reason},
+                    issued_by=self.ctx.actor_user_id, approval_override=True,
+                )
+                command_id, command_status = cmd.id, cmd.status
+            except AgentServiceError as exc:
+                error = str(exc)
+
+        if command_id:
+            mode, status = "enforced_via_agent", "isolation_queued"
+            note = f"isolate_host command {command_id} queued to endpoint agent {agent.id} ({agent.hostname})"  # type: ignore[union-attr]
+        elif agent is not None:
+            mode, status = "detection_only", "recorded"
+            note = f"Endpoint agent {agent.hostname} rejected isolate_host: {error}. Isolation request recorded only; isolate manually."
+        else:
+            mode, status = "detection_only", "recorded"
+            note = (
+                f"No enrolled endpoint agent for host {label}: isolation request recorded as a remediation activity only. "
+                "Enroll the PySOAR agent with the isolate_host capability or isolate the host manually."
+            )
         self.db.add(TicketActivity(
             source_type="remediation", source_id=asset.id if asset else label, activity_type="isolate_host",
-            description=f"Host {label} isolated by agent. Reason: {reason}",
+            description=f"Host {label} isolation ({mode}) by agent. Reason: {reason}",
             actor_id=self._actor_id(), organization_id=self.ctx.org_id,
+            extra_metadata={
+                "asset_id": asset.id if asset else None, "mode": mode, "agent_id": agent.id if agent else None,
+                "command_id": command_id, "command_status": command_status, "error": error,
+            },
         ))
         await self.db.flush()
-        return {"hostname": label, "asset_id": asset.id if asset else None, "status": "isolated", "reason": reason}
+        return {
+            "hostname": label, "asset_id": asset.id if asset else None, "status": status, "mode": mode,
+            "agent_id": agent.id if agent else None, "command_id": command_id, "command_status": command_status,
+            "note": note, "reason": reason,
+        }
 
     async def _disable_user(self, user_email: str, reason: str) -> dict[str, Any]:
         user = await self._resolve_user_ref(user_email)
         if not user:
             return {"error": "User not found in this organization"}
+        if bool(getattr(user, "is_superuser", False)):
+            return {"error": "Refusing to disable a superuser account"}
+        if self.ctx.actor_user_id and user.id == self.ctx.actor_user_id:
+            return {"error": "Refusing to disable the acting user's own account"}
+        if not user.is_active:
+            return {"user_email": user.email, "user_id": user.id, "status": "already_disabled", "reason": reason}
         user.is_active = False
         await self.db.flush()
         return {"user_email": user.email, "user_id": user.id, "status": "disabled", "reason": reason}
 
-    async def _create_remediation_ticket(self, title: str, priority: str = "medium", description: str = "") -> dict[str, Any]:
+    async def _create_remediation_ticket(
+        self, title: str, priority: str = "medium", description: str = "", incident_id: Optional[str] = None,
+    ) -> dict[str, Any]:
+        tags: list[str] = []
+        if incident_id:
+            inc = await self._incident(incident_id)
+            if inc is None:
+                return {"error": "Incident not found"}
+            tags.append(f"incident:{inc.id}")
         ticket = RemediationTicket(
             title=title, description=description, priority=priority, status="open", remediation_type="manual",
-            organization_id=self.ctx.org_id,
+            organization_id=self.ctx.org_id, tags=tags,
         )
         self.db.add(ticket)
         await self.db.flush()
-        return {"id": ticket.id, "title": title}
+        return {"id": ticket.id, "title": title, "incident_id": incident_id}
 
     async def _execute_integration_action(self, installation_id: str, action_name: str, input_data: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         from src.integrations.engine import ActionExecutor

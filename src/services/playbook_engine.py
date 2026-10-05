@@ -911,6 +911,14 @@ class PlaybookEngine:
             context.update(json.loads(execution.input_data))
         if playbook.variables:
             context.update(json.loads(playbook.variables))
+        # Tenant scope comes from the execution row (falling back to the
+        # playbook's own org), never from caller-supplied input_data or
+        # playbook variables: any organization_id they carry is overwritten.
+        scoped_org = execution.organization_id or playbook.organization_id
+        if scoped_org:
+            context["organization_id"] = scoped_org
+        else:
+            context.pop("organization_id", None)
 
         # Start execution
         execution.status = ExecutionStatus.RUNNING.value

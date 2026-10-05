@@ -231,7 +231,14 @@ class TicketAggregator:
 
     async def _fetch_case_tasks(self, org_id: Optional[str]) -> List[Dict]:
         from src.models.case import Task
-        query = select(Task).order_by(Task.created_at.desc()).limit(200)
+        from src.models.incident import Incident
+        query = select(Task)
+        if org_id:
+            # Task has no organization_id; scope through the owning incident.
+            query = query.where(
+                Task.incident_id.in_(select(Incident.id).where(Incident.organization_id == org_id))
+            )
+        query = query.order_by(Task.created_at.desc()).limit(200)
         result = await self.db.execute(query)
         return [self._normalize_case_task(r) for r in result.scalars().all()]
 
@@ -246,7 +253,12 @@ class TicketAggregator:
 
     async def _fetch_action_items(self, org_id: Optional[str]) -> List[Dict]:
         from src.collaboration.models import ActionItem
-        query = select(ActionItem).order_by(ActionItem.created_at.desc()).limit(200)
+        query = select(ActionItem)
+        if org_id:
+            # Was unscoped: every tenant's war-room action items landed in every
+            # tenant's unified ticket feed (and in the agent's list_tickets tool).
+            query = query.where(ActionItem.organization_id == org_id)
+        query = query.order_by(ActionItem.created_at.desc()).limit(200)
         result = await self.db.execute(query)
         return [self._normalize_action_item(r) for r in result.scalars().all()]
 
