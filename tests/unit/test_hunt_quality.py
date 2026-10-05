@@ -62,13 +62,10 @@ async def test_cooccurring_keywords_create_meaningful_finding(db_session):
     assert "evil.exe" in f.title or "evil.exe" in (f.description or "")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=TypeError,
-    reason="src/agentic/structured_hunt.py still builds AgentToolRegistry(db) without an AgentContext; fixed in a later work package",
-)
 @pytest.mark.asyncio
 async def test_structured_hunt_does_not_cry_wolf_on_low_sev(db_session):
+    # The hunt now runs through the guarded registry, so it needs the
+    # organization and the analyst it runs as (work package 6).
     from src.agentic.structured_hunt import run_structured_hunt
     from src.attack.loader import load_stix_bundle
     from tests.unit.test_attack_loader import _bundle
@@ -81,6 +78,7 @@ async def test_structured_hunt_does_not_cry_wolf_on_low_sev(db_session):
     r = await run_structured_hunt(
         db_session, hypothesis="faulting application exception T1110",
         organization_id="org-1", timeframe_hours=24,
+        actor_user_id="eeeeeeee-0000-4000-8000-00000000000a",
     )
     # informational-only findings must not be called suspicious_activity
     if r["verdict"] == "suspicious_activity":

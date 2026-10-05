@@ -222,14 +222,15 @@ def ai_triage_pending_alerts(self, alert_ids: list[str] | None = None, limit: in
     try:
         logger.info(f"Starting AI alert triage (limit={limit})")
 
-        analyzer = AIAnalyzer(provider="openai")
-
         # Fetch and triage real pending alerts
         async def _triage_alerts():
             from src.core.database import async_session_factory
             from src.models.alert import Alert
 
             async with async_session_factory() as session:
+                # The analyzer resolves one provider per alert organization, so
+                # a tenant's own AI credentials are the only ones ever used.
+                analyzer = AIAnalyzer(db=session)
                 if alert_ids:
                     query = select(Alert).where(Alert.id.in_(alert_ids)).limit(limit)
                 else:
@@ -242,6 +243,7 @@ def ai_triage_pending_alerts(self, alert_ids: list[str] | None = None, limit: in
                 alerts = list(result.scalars().all())
 
                 triaged = 0
+                unavailable = 0
                 total_confidence = 0.0
 
                 for alert_obj in alerts:
@@ -259,30 +261,50 @@ def ai_triage_pending_alerts(self, alert_ids: list[str] | None = None, limit: in
                                 "username": alert_obj.username or "",
                             },
                         }
-                        triage_result = analyzer.triage_alert(alert_dict)
-                        triaged += 1
-                        total_confidence += triage_result.get("confidence", 0.5)
+                        triage_result = await analyzer.triage_alert(
+                            alert_dict, org_id=alert_obj.organization_id
+                        )
+                        if triage_result.get("status") != "ok":
+                            # No provider, or the provider failed: the alert
+                            # keeps its existing priority. Nothing is guessed.
+                            unavailable += 1
+                            logger.warning(
+                                "ai_triage_unavailable",
+                                alert_id=alert_obj.id,
+                                organization_id=alert_obj.organization_id,
+                                error_code=triage_result.get("error_code"),
+                            )
+                            continue
 
-                        # Write back the triage priority to the alert record
                         priority_map = {"p1": 1, "p2": 2, "p3": 3, "p4": 4}
-                        triage_priority = triage_result.get("priority", "p3")
-                        alert_obj.priority = priority_map.get(triage_priority, 3)
-
+                        triage_priority = triage_result.get("priority")
+                        if triage_priority in priority_map:
+                            alert_obj.priority = priority_map[triage_priority]
+                        confidence = triage_result.get("confidence")
+                        if isinstance(confidence, (int, float)):
+                            total_confidence += float(confidence)
+                        triaged += 1
                         logger.debug(f"Triaged alert {alert_obj.id}: {triage_priority}")
                     except Exception as e:
                         logger.error(f"Failed to triage alert {alert_obj.id}: {e}")
 
                 await session.commit()
-                return triaged, total_confidence
+                return triaged, unavailable, total_confidence
 
-        triaged, total_confidence = _run_async(_triage_alerts())
-        avg_confidence = total_confidence / max(1, triaged)
+        triaged, unavailable, total_confidence = _run_async(_triage_alerts())
+        avg_confidence = total_confidence / triaged if triaged else None
 
-        logger.info(f"Alert triage complete: {triaged} alerts triaged, avg confidence {avg_confidence:.2f}")
+        logger.info(
+            "ai_alert_triage_complete",
+            alerts_triaged=triaged,
+            unavailable=unavailable,
+            average_confidence=avg_confidence,
+        )
 
         return {
             "status": "success",
             "alerts_triaged": triaged,
+            "alerts_unavailable": unavailable,
             "average_confidence": avg_confidence,
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
@@ -305,8 +327,6 @@ def generate_daily_threat_briefing():
     """
     try:
         logger.info("Generating daily threat briefing")
-
-        analyzer = AIAnalyzer(provider="claude")
 
         async def _build_briefing():
             from src.core.database import async_session_factory

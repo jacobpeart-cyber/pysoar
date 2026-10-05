@@ -3,6 +3,7 @@
 from celery.schedules import crontab
 
 from celery import Celery
+from kombu import Queue
 
 from src.core.config import settings
 
@@ -29,9 +30,9 @@ celery_app = Celery(
         # so the beat schedule entry fires into the void.
         "src.siem.tasks",
         # Agentic SOC autonomous investigations — `run_investigation`
-        # drives AutonomousInvestigator against a real Gemini + tool
-        # loop. Missing this entry silently drops every investigation
-        # kickoff on the floor.
+        # drives AutonomousInvestigator through the guarded AgentRunner
+        # (org-resolved LLM provider + read-only tool allow-list). Missing
+        # this entry silently drops every investigation kickoff on the floor.
         "src.agentic.tasks",
         # STIG fleet sweep + scan execution.
         "src.stig.tasks",
@@ -89,6 +90,40 @@ celery_app.conf.update(
     task_reject_on_worker_lost=True,
     result_expires=86400,  # Results expire after 1 day
 )
+
+# --- Queues -----------------------------------------------------------------
+# Autonomous investigations get their own queue (design v2 section 8): one LLM
+# run can hold a worker child for minutes, and a backlog of them must never
+# starve playbook execution, ingest or the notification fan-out.
+#
+# Both queues are declared here, so a worker started without `-Q` consumes
+# both and nothing is silently dropped. To isolate investigations in
+# production, run a dedicated worker:
+#
+#   celery -A src.workers.celery_app worker -Q investigations \
+#       --concurrency=2 --max-memory-per-child=400000
+#
+# (`--max-memory-per-child=400000` is the design's 400 MB recycle threshold
+# for that queue; the global 500 MB in `worker_max_memory_per_child` above
+# still applies to the default worker.)
+celery_app.conf.task_default_queue = "celery"
+celery_app.conf.task_queues = (
+    Queue("celery"),
+    Queue("investigations"),
+)
+celery_app.conf.task_routes = {
+    "src.agentic.tasks.run_investigation": {"queue": "investigations"},
+    "src.agentic.tasks.autonomous_triage": {"queue": "investigations"},
+}
+# Per-task limits: an investigation is capped at a 600 s wall clock inside the
+# runtime, so 900 s soft / 960 s hard leaves room for persistence and still
+# kills a wedged run well inside the global hour.
+celery_app.conf.task_annotations = {
+    "src.agentic.tasks.run_investigation": {
+        "soft_time_limit": 900,
+        "time_limit": 960,
+    },
+}
 
 # Beat schedule for periodic tasks
 celery_app.conf.beat_schedule = {

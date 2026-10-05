@@ -3,20 +3,27 @@
 Runs the defensive hunt phases in order against the real engine and the
 ATT&CK KB, and produces a structured report: scope, data collection,
 findings, ATT&CK mapping, verdict, and recommendations that are ALWAYS
-flagged for human approval (no auto-remediation). One place, called by
-both the API endpoint and the registered agent skill.
+flagged for human approval (no auto-remediation).
+
+Both hunt phases go through ``AgentToolRegistry.call``, so ``scope_hunt`` and
+``run_threat_hunt`` get the same policy evaluation, org scoping, rate charge
+and audit pair here as they do from chat (design v2 section 1: no code path
+executes a tool handler directly). That needs an actor: the caller passes the
+authenticated analyst's id and role, exactly as the chat surface does.
 """
 
 from __future__ import annotations
 
 import json
-import logging
 from typing import Any, Optional
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-logger = logging.getLogger(__name__)
+from src.agentic.context import AgentContext, Mode, UserRole
+from src.core.logging import get_logger
+
+logger = get_logger(__name__)
 
 _SEVERITY_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1, "informational": 0}
 
@@ -26,24 +33,57 @@ async def run_structured_hunt(
     hypothesis: str,
     organization_id: Optional[str] = None,
     timeframe_hours: int = 24,
+    *,
+    actor_user_id: Optional[str] = None,
+    role: UserRole = UserRole.ANALYST,
+    actor_ip: Optional[str] = None,
+    redis: Any = None,
 ) -> dict[str, Any]:
-    """Execute PY-HUNT-001 and return a structured hunt report."""
-    from src.services.agent_tools import AgentToolRegistry
+    """Execute PY-HUNT-001 and return a structured hunt report.
+
+    ``organization_id`` and ``actor_user_id`` are required: the hunt writes a
+    hunt session and findings for one organization on behalf of one analyst,
+    and the policy engine will not evaluate a call without that identity.
+    """
+    from src.agentic.runtime_factory import build_policy
     from src.hunting.models import HuntFinding
 
-    registry = AgentToolRegistry(db)
+    if not organization_id:
+        raise ValueError("run_structured_hunt requires organization_id")
+    if not actor_user_id:
+        raise ValueError(
+            "run_structured_hunt requires actor_user_id: the hunt runs as the authenticated "
+            "analyst so its tool calls can be policy-checked and audited"
+        )
+
+    ctx = AgentContext(
+        org_id=organization_id,
+        role=role,
+        mode=Mode.INTERACTIVE,
+        actor_user_id=actor_user_id,
+        actor_ip=actor_ip,
+    )
+    registry, policy, _audit = build_policy(db, ctx, redis=redis)
 
     # --- Phase 1: Scope (ATT&CK-validated) ---
-    scope = await registry._scope_hunt(hypothesis)
+    scope = await registry.call(ctx, "scope_hunt", {"hypothesis": hypothesis}, policy=policy)
 
     # --- Phases 2-3: Data collection + correlation (real multi-source scan) ---
-    hunt = await registry._run_threat_hunt(hypothesis, timeframe_hours=timeframe_hours)
+    hunt = await registry.call(
+        ctx,
+        "run_threat_hunt",
+        {"hypothesis": hypothesis, "timeframe_hours": int(timeframe_hours)},
+        policy=policy,
+    )
     session_id = hunt.get("session_id")
 
     findings = []
     if session_id:
         rows = (await db.execute(
-            select(HuntFinding).where(HuntFinding.session_id == session_id)
+            select(HuntFinding).where(
+                HuntFinding.session_id == session_id,
+                HuntFinding.organization_id == organization_id,
+            )
         )).scalars().all()
         for f in rows:
             try:

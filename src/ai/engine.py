@@ -7,7 +7,6 @@ natural language query processing for security operations.
 
 import json
 import logging
-import os
 import time
 from datetime import datetime, timedelta
 from typing import Any
@@ -16,9 +15,105 @@ import numpy as np
 from scipy import stats
 
 from src.core.config import settings
+from src.core.llm_parsing import extract_json
 from src.core.logging import get_logger
+from src.llm import factory as llm_factory
+from src.llm.base import LLMError, LLMInvalidResponse, Message, TextBlock
 
 logger = get_logger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Response schemas for the tool-less analysis calls (design v2 section 6:
+# response_schema is only used when no tools are attached).
+# ---------------------------------------------------------------------------
+
+_STRING_ARRAY: dict[str, Any] = {"type": "array", "items": {"type": "string"}}
+
+TRIAGE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "priority": {"type": "string", "enum": ["p1", "p2", "p3", "p4"]},
+        "reasoning": {"type": "string"},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "false_positive_probability": {"type": "number", "minimum": 0, "maximum": 1},
+        "recommended_actions": _STRING_ARRAY,
+    },
+    "required": ["priority", "reasoning", "confidence"],
+    "additionalProperties": False,
+}
+
+INCIDENT_SUMMARY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "executive_summary": {"type": "string"},
+        "technical_details": {"type": "string"},
+        "impact_assessment": {
+            "type": "object",
+            "properties": {
+                "affected_systems": _STRING_ARRAY,
+                "data_exposed": {"type": "string"},
+                "users_affected": {"type": "integer", "minimum": 0},
+                "severity": {"type": "string"},
+            },
+            "required": [],
+            "additionalProperties": True,
+        },
+        "recommendations": _STRING_ARRAY,
+    },
+    "required": ["executive_summary", "technical_details"],
+    "additionalProperties": False,
+}
+
+THREAT_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "threat_level": {"type": "string", "enum": ["critical", "high", "medium", "low", "unknown"]},
+        "analysis": {"type": "string"},
+        "historical_context": {"type": "string"},
+        "predicted_impact": {"type": "string"},
+    },
+    "required": ["threat_level", "analysis"],
+    "additionalProperties": False,
+}
+
+RESPONSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "immediate_actions": _STRING_ARRAY,
+        "containment_steps": _STRING_ARRAY,
+        "investigation_steps": _STRING_ARRAY,
+        "recovery_plan": _STRING_ARRAY,
+        "timeline_estimate_hours": {"type": "number", "minimum": 0},
+    },
+    "required": ["immediate_actions"],
+    "additionalProperties": False,
+}
+
+PLAYBOOK_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "playbook_name": {"type": "string"},
+        "steps": {"type": "array", "items": {"type": "object", "additionalProperties": True}},
+        "conditions": _STRING_ARRAY,
+        "automations": _STRING_ARRAY,
+    },
+    "required": ["playbook_name", "steps"],
+    "additionalProperties": False,
+}
+
+ROOT_CAUSE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "root_cause": {"type": "string"},
+        "attack_chain": _STRING_ARRAY,
+        "entry_point": {"type": "string"},
+        "dwell_time_days": {"type": "number", "minimum": 0},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+    },
+    "required": ["root_cause"],
+    "additionalProperties": False,
+}
 
 
 class AnomalyDetector:
@@ -548,558 +643,347 @@ class AnomalyDetector:
 
 
 class AIAnalyzer:
+    """LLM-powered security analysis: triage, summaries, threat assessment,
+    response recommendations, playbook drafts and root-cause analysis.
+
+    Every call goes through ``src/llm``: the organization's ``ai`` settings
+    decide the provider and supply the credential (design v2 section 6), the
+    call is tool-less and single-shot, and the structured answer is validated
+    against a response schema.
+
+    There are no fabricated defaults. When no provider is configured, or the
+    provider fails, these methods return
+    ``{"status": "unavailable", "error_code": ..., "request_id": ...}`` and the
+    caller decides what to show. A missing field in an otherwise valid answer
+    stays ``None``; it is never replaced with an invented priority, confidence
+    or threat level.
     """
-    LLM-Powered Security Analysis Engine.
 
-    Performs alert triage, incident analysis, threat assessment, and
-    automated response recommendations using large language models.
-    """
-
-    # Gemini API configuration
-    GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-    GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent"
-
-    def __init__(self, provider: str = "gemini"):
-        """
-        Initialize AI analyzer with Gemini LLM.
-        """
+    def __init__(self, db: Any = None):
         self.logger = get_logger(__name__)
-        self.provider = provider
-        self.model_map = {
-            "gemini": "gemini-2.5-flash",
-            "openai": "gpt-4",
-            "claude": "claude-3-opus",
-        }
+        self.db = db
 
-    def triage_alert(self, alert_data: dict) -> dict:
+    # ------------------------------------------------------------------
+    # Provider plumbing
+    # ------------------------------------------------------------------
+
+    async def _resolve(self, org_id: str | None) -> Any:
+        """The provider for ``org_id``; raises ``LLMNotConfigured`` otherwise.
+
+        An organization is always required: ``resolve_llm_config`` already
+        honours the platform default for an org with no ``ai`` section of its
+        own (``use_platform_default`` on the global section), so there is no
+        unscoped path here.
         """
-        Triage an alert and determine priority and recommended actions.
-
-        Args:
-            alert_data: Alert details
-
-        Returns:
-            Dictionary with priority, reasoning, confidence, false_positive_probability
-        """
-        system_prompt = """You are a security operations expert. Analyze the provided security alert
-        and determine its priority level and recommended immediate actions. Consider false positive
-        likelihood based on common security alert patterns."""
-
-        user_prompt = f"""Alert Details:
-        - Title: {alert_data.get('title', 'N/A')}
-        - Description: {alert_data.get('description', 'N/A')}
-        - Source: {alert_data.get('source', 'N/A')}
-        - Timestamp: {alert_data.get('timestamp', 'N/A')}
-        - Indicators: {json.dumps(alert_data.get('indicators', {}))}
-
-        Provide a JSON response with: priority (p1/p2/p3/p4), reasoning (brief), confidence (0-1),
-        false_positive_probability (0-1), and recommended_actions (list)."""
-
-        response = self._call_llm(system_prompt, user_prompt, structured_output=True)
-
-        return {
-            "priority": response.get("priority", "p3"),
-            "reasoning": response.get("reasoning", "Analysis incomplete"),
-            "confidence": response.get("confidence", 0.5),
-            "false_positive_probability": response.get("false_positive_probability", 0.3),
-            "recommended_actions": response.get("recommended_actions", []),
-            "model_used": self.model_map[self.provider],
-        }
-
-    def summarize_incident(
-        self, incident_data: dict, related_alerts: list[dict], timeline: list[dict]
-    ) -> dict:
-        """
-        Generate comprehensive incident summary and analysis.
-
-        Args:
-            incident_data: Incident details
-            related_alerts: List of related security alerts
-            timeline: Chronological timeline of events
-
-        Returns:
-            Dictionary with executive summary, technical details, and recommendations
-        """
-        system_prompt = """You are a senior security analyst. Provide a comprehensive incident analysis
-        including executive summary, technical deep dive, impact assessment, and response recommendations."""
-
-        context = self._build_security_context(
-            {
-                "incident": incident_data,
-                "alerts": related_alerts,
-                "timeline": timeline,
-            }
+        if self.db is None:
+            raise llm_factory.not_configured(
+                "AIAnalyzer was constructed without a database session, so the organization's "
+                "AI settings cannot be read",
+                source="org",
+                reason="ai_not_configured",
+            )
+        if not org_id:
+            raise llm_factory.not_configured(
+                "AI analysis requires an organization: provider credentials are per tenant",
+                source="org",
+                reason="organization_required",
+            )
+        config, api_key = await llm_factory.resolve_llm_config(self.db, org_id)
+        return llm_factory.build_provider(
+            config.provider,
+            model=config.model,
+            api_key=api_key,
+            credential_source=config.credential_source,
         )
 
-        user_prompt = f"""Incident Analysis Request:
-        {context}
+    async def _complete(
+        self,
+        system: str,
+        user: str,
+        response_schema: dict[str, Any] | None = None,
+        org_id: str | None = None,
+    ) -> dict[str, Any]:
+        """One tool-less completion.
 
-        Provide JSON response with: executive_summary (1-2 sentences), technical_details (paragraph),
-        impact_assessment (dict with affected_systems, data_exposed, etc.), recommendations (list)."""
-
-        response = self._call_llm(system_prompt, user_prompt, structured_output=True)
-
-        return {
-            "executive_summary": response.get("executive_summary", ""),
-            "technical_details": response.get("technical_details", ""),
-            "impact_assessment": response.get("impact_assessment", {}),
-            "recommendations": response.get("recommendations", []),
-            "analysis_complete": True,
-        }
-
-    def assess_threat(self, indicator_data: dict, context: dict) -> dict:
+        Returns ``{"status": "ok", "data": <parsed json | text>, ...}`` or
+        ``{"status": "unavailable", "error_code": ..., "request_id": ...}``.
         """
-        Assess threat level of provided indicators.
-
-        Args:
-            indicator_data: IOC or threat indicator details
-            context: Additional context (campaigns, history, etc.)
-
-        Returns:
-            Dictionary with threat level, analysis, and predicted impact
-        """
-        system_prompt = """You are a threat intelligence analyst. Assess the provided indicators
-        and determine threat level based on intelligence, historical context, and potential impact."""
-
-        user_prompt = f"""Threat Assessment:
-        Indicators: {json.dumps(indicator_data)}
-        Context: {json.dumps(context)}
-
-        Provide JSON with: threat_level (critical/high/medium/low), analysis (explanation),
-        historical_context (any known usage), predicted_impact (what this threat could do)."""
-
-        response = self._call_llm(system_prompt, user_prompt, structured_output=True)
-
-        return {
-            "threat_level": response.get("threat_level", "medium"),
-            "analysis": response.get("analysis", ""),
-            "historical_context": response.get("historical_context", ""),
-            "predicted_impact": response.get("predicted_impact", ""),
-        }
-
-    def recommend_response(self, incident_type: str, severity: str, context: dict) -> dict:
-        """
-        Generate incident response recommendations.
-
-        Args:
-            incident_type: Type of incident
-            severity: Severity level
-            context: Incident context
-
-        Returns:
-            Dictionary with immediate actions, containment, investigation, and recovery steps
-        """
-        system_prompt = """You are an incident response specialist. Provide detailed, actionable
-        response recommendations for the incident. Prioritize actions by criticality."""
-
-        user_prompt = f"""Incident Response Request:
-        - Type: {incident_type}
-        - Severity: {severity}
-        - Context: {json.dumps(context)}
-
-        Provide JSON with: immediate_actions (list), containment_steps (list),
-        investigation_steps (list), recovery_plan (list), timeline_estimate_hours (number)."""
-
-        response = self._call_llm(system_prompt, user_prompt, structured_output=True)
-
-        return {
-            "immediate_actions": response.get("immediate_actions", []),
-            "containment_steps": response.get("containment_steps", []),
-            "investigation_steps": response.get("investigation_steps", []),
-            "recovery_plan": response.get("recovery_plan", []),
-            "timeline_estimate_hours": response.get("timeline_estimate_hours", 4),
-        }
-
-    def generate_playbook(self, incident_pattern: str, historical_responses: list[dict]) -> dict:
-        """
-        Generate incident response playbook from pattern and history.
-
-        Args:
-            incident_pattern: Description of incident pattern
-            historical_responses: Previous responses to similar incidents
-
-        Returns:
-            Dictionary with playbook name, steps, conditions, and automations
-        """
-        system_prompt = """You are an incident response automation expert. Generate a detailed,
-        executable playbook based on the incident pattern and historical responses."""
-
-        user_prompt = f"""Playbook Generation:
-        Pattern: {incident_pattern}
-        Historical Examples: {json.dumps(historical_responses[:3])}
-
-        Provide JSON with: playbook_name (descriptive), steps (ordered list with conditions),
-        automations (list of executable actions), success_criteria (how to know it worked)."""
-
-        response = self._call_llm(system_prompt, user_prompt, structured_output=True)
-
-        return {
-            "playbook_name": response.get("playbook_name", f"Response to {incident_pattern}"),
-            "steps": response.get("steps", []),
-            "conditions": response.get("conditions", []),
-            "automations": response.get("automations", []),
-        }
-
-    def analyze_root_cause(self, incident_data: dict, log_evidence: list[str], timeline: list[dict]) -> dict:
-        """
-        Analyze root cause of incident using available evidence.
-
-        Args:
-            incident_data: Incident details
-            log_evidence: Relevant log entries
-            timeline: Timeline of events
-
-        Returns:
-            Dictionary with root cause, attack chain, entry point, and dwell time
-        """
-        system_prompt = """You are a forensic security analyst. Analyze the incident evidence
-        to determine root cause, attack chain, and attacker entry point."""
-
-        context = self._build_security_context(
-            {
-                "incident": incident_data,
-                "evidence": log_evidence[:10],  # Limit for token usage
-                "timeline": timeline,
+        try:
+            provider = await self._resolve(org_id)
+        except LLMError as exc:
+            self.logger.info(
+                "ai_analysis_unavailable",
+                organization_id=org_id,
+                code=exc.code,
+                reason=getattr(exc, "reason", None),
+            )
+            return {
+                "status": "unavailable",
+                "error_code": exc.code,
+                "request_id": None,
+                "detail": str(exc)[:300],
             }
+
+        try:
+            async with provider:
+                turn = await provider.complete(
+                    system=system,
+                    messages=[Message(role="user", content=[TextBlock(text=user)])],
+                    tools=None,
+                    max_tokens=2048,
+                    response_schema=response_schema,
+                )
+        except LLMError as exc:
+            self.logger.warning(
+                "ai_analysis_provider_failed",
+                organization_id=org_id,
+                code=exc.code,
+                error_class=exc.__class__.__name__,
+                request_id=exc.request_id,
+            )
+            return {
+                "status": "unavailable",
+                "error_code": exc.code,
+                "request_id": exc.request_id,
+                "detail": str(exc)[:300],
+            }
+
+        if turn.stop_reason not in ("end_turn", "max_tokens"):
+            self.logger.warning(
+                "ai_analysis_stopped",
+                organization_id=org_id,
+                stop_reason=turn.stop_reason,
+                request_id=turn.request_id,
+            )
+            return {
+                "status": "unavailable",
+                "error_code": f"llm_{turn.stop_reason}",
+                "request_id": turn.request_id,
+                "detail": f"the model stopped with {turn.stop_reason}",
+            }
+
+        text = (turn.text or "").strip()
+        if not text:
+            return {
+                "status": "unavailable",
+                "error_code": LLMInvalidResponse.code,
+                "request_id": turn.request_id,
+                "detail": "the model returned no text",
+            }
+        if response_schema is None:
+            return {"status": "ok", "data": text, "model": turn.model, "request_id": turn.request_id}
+
+        parsed = extract_json(text)
+        if not parsed.ok or not isinstance(parsed.data, dict):
+            self.logger.warning(
+                "ai_analysis_unparsable",
+                organization_id=org_id,
+                request_id=turn.request_id,
+                error=str(parsed.error)[:200],
+            )
+            return {
+                "status": "unavailable",
+                "error_code": LLMInvalidResponse.code,
+                "request_id": turn.request_id,
+                "detail": "the model response was not valid JSON",
+            }
+        return {"status": "ok", "data": parsed.data, "model": turn.model, "request_id": turn.request_id}
+
+    # ------------------------------------------------------------------
+    # Analyses
+    # ------------------------------------------------------------------
+
+    async def triage_alert(self, alert_data: dict, org_id: str | None = None) -> dict:
+        """Priority, false-positive likelihood and next actions for one alert."""
+        system = (
+            "You are a security operations expert. Analyze the security alert and determine its "
+            "priority and recommended immediate actions, considering how often this pattern is a "
+            "false positive. Do not invent details that are not in the alert; if the evidence is "
+            "thin, say so and lower your confidence. Reply with JSON only."
         )
-
-        user_prompt = f"""Root Cause Analysis:
-        {context}
-
-        Provide JSON with: root_cause (explanation), attack_chain (step-by-step),
-        entry_point (how attacker got in), dwell_time_days (estimate), confidence (0-1)."""
-
-        response = self._call_llm(system_prompt, user_prompt, structured_output=True)
-
+        user = (
+            "Alert details:\n"
+            f"- Title: {alert_data.get('title')}\n"
+            f"- Description: {alert_data.get('description')}\n"
+            f"- Source: {alert_data.get('source')}\n"
+            f"- Severity: {alert_data.get('severity')}\n"
+            f"- Timestamp: {alert_data.get('timestamp')}\n"
+            f"- Indicators: {json.dumps(alert_data.get('indicators', {}), default=str)}\n"
+        )
+        out = await self._complete(system, user, response_schema=TRIAGE_SCHEMA, org_id=org_id)
+        if out.get("status") != "ok":
+            return out
+        data = out["data"]
         return {
-            "root_cause": response.get("root_cause", ""),
-            "attack_chain": response.get("attack_chain", []),
-            "entry_point": response.get("entry_point", ""),
-            "dwell_time_days": response.get("dwell_time_days", 0),
-            "confidence": response.get("confidence", 0.5),
+            "status": "ok",
+            "priority": data.get("priority"),
+            "reasoning": data.get("reasoning"),
+            "confidence": data.get("confidence"),
+            "false_positive_probability": data.get("false_positive_probability"),
+            "recommended_actions": data.get("recommended_actions") or [],
+            "model_used": out.get("model"),
         }
 
-    def _call_llm(self, system_prompt: str, user_prompt: str, structured_output: bool = False) -> str | dict:
-        """
-        Call Gemini 2.0 Flash API.
-
-        Args:
-            system_prompt: System-level instructions
-            user_prompt: User query
-            structured_output: Whether to expect JSON response
-
-        Returns:
-            LLM response (string or parsed JSON)
-        """
-        import httpx
-
-        self.logger.info(f"Calling Gemini API (structured={structured_output})")
-
-        full_prompt = f"{system_prompt}\n\n{user_prompt}"
-        if structured_output:
-            full_prompt += "\n\nRespond ONLY with valid JSON. No markdown, no code fences."
-
-        try:
-            response = httpx.post(
-                self.GEMINI_URL,
-                headers={"x-goog-api-key": self.GEMINI_API_KEY, "Content-Type": "application/json"},
-                json={
-                    "contents": [{"parts": [{"text": full_prompt}]}],
-                    "generationConfig": {
-                        "temperature": 0.3,
-                        "maxOutputTokens": 2048,
-                    },
-                },
-                timeout=30.0,
-            )
-            response.raise_for_status()
-            data = response.json()
-
-            # Extract text from Gemini response
-            text = data["candidates"][0]["content"]["parts"][0]["text"]
-            self.logger.info(f"Gemini response received ({len(text)} chars)")
-
-            if structured_output:
-                # Clean markdown fences if present
-                clean = text.strip()
-                if clean.startswith("```"):
-                    clean = clean.split("\n", 1)[1] if "\n" in clean else clean[3:]
-                    clean = clean.rsplit("```", 1)[0]
-                try:
-                    return json.loads(clean.strip())
-                except json.JSONDecodeError:
-                    self.logger.warning(f"Failed to parse Gemini JSON, returning raw text")
-                    return {
-                        "analysis": clean.strip(),
-                        "priority": "p3",
-                        "reasoning": clean.strip()[:200],
-                        "confidence": 0.7,
-                        "false_positive_probability": 0.3,
-                        "recommended_actions": ["Review manually"],
-                        "executive_summary": clean.strip()[:300],
-                        "technical_details": clean.strip(),
-                        "recommendations": ["Review the analysis above"],
-                        "threat_level": "medium",
-                    }
-            else:
-                return text.strip()
-
-        except Exception as e:
-            self.logger.error(f"Gemini API call failed: {e}")
-            # Graceful fallback — never crash the endpoint
-            if structured_output:
-                return {
-                    "priority": "p3",
-                    "reasoning": f"AI analysis unavailable: {str(e)[:100]}",
-                    "confidence": 0.0,
-                    "false_positive_probability": 0.5,
-                    "recommended_actions": ["Manual review required"],
-                    "executive_summary": "AI analysis could not be completed",
-                    "technical_details": f"Error: {str(e)[:200]}",
-                    "recommendations": ["Retry analysis", "Review manually"],
-                    "threat_level": "unknown",
-                    "analysis": "AI unavailable",
-                }
-            else:
-                return f"AI analysis unavailable: {str(e)[:100]}"
-
-    def call_llm_with_tools(
+    async def summarize_incident(
         self,
-        system_prompt: str,
-        user_prompt: str,
-        tools: list[dict],
+        incident_data: dict,
+        related_alerts: list[dict],
+        timeline: list[dict],
+        org_id: str | None = None,
     ) -> dict:
-        """
-        Call Gemini with function/tool declarations. Returns structured result
-        indicating whether the model wants to call a tool or has a final text answer.
+        """Executive summary, technical detail and impact for one incident."""
+        system = (
+            "You are a senior security analyst. Provide an incident analysis: executive summary, "
+            "technical deep dive, impact assessment and response recommendations. Use only the "
+            "supplied data; never invent affected systems, users or evidence. Reply with JSON only."
+        )
+        context = self._build_security_context(
+            {"incident": incident_data, "alerts": related_alerts, "timeline": timeline}
+        )
+        user = (
+            f"{context}\n\n"
+            f"Incident: {json.dumps(incident_data, default=str)[:4000]}\n"
+            f"Related alerts: {json.dumps(related_alerts, default=str)[:6000]}\n"
+            f"Timeline: {json.dumps(timeline, default=str)[:4000]}\n"
+        )
+        out = await self._complete(system, user, response_schema=INCIDENT_SUMMARY_SCHEMA, org_id=org_id)
+        if out.get("status") != "ok":
+            return out
+        data = out["data"]
+        return {
+            "status": "ok",
+            "executive_summary": data.get("executive_summary"),
+            "technical_details": data.get("technical_details"),
+            "impact_assessment": data.get("impact_assessment") or {},
+            "recommendations": data.get("recommendations") or [],
+            "model_used": out.get("model"),
+        }
 
-        Args:
-            system_prompt: System instructions for the model
-            user_prompt: User's question
-            tools: List of tool definitions in Gemini function calling format:
-                [{"name": "...", "description": "...", "parameters": {...}}, ...]
+    async def assess_threat(self, indicator_data: dict, context: dict, org_id: str | None = None) -> dict:
+        """Threat level and analysis for a set of indicators."""
+        system = (
+            "You are a threat intelligence analyst. Assess the indicators and determine a threat "
+            "level from the supplied intelligence and context. If you do not recognise an "
+            "indicator, say so rather than guessing. Reply with JSON only."
+        )
+        user = (
+            f"Indicators: {json.dumps(indicator_data, default=str)[:4000]}\n"
+            f"Context: {json.dumps(context, default=str)[:4000]}\n"
+        )
+        out = await self._complete(system, user, response_schema=THREAT_SCHEMA, org_id=org_id)
+        if out.get("status") != "ok":
+            return out
+        data = out["data"]
+        return {
+            "status": "ok",
+            "threat_level": data.get("threat_level"),
+            "analysis": data.get("analysis"),
+            "historical_context": data.get("historical_context"),
+            "predicted_impact": data.get("predicted_impact"),
+            "model_used": out.get("model"),
+        }
 
-        Returns:
-            dict with one of these shapes:
-              - {"type": "tool_call", "name": "...", "args": {...}}
-              - {"type": "text", "text": "..."}
-              - {"type": "error", "error": "..."}
-        """
-        import httpx
-
-        self.logger.info(f"Calling Gemini with {len(tools)} tools")
-
-        try:
-            response = httpx.post(
-                self.GEMINI_URL,
-                headers={"x-goog-api-key": self.GEMINI_API_KEY, "Content-Type": "application/json"},
-                json={
-                    "contents": [
-                        {"role": "user", "parts": [{"text": f"{system_prompt}\n\n{user_prompt}"}]}
-                    ],
-                    "tools": [{"function_declarations": tools}],
-                    "tool_config": {"function_calling_config": {"mode": "AUTO"}},
-                    "generationConfig": {
-                        "temperature": 0.2,
-                        "maxOutputTokens": 1024,
-                    },
-                },
-                timeout=30.0,
-            )
-            response.raise_for_status()
-            data = response.json()
-
-            candidate = data.get("candidates", [{}])[0]
-            parts = candidate.get("content", {}).get("parts", [])
-
-            for part in parts:
-                if "functionCall" in part:
-                    fc = part["functionCall"]
-                    return {
-                        "type": "tool_call",
-                        "name": fc.get("name", ""),
-                        "args": fc.get("args", {}),
-                    }
-                if "text" in part and part["text"]:
-                    return {"type": "text", "text": part["text"]}
-
-            return {"type": "text", "text": ""}
-
-        except Exception as e:
-            self.logger.error(f"Gemini tool call failed: {e}")
-            # Deterministic fallback: pick a tool via keyword heuristic so the
-            # agent still does something useful when the LLM is unavailable.
-            fallback_tool = self._heuristic_tool_pick(user_prompt, tools)
-            if fallback_tool:
-                return {
-                    "type": "tool_call",
-                    "name": fallback_tool["name"],
-                    "args": fallback_tool["args"],
-                    "fallback": True,
-                }
-            return {"type": "error", "error": str(e)[:200]}
-
-    def _heuristic_tool_pick(self, user_prompt: str, tools: list[dict]) -> dict | None:
-        """Keyword-based tool picker for LLM-unavailable fallback."""
-        if not tools:
-            return None
-        text = (user_prompt or "").lower()
-        tool_names = {t.get("name", ""): t for t in tools}
-
-        # Priority-ordered keyword rules → tool name + arg extractor
-        import re
-        ip_match = re.search(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b", text)
-        rules: list[tuple[list[str], str, dict]] = [
-            (["block", "blacklist"], "block_ip", {"ip": ip_match.group(1) if ip_match else ""}),
-            (["isolate", "quarantine host"], "isolate_host", {}),
-            (["disable user", "lock account"], "disable_user", {}),
-            (["list alert", "show alert", "recent alert"], "list_alerts", {"limit": 10}),
-            (["list incident", "show incident"], "list_incidents", {"limit": 10}),
-            (["list ioc", "show ioc", "indicator"], "list_iocs", {"limit": 10}),
-            (["stat", "status", "overview", "summary", "dashboard", "how many"], "platform_stats", {}),
-            (["search", "find"], "search_alerts", {"query": user_prompt[:200]}),
-            (["hunt"], "run_threat_hunt", {}),
-            (["triage"], "triage_alert", {}),
-        ]
-        for keywords, name, args in rules:
-            if name in tool_names and any(k in text for k in keywords):
-                return {"name": name, "args": args}
-
-        if "platform_stats" in tool_names:
-            return {"name": "platform_stats", "args": {}}
-        return None
-
-    def call_llm_with_tools_chain(
-        self,
-        system_prompt: str,
-        user_prompt: str,
-        tools: list[dict],
-        history: list[dict],
+    async def recommend_response(
+        self, incident_type: str, severity: str, context: dict, org_id: str | None = None
     ) -> dict:
-        """
-        Continue a tool-calling conversation. `history` is a list of
-        {"tool": name, "args": {...}, "result": {...}} entries representing
-        tool calls already made this turn. Gemini gets the full transcript
-        and the tool declarations, so it can decide to either call another
-        tool or produce the final text answer.
+        """Containment, investigation and recovery steps for one incident."""
+        system = (
+            "You are an incident response specialist. Provide actionable response recommendations "
+            "for this incident, prioritised by criticality. Recommend only steps that follow from "
+            "the supplied context. Reply with JSON only."
+        )
+        user = (
+            f"- Type: {incident_type}\n- Severity: {severity}\n"
+            f"- Context: {json.dumps(context, default=str)[:6000]}\n"
+        )
+        out = await self._complete(system, user, response_schema=RESPONSE_SCHEMA, org_id=org_id)
+        if out.get("status") != "ok":
+            return out
+        data = out["data"]
+        return {
+            "status": "ok",
+            "immediate_actions": data.get("immediate_actions") or [],
+            "containment_steps": data.get("containment_steps") or [],
+            "investigation_steps": data.get("investigation_steps") or [],
+            "recovery_plan": data.get("recovery_plan") or [],
+            "timeline_estimate_hours": data.get("timeline_estimate_hours"),
+            "model_used": out.get("model"),
+        }
 
-        Returns the same shape as call_llm_with_tools (tool_call | text | error).
-        """
-        import httpx
+    async def generate_playbook(
+        self, incident_pattern: str, historical_responses: list[dict], org_id: str | None = None
+    ) -> dict:
+        """Draft a response playbook from a pattern and prior responses."""
+        system = (
+            "You are an incident response automation expert. Draft a playbook for the incident "
+            "pattern, grounded in the historical responses supplied. Reply with JSON only."
+        )
+        user = (
+            f"Pattern: {incident_pattern}\n"
+            f"Historical examples: {json.dumps(historical_responses[:3], default=str)[:6000]}\n"
+        )
+        out = await self._complete(system, user, response_schema=PLAYBOOK_SCHEMA, org_id=org_id)
+        if out.get("status") != "ok":
+            return out
+        data = out["data"]
+        return {
+            "status": "ok",
+            "playbook_name": data.get("playbook_name"),
+            "steps": data.get("steps") or [],
+            "conditions": data.get("conditions") or [],
+            "automations": data.get("automations") or [],
+            "model_used": out.get("model"),
+        }
 
-        try:
-            contents = [
-                {"role": "user", "parts": [{"text": f"{system_prompt}\n\n{user_prompt}"}]},
-            ]
-            for h in history:
-                contents.append({
-                    "role": "model",
-                    "parts": [{"functionCall": {"name": h["tool"], "args": h.get("args", {})}}],
-                })
-                contents.append({
-                    "role": "function",
-                    "parts": [{"functionResponse": {"name": h["tool"], "response": h.get("result", {})}}],
-                })
-
-            response = httpx.post(
-                self.GEMINI_URL,
-                headers={"x-goog-api-key": self.GEMINI_API_KEY, "Content-Type": "application/json"},
-                json={
-                    "contents": contents,
-                    "tools": [{"function_declarations": tools}],
-                    "tool_config": {"function_calling_config": {"mode": "AUTO"}},
-                    "generationConfig": {"temperature": 0.2, "maxOutputTokens": 1024},
-                },
-                timeout=30.0,
-            )
-            response.raise_for_status()
-            data = response.json()
-            parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-            for part in parts:
-                if "functionCall" in part:
-                    fc = part["functionCall"]
-                    return {"type": "tool_call", "name": fc.get("name", ""), "args": fc.get("args", {})}
-                if "text" in part and part["text"]:
-                    return {"type": "text", "text": part["text"]}
-            return {"type": "text", "text": ""}
-        except Exception as e:
-            self.logger.error(f"Gemini chain call failed: {e}")
-            return {"type": "error", "error": str(e)[:200]}
-
-    def call_llm_followup(
+    async def analyze_root_cause(
         self,
-        system_prompt: str,
-        user_prompt: str,
-        tool_name: str,
-        tool_args: dict,
-        tool_result: dict,
-    ) -> str:
-        """
-        After executing a tool, feed the result back to Gemini to get a final
-        natural-language answer grounded in the tool output.
-        """
-        import httpx
-
-        try:
-            response = httpx.post(
-                self.GEMINI_URL,
-                headers={"x-goog-api-key": self.GEMINI_API_KEY, "Content-Type": "application/json"},
-                json={
-                    "contents": [
-                        {"role": "user", "parts": [{"text": f"{system_prompt}\n\n{user_prompt}"}]},
-                        {"role": "model", "parts": [{"functionCall": {"name": tool_name, "args": tool_args}}]},
-                        {"role": "function", "parts": [{"functionResponse": {"name": tool_name, "response": tool_result}}]},
-                    ],
-                    "generationConfig": {
-                        "temperature": 0.3,
-                        "maxOutputTokens": 1024,
-                    },
-                },
-                timeout=30.0,
-            )
-            response.raise_for_status()
-            data = response.json()
-            parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-            for part in parts:
-                if "text" in part and part["text"]:
-                    return part["text"]
-            return "Action completed."
-        except Exception as e:
-            self.logger.error(f"Gemini followup failed: {e}")
-            # Build a deterministic response from the tool result
-            if isinstance(tool_result, dict):
-                if tool_result.get("success"):
-                    return f"Executed {tool_name}: {json.dumps(tool_result.get('result', {}))[:500]}"
-                else:
-                    return f"Tool {tool_name} failed: {tool_result.get('error', 'unknown error')}"
-            return str(tool_result)[:500]
+        incident_data: dict,
+        log_evidence: list[str],
+        timeline: list[dict],
+        org_id: str | None = None,
+    ) -> dict:
+        """Root cause, attack chain and entry point from the real evidence."""
+        system = (
+            "You are a forensic security analyst. Determine the root cause, attack chain and "
+            "entry point from the evidence supplied. If the evidence does not show how the "
+            "attacker got in, say that instead of speculating. Reply with JSON only."
+        )
+        context = self._build_security_context(
+            {"incident": incident_data, "evidence": log_evidence[:10], "timeline": timeline}
+        )
+        user = (
+            f"{context}\n\n"
+            f"Incident: {json.dumps(incident_data, default=str)[:4000]}\n"
+            f"Log evidence: {json.dumps(log_evidence[:10], default=str)[:6000]}\n"
+            f"Timeline: {json.dumps(timeline, default=str)[:4000]}\n"
+        )
+        out = await self._complete(system, user, response_schema=ROOT_CAUSE_SCHEMA, org_id=org_id)
+        if out.get("status") != "ok":
+            return out
+        data = out["data"]
+        return {
+            "status": "ok",
+            "root_cause": data.get("root_cause"),
+            "attack_chain": data.get("attack_chain") or [],
+            "entry_point": data.get("entry_point"),
+            "dwell_time_days": data.get("dwell_time_days"),
+            "confidence": data.get("confidence"),
+            "model_used": out.get("model"),
+        }
 
     def _build_security_context(self, data: dict) -> str:
-        """
-        Format security data for LLM consumption.
-
-        Args:
-            data: Security data dictionary
-
-        Returns:
-            Formatted context string
-        """
+        """Format security data for LLM consumption (counts, not contents)."""
         context_parts = []
-
         if "incident" in data:
             incident = data["incident"]
             context_parts.append(f"Incident: {incident.get('title', 'Unknown')}")
             context_parts.append(f"Status: {incident.get('status', 'unknown')}")
-
         if "alerts" in data:
             context_parts.append(f"Related Alerts: {len(data['alerts'])} total")
-
         if "timeline" in data:
             context_parts.append(f"Timeline: {len(data['timeline'])} events")
-
         if "evidence" in data:
             context_parts.append(f"Evidence: {len(data['evidence'])} log entries")
-
         return "\n".join(context_parts)
 
 
@@ -1312,21 +1196,23 @@ class NaturalLanguageQueryEngine:
             return asyncio.run(_run())
 
     def _summarize_results(self, query: str, results: list[dict]) -> str:
-        """Summarize query results using Gemini AI."""
+        """Describe the query results from the rows themselves.
+
+        This method is synchronous and has no organization in scope, so it
+        does not call an LLM: provider resolution is per tenant and async
+        (``AIAnalyzer._complete``), and calling it from here would either
+        block the event loop or need credentials this path cannot resolve.
+        The description is therefore counted off the real rows -- no
+        narrative, and nothing invented.
+        """
         if not results:
             return "No results found for your query."
-
-        try:
-            analyzer = AIAnalyzer()
-            summary = analyzer._call_llm(
-                system_prompt="You are a SOC analyst assistant. Summarize security query results in 2-3 actionable sentences.",
-                user_prompt=f'User asked: "{query}"\n\nResults ({len(results)} items, first 5):\n{json.dumps(results[:5], indent=2, default=str)[:2000]}',
-                structured_output=False,
-            )
-            return str(summary).strip() if summary else f"Found {len(results)} results matching your query about '{query}'."
-        except Exception as e:
-            self.logger.warning(f"Gemini summarization failed: {e}")
-            return f"Found {len(results)} results matching your query about '{query}'."
+        kinds = sorted({k for row in results[:25] if isinstance(row, dict) for k in row})
+        shown = ", ".join(kinds[:8])
+        return (
+            f"Found {len(results)} result(s) for '{query}'."
+            + (f" Fields returned: {shown}." if shown else "")
+        )
 
 
 class ThreatPredictor:

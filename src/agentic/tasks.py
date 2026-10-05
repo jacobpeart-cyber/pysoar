@@ -1,50 +1,501 @@
-"""
-Celery Tasks for Agentic SOC Investigation
+"""Celery tasks for the agentic SOC (design v2 sections 6 and 8).
 
-Background tasks for autonomous investigations, memory maintenance,
-performance evaluation, and threat hunts.
+``run_investigation`` is the only task that talks to an LLM. It runs on its
+own ``investigations`` queue with its own time limits (see
+``src/workers/celery_app.py``) and classifies provider failures instead of
+retrying blindly:
+
+* ``llm_auth`` / ``llm_not_configured`` / ``llm_quota_exceeded`` /
+  ``llm_invalid_response`` are not retryable. The investigation is recorded
+  once as escalated and a per-organization ``llm:disabled:{org}`` flag (TTL
+  1 h) stops the sweeps from enqueueing more work that cannot succeed.
+* ``llm_transient`` retries at most twice, honouring ``Retry-After``.
+
+Admission happens before anything is enqueued (:class:`_Kickoff`): the
+organization's autonomous token budget, at most 3 investigations running and
+at most 20 started per hour. A budget denial is persisted as an
+``Investigation`` with ``outcome='queued_budget_exceeded'`` and no LLM call,
+so an operator can see why nothing ran.
+
+Every Redis and database client is created inside the task's own event loop:
+Celery prefork workers call ``asyncio.run`` once per task and asyncpg ties
+connections to the loop that opened them.
 """
 
+from __future__ import annotations
+
+import asyncio
 import json
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from celery import shared_task
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy import func as sqlfunc, select
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import NullPool
 
-from src.core.config import settings
-from src.core.logging import get_logger
-from src.agentic.engine import (
-    AgenticSOCEngine,
-    AgentMemoryManager,
-    AgentOrchestrator,
-)
 from src.agentic.models import (
-    SOCAgent,
+    ActionExecutionStatus,
+    AgentAction,
     Investigation,
     InvestigationStatus,
-    AgentStatus,
+    SOCAgent,
+)
+from src.core.config import settings
+from src.core.logging import get_logger
+from src.llm.base import (
+    LLMAuthError,
+    LLMInvalidResponse,
+    LLMNotConfigured,
+    LLMQuotaExceeded,
+    LLMRateLimitError,
+    LLMTransientError,
 )
 
 logger = get_logger(__name__)
 
+#: Provider error codes that no amount of retrying will fix.
+NON_RETRYABLE_CODES: frozenset[str] = frozenset({
+    LLMAuthError.code,
+    LLMNotConfigured.code,
+    LLMQuotaExceeded.code,
+    LLMInvalidResponse.code,
+})
 
-# Create async session factory for tasks
-engine = create_async_engine(settings.database_url, echo=False)
-AsyncSessionLocal = sessionmaker(
-    engine, class_=AsyncSession, expire_on_commit=False
-)
+#: ``llm:disabled:{org}`` time to live, in seconds.
+LLM_DISABLED_TTL = 3600
+
+#: Autonomous admission caps (design section 6).
+MAX_RUNNING_PER_ORG = 3
+MAX_STARTED_PER_ORG_PER_HOUR = 20
+
+#: Tokens reserved as an admission probe at enqueue time. The real spend is
+#: reserved and settled inside ``run_investigation``; this reservation is
+#: released immediately so a queued investigation is never double-charged.
+KICKOFF_RESERVE_TOKENS = 20_000
+
+#: Tokens reserved for one investigation before the run, settled afterwards
+#: with the usage the runner actually reports.
+RUN_RESERVE_TOKENS = 60_000
 
 
-async def get_db():
-    """Get database session"""
-    async with AsyncSessionLocal() as session:
-        yield session
+def _fresh_async_session_factory() -> tuple[Any, Any]:
+    """A per-call engine with NullPool.
+
+    Celery prefork workers re-enter ``asyncio.run`` per task and asyncpg pools
+    tie futures to the loop that opened them. Sharing one engine across tasks
+    produces ``got Future attached to a different loop`` on the second call.
+    """
+    engine = create_async_engine(settings.database_url, echo=False, poolclass=NullPool)
+    return engine, sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
 
-@shared_task(bind=True, max_retries=0)
+def _redis_client() -> Any:
+    """A Redis client for the *current* event loop (never module-level)."""
+    from src.llm.quota import default_redis_factory
+
+    return default_redis_factory(settings)()
+
+
+async def _close(client: Any) -> None:
+    closer = getattr(client, "aclose", None) or getattr(client, "close", None)
+    if closer is None:
+        return
+    try:
+        result = closer()
+        if asyncio.iscoroutine(result):
+            await result
+    except Exception as exc:  # noqa: BLE001 - closing is best effort
+        logger.warning("agentic_task_client_close_failed", error=str(exc)[:200])
+
+
+def _hour_key(now: Optional[datetime] = None) -> str:
+    return (now or datetime.now(timezone.utc)).strftime("%Y%m%d%H")
+
+
+async def llm_disabled(redis: Any, org_id: str) -> bool:
+    """Whether this organization's LLM is flagged unusable right now.
+
+    Redis being unreachable is reported, not treated as "enabled": the caller
+    decides, and the sweeps choose to keep enqueueing rather than stall the
+    SOC on a cache outage.
+    """
+    if redis is None:
+        return False
+    try:
+        return bool(await redis.exists(f"llm:disabled:{org_id}"))
+    except Exception as exc:  # noqa: BLE001 - a cache outage must not hide work
+        logger.warning("llm_disabled_check_failed", organization_id=org_id, error=str(exc)[:200])
+        return False
+
+
+async def set_llm_disabled(redis: Any, org_id: str, reason: str) -> None:
+    """Flag the org's LLM as unusable for an hour after a non-retryable error."""
+    if redis is None:
+        return
+    try:
+        await redis.set(f"llm:disabled:{org_id}", reason[:200], ex=LLM_DISABLED_TTL)
+        logger.warning("llm_disabled_flag_set", organization_id=org_id, reason=reason[:200])
+    except Exception as exc:  # noqa: BLE001
+        logger.error("llm_disabled_flag_failed", organization_id=org_id, error=str(exc)[:200])
+
+
+# ---------------------------------------------------------------------------
+# Admission
+# ---------------------------------------------------------------------------
+
+
+class _Kickoff:
+    """Enqueues investigations under the autonomous admission caps.
+
+    One instance per sweep run; it owns the Redis client and the per-org agent
+    lookup cache for that sweep.
+    """
+
+    def __init__(self, db: AsyncSession, redis: Any, quota: Any = None) -> None:
+        self.db = db
+        self.redis = redis
+        self._quota = quota
+        self._agents: dict[str, Optional[str]] = {}
+        self.enqueued: list[dict[str, str]] = []
+        self.skipped: dict[str, int] = {}
+
+    @property
+    def quota(self) -> Any:
+        if self._quota is None:
+            from src.llm.quota import TokenQuota
+
+            self._quota = TokenQuota(redis_factory=(lambda: self.redis) if self.redis is not None else None)
+        return self._quota
+
+    def _skip(self, reason: str) -> None:
+        self.skipped[reason] = self.skipped.get(reason, 0) + 1
+
+    async def agent_for(self, org_id: str) -> Optional[str]:
+        """The org's investigation-capable SOC agent, if it has one."""
+        if org_id in self._agents:
+            return self._agents[org_id]
+        agent = (await self.db.execute(
+            select(SOCAgent).where(
+                SOCAgent.organization_id == org_id,
+                SOCAgent.agent_type.in_(["investigation", "triage_analyst"]),
+            ).limit(1)
+        )).scalar_one_or_none()
+        if agent is None:
+            agent = (await self.db.execute(
+                select(SOCAgent).where(SOCAgent.organization_id == org_id).limit(1)
+            )).scalar_one_or_none()
+        self._agents[org_id] = agent.id if agent is not None else None
+        return self._agents[org_id]
+
+    async def already_investigated(self, org_id: str, trigger_type: str, trigger_source_id: str) -> bool:
+        existing = (await self.db.execute(
+            select(Investigation.id).where(
+                Investigation.organization_id == org_id,
+                Investigation.trigger_type == trigger_type,
+                Investigation.trigger_source_id == trigger_source_id,
+            ).limit(1)
+        )).scalar_one_or_none()
+        return existing is not None
+
+    async def _concurrency_ok(self, org_id: str) -> bool:
+        """At most ``MAX_RUNNING_PER_ORG`` investigations in flight per org."""
+        if self.redis is None:
+            return True
+        try:
+            running = int(await self.redis.get(f"llm:auto:running:{org_id}") or 0)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("auto_running_check_failed", organization_id=org_id, error=str(exc)[:200])
+            return True
+        return running < MAX_RUNNING_PER_ORG
+
+    async def _hourly_ok(self, org_id: str) -> bool:
+        """At most ``MAX_STARTED_PER_ORG_PER_HOUR`` starts per org per hour."""
+        if self.redis is None:
+            return True
+        key = f"llm:auto:started:{org_id}:{_hour_key()}"
+        try:
+            started = int(await self.redis.incr(key))
+            if started == 1:
+                await self.redis.expire(key, LLM_DISABLED_TTL)
+            if started > MAX_STARTED_PER_ORG_PER_HOUR:
+                await self.redis.decr(key)
+                return False
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("auto_started_check_failed", organization_id=org_id, error=str(exc)[:200])
+            return True
+        return True
+
+    async def _budget_ok(self, org_id: str) -> bool:
+        """Probe the org's autonomous token budget and release the probe."""
+        quota = self.quota
+        try:
+            reservation = await quota.reserve(org_id, "autonomous", KICKOFF_RESERVE_TOKENS)
+        except LLMQuotaExceeded as exc:
+            logger.warning("autonomous_budget_denied", organization_id=org_id, detail=str(exc)[:200])
+            return False
+        try:
+            await quota.settle(reservation, 0)
+        except Exception as exc:  # noqa: BLE001 - the probe must not hold budget
+            logger.warning("autonomous_budget_probe_release_failed", organization_id=org_id, error=str(exc)[:200])
+        return True
+
+    async def _record_budget_denied(
+        self, org_id: str, agent_id: str, trigger_type: str, trigger_source_id: str, title: str
+    ) -> None:
+        """Persist the denial so the operator sees why nothing ran. No LLM call."""
+        self.db.add(Investigation(
+            agent_id=agent_id,
+            organization_id=org_id,
+            trigger_type=trigger_type,
+            trigger_source_id=trigger_source_id,
+            title=title[:500],
+            status=InvestigationStatus.AWAITING_HUMAN.value,
+            priority=3,
+            confidence_score=None,
+            outcome="queued_budget_exceeded",
+            failure_reason="autonomous daily token budget exhausted for this organization",
+            findings_summary=(
+                "Not investigated: this organization's autonomous LLM token budget is exhausted, "
+                "so no analysis was attempted. Raise the budget or triage this trigger manually."
+            ),
+        ))
+        await self.db.commit()
+
+    async def submit(
+        self,
+        org_id: str,
+        trigger_type: str,
+        trigger_source_id: str,
+        title: str,
+        severity: str,
+    ) -> bool:
+        """Enqueue one investigation if every admission check passes."""
+        if not org_id or not trigger_source_id:
+            self._skip("missing_org_or_trigger")
+            return False
+        agent_id = await self.agent_for(org_id)
+        if not agent_id:
+            self._skip("no_soc_agent")
+            return False
+        if await self.already_investigated(org_id, trigger_type, trigger_source_id):
+            self._skip("already_investigated")
+            return False
+        if await llm_disabled(self.redis, org_id):
+            self._skip("llm_disabled")
+            return False
+        if not await self._concurrency_ok(org_id):
+            self._skip("org_concurrency_cap")
+            return False
+        if not await self._budget_ok(org_id):
+            self._skip("budget_exceeded")
+            await self._record_budget_denied(
+                org_id, agent_id, trigger_type, trigger_source_id, f"Auto-triage: {title[:160]}"
+            )
+            return False
+        if not await self._hourly_ok(org_id):
+            self._skip("org_hourly_cap")
+            return False
+
+        run_investigation.delay(
+            agent_id=agent_id,
+            organization_id=org_id,
+            trigger_type=trigger_type,
+            trigger_source_id=trigger_source_id,
+            title=f"Auto-triage: {title[:160]}",
+            initial_context={"auto_triage": True, "severity": severity, "source": trigger_type},
+        )
+        self.enqueued.append({"type": trigger_type, "id": trigger_source_id})
+        return True
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            "enqueued": len(self.enqueued),
+            "items": self.enqueued[:10],
+            "skipped": dict(self.skipped),
+        }
+
+
+# ---------------------------------------------------------------------------
+# The investigation task
+# ---------------------------------------------------------------------------
+
+
+async def _load_or_create_investigation(
+    db: AsyncSession,
+    *,
+    agent_id: str,
+    organization_id: str,
+    trigger_type: str,
+    trigger_source_id: str,
+    title: str,
+    initial_context: Optional[dict[str, Any]],
+) -> Investigation:
+    """Reuse an open investigation for this trigger, else create one."""
+    existing = None
+    if trigger_source_id:
+        existing = (await db.execute(
+            select(Investigation).where(
+                Investigation.organization_id == organization_id,
+                Investigation.trigger_source_id == trigger_source_id,
+                Investigation.trigger_type == trigger_type,
+                Investigation.status.notin_([
+                    InvestigationStatus.COMPLETED.value,
+                    InvestigationStatus.ABANDONED.value,
+                ]),
+            ).limit(1)
+        )).scalar_one_or_none()
+    if existing is not None:
+        return existing
+    row = Investigation(
+        agent_id=agent_id,
+        organization_id=organization_id,
+        trigger_type=trigger_type,
+        trigger_source_id=trigger_source_id,
+        title=title[:500],
+        status=InvestigationStatus.INITIATED.value,
+        priority=3,
+        confidence_score=None,
+        reasoning_chain=json.dumps([]),
+        evidence_collected=json.dumps(initial_context or {}),
+        actions_taken=json.dumps([]),
+    )
+    db.add(row)
+    await db.flush()
+    return row
+
+
+async def _run_one_investigation(
+    *,
+    agent_id: str,
+    organization_id: str,
+    trigger_type: str,
+    trigger_source_id: str,
+    title: str,
+    initial_context: Optional[dict[str, Any]],
+    session_factory: Any = None,
+    redis: Any = None,
+    quota: Any = None,
+) -> dict[str, Any]:
+    """One investigation, end to end, inside this task's event loop.
+
+    ``session_factory`` / ``redis`` / ``quota`` default to the per-loop
+    production clients; the tests inject their own so this classification
+    path can be exercised without a worker.
+    """
+    from src.agentic.investigator import AutonomousInvestigator, InvestigationSetupError
+    from src.llm.quota import TokenQuota
+
+    engine = None
+    if session_factory is None:
+        engine, session_factory = _fresh_async_session_factory()
+    owns_redis = redis is None
+    redis = redis if redis is not None else _redis_client()
+    owns_quota = quota is None
+    quota = quota if quota is not None else TokenQuota(redis_factory=lambda: redis)
+    running_key = f"llm:auto:running:{organization_id}"
+    counted = False
+    reservation = None
+    out: dict[str, Any] = {"organization_id": organization_id}
+
+    try:
+        try:
+            await redis.incr(running_key)
+            await redis.expire(running_key, 3600)
+            counted = True
+        except Exception as exc:  # noqa: BLE001 - the gauge is advisory
+            logger.warning("auto_running_incr_failed", organization_id=organization_id, error=str(exc)[:200])
+
+        async with session_factory() as db:
+            investigation = await _load_or_create_investigation(
+                db,
+                agent_id=agent_id,
+                organization_id=organization_id,
+                trigger_type=trigger_type,
+                trigger_source_id=trigger_source_id,
+                title=title,
+                initial_context=initial_context,
+            )
+            out["investigation_id"] = investigation.id
+            try:
+                reservation = await quota.reserve(organization_id, "autonomous", RUN_RESERVE_TOKENS)
+            except LLMQuotaExceeded as exc:
+                investigation.outcome = "queued_budget_exceeded"
+                investigation.failure_reason = str(exc)[:2000]
+                investigation.confidence_score = None
+                investigation.status = InvestigationStatus.AWAITING_HUMAN.value
+                investigation.findings_summary = (
+                    "Not investigated: this organization's autonomous LLM token budget is exhausted, "
+                    "so no provider call was made."
+                )
+                await db.commit()
+                out.update({"outcome": investigation.outcome, "error_code": exc.code})
+                return out
+
+            investigator = AutonomousInvestigator(db, redis=redis, quota=quota)
+            try:
+                await investigator.run(investigation)
+            except InvestigationSetupError as exc:
+                await db.rollback()
+                investigation.outcome = "setup_error"
+                investigation.failure_reason = f"{exc.reason}: {exc}"[:2000]
+                investigation.confidence_score = None
+                investigation.status = InvestigationStatus.ESCALATED.value
+                investigation.findings_summary = (
+                    f"Investigation could not start: {exc}. No analysis was performed."
+                )
+                await db.commit()
+                out.update({"outcome": investigation.outcome, "error_code": "setup_error"})
+                return out
+
+            out.update({
+                "status": investigation.status,
+                "outcome": investigation.outcome,
+                "resolution_type": investigation.resolution_type,
+                "confidence": investigation.confidence_score,
+                "findings_summary": investigation.findings_summary,
+                "tokens_used": investigation.tokens_used or 0,
+            })
+            if investigation.outcome == "provider_error":
+                out["error_code"] = _error_code_from(investigation.failure_reason)
+            elif investigation.outcome == "llm_not_configured":
+                out["error_code"] = LLMNotConfigured.code
+
+        code = out.get("error_code")
+        if code in NON_RETRYABLE_CODES:
+            await set_llm_disabled(redis, organization_id, f"{code} on investigation {out.get('investigation_id')}")
+        return out
+    finally:
+        if reservation is not None:
+            try:
+                await quota.settle(reservation, int(out.get("tokens_used") or 0))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("autonomous_settle_failed", organization_id=organization_id, error=str(exc)[:200])
+        if counted:
+            try:
+                await redis.decr(running_key)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("auto_running_decr_failed", organization_id=organization_id, error=str(exc)[:200])
+        if owns_quota:
+            await quota.aclose()
+        if owns_redis:
+            await _close(redis)
+        if engine is not None:
+            await engine.dispose()
+
+
+def _error_code_from(failure_reason: Optional[str]) -> Optional[str]:
+    """The provider error code the investigator recorded, if any."""
+    if not failure_reason:
+        return None
+    for code in (*NON_RETRYABLE_CODES, LLMTransientError.code, LLMRateLimitError.code):
+        if code in failure_reason:
+            return code
+    return None
+
+
+@shared_task(bind=True, max_retries=2)
 def run_investigation(
     self,
     agent_id: str,
@@ -52,777 +503,365 @@ def run_investigation(
     trigger_type: str,
     trigger_source_id: str,
     title: str,
-    initial_context: dict = None,
+    initial_context: Optional[dict] = None,
 ):
-    """
-    Run an autonomous investigation for an alert/anomaly using the
-    LLM-driven AutonomousInvestigator.
+    """Run one autonomous investigation on the ``investigations`` queue.
 
-    Creates an Investigation row (if not pre-created), seeds the
-    triggering alert/incident into the evidence bundle, then runs the
-    OODA loop until Gemini emits a verdict or the step budget is hit.
-    Every step persists a ReasoningStep + ticket_activities audit row,
-    and lifecycle events are broadcast on the per-org WebSocket
-    channel so the Agent Console renders progress live.
+    Non-retryable provider failures are recorded once and disable the org's
+    LLM for an hour; transient failures retry at most twice.
     """
     try:
-        logger.info(f"Running investigation: {title}")
+        result = asyncio.run(_run_one_investigation(
+            agent_id=agent_id,
+            organization_id=organization_id,
+            trigger_type=trigger_type,
+            trigger_source_id=trigger_source_id,
+            title=title,
+            initial_context=initial_context,
+        ))
+    except (LLMAuthError, LLMNotConfigured, LLMQuotaExceeded, LLMInvalidResponse) as exc:
+        # Raised outside the investigator's own handling (e.g. during
+        # admission). Record nothing twice; just stop retrying.
+        logger.error(
+            "investigation_not_retryable",
+            organization_id=organization_id,
+            code=exc.code,
+            error=str(exc)[:300],
+        )
+        return {"organization_id": organization_id, "outcome": "llm_error", "error_code": exc.code}
+    except LLMTransientError as exc:
+        countdown = int(exc.retry_after or 60 * (2 ** self.request.retries))
+        logger.warning(
+            "investigation_transient_retry",
+            organization_id=organization_id,
+            retries=self.request.retries,
+            countdown=countdown,
+        )
+        raise self.retry(exc=exc, countdown=countdown, max_retries=2)
 
-        async def _run():
-            from src.agentic.investigator import AutonomousInvestigator
-            from src.agentic.models import Investigation, InvestigationStatus
-            from sqlalchemy import select as sa_select
-            _engine, _factory = _fresh_async_session_factory()
-            async with _factory() as db:
-                # Find or create the Investigation row. If the caller
-                # already POSTed /investigations, reuse that row;
-                # otherwise create one here.
-                existing = None
-                if trigger_source_id:
-                    existing = (await db.execute(
-                        sa_select(Investigation).where(
-                            Investigation.trigger_source_id == trigger_source_id,
-                            Investigation.organization_id == organization_id,
-                            Investigation.status.notin_([
-                                InvestigationStatus.COMPLETED.value,
-                                InvestigationStatus.ABANDONED.value,
-                            ]),
-                        )
-                    )).scalar_one_or_none()
-                if existing is None:
-                    existing = Investigation(
-                        agent_id=agent_id,
-                        organization_id=organization_id,
-                        trigger_type=trigger_type,
-                        trigger_source_id=trigger_source_id,
-                        title=title,
-                        status=InvestigationStatus.INITIATED.value,
-                        priority=3,
-                        confidence_score=0.0,
-                        reasoning_chain=json.dumps([]),
-                        evidence_collected=json.dumps(initial_context or {}),
-                        actions_taken=json.dumps([]),
-                    )
-                    db.add(existing)
-                    await db.flush()
-
-                investigator = AutonomousInvestigator(db)
-                await investigator.run(existing)
-                result = {
-                    "investigation_id": existing.id,
-                    "status": existing.status,
-                    "confidence": existing.confidence_score,
-                    "resolution_type": existing.resolution_type,
-                    "findings_summary": existing.findings_summary,
-                }
-                await _engine.dispose()
-                return result
-
-        import asyncio
-        result = asyncio.run(_run())
-
-        logger.info(f"Investigation completed: {result['investigation_id']}")
-        return result
-
-    except Exception as e:
-        logger.error(f"Investigation failed: {e}")
-        raise self.retry(exc=e, countdown=60 * (2 ** self.request.retries))
+    code = result.get("error_code")
+    if code == LLMTransientError.code and self.request.retries < 2:
+        countdown = 60 * (2 ** self.request.retries)
+        logger.warning(
+            "investigation_transient_retry",
+            organization_id=organization_id,
+            investigation_id=result.get("investigation_id"),
+            countdown=countdown,
+        )
+        raise self.retry(countdown=countdown, max_retries=2)
+    logger.info(
+        "investigation_task_finished",
+        organization_id=organization_id,
+        investigation_id=result.get("investigation_id"),
+        outcome=result.get("outcome"),
+    )
+    return result
 
 
-@shared_task(bind=True, max_retries=3)
-def periodic_threat_hunt(
-    self,
-    agent_id: str,
-    organization_id: str,
-    hunt_profile: str = "standard",
-):
+# ---------------------------------------------------------------------------
+# Sweeps
+# ---------------------------------------------------------------------------
+
+
+@shared_task(bind=True, max_retries=0)
+def autonomous_triage(self, organization_id: str, alert_batch_size: int = 10):
+    """Triage one organization's newest untriaged alerts.
+
+    Picks the highest-severity ``new`` alerts and hands each to
+    ``run_investigation`` through the shared admission path. Alert status is
+    advanced only for the alerts actually enqueued.
     """
-    Run periodic threat hunt
 
-    Proactively searches for indicators of compromise and attack patterns.
+    async def _run() -> dict[str, Any]:
+        from src.models.alert import Alert, AlertStatus
 
-    Args:
-        agent_id: Agent ID to run hunt
-        organization_id: Organization context
-        hunt_profile: Hunt profile (standard, aggressive, etc)
-
-    Returns:
-        Hunt results
-    """
-    try:
-        logger.info(f"Starting threat hunt: {hunt_profile}")
-
-        hunt_results = {
-            "hunt_id": f"hunt_{datetime.now(timezone.utc).timestamp()}",
-            "agent_id": agent_id,
-            "profile": hunt_profile,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "indicators_found": 3,
-            "investigations_created": 1,
-            "high_confidence_findings": 2,
-        }
-
-        logger.info(f"Threat hunt completed: {hunt_results['hunt_id']}")
-        return hunt_results
-
-    except Exception as e:
-        logger.error(f"Threat hunt failed: {e}")
-        raise self.retry(exc=e, countdown=60 * (2 ** self.request.retries))
-
-
-@shared_task(bind=True, max_retries=2)
-def agent_memory_maintenance(
-    self,
-    agent_id: str,
-    organization_id: str,
-):
-    """
-    Periodic memory maintenance and decay
-
-    Decays confidence on old patterns, optimizes memory storage.
-
-    Args:
-        agent_id: Agent ID
-        organization_id: Organization context
-
-    Returns:
-        Maintenance results
-    """
-    try:
-        logger.info(f"Running memory maintenance for agent {agent_id}")
-
-        async def _run():
-            async with AsyncSessionLocal() as db:
-                memory_manager = AgentMemoryManager(db)
-
-                # Decay old memories
-                await memory_manager.decay_old_memories(agent_id)
-
-                # Update baselines
-                await memory_manager.update_baselines(agent_id, organization_id)
-
-                return {
-                    "agent_id": agent_id,
-                    "status": "success",
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                }
-
-        import asyncio
-        result = asyncio.run(_run())
-
-        logger.info(f"Memory maintenance completed for agent {agent_id}")
-        return result
-
-    except Exception as e:
-        logger.error(f"Memory maintenance failed: {e}")
-        raise self.retry(exc=e, countdown=300)
-
-
-@shared_task(bind=True, max_retries=2)
-def performance_evaluation(
-    self,
-    agent_id: str = None,
-    organization_id: str = None,
-):
-    """
-    Evaluate agent performance metrics
-
-    Calculates accuracy, false positive rate, resolution times.
-
-    Args:
-        agent_id: Optional specific agent
-        organization_id: Optional organization filter
-
-    Returns:
-        Performance metrics
-    """
-    try:
-        logger.info("Evaluating agent performance")
-
-        async def _run():
-            async with AsyncSessionLocal() as db:
-                # Query investigations
-                query = select(Investigation)
-
-                if agent_id:
-                    query = query.where(Investigation.agent_id == agent_id)
-
-                if organization_id:
-                    query = query.where(
-                        Investigation.organization_id == organization_id
-                    )
-
-                result = await db.execute(query)
-                investigations = list(result.scalars().all())
-
-                # Calculate metrics
-                total = len(investigations)
-                completed = len(
-                    [i for i in investigations if i.status == InvestigationStatus.COMPLETED.value]
-                )
-                true_positives = len(
-                    [i for i in investigations if i.confidence_score > 80]
-                )
-
-                accuracy = (true_positives / total * 100) if total > 0 else 0
-                false_positives = len(
-                    [i for i in investigations if i.confidence_score < 30]
-                )
-                fp_rate = (false_positives / total * 100) if total > 0 else 0
-
-                return {
-                    "total_investigations": total,
-                    "completed": completed,
-                    "accuracy_score": accuracy,
-                    "false_positive_rate": fp_rate,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                }
-
-        import asyncio
-        result = asyncio.run(_run())
-
-        logger.info(f"Performance evaluation complete: {result}")
-        return result
-
-    except Exception as e:
-        logger.error(f"Performance evaluation failed: {e}")
-        raise self.retry(exc=e, countdown=300)
-
-
-@shared_task(bind=True, max_retries=3)
-def autonomous_triage(
-    self,
-    organization_id: str,
-    alert_batch_size: int = 10,
-):
-    """
-    Autonomously triage incoming alerts
-
-    Runs lightweight investigations to categorize alerts.
-
-    Args:
-        organization_id: Organization context
-        alert_batch_size: Number of alerts to triage
-
-    Returns:
-        Triage results
-    """
-    try:
-        logger.info(f"Running autonomous triage for {alert_batch_size} alerts")
-
-        async def _run():
-            async with AsyncSessionLocal() as db:
-                orchestrator = AgentOrchestrator(db)
-
-                # Get available agents
-                query = select(SOCAgent).where(
-                    SOCAgent.organization_id == organization_id,
-                    SOCAgent.status == AgentStatus.IDLE.value,
-                )
-                result = await db.execute(query)
-                agents = list(result.scalars().all())
-
-                if not agents:
-                    return {
-                        "status": "no_agents_available",
-                        "alerts_processed": 0,
-                    }
-
-                # Query untriaged alerts for this organization
-                from src.models.alert import Alert, AlertStatus
-                alert_query = select(Alert).where(
-                    Alert.organization_id == organization_id,
-                    Alert.status == AlertStatus.NEW.value,
-                ).order_by(Alert.severity.desc()).limit(alert_batch_size)
-                alert_result = await db.execute(alert_query)
-                alerts = list(alert_result.scalars().all())
-
-                if not alerts:
-                    return {
-                        "status": "success",
-                        "alerts_processed": 0,
-                        "agents_used": 0,
-                        "investigations_created": 0,
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                    }
-
-                # Triage each alert: assign severity-based priority and create investigations
-                investigations_created = 0
-                severity_priority = {"critical": 1, "high": 2, "medium": 3, "low": 4, "info": 5}
-                agent_idx = 0
-
+        engine, session_factory = _fresh_async_session_factory()
+        redis = _redis_client()
+        try:
+            async with session_factory() as db:
+                kickoff = _Kickoff(db, redis)
+                alerts = list(await db.scalars(
+                    select(Alert).where(
+                        Alert.organization_id == organization_id,
+                        Alert.status == AlertStatus.NEW.value,
+                    ).order_by(Alert.severity.desc()).limit(int(alert_batch_size))
+                ))
                 for alert in alerts:
-                    alert.status = "triaged"
-                    priority = severity_priority.get(alert.severity, 3)
-
-                    # Create investigation for high-priority alerts
-                    if priority <= 2 and agent_idx < len(agents):
-                        agent = agents[agent_idx]
-                        investigation = Investigation(
-                            organization_id=organization_id,
-                            alert_id=alert.id,
-                            agent_id=agent.id,
-                            status=InvestigationStatus.IN_PROGRESS.value,
-                            priority=priority,
-                            hypothesis=f"Auto-triage investigation for {alert.severity} alert: {alert.title}",
-                        )
-                        db.add(investigation)
-                        agent.status = AgentStatus.INVESTIGATING.value
-                        investigations_created += 1
-                        agent_idx = (agent_idx + 1) % len(agents)
-
+                    if await kickoff.submit(
+                        organization_id, "alert", alert.id, alert.title or alert.id, alert.severity or "medium"
+                    ):
+                        alert.status = "triaged"
                 await db.commit()
+                out = kickoff.summary()
+                out["alerts_considered"] = len(alerts)
+                return out
+        finally:
+            await _close(redis)
+            await engine.dispose()
 
-                return {
-                    "status": "success",
-                    "alerts_processed": len(alerts),
-                    "agents_used": min(agent_idx + 1, len(agents)) if alerts else 0,
-                    "investigations_created": investigations_created,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                }
-
-        import asyncio
-        result = asyncio.run(_run())
-
-        logger.info(f"Autonomous triage complete: {result}")
-        return result
-
-    except Exception as e:
-        logger.error(f"Autonomous triage failed: {e}")
-        raise self.retry(exc=e, countdown=60 * (2 ** self.request.retries))
+    result = asyncio.run(_run())
+    logger.info("autonomous_triage_complete", organization_id=organization_id, **{
+        k: v for k, v in result.items() if k != "items"
+    })
+    return result
 
 
-def _fresh_async_session_factory():
-    """Create a per-call engine with NullPool.
+@shared_task(bind=True, max_retries=0)
+def auto_triage_new_alerts(self):
+    """Cross-org sweep: investigate fresh critical/high alerts.
 
-    Celery prefork workers re-enter asyncio.run() per task, and
-    asyncpg connection pools tie futures to the first loop that opened
-    them. Sharing the module-level engine across tasks produces
-    `Task ... got Future attached to a different loop` crashes on the
-    second invocation. A per-task engine with NullPool closes every
-    connection at context exit, so the next task gets a clean slate.
+    Runs every 60 s. Idempotent by (trigger_type, trigger_source_id); the
+    10-minute lookback caps backlog processing on a slow worker.
     """
-    from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-    from sqlalchemy.orm import sessionmaker as _sm
-    from sqlalchemy.pool import NullPool
-    e = create_async_engine(settings.database_url, echo=False, poolclass=NullPool)
-    return e, _sm(e, class_=AsyncSession, expire_on_commit=False)
+
+    async def _scan() -> dict[str, Any]:
+        from src.models.alert import Alert
+
+        since = datetime.now(timezone.utc) - timedelta(minutes=10)
+        engine, session_factory = _fresh_async_session_factory()
+        redis = _redis_client()
+        try:
+            async with session_factory() as db:
+                kickoff = _Kickoff(db, redis)
+                alerts = list(await db.scalars(
+                    select(Alert).where(
+                        Alert.created_at >= since,
+                        Alert.severity.in_(["critical", "high"]),
+                        Alert.status.in_(["new", "open", "investigating"]),
+                    ).limit(25)
+                ))
+                for alert in alerts:
+                    if not alert.organization_id:
+                        continue
+                    await kickoff.submit(
+                        alert.organization_id, "alert", alert.id,
+                        alert.title or alert.id, alert.severity or "high",
+                    )
+                out = kickoff.summary()
+                out["checked"] = len(alerts)
+                return out
+        finally:
+            await _close(redis)
+            await engine.dispose()
+
+    result = asyncio.run(_scan())
+    if result.get("enqueued"):
+        logger.info("auto_triage_new_alerts_enqueued", count=result["enqueued"])
+    return result
 
 
-@shared_task(bind=True)
+@shared_task(bind=True, max_retries=0)
 def auto_triage_broad_sweep(self):
-    """Proactive investigation of non-alert security signals.
+    """Cross-org sweep over the non-alert detectors.
 
-    The original auto_triage_new_alerts task only watches the alerts
-    table. A real SOC analyst watches *every* signal source: UEBA
-    risk alerts, dark web findings, decoy-asset interactions, and
-    fresh KEV-listed vulnerabilities against the asset inventory.
-    This sweep fans those into autonomous investigations so the
-    agent keeps up regardless of which detector fired.
-
-    Runs every 2 minutes. Each source is scanned within a 30-minute
-    lookback window; an Investigation is created only if one doesn't
-    already exist for the triggering entity (idempotent by
-    trigger_source_id + trigger_type).
-
-    Sources covered:
-      - UEBA risk alerts of severity=high|critical
-      - Dark web findings of severity=high|critical
-      - Decoy interactions (ALWAYS investigate — no legitimate
-        reason to touch a decoy)
-      - Vulnerability instances on the KEV catalog with
-        SLA=overdue (existing unpatched CVEs known-exploited)
+    A real SOC watches every signal source, not just the alerts table: UEBA
+    risk alerts, dark-web findings and decoy interactions all fan into the
+    same autonomous investigator under the same admission caps. Each source
+    is scanned within a 30-minute lookback window.
     """
-    from sqlalchemy import select, and_, or_
-    from datetime import datetime, timedelta, timezone
-    from src.agentic.models import Investigation, SOCAgent
 
-    async def _sweep():
+    async def _sweep() -> dict[str, Any]:
         since = datetime.now(timezone.utc) - timedelta(minutes=30)
-        enqueued: list[dict] = []
-        _engine, _session_factory = _fresh_async_session_factory()
+        engine, session_factory = _fresh_async_session_factory()
+        redis = _redis_client()
+        try:
+            async with session_factory() as db:
+                kickoff = _Kickoff(db, redis)
 
-        async with _session_factory() as db:
-            # Resolve the investigation-capable agent once per org.
-            agent_by_org: dict[str, str] = {}
+                try:
+                    from src.ueba.models import EntityProfile, UEBARiskAlert
 
-            async def _agent_for(org_id: str) -> Optional[str]:
-                if org_id in agent_by_org:
-                    return agent_by_org[org_id]
-                agent = (await db.execute(
-                    select(SOCAgent).where(
-                        SOCAgent.organization_id == org_id,
-                        SOCAgent.agent_type.in_(["investigation", "triage_analyst"]),
-                    ).limit(1)
-                )).scalar_one_or_none()
-                if agent is None:
-                    agent = (await db.execute(
-                        select(SOCAgent).where(SOCAgent.organization_id == org_id).limit(1)
-                    )).scalar_one_or_none()
-                agent_by_org[org_id] = agent.id if agent else None
-                return agent_by_org[org_id]
+                    rows = list(await db.scalars(
+                        select(UEBARiskAlert).where(
+                            UEBARiskAlert.created_at >= since,
+                            UEBARiskAlert.severity.in_(["critical", "high"]),
+                        ).limit(25)
+                    ))
+                    for r in rows:
+                        entity = await db.get(EntityProfile, r.entity_profile_id)
+                        if entity is None or not entity.organization_id:
+                            continue
+                        await kickoff.submit(
+                            entity.organization_id, "ueba_alert", r.id,
+                            f"UEBA {r.severity} risk alert: {r.alert_type} on "
+                            f"{entity.display_name or entity.entity_id}",
+                            r.severity,
+                        )
+                except Exception as exc:  # noqa: BLE001 - one detector must not stop the sweep
+                    logger.warning("broad_sweep_ueba_failed", error_class=exc.__class__.__name__, error=str(exc)[:200])
 
-            async def _already_investigated(trigger_type: str, trigger_source_id: str) -> bool:
-                existing = (await db.execute(
-                    select(Investigation.id).where(
-                        Investigation.trigger_type == trigger_type,
-                        Investigation.trigger_source_id == trigger_source_id,
-                    ).limit(1)
-                )).scalar_one_or_none()
-                return existing is not None
+                try:
+                    from src.darkweb.models import DarkWebFinding
 
-            async def _kickoff(org_id: str, trigger_type: str, trigger_source_id: str, title: str, severity: str):
-                agent_id = await _agent_for(org_id)
-                if not agent_id:
-                    return
-                if await _already_investigated(trigger_type, trigger_source_id):
-                    return
-                run_investigation.delay(
-                    agent_id=agent_id,
-                    organization_id=org_id,
-                    trigger_type=trigger_type,
-                    trigger_source_id=trigger_source_id,
-                    title=f"Auto-triage: {title[:160]}",
-                    initial_context={"auto_triage": True, "severity": severity, "source": trigger_type},
-                )
-                enqueued.append({"type": trigger_type, "id": trigger_source_id})
+                    rows = list(await db.scalars(
+                        select(DarkWebFinding).where(
+                            DarkWebFinding.created_at >= since,
+                            DarkWebFinding.severity.in_(["critical", "high"]),
+                            DarkWebFinding.status.in_(["new", "reviewing"]),
+                        ).limit(25)
+                    ))
+                    for r in rows:
+                        if not r.organization_id:
+                            continue
+                        await kickoff.submit(
+                            r.organization_id, "darkweb_finding", r.id,
+                            f"Dark web {r.severity} finding ({r.finding_type}): {r.title or r.id}",
+                            r.severity,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("broad_sweep_darkweb_failed", error_class=exc.__class__.__name__, error=str(exc)[:200])
 
-            # --- UEBA risk alerts (high / critical) ---
-            try:
-                from src.ueba.models import UEBARiskAlert, EntityProfile
-                rows = list(await db.scalars(
-                    select(UEBARiskAlert).where(
-                        UEBARiskAlert.created_at >= since,
-                        UEBARiskAlert.severity.in_(["critical", "high"]),
-                    ).limit(25)
-                ))
-                for r in rows:
-                    # UEBARiskAlert doesn't have a direct organization_id;
-                    # climb through EntityProfile.
-                    entity = await db.get(EntityProfile, r.entity_profile_id)
-                    if entity is None or not entity.organization_id:
-                        continue
-                    await _kickoff(
-                        entity.organization_id, "ueba_alert", r.id,
-                        f"UEBA {r.severity} risk alert: {r.alert_type} on {entity.display_name or entity.entity_id}",
-                        r.severity,
-                    )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(f"broad_sweep UEBA branch failed: {exc}")
+                try:
+                    from src.deception.models import Decoy, DecoyInteraction
 
-            # --- Dark web findings (high / critical) ---
-            try:
-                from src.darkweb.models import DarkWebFinding
-                rows = list(await db.scalars(
-                    select(DarkWebFinding).where(
-                        DarkWebFinding.created_at >= since,
-                        DarkWebFinding.severity.in_(["critical", "high"]),
-                        DarkWebFinding.status.in_(["new", "reviewing"]),
-                    ).limit(25)
-                ))
-                for r in rows:
-                    if not r.organization_id:
-                        continue
-                    await _kickoff(
-                        r.organization_id, "darkweb_finding", r.id,
-                        f"Dark web {r.severity} finding ({r.finding_type}): {r.title or r.id}",
-                        r.severity,
-                    )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(f"broad_sweep darkweb branch failed: {exc}")
+                    rows = list(await db.scalars(
+                        select(DecoyInteraction).where(DecoyInteraction.created_at >= since).limit(25)
+                    ))
+                    for r in rows:
+                        decoy = await db.get(Decoy, r.decoy_id)
+                        org_id = getattr(decoy, "organization_id", None) if decoy is not None else None
+                        if not org_id:
+                            continue
+                        await kickoff.submit(
+                            org_id, "decoy_interaction", r.id,
+                            f"Decoy touched: {r.interaction_type} from {r.source_ip} on "
+                            f"{decoy.name if decoy is not None else r.decoy_id}",
+                            "high",  # there is no legitimate reason to touch a decoy
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("broad_sweep_decoy_failed", error_class=exc.__class__.__name__, error=str(exc)[:200])
 
-            # --- Decoy / honey-token interactions (ALWAYS investigate) ---
-            try:
-                from src.deception.models import DecoyInteraction, Decoy
-                rows = list(await db.scalars(
-                    select(DecoyInteraction).where(
-                        DecoyInteraction.created_at >= since,
-                    ).limit(25)
-                ))
-                for r in rows:
-                    decoy = await db.get(Decoy, r.decoy_id)
-                    org_id = getattr(decoy, "organization_id", None) if decoy else None
-                    if not org_id:
-                        continue
-                    await _kickoff(
-                        org_id, "decoy_interaction", r.id,
-                        f"Decoy touched: {r.interaction_type} from {r.source_ip} on {decoy.name if decoy else r.decoy_id}",
-                        "high",  # no legitimate reason to touch a decoy
-                    )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning(f"broad_sweep decoy branch failed: {exc}")
+                return kickoff.summary()
+        finally:
+            await _close(redis)
+            await engine.dispose()
 
-        await _engine.dispose()
-        return {"enqueued": len(enqueued), "items": enqueued[:10]}
-
-    try:
-        import asyncio
-        result = asyncio.run(_sweep())
-        if result.get("enqueued"):
-            logger.info(f"broad_sweep: enqueued {result['enqueued']} investigations")
-        return result
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(f"broad_sweep failed: {exc}")
-        return {"enqueued": 0, "error": str(exc)[:200]}
+    result = asyncio.run(_sweep())
+    if result.get("enqueued"):
+        logger.info("broad_sweep_enqueued", count=result["enqueued"])
+    return result
 
 
-@shared_task(bind=True)
+@shared_task(bind=True, max_retries=0)
 def followup_open_incidents(self):
-    """Post-incident followup check.
+    """Nudge on incidents whose recommended actions are still unapproved.
 
-    Real SOC analysts circle back on incidents to verify remediation
-    actually happened. This task scans incidents that were auto-opened
-    >= 4 hours ago and haven't transitioned to a terminal state
-    ('contained'/'eradicated'/'recovered'/'closed'), and for each one
-    checks whether the recommended AgentActions were approved +
-    executed. If any actions are still PENDING_APPROVAL after 4 hours,
-    re-sends the notification so the on-call analyst gets a nudge.
-
-    This is the bot-level equivalent of 'did the isolate-host action
-    ever get approved? the incident is still open.'
+    Scans incidents open >= 4 hours, finds the investigation that opened each
+    one (``Alert.incident_id`` is the link the investigator writes), and
+    re-sends the notification when proposals are still pending. This is the
+    bot-level "did anyone ever approve the isolate-host action?".
     """
-    from datetime import datetime, timedelta, timezone
-    from sqlalchemy import select, and_, func as sqlfunc
-    from src.agentic.models import AgentAction, ActionExecutionStatus, Investigation
-    from src.models.incident import Incident
 
-    async def _followup():
+    async def _followup() -> dict[str, Any]:
+        from src.models.alert import Alert
+        from src.models.incident import Incident
+
         cutoff = datetime.now(timezone.utc) - timedelta(hours=4)
         nudged: list[str] = []
-        _engine, _session_factory = _fresh_async_session_factory()
-        async with _session_factory() as db:
-            # Pull incidents that have been open for >= 4 hours and
-            # still aren't in a terminal status.
-            incidents = list(await db.scalars(
-                select(Incident).where(
-                    Incident.created_at <= cutoff,
-                    Incident.status.in_(["open", "investigating", "triaged"]),
-                ).limit(50)
-            ))
-            for inc in incidents:
-                # Find the investigation that auto-opened this incident.
-                source_alert_id = getattr(inc, "source_alert_id", None)
-                if not source_alert_id:
-                    continue
-                inv = (await db.execute(
-                    select(Investigation).where(
-                        Investigation.trigger_source_id == source_alert_id,
-                        Investigation.trigger_type == "alert",
-                    ).limit(1)
-                )).scalar_one_or_none()
-                if inv is None:
-                    continue
-                # Count pending approvals for this investigation.
-                pending_count = await db.scalar(
-                    select(sqlfunc.count(AgentAction.id)).where(
-                        AgentAction.investigation_id == inv.id,
-                        AgentAction.execution_status == ActionExecutionStatus.PENDING_APPROVAL.value,
-                    )
-                )
-                if not pending_count:
-                    continue
-                # Re-fire the notification via the existing dispatcher.
-                try:
-                    from src.services.notifications import send_incident_notifications
-                    event = {
-                        "incident_id": inc.id,
-                        "title": f"[FOLLOW-UP] {inc.title}",
-                        "severity": inc.severity,
-                        "summary": (
-                            f"Incident has been open {int((datetime.now(timezone.utc) - inc.created_at).total_seconds() / 3600)} hours "
-                            f"with {pending_count} agent-recommended action(s) still awaiting approval. "
-                            f"Verdict: {inv.resolution_type or 'unknown'}. "
-                            f"Open /agentic → Approvals to review."
-                        ),
-                        "trigger": "followup-check",
-                    }
-                    await send_incident_notifications(
-                        db, organization_id=inc.organization_id, event=event,
-                    )
-                    nudged.append(inc.id)
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug(f"followup notify failed for {inc.id}: {exc}")
-        await _engine.dispose()
-        return {"nudged": len(nudged), "incidents": nudged}
-
-    try:
-        import asyncio
-        return asyncio.run(_followup())
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(f"followup_open_incidents failed: {exc}")
-        return {"nudged": 0, "error": str(exc)[:200]}
-
-
-@shared_task(bind=True)
-def auto_triage_new_alerts(self):
-    """Proactive auto-triage across all orgs.
-
-    Runs every 60s. For each critical/high alert created in the last
-    10 minutes that has NO existing Investigation row referencing it,
-    kicks off `run_investigation` so the autonomous investigator
-    handles triage without a human typing in chat.
-
-    This is what turns the agent from reactive (user asks) to a
-    standing analyst queue watcher. Every org's Investigation Agent
-    (seeded by default at deploy) becomes the on-call triage bot.
-
-    Idempotent by design: the Investigation-by-trigger lookup prevents
-    double-triaging the same alert, and the 10-minute lookback window
-    caps backlog processing on a slow worker.
-    """
-    from sqlalchemy import select, func as sqlfunc
-    from src.agentic.models import Investigation, SOCAgent
-    from src.models.alert import Alert
-    from datetime import datetime, timedelta, timezone
-
-    async def _scan():
-        since = datetime.now(timezone.utc) - timedelta(minutes=10)
-        enqueued = 0
-        _engine, _session_factory = _fresh_async_session_factory()
-        async with _session_factory() as db:
-            # Pick every new-enough high/critical alert that has not
-            # already been investigated. We check trigger_source_id
-            # instead of a dedicated column because Investigation
-            # points back to the triggering entity via that field.
-            alerts = list(await db.scalars(
-                select(Alert).where(
-                    Alert.created_at >= since,
-                    Alert.severity.in_(["critical", "high"]),
-                    Alert.status.in_(["new", "open", "investigating"]),
-                ).limit(25)
-            ))
-            if not alerts:
-                return {"enqueued": 0, "checked": 0}
-
-            existing_ids = set(await db.scalars(
-                select(Investigation.trigger_source_id).where(
-                    Investigation.trigger_source_id.in_([a.id for a in alerts]),
-                    Investigation.trigger_type == "alert",
-                )
-            ))
-
-            # Resolve the investigation-capable SOC agent per org once.
-            agent_by_org: dict[str, str] = {}
-            for a in alerts:
-                if a.id in existing_ids:
-                    continue
-                org_id = a.organization_id
-                if not org_id:
-                    continue
-                if org_id not in agent_by_org:
-                    agent = (await db.execute(
-                        select(SOCAgent).where(
-                            SOCAgent.organization_id == org_id,
-                            SOCAgent.agent_type.in_(["investigation", "triage_analyst"]),
+        engine, session_factory = _fresh_async_session_factory()
+        try:
+            async with session_factory() as db:
+                incidents = list(await db.scalars(
+                    select(Incident).where(
+                        Incident.created_at <= cutoff,
+                        Incident.status.in_(["open", "investigating", "triaged"]),
+                    ).limit(50)
+                ))
+                for inc in incidents:
+                    alert_id = (await db.execute(
+                        select(Alert.id).where(
+                            Alert.incident_id == inc.id,
+                            Alert.organization_id == inc.organization_id,
                         ).limit(1)
                     )).scalar_one_or_none()
-                    if agent is None:
-                        # Fallback: any agent in the org.
-                        agent = (await db.execute(
-                            select(SOCAgent).where(
-                                SOCAgent.organization_id == org_id,
-                            ).limit(1)
-                        )).scalar_one_or_none()
-                    agent_by_org[org_id] = agent.id if agent else None
-                agent_id = agent_by_org[org_id]
-                if not agent_id:
-                    continue
-                run_investigation.delay(
-                    agent_id=agent_id,
-                    organization_id=org_id,
-                    trigger_type="alert",
-                    trigger_source_id=a.id,
-                    title=f"Auto-triage: {a.title[:160]}",
-                    initial_context={"auto_triage": True, "severity": a.severity},
-                )
-                enqueued += 1
-        await _engine.dispose()
-        return {"enqueued": enqueued, "checked": len(alerts)}
+                    if not alert_id:
+                        continue
+                    inv = (await db.execute(
+                        select(Investigation).where(
+                            Investigation.organization_id == inc.organization_id,
+                            Investigation.trigger_source_id == alert_id,
+                            Investigation.trigger_type.in_(["alert", "alert_manual"]),
+                        ).limit(1)
+                    )).scalar_one_or_none()
+                    if inv is None:
+                        continue
+                    pending = await db.scalar(
+                        select(sqlfunc.count(AgentAction.id)).where(
+                            AgentAction.organization_id == inc.organization_id,
+                            AgentAction.investigation_id == inv.id,
+                            AgentAction.execution_status == ActionExecutionStatus.PENDING_APPROVAL.value,
+                        )
+                    )
+                    if not pending:
+                        continue
+                    hours = int((datetime.now(timezone.utc) - inc.created_at).total_seconds() / 3600)
+                    try:
+                        from src.services.notifications import send_incident_notifications
 
-    try:
-        import asyncio
-        result = asyncio.run(_scan())
-        if result.get("enqueued"):
-            logger.info(f"auto_triage_new_alerts: enqueued {result['enqueued']} investigations")
-        return result
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(f"auto_triage_new_alerts failed: {exc}")
-        return {"enqueued": 0, "error": str(exc)[:200]}
+                        await send_incident_notifications(
+                            db,
+                            organization_id=inc.organization_id,
+                            event={
+                                "incident_id": inc.id,
+                                "title": f"[FOLLOW-UP] {inc.title}",
+                                "severity": inc.severity,
+                                "summary": (
+                                    f"Incident has been open {hours} hours with {pending} agent-recommended "
+                                    f"action(s) still awaiting approval. Verdict: "
+                                    f"{inv.resolution_type or inv.outcome or 'unknown'}. "
+                                    "Open /agentic -> Approvals to review."
+                                ),
+                                "trigger": "followup-check",
+                            },
+                        )
+                        nudged.append(inc.id)
+                    except Exception as exc:  # noqa: BLE001 - one failed channel must not stop the sweep
+                        logger.warning(
+                            "followup_notify_failed", incident_id=inc.id, error_class=exc.__class__.__name__
+                        )
+            return {"nudged": len(nudged), "incidents": nudged}
+        finally:
+            await engine.dispose()
+
+    return asyncio.run(_followup())
 
 
-@shared_task(bind=True)
-def cleanup_stale_investigations(
-    self,
-    days_old: int = 30,
-):
+@shared_task(bind=True, max_retries=0)
+def cleanup_stale_investigations(self, days_old: int = 30):
+    """Abandon investigations that have been stuck short of a terminal state.
+
+    Anything still in a working state after ``days_old`` days is marked
+    abandoned with an honest reason, so the queue stops showing work nobody
+    is doing. Completed and already-abandoned rows are left alone.
     """
-    Clean up old abandoned investigations
 
-    Removes or archives investigations older than threshold.
-
-    Args:
-        days_old: Age threshold in days
-
-    Returns:
-        Cleanup statistics
-    """
-    try:
-        logger.info(f"Cleaning up investigations older than {days_old} days")
-
-        cutoff_date = datetime.now(timezone.utc) - timedelta(days=days_old)
-
-        async def _run():
-            async with AsyncSessionLocal() as db:
-                query = select(Investigation).where(
-                    Investigation.status == InvestigationStatus.ABANDONED.value,
-                    Investigation.created_at < cutoff_date,
-                )
-                result = await db.execute(query)
-                investigations = list(result.scalars().all())
-
-                count = len(investigations)
-                logger.info(f"Marked {count} investigations for cleanup")
-
+    async def _run() -> dict[str, Any]:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=int(days_old))
+        engine, session_factory = _fresh_async_session_factory()
+        try:
+            async with session_factory() as db:
+                stale = list(await db.scalars(
+                    select(Investigation).where(
+                        Investigation.created_at < cutoff,
+                        Investigation.status.notin_([
+                            InvestigationStatus.COMPLETED.value,
+                            InvestigationStatus.ABANDONED.value,
+                        ]),
+                    ).limit(500)
+                ))
+                for inv in stale:
+                    inv.status = InvestigationStatus.ABANDONED.value
+                    if not inv.outcome:
+                        inv.outcome = "inconclusive_budget"
+                        inv.failure_reason = f"abandoned after {days_old} days without reaching a verdict"
+                await db.commit()
                 return {
-                    "investigations_cleaned": count,
-                    "cutoff_date": cutoff_date.isoformat(),
+                    "investigations_abandoned": len(stale),
+                    "cutoff_date": cutoff.isoformat(),
                 }
+        finally:
+            await engine.dispose()
 
-        import asyncio
-        result = asyncio.run(_run())
-
-        return result
-
-    except Exception as e:
-        logger.error(f"Cleanup failed: {e}")
-        raise
-
-
-# Celery beat schedule configuration
-CELERY_BEAT_SCHEDULE = {
-    "periodic_threat_hunt": {
-        "task": "src.agentic.tasks.periodic_threat_hunt",
-        "schedule": 3600.0,  # Every hour
-        "options": {"queue": "investigations"},
-    },
-    "agent_memory_maintenance": {
-        "task": "src.agentic.tasks.agent_memory_maintenance",
-        "schedule": 86400.0,  # Daily
-        "options": {"queue": "background"},
-    },
-    "performance_evaluation": {
-        "task": "src.agentic.tasks.performance_evaluation",
-        "schedule": 3600.0,  # Hourly
-        "options": {"queue": "background"},
-    },
-    "autonomous_triage": {
-        "task": "src.agentic.tasks.autonomous_triage",
-        "schedule": 300.0,  # Every 5 minutes
-        "options": {"queue": "investigations"},
-    },
-    "cleanup_stale_investigations": {
-        "task": "src.agentic.tasks.cleanup_stale_investigations",
-        "schedule": 604800.0,  # Weekly
-        "options": {"queue": "background"},
-    },
-}
+    result = asyncio.run(_run())
+    logger.info("cleanup_stale_investigations", **result)
+    return result

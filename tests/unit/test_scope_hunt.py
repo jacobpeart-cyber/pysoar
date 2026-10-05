@@ -94,7 +94,17 @@ async def test_scope_is_honest_about_collected_sources(db_session):
     assert any("edr" in n.lower() or "dns" in n.lower() for n in r["notes"])
 
 
-@pytest.mark.asyncio
-async def test_scope_tool_in_investigator_allowlist():
-    from src.agentic.investigator import INVESTIGATOR_READONLY_TOOLS
-    assert "scope_hunt" in INVESTIGATOR_READONLY_TOOLS
+def test_scope_hunt_is_not_on_the_autonomous_allowlist():
+    """``scope_hunt`` is tier WRITE (it is an analyst hunt phase), so the
+    autonomous investigator cannot call it: its allow-list is read tier only.
+    An analyst reaches it from chat and from ``/agentic/hunts``."""
+    from unittest.mock import AsyncMock
+
+    from src.agentic.investigator import INVESTIGATOR_READONLY_TOOLS, evidence_allowlist
+    from src.agentic.toolspec import Tier
+    from tests.unit.test_tool_spec_invariants import make_registry
+
+    specs = make_registry(AsyncMock()).specs
+    assert specs["scope_hunt"].tier is Tier.WRITE
+    assert "scope_hunt" not in INVESTIGATOR_READONLY_TOOLS
+    assert "scope_hunt" not in evidence_allowlist(specs)

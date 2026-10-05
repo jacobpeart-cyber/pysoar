@@ -100,11 +100,16 @@ async def test_get_playbook_unknown_id_is_clean_error(db_session):
 
 @pytest.mark.asyncio
 async def test_investigator_allows_new_tools_and_still_blocks_execute(db_session):
-    from src.agentic.investigator import (
-        AUTONOMOUS_BLOCKED_TOOLS,
-        INVESTIGATOR_READONLY_TOOLS,
-    )
+    # Work package 6: the autonomous surface is an allow-list of read-only
+    # evidence tools, not a blocklist. ``AUTONOMOUS_BLOCKED_TOOLS`` is gone;
+    # anything absent from the allow-list is denied by the policy engine.
+    from src.agentic.investigator import INVESTIGATOR_READONLY_TOOLS, evidence_allowlist
+
+    registry = make_registry(db_session)
+    allowed = evidence_allowlist(registry.specs)
 
     assert "list_playbooks" in INVESTIGATOR_READONLY_TOOLS
     assert "get_playbook" in INVESTIGATOR_READONLY_TOOLS
-    assert "execute_playbook" in AUTONOMOUS_BLOCKED_TOOLS
+    assert {"list_playbooks", "get_playbook"} <= allowed
+    assert "execute_playbook" not in INVESTIGATOR_READONLY_TOOLS
+    assert "execute_playbook" not in allowed

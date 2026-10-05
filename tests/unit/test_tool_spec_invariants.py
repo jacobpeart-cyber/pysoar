@@ -104,13 +104,14 @@ def test_registry_requires_org_context():
 
 
 def test_registry_registers_all_tools(specs):
-    assert len(specs) == 65
+    # 66 = 65 + `submit_verdict`, the terminal verdict tool (work package 6).
+    assert len(specs) == 66
     by_category = {}
     for s in specs.values():
         by_category.setdefault(s.category, set()).add(s.name)
     assert len(by_category["query"]) == 37
     assert len(by_category["action"]) == 20
-    assert len(by_category["analyze"]) == 8
+    assert len(by_category["analyze"]) == 9
 
 
 @pytest.mark.asyncio

@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.deps import CurrentUser, DatabaseSession
 from src.core.logging import get_logger
 from src.ai.engine import AIAnalyzer, AnomalyDetector, ThreatPredictor
+from src.llm.base import LLMNotConfigured
 from src.ai.models import MLModel, AnomalyDetection, AIAnalysis, ThreatPrediction, NLQuery
 from src.schemas.ai import (
     NLQueryRequest,
@@ -1228,15 +1229,18 @@ async def analyze_incident(
     model_used = "heuristic-v1"
     result_data: dict[str, Any]
 
-    if _llm_available():
+    # The organization's `ai` settings decide whether an LLM is available --
+    # never an ambient env key. `status != "ok"` is surfaced, never papered
+    # over: a missing provider falls back to the DB-derived (rule_based)
+    # analysis, a failing provider returns 503 with the provider's error code.
+    llm_out = await AIAnalyzer(db=db).summarize_incident(
+        _serialize_incident(incident),
+        related_alerts_serialized,
+        timeline,
+        org_id=getattr(current_user, "organization_id", None),
+    )
+    if llm_out.get("status") == "ok":
         try:
-            analyzer = AIAnalyzer()
-            llm_out = await asyncio.to_thread(
-                analyzer.summarize_incident,
-                _serialize_incident(incident),
-                related_alerts_serialized,
-                timeline,
-            )
             # Merge LLM output with our DB-derived impact when LLM omits fields.
             heuristic = _heuristic_incident_analysis(ctx)
             impact = llm_out.get("impact_assessment") or {}
@@ -1263,21 +1267,32 @@ async def analyze_incident(
                 "derivation": "llm",
             }
             derivation = "llm"
-            model_used = "gemini-2.5-flash"
+            model_used = llm_out.get("model_used") or "unknown"
         except HTTPException:
             raise
-        except Exception as e:  # network/parse — fall back, surface in derivation
+        except (KeyError, TypeError, ValueError) as e:
             logger.warning(
-                f"LLM incident analysis failed for {incident_id}: {e}; "
+                f"LLM incident analysis for {incident_id} was not usable ({e}); "
                 f"falling back to rule-based derivation"
             )
             result_data = _heuristic_incident_analysis(ctx)
-    else:
-        logger.warning(
-            f"LLM not configured (GEMINI_API_KEY unset); using rule-based "
-            f"incident analysis for {incident_id}"
+    elif llm_out.get("error_code") == LLMNotConfigured.code:
+        logger.info(
+            "incident_analysis_rule_based",
+            incident_id=incident_id,
+            reason="no llm provider configured for this organization",
         )
         result_data = _heuristic_incident_analysis(ctx)
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": "llm_provider_error",
+                "error_code": llm_out.get("error_code"),
+                "request_id": llm_out.get("request_id"),
+                "detail": llm_out.get("detail") or "the AI provider call failed",
+            },
+        )
 
     # Persist analysis with REAL content
     analysis = AIAnalysis(
@@ -1355,15 +1370,14 @@ async def analyze_root_cause(
     model_used = "heuristic-v1"
     rca: dict[str, Any]
 
-    if _llm_available():
+    llm_out = await AIAnalyzer(db=db).analyze_root_cause(
+        _serialize_incident(incident),
+        log_evidence,
+        timeline,
+        org_id=getattr(current_user, "organization_id", None),
+    )
+    if llm_out.get("status") == "ok":
         try:
-            analyzer = AIAnalyzer()
-            llm_out = await asyncio.to_thread(
-                analyzer.analyze_root_cause,
-                _serialize_incident(incident),
-                log_evidence,
-                timeline,
-            )
             heuristic = _heuristic_root_cause(ctx)
             # Always trust REAL dwell time computed from DB over LLM guess.
             real_dwell = heuristic["dwell_time_days"]
@@ -1376,21 +1390,32 @@ async def analyze_root_cause(
                 "derivation": "llm",
             }
             derivation = "llm"
-            model_used = "gemini-2.5-flash"
+            model_used = llm_out.get("model_used") or "unknown"
         except HTTPException:
             raise
-        except Exception as e:
+        except (KeyError, TypeError, ValueError) as e:
             logger.warning(
-                f"LLM root cause analysis failed for {incident_id}: {e}; "
+                f"LLM root cause analysis for {incident_id} was not usable ({e}); "
                 f"falling back to rule-based derivation"
             )
             rca = _heuristic_root_cause(ctx)
-    else:
-        logger.warning(
-            f"LLM not configured (GEMINI_API_KEY unset); deriving root cause for "
-            f"{incident_id} from linked alerts"
+    elif llm_out.get("error_code") == LLMNotConfigured.code:
+        logger.info(
+            "root_cause_rule_based",
+            incident_id=incident_id,
+            reason="no llm provider configured for this organization",
         )
         rca = _heuristic_root_cause(ctx)
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": "llm_provider_error",
+                "error_code": llm_out.get("error_code"),
+                "request_id": llm_out.get("request_id"),
+                "detail": llm_out.get("detail") or "the AI provider call failed",
+            },
+        )
 
     analysis = AIAnalysis(
         analysis_type="root_cause",
@@ -1454,22 +1479,20 @@ async def recommend_response(
     model_used = "heuristic-v1"
     rec: dict[str, Any]
 
-    if _llm_available():
+    llm_out = await AIAnalyzer(db=db).recommend_response(
+        request.incident_type or incident.incident_type,
+        request.severity or incident.severity,
+        {
+            "incident": _serialize_incident(incident),
+            "affected_systems": ctx["affected_systems"],
+            "affected_users": ctx["affected_users"],
+            "alert_count": len(ctx["alerts"]),
+            "mitre_techniques": ctx["mitre_techniques"],
+        },
+        org_id=getattr(current_user, "organization_id", None),
+    )
+    if llm_out.get("status") == "ok":
         try:
-            analyzer = AIAnalyzer()
-            llm_context = {
-                "incident": _serialize_incident(incident),
-                "affected_systems": ctx["affected_systems"],
-                "affected_users": ctx["affected_users"],
-                "alert_count": len(ctx["alerts"]),
-                "mitre_techniques": ctx["mitre_techniques"],
-            }
-            llm_out = await asyncio.to_thread(
-                analyzer.recommend_response,
-                request.incident_type or incident.incident_type,
-                request.severity or incident.severity,
-                llm_context,
-            )
             heuristic = _heuristic_response_recommendations(
                 ctx, request.incident_type, request.severity
             )
@@ -1484,24 +1507,35 @@ async def recommend_response(
                 "derivation": "llm",
             }
             derivation = "llm"
-            model_used = "gemini-2.5-flash"
+            model_used = llm_out.get("model_used") or "unknown"
         except HTTPException:
             raise
-        except Exception as e:
+        except (KeyError, TypeError, ValueError) as e:
             logger.warning(
-                f"LLM response recommendation failed for {incident_id}: {e}; "
+                f"LLM response recommendation for {incident_id} was not usable ({e}); "
                 f"falling back to rule-based derivation"
             )
             rec = _heuristic_response_recommendations(
                 ctx, request.incident_type, request.severity
             )
-    else:
-        logger.warning(
-            f"LLM not configured (GEMINI_API_KEY unset); deriving response "
-            f"recommendations for {incident_id} from incident DB fields"
+    elif llm_out.get("error_code") == LLMNotConfigured.code:
+        logger.info(
+            "response_recommendation_rule_based",
+            incident_id=incident_id,
+            reason="no llm provider configured for this organization",
         )
         rec = _heuristic_response_recommendations(
             ctx, request.incident_type, request.severity
+        )
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": "llm_provider_error",
+                "error_code": llm_out.get("error_code"),
+                "request_id": llm_out.get("request_id"),
+                "detail": llm_out.get("detail") or "the AI provider call failed",
+            },
         )
 
     confidence = 0.85 if derivation == "llm" else 0.6
@@ -1591,12 +1625,13 @@ async def generate_playbook(
     confidence = 0.6
     playbook_data: dict[str, Any]
 
-    if _llm_available():
+    llm_out = await AIAnalyzer(db=db).generate_playbook(
+        incident_pattern,
+        historical_responses,
+        org_id=getattr(current_user, "organization_id", None),
+    )
+    if llm_out.get("status") == "ok":
         try:
-            analyzer = AIAnalyzer()
-            llm_out = await asyncio.to_thread(
-                analyzer.generate_playbook, incident_pattern, historical_responses
-            )
             steps_raw = llm_out.get("steps") or []
             # Normalize step shape and apply limit.
             steps: list[dict[str, Any]] = []
@@ -1620,25 +1655,37 @@ async def generate_playbook(
                 "derivation": "llm",
             }
             derivation = "llm"
-            model_used = "gemini-2.5-flash"
+            model_used = llm_out.get("model_used") or "unknown"
             confidence = 0.8
         except HTTPException:
             raise
-        except Exception as e:
+        except (KeyError, TypeError, ValueError) as e:
             logger.warning(
-                f"LLM playbook generation failed for pattern '{incident_pattern}': {e}; "
+                f"LLM playbook for pattern '{incident_pattern}' was not usable ({e}); "
                 f"falling back to history-derived playbook"
             )
             playbook_data = _derive_playbook_from_history(
                 incident_pattern, historical_responses, limit
             )
-    else:
-        logger.warning(
-            f"LLM not configured (GEMINI_API_KEY unset); deriving playbook for "
-            f"'{incident_pattern}' from {len(historical_responses)} historical incidents"
+    elif llm_out.get("error_code") == LLMNotConfigured.code:
+        logger.info(
+            "playbook_history_derived",
+            pattern=incident_pattern,
+            historical_incidents=len(historical_responses),
+            reason="no llm provider configured for this organization",
         )
         playbook_data = _derive_playbook_from_history(
             incident_pattern, historical_responses, limit
+        )
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": "llm_provider_error",
+                "error_code": llm_out.get("error_code"),
+                "request_id": llm_out.get("request_id"),
+                "detail": llm_out.get("detail") or "the AI provider call failed",
+            },
         )
 
     analysis = AIAnalysis(

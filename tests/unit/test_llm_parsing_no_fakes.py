@@ -11,6 +11,8 @@ Patterns are drawn from the historical fake-fallback code in:
 
 import inspect
 
+import pytest
+
 import src.core.llm_parsing as llm_parsing
 
 
@@ -63,3 +65,40 @@ class TestNoFakeSuccessPayloads:
             f"removed it, update this guard. If you added one, document and "
             f"justify before adding."
         )
+
+
+class TestNoFakeSuccessPayloadsInTheLLMCallers:
+    """The same contract for the two modules that used to break it.
+
+    ``src/ai/engine.py``'s ``_call_llm`` fabricated a whole analysis on
+    failure and ``src/agentic/investigator.py`` fabricated a 40% confidence
+    when the model never produced a verdict. Both are rewritten on
+    ``src/llm``; these patterns must not come back.
+    """
+
+    @pytest.mark.parametrize("module_name", ["src.ai.engine", "src.agentic.investigator"])
+    def test_module_source_contains_no_forbidden_patterns(self, module_name):
+        import importlib
+
+        module = importlib.import_module(module_name)
+        source = inspect.getsource(module)
+        offenders = [p for p in FORBIDDEN_PATTERNS if p in source]
+        assert not offenders, (
+            f"{module_name} contains forbidden fake-success patterns: {offenders}. "
+            f"A failed or absent LLM call must be reported, never answered with a "
+            f"hardcoded success-shaped payload."
+        )
+
+    def test_investigator_does_not_fabricate_a_confidence(self):
+        from src.agentic import investigator
+
+        source = inspect.getsource(investigator)
+        assert "or 40" not in source
+        assert "confidence_score or" not in source
+
+    def test_ai_engine_has_no_hardcoded_provider_endpoint(self):
+        from src.ai import engine
+
+        source = inspect.getsource(engine)
+        assert "generativelanguage.googleapis.com" not in source
+        assert "GEMINI_API_KEY" not in source

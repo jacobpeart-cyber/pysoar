@@ -1351,9 +1351,131 @@ class AgentToolRegistry:
             handler=self._generate_incident_summary, category="analyze",
         ))
 
+        # ===== TERMINAL: the verdict is a tool (design section 6) =====
+        # The autonomous investigator ends its run by calling this tool. It is
+        # tier READ with read-only effects so the autonomous visibility filter
+        # admits it, and the handler only echoes back the arguments the policy
+        # engine already validated: the runtime captures them as
+        # ``RunResult.verdict`` and the investigator persists them. Every
+        # ``recommended_actions`` entry becomes an approval-gated PROPOSAL --
+        # calling this tool executes nothing.
+        self._register(ToolSpec(
+            name="submit_verdict",
+            description=(
+                "Conclude this investigation with a verdict. Call exactly once, only when the evidence "
+                "supports a decision; calling it ends the investigation. recommended_actions are proposals "
+                "for a human analyst to approve -- naming a tool here does NOT execute it."
+            ),
+            params={
+                "verdict": _s(
+                    "Disposition of the triggering signal",
+                    required=True,
+                    enum=["true_positive", "false_positive", "benign", "inconclusive"],
+                ),
+                "confidence": ParamSpec(
+                    type="integer",
+                    description="Confidence in the verdict, 0-100. Be honest: low confidence plus high impact means escalate.",
+                    required=True,
+                    minimum=0,
+                    maximum=100,
+                ),
+                "reasoning": _s(
+                    "4-6 sentence narrative citing the specific evidence that moved your confidence",
+                    required=True,
+                    max_length=4000,
+                ),
+                "mitre_techniques": ParamSpec(
+                    type="array",
+                    description="ATT&CK technique ids observed, e.g. T1110.001",
+                    items=_s("ATT&CK technique id", max_length=20),
+                ),
+                "recommended_actions": ParamSpec(
+                    type="array",
+                    description=(
+                        "Actions a human should approve, most important first. Each names a real platform tool "
+                        "and the exact arguments it should run with."
+                    ),
+                    items=ParamSpec(
+                        type="object",
+                        description="One proposed, approval-gated action",
+                        schema=self._recommended_action_schema(),
+                    ),
+                ),
+                "affected_assets": ParamSpec(
+                    type="array",
+                    description="Hostnames, IPs or usernames the evidence shows as affected",
+                    items=_s("Affected asset identifier", max_length=255),
+                ),
+            },
+            effects=READ, tier=Tier.READ, min_role=UserRole.VIEWER, models=(),
+            handler=self._submit_verdict, category="analyze",
+        ))
+
+    def _recommended_action_schema(self) -> dict[str, Any]:
+        """Schema for one ``submit_verdict.recommended_actions`` entry.
+
+        ``tool`` is constrained to the state-changing tools this registry
+        actually exposes, so a verdict can never name an action the platform
+        cannot propose. Built from ``self.specs``, which is why
+        ``submit_verdict`` registers last.
+        """
+        action_tools = sorted(name for name, spec in self.specs.items() if spec.tier is not Tier.READ)
+        return {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "tool": {
+                    "type": "string",
+                    "description": "The platform tool a human should approve",
+                    "enum": action_tools,
+                },
+                "args": {
+                    "type": "object",
+                    "description": "Arguments the tool should run with (must satisfy that tool's own schema)",
+                    "additionalProperties": True,
+                },
+                "rationale": {
+                    "type": "string",
+                    "description": "Why this action follows from the evidence",
+                    "maxLength": 1000,
+                },
+            },
+            "required": ["tool", "rationale"],
+        }
+
     # ==================================================================
     # QUERY handlers
     # ==================================================================
+
+    async def _submit_verdict(
+        self,
+        verdict: str,
+        confidence: int,
+        reasoning: str,
+        mitre_techniques: Optional[list[str]] = None,
+        recommended_actions: Optional[list[dict[str, Any]]] = None,
+        affected_assets: Optional[list[str]] = None,
+    ) -> dict[str, Any]:
+        """Terminal tool: echo the validated verdict back to the caller.
+
+        No state changes and no side effects. The runtime stores
+        ``decision.resolved_args`` as the run's verdict; this return value is
+        what the model sees as the tool result.
+        """
+        return {
+            "recorded": True,
+            "executed_actions": 0,
+            "verdict": verdict,
+            "confidence": int(confidence),
+            "reasoning": reasoning,
+            "mitre_techniques": list(mitre_techniques or []),
+            "recommended_actions": list(recommended_actions or []),
+            "affected_assets": list(affected_assets or []),
+            "note": (
+                "Verdict recorded; the investigation ends here. Recommended actions are pending "
+                "human approval and have NOT been executed."
+            ),
+        }
 
     async def _list_alerts(self, severity: Optional[str] = None, status: Optional[str] = None, limit: int = 20) -> list[dict[str, Any]]:
         q = self._scoped(select(Alert), Alert).order_by(Alert.created_at.desc())

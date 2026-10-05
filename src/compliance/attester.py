@@ -217,22 +217,30 @@ async def _check_ac6_least_privilege(db: AsyncSession, org_id: str) -> Optional[
         "status": "implemented",
         "narrative": (
             "Least privilege is enforced at two layers: (1) User-level RBAC "
-            "via the UserRole enum (admin, analyst, viewer, custom) checked "
-            "by src.api.deps.get_current_active_user and role-gated endpoint "
-            "dependencies. (2) Agent-level capability enforcement in "
+            "via the UserRole enum (admin, analyst, viewer) checked by "
+            "src.api.deps.get_current_active_user, admin-only dependencies "
+            "(AdminUser / get_current_superuser) on configuration endpoints, "
+            "and - for the agentic SOC - the PolicyEngine's per-tool min_role "
+            "gate (viewers are read-only; destructive tools are proposals that "
+            "an analyst or admin must approve). (2) Agent-level capability enforcement in "
             "src.agents.capabilities.AgentCapability (bas, ir, purple, "
             "compliance): an endpoint agent enrolled for BAS cannot execute "
             "IR actions (kill_process, isolate_host) even if the server "
             "queues such a command — the agent binary's action dispatch "
             "table only contains handlers for its enrolled capabilities. "
-            "Destructive actions in the agentic SOC are additionally gated "
-            "behind human approval (AUTONOMOUS_BLOCKED_TOOLS in "
-            "src.agentic.investigator)."
+            "Destructive actions in the agentic SOC are never executed "
+            "inline: PolicyEngine (src.agentic.policy) turns them into "
+            "hash-bound AgentAction proposals that require human approval, "
+            "and autonomous investigations may only call the read-only "
+            "evidence allow-list (src.agentic.investigator.evidence_allowlist; "
+            "reason code autonomous_mode_readonly)."
         ),
         "evidence_refs": [
             "code:src/agents/capabilities.py:AgentCapability",
             "code:src/agents/capabilities.py:capability_allows",
-            "code:src/agentic/investigator.py:AUTONOMOUS_BLOCKED_TOOLS",
+            "code:src/agentic/policy.py:PolicyEngine",
+            "code:src/agentic/investigator.py:evidence_allowlist",
+            "code:src/api/v1/endpoints/agentic.py:approve_action",
             "code:agent/pysoar_agent.py:build_action_handlers",
         ],
     }
