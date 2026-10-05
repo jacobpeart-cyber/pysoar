@@ -1,27 +1,61 @@
 'use client';
 
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import { Send, Trash2, Plus, Wrench, ChevronDown, ChevronRight, ShieldAlert, CheckCircle2, AlertTriangle, Activity, XCircle } from 'lucide-react';
+import { Send, Trash2, Plus, ShieldAlert, Activity, XCircle } from 'lucide-react';
 import clsx from 'clsx';
 import { api } from '../api/client';
+import { agenticApi } from '../api/endpoints';
+import type {
+  AgentProposal,
+  AgenticChatFailure,
+  PolicyEvent,
+  RunUsage,
+  StoredRunEnvelope,
+  ToolInvocation,
+  TrustAssessment,
+} from '../api/endpoints';
+import { useAuth } from '../contexts/AuthContext';
+import ApprovalCard from './agentic/ApprovalCard';
+import {
+  ActionsTakenPanel,
+  AgentErrorCard,
+  PolicyEventList,
+  RunFooter,
+  ToolLogPanel,
+  TrustBanner,
+} from './agentic/RunPanels';
+import { normalizeFailure } from './agentic/runtime';
 
 type ChatRole = 'user' | 'assistant' | 'system';
 
-interface ToolCall {
-  step: number;
-  tool: string;
-  args: Record<string, any>;
-  result: any;
-  blocked?: boolean;
-  fallback?: boolean;
+/** Everything the UI is allowed to say about one agent turn. */
+interface RunRecord {
+  tools_invoked: ToolInvocation[];
+  proposals: AgentProposal[];
+  policy_events: PolicyEvent[];
+  trust: TrustAssessment | null;
+  provider?: string | null;
+  model?: string | null;
+  credential_source?: string | null;
+  usage?: RunUsage | null;
+  run_id?: string | null;
+  stop_reason?: string | null;
+  honesty_note_applied?: boolean | null;
 }
 
 interface ChatMessage {
   id: string;
   role: ChatRole;
   content: string;
-  tool_calls?: ToolCall[] | null;
+  /** Raw `tool_calls` as persisted by the API (object envelope or legacy list). */
+  tool_calls?: unknown;
   created_at?: string | null;
+  /** Populated for turns made in this browser session. */
+  run?: RunRecord | null;
+  /** Set instead of `run` when the request itself failed. */
+  failure?: AgenticChatFailure | null;
+  /** The user text to resend from the error card's Retry button. */
+  retryText?: string | null;
 }
 
 interface ChatSession {
@@ -60,6 +94,44 @@ const suggestedPrompts = [
   'Which assets are most exposed? Show me critical ones.',
 ];
 
+const ENVELOPE_KEYS = ['tools_invoked', 'proposals', 'policy_events', 'status', 'injection_tier'];
+
+function isEnvelopeLike(value: unknown): boolean {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  return ENVELOPE_KEYS.some((k) => k in (value as Record<string, unknown>));
+}
+
+/**
+ * Normalize the persisted `tool_calls` of a stored message.
+ *
+ * Two shapes exist in the wild: the guarded-runtime envelope
+ * (`{tools_invoked, proposals, policy_events, status, …}`) and, on sessions
+ * written before the rebuild, a flat list of tool-call records. Legacy lists
+ * degrade to a tool log with no proposals, no policy events and no trust
+ * state — nothing is invented for them.
+ */
+function toEnvelope(raw: unknown): StoredRunEnvelope | null {
+  if (!raw) return null;
+  if (Array.isArray(raw)) {
+    if (raw.length === 1 && isEnvelopeLike(raw[0])) return raw[0] as StoredRunEnvelope;
+    return { tools_invoked: raw as ToolInvocation[] };
+  }
+  if (isEnvelopeLike(raw)) return raw as StoredRunEnvelope;
+  return null;
+}
+
+function envelopeToRun(env: StoredRunEnvelope): RunRecord {
+  return {
+    tools_invoked: env.tools_invoked || [],
+    proposals: env.proposals || [],
+    policy_events: env.policy_events || [],
+    // Stored messages carry only the tier, not the individual hits.
+    trust: env.injection_tier ? { tier: env.injection_tier, hits: [] } : null,
+    provider: env.provider || null,
+    model: env.model || null,
+  };
+}
+
 /**
  * Reusable chat workbench — session sidebar + chat pane + live
  * investigations strip. Used as the Chat tab on /agentic. Expects the
@@ -67,14 +139,17 @@ const suggestedPrompts = [
  * the containing tab body rather than forcing its own viewport height.
  */
 const ChatWorkbench: React.FC = () => {
+  const { user } = useAuth();
+  const role = user?.role ?? null;
+  const isViewer = role === 'viewer';
+
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const [sending, setSending] = useState(false);
-  const [authorizeActions, setAuthorizeActions] = useState(false);
-  const [expandedTools, setExpandedTools] = useState<Record<string, boolean>>({});
+  const [proposeActions, setProposeActions] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [investigations, setInvestigations] = useState<InvestigationCard[]>([]);
   const [showInvestigations, setShowInvestigations] = useState(true);
@@ -83,6 +158,10 @@ const ChatWorkbench: React.FC = () => {
   const [correctionNote, setCorrectionNote] = useState<string>('');
   const [correctionBusy, setCorrectionBusy] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+
+  // A viewer may never ask for proposals — the API answers 403 — so the
+  // flag is coerced off at render and again at send time.
+  const wantsProposals = proposeActions && !isViewer;
 
   const loadSessions = async () => {
     try {
@@ -193,7 +272,11 @@ const ChatWorkbench: React.FC = () => {
     }
   };
 
-  const send = async (textArg?: string) => {
+  /**
+   * Send one turn. `retryOf` replaces a previous failure bubble instead of
+   * appending a second user bubble for the same question.
+   */
+  const send = async (textArg?: string, retryOf?: string) => {
     const text = (textArg ?? input).trim();
     if (!text || sending) return;
     setError(null);
@@ -210,28 +293,57 @@ const ChatWorkbench: React.FC = () => {
         return;
       }
     }
-    // Optimistic user bubble
-    setMessages((m) => [...m, { id: `tmp-${Date.now()}`, role: 'user', content: text }]);
-    setInput('');
+    if (retryOf) {
+      setMessages((m) => m.filter((x) => x.id !== retryOf));
+    } else {
+      // Optimistic user bubble
+      setMessages((m) => [...m, { id: `tmp-${Date.now()}`, role: 'user', content: text }]);
+      setInput('');
+    }
     setSending(true);
     try {
-      const res = await api.post('/agentic/chat', {
+      const data = await agenticApi.chat({
         query: text,
         session_id: sid,
-        authorize_actions: authorizeActions,
+        propose_actions: wantsProposals,
       });
-      const reply = res.data?.response || '(no response)';
-      const tools: ToolCall[] = res.data?.interpretation?.tools_invoked || [];
+      const interpretation = data.interpretation || {};
+      const run: RunRecord = {
+        tools_invoked: interpretation.tools_invoked || [],
+        proposals: data.proposals || [],
+        policy_events: data.policy_events || [],
+        trust: data.trust || null,
+        provider: data.provider,
+        model: data.model,
+        credential_source: data.credential_source,
+        usage: data.usage,
+        run_id: data.run_id || interpretation.run_id,
+        stop_reason: interpretation.stop_reason,
+        honesty_note_applied: interpretation.honesty_note_applied,
+      };
       setMessages((m) => [
         ...m,
-        { id: `tmp-reply-${Date.now()}`, role: 'assistant', content: reply, tool_calls: tools },
+        {
+          id: `reply-${Date.now()}`,
+          role: 'assistant',
+          content: data.response || '',
+          run,
+        },
       ]);
       // Refresh session list so the title (and updated_at ordering) reflects latest turn
       loadSessions();
-    } catch (e: any) {
+    } catch (err) {
+      // Never fabricate a reply. The bubble carries the machine-readable
+      // failure and a Retry that re-sends exactly the same text.
       setMessages((m) => [
         ...m,
-        { id: `err-${Date.now()}`, role: 'assistant', content: 'Request failed — check connectivity and try again.' },
+        {
+          id: `err-${Date.now()}`,
+          role: 'assistant',
+          content: '',
+          failure: normalizeFailure(err),
+          retryText: text,
+        },
       ]);
     } finally {
       setSending(false);
@@ -245,63 +357,102 @@ const ChatWorkbench: React.FC = () => {
     }
   };
 
-  const renderToolCall = (call: ToolCall, key: string) => {
-    const open = expandedTools[key];
-    const isBlocked = call.blocked || call.result?.blocked;
-    const ok = call.result?.success !== false && !isBlocked;
+  const dropProposal = (messageId: string, actionId: string) => {
+    setMessages((prev) =>
+      prev.map((m) => {
+        if (m.id !== messageId || !m.run) return m;
+        return {
+          ...m,
+          run: {
+            ...m.run,
+            proposals: m.run.proposals.filter((p) => p.id !== actionId),
+          },
+        };
+      }),
+    );
+  };
+
+  /** The user text that produced the message at `index`, for Retry. */
+  const precedingUserText = (index: number): string | null => {
+    for (let i = index - 1; i >= 0; i -= 1) {
+      if (messages[i].role === 'user') return messages[i].content;
+    }
+    return null;
+  };
+
+  const renderAssistant = (m: ChatMessage, index: number) => {
+    // 1) A request that failed outright: honest error card, no prose.
+    if (m.failure) {
+      return (
+        <AgentErrorCard
+          failure={m.failure}
+          retrying={sending}
+          onRetry={
+            m.retryText ? () => send(m.retryText as string, m.id) : undefined
+          }
+        />
+      );
+    }
+
+    const env = m.run ? null : toEnvelope(m.tool_calls);
+
+    // 2) A stored turn the backend recorded as failed.
+    if (env && env.status === 'failed') {
+      const retryText = precedingUserText(index);
+      return (
+        <AgentErrorCard
+          failure={{
+            status: null,
+            code: env.error || 'run_failed',
+            detail: null,
+            source: env.provider || null,
+          }}
+          retrying={sending}
+          onRetry={retryText ? () => send(retryText) : undefined}
+        />
+      );
+    }
+
+    const run: RunRecord | null = m.run ?? (env ? envelopeToRun(env) : null);
+
     return (
-      <div
-        key={key}
-        className={clsx(
-          'border rounded-md mt-2 text-xs',
-          isBlocked
-            ? 'border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/20'
-            : ok
-              ? 'border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900'
-              : 'border-orange-200 dark:border-orange-800 bg-orange-50 dark:bg-orange-900/20',
-        )}
-      >
-        <button
-          onClick={() => setExpandedTools((s) => ({ ...s, [key]: !s[key] }))}
-          className="w-full flex items-center gap-2 px-3 py-2 text-left"
-        >
-          {open ? <ChevronDown className="w-3 h-3" /> : <ChevronRight className="w-3 h-3" />}
-          <Wrench className="w-3 h-3 text-blue-600 dark:text-blue-400" />
-          <span className="font-mono font-semibold text-gray-900 dark:text-white">{call.tool}</span>
-          <span className="text-gray-500 dark:text-gray-400">step {call.step}</span>
-          {isBlocked && (
-            <span className="ml-auto flex items-center gap-1 text-red-700 dark:text-red-300">
-              <ShieldAlert className="w-3 h-3" /> Blocked (authorize_actions=false)
-            </span>
-          )}
-          {!isBlocked && ok && (
-            <span className="ml-auto flex items-center gap-1 text-green-700 dark:text-green-300">
-              <CheckCircle2 className="w-3 h-3" /> ok
-            </span>
-          )}
-          {!isBlocked && !ok && (
-            <span className="ml-auto flex items-center gap-1 text-orange-700 dark:text-orange-300">
-              <AlertTriangle className="w-3 h-3" /> error
-            </span>
-          )}
-        </button>
-        {open && (
-          <div className="px-3 pb-3 space-y-2">
-            <div>
-              <div className="text-[10px] uppercase tracking-wide text-gray-500 dark:text-gray-400">args</div>
-              <pre className="bg-white dark:bg-gray-800 rounded p-2 overflow-x-auto text-gray-800 dark:text-gray-200">
-                {JSON.stringify(call.args || {}, null, 2)}
-              </pre>
-            </div>
-            <div>
-              <div className="text-[10px] uppercase tracking-wide text-gray-500 dark:text-gray-400">result</div>
-              <pre className="bg-white dark:bg-gray-800 rounded p-2 overflow-x-auto text-gray-800 dark:text-gray-200 max-h-64">
-                {JSON.stringify(call.result, null, 2)}
-              </pre>
-            </div>
-          </div>
-        )}
-      </div>
+      <>
+        {m.content ? <div className="whitespace-pre-wrap">{m.content}</div> : null}
+        {run ? (
+          <>
+            <TrustBanner trust={run.trust} />
+            <ActionsTakenPanel tools={run.tools_invoked} />
+            {run.proposals.map((p, idx) => (
+              <ApprovalCard
+                key={p.id || `${p.tool}-${idx}`}
+                actionId={p.id}
+                tool={p.tool}
+                args={p.args || {}}
+                targets={p.effective_targets || []}
+                paramsSha256={p.params_sha256}
+                evidenceSha256={p.evidence_sha256}
+                suspect={p.suspect}
+                injectionTier={p.injection_tier ?? run.trust?.tier ?? null}
+                expiresAt={p.expires_at}
+                role={role}
+                isSuperuser={user?.is_superuser}
+                onResolved={(actionId) => dropProposal(m.id, actionId)}
+              />
+            ))}
+            <PolicyEventList events={run.policy_events} />
+            <ToolLogPanel tools={run.tools_invoked} />
+            <RunFooter
+              provider={run.provider}
+              model={run.model}
+              credentialSource={run.credential_source}
+              usage={run.usage}
+              runId={run.run_id}
+              stopReason={run.stop_reason}
+              honestyNote={run.honesty_note_applied}
+            />
+          </>
+        ) : null}
+      </>
     );
   };
 
@@ -477,18 +628,32 @@ const ChatWorkbench: React.FC = () => {
               {activeSession?.title || 'Agent Console'}
             </h1>
             <p className="text-xs text-gray-500 dark:text-gray-400">
-              Ask the SOC agent to investigate, query, or act across the platform.
+              Ask the SOC agent to investigate or query across the platform. State-changing
+              actions are never executed inline — they come back as proposals you approve.
             </p>
           </div>
-          <label className="flex items-center gap-2 text-xs text-gray-700 dark:text-gray-300 cursor-pointer select-none">
+          <label
+            className={clsx(
+              'flex items-center gap-2 text-xs select-none',
+              isViewer
+                ? 'text-gray-400 dark:text-gray-500 cursor-not-allowed'
+                : 'text-gray-700 dark:text-gray-300 cursor-pointer',
+            )}
+            title={
+              isViewer
+                ? 'Viewers cannot request action proposals. Ask an analyst or admin.'
+                : 'When on, destructive and privileged tools are turned into approval-gated proposals instead of being refused outright. Nothing executes without your approval.'
+            }
+          >
             <input
               type="checkbox"
-              checked={authorizeActions}
-              onChange={(e) => setAuthorizeActions(e.target.checked)}
-              className="rounded"
+              checked={wantsProposals}
+              disabled={isViewer}
+              onChange={(e) => setProposeActions(e.target.checked)}
+              className="rounded disabled:cursor-not-allowed"
             />
             <span className="flex items-center gap-1">
-              <ShieldAlert className="w-3.5 h-3.5" /> Authorize destructive actions
+              <ShieldAlert className="w-3.5 h-3.5" /> Propose actions for my approval
             </span>
           </label>
         </header>
@@ -522,22 +687,21 @@ const ChatWorkbench: React.FC = () => {
               </div>
             </div>
           ) : (
-            messages.map((m) => (
+            messages.map((m, idx) => (
               <div key={m.id} className={clsx('flex', m.role === 'user' ? 'justify-end' : 'justify-start')}>
                 <div
                   className={clsx(
-                    'max-w-[70%] rounded-lg px-4 py-2 text-sm',
+                    'rounded-lg px-4 py-2 text-sm',
                     m.role === 'user'
-                      ? 'bg-blue-600 text-white'
-                      : 'bg-white dark:bg-gray-800 text-gray-900 dark:text-white border border-gray-200 dark:border-gray-700',
+                      ? 'max-w-[70%] bg-blue-600 text-white'
+                      : 'max-w-[85%] w-full bg-white dark:bg-gray-800 text-gray-900 dark:text-white border border-gray-200 dark:border-gray-700',
                   )}
                 >
-                  <div className="whitespace-pre-wrap">{m.content}</div>
-                  {m.tool_calls && m.tool_calls.length > 0 ? (
-                    <div>
-                      {m.tool_calls.map((call, idx) => renderToolCall(call, `${m.id}-${idx}`))}
-                    </div>
-                  ) : null}
+                  {m.role === 'user' ? (
+                    <div className="whitespace-pre-wrap">{m.content}</div>
+                  ) : (
+                    renderAssistant(m, idx)
+                  )}
                 </div>
               </div>
             ))

@@ -919,6 +919,63 @@ export const agenticApi = {
     const response = await api.get(`/agentic/investigations/${investigationId}/reasoning`);
     return response.data;
   },
+
+  // --- Guarded runtime (design v2 sections 8/9). Contract types live in the
+  // "Agentic SOC" block near the bottom of this file. ---
+
+  /** One chat turn against the guarded runtime. */
+  chat: async (body: AgenticChatRequest): Promise<AgenticChatResponse> => {
+    const response = await api.post('/agentic/chat', body);
+    return response.data;
+  },
+
+  listPendingApprovals: async (params?: {
+    page?: number;
+    size?: number;
+  }): Promise<PendingApprovalRow[]> => {
+    const response = await api.get('/agentic/actions/pending-approval', { params });
+    return extractData(response.data) || [];
+  },
+
+  /**
+   * Approve a proposal. The caller MUST echo the hashes it rendered on the
+   * card: a mismatch comes back as 409 `approval_stale` instead of executing
+   * something the approver never saw.
+   */
+  approveAction: async (
+    actionId: string,
+    body: {
+      params_sha256: string;
+      evidence_sha256: string;
+      acknowledge_suspect?: boolean;
+      reason?: string;
+      approval_notes?: string;
+    },
+  ): Promise<unknown> => {
+    const payload: ApproveActionRequest = { approved: true, ...body };
+    const response = await api.post(`/agentic/actions/${actionId}/approve`, payload);
+    return response.data;
+  },
+
+  denyAction: async (actionId: string, approvalNotes?: string): Promise<unknown> => {
+    const payload: ApproveActionRequest = {
+      approved: false,
+      approval_notes: approvalNotes || undefined,
+    };
+    const response = await api.post(`/agentic/actions/${actionId}/approve`, payload);
+    return response.data;
+  },
+
+  rollbackAction: async (actionId: string): Promise<RollbackResult> => {
+    const response = await api.post(`/agentic/actions/${actionId}/rollback`);
+    return response.data;
+  },
+
+  /** Only the tools the caller's role may invoke. */
+  listTools: async (): Promise<AgentToolSpec[]> => {
+    const response = await api.get('/agentic/tools');
+    return response.data?.tools || [];
+  },
 };
 
 // Playbook Builder
@@ -1497,6 +1554,286 @@ export const phishingApi = {
 
   launchCampaign: async (campaignId: string): Promise<any> => {
     const response = await api.post(`/phishing_sim/campaigns/${campaignId}/launch`);
+    return response.data;
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Agentic SOC — guarded runtime contracts (design v2 sections 8/9)
+// ---------------------------------------------------------------------------
+
+export type ToolTier = 'read' | 'write' | 'destructive' | 'privileged';
+export type PolicyDecision = 'allow' | 'deny' | 'propose';
+export type TargetProvenance = 'structured' | 'untrusted_text' | 'unknown';
+export type TrustTier = 'clean' | 'flagged' | 'lockdown';
+export type CredentialSource = 'org' | 'platform';
+
+/** One step of the tool log. decision/tier drive what the UI may claim. */
+export interface ToolInvocation {
+  step: number;
+  tool: string;
+  args?: Record<string, unknown> | null;
+  tier?: ToolTier | string | null;
+  decision?: PolicyDecision | string | null;
+  reason_code?: string | null;
+  blocked?: boolean | null;
+  duration_ms?: number | null;
+  result?: unknown;
+  proposal_id?: string | null;
+  error?: string | null;
+}
+
+/** A target the proposal would actually act on, with where it came from. */
+export interface EffectiveTarget {
+  kind?: string | null;
+  value?: string | null;
+  resolved_id?: string | null;
+  provenance?: TargetProvenance | string | null;
+}
+
+export interface AgentProposal {
+  id?: string | null;
+  tool: string;
+  args?: Record<string, unknown> | null;
+  effective_targets?: EffectiveTarget[] | null;
+  params_sha256?: string | null;
+  evidence_sha256?: string | null;
+  suspect?: boolean | null;
+  expires_at?: string | null;
+  /** Present on proposals surfaced through the pending-approval list. */
+  injection_tier?: TrustTier | string | null;
+}
+
+export interface PolicyEvent {
+  step?: number | null;
+  tool?: string | null;
+  decision?: PolicyDecision | string | null;
+  reason_code?: string | null;
+  tier?: ToolTier | string | null;
+  audit_id?: string | null;
+  proposal_id?: string | null;
+}
+
+export interface TrustHit {
+  family?: string | null;
+  preview?: string | null;
+  label?: string | null;
+}
+
+export interface TrustAssessment {
+  tier?: TrustTier | string | null;
+  hits?: TrustHit[] | null;
+}
+
+export interface RunUsage {
+  input_uncached?: number | null;
+  cache_read?: number | null;
+  cache_write?: number | null;
+  output?: number | null;
+  thinking?: number | null;
+  total_billable?: number | null;
+  estimated?: boolean | null;
+}
+
+export interface ChatInterpretation {
+  tools_invoked?: ToolInvocation[] | null;
+  run_id?: string | null;
+  stop_reason?: string | null;
+  stop_detail?: string | null;
+  steps?: number | null;
+  honesty_note_applied?: boolean | null;
+}
+
+export interface AgenticChatResponse {
+  response: string;
+  agent_id?: string;
+  agent_name?: string;
+  session_id?: string | null;
+  run_id?: string;
+  interpretation?: ChatInterpretation | null;
+  proposals?: AgentProposal[] | null;
+  policy_events?: PolicyEvent[] | null;
+  trust?: TrustAssessment | null;
+  provider?: string;
+  model?: string;
+  credential_source?: CredentialSource | string;
+  usage?: RunUsage | null;
+}
+
+/** Error body returned by /agentic/chat on 503 / 429 / 403. */
+export interface AgenticChatErrorBody {
+  error?: string;
+  detail?: unknown;
+  source?: string;
+  request_id?: string;
+  run_id?: string;
+}
+
+/** Normalized, render-ready failure for the chat error card. */
+export interface AgenticChatFailure {
+  status: number | null;
+  code: string;
+  detail: string | null;
+  source?: string | null;
+  request_id?: string | null;
+  run_id?: string | null;
+  retry_after_seconds?: number | null;
+}
+
+/** tool_calls as persisted on a stored assistant message. */
+export interface StoredRunEnvelope {
+  tools_invoked?: ToolInvocation[] | null;
+  proposals?: AgentProposal[] | null;
+  policy_events?: PolicyEvent[] | null;
+  status?: 'ok' | 'failed' | string | null;
+  error?: string | null;
+  provider?: string | null;
+  model?: string | null;
+  injection_tier?: TrustTier | string | null;
+}
+
+export interface AgenticChatRequest {
+  query: string;
+  session_id?: string | null;
+  agent_id?: string | null;
+  propose_actions?: boolean;
+}
+
+export interface ApproveActionRequest {
+  approved: boolean;
+  approval_notes?: string;
+  params_sha256?: string;
+  evidence_sha256?: string;
+  acknowledge_suspect?: boolean;
+  reason?: string;
+}
+
+/**
+ * A row from GET /agentic/actions/pending-approval.
+ *
+ * Every field beyond the identifier is optional on purpose: rows written
+ * before the guarded runtime landed carry none of the integrity binding
+ * (params_sha256/evidence_sha256) and must degrade to read-only in the UI
+ * rather than being approved blind.
+ */
+export interface PendingApprovalRow {
+  action_id?: string;
+  id?: string;
+  tool_name?: string | null;
+  action_type?: string | null;
+  parameters?: Record<string, unknown> | string | null;
+  effective_targets?: EffectiveTarget[] | null;
+  target?: string | null;
+  params_sha256?: string | null;
+  evidence_sha256?: string | null;
+  suspect?: boolean | null;
+  injection_tier?: TrustTier | string | null;
+  expires_at?: string | null;
+  source?: string | null;
+  proposed_by_user_id?: string | null;
+  proposed_by_agent_id?: string | null;
+  investigation_id?: string | null;
+  investigation_title?: string | null;
+  agent_id?: string | null;
+  agent_name?: string | null;
+  confidence_score?: number | null;
+  risk_score?: number | null;
+  created_at?: string | null;
+}
+
+export interface RollbackResult {
+  status?: string;
+  detail?: { reversed?: unknown; problems?: unknown[] } | null;
+}
+
+export interface AgentToolSpec {
+  name: string;
+  description?: string;
+  parameters?: Record<string, unknown>;
+  tier?: ToolTier | string;
+  min_role?: string;
+}
+
+// ---------------------------------------------------------------------------
+// AI provider settings + LLM health (design v2 section 9)
+// ---------------------------------------------------------------------------
+
+export type AIProviderName = 'anthropic' | 'gemini' | 'openai' | 'ollama';
+
+export interface AICapabilities {
+  models_seen_at?: string | null;
+  model_count?: number | null;
+}
+
+export interface AISettings {
+  provider?: AIProviderName | null;
+  model?: string | null;
+  use_platform_default: boolean;
+  configured: boolean;
+  source: 'org' | 'platform' | 'none';
+  reason?: string | null;
+  key_fingerprint?: string | null;
+  rotated_at?: string | null;
+  last_successful_call_at?: string | null;
+  capabilities?: AICapabilities | null;
+}
+
+export interface AISettingsUpdate {
+  provider: AIProviderName;
+  model: string;
+  use_platform_default?: boolean;
+  /** Write-only. Never echoed back by the API; never pre-filled in the UI. */
+  api_key?: string;
+}
+
+export interface AIModelsResponse {
+  provider: AIProviderName;
+  source: 'org' | 'platform';
+  models: string[];
+  fetched_at: string;
+}
+
+/** Top-level error body for PUT /settings/ai (not nested under detail). */
+export interface AISettingsErrorBody {
+  error?: string;
+  detail?: string;
+  available?: string[];
+}
+
+export interface LLMHealth {
+  status?: 'ok' | 'not_configured' | 'degraded' | string;
+  organization_id?: string | null;
+  configured: boolean;
+  provider?: string | null;
+  model?: string | null;
+  source?: 'org' | 'platform' | 'none' | string;
+  reason?: string | null;
+  last_successful_call_at?: string | null;
+  breaker_open?: boolean | null;
+  checked_at?: string;
+  cached?: boolean;
+}
+
+export const settingsApi = {
+  getAi: async (): Promise<AISettings> => {
+    const response = await api.get('/settings/ai');
+    return response.data;
+  },
+
+  putAi: async (body: AISettingsUpdate): Promise<AISettings> => {
+    const response = await api.put('/settings/ai', body);
+    return response.data;
+  },
+
+  aiModels: async (provider: AIProviderName): Promise<AIModelsResponse> => {
+    const response = await api.get('/settings/ai/models', { params: { provider } });
+    return response.data;
+  },
+};
+
+export const healthApi = {
+  llm: async (): Promise<LLMHealth> => {
+    const response = await api.get('/health/llm');
     return response.data;
   },
 };

@@ -40,6 +40,41 @@ export {
   datalakeApi,
   collaborationApi,
   phishingApi,
+  settingsApi,
+  healthApi,
+} from './endpoints';
+
+// Agentic SOC guarded-runtime + AI provider contracts
+export type {
+  ToolTier,
+  PolicyDecision,
+  TargetProvenance,
+  TrustTier,
+  CredentialSource,
+  ToolInvocation,
+  EffectiveTarget,
+  AgentProposal,
+  PolicyEvent,
+  TrustHit,
+  TrustAssessment,
+  RunUsage,
+  ChatInterpretation,
+  AgenticChatResponse,
+  AgenticChatErrorBody,
+  AgenticChatFailure,
+  AgenticChatRequest,
+  StoredRunEnvelope,
+  ApproveActionRequest,
+  PendingApprovalRow,
+  RollbackResult,
+  AgentToolSpec,
+  AIProviderName,
+  AICapabilities,
+  AISettings,
+  AISettingsUpdate,
+  AISettingsErrorBody,
+  AIModelsResponse,
+  LLMHealth,
 } from './endpoints';
 
 // Types

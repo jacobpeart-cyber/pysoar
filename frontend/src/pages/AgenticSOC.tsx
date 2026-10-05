@@ -4,13 +4,9 @@ import React, { useState, useEffect } from 'react';
 import {
   Bot,
   Brain,
-  MessageSquare,
-  CheckSquare,
   Zap,
-  Clock,
   TrendingUp,
   AlertCircle,
-  Send,
   X,
   CheckCircle,
   XCircle,
@@ -27,7 +23,10 @@ import {
 } from 'recharts';
 import clsx from 'clsx';
 import { api } from '../api/client';
+import type { PendingApprovalRow } from '../api/endpoints';
+import { useAuth } from '../contexts/AuthContext';
 import ChatWorkbench from '../components/ChatWorkbench';
+import PendingApprovals from '../components/agentic/PendingApprovals';
 
 type TabId = 'chat' | 'investigations' | 'approvals' | 'triage' | 'anomalies' | 'predictions' | 'models' | 'agents';
 
@@ -46,6 +45,7 @@ const severityColors: Record<string, string> = {
 };
 
 const AgenticSOC: React.FC = () => {
+  const { user } = useAuth();
   const [activeTab, setActiveTab] = useState<TabId>(() => {
     // Support both /agentic (default) and a deep-link like
     // /agentic?tab=investigations so /agent-console can redirect in
@@ -57,7 +57,6 @@ const AgenticSOC: React.FC = () => {
   });
   const [selectedAgent, setSelectedAgent] = useState<string | null>(null);
   const [selectedInvestigation, setSelectedInvestigation] = useState<string | null>(null);
-  const [approvalModal, setApprovalModal] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [statusToast, setStatusToast] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
@@ -65,7 +64,7 @@ const AgenticSOC: React.FC = () => {
   // State for API data
   const [agents, setAgents] = useState<any[]>([]);
   const [investigations, setInvestigations] = useState<any[]>([]);
-  const [pendingApprovals, setPendingApprovals] = useState<any[]>([]);
+  const [pendingApprovals, setPendingApprovals] = useState<PendingApprovalRow[]>([]);
   const [reasoningChain, setReasoningChain] = useState<any[]>([]);
   const [timelineData, setTimelineData] = useState<any[]>([]);
   const [agentMetrics, setAgentMetrics] = useState({
@@ -301,24 +300,15 @@ const AgenticSOC: React.FC = () => {
     }
   };
 
-  const handleApprove = async (id: string) => {
-    try {
-      await api.post(`/agentic/actions/${id}/approve`, { approved: true });
-      setPendingApprovals(prev => prev.filter(a => (a.action_id || a.id) !== id));
-    } catch {
-      setError('Failed to approve action.');
-    }
-    setApprovalModal(null);
-  };
-
-  const handleDeny = async (id: string) => {
-    try {
-      await api.post(`/agentic/actions/${id}/approve`, { approved: false });
-      setPendingApprovals(prev => prev.filter(a => (a.action_id || a.id) !== id));
-    } catch {
-      setError('Failed to deny action.');
-    }
-    setApprovalModal(null);
+  // Approve/deny themselves live in ApprovalCard (hash echo + suspect rules
+  // in one place); the page only drops the row once the API accepted it.
+  const handleApprovalResolved = (id: string, outcome: 'approved' | 'denied') => {
+    setPendingApprovals((prev) => prev.filter((a) => (a.action_id || a.id) !== id));
+    setAgentMetrics((m) => ({
+      ...m,
+      actionsPendingApproval: Math.max(0, m.actionsPendingApproval - 1),
+    }));
+    showStatus('success', `Action ${outcome}.`);
   };
 
 
@@ -962,81 +952,16 @@ const AgenticSOC: React.FC = () => {
             </div>
           )}
 
-          {/* Approvals Tab */}
+          {/* Approvals Tab — one card per action; approve/deny and the
+              integrity hash echo live in the shared ApprovalCard so the
+              chat workbench and this page cannot diverge. */}
           {activeTab === 'approvals' && (
-            <div>
-              <h2 className="text-xl font-bold text-gray-900 dark:text-white mb-6">
-                Pending Approvals
-              </h2>
-              <div className="overflow-x-auto">
-                <table className="w-full text-sm">
-                  <thead>
-                    <tr className="border-b border-gray-200 dark:border-gray-700">
-                      <th className="text-left py-3 px-4 font-semibold text-gray-900 dark:text-white">
-                        Action
-                      </th>
-                      <th className="text-left py-3 px-4 font-semibold text-gray-900 dark:text-white">
-                        Investigation
-                      </th>
-                      <th className="text-left py-3 px-4 font-semibold text-gray-900 dark:text-white">
-                        Confidence
-                      </th>
-                      <th className="text-left py-3 px-4 font-semibold text-gray-900 dark:text-white">
-                        Risk Score
-                      </th>
-                      <th className="text-right py-3 px-4 font-semibold text-gray-900 dark:text-white">
-                        Actions
-                      </th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {pendingApprovals.length === 0 ? (
-                      <tr>
-                        <td colSpan={5} className="py-8 text-center text-gray-500 dark:text-gray-400 text-sm">
-                          No actions awaiting approval.
-                        </td>
-                      </tr>
-                    ) : null}
-                    {pendingApprovals.map((approval) => (
-                      <tr
-                        key={approval.action_id || approval.id}
-                        className="border-b border-gray-200 dark:border-gray-700 hover:bg-gray-50 dark:hover:bg-gray-700"
-                      >
-                        <td className="py-3 px-4 text-gray-900 dark:text-white">
-                          {(approval.action_type || 'Unknown').replace(/_/g, ' ')}
-                        </td>
-                        <td className="py-3 px-4 text-gray-600 dark:text-gray-400">
-                          {approval.investigation_title || 'N/A'}
-                        </td>
-                        <td className="py-3 px-4">
-                          <span className="inline-block px-2 py-1 bg-green-100 dark:bg-green-900 text-green-800 dark:text-green-200 rounded text-xs font-medium">
-                            {approval.confidence_score ?? 0}%
-                          </span>
-                        </td>
-                        <td className="py-3 px-4 font-medium text-gray-900 dark:text-white">
-                          {/* Risk score — falls back to "—" rather than
-                              duplicating Confidence. Previous column
-                              rendered confidence_score in both cells,
-                              labelled Confidence and Risk Score — one
-                              was a lie. */}
-                          {typeof approval.risk_score === 'number'
-                            ? `${approval.risk_score}`
-                            : '—'}
-                        </td>
-                        <td className="py-3 px-4 text-right">
-                          <button
-                            onClick={() => setApprovalModal(approval.action_id || approval.id)}
-                            className="text-blue-600 dark:text-blue-400 hover:text-blue-900 dark:hover:text-blue-200 font-medium text-xs"
-                          >
-                            Review
-                          </button>
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            </div>
+            <PendingApprovals
+              rows={pendingApprovals}
+              role={user?.role}
+              isSuperuser={user?.is_superuser}
+              onResolved={handleApprovalResolved}
+            />
           )}
         </div>
 
@@ -1045,77 +970,6 @@ const AgenticSOC: React.FC = () => {
             shipping two different chat UIs on the same page. */}
       </div>
 
-      {/* Approval Modal */}
-      {approvalModal && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 dark:bg-opacity-70 flex items-center justify-center p-4 z-50">
-          <div className="bg-white dark:bg-gray-800 rounded-lg max-w-2xl w-full p-6">
-            <div className="flex items-center justify-between mb-4">
-              <h2 className="text-2xl font-bold text-gray-900 dark:text-white flex items-center gap-2">
-                <CheckSquare className="w-6 h-6" />
-                Approve Action
-              </h2>
-              <button
-                onClick={() => setApprovalModal(null)}
-                className="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
-              >
-                <X className="w-6 h-6" />
-              </button>
-            </div>
-
-            {pendingApprovals
-              .filter((a) => (a.action_id || a.id) === approvalModal)
-              .map((approval) => (
-                <div key={approval.action_id || approval.id} className="space-y-4">
-                  <div className="bg-gray-50 dark:bg-gray-900 rounded-lg p-4">
-                    <p className="text-sm text-gray-600 dark:text-gray-400 mb-1">Action</p>
-                    <p className="font-semibold text-gray-900 dark:text-white">
-                      {(approval.action_type || 'Unknown').replace(/_/g, ' ')}
-                    </p>
-                  </div>
-
-                  <div className="grid grid-cols-2 gap-4">
-                    <div className="bg-gray-50 dark:bg-gray-900 rounded-lg p-4">
-                      <p className="text-sm text-gray-600 dark:text-gray-400 mb-1">Investigation</p>
-                      <p className="font-semibold text-gray-900 dark:text-white">
-                        {approval.investigation_title || 'N/A'}
-                      </p>
-                    </div>
-                    <div className="bg-gray-50 dark:bg-gray-900 rounded-lg p-4">
-                      <p className="text-sm text-gray-600 dark:text-gray-400 mb-1">
-                        Confidence Score
-                      </p>
-                      <p className="font-semibold text-green-600 dark:text-green-400">
-                        {approval.confidence_score ?? 0}%
-                      </p>
-                    </div>
-                  </div>
-
-                  <div className="bg-gray-50 dark:bg-gray-900 rounded-lg p-4">
-                    <p className="text-sm text-gray-600 dark:text-gray-400 mb-1">Agent</p>
-                    <p className="font-semibold text-gray-900 dark:text-white">
-                      {approval.agent_name || 'N/A'}
-                    </p>
-                  </div>
-
-                  <div className="flex gap-3 pt-4">
-                    <button
-                      onClick={() => handleDeny(approval.action_id || approval.id)}
-                      className="flex-1 px-4 py-2 border border-gray-200 dark:border-gray-700 text-gray-900 dark:text-white rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700 transition"
-                    >
-                      Deny
-                    </button>
-                    <button
-                      onClick={() => handleApprove(approval.action_id || approval.id)}
-                      className="flex-1 px-4 py-2 bg-green-600 dark:bg-green-500 text-white rounded-lg hover:bg-green-700 dark:hover:bg-green-600 transition"
-                    >
-                      Approve
-                    </button>
-                  </div>
-                </div>
-              ))}
-          </div>
-        </div>
-      )}
     </div>
   );
 };

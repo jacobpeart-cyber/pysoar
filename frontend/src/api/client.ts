@@ -11,7 +11,9 @@ interface TokenPayload {
 
 class ApiClient {
   private axiosInstance: AxiosInstance;
-  private refreshTimeout: NodeJS.Timeout | null = null;
+  // `NodeJS.Timeout` is not in scope for the app tsconfig (types: vite/client),
+  // so the browser timer handle is derived from setTimeout itself.
+  private refreshTimeout: ReturnType<typeof setTimeout> | null = null;
 
   constructor() {
     this.axiosInstance = axios.create({
@@ -47,16 +49,25 @@ class ApiClient {
           return Promise.reject(new Error('Unauthorized. Please log in again.'));
         }
 
+        // 403/429/5xx keep a friendly `message` for callers that only read
+        // `.message`, but the AxiosError itself is rethrown so callers that
+        // need the machine-readable body (e.g. the agentic chat error card,
+        // which must show `llm_not_configured` / `llm_quota_exceeded` and the
+        // Retry-After header rather than invent a reply) can still reach
+        // `error.response.data` and `error.response.headers`.
         if (status === 403) {
-          return Promise.reject(new Error('Permission denied. You do not have access to this resource.'));
+          error.message = 'Permission denied. You do not have access to this resource.';
+          return Promise.reject(error);
         }
 
         if (status === 429) {
-          return Promise.reject(new Error('Rate limit exceeded. Please try again later.'));
+          error.message = 'Rate limit exceeded. Please try again later.';
+          return Promise.reject(error);
         }
 
         if (status && status >= 500) {
-          return Promise.reject(new Error('Server error. Please try again later.'));
+          error.message = 'Server error. Please try again later.';
+          return Promise.reject(error);
         }
 
         return Promise.reject(error);

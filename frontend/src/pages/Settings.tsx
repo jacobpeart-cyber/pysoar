@@ -15,9 +15,15 @@ import {
   Eye,
   EyeOff,
   ExternalLink,
+  Bot,
+  AlertTriangle,
+  RefreshCw,
 } from 'lucide-react';
 import { api } from '../lib/api';
 import clsx from 'clsx';
+import { settingsApi, healthApi } from '../api/endpoints';
+import type { AIProviderName, AISettings, LLMHealth } from '../api/endpoints';
+import { useAuth } from '../contexts/AuthContext';
 
 interface SettingsData {
   general: {
@@ -54,14 +60,20 @@ interface SettingsData {
 }
 
 const tabs = [
-  { id: 'general', name: 'General', icon: SettingsIcon },
-  { id: 'notifications', name: 'Notifications', icon: Bell },
-  { id: 'email', name: 'Email (SMTP)', icon: Mail },
-  { id: 'integrations', name: 'Integrations', icon: Link },
-  { id: 'security', name: 'Security', icon: Shield },
+  { id: 'general', name: 'General', icon: SettingsIcon, adminOnly: false },
+  { id: 'notifications', name: 'Notifications', icon: Bell, adminOnly: false },
+  { id: 'email', name: 'Email (SMTP)', icon: Mail, adminOnly: false },
+  { id: 'integrations', name: 'Integrations', icon: Link, adminOnly: false },
+  // Writing the org's LLM credential is an admin action; the tab is hidden
+  // for everyone else rather than rendered and then rejected by the API.
+  { id: 'ai', name: 'AI Provider', icon: Bot, adminOnly: true },
+  { id: 'security', name: 'Security', icon: Shield, adminOnly: false },
 ];
 
 export default function Settings() {
+  const { user } = useAuth();
+  const isAdmin = Boolean(user?.is_superuser) || user?.role === 'admin';
+  const visibleTabs = tabs.filter((t) => !t.adminOnly || isAdmin);
   const [activeTab, setActiveTab] = useState('general');
   const [globalError, setGlobalError] = useState<string | null>(null);
   const queryClient = useQueryClient();
@@ -136,7 +148,7 @@ export default function Settings() {
         {/* Sidebar */}
         <div className="w-48 flex-shrink-0">
           <nav className="space-y-1">
-            {tabs.map((tab) => (
+            {visibleTabs.map((tab) => (
               <button
                 key={tab.id}
                 onClick={() => setActiveTab(tab.id)}
@@ -176,6 +188,14 @@ export default function Settings() {
               testStatus={testIntegrationMutation}
             />
           )}
+          {activeTab === 'ai' &&
+            (isAdmin ? (
+              <AIProviderSettings />
+            ) : (
+              <p className="text-sm text-gray-500 dark:text-gray-400">
+                Only an administrator can view or change the AI provider configuration.
+              </p>
+            ))}
           {activeTab === 'security' && settings && (
             <SecuritySettings settings={settings.alert_correlation} general={settings.general} />
           )}
@@ -1194,5 +1214,487 @@ function SecuritySettings({
       </div>
     </div>
     </form>
+  );
+}
+
+const AI_PROVIDERS: Array<{ id: AIProviderName; name: string }> = [
+  { id: 'anthropic', name: 'Anthropic' },
+  { id: 'gemini', name: 'Google Gemini' },
+  { id: 'openai', name: 'OpenAI' },
+  { id: 'ollama', name: 'Ollama' },
+];
+
+interface AiErrorInfo {
+  code: string | null;
+  detail: string | null;
+  available: string[];
+}
+
+/**
+ * PUT /settings/ai reports failures as a TOP-LEVEL body (`{error, detail,
+ * available}`), not FastAPI's nested `{detail: {...}}`. Both are read here so
+ * the panel can name the actual failure instead of "request failed".
+ */
+function readAiError(err: unknown): AiErrorInfo {
+  const response = (err as { response?: { data?: unknown } })?.response;
+  const data = response?.data;
+  const body =
+    data && typeof data === 'object' && !Array.isArray(data)
+      ? (data as Record<string, unknown>)
+      : null;
+  if (!body) {
+    const message = (err as { message?: string })?.message;
+    return { code: null, detail: message || null, available: [] };
+  }
+  const nested =
+    body.detail && typeof body.detail === 'object' && !Array.isArray(body.detail)
+      ? (body.detail as Record<string, unknown>)
+      : null;
+  const code =
+    (typeof body.error === 'string' && body.error) ||
+    (nested && typeof nested.error === 'string' ? nested.error : null) ||
+    null;
+  const detail =
+    (typeof body.detail === 'string' && body.detail) ||
+    (nested && typeof nested.detail === 'string' ? nested.detail : null) ||
+    null;
+  const availableRaw = body.available ?? nested?.available;
+  const available = Array.isArray(availableRaw)
+    ? availableRaw.filter((m): m is string => typeof m === 'string')
+    : [];
+  return { code, detail, available };
+}
+
+const AI_ERROR_TEXT: Record<string, string> = {
+  unknown_model: 'That model is not available for this provider.',
+  invalid_credentials: 'The provider rejected this API key.',
+  provider_timeout: 'The provider did not respond in time. Try again, or check the key.',
+  llm_not_configured: 'No usable LLM configuration — set a provider, a model and a key.',
+  secret_unreadable: 'The stored key could not be decrypted. Re-enter the API key to rotate it.',
+  tenant_url_not_allowed: 'Provider URLs cannot be set per tenant.',
+};
+
+function formatTimestamp(value?: string | null): string {
+  if (!value) return 'never';
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? value : new Date(parsed).toLocaleString();
+}
+
+function AIProviderSettings() {
+  const { data: aiSettings, isLoading } = useQuery<AISettings | null>({
+    queryKey: ['settings', 'ai'],
+    queryFn: async () => settingsApi.getAi(),
+  });
+
+  const { data: health, isFetching: healthFetching } = useQuery<LLMHealth | null>({
+    queryKey: ['health', 'llm'],
+    queryFn: async () => healthApi.llm(),
+  });
+
+  if (isLoading) {
+    return (
+      <div className="flex items-center justify-center h-32">
+        <Loader2 className="w-6 h-6 animate-spin text-blue-500" />
+      </div>
+    );
+  }
+
+  // The form is seeded from the server state through `key` rather than an
+  // effect: when the saved configuration changes the form remounts with the
+  // new values, and no setState-in-effect cascade is needed.
+  const formKey = [
+    aiSettings?.provider ?? '',
+    aiSettings?.model ?? '',
+    String(aiSettings?.use_platform_default ?? false),
+    aiSettings?.rotated_at ?? '',
+  ].join('|');
+
+  return (
+    <AIProviderForm
+      key={formKey}
+      aiSettings={aiSettings ?? null}
+      health={health ?? null}
+      healthFetching={healthFetching}
+    />
+  );
+}
+
+function AIProviderForm({
+  aiSettings,
+  health,
+  healthFetching,
+}: {
+  aiSettings: AISettings | null;
+  health: LLMHealth | null;
+  healthFetching: boolean;
+}) {
+  const queryClient = useQueryClient();
+  // The API key is never echoed back by the server, so this always starts empty.
+  const [provider, setProvider] = useState<AIProviderName>(aiSettings?.provider ?? 'anthropic');
+  const [model, setModel] = useState(aiSettings?.model ?? '');
+  const [usePlatformDefault, setUsePlatformDefault] = useState(
+    Boolean(aiSettings?.use_platform_default),
+  );
+  const [apiKey, setApiKey] = useState('');
+  const [showKey, setShowKey] = useState(false);
+  const [models, setModels] = useState<string[]>([]);
+  const [modelsError, setModelsError] = useState<string | null>(null);
+  const [saveError, setSaveError] = useState<AiErrorInfo | null>(null);
+  const [saved, setSaved] = useState(false);
+
+  const modelsMutation = useMutation({
+    mutationFn: async (p: AIProviderName) => settingsApi.aiModels(p),
+    onSuccess: (data) => {
+      setModels(data.models || []);
+      setModelsError(
+        (data.models || []).length === 0
+          ? 'The provider returned no models for this credential.'
+          : null,
+      );
+    },
+    onError: (err: unknown) => {
+      const info = readAiError(err);
+      setModels([]);
+      setModelsError(
+        AI_ERROR_TEXT[info.code || ''] || info.detail || 'Could not list models for this provider.',
+      );
+    },
+  });
+
+  const saveMutation = useMutation({
+    mutationFn: async () =>
+      settingsApi.putAi({
+        provider,
+        model: model.trim(),
+        use_platform_default: usePlatformDefault,
+        api_key: apiKey.trim() ? apiKey.trim() : undefined,
+      }),
+    onSuccess: () => {
+      setSaveError(null);
+      setSaved(true);
+      setApiKey('');
+      setShowKey(false);
+      queryClient.invalidateQueries({ queryKey: ['settings', 'ai'] });
+      queryClient.invalidateQueries({ queryKey: ['health', 'llm'] });
+    },
+    onError: (err: unknown) => {
+      setSaved(false);
+      setSaveError(readAiError(err));
+    },
+  });
+
+  const configured = Boolean(aiSettings?.configured);
+  const breakerOpen = health?.breaker_open === true;
+  const canSave = model.trim().length > 0 && !saveMutation.isPending;
+
+  return (
+    <div className="space-y-6">
+      <div>
+        <h2 className="text-lg font-semibold text-gray-900 dark:text-white">AI Provider</h2>
+        <p className="text-sm text-gray-500 dark:text-gray-400">
+          Which LLM this organization's agents call, and the credential they call it with. The
+          provider endpoint is fixed by the platform — there is nothing to point at a different
+          host.
+        </p>
+      </div>
+
+      {/* Live status, straight from GET /health/llm */}
+      <div className="rounded-lg border border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 p-4">
+        <div className="flex items-center gap-2 mb-2">
+          {configured && !breakerOpen ? (
+            <CheckCircle className="w-4 h-4 text-green-600 dark:text-green-400" />
+          ) : (
+            <AlertTriangle className="w-4 h-4 text-amber-600 dark:text-amber-400" />
+          )}
+          <span className="text-sm font-medium text-gray-900 dark:text-white">
+            {configured ? 'Configured' : 'Not configured'}
+          </span>
+          {healthFetching ? (
+            <Loader2 className="w-3 h-3 animate-spin text-gray-400" />
+          ) : null}
+          <button
+            type="button"
+            onClick={() => queryClient.invalidateQueries({ queryKey: ['health', 'llm'] })}
+            className="ml-auto inline-flex items-center gap-1 text-xs text-gray-500 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200"
+          >
+            <RefreshCw className="w-3 h-3" /> Refresh
+          </button>
+        </div>
+        <dl className="grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-1 text-xs">
+          <div className="flex justify-between gap-2">
+            <dt className="text-gray-500 dark:text-gray-400">Credential source</dt>
+            <dd className="font-mono text-gray-900 dark:text-white">
+              {health?.source || aiSettings?.source || 'none'}
+            </dd>
+          </div>
+          <div className="flex justify-between gap-2">
+            <dt className="text-gray-500 dark:text-gray-400">Provider / model in use</dt>
+            <dd className="font-mono text-gray-900 dark:text-white break-all">
+              {health?.provider || aiSettings?.provider || '—'}
+              {health?.model || aiSettings?.model ? ` / ${health?.model || aiSettings?.model}` : ''}
+            </dd>
+          </div>
+          <div className="flex justify-between gap-2">
+            <dt className="text-gray-500 dark:text-gray-400">Last successful call</dt>
+            <dd className="font-mono text-gray-900 dark:text-white">
+              {formatTimestamp(health?.last_successful_call_at ?? aiSettings?.last_successful_call_at)}
+            </dd>
+          </div>
+          <div className="flex justify-between gap-2">
+            <dt className="text-gray-500 dark:text-gray-400">Quota breaker</dt>
+            <dd
+              className={clsx(
+                'font-mono',
+                breakerOpen ? 'text-red-600 dark:text-red-400' : 'text-gray-900 dark:text-white',
+              )}
+            >
+              {health?.breaker_open === null || health?.breaker_open === undefined
+                ? 'unknown'
+                : breakerOpen
+                  ? 'open — calls are being rejected'
+                  : 'closed'}
+            </dd>
+          </div>
+          {!configured && (aiSettings?.reason || health?.reason) ? (
+            <div className="sm:col-span-2 flex justify-between gap-2">
+              <dt className="text-gray-500 dark:text-gray-400">Reason</dt>
+              <dd className="font-mono text-amber-700 dark:text-amber-300">
+                {aiSettings?.reason || health?.reason}
+              </dd>
+            </div>
+          ) : null}
+        </dl>
+      </div>
+
+      {/* Provider */}
+      <div>
+        <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+          Provider
+        </label>
+        <select
+          value={provider}
+          onChange={(e) => {
+            setProvider(e.target.value as AIProviderName);
+            setModels([]);
+            setModelsError(null);
+            setSaved(false);
+          }}
+          className="w-full max-w-sm px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white rounded-lg"
+        >
+          {AI_PROVIDERS.map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.name}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      {/* Model + live model list */}
+      <div>
+        <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+          Model
+        </label>
+        <div className="flex flex-wrap gap-2 items-start">
+          <input
+            type="text"
+            list="ai-model-options"
+            value={model}
+            onChange={(e) => {
+              setModel(e.target.value);
+              setSaved(false);
+            }}
+            placeholder="Model id, e.g. the provider's latest"
+            className="flex-1 min-w-[16rem] px-3 py-2 text-sm border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white rounded-lg"
+          />
+          <datalist id="ai-model-options">
+            {models.map((m) => (
+              <option key={m} value={m} />
+            ))}
+          </datalist>
+          <button
+            type="button"
+            onClick={() => {
+              setModelsError(null);
+              modelsMutation.mutate(provider);
+            }}
+            disabled={modelsMutation.isPending}
+            className="inline-flex items-center gap-2 px-3 py-2 text-sm font-medium border border-gray-300 dark:border-gray-600 text-gray-800 dark:text-gray-200 rounded-lg hover:bg-gray-50 dark:hover:bg-gray-700 disabled:opacity-50"
+          >
+            {modelsMutation.isPending ? (
+              <Loader2 className="w-4 h-4 animate-spin" />
+            ) : (
+              <RefreshCw className="w-4 h-4" />
+            )}
+            Load models
+          </button>
+        </div>
+        {models.length > 0 ? (
+          <div className="mt-2">
+            <p className="text-xs text-gray-500 dark:text-gray-400 mb-1">
+              {models.length} model(s) reported by the provider — click to use:
+            </p>
+            <div className="flex flex-wrap gap-1">
+              {models.map((m) => (
+                <button
+                  key={m}
+                  type="button"
+                  onClick={() => {
+                    setModel(m);
+                    setSaved(false);
+                  }}
+                  className={clsx(
+                    'font-mono text-[11px] px-2 py-0.5 rounded border',
+                    m === model
+                      ? 'border-blue-500 bg-blue-50 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300'
+                      : 'border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-700',
+                  )}
+                >
+                  {m}
+                </button>
+              ))}
+            </div>
+          </div>
+        ) : null}
+        {modelsError ? (
+          <p className="mt-2 text-xs text-amber-700 dark:text-amber-300">{modelsError}</p>
+        ) : null}
+      </div>
+
+      {/* API key — write only */}
+      <div>
+        <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+          API key
+        </label>
+        <div className="relative max-w-xl">
+          <input
+            type={showKey ? 'text' : 'password'}
+            value={apiKey}
+            autoComplete="off"
+            onChange={(e) => {
+              setApiKey(e.target.value);
+              setSaved(false);
+            }}
+            placeholder={
+              aiSettings?.key_fingerprint
+                ? 'Leave blank to keep the stored key'
+                : 'Paste the provider API key'
+            }
+            className="w-full px-3 py-2 pr-10 text-sm border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-white rounded-lg"
+          />
+          <button
+            type="button"
+            onClick={() => setShowKey((s) => !s)}
+            className="absolute right-2 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-200"
+            aria-label={showKey ? 'Hide API key' : 'Show API key'}
+          >
+            {showKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+          </button>
+        </div>
+        <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
+          The key is write-only: it is never returned by the API and is never pre-filled here.
+          Stored key:{' '}
+          <span className="font-mono text-gray-700 dark:text-gray-300">
+            {aiSettings?.key_fingerprint || 'none'}
+          </span>
+          {aiSettings?.rotated_at ? ` · rotated ${formatTimestamp(aiSettings.rotated_at)}` : ''}
+        </p>
+      </div>
+
+      {/* Platform default */}
+      <div className="rounded-lg border border-gray-200 dark:border-gray-700 p-4">
+        <label className="flex items-start gap-3 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={usePlatformDefault}
+            onChange={(e) => {
+              setUsePlatformDefault(e.target.checked);
+              setSaved(false);
+            }}
+            className="mt-0.5 rounded"
+          />
+          <span className="text-sm">
+            <span className="font-medium text-gray-900 dark:text-white">
+              Fall back to the platform's provider
+            </span>
+            <span className="block text-xs text-gray-500 dark:text-gray-400 mt-0.5">
+              When enabled, agent runs that have no working organization credential are sent to
+              the platform operator's provider account instead of failing. Your organization's
+              alert, incident and asset data is included in those requests and therefore leaves
+              your own provider contract. Leave this off if the tenant data must only reach your
+              own provider.
+            </span>
+          </span>
+        </label>
+      </div>
+
+      {saveError ? (
+        <div className="rounded-lg border border-red-200 dark:border-red-800 bg-red-50 dark:bg-red-900/20 p-3 space-y-1">
+          <div className="flex items-center gap-2">
+            <XCircle className="w-4 h-4 text-red-600 dark:text-red-400" />
+            <span className="text-sm font-medium text-red-800 dark:text-red-200">
+              {AI_ERROR_TEXT[saveError.code || ''] || 'Could not save the AI configuration.'}
+            </span>
+            {saveError.code ? (
+              <span className="ml-auto font-mono text-[10px] text-red-700 dark:text-red-300">
+                {saveError.code}
+              </span>
+            ) : null}
+          </div>
+          {saveError.detail ? (
+            <p className="text-xs font-mono text-red-900 dark:text-red-100 break-words">
+              {saveError.detail}
+            </p>
+          ) : null}
+          {saveError.available.length > 0 ? (
+            <div>
+              <p className="text-xs text-red-800 dark:text-red-200 mb-1">Available models:</p>
+              <div className="flex flex-wrap gap-1">
+                {saveError.available.map((m) => (
+                  <button
+                    key={m}
+                    type="button"
+                    onClick={() => {
+                      setModel(m);
+                      setSaveError(null);
+                    }}
+                    className="font-mono text-[11px] px-2 py-0.5 rounded border border-red-300 dark:border-red-700 text-red-800 dark:text-red-200 hover:bg-red-100 dark:hover:bg-red-900/40"
+                  >
+                    {m}
+                  </button>
+                ))}
+              </div>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+
+      {saved ? (
+        <p className="flex items-center gap-2 text-sm text-green-700 dark:text-green-400">
+          <CheckCircle className="w-4 h-4" /> Saved. The next agent run uses this configuration.
+        </p>
+      ) : null}
+
+      <div className="flex items-center gap-3">
+        <button
+          type="button"
+          onClick={() => saveMutation.mutate()}
+          disabled={!canSave}
+          className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium bg-blue-600 hover:bg-blue-700 disabled:bg-blue-300 text-white rounded-lg"
+        >
+          {saveMutation.isPending ? (
+            <Loader2 className="w-4 h-4 animate-spin" />
+          ) : (
+            <Save className="w-4 h-4" />
+          )}
+          Save
+        </button>
+        {aiSettings?.capabilities?.models_seen_at ? (
+          <span className="text-xs text-gray-500 dark:text-gray-400">
+            Last model list: {aiSettings.capabilities.model_count ?? 0} models at{' '}
+            {formatTimestamp(aiSettings.capabilities.models_seen_at)}
+          </span>
+        ) : null}
+      </div>
+    </div>
   );
 }
