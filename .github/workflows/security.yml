@@ -54,7 +54,10 @@ jobs:
           pip install -r requirements.txt pip-audit
 
       - name: Run pip-audit
-        run: pip-audit -r requirements.txt --format json --output pip-audit-results.json || true
+        # Enforcing since 2026-10: the requirement set audits clean (cryptography
+        # 50, msal 1.39, react-router 7.18, axios 1.20). A reintroduced advisory
+        # fails the job instead of being filed away in an artifact nobody reads.
+        run: pip-audit -r requirements.txt --format json --output pip-audit-results.json
 
       - name: Run safety check
         run: safety check -r requirements.txt --json --output safety-results.json || true
