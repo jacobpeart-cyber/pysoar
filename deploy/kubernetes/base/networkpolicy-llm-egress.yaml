@@ -1,0 +1,155 @@
+# LLM egress policy for the PySOAR api and worker pods.
+#
+# Why: the Agentic SOC sends alert/log/IOC excerpts to the configured LLM
+# provider. Egress from those pods must be limited to the provider endpoints
+# so a compromised or prompt-injected agent cannot reach the cloud metadata
+# service (169.254.169.254 - IAM credentials on EC2/EKS), in-cluster data
+# stores, or arbitrary internet hosts via a tenant-supplied URL.
+#
+# Two documents:
+#   1. A vanilla NetworkPolicy (works on every CNI that enforces policies).
+#      It cannot match hostnames, so it allows TCP/443 to public address
+#      space only and explicitly denies the metadata range, link-local,
+#      loopback and all RFC1918 ranges except the in-cluster services the
+#      pods legitimately need (postgres, redis, ollama).
+#   2. A CiliumNetworkPolicy with toFQDNs that pins egress to the exact
+#      provider hosts. Apply it INSTEAD of (1) on Cilium clusters; it is the
+#      control that fully satisfies the "fixed provider hosts" requirement.
+#      Calico users: translate toFQDNs into a GlobalNetworkSet + domain
+#      selector; the host list is the same.
+#
+# Hosts the providers in src/llm use (fixed in code; tenants supply keys only):
+#   api.anthropic.com, generativelanguage.googleapis.com, api.openai.com,
+#   and the platform-configured Ollama service (in-cluster, port 11434).
+#
+# Controls: SC-7, SC-7(5) (deny-by-default egress), SC-7(8), CM-7, AC-4.
+# Adjust the in-cluster selectors (app labels / namespace) to your deployment;
+# the api/worker pod labels follow pdb.yaml (app: pysoar-api, component: api).
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pysoar-llm-egress
+  namespace: pysoar
+  labels:
+    app.kubernetes.io/part-of: pysoar
+    pysoar.io/control: SC-7
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values: ["pysoar-api", "pysoar-worker", "pysoar-scheduler"]
+  policyTypes:
+    - Egress
+  egress:
+    # DNS (cluster resolver) - required to resolve provider hostnames.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # In-cluster dependencies the pods must reach (same namespace).
+    - to:
+        - podSelector:
+            matchLabels:
+              app: pysoar-postgres
+      ports:
+        - protocol: TCP
+          port: 5432
+    - to:
+        - podSelector:
+            matchLabels:
+              app: pysoar-redis
+      ports:
+        - protocol: TCP
+          port: 6379
+    - to:
+        - podSelector:
+            matchLabels:
+              app: pysoar-ollama
+      ports:
+        - protocol: TCP
+          port: 11434
+    # HTTPS to public address space only. The except list blocks the cloud
+    # metadata service, link-local, loopback, multicast and every RFC1918
+    # range so a provider base URL can never be pointed at internal targets.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.0.0/16
+              - 127.0.0.0/8
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 100.64.0.0/10
+              - 224.0.0.0/4
+      ports:
+        - protocol: TCP
+          port: 443
+---
+# Strict variant (Cilium): egress pinned to the provider hostnames.
+# Requires Cilium with DNS proxy enabled (enable-l7-proxy, dnsPolicy FQDN).
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: pysoar-llm-egress-fqdn
+  namespace: pysoar
+  labels:
+    app.kubernetes.io/part-of: pysoar
+    pysoar.io/control: SC-7
+spec:
+  endpointSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values: ["pysoar-api", "pysoar-worker", "pysoar-scheduler"]
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s:k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: ANY
+          rules:
+            dns:
+              - matchPattern: "*"
+    - toEndpoints:
+        - matchLabels:
+            app: pysoar-postgres
+      toPorts:
+        - ports:
+            - port: "5432"
+              protocol: TCP
+    - toEndpoints:
+        - matchLabels:
+            app: pysoar-redis
+      toPorts:
+        - ports:
+            - port: "6379"
+              protocol: TCP
+    - toEndpoints:
+        - matchLabels:
+            app: pysoar-ollama
+      toPorts:
+        - ports:
+            - port: "11434"
+              protocol: TCP
+    - toFQDNs:
+        - matchName: api.anthropic.com
+        - matchName: generativelanguage.googleapis.com
+        - matchName: api.openai.com
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
