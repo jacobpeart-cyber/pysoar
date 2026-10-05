@@ -1,7 +1,8 @@
 """Settings and configuration schemas"""
 
-from typing import Optional, List
-from pydantic import BaseModel, Field
+from typing import List, Literal, Optional
+
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class IntegrationConfig(BaseModel):
@@ -71,3 +72,109 @@ class SettingsUpdate(BaseModel):
     notifications: Optional[NotificationConfig] = None
     alert_correlation: Optional[AlertCorrelationConfig] = None
     integrations: Optional[dict] = None
+
+
+# ---------------------------------------------------------------------------
+# AI provider settings (design v2 §9: GET/PUT /settings/ai)
+# ---------------------------------------------------------------------------
+
+AIProviderName = Literal["anthropic", "gemini", "openai", "ollama"]
+
+
+class AICapabilities(BaseModel):
+    """What the last successful model-list told us about the provider."""
+
+    models_seen_at: str
+    model_count: int
+
+
+class AISettingsResponse(BaseModel):
+    """Read model for ``GET /settings/ai``. Never carries an API key."""
+
+    provider: Optional[AIProviderName] = None
+    model: Optional[str] = None
+    use_platform_default: bool = False
+    configured: bool = False
+    source: Literal["org", "platform", "none"] = "none"
+    # Why the org is not configured (``missing_credential`` / ``model_not_set``
+    # / ``ai_not_configured`` ...); None when ``configured`` is true.
+    reason: Optional[str] = None
+    # ``sha256[:12]:last4`` of the stored key — safe to display, never the key.
+    key_fingerprint: Optional[str] = None
+    rotated_at: Optional[str] = None
+    last_successful_call_at: Optional[str] = None
+    capabilities: Optional[AICapabilities] = None
+
+
+class AISettingsUpdate(BaseModel):
+    """Write model for ``PUT /settings/ai``.
+
+    ``extra="forbid"`` is deliberate: a tenant must not be able to smuggle a
+    base URL (or any other provider knob) into the request. The explicit
+    URL-ish fields below exist only so such an attempt gets a precise
+    ``400 tenant_url_not_allowed`` instead of a generic 422.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    provider: AIProviderName
+    model: str = Field(min_length=1, max_length=120)
+    use_platform_default: bool = False
+    api_key: Optional[str] = Field(default=None, min_length=8, max_length=1024, repr=False)
+
+    base_url: Optional[str] = None
+    url: Optional[str] = None
+    host: Optional[str] = None
+    api_base: Optional[str] = None
+    endpoint: Optional[str] = None
+
+    def supplied_url_keys(self) -> List[str]:
+        """URL-ish keys the client sent a value for (always rejected)."""
+        return [
+            key
+            for key in ("base_url", "url", "host", "api_base", "endpoint")
+            if getattr(self, key, None)
+        ]
+
+
+class AIModelsResponse(BaseModel):
+    """Read model for ``GET /settings/ai/models``."""
+
+    provider: AIProviderName
+    source: Literal["org", "platform"]
+    models: List[str] = Field(default_factory=list)
+    fetched_at: str
+
+
+class AITenantRow(BaseModel):
+    """One organization's AI configuration, for the superuser overview."""
+
+    organization_id: str
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    source: Literal["org", "platform", "none"] = "none"
+    last_successful_call_at: Optional[str] = None
+
+
+class AITenantsResponse(BaseModel):
+    """Read model for the superuser ``GET /settings/ai/tenants``."""
+
+    tenants: List[AITenantRow] = Field(default_factory=list)
+    count: int = 0
+
+
+class LLMHealthResponse(BaseModel):
+    """Read model for ``GET /health/llm`` (per-org provider reachability)."""
+
+    status: Literal["ok", "not_configured", "degraded"]
+    organization_id: Optional[str] = None
+    configured: bool = False
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    source: Literal["org", "platform", "none"] = "none"
+    reason: Optional[str] = None
+    last_successful_call_at: Optional[str] = None
+    # None when the breaker state could not be read (Redis unavailable).
+    breaker_open: Optional[bool] = None
+    checked_at: str
+    cached: bool = False
