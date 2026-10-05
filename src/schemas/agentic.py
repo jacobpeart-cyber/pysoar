@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any, Optional
 
 from src.schemas.base import DBModel
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 # ============================================================================
@@ -202,10 +202,30 @@ class AgentActionCreate(AgentActionBase):
 
 
 class AgentActionApproval(BaseModel):
-    """Schema for approving/denying action"""
+    """Schema for approving/denying an agent-proposed action (design v2 §8).
+
+    ``params_sha256``/``evidence_sha256`` bind the approval to the exact
+    arguments and evidence the proposal was created with: the client echoes
+    what it rendered on the approve card and a mismatch is rejected with
+    ``approval_stale`` rather than executing something the approver never saw.
+    """
 
     approved: bool = False
     approval_notes: Optional[str] = None
+    params_sha256: Optional[str] = Field(default=None, max_length=64)
+    evidence_sha256: Optional[str] = Field(default=None, max_length=64)
+    # Admin-only escape hatch for proposals raised in a flagged/lockdown
+    # session; requires an explicit written reason (audited, risk high).
+    acknowledge_suspect: bool = False
+    reason: Optional[str] = Field(default=None, max_length=2000)
+
+    @model_validator(mode="after")
+    def _hashes_required_when_approving(self) -> "AgentActionApproval":
+        if self.approved and not (self.params_sha256 and self.evidence_sha256):
+            raise ValueError(
+                "params_sha256 and evidence_sha256 must be echoed from the proposal when approving"
+            )
+        return self
 
 
 class AgentActionResponse(AgentActionBase, DBModel):
@@ -303,14 +323,37 @@ class NaturalLanguageQuery(BaseModel):
     """Natural language query to agent"""
 
     query: str = Field(..., min_length=1)
-    agent_id: Optional[str] = None  # Specific agent or auto-select
-    # If provided, the turn is persisted into an existing chat session.
-    # If omitted, the chat remains ephemeral (backwards-compatible).
+    agent_id: Optional[str] = None  # Specific SOC agent (validated in-org) or auto-select
+    # If provided, the turn is persisted into an existing chat session
+    # (which must belong to the caller AND the caller's organization).
     session_id: Optional[str] = None
-    # If False, destructive action tools (block_ip, isolate_host, disable_user,
-    # execute_playbook, create_incident, etc.) are blocked — the agent can only
-    # query and analyze. Caller must explicitly authorize actions.
+    # Analyst+: "the agent may propose destructive actions for my approval".
+    # Destructive/privileged tools are never executed inline from chat; with
+    # this flag the runtime materializes an approval-gated AgentAction instead
+    # of refusing the call outright (design v2 §1/§8). Viewers may not set it.
+    propose_actions: bool = False
+    # Deprecated alias for ``propose_actions`` (v1.1 field name). Kept so
+    # existing clients keep working; it maps onto ``propose_actions``.
     authorize_actions: bool = False
+
+    @model_validator(mode="after")
+    def _merge_deprecated_alias(self) -> "NaturalLanguageQuery":
+        if self.authorize_actions and not self.propose_actions:
+            object.__setattr__(self, "propose_actions", True)
+        return self
+
+
+class AgentProposal(BaseModel):
+    """An approval-gated action the agent proposed during a run (design v2 §8)."""
+
+    id: Optional[str] = None
+    tool: str = ""
+    args: dict[str, Any] = Field(default_factory=dict)
+    effective_targets: list[dict[str, Any]] = Field(default_factory=list)
+    params_sha256: str = ""
+    evidence_sha256: str = ""
+    suspect: bool = False
+    expires_at: Optional[datetime] = None
 
 
 class NaturalLanguageResponse(BaseModel):
@@ -321,6 +364,17 @@ class NaturalLanguageResponse(BaseModel):
     agent_name: str = ""
     interpretation: dict[str, Any]
     session_id: Optional[str] = None
+    # Design v2 §9: every chat turn reports its run id, what it proposed,
+    # which policy decisions were taken, the session trust state and the
+    # provider/model/usage that produced the answer.
+    run_id: str = ""
+    proposals: list[AgentProposal] = Field(default_factory=list)
+    policy_events: list[dict[str, Any]] = Field(default_factory=list)
+    trust: dict[str, Any] = Field(default_factory=dict)
+    provider: str = ""
+    model: str = ""
+    credential_source: str = ""
+    usage: dict[str, Any] = Field(default_factory=dict)
 
 
 class ChatSessionResponse(BaseModel):

@@ -591,10 +591,15 @@ class TestAgenticActionRollback:
         execution_status: str = "completed",
         parameters: dict | None = None,
         rollback_available: bool = True,
+        result: dict | None = None,
+        tool_name: str | None = None,
     ):
         from src.agentic.models import AgentAction
         from uuid import uuid4
 
+        # Rollback reverses ONLY the effect ids the execution recorded in
+        # ``result`` (ioc_id / user_id / agent_commands[].agent_id) - never by
+        # matching values such as an IP or an email across the table.
         action = AgentAction(
             investigation_id=str(uuid4()),
             organization_id=org.id,
@@ -604,7 +609,10 @@ class TestAgenticActionRollback:
             requires_approval=True,
             execution_status=execution_status,
             rollback_available=rollback_available,
+            result=json.dumps(result) if result is not None else None,
         )
+        if tool_name is not None and hasattr(action, "tool_name"):
+            action.tool_name = tool_name
         db_session.add(action)
         await db_session.commit()
         await db_session.refresh(action)
@@ -621,6 +629,7 @@ class TestAgenticActionRollback:
             is_active=True,
             is_whitelisted=False,
             source="agent_block",
+            organization_id=org.id,
         )
         db_session.add(ioc)
         await db_session.commit()
@@ -629,7 +638,8 @@ class TestAgenticActionRollback:
             db_session, org,
             action_type="block_ip",
             target="203.0.113.99",
-            parameters={"_tool": "block_ip"},
+            tool_name="block_ip",
+            result={"ip": "203.0.113.99", "mode": "detection_only", "ioc_id": ioc.id, "agent_commands": []},
         )
 
         resp = await client.post(
@@ -639,7 +649,7 @@ class TestAgenticActionRollback:
         assert resp.status_code == 200, resp.text
         body = resp.json()
         assert body["status"] == "rolled_back"
-        assert ioc.id in body["detail"]["indicators_deactivated"]
+        assert body["detail"]["reversed"]["indicator_deactivated"] == ioc.id
 
         await db_session.refresh(ioc)
         assert ioc.is_active is False
@@ -665,7 +675,8 @@ class TestAgenticActionRollback:
             db_session, org,
             action_type="disable_account",
             target="disabled@rollback.test",
-            parameters={"_tool": "disable_user", "user_email": "disabled@rollback.test"},
+            tool_name="disable_user",
+            result={"user_id": disabled.id, "status": "disabled"},
         )
 
         resp = await client.post(
@@ -673,7 +684,9 @@ class TestAgenticActionRollback:
             headers=org_auth_headers,
         )
         assert resp.status_code == 200, resp.text
-        assert resp.json()["status"] == "rolled_back"
+        body = resp.json()
+        assert body["status"] == "rolled_back"
+        assert body["detail"]["reversed"]["user_reenabled"] == disabled.id
 
         await db_session.refresh(disabled)
         assert disabled.is_active is True
@@ -685,16 +698,18 @@ class TestAgenticActionRollback:
             db_session, org,
             action_type="create_ticket",
             target="TICKET-1",
+            # A completed execution that recorded no reversible effect ids.
+            result={"status": "created", "ticket": "TICKET-1"},
         )
 
         resp = await client.post(
             f"/api/v1/agentic/actions/{action.id}/rollback",
             headers=org_auth_headers,
         )
-        assert resp.status_code == 200, resp.text
-        body = resp.json()
-        assert body["status"] == "not_reversible"
-        assert "no automated inverse" in body["reason"]
+        assert resp.status_code == 409, resp.text
+        body = resp.json()["detail"]
+        assert body["error"] == "not_reversible"
+        assert "manual remediation" in body["detail"]
 
         await db_session.refresh(action)
         # Not marked rolled back, and no longer advertised as reversible
@@ -716,8 +731,10 @@ class TestAgenticActionRollback:
             f"/api/v1/agentic/actions/{action.id}/rollback",
             headers=org_auth_headers,
         )
-        assert resp.status_code == 400
-        assert "only" in resp.json()["detail"].lower()
+        assert resp.status_code == 409, resp.text
+        body = resp.json()["detail"]
+        assert body["error"] == "not_completed"
+        assert "only completed actions" in body["detail"]
 
     async def test_block_ip_rollback_fails_when_no_indicator(
         self, client, db_session: AsyncSession, org: Organization, org_auth_headers: dict
@@ -725,17 +742,22 @@ class TestAgenticActionRollback:
         action = await self._make_action(
             db_session, org,
             action_type="block_ip",
-            target="198.18.0.1",  # never blocked — no IOC exists
+            target="198.18.0.1",
+            tool_name="block_ip",
+            # The execution recorded an indicator id that no longer exists in
+            # this organization: the rollback must fail loudly, not silently
+            # deactivate some other row that happens to share the IP value.
+            result={"ip": "198.18.0.1", "ioc_id": "00000000-0000-4000-8000-000000000000", "agent_commands": []},
         )
 
         resp = await client.post(
             f"/api/v1/agentic/actions/{action.id}/rollback",
             headers=org_auth_headers,
         )
-        assert resp.status_code == 200, resp.text
-        body = resp.json()
-        assert body["status"] == "failed"
-        assert "no active threat indicator" in body["reason"]
+        assert resp.status_code == 409, resp.text
+        body = resp.json()["detail"]
+        assert body["error"] == "rollback_failed"
+        assert any("threat indicator" in p for p in body["problems"])
 
         await db_session.refresh(action)
         assert action.rollback_executed is False

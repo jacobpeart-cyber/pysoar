@@ -1,114 +1,545 @@
-"""API endpoints for Agentic AI SOC Analyst"""
+"""API endpoints for the Agentic AI SOC analyst.
 
+Every agent surface in this module (chat, direct tool execute, approve,
+rollback) goes through the same guarded runtime (design v2 sections 1, 7-9):
+
+    AgentContext (from the JWT)  ->  AgentToolRegistry (org-bound)
+         -> PolicyEngine (role / mode / tier / refs / rate / audit)
+             -> AgentRunner (provider turns, trust scan, proposals)
+
+There is no Gemini loop, no heuristic fallback and no canned reply left in
+here: when the LLM is not configured, out of budget or failing, the caller
+gets a typed 4xx/5xx and the user's message is persisted as ``failed`` so
+the UI can retry it.
+"""
+
+import hashlib
 import json
-import logging
 import math
+import time
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional
 
-from fastapi import APIRouter, Path, HTTPException, Query, status
+import structlog
+from fastapi import APIRouter, Body, HTTPException, Path, Query, Request, status
+from pydantic import BaseModel, Field
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from src.api.deps import CurrentUser, DatabaseSession
-from src.core.utils import safe_json_loads
-from src.models.alert import Alert
-from src.models.incident import Incident
-
-logger = logging.getLogger(__name__)
-from src.agentic.engine import (
-    AgenticSOCEngine,
-    AgentMemoryManager,
-    AgentOrchestrator,
-    NaturalLanguageInterface,
-)
+from src.agentic.context import ROLE_RANK, AgentContext, Mode, UserRole
+from src.agentic.decisions import TrustState, TrustTier
+from src.agentic.engine import AgenticSOCEngine, NaturalLanguageInterface
 from src.agentic.models import (
-    SOCAgent,
-    Investigation,
+    ActionExecutionStatus,
     AgentAction,
-    AgentMemory,
-    AgentChatSession,
     AgentChatMessage,
+    AgentChatSession,
+    AgentMemory,
+    Investigation,
     InvestigationFeedback as InvestigationFeedbackRow,
     InvestigationStatus,
-    ActionExecutionStatus,
+    SOCAgent,
+)
+from src.agentic.policy import (
+    AUDIT_EVENT_POLICY,
+    OrgPolicySettings,
+    PolicyEngine,
+    audit_rows_fallback_counter,
+    canonical_json,
+)
+from src.agentic.runtime import (
+    AdmissionDenied,
+    AgentRunner,
+    LLMCallRecord,
+    RunRejected,
+    RunResult,
+    _RunState,
 )
 from src.agentic.tasks import run_investigation
+from src.agentic.toolspec import Tier
+from src.agentic.trust import TrustScanner, trust_state_from_dict
+from src.api.deps import CurrentUser, DatabaseSession, RedisClient
+from src.audit_evidence.engine import AuditLogger
+from src.core.utils import safe_json_loads
+from src.llm.base import (
+    LLMNotConfigured,
+    LLMQuotaExceeded,
+    Message,
+    TextBlock,
+    Usage,
+)
+from src.llm.calllog import LLMCallLogWriter, price_call
+from src.llm import factory as llm_factory
+from src.llm.models import LLMCallLog
+from src.llm.quota import CircuitOpen, QuotaBackendUnavailable, TokenQuota
 from src.schemas.agentic import (
-    SOCAgentCreate,
-    SOCAgentResponse,
-    SOCAgentUpdate,
-    SOCAgentListResponse,
-    SOCAgentPerformance,
-    InvestigationCreate,
-    InvestigationUpdate,
-    InvestigationResponse,
-    InvestigationListResponse,
-    InvestigationCorrection,
-    InvestigationFeedback,
-    AgentActionResponse,
-    AgentActionApproval,
-    ActionPendingApproval,
-    NaturalLanguageQuery,
-    NaturalLanguageResponse,
-    AlertExplanation,
-    InvestigationExplanation,
-    DashboardMetrics,
-    InvestigationMetrics,
     AccuracyStats,
-    ThreatHuntRequest,
-    ThreatHuntResult,
-    ConfigUpdate,
+    ActionPendingApproval,
+    AgentActionApproval,
     AgentMemoryListResponse,
     AgentMemoryResponse,
-    MemoryStats,
-    ChatSessionCreate,
-    ChatSessionResponse,
-    ChatSessionListResponse,
-    ChatMessageResponse,
+    AgentProposal,
+    AlertExplanation,
     ChatMessageListResponse,
+    ChatMessageResponse,
+    ChatSessionCreate,
+    ChatSessionListResponse,
+    ChatSessionResponse,
+    DashboardMetrics,
+    InvestigationCorrection,
+    InvestigationCreate,
+    InvestigationExplanation,
+    InvestigationFeedback,
+    InvestigationListResponse,
+    InvestigationMetrics,
+    InvestigationResponse,
+    InvestigationUpdate,
+    MemoryStats,
+    NaturalLanguageQuery,
+    NaturalLanguageResponse,
+    SOCAgentCreate,
+    SOCAgentListResponse,
+    SOCAgentPerformance,
+    SOCAgentResponse,
+    SOCAgentUpdate,
+    ThreatHuntRequest,
+    ThreatHuntResult,
 )
+from src.services.agent_tools import AgentToolRegistry, render_json_schema
+
+logger = structlog.get_logger(__name__)
 
 router = APIRouter(prefix="/agentic", tags=["Agentic"])
 
+#: Turns of prior conversation replayed into a chat run (runtime elides further).
+CHAT_HISTORY_TURNS = 12
+#: Persisted assistant/user message payload cap.
+MESSAGE_RESULT_CAP = 8_000
 
-# NIST AC-3: state-changing / outward-facing tools require explicit caller
-# authorization (authorize_actions=True). Without it the chat agent is
-# read-only and these tools return blocked:true instead of executing.
-#
-# This is the single source of truth for the gate. The invariant
-# (enforced by tests/unit/test_destructive_tool_gate.py) is: EVERY tool the
-# registry registers under category="action" must be listed here, EXCEPT the
-# documentation-only tools in UNGATED_ACTION_TOOLS — an analyst should always
-# be able to record notes/findings. A new action tool that lands in neither
-# set fails the test, so the gate can't silently drift again.
-UNGATED_ACTION_TOOLS = frozenset({
-    # Pure documentation — append a note / record post-incident findings.
-    # No external effect, no irreversible state change.
-    "add_incident_note",
-    "update_incident_findings",
-})
 
-DESTRUCTIVE_TOOLS = frozenset({
-    "block_ip", "isolate_host", "disable_user", "execute_playbook",
-    "create_incident", "create_alert", "create_ioc", "create_war_room",
-    "create_remediation_ticket", "update_alert_status", "assign_alert",
-    "create_action_item", "create_forensic_case", "queue_endpoint_command",
-    # Fires connector-specific API actions on a third-party integration
-    # (EDR isolate, firewall block, notify, etc.) — outward-facing and
-    # state-changing, so it must require explicit authorization.
-    "execute_integration_action",
-    # Incident lifecycle / response (state-changing + containment actions).
-    "update_incident_status", "assign_incident", "remediate_incident",
-})
+# ============================================================================
+# Agent context + runtime wiring (design v2 sections 1 and 9)
+# ============================================================================
+
+
+def _org_id(current_user: Any) -> str:
+    """The caller's organization; every agent query is scoped to it."""
+    org_id = getattr(current_user, "organization_id", None)
+    if not org_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "no_organization",
+                "detail": "the account is not attached to an organization; agent tools are org-scoped",
+            },
+        )
+    return str(org_id)
+
+
+def _agent_role(current_user: Any) -> UserRole:
+    """Map the JWT user's role onto the agent role ladder (superuser -> admin)."""
+    if bool(getattr(current_user, "is_superuser", False)):
+        return UserRole.ADMIN
+    raw = str(getattr(current_user, "role", "") or "").lower()
+    if raw == UserRole.ADMIN.value:
+        return UserRole.ADMIN
+    if raw == UserRole.ANALYST.value:
+        return UserRole.ANALYST
+    return UserRole.VIEWER
+
+
+def _client_ip(request: Optional[Request]) -> Optional[str]:
+    if request is None:
+        return None
+    client = getattr(request, "client", None)
+    return getattr(client, "host", None)
+
+
+def _agent_context(
+    current_user: Any,
+    mode: Mode,
+    *,
+    propose_actions: bool = False,
+    session_id: Optional[str] = None,
+    investigation_id: Optional[str] = None,
+    request: Optional[Request] = None,
+    origin_trust_tier: Optional[TrustTier] = None,
+    approving_action_id: Optional[str] = None,
+) -> AgentContext:
+    """Build the run context from the JWT user. 403 when the user has no org."""
+    return AgentContext(
+        org_id=_org_id(current_user),
+        role=_agent_role(current_user),
+        mode=mode,
+        actor_user_id=str(getattr(current_user, "id", "") or ""),
+        propose_actions=propose_actions,
+        session_id=session_id,
+        investigation_id=investigation_id,
+        origin_trust_tier=origin_trust_tier,
+        approving_action_id=approving_action_id,
+        is_superuser=bool(getattr(current_user, "is_superuser", False)),
+        actor_ip=_client_ip(request),
+    )
+
+
+def _require_analyst(ctx: AgentContext) -> None:
+    if ROLE_RANK[ctx.role] < ROLE_RANK[UserRole.ANALYST]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "role_not_permitted", "detail": "this operation requires the analyst role"},
+        )
+
+
+class _RedisToolRateLimiter:
+    """Per-(org, tool) token bucket on the request's Redis client.
+
+    Implements ``ToolRateLimiter`` (src/agentic/policy.py). Any backend
+    failure propagates so the policy engine falls back to the audit-row
+    counter and, failing that, denies write+ tools (fail closed).
+    """
+
+    def __init__(self, redis: Any, *, limit_per_minute: int) -> None:
+        self._redis = redis
+        self._limit = max(int(limit_per_minute), 1)
+
+    async def try_acquire(self, org_id: str, tool: str) -> bool:
+        if self._redis is None:
+            raise RuntimeError("no redis client available for tool rate limiting")
+        minute = datetime.now(timezone.utc).strftime("%Y%m%d%H%M")
+        key = f"agent:toolrate:{org_id}:{tool}:{minute}"
+        count = int(await self._redis.incr(key))
+        if count == 1:
+            await self._redis.expire(key, 120)
+        return count <= self._limit
+
+
+def _agent_quota(redis: Any) -> TokenQuota:
+    """The LLM budget/admission/breaker backend for one request.
+
+    Factory indirection so tests can substitute a permissive implementation
+    without reaching into Redis; production always gets the real quota.
+    """
+    return TokenQuota(redis_factory=lambda: redis)
+
+
+class _QuotaAdmission:
+    """``Admission`` adapter: TokenQuota.admit(org, actor_key, bucket)."""
+
+    def __init__(self, quota: Any, bucket: str = "interactive") -> None:
+        self._quota = quota
+        self._bucket = bucket
+
+    def admit(self, ctx: AgentContext) -> Any:
+        actor_key = ctx.actor_user_id or ctx.soc_agent_id or "unknown"
+        return self._quota.admit(ctx.org_id, actor_key, self._bucket)
+
+
+class _QuotaBreaker:
+    """``CircuitBreaker`` adapter over TokenQuota's provider breaker."""
+
+    def __init__(self, quota: Any) -> None:
+        self._quota = quota
+
+    async def is_open(self, provider: str, credential_source: str, org_id: str) -> bool:
+        try:
+            await self._quota.breaker_check(provider, credential_source, org_id)
+        except CircuitOpen:
+            return True
+        return False
+
+    async def record_failure(self, provider: str, credential_source: str, org_id: str, error_class: str) -> None:
+        await self._quota.breaker_record_failure(provider, credential_source, org_id)
+
+    async def record_success(self, provider: str, credential_source: str, org_id: str) -> None:
+        await self._quota.breaker_record_success(provider, credential_source, org_id)
+
+
+def _call_log_writer() -> Any:
+    """Runtime ``CallLogWriter``: one committed ``llm_call_logs`` row per turn."""
+    writer = LLMCallLogWriter()
+
+    async def _write(record: LLMCallRecord) -> None:
+        usage = Usage(
+            input_uncached=record.input_uncached,
+            cache_read=record.cache_read,
+            cache_write=record.cache_write,
+            output=record.output,
+            thinking=record.thinking,
+            estimated=record.usage_estimated,
+        )
+        row = LLMCallLog(
+            run_id=record.run_id,
+            organization_id=record.organization_id,
+            actor_user_id=record.actor_user_id,
+            soc_agent_id=record.soc_agent_id,
+            purpose=record.purpose,
+            mode=record.mode,
+            role=record.role,
+            propose_actions=record.propose_actions,
+            session_id=record.session_id,
+            investigation_id=record.investigation_id,
+            provider=record.provider,
+            model=record.model,
+            credential_source=record.credential_source,
+            prompt_version=record.prompt_version,
+            system_prompt_sha256=record.system_prompt_sha256,
+            tools_offered=record.tools_offered,
+            messages_sha256=record.messages_sha256,
+            input_uncached_tokens=record.input_uncached,
+            cache_read_tokens=record.cache_read,
+            cache_write_tokens=record.cache_write,
+            output_tokens=record.output,
+            thinking_tokens=record.thinking,
+            total_billable_tokens=record.total_billable,
+            usage_estimated=record.usage_estimated,
+            latency_ms=record.latency_ms,
+            stop_reason=record.stop_reason,
+            injection_tier=record.injection_tier,
+            request_id=record.request_id,
+            data_sent_bytes=record.data_sent_bytes,
+            redactions_applied=record.redactions_applied,
+            error_class=record.error_class,
+            cost_usd=price_call(record.model, usage),
+        )
+        await writer.write(row)
+
+    return _write
+
+
+class _AgentRuntime:
+    """The wired collaborators one agent request needs."""
+
+    def __init__(
+        self,
+        *,
+        provider: Any,
+        registry: AgentToolRegistry,
+        policy: PolicyEngine,
+        runner: AgentRunner,
+        audit: AuditLogger,
+        quota: Any,
+        credential_source: str,
+    ) -> None:
+        self.provider = provider
+        self.registry = registry
+        self.policy = policy
+        self.runner = runner
+        self.audit = audit
+        self.quota = quota
+        self.credential_source = credential_source
+
+
+async def _build_runtime(
+    db: AsyncSession,
+    ctx: AgentContext,
+    redis: Any,
+    *,
+    purpose: str = "chat",
+    with_provider: bool = True,
+) -> _AgentRuntime:
+    """Resolve the org's provider and wire registry + policy + runner.
+
+    ``with_provider=False`` skips provider construction for the surfaces that
+    never call an LLM (direct tool execute, approve, rollback) so a tenant
+    without AI settings can still run tools.
+    """
+    registry = AgentToolRegistry(db, ctx)
+    audit = AuditLogger(db, ctx.org_id)
+    settings = OrgPolicySettings()
+    policy = PolicyEngine(
+        registry,
+        audit,
+        limiter=_RedisToolRateLimiter(redis, limit_per_minute=settings.tool_rate_limit_per_minute),
+        rate_fallback_counter=audit_rows_fallback_counter(db),
+        settings=settings,
+    )
+    registry.bind_policy(policy)
+
+    quota = _agent_quota(redis)
+    provider = None
+    credential_source = ""
+    if with_provider:
+        # Called through the module so the provider factory stays patchable
+        # (and so the org's settings remain the authoritative source).
+        config, api_key = await llm_factory.resolve_llm_config(db, ctx.org_id)
+        provider = llm_factory.build_provider(
+            config.provider,
+            model=config.model,
+            api_key=api_key,
+            credential_source=config.credential_source,
+        )
+        credential_source = config.credential_source
+
+    runner = AgentRunner(
+        provider=provider,
+        registry=registry,
+        policy=policy,
+        audit=audit,
+        session=db,
+        admission=_QuotaAdmission(quota) if with_provider else None,
+        breaker=_QuotaBreaker(quota) if with_provider else None,
+        call_log_writer=_call_log_writer() if with_provider else None,
+        purpose=purpose,
+    )
+    return _AgentRuntime(
+        provider=provider, registry=registry, policy=policy, runner=runner,
+        audit=audit, quota=quota, credential_source=credential_source,
+    )
+
+
+def _not_configured_error(exc: LLMNotConfigured) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail={
+            "error": "llm_not_configured",
+            "detail": str(exc),
+            "source": getattr(exc, "source", None),
+            "reason": getattr(exc, "reason", None),
+        },
+    )
+
+
+def _quota_error(exc: LLMQuotaExceeded) -> HTTPException:
+    retry_after = getattr(exc, "retry_after", None)
+    headers = {"Retry-After": str(int(retry_after))} if retry_after else None
+    return HTTPException(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        detail={
+            "error": "quota_backend_unavailable" if isinstance(exc, QuotaBackendUnavailable) else "llm_quota_exceeded",
+            "detail": str(exc),
+            "bucket": getattr(exc, "bucket", None),
+        },
+        headers=headers,
+    )
+
+
+def _run_result_error(result: RunResult) -> HTTPException:
+    """A run that ended in ``stop_reason=error`` is reported, never papered over."""
+    if result.error_code == CircuitOpen.code:
+        return HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": "llm_unavailable",
+                "detail": "the provider circuit breaker is open for this organization; no call was attempted",
+                "run_id": result.run_id,
+            },
+        )
+    return HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail={
+            "error": "llm_provider_error",
+            "detail": result.stop_detail or result.error_code or "the provider call failed",
+            "error_code": result.error_code,
+            "request_id": result.request_id,
+            "run_id": result.run_id,
+        },
+    )
+
+
+def _rejected_error(exc: RunRejected) -> HTTPException:
+    if isinstance(exc, AdmissionDenied):
+        headers = {"Retry-After": str(int(exc.retry_after))} if exc.retry_after else None
+        return HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={"error": exc.code, "detail": str(exc)},
+            headers=headers,
+        )
+    return HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail={"error": exc.code, "detail": str(exc)},
+    )
+
+
+def _tool_log_entry(entry: Any) -> dict[str, Any]:
+    """One renderable row for ``interpretation.tools_invoked``."""
+    out: dict[str, Any] = {
+        "step": entry.step,
+        "tool": entry.tool,
+        "args": entry.args,
+        "tier": entry.tier,
+        "decision": entry.decision,
+        "reason_code": entry.reason_code,
+        "blocked": not entry.allowed,
+        "duration_ms": entry.duration_ms,
+    }
+    if entry.proposal_id:
+        out["proposal_id"] = entry.proposal_id
+    if entry.allowed and entry.result_preview is not None:
+        out["result"] = entry.result_preview
+    if entry.error_class:
+        out["error"] = entry.error_class
+    return out
+
+
+def _proposal_payload(proposal: Any) -> dict[str, Any]:
+    return {
+        "id": proposal.id,
+        "tool": proposal.tool,
+        "args": proposal.args,
+        "effective_targets": proposal.effective_targets,
+        "params_sha256": proposal.params_sha256,
+        "evidence_sha256": proposal.evidence_sha256,
+        "suspect": proposal.suspect,
+        "expires_at": proposal.expires_at,
+    }
+
+
+def _policy_event_payload(event: Any) -> dict[str, Any]:
+    return {
+        "step": event.step,
+        "tool": event.tool,
+        "decision": event.decision,
+        "reason_code": event.reason_code,
+        "tier": event.tier.value if hasattr(event.tier, "value") else str(event.tier),
+        "audit_id": event.audit_id,
+        "proposal_id": event.proposal_id,
+    }
+
+
+def _usage_payload(usage: Usage) -> dict[str, Any]:
+    return {
+        "input_uncached": usage.input_uncached,
+        "cache_read": usage.cache_read,
+        "cache_write": usage.cache_write,
+        "output": usage.output,
+        "thinking": usage.thinking,
+        "total_billable": usage.total_billable,
+        "estimated": usage.estimated,
+    }
+
+
+def _proposal_state(ctx: AgentContext, trust: TrustState) -> _RunState:
+    """A minimal run state so the runtime's own materializer/auditor can be reused.
+
+    The direct-execute and approval surfaces must produce byte-identical
+    proposal hashes and audit payloads to the chat runtime, so they call the
+    runtime's methods rather than re-implementing them.
+    """
+    state = _RunState(ctx=ctx, started=time.monotonic())
+    state.trust = TrustScanner(trust)
+    return state
+
+
+def _result_dict(raw: Any) -> dict[str, Any]:
+    """``AgentAction.result`` normalized: it may be a JSON string or a dict."""
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        parsed = safe_json_loads(raw, {})
+        return parsed if isinstance(parsed, dict) else {"execution_result": parsed}
+    return {}
+
+
+def _rollback_capable(result: dict[str, Any]) -> bool:
+    """True when the execution recorded forward-effect ids we can reverse by id."""
+    return bool(result.get("ioc_id") or result.get("agent_commands") or result.get("user_id"))
+
 
 
 # ============================================================================
 # Structured Threat Hunt (PY-HUNT-001)
 # ============================================================================
-
-from pydantic import BaseModel, Field
 
 
 class StructuredHuntRequest(BaseModel):
@@ -401,25 +832,25 @@ async def get_investigation(
     if investigation.reasoning_chain:
         try:
             inv_data.reasoning_chain = safe_json_loads(investigation.reasoning_chain, {})
-        except:
+        except (ValueError, TypeError):  # malformed legacy JSON column
             pass
 
     if investigation.evidence_collected:
         try:
             inv_data.evidence_collected = safe_json_loads(investigation.evidence_collected, {})
-        except:
+        except (ValueError, TypeError):  # malformed legacy JSON column
             pass
 
     if investigation.actions_taken:
         try:
             inv_data.actions_taken = safe_json_loads(investigation.actions_taken, {})
-        except:
+        except (ValueError, TypeError):  # malformed legacy JSON column
             pass
 
     if investigation.recommendations:
         try:
             inv_data.recommendations = safe_json_loads(investigation.recommendations, {})
-        except:
+        except (ValueError, TypeError):  # malformed legacy JSON column
             pass
 
     return inv_data
@@ -757,376 +1188,812 @@ async def list_pending_approvals(
         "pages": math.ceil(total / size) if total > 0 else 0,
     }
 
+def _params_dict(raw: Any) -> dict[str, Any]:
+    """``AgentAction.parameters`` normalized (dict rows and legacy JSON strings)."""
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        parsed = safe_json_loads(raw, {})
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _conflict(error: str, detail: str, **extra: Any) -> HTTPException:
+    payload: dict[str, Any] = {"error": error, "detail": detail}
+    payload.update(extra)
+    return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=payload)
+
+
+def _expired(action: AgentAction) -> bool:
+    expires_at = getattr(action, "expires_at", None)
+    if expires_at is None:
+        return False
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    return expires_at < datetime.now(timezone.utc)
+
 
 @router.post("/actions/{action_id}/approve")
 async def approve_action(
     approval: AgentActionApproval,
+    request: Request,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
+    redis: RedisClient = None,
     action_id: str = Path(...),
 ):
-    """Approve an agent-proposed action and execute it.
+    """Approve (or deny) an agent-proposed action and execute it.
 
-    When `approved=true`, the action is dispatched through the
-    AgentToolRegistry (same registry the chat agent and autonomous
-    investigator use). The tool executes against real platform state
-    and the outcome is persisted back onto the AgentAction row so a
-    3PAO can trace: investigation → recommendation → approval →
-    execution → result.
-
-    Closes the IR loop the autonomous investigator started: a TP
-    verdict produces approval-gated actions; a human clicks approve;
-    the platform actually executes. Every hop is logged in
-    ticket_activities (AU-2) and the AgentAction row (AU-3).
+    Design v2 section 8. The approval is bound by hash to the exact
+    arguments and evidence the proposal was created with, re-evaluated by
+    the policy engine in ``approval`` mode with the originating run's trust
+    tier, and executed through ``AgentToolRegistry.call`` with the approver
+    as the actor. Both audit events (pre-decision + post-execution) are
+    written by the same code the chat runtime uses.
     """
-    action = await db.get(AgentAction, action_id)
+    ctx_probe = _agent_context(current_user, Mode.APPROVAL, request=request)
+    _require_analyst(ctx_probe)
+    org_id = ctx_probe.org_id
 
-    if not action or action.organization_id != getattr(current_user, "organization_id", None):
+    action = (await db.execute(
+        select(AgentAction).where(AgentAction.id == action_id, AgentAction.organization_id == org_id)
+    )).scalar_one_or_none()
+    if action is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Action not found",
+            detail={"error": "action_not_found", "detail": "Action not found"},
         )
+
+    approver_ip = _client_ip(request)
+    approver_role = ctx_probe.role.value
+    now = datetime.now(timezone.utc)
 
     if not approval.approved:
         action.execution_status = ActionExecutionStatus.DENIED.value
+        action.approved_by = ctx_probe.actor_user_id
+        action.approval_timestamp = now.isoformat()
+        if hasattr(action, "approver_role"):
+            action.approver_role = approver_role
+            action.approver_ip = approver_ip
+            action.approval_reason = approval.reason or approval.approval_notes
+        audit = AuditLogger(db, org_id)
+        await audit.log_event(
+            event_type=AUDIT_EVENT_POLICY,
+            action="action.denied",
+            actor_type="user",
+            actor_id=ctx_probe.actor_user_id or "unknown",
+            resource_type="agent_action",
+            resource_id=action.id,
+            description=f"proposal denied: {action.tool_name or action.action_type}",
+            new_value={
+                "tool": action.tool_name,
+                "reason": (approval.reason or approval.approval_notes or "")[:500],
+                "approver_role": approver_role,
+            },
+            result="denied",
+            risk_level="medium",
+            actor_ip=approver_ip,
+            request_id=action.run_id,
+            run_id=action.run_id,
+        )
         await db.commit()
-        return {"status": "denied", "action_id": action_id}
+        return {"status": "denied", "action_id": action_id, "execution_status": action.execution_status}
 
-    # Mark approved, then dispatch.
-    action.execution_status = ActionExecutionStatus.APPROVED.value
-    action.approved_by = current_user.id
-    action.approval_timestamp = datetime.now(timezone.utc).isoformat()
+    if action.execution_status != ActionExecutionStatus.PENDING_APPROVAL.value:
+        raise _conflict(
+            "not_pending_approval",
+            f"action is in status '{action.execution_status}'; only pending proposals can be approved",
+        )
+
+    tool_name = getattr(action, "tool_name", None)
+    params = _params_dict(action.parameters)
+
+    # -- hash binding (AC-3 / SI-10): approve exactly what was proposed ----
+    stored_params_sha = getattr(action, "params_sha256", None)
+    stored_evidence_sha = getattr(action, "evidence_sha256", None)
+    if not stored_params_sha or not stored_evidence_sha:
+        raise _conflict(
+            "approval_stale",
+            "this proposal carries no argument/evidence binding; it cannot be approved for execution",
+        )
+    if approval.params_sha256 != stored_params_sha or approval.evidence_sha256 != stored_evidence_sha:
+        raise _conflict("approval_stale", "the approval does not match the proposal's bound arguments or evidence")
+    if tool_name:
+        recomputed = hashlib.sha256(
+            canonical_json({"tool": tool_name, "args": params}).encode("utf-8")
+        ).hexdigest()
+        if recomputed != stored_params_sha:
+            raise _conflict("approval_stale", "the stored arguments no longer hash to the proposal binding")
+
+    if _expired(action):
+        raise _conflict("approval_expired", "the proposal expired before it was approved")
+
+    # -- suspect proposals (prompt-injection contaminated evidence) --------
+    if bool(getattr(action, "suspect", False)):
+        if ctx_probe.role is not UserRole.ADMIN or not approval.acknowledge_suspect or not (approval.reason or "").strip():
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "error": "suspect_action_requires_reinvestigation",
+                    "detail": (
+                        "this proposal was raised from evidence flagged for prompt injection; an admin must "
+                        "acknowledge_suspect with a written reason, or the alert must be re-investigated"
+                    ),
+                    "injection_tier": getattr(action, "injection_tier", None),
+                },
+            )
+        audit = AuditLogger(db, org_id)
+        await audit.log_event(
+            event_type=AUDIT_EVENT_POLICY,
+            action="suspect.approved",
+            actor_type="user",
+            actor_id=ctx_probe.actor_user_id or "unknown",
+            resource_type="agent_action",
+            resource_id=action.id,
+            description=f"admin acknowledged a suspect proposal: {tool_name or action.action_type}",
+            new_value={
+                "tool": tool_name,
+                "injection_tier": getattr(action, "injection_tier", None),
+                "reason": approval.reason[:500],
+                "approver_role": approver_role,
+            },
+            result="success",
+            risk_level="high",
+            actor_ip=approver_ip,
+            request_id=action.run_id,
+            run_id=action.run_id,
+        )
+
+    # -- proposals with no executable tool stay human work ------------------
+    if not tool_name:
+        action.execution_status = ActionExecutionStatus.APPROVED.value
+        action.approved_by = ctx_probe.actor_user_id
+        action.approval_timestamp = now.isoformat()
+        if hasattr(action, "approver_role"):
+            action.approver_role = approver_role
+            action.approver_ip = approver_ip
+            action.approval_reason = approval.reason or approval.approval_notes
+        action.rollback_available = False
+        action.result = json.dumps(
+            {
+                "executed": False,
+                "note": "approved as human work: this proposal carries no executable tool",
+                "target": action.target,
+            }
+        )
+        await db.commit()
+        return {
+            "status": "approved",
+            "action_id": action_id,
+            "executed": False,
+            "execution_status": action.execution_status,
+            "detail": "no executable tool is bound to this proposal; it is recorded as human work",
+        }
+
+    origin_tier: Optional[TrustTier] = None
+    raw_tier = getattr(action, "injection_tier", None)
+    if raw_tier:
+        try:
+            origin_tier = TrustTier(str(raw_tier))
+        except ValueError:
+            origin_tier = TrustTier.LOCKDOWN  # an unreadable tier is treated as the worst case
+
+    ctx = _agent_context(
+        current_user,
+        Mode.APPROVAL,
+        propose_actions=True,
+        investigation_id=action.investigation_id,
+        request=request,
+        origin_trust_tier=origin_tier,
+        approving_action_id=action.id,
+    )
+    runtime = await _build_runtime(db, ctx, redis, purpose="approval", with_provider=False)
+
+    spec = runtime.registry.specs.get(tool_name)
+    if spec is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": "unknown_tool", "detail": f"{tool_name} is not a registered tool"},
+        )
+    if spec.tier is Tier.PRIVILEGED and ctx.role is not UserRole.ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "role_not_permitted", "detail": "privileged actions require an admin approver"},
+        )
+
+    action.approved_by = ctx.actor_user_id
+    action.approval_timestamp = now.isoformat()
+    if hasattr(action, "approver_role"):
+        action.approver_role = approver_role
+        action.approver_ip = approver_ip
+        action.approval_reason = approval.reason or approval.approval_notes
     await db.flush()
 
-    # AU-2 audit: record the approval decision before execution.
-    try:
-        from src.tickethub.models import TicketActivity
-        db.add(TicketActivity(
-            source_type="agent_action",
-            source_id=action.id,
-            activity_type="action_approved",
-            description=(
-                f"user={getattr(current_user, 'email', 'system')} "
-                f"action_type={action.action_type} target={action.target}"
-            ),
-            organization_id=action.organization_id,
-        ))
-        await db.flush()
-    except Exception:
-        pass
+    decision = await runtime.policy.evaluate(ctx, spec, params, TrustState(), step=0)
+    if decision.kind != "allow":
+        # The proposal stays pending: the approval was recorded and audited,
+        # but the policy refused the execution.
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "policy_denied",
+                "reason_code": decision.reason_code,
+                "detail": decision.detail or f"policy returned {decision.kind} for {tool_name}",
+                "decision": decision.kind,
+            },
+        )
 
-    # Execute via the same tool registry the agent uses. `parameters`
-    # carries _tool (which registered tool to invoke) + the tool args.
+    state = _proposal_state(ctx, TrustState(tier=origin_tier or TrustTier.CLEAN))
+    started = time.monotonic()
+    action.execution_status = ActionExecutionStatus.APPROVED.value
+    await db.flush()
+    action.execution_status = ActionExecutionStatus.EXECUTING.value
+    await db.flush()
     try:
-        from src.services.agent_tools import AgentToolRegistry
-        registry = AgentToolRegistry(db)
-        params = json.loads(action.parameters) if action.parameters else {}
-        tool_name = params.pop("_tool", None)
-        params.pop("_description", None)  # not a tool arg
-        if tool_name:
-            action.execution_status = ActionExecutionStatus.EXECUTING.value
-            await db.flush()
-            result = await registry.execute(tool_name, params)
-            action.result = json.dumps(result, default=str)[:8000]
-            action.execution_status = (
-                ActionExecutionStatus.COMPLETED.value
-                if result.get("success")
-                else ActionExecutionStatus.FAILED.value
-            )
-        else:
-            # No mapped tool (e.g. ESCALATE / SNAPSHOT_VM) — the human
-            # analyst is the executor. We record approval only.
-            action.result = json.dumps({
-                "note": "Approved as human task — no automated tool",
-                "description": params.get("description") or "",
-            })
-            action.execution_status = ActionExecutionStatus.COMPLETED.value
-    except Exception as exc:  # noqa: BLE001
+        result = await runtime.registry.call(ctx, tool_name, params, decision=decision, policy=runtime.policy)
+    except PermissionError as exc:
+        await runtime.runner._audit_post(state, tool_name, "blocked", started, error_class=str(exc))
+        action.execution_status = ActionExecutionStatus.PENDING_APPROVAL.value
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "policy_denied", "reason_code": str(exc), "detail": "the tool refused the approved call"},
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 - the failure class is recorded, never the secrets
+        error_class = exc.__class__.__name__
+        logger.error("approved_action_failed", action_id=action.id, tool=tool_name, error_class=error_class)
+        await runtime.runner._audit_post(state, tool_name, "failed", started, error_class=error_class)
         action.execution_status = ActionExecutionStatus.FAILED.value
-        action.result = json.dumps({"error": str(exc)[:500]})
-        logger.exception("approve_action execution failed")
+        action.result = json.dumps({"executed": False, "error_class": error_class})
+        action.rollback_available = False
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"error": "tool_failed", "detail": f"{error_class}: the approved tool did not complete"},
+        ) from exc
 
+    payload = result if isinstance(result, dict) else {"result": result}
+    result_json = json.dumps(payload, default=str)[:MESSAGE_RESULT_CAP]
+    action.result = result_json
+    action.execution_status = (
+        ActionExecutionStatus.FAILED.value if isinstance(payload, dict) and payload.get("error")
+        else ActionExecutionStatus.COMPLETED.value
+    )
+    action.rollback_available = _rollback_capable(payload) and action.execution_status == ActionExecutionStatus.COMPLETED.value
+    await runtime.runner._audit_post(
+        state,
+        tool_name,
+        "executed" if action.execution_status == ActionExecutionStatus.COMPLETED.value else "failed",
+        started,
+        extra={
+            "action_id": action.id,
+            "approver_role": approver_role,
+            "params_sha256": stored_params_sha,
+            "result_sha256": hashlib.sha256(result_json.encode("utf-8")).hexdigest(),
+            "rollback_available": action.rollback_available,
+        },
+    )
     await db.commit()
 
     return {
         "status": "approved",
         "action_id": action_id,
+        "executed": True,
+        "tool": tool_name,
         "execution_status": action.execution_status,
-        "result_preview": (action.result or "")[:300],
+        "rollback_available": action.rollback_available,
+        "result": payload,
+        "run_id": action.run_id,
     }
 
 
 @router.post("/actions/{action_id}/rollback")
 async def rollback_action(
+    request: Request,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     action_id: str = Path(...),
 ):
-    """Rollback an executed action by actually reversing what it did.
+    """Reverse an executed action by its recorded forward-effect ids only.
 
-    Agentic actions execute through the AgentToolRegistry (see
-    approve_action), so the inverse is dispatched per tool:
-
-    - ``block_ip``       → the tool created an active ThreatIndicator
-                           for the target; find and deactivate it.
-    - ``disable_account``/``disable_user`` → the tool set
-                           ``User.is_active = False``; re-enable.
-    - ``isolate_host``   → the tool is detection-only (it records a
-                           ticket activity, no enforcement point); the
-                           record is negated with a compensating
-                           release entry and the response says so via
-                           ``mode: detection_only``.
-
-    Anything else has no automated inverse — the endpoint reports
-    ``status: not_reversible`` with the reason and marks the action so,
-    instead of returning a fabricated success.
+    Design v2 section 3/8: the rollback never re-derives its targets from
+    values in the proposal (an attacker-influenced value must not steer the
+    reversal). It reads the ids the forward execution recorded in
+    ``AgentAction.result`` -- the ThreatIndicator id, the endpoint-agent
+    command ids, the User id -- and reverses exactly those. Where the
+    forward effect was an endpoint-agent command, the inverse command
+    (``unblock_ip`` / ``release_host``) is queued through the same agent
+    service, issued by the approver.
     """
+    from src.agents.capabilities import capability_allows
+    from src.agents.models import EndpointAgent
+    from src.agents.service import AgentService, AgentServiceError
     from src.intel.models import ThreatIndicator
     from src.models.user import User
-    from src.tickethub.models import TicketActivity
 
-    action = await db.get(AgentAction, action_id)
+    ctx = _agent_context(current_user, Mode.APPROVAL, request=request)
+    _require_analyst(ctx)
+    org_id = ctx.org_id
 
-    if not action or action.organization_id != getattr(current_user, "organization_id", None):
+    action = (await db.execute(
+        select(AgentAction).where(AgentAction.id == action_id, AgentAction.organization_id == org_id)
+    )).scalar_one_or_none()
+    if action is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Action not found",
+            detail={"error": "action_not_found", "detail": "Action not found"},
         )
-
-    if not action.rollback_available:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Action does not support rollback",
-        )
-
     if action.rollback_executed or action.execution_status == ActionExecutionStatus.ROLLED_BACK.value:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Action has already been rolled back",
-        )
-
+        raise _conflict("already_rolled_back", "this action has already been rolled back")
     if action.execution_status != ActionExecutionStatus.COMPLETED.value:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(
-                f"Action is in status '{action.execution_status}'; only "
-                "completed actions have executed effects to reverse"
-            ),
+        raise _conflict(
+            "not_completed",
+            f"action is in status '{action.execution_status}'; only completed actions have effects to reverse",
         )
 
-    # parameters may be a JSON string (investigator/tools write
-    # json.dumps) or a dict (skills write dicts) — normalize.
-    try:
-        params = action.parameters if isinstance(action.parameters, dict) else json.loads(action.parameters or "{}")
-    except (ValueError, TypeError):
-        params = {}
-    tool_name = params.get("_tool")
-    action_key = (action.action_type or "").lower()
-
-    rollback_detail: dict
-    if action_key == "block_ip" or tool_name == "block_ip":
-        # Forward effect: ThreatIndicator rows created for the target.
-        result = await db.execute(
-            select(ThreatIndicator).where(
-                and_(
-                    ThreatIndicator.value == action.target,
-                    ThreatIndicator.is_active == True,  # noqa: E712
-                )
-            )
-        )
-        iocs = list(result.scalars().all())
-        if not iocs:
-            return {
-                "status": "failed",
-                "action_id": action_id,
-                "reason": (
-                    f"no active threat indicator found for {action.target}; "
-                    "nothing to deactivate"
-                ),
-            }
-        for ioc in iocs:
-            ioc.is_active = False
-        rollback_detail = {
-            "reversed": "block_ip",
-            "indicators_deactivated": [ioc.id for ioc in iocs],
-        }
-
-    elif action_key in ("disable_account", "disable_user") or tool_name == "disable_user":
-        target_email = params.get("user_email") or action.target
-        result = await db.execute(select(User).where(User.email == target_email))
-        user = result.scalar_one_or_none()
-        if not user:
-            return {
-                "status": "failed",
-                "action_id": action_id,
-                "reason": f"user {target_email} not found; cannot re-enable account",
-            }
-        if user.is_active:
-            rollback_detail = {
-                "reversed": "disable_account",
-                "user_id": user.id,
-                "note": "account was already active",
-            }
-        else:
-            user.is_active = True
-            rollback_detail = {
-                "reversed": "disable_account",
-                "user_id": user.id,
-                "is_active": True,
-            }
-
-    elif action_key == "isolate_host" or tool_name == "isolate_host":
-        # The forward isolate_host tool is detection-only: it records a
-        # ticket activity but performs no network enforcement. Reversal
-        # is the compensating record — and we say so.
-        db.add(TicketActivity(
-            source_type="remediation",
-            source_id=action.target,
-            activity_type="release_host",
-            description=(
-                f"Host {action.target} isolation rolled back "
-                f"(detection-only record; no network enforcement existed to reverse)"
-            ),
-            organization_id=action.organization_id,
-        ))
-        rollback_detail = {
-            "reversed": "isolate_host",
-            "mode": "detection_only",
-            "detail": (
-                "forward isolation was a detection-only record; "
-                "compensating release entry logged, no network change to reverse"
-            ),
-        }
-
-    else:
-        # No automated inverse exists for this action type. Report
-        # honestly and remember that so the UI stops offering rollback.
+    recorded = _result_dict(action.result)
+    if not _rollback_capable(recorded):
         action.rollback_available = False
         await db.commit()
-        return {
-            "status": "not_reversible",
-            "action_id": action_id,
-            "reason": (
-                f"action type '{action.action_type}' has no automated inverse; "
-                "manual remediation required"
-            ),
-        }
+        raise _conflict(
+            "not_reversible",
+            "the execution recorded no reversible effect ids; manual remediation is required",
+            tool=getattr(action, "tool_name", None),
+        )
 
+    audit = AuditLogger(db, org_id)
+    await audit.log_event(
+        event_type=AUDIT_EVENT_POLICY,
+        action="action.rollback",
+        actor_type="user",
+        actor_id=ctx.actor_user_id or "unknown",
+        resource_type="agent_action",
+        resource_id=action.id,
+        description=f"rollback requested for {getattr(action, 'tool_name', None) or action.action_type}",
+        new_value={"tool": getattr(action, "tool_name", None), "effects": sorted(recorded.keys())[:20]},
+        result="success",
+        risk_level="medium",
+        actor_ip=ctx.actor_ip,
+        request_id=ctx.run_id,
+        run_id=ctx.run_id,
+    )
+
+    reversed_effects: dict[str, Any] = {}
+    problems: list[str] = []
+
+    ioc_id = recorded.get("ioc_id")
+    if ioc_id:
+        ioc = (await db.execute(
+            select(ThreatIndicator).where(
+                ThreatIndicator.id == str(ioc_id), ThreatIndicator.organization_id == org_id
+            )
+        )).scalar_one_or_none()
+        if ioc is None:
+            problems.append(f"threat indicator {ioc_id} is no longer present in this organization")
+        else:
+            ioc.is_active = False
+            reversed_effects["indicator_deactivated"] = ioc.id
+
+    user_id = recorded.get("user_id")
+    if user_id:
+        user = (await db.execute(
+            select(User).where(User.id == str(user_id), User.organization_id == org_id)
+        )).scalar_one_or_none()
+        if user is None:
+            problems.append(f"user {user_id} is no longer present in this organization")
+        else:
+            user.is_active = True
+            reversed_effects["user_reenabled"] = user.id
+
+    commands = recorded.get("agent_commands")
+    if isinstance(commands, list) and commands:
+        inverse = {"block_ip": "unblock_ip", "isolate_host": "release_host"}.get(
+            str(getattr(action, "tool_name", "") or action.action_type or "")
+        )
+        if inverse is None:
+            problems.append(
+                f"no inverse endpoint command is defined for {getattr(action, 'tool_name', None) or action.action_type}"
+            )
+        else:
+            svc = AgentService(db)
+            issued: list[dict[str, Any]] = []
+            for entry in commands:
+                if not isinstance(entry, dict) or not entry.get("agent_id"):
+                    continue
+                agent = (await db.execute(
+                    select(EndpointAgent).where(
+                        EndpointAgent.id == str(entry["agent_id"]),
+                        EndpointAgent.organization_id == org_id,
+                    )
+                )).scalar_one_or_none()
+                if agent is None:
+                    problems.append(f"endpoint agent {entry.get('agent_id')} not found; cannot queue {inverse}")
+                    continue
+                if not capability_allows(list(agent.capabilities or []), inverse):
+                    problems.append(f"agent {agent.id} is not enrolled for {inverse}")
+                    continue
+                payload = (
+                    {"ip": recorded.get("ip")} if inverse == "unblock_ip"
+                    else {"hostname": recorded.get("hostname")}
+                )
+                try:
+                    cmd = await svc.issue_command(
+                        agent=agent,
+                        action=inverse,
+                        payload=payload,
+                        issued_by=ctx.actor_user_id,
+                        approval_override=True,
+                    )
+                except AgentServiceError as exc:
+                    problems.append(f"agent {agent.id}: {exc}")
+                    continue
+                issued.append({
+                    "agent_id": agent.id,
+                    "reverses_command_id": entry.get("command_id"),
+                    "command_id": cmd.id,
+                    "action": inverse,
+                })
+            if issued:
+                reversed_effects["inverse_commands"] = issued
+
+    if not reversed_effects:
+        await db.commit()
+        raise _conflict(
+            "rollback_failed",
+            "none of the recorded effects could be reversed",
+            problems=problems[:10],
+        )
+
+    detail = {"reversed": reversed_effects, "problems": problems[:10]}
     action.rollback_executed = True
     action.execution_status = ActionExecutionStatus.ROLLED_BACK.value
-    # Persist the rollback outcome alongside the execution result.
-    try:
-        result_data = json.loads(action.result) if action.result else {}
-        if not isinstance(result_data, dict):
-            result_data = {"execution_result": result_data}
-    except (ValueError, TypeError):
-        result_data = {}
-    result_data["rollback"] = rollback_detail
-    action.result = json.dumps(result_data, default=str)[:8000]
+    stored = _result_dict(action.result)
+    stored["rollback"] = detail
+    action.result = json.dumps(stored, default=str)[:MESSAGE_RESULT_CAP]
 
-    # AU-2 audit: record the rollback with what was actually reversed.
-    db.add(TicketActivity(
-        source_type="agent_action",
-        source_id=action.id,
-        activity_type="action_rolled_back",
-        description=(
-            f"user={getattr(current_user, 'email', 'system')} "
-            f"action_type={action.action_type} target={action.target} "
-            f"detail={json.dumps(rollback_detail, default=str)[:400]}"
-        ),
-        organization_id=action.organization_id,
-    ))
-
+    await audit.log_event(
+        event_type=AUDIT_EVENT_POLICY,
+        action="action.rolled_back",
+        actor_type="user",
+        actor_id=ctx.actor_user_id or "unknown",
+        resource_type="agent_action",
+        resource_id=action.id,
+        description=f"rollback executed for {getattr(action, 'tool_name', None) or action.action_type}",
+        new_value=detail,
+        result="success" if not problems else "partial",
+        risk_level="medium",
+        actor_ip=ctx.actor_ip,
+        request_id=ctx.run_id,
+        run_id=ctx.run_id,
+    )
     await db.commit()
 
-    return {
-        "status": "rolled_back",
-        "action_id": action_id,
-        "detail": rollback_detail,
-    }
+    return {"status": "rolled_back", "action_id": action_id, "detail": detail}
+
+
 
 
 # ============================================================================
 # Natural Language Interface
 # ============================================================================
 
-
 @router.get("/tools")
 async def list_agent_tools(
+    request: Request,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    category: Optional[str] = None,
 ):
-    """List all tools the AI agent can invoke."""
-    from src.services.agent_tools import AgentToolRegistry
-    registry = AgentToolRegistry(db)
-    return {"tools": registry.list_tools(category=category), "total": len(registry.tools)}
+    """The tools the caller's role may invoke (ToolSpec-driven, org-bound)."""
+    ctx = _agent_context(current_user, Mode.INTERACTIVE, request=request)
+    registry = AgentToolRegistry(db, ctx)
+    tools = [
+        {
+            "name": spec.name,
+            "description": spec.description,
+            "parameters": render_json_schema(spec),
+            "tier": spec.tier.value,
+            "min_role": spec.min_role.value,
+        }
+        for spec in registry.visible_specs(ctx.role)
+    ]
+    return {"tools": tools, "total": len(tools)}
 
 
 @router.post("/tools/{tool_name}/execute")
 async def execute_agent_tool(
     tool_name: str,
-    params: dict,
+    request: Request,
+    body: dict[str, Any] = Body(default_factory=dict),
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
+    redis: RedisClient = None,
 ):
-    """Execute an agent tool directly. Every invocation is audit-logged."""
-    from src.services.agent_tools import AgentToolRegistry
-    from src.tickethub.models import TicketActivity
+    """Execute one tool directly, through the same policy gate as the agent.
 
-    registry = AgentToolRegistry(db)
-    org_id = getattr(current_user, "organization_id", None)
+    F14 (direct execute bypass) is closed: the call goes through
+    ``PolicyEngine.evaluate`` + ``AgentToolRegistry.call``, so role, tier,
+    reference scoping, rate limits and the audit pair all apply. A
+    destructive/privileged tier therefore yields a *proposal* here too -- it
+    is never executed inline.
 
-    # AU-2: Audit log the direct invocation
+    Body: the tool arguments, optionally wrapped as
+    ``{"params": {...}, "propose_actions": true}``.
+    """
+    propose_actions = bool(body.pop("propose_actions", False)) if isinstance(body, dict) else False
+    params = body.get("params") if isinstance(body.get("params"), dict) else body
+    if not isinstance(params, dict):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "invalid_arguments", "detail": "tool arguments must be a JSON object"},
+        )
+
+    ctx = _agent_context(
+        current_user, Mode.INTERACTIVE, propose_actions=propose_actions, request=request
+    )
+    runtime = await _build_runtime(db, ctx, redis, purpose="chat", with_provider=False)
+    spec = runtime.registry.specs.get(tool_name)
+    if spec is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": "unknown_tool", "detail": f"{tool_name} is not a registered tool"},
+        )
+
+    decision = await runtime.policy.evaluate(ctx, spec, params, TrustState(), step=0)
+    state = _proposal_state(ctx, TrustState())
+    started = time.monotonic()
+
+    if decision.kind == "propose":
+        investigation = await _proposal_investigation(
+            db, ctx.org_id,
+            trigger_type="direct_tool",
+            source_id=ctx.actor_user_id or "unknown",
+            title=f"Direct tool proposals: {getattr(current_user, 'email', ctx.actor_user_id)}",
+            hypothesis="Destructive tools invoked directly are proposed for approval, never executed inline.",
+        )
+        if investigation is None:
+            raise _proposals_unavailable()
+        ctx.investigation_id = investigation.id
+        proposal = await runtime.runner._materialize_proposal(state, decision)
+        await runtime.runner._audit_post(
+            state, tool_name, "proposed" if proposal.persisted else "failed", started,
+            extra={"proposal_id": proposal.id, "params_sha256": proposal.params_sha256},
+            error_class=None if proposal.persisted else "proposal_not_persisted",
+        )
+        await db.commit()
+        if not proposal.persisted:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "error": "proposal_unavailable",
+                    "detail": (
+                        "the proposal could not be recorded, so nothing was executed; "
+                        "destructive tools are only executed from an approved proposal"
+                    ),
+                },
+            )
+        return {"proposed": True, "executed": False, "proposal": _proposal_payload(proposal)}
+
+    if decision.kind != "allow":
+        await runtime.runner._audit_post(
+            state, tool_name, "blocked", started, error_class=decision.reason_code, detail=decision.detail,
+        )
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "policy_denied",
+                "reason_code": decision.reason_code,
+                "detail": decision.detail or f"{tool_name} was denied",
+            },
+        )
+
     try:
-        db.add(TicketActivity(
-            source_type="agent_decision",
-            source_id="direct_api",
-            activity_type="tool_direct_invocation",
-            description=(
-                f"tool={tool_name} user={getattr(current_user, 'email', 'system')} "
-                f"params={json.dumps(params, default=str)[:500]}"
-            ),
-            organization_id=org_id,
-        ))
-        await db.flush()
-    except Exception as e:
-        logger.warning(f"Direct tool audit log failed: {e}")
+        result = await runtime.registry.call(ctx, tool_name, params, decision=decision, policy=runtime.policy)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={"error": "unknown_tool", "detail": f"{tool_name} is not a registered tool"},
+        ) from exc
+    except PermissionError as exc:
+        await runtime.runner._audit_post(state, tool_name, "blocked", started, error_class=str(exc))
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "policy_denied", "reason_code": str(exc), "detail": f"{tool_name} was denied"},
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 - the failure class is recorded, never its secrets
+        error_class = exc.__class__.__name__
+        logger.error("direct_tool_failed", tool=tool_name, error_class=error_class, organization_id=ctx.org_id)
+        await runtime.runner._audit_post(state, tool_name, "failed", started, error_class=error_class)
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"error": "tool_failed", "detail": f"{error_class}: the tool did not complete"},
+        ) from exc
 
-    result = await registry.execute(tool_name, params)
+    payload = result if isinstance(result, dict) else {"result": result}
+    await runtime.runner._audit_post(
+        state, tool_name, "executed", started,
+        extra={"result_sha256": hashlib.sha256(
+            json.dumps(payload, default=str, sort_keys=True).encode("utf-8")
+        ).hexdigest()},
+    )
     await db.commit()
-    return result
+    return {"proposed": False, "executed": True, "tool": tool_name, "result": payload}
+
+
+# ----------------------------------------------------------------------------
+# Chat
+# ----------------------------------------------------------------------------
+
+
+def _jsonable(value: Any) -> Any:
+    """JSON-safe copy for the ``tool_calls`` JSON column (datetimes -> str)."""
+    return json.loads(json.dumps(value, default=str))
+
+
+async def _chat_history(db: AsyncSession, session_id: str) -> list[Message]:
+    """The last ``CHAT_HISTORY_TURNS`` persisted turns, oldest first."""
+    rows = (await db.execute(
+        select(AgentChatMessage)
+        .where(AgentChatMessage.session_id == session_id)
+        .order_by(AgentChatMessage.created_at.desc(), AgentChatMessage.id.desc())
+        .limit(CHAT_HISTORY_TURNS)
+    )).scalars().all()
+    history: list[Message] = []
+    for row in reversed(list(rows)):
+        text = (row.content or "").strip()
+        if not text:
+            continue
+        role = "assistant" if (row.role or "user") == "assistant" else "user"
+        history.append(Message(role=role, content=[TextBlock(text=text)]))
+    return history
+
+
+async def _proposal_investigation(
+    db: AsyncSession,
+    org_id: str,
+    *,
+    trigger_type: str,
+    source_id: str,
+    title: str,
+    hypothesis: str,
+    agent: Optional[SOCAgent] = None,
+) -> Optional[Investigation]:
+    """The investigation interactive proposals are recorded against.
+
+    ``agent_actions.investigation_id`` is NOT NULL, so an interactive run
+    that may propose actions needs an investigation row of its own. One row
+    per source (a chat session, or a user's direct tool executions), created
+    on first use and reused afterwards, attributed to the caller's chosen SOC
+    agent or the organization's oldest one. Returns ``None`` when the
+    organization has no SOC agent -- the caller is told rather than silently
+    losing the proposal.
+    """
+    existing = (await db.execute(
+        select(Investigation)
+        .where(
+            Investigation.organization_id == org_id,
+            Investigation.trigger_type == trigger_type,
+            Investigation.trigger_source_id == source_id,
+        )
+        .limit(1)
+    )).scalars().first()
+    if existing is not None:
+        return existing
+
+    host = agent
+    if host is None:
+        host = (await db.execute(
+            select(SOCAgent)
+            .where(SOCAgent.organization_id == org_id)
+            .order_by(SOCAgent.created_at.asc())
+            .limit(1)
+        )).scalars().first()
+    if host is None:
+        return None
+
+    investigation = Investigation(
+        organization_id=org_id,
+        agent_id=host.id,
+        trigger_type=trigger_type,
+        trigger_source_id=source_id,
+        title=title[:500],
+        hypothesis=hypothesis,
+        status=InvestigationStatus.INITIATED.value,
+        priority=3,
+    )
+    db.add(investigation)
+    await db.flush()
+    return investigation
+
+
+def _proposals_unavailable() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={
+            "error": "proposals_unavailable",
+            "detail": (
+                "proposals are recorded against a SOC agent's investigation and this organization "
+                "has no SOC agent; create one before proposing destructive actions"
+            ),
+        },
+    )
+
+
+async def _mark_message_failed(
+    db: AsyncSession, message: AgentChatMessage, run_id: str, error: str, detail: str
+) -> None:
+    """Record the failure on the user's turn so the UI can offer a retry."""
+    message.tool_calls = {
+        "status": "failed",
+        "error": error,
+        "detail": detail[:500],
+        "run_id": run_id,
+    }
+    try:
+        await db.commit()
+    except Exception as exc:  # noqa: BLE001 - the original failure is the one the caller sees
+        logger.error("chat_failure_persist_failed", run_id=run_id, error=str(exc)[:300])
+        await db.rollback()
+
+
+async def _settle_reservation(quota: Any, reservation: Any, tokens: int) -> None:
+    if reservation is None:
+        return
+    try:
+        await quota.settle(reservation, tokens)
+    except Exception as exc:  # noqa: BLE001 - accounting must never fail the request
+        logger.warning("llm_quota_settle_failed", error=str(exc)[:200])
 
 
 @router.post("/chat", response_model=NaturalLanguageResponse)
 async def chat_with_agent(
     query_data: NaturalLanguageQuery,
+    request: Request,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
+    redis: RedisClient = None,
 ):
+    """One guarded agent turn (design v2 sections 1 and 9).
+
+    The JWT builds the ``AgentContext``; the org's configured provider runs
+    the turn through ``AgentRunner``; destructive tools become approval-gated
+    proposals instead of executing inline; the session's injection trust
+    state is loaded and persisted back. Nothing here fabricates an answer:
+    a provider or budget failure is a 503/429 and the user's message is
+    persisted as ``failed``.
     """
-    Autonomous SOC agent chat with real function calling.
+    org_id = _org_id(current_user)
+    role = _agent_role(current_user)
+    user_id = str(getattr(current_user, "id", "") or "")
+    propose_actions = bool(query_data.propose_actions)
 
-    The agent loop:
-      1. Send user query + tool declarations to Gemini
-      2. If Gemini returns a tool_call, execute the tool against real DB
-      3. Feed tool result back to Gemini
-      4. Repeat up to MAX_STEPS times
-      5. Return final grounded answer + log of all tools invoked
-    """
-    from src.ai.engine import AIAnalyzer
-    from src.services.agent_tools import AgentToolRegistry
+    if propose_actions and ROLE_RANK[role] < ROLE_RANK[UserRole.ANALYST]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "role_not_permitted",
+                "detail": "viewers may not enable propose_actions; the agent stays read-only for this role",
+            },
+        )
 
-    org_id = getattr(current_user, "organization_id", None)
-    user_id = getattr(current_user, "id", None)
-
-    # Resolve or create session for persistence
-    session = None
+    # -- session: must belong to this organization AND this user -----------
     if query_data.session_id:
         session = (await db.execute(
-            select(AgentChatSession).where(AgentChatSession.id == query_data.session_id)
+            select(AgentChatSession).where(
+                AgentChatSession.id == query_data.session_id,
+                AgentChatSession.organization_id == org_id,
+                AgentChatSession.user_id == user_id,
+            )
         )).scalar_one_or_none()
-    if session is None and user_id and org_id:
+        if session is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"error": "session_not_found", "detail": "Session not found"},
+            )
+    else:
         session = AgentChatSession(
             user_id=user_id,
             organization_id=org_id,
@@ -1134,214 +2001,153 @@ async def chat_with_agent(
         )
         db.add(session)
         await db.flush()
-    # Load prior conversation turns BEFORE storing the current message, so
-    # multi-turn references ("them", "go ahead", "do it") resolve to what
-    # was discussed earlier (e.g. the incidents just listed). Without this
-    # the agent is amnesiac per-message and falls back to filler replies.
-    conversation_context = ""
-    if session is not None:
-        prior = (await db.execute(
-            select(AgentChatMessage)
-            .where(AgentChatMessage.session_id == session.id)
-            .order_by(AgentChatMessage.created_at.desc())
-            .limit(12)
-        )).scalars().all()
-        prior = list(reversed(prior))
-        if prior:
-            transcript = "\n".join(
-                f"{(m.role or 'user').upper()}: {(m.content or '')[:1500]}" for m in prior
+
+    # -- the client-supplied agent id is validated, never trusted ----------
+    agent: Optional[SOCAgent] = None
+    if query_data.agent_id:
+        agent = (await db.execute(
+            select(SOCAgent).where(
+                SOCAgent.id == query_data.agent_id, SOCAgent.organization_id == org_id
             )
-            conversation_context = (
-                "Conversation so far (most recent last) — use it to resolve "
-                "references like 'them', 'those', 'go ahead', 'do it':\n"
-                f"{transcript}\n\n"
+        )).scalar_one_or_none()
+        if agent is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"error": "unknown_agent", "detail": "agent_id is not a SOC agent in this organization"},
             )
 
-    if session is not None:
-        db.add(AgentChatMessage(
-            session_id=session.id, role="user", content=query_data.query, tool_calls=None,
-        ))
-        await db.flush()
+    investigation_id: Optional[str] = None
+    if propose_actions:
+        investigation = await _proposal_investigation(
+            db, org_id,
+            trigger_type="chat",
+            source_id=session.id,
+            title=f"Chat session: {session.title}",
+            hypothesis="Interactive analyst session; actions proposed here require approval.",
+            agent=agent,
+        )
+        if investigation is None:
+            raise _proposals_unavailable()
+        investigation_id = investigation.id
 
-    # Effective prompt the LLM sees = prior transcript + current request.
-    effective_query = f"{conversation_context}CURRENT REQUEST: {query_data.query}"
+    # History is loaded BEFORE the current turn is persisted.
+    history = await _chat_history(db, session.id)
+    user_message = AgentChatMessage(
+        session_id=session.id, role="user", content=query_data.query, tool_calls=None,
+    )
+    db.add(user_message)
+    await db.flush()
 
-    tool_registry = AgentToolRegistry(db)
-    tool_declarations = tool_registry.gemini_function_declarations()
-    analyzer = AIAnalyzer()
-
-    # Destructive/outward-facing tools require authorize_actions=True; the
-    # gate is the module-level DESTRUCTIVE_TOOLS (single source of truth).
-
-    system_prompt = (
-        "You are an autonomous SOC analyst for PySOAR with direct tool access to the security platform. "
-        "When a question needs data, CALL the appropriate query tool. When the user asks to take an action "
-        "(block, create, assign, execute, queue, remediate, contain, close), CALL the action tool — do not merely suggest. "
-        "\n\nINCIDENT RESPONSE (NIST 800-61): to work an incident, follow the lifecycle — assign_incident to take "
-        "ownership, update_incident_status to advance it (investigating → containment → eradication → recovery → "
-        "closed), add_incident_note / update_incident_findings to document, and remediate_incident to actually "
-        "contain it (isolates the incident's affected hosts and blocks its indicator IPs). To 'remediate the open "
-        "incidents', list_incidents then call remediate_incident on each. "
-        "\n\nCRITICAL — be honest and decisive, NEVER loop on clarifying questions:\n"
-        "- If a tool returns blocked:true (authorize_actions=false), tell the user in ONE sentence exactly what you "
-        "would do and that they must enable the 'Authorize actions' toggle to let you execute it. Do NOT ask what they meant.\n"
-        "- If NO tool can fulfill the request, say so plainly in one sentence and list what you CAN do. Never ask the "
-        "same clarifying question twice. If the user repeats a request, ACT or state the blocker — do not re-list data.\n"
-        "- 'critical/exposed assets' means criticality, not status: call list_assets with criticality='critical'.\n\n"
-        "Chain tools when it helps (up to 6 steps). After acting, produce a final text answer (2-5 sentences) "
-        "summarizing findings and the concrete actions you took (or the one thing blocking you)."
+    ctx = _agent_context(
+        current_user,
+        Mode.INTERACTIVE,
+        propose_actions=propose_actions,
+        session_id=session.id,
+        investigation_id=investigation_id,
+        request=request,
     )
 
-    tool_log: list[dict] = []
-    final_text: str = ""
-    MAX_STEPS = 6
-
-    history: list[dict] = []
-    for step in range(MAX_STEPS):
-        if step == 0:
-            llm_result = analyzer.call_llm_with_tools(
-                system_prompt=system_prompt,
-                user_prompt=effective_query,
-                tools=tool_declarations,
-            )
-        else:
-            llm_result = analyzer.call_llm_with_tools_chain(
-                system_prompt=system_prompt,
-                user_prompt=effective_query,
-                tools=tool_declarations,
-                history=history,
-            )
-
-        if llm_result.get("type") == "error":
-            # Gemini failed - fall back to heuristic tool execution
-            logger.warning(f"Gemini tool call failed: {llm_result.get('error')}")
-            try:
-                stats_res = await tool_registry.execute("platform_stats", {})
-                final_text = (
-                    f"AI service temporarily unavailable. Current platform state: "
-                    f"{stats_res.get('result', {})}"
-                )
-            except Exception:
-                final_text = f"AI unavailable: {llm_result.get('error', 'unknown')[:200]}"
-            break
-
-        if llm_result.get("type") == "text":
-            final_text = llm_result.get("text", "")
-            break
-
-        if llm_result.get("type") == "tool_call":
-            tool_name = llm_result.get("name", "")
-            tool_args = llm_result.get("args", {}) or {}
-            is_fallback = bool(llm_result.get("fallback"))
-
-            # AC-3 enforcement: block destructive tools unless explicitly authorized
-            if tool_name in DESTRUCTIVE_TOOLS and not query_data.authorize_actions:
-                blocked_msg = (
-                    f"The agent wants to call `{tool_name}` with args {json.dumps(tool_args, default=str)[:200]}, "
-                    f"which is a state-changing action. Re-send the request with `authorize_actions: true` "
-                    f"to approve and execute this action."
-                )
-                tool_log.append({
-                    "step": step + 1,
-                    "tool": tool_name,
-                    "args": tool_args,
-                    "result": {"blocked": True, "reason": "authorize_actions=false"},
-                    "blocked": True,
-                })
-                # Audit the blocked attempt
-                try:
-                    from src.tickethub.models import TicketActivity
-                    db.add(TicketActivity(
-                        source_type="agent_decision",
-                        source_id=str(query_data.agent_id or "auto"),
-                        activity_type="tool_blocked",
-                        description=(
-                            f"BLOCKED tool={tool_name} reason=authorize_actions=false "
-                            f"user={getattr(current_user, 'email', 'system')} "
-                            f"args={json.dumps(tool_args, default=str)[:400]}"
-                        ),
-                        organization_id=org_id,
-                    ))
-                    await db.flush()
-                except Exception:
-                    pass
-                final_text = blocked_msg
-                break
-
-            logger.info(
-                f"Agent step {step+1}: calling tool {tool_name} with {tool_args}"
-                f"{' [heuristic-fallback]' if is_fallback else ''}"
-            )
-
-            # AU-2: Persist every agent tool invocation BEFORE execution so
-            # there is a tamper-evident record even if the action crashes.
-            try:
-                from src.tickethub.models import TicketActivity
-                audit = TicketActivity(
-                    source_type="agent_decision",
-                    source_id=str(query_data.agent_id or "auto"),
-                    activity_type="tool_invocation",
-                    description=(
-                        f"step={step+1} tool={tool_name} "
-                        f"mode={'fallback' if is_fallback else 'llm'} "
-                        f"user={getattr(current_user, 'email', 'system')} "
-                        f"args={json.dumps(tool_args, default=str)[:500]}"
-                    ),
-                    organization_id=org_id,
-                )
-                db.add(audit)
-                await db.flush()
-            except Exception as audit_err:
-                logger.warning(f"Agent audit log write failed: {audit_err}")
-
-            exec_result = await tool_registry.execute(tool_name, tool_args)
-            tool_log.append({
-                "step": step + 1,
-                "tool": tool_name,
-                "args": tool_args,
-                "result": exec_result,
-                "fallback": is_fallback,
-            })
-            history.append({
-                "tool": tool_name,
-                "args": tool_args,
-                "result": exec_result,
-            })
-            # Loop back — next iteration feeds the transcript through
-            # call_llm_with_tools_chain so Gemini can either call another
-            # tool or produce the final text answer.
-            continue
-
-    if not final_text:
-        # Absolute fallback - build from tool log
-        if tool_log:
-            final_text = f"Executed {len(tool_log)} tools. Latest result: {json.dumps(tool_log[-1].get('result', {}), default=str)[:400]}"
-        else:
-            final_text = "I couldn't determine how to answer that. Please rephrase your question."
-
-    # Persist assistant reply before commit so it lands in the same txn as
-    # any state-changing tool calls.
-    if session is not None:
-        db.add(AgentChatMessage(
-            session_id=session.id,
-            role="assistant",
-            content=final_text or "",
-            tool_calls=tool_log or None,
-        ))
-
-    # Commit any DB changes made by action tools
     try:
-        await db.commit()
-    except Exception as e:
-        logger.error(f"Failed to commit agent tool changes: {e}")
+        runtime = await _build_runtime(db, ctx, redis, purpose="chat")
+    except LLMNotConfigured as exc:
+        await _mark_message_failed(db, user_message, ctx.run_id, "llm_not_configured", str(exc))
+        raise _not_configured_error(exc) from exc
+
+    trust_state = trust_state_from_dict(session.trust_state)
+    reservation = None
+    try:
+        reservation = await runtime.quota.reserve(
+            org_id, "interactive", ctx.max_tokens,
+            credential_source=runtime.credential_source or "org",
+        )
+    except LLMQuotaExceeded as exc:
+        await _mark_message_failed(db, user_message, ctx.run_id, getattr(exc, "code", "llm_quota_exceeded"), str(exc))
+        raise _quota_error(exc) from exc
+
+    try:
+        async with runtime.provider:
+            result = await runtime.runner.run(
+                ctx, query_data.query, history=history, trust_state=trust_state,
+            )
+    except RunRejected as exc:
+        await _settle_reservation(runtime.quota, reservation, 0)
+        await _mark_message_failed(db, user_message, ctx.run_id, exc.code, str(exc))
+        raise _rejected_error(exc) from exc
+    except LLMQuotaExceeded as exc:
+        await _settle_reservation(runtime.quota, reservation, 0)
+        await _mark_message_failed(db, user_message, ctx.run_id, getattr(exc, "code", "llm_quota_exceeded"), str(exc))
+        raise _quota_error(exc) from exc
+    except CircuitOpen as exc:
+        await _settle_reservation(runtime.quota, reservation, 0)
+        await _mark_message_failed(db, user_message, ctx.run_id, CircuitOpen.code, str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error": "llm_unavailable", "detail": str(exc), "run_id": ctx.run_id},
+        ) from exc
+
+    await _settle_reservation(runtime.quota, reservation, result.usage.total_billable)
+    session.trust_state = result.trust_state_dict
+
+    if result.stop_reason == "error":
+        await _mark_message_failed(
+            db, user_message, result.run_id,
+            result.error_code or "llm_provider_error",
+            result.stop_detail or "the provider call failed",
+        )
+        raise _run_result_error(result)
+
+    tools_invoked = [_tool_log_entry(entry) for entry in result.tool_log]
+    proposals = [_proposal_payload(p) for p in result.proposals]
+    policy_events = [_policy_event_payload(e) for e in result.policy_events]
+
+    db.add(AgentChatMessage(
+        session_id=session.id,
+        role="assistant",
+        content=result.final_text or "",
+        tool_calls=_jsonable({
+            "run_id": result.run_id,
+            "status": "ok",
+            "stop_reason": result.stop_reason,
+            "tools_invoked": tools_invoked,
+            "proposals": proposals,
+            "policy_events": policy_events,
+            "provider": result.provider,
+            "model": result.model,
+            "injection_tier": result.trust.tier.value,
+        }),
+    ))
+    await db.commit()
 
     return NaturalLanguageResponse(
-        response=final_text,
-        agent_id=query_data.agent_id or "auto",
-        agent_name="SOC Agent",
-        interpretation={"tools_invoked": tool_log},
-        session_id=session.id if session is not None else None,
+        response=result.final_text or "",
+        agent_id=agent.id if agent is not None else "",
+        agent_name=agent.name if agent is not None else "SOC Agent",
+        interpretation={
+            "tools_invoked": tools_invoked,
+            "run_id": result.run_id,
+            "stop_reason": result.stop_reason,
+            "stop_detail": result.stop_detail,
+            "steps": len(result.steps),
+            "honesty_note_applied": result.honesty_note_applied,
+        },
+        session_id=session.id,
+        run_id=result.run_id,
+        proposals=[AgentProposal(**p) for p in proposals],
+        policy_events=policy_events,
+        trust={
+            "tier": result.trust.tier.value,
+            "hits": [
+                {"family": h.family, "label": h.label, "preview": h.preview, "snippet_sha256": h.snippet_sha256}
+                for h in result.trust.hits
+            ],
+        },
+        provider=result.provider,
+        model=result.model,
+        credential_source=result.credential_source,
+        usage=_usage_payload(result.usage),
     )
+
+
 
 
 # ============================================================================
