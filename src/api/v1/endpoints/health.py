@@ -24,12 +24,8 @@ logger = get_logger(__name__)
 router = APIRouter(tags=["Health"])
 
 
-@router.get("/health")
-async def health_check():
-    """
-    Health check endpoint for load balancers.
-    Returns minimal status only (no internal details).
-    """
+async def _probe_dependencies() -> tuple[bool, bool]:
+    """Probe the database and Redis once; shared by the public and admin checks."""
     db_ok = False
     redis_ok = False
 
@@ -37,18 +33,30 @@ async def health_check():
         async with async_session_factory() as db:
             await db.execute(text("SELECT 1"))
             db_ok = True
-    except Exception:
-        pass
+    except Exception:  # noqa: BLE001 - a failed probe is the signal, not an error to raise
+        db_ok = False
 
     try:
         from redis import asyncio as aioredis
         r = aioredis.from_url(settings.redis_url)
-        await r.ping()
-        redis_ok = True
-        await r.aclose()
-    except Exception:
-        pass
+        try:
+            await r.ping()
+            redis_ok = True
+        finally:
+            await r.aclose()
+    except Exception:  # noqa: BLE001
+        redis_ok = False
 
+    return db_ok, redis_ok
+
+
+@router.get("/health")
+async def health_check():
+    """
+    Health check endpoint for load balancers.
+    Returns minimal status only (no internal details).
+    """
+    db_ok, redis_ok = await _probe_dependencies()
     status = "healthy" if (db_ok and redis_ok) else "degraded"
     return {"status": status}
 
@@ -57,14 +65,17 @@ async def health_check():
 async def health_check_detailed(admin: AdminUser = None):
     """
     Detailed health check endpoint for authenticated admins.
+
+    Previously read ``database``/``redis`` keys from the public check, which
+    only ever returned ``status`` - every call raised KeyError (HTTP 500).
     """
-    health = await health_check()
+    db_ok, redis_ok = await _probe_dependencies()
     return HealthResponse(
-        status=health["status"],
+        status="healthy" if (db_ok and redis_ok) else "degraded",
         version=__version__,
         environment=settings.app_env,
-        database=health["database"],
-        redis=health["redis"],
+        database="ok" if db_ok else "down",
+        redis="ok" if redis_ok else "down",
     )
 
 

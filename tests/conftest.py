@@ -52,6 +52,7 @@ from sqlalchemy.schema import DropTable
 # on the test SQLite file. Each import is side-effect-only; the Base
 # metaclass registers tables on import. F401 suppresses the unused warning.
 import src.agentic.models  # noqa: F401
+import src.agentic.transcript  # noqa: F401  # agent_run_transcripts (migration 020)
 import src.agents.models  # noqa: F401
 import src.ai.models  # noqa: F401
 import src.api_security.models  # noqa: F401
@@ -70,6 +71,7 @@ import src.hunting.models  # noqa: F401
 import src.integrations.models  # noqa: F401
 import src.intel.models  # noqa: F401
 import src.itdr.models  # noqa: F401
+import src.llm.models  # noqa: F401  # llm_call_logs / llm_usage_daily (migration 020)
 import src.ot_security.models  # noqa: F401
 import src.phishing_sim.models  # noqa: F401
 import src.playbook_builder.models  # noqa: F401
