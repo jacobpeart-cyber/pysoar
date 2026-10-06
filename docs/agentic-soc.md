@@ -190,6 +190,38 @@ corpus with a 5 % false-positive ceiling), `tests/unit/test_agent_runtime.py`.
   public address space (metadata and private ranges blocked); the Cilium
   variant pins the three provider hostnames.
 
+### Rotating `ENCRYPTION_MASTER_KEY`
+
+`scripts/rotate_master_key.py` re-encrypts every value the master key protects
+in one database transaction: `enc:v1` envelopes in `app_settings.value`
+(including the `_crypto_canary` row), `installed_integrations.auth_credentials_encrypted`
+(envelopes and legacy raw ciphertext; `__plaintext__:` rows are counted and left
+alone), `users.mfa_secret` / `users.mfa_backup_codes`, and
+`agent_run_transcripts.steps`. It refuses to start unless the canary opens under
+the old key (or, on a re-run, the new key), re-reads every rewritten value under
+the new key before committing, rolls everything back on any failure, and skips
+values already under the new key, so it is safe to re-run. Keys come only from
+the `ENCRYPTION_MASTER_KEY` (old/current) and `ENCRYPTION_MASTER_KEY_NEW`
+environment variables and are never logged. Exit codes: 0 success, 1 failed and
+rolled back, 2 refused before writing. Production procedure (from `/opt/pysoar`;
+`scripts/` is not mounted into the api container, hence the `-v`):
+
+1. Generate the new key: `docker compose run --rm --no-deps -v "$PWD/scripts:/app/scripts:ro" api python scripts/rotate_master_key.py --generate`.
+2. `read -rs ENCRYPTION_MASTER_KEY_NEW && export ENCRYPTION_MASTER_KEY_NEW`
+   (keeps the key out of shell history), then `docker compose stop api worker scheduler`
+   so nothing writes under the old key mid-rotation.
+3. Dry run: `docker compose run --rm -e ENCRYPTION_MASTER_KEY_NEW -v "$PWD/scripts:/app/scripts:ro" api python scripts/rotate_master_key.py --dry-run`.
+4. The same command without `--dry-run` rotates for real. Do not continue unless it exits 0.
+5. Set `ENCRYPTION_MASTER_KEY` to the new value in `/opt/pysoar/.env`, then
+   `docker compose up -d api worker scheduler`.
+6. `docker compose run --rm -v "$PWD/scripts:/app/scripts:ro" api python scripts/rotate_master_key.py --verify-only`
+   checks that every encrypted value opens under the now-current key; then `unset ENCRYPTION_MASTER_KEY_NEW`.
+7. Store the new key in the password manager and retire the old key.
+
+`app_settings.value_pre020` still holds the plaintext copy of settings that
+migration 020 took before enveloping them. Rotation does not touch it, so a
+leaked key alone does not expose those values, but a leaked database dump does.
+
 ## 8. Threat model (STRIDE)
 
 | Threat | Mitigation | Test |
