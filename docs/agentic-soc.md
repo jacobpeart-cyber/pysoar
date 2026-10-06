@@ -225,6 +225,15 @@ corpus with a 5 % false-positive ceiling), `tests/unit/test_agent_runtime.py`.
 * **Autonomous triage paused** — a non-retryable LLM error set
   `llm:disabled:{org}` for an hour; fix the credentials under Settings → AI
   Provider and the flag expires.
+* **Where to look** (all org-scoped; analyst role or above unless noted):
+  `GET /agentic/runs/{run_id}` is the per-run timeline (audit rows, LLM calls,
+  proposals joined); `GET /agentic/usage` totals tokens and cost from
+  `llm_call_logs` (superusers may span organizations); `GET
+  /agentic/policy-events` pages and filters every allow/deny decision;
+  `GET /agentic/evidence/export` (admin only) returns the same as JSON or CSV
+  for an auditor; `GET /agentic/actions/pending-approval` lists proposals with
+  their hash binding; `GET /metrics/agentic` (admin only) is the in-process
+  counter snapshot.
 
 ## 10. Control-to-code map
 
@@ -235,6 +244,7 @@ corpus with a 5 % false-positive ceiling), `tests/unit/test_agent_runtime.py`.
 | AC-5 | Suspect proposals require admin acknowledgement with a reason (second-approver setting: not implemented, see §11) | approval tests |
 | AU-2, AU-3, AU-12 | Pre/post audit rows per tool, `llm_call_logs` per turn | `test_audit_chain.py`, `test_call_log_records_are_complete_per_turn` |
 | AU-9, AU-10 | `audit_trails.prev_hash/row_hash` chain; fail-closed audit | `test_audit_chain.py`, `test_post_audit_failure_fails_closed` |
+| AU-6, AU-7 | Run timeline, policy-event review, usage totals and admin-only evidence export (JSON/CSV); ITDR respond routed through the same `guarded_tool_call` path | `test_agentic_read_surfaces.py`, `test_itdr_respond.py` |
 | CM-7 | Autonomous read-only allow-list; effects-based tiers | `test_autonomous_offers_only_allowlisted_read_tools_and_ends_on_verdict` |
 | SI-10 | Schema validation, injection scanner, semantic validators | `test_trust_scanner.py`, policy matrix |
 | SC-5 | Admission, budgets, breaker | `test_llm_quota.py` |
@@ -254,10 +264,11 @@ corpus with a 5 % false-positive ceiling), `tests/unit/test_agent_runtime.py`.
   `llm_not_configured` until an admin configures a provider or opts in.
 * **Metrics**: `GET /metrics/agentic` is an in-process registry (no
   `prometheus_client`); counters reset on restart.
-* **Read surfaces** (`/agentic/runs/{id}`, `/agentic/usage`,
-  `/agentic/policy-events`, `/agentic/evidence/export`): documented in the
-  design; landing in the package after this document was written — verify
-  against `src/api/v1/endpoints/agentic.py` before citing them to a customer.
+* **Ingest-time memory bounds outside the agent**: the beat tasks that caused
+  the September 2026 worker OOM (IOC sweep, feed polling, UEBA baselines,
+  ITDR and exposure sweeps) are now windowed and capped, with per-child
+  recycling at 300 MB. The dark-web, STIG, integrations, supply-chain and
+  on-demand exposure tasks still load whole tables and are a follow-up.
 
 ## 12. Deploying this release
 

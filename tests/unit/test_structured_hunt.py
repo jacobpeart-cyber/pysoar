@@ -9,6 +9,7 @@ section 1), so the hunt needs the organization *and* the analyst it runs as:
 import json
 
 import pytest
+from sqlalchemy import select
 
 from src.hunting.models import HuntFinding, HuntSession, HuntHypothesis
 from src.siem.models import DetectionRule, LogEntry
@@ -99,30 +100,83 @@ async def test_hunt_requires_an_actor(db_session):
         )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "POST /agentic/hunts must pass actor_user_id=str(current_user.id) and "
-        "role=_agent_role(current_user) to run_structured_hunt. The endpoint is owned by "
-        "another work package; it already failed before this change because it called "
-        "AgentToolRegistry(db) without a context."
-    ),
-)
+HUNT_ORG = "ffffffff-0000-4000-8000-00000000000f"
+
+
+async def _hunt_user(db_session, *, email: str, role: str):
+    """An org-scoped caller: ``POST /agentic/hunts`` takes the organization,
+    the actor id and the role straight off the JWT, so the default
+    ``test_user`` fixture (no organization) cannot exercise it."""
+    from src.core.security import get_password_hash
+    from src.models.organization import Organization
+    from src.models.user import User
+
+    if await db_session.get(Organization, HUNT_ORG) is None:
+        db_session.add(Organization(id=HUNT_ORG, name="HUNT-ORG", slug="hunt-org"))
+        await db_session.flush()
+    user = User(
+        email=email,
+        hashed_password=get_password_hash("pw-for-tests"),
+        full_name=email.split("@")[0],
+        role=role,
+        is_active=True,
+        organization_id=HUNT_ORG,
+    )
+    db_session.add(user)
+    await db_session.flush()
+    return user
+
+
+def _hunt_headers(user) -> dict:
+    from src.core.security import create_access_token
+
+    return {"Authorization": f"Bearer {create_access_token(subject=user.id)}"}
+
+
 @pytest.mark.asyncio
-async def test_endpoint_kicks_off_hunt(client, auth_headers, db_session, test_user):
+async def test_endpoint_kicks_off_hunt(client, db_session):
+    """The endpoint now passes the caller's identity through, so both hunt
+    phases pass the policy gate and the hunt session is written for the
+    caller's organization."""
     from src.attack.loader import load_stix_bundle
+
     await load_stix_bundle(db_session, _bundle(), domain="enterprise", attack_version="17.1")
+    analyst = await _hunt_user(db_session, email="hunter@hunt-org.test", role="analyst")
     await db_session.commit()
 
     resp = await client.post(
         "/api/v1/agentic/hunts",
-        headers=auth_headers,
+        headers=_hunt_headers(analyst),
         json={"hypothesis": "hunt for T1110 brute force", "timeframe_hours": 24},
     )
-    assert resp.status_code == 200
+    assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["hypothesis"]
     assert "phases" in body and "verdict" in body
+
+    sessions = (await db_session.execute(select(HuntSession))).scalars().all()
+    assert sessions, "the hunt must persist a hunt session"
+    assert {s.organization_id for s in sessions} == {HUNT_ORG}
+
+
+@pytest.mark.asyncio
+async def test_endpoint_refuses_a_viewer(client, db_session):
+    """``scope_hunt``/``run_threat_hunt`` write hunt sessions and findings, so
+    a viewer cannot start a hunt."""
+    from src.attack.loader import load_stix_bundle
+
+    await load_stix_bundle(db_session, _bundle(), domain="enterprise", attack_version="17.1")
+    viewer = await _hunt_user(db_session, email="viewer@hunt-org.test", role="viewer")
+    await db_session.commit()
+
+    resp = await client.post(
+        "/api/v1/agentic/hunts",
+        headers=_hunt_headers(viewer),
+        json={"hypothesis": "hunt for T1110 brute force", "timeframe_hours": 24},
+    )
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["detail"]["error"] == "role_not_permitted"
+    assert (await db_session.execute(select(HuntSession))).scalars().all() == []
 
 
 @pytest.mark.asyncio

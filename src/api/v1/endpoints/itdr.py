@@ -7,15 +7,16 @@ access anomaly analysis, and privileged access management.
 
 import math
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional
 
-from fastapi import APIRouter, HTTPException, Query, status, BackgroundTasks
+from fastapi import APIRouter, HTTPException, Query, Request, status, BackgroundTasks
 import json
 
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import CurrentUser, DatabaseSession
+from src.agentic.context import Mode
+from src.api.deps import CurrentUser, DatabaseSession, RedisClient
 from src.core.database import async_session_factory
 from src.core.logging import get_logger
 from src.services.automation import AutomationService
@@ -441,6 +442,109 @@ async def investigate_threat(
     }
 
 
+#: ``action_type`` -> the guarded tools that carry it out. Everything here is
+#: a real registry tool; ``contain`` deliberately maps to nothing, because
+#: marking a threat contained is a bookkeeping act, not a response action.
+RESPONSE_TOOLS: dict[str, tuple[str, ...]] = {
+    "disable_account": ("disable_user",),
+    "disable_user": ("disable_user",),
+    "force_password_reset": ("disable_user",),
+    "isolate_host": ("isolate_host",),
+    "block_ip": ("block_ip",),
+    "quarantine": ("disable_user", "isolate_host"),
+    "open_incident": ("create_incident",),
+    "contain": (),
+}
+
+
+def _propose_actions(data: ThreatResponseAction) -> bool:
+    """``propose_actions`` out of ``action_details`` (default ``False``).
+
+    ``ThreatResponseAction`` is shared with the other ITDR surfaces, so the
+    flag travels in ``action_details`` rather than widening that schema.
+    Default ``False`` means a destructive action is *denied* unless the
+    caller asked for a proposal -- it is never silently escalated.
+    """
+    details = data.action_details if isinstance(data.action_details, dict) else {}
+    return bool(details.get("propose_actions", False))
+
+
+def _missing_argument(action: str, name: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail={
+            "error": "invalid_arguments",
+            "detail": f"action_type '{action}' requires action_details.{name}",
+        },
+    )
+
+
+def _response_tool_calls(
+    action: str,
+    threat: IdentityThreat,
+    details: dict[str, Any],
+    target_user: Optional[str],
+) -> list[tuple[str, dict[str, Any]]]:
+    """The (tool, arguments) pairs one ``action_type`` expands into.
+
+    Raises 400 when the action needs a target the request did not supply:
+    the previous implementation swallowed that case and still reported the
+    threat contained, which claimed a response that never happened.
+    """
+    tools = RESPONSE_TOOLS.get(action)
+    if tools is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": "unknown_action",
+                "detail": f"unsupported action_type '{action}'",
+                "supported": sorted(RESPONSE_TOOLS),
+            },
+        )
+
+    threat_type = threat.threat_type or "identity threat"
+    reason = (
+        f"password reset required: {threat_type}" if action == "force_password_reset"
+        else f"ITDR quarantine: {threat_type}" if action == "quarantine"
+        else f"ITDR threat {threat_type}"
+    )
+    calls: list[tuple[str, dict[str, Any]]] = []
+    for tool in tools:
+        if tool == "disable_user":
+            if not target_user:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={
+                        "error": "no_identity_target",
+                        "detail": (
+                            "this threat has no identity profile with an email or username, "
+                            "so no account can be disabled"
+                        ),
+                    },
+                )
+            calls.append(("disable_user", {"user_email": target_user, "reason": reason}))
+        elif tool == "isolate_host":
+            hostname = details.get("hostname")
+            if not hostname:
+                raise _missing_argument(action, "hostname")
+            calls.append(("isolate_host", {"hostname": str(hostname), "reason": reason}))
+        elif tool == "block_ip":
+            ip = details.get("ip") or threat.source_ip
+            if not ip:
+                raise _missing_argument(action, "ip")
+            calls.append(("block_ip", {"ip": str(ip), "reason": reason}))
+        elif tool == "create_incident":
+            calls.append((
+                "create_incident",
+                {
+                    "title": f"ITDR: {threat_type} on {target_user or threat.identity_id or threat.id}"[:500],
+                    "severity": threat.severity or "high",
+                    "description": str(threat.evidence or "")[:1500],
+                },
+            ))
+    return calls
+
+
 @router.post("/threats/{threat_id}/respond")
 async def respond_to_threat(
     threat_id: str,
@@ -484,6 +588,15 @@ async def respond_to_threat(
     Returns ``{"proposed": true, "proposal": {...}}`` for a destructive
     action, exactly as the direct-execute surface does, and
     ``{"executed": true, "results": [...]}`` once the tools actually ran.
+    ``quarantine`` expands to two tools, so it also returns ``proposals``
+    with one entry per tool; if the second is refused the request fails with
+    that denial while the first proposal stays recorded as pending approval
+    (nothing was executed either way, and both decisions are in the audit
+    trail).
+
+    The threat is only marked ``contained`` once a tool actually executed --
+    a proposal leaves the status untouched rather than claiming a response
+    that has not happened yet.
     """
     from src.api.v1.endpoints.agentic import (
         _agent_context,
@@ -511,7 +624,7 @@ async def respond_to_threat(
                 IdentityProfile.organization_id == ctx.org_id,
             )
         )).scalar_one_or_none()
-    target_user = getattr(identity_row, "primary_email", None) or getattr(
+    target_user = getattr(identity_row, "email", None) or getattr(
         identity_row, "username", None
     )
 
