@@ -13,7 +13,10 @@
 # accepts the new files, and restarts the container so it picks them up.
 set -euo pipefail
 
-LINEAGE="${RENEWED_LINEAGE:-/etc/letsencrypt/live/pysoar.it.com}"
+# certbot sets RENEWED_LINEAGE when it calls the hook. When run by hand, fall
+# back to the newest lineage directory (the webroot switch on 2026-10-06
+# created pysoar.it.com-0001 and the old standalone lineage was deleted).
+LINEAGE="${RENEWED_LINEAGE:-$(ls -d /etc/letsencrypt/live/pysoar.it.com* 2>/dev/null | sort | tail -n 1)}"
 REPO="${PYSOAR_DIR:-/opt/pysoar}"
 SSL_DIR="${REPO}/nginx/ssl"
 OWNER="${PYSOAR_OWNER:-ubuntu}"

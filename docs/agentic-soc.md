@@ -285,9 +285,14 @@ corpus with a 5 % false-positive ceiling), `tests/unit/test_agent_runtime.py`.
        --non-interactive --agree-tos --force-renewal
    ```
 
-   This rewrites the renewal config to webroot and registers the hook, which
-   copies the lineage into `nginx/ssl/` and restarts the proxy. The existing
-   `certbot.timer` then renews unattended.
+   Done on 2026-10-06: certbot created the lineage `pysoar.it.com-0001`
+   (webroot + `renew_hook`), the old standalone lineage was removed with
+   `certbot delete --cert-name pysoar.it.com`, and `certbot renew --dry-run
+   --no-random-sleep-on-renew` succeeded. The existing `certbot.timer` renews
+   unattended; the hook copies the lineage into `nginx/ssl/` and restarts the
+   proxy. When checking renewal by hand, pass `--no-random-sleep-on-renew`:
+   non-interactive certbot otherwise sleeps up to eight minutes first, which
+   looks like a hang.
 1. Prod requires `ENCRYPTION_MASTER_KEY` in `/opt/pysoar/.env` before
    `alembic upgrade head` (migration 020 backfills settings secrets and refuses
    to run without the key).

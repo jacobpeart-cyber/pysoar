@@ -51,7 +51,18 @@ def init(queue_maxsize: int = 10000, db_session_factory=None, redis_url: Optiona
                 health_check_interval=30,
                 retry_on_timeout=True,
             )
-            logger.info("SIEM ingest queue configured with Redis", redis_url=redis_url)
+            # Stdlib logger: no keyword fields (a kwarg here raised TypeError
+            # inside this try, which made every start fall back to the
+            # in-memory queue even though Redis had connected). Log the host
+            # only; the URL may carry a password.
+            from urllib.parse import urlsplit
+
+            _parts = urlsplit(redis_url)
+            logger.info(
+                "SIEM ingest queue configured with Redis at %s:%s",
+                _parts.hostname or "?",
+                _parts.port or "",
+            )
             return
         except Exception as e:  # noqa: BLE001
             logger.warning(f"redis.asyncio unavailable or connection failed: {e}; falling back to in-memory queue")

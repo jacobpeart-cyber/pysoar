@@ -184,9 +184,23 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
             rows = await _bridge_db.execute(
                 text("SELECT organization_id, section, value FROM app_settings WHERE section LIKE 'integration:%'")
             )
+            # installed_integrations.connector_id is a foreign key into
+            # integration_connectors; a Settings section for a connector that
+            # is not registered there (seen in prod with "teams") used to raise
+            # a ForeignKeyViolation that aborted the whole bridge. Skip and
+            # name those instead.
+            from src.integrations.models import IntegrationConnector
+
+            known_connectors = set(
+                (await _bridge_db.execute(select(IntegrationConnector.id))).scalars().all()
+            )
+            skipped: list[str] = []
             bridged = 0
             for org_id, section, value in rows.all():
                 connector_id = section.split(":", 1)[1] if ":" in section else section
+                if connector_id not in known_connectors:
+                    skipped.append(connector_id)
+                    continue
                 existing = (
                     await _bridge_db.execute(
                         select(InstalledIntegration).where(
@@ -213,6 +227,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
             if bridged:
                 await _bridge_db.commit()
                 logger.info("Bridged Settings integrations into marketplace", count=bridged)
+            if skipped:
+                logger.warning(
+                    "Settings integrations with no registered connector were not bridged",
+                    connectors=sorted(set(skipped)),
+                )
     except Exception as e:  # noqa: BLE001
         logger.warning("Settings→marketplace bridge failed", error=str(e))
 
