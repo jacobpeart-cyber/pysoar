@@ -234,7 +234,10 @@ services:
     container_name: pysoar-grafana
     environment:
       - GF_SECURITY_ADMIN_USER=admin
-      - GF_SECURITY_ADMIN_PASSWORD=pysoar-grafana
+      # No default: a hardcoded Grafana admin password sat in this public file
+      # until 2026-10-06. Set GRAFANA_ADMIN_PASSWORD in .env; compose refuses
+      # to start the service without it.
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in .env}
       - GF_USERS_ALLOW_SIGN_UP=false
     volumes:
       - pysoar-grafana:/var/lib/grafana

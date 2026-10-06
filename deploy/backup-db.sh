@@ -38,7 +38,11 @@ done
 log() { printf '%s [backup-db] %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
 run() { if [ "$DRY_RUN" = 1 ]; then log "DRY-RUN: $*"; else "$@"; fi; }
 
+# A database dump is as sensitive as the database: owner-only from the first
+# byte written (umask), and the directory itself is closed to other users.
+umask 077
 mkdir -p "$DIR"
+chmod 700 "$DIR"
 cd "$REPO"
 
 # ---------------------------------------------------------------- dump ----
@@ -64,6 +68,8 @@ if [ "$PRUNE_ONLY" = 0 ]; then
 fi
 
 # --------------------------------------------------------------- prune ----
+# Dumps written by the old crontab line were world-readable; tighten them.
+run find "$DIR" -maxdepth 1 -name '*.sql.gz' -perm /077 -exec chmod 600 {} +
 today_epoch=$(date -d "$(date +%Y-%m-%d)" +%s)
 deleted=0
 kept=0

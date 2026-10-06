@@ -182,14 +182,13 @@ docker compose up -d
 # Apply database migrations
 docker exec pysoar-api alembic upgrade head
 
-# Seed demo data (optional)
-docker exec pysoar-api python scripts/seed_demo.py
-
 # Access the platform
 open http://localhost
 ```
 
-**Default login:** `admin@pysoar.local` / `changeme123`
+**First login:** the API creates the first administrator on start from
+`FIRST_ADMIN_EMAIL` and `FIRST_ADMIN_PASSWORD` in your `.env`. There are no
+default credentials and no demo data; the repository ships nothing synthetic.
 
 ---
 

@@ -1,47 +1,46 @@
+# Local hooks mirror what CI enforces (.github/workflows/ci.yml), nothing more:
+# a hook the tree cannot pass gets skipped with --no-verify and teaches people
+# to skip hooks. black, isort and strict mypy were removed for that reason
+# (352 unformatted files, ~7,000 mypy errors); they are tracked as debt by the
+# lint ratchet (scripts/lint_ratchet.py), which CI runs.
+#
+#   pip install pre-commit && pre-commit install
+#   pre-commit autoupdate   # to refresh the pinned revs
 repos:
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.3.5
+    rev: v0.16.10
     hooks:
       - id: ruff
-        args: [--fix]
+        name: ruff (runtime-defect rules, same set as CI)
+        args:
+          - --select
+          - F821,F822,F823,F402,F601,F632,F704,F706,F707,F811,F901,E9,B006,B015,B016,B018,B021,B022,B023,B032,B035,RUF006,PLE
 
-  - repo: https://github.com/psf/black
-    rev: 24.3.0
+  - repo: https://github.com/PyCQA/bandit
+    rev: 1.9.4
     hooks:
-      - id: black
-        language_version: python3.11
-
-  - repo: https://github.com/PyCQA/isort
-    rev: 5.13.2
-    hooks:
-      - id: isort
-        args: [--profile=black]
+      - id: bandit
+        name: bandit (high severity, same level as CI)
+        args: [-lll, -ii]
+        exclude: ^tests/
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.5.0
+    rev: v6.0.0
     hooks:
       - id: check-yaml
+        args: [--allow-multiple-documents]
+        exclude: ^deploy/kubernetes/   # Kustomize/Helm templates are not plain YAML
       - id: check-json
       - id: check-toml
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+      - id: detect-private-key
       - id: end-of-file-fixer
       - id: trailing-whitespace
 
-  - repo: https://github.com/pre-commit/mirrors-mypy
-    rev: v1.9.0
-    hooks:
-      - id: mypy
-        additional_dependencies: [types-all]
-        args: [--ignore-missing-imports]
-
-  - repo: https://github.com/PyCQA/bandit
-    rev: 1.7.5
-    hooks:
-      - id: bandit
-        args: [-c, .bandit]
-        exclude: ^tests/
-
   - repo: https://github.com/Yelp/detect-secrets
-    rev: v1.4.0
+    rev: v1.5.0
     hooks:
       - id: detect-secrets
         args: [--baseline, .secrets.baseline]
+        exclude: ^(frontend/package-lock\.json|tests/)

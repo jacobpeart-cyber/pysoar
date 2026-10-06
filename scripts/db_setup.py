@@ -3,7 +3,6 @@
 
 Usage:
     python scripts/db_setup.py                # Run migrations only
-    python scripts/db_setup.py --seed         # Run migrations and seed demo data
     python scripts/db_setup.py --drop         # Drop all tables (be careful!)
 """
 
@@ -11,12 +10,9 @@ import asyncio
 import sys
 from pathlib import Path
 from argparse import ArgumentParser
-from datetime import datetime, timezone
-from uuid import uuid4
 
 import sqlalchemy as sa
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.ext.asyncio import create_async_engine
 
 # Add project root to path
 project_root = Path(__file__).parent.parent
@@ -25,12 +21,8 @@ sys.path.insert(0, str(project_root))
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 from alembic.runtime.migration import MigrationContext
-from alembic.operations import Operations
 from src.core.config import settings
 from src.models.base import Base
-from src.models.user import User, UserRole
-from src.models.organization import Organization, OrganizationMember
-from src.models.alert import Alert
 
 
 def get_alembic_config() -> Config:
@@ -111,135 +103,6 @@ def run_migrations() -> None:
         raise
 
 
-async def seed_demo_data() -> None:
-    """Seed demo data into the database."""
-    print("\nSeeding demo data...")
-
-    engine = create_async_engine(settings.database_url, echo=False)
-    async_session = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-
-    async with async_session() as session:
-        try:
-            # Create default organization
-            org = Organization(
-                id=str(uuid4()),
-                name="Default Organization",
-                description="Default organization for PySOAR",
-                is_active=True,
-                created_at=datetime.now(timezone.utc),
-                updated_at=datetime.now(timezone.utc),
-            )
-            session.add(org)
-            await session.flush()
-
-            # Create admin user
-            admin_user = User(
-                id=str(uuid4()),
-                email=settings.first_admin_email,
-                hashed_password=settings.first_admin_password,  # In production, this should be hashed
-                full_name="Admin User",
-                role=UserRole.ADMIN.value,
-                is_active=True,
-                is_superuser=True,
-                created_at=datetime.now(timezone.utc),
-                updated_at=datetime.now(timezone.utc),
-            )
-            session.add(admin_user)
-            await session.flush()
-
-            # Add admin to organization
-            org_member = OrganizationMember(
-                id=str(uuid4()),
-                organization_id=org.id,
-                user_id=admin_user.id,
-                role="admin",
-                created_at=datetime.now(timezone.utc),
-                updated_at=datetime.now(timezone.utc),
-            )
-            session.add(org_member)
-
-            # Create sample analyst user
-            analyst_user = User(
-                id=str(uuid4()),
-                email="analyst@pysoar.local",
-                hashed_password="changeme123",
-                full_name="Security Analyst",
-                role=UserRole.ANALYST.value,
-                is_active=True,
-                is_superuser=False,
-                created_at=datetime.now(timezone.utc),
-                updated_at=datetime.now(timezone.utc),
-            )
-            session.add(analyst_user)
-            await session.flush()
-
-            # Add analyst to organization
-            analyst_member = OrganizationMember(
-                id=str(uuid4()),
-                organization_id=org.id,
-                user_id=analyst_user.id,
-                role="analyst",
-                created_at=datetime.now(timezone.utc),
-                updated_at=datetime.now(timezone.utc),
-            )
-            session.add(analyst_member)
-
-            # Create sample viewer user
-            viewer_user = User(
-                id=str(uuid4()),
-                email="viewer@pysoar.local",
-                hashed_password="changeme123",
-                full_name="SOC Viewer",
-                role=UserRole.VIEWER.value,
-                is_active=True,
-                is_superuser=False,
-                created_at=datetime.now(timezone.utc),
-                updated_at=datetime.now(timezone.utc),
-            )
-            session.add(viewer_user)
-            await session.flush()
-
-            # Add viewer to organization
-            viewer_member = OrganizationMember(
-                id=str(uuid4()),
-                organization_id=org.id,
-                user_id=viewer_user.id,
-                role="viewer",
-                created_at=datetime.now(timezone.utc),
-                updated_at=datetime.now(timezone.utc),
-            )
-            session.add(viewer_member)
-
-            # Create sample alerts
-            for i in range(3):
-                alert = Alert(
-                    id=str(uuid4()),
-                    title=f"Sample Alert {i+1}",
-                    description=f"This is a sample alert for testing purposes {i+1}",
-                    severity="medium" if i == 0 else "low" if i == 1 else "high",
-                    status="open",
-                    source="sample",
-                    assigned_to=analyst_user.id if i == 0 else None,
-                    created_at=datetime.now(timezone.utc),
-                    updated_at=datetime.now(timezone.utc),
-                )
-                session.add(alert)
-
-            await session.commit()
-            print("✓ Demo data seeded successfully")
-            print(f"  - Organization: Default Organization")
-            print(f"  - Admin User: {settings.first_admin_email}")
-            print(f"  - Analyst User: analyst@pysoar.local")
-            print(f"  - Viewer User: viewer@pysoar.local")
-            print(f"  - Sample Alerts: 3")
-        except Exception as e:
-            await session.rollback()
-            print(f"✗ Failed to seed demo data: {e}")
-            raise
-
-    await engine.dispose()
-
-
 async def drop_all_tables() -> None:
     """Drop all tables from database."""
     print("\nDropping all tables...")
@@ -256,11 +119,6 @@ async def drop_all_tables() -> None:
 def main() -> None:
     """Main entry point."""
     parser = ArgumentParser(description="PySOAR Database Setup")
-    parser.add_argument(
-        "--seed",
-        action="store_true",
-        help="Seed demo data after running migrations"
-    )
     parser.add_argument(
         "--drop",
         action="store_true",
@@ -284,10 +142,6 @@ def main() -> None:
 
         # Run migrations
         run_migrations()
-
-        # Seed demo data if requested
-        if args.seed:
-            asyncio.run(seed_demo_data())
 
         print("\n✓ Database setup completed successfully!")
         print("\nNext steps:")
