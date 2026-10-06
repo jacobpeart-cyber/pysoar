@@ -124,3 +124,8 @@ site/
 # Claude Code harness runtime state (not project code)
 .claude/scheduled_tasks.lock
 .claude/*.lock
+
+# Local-only compose override (test rig: passwordless redis, local DB creds). Compose auto-applies it, so it must never reach a prod checkout.
+docker-compose.override.yml
+# Unrelated scratch script
+secret_message.py
