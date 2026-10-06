@@ -79,13 +79,22 @@ celery_app.conf.update(
     task_soft_time_limit=3300,  # 55 minutes soft limit
     worker_prefetch_multiplier=1,
     worker_concurrency=2,
-    # Memory-leak containment (prod incident 2026-05-20: leaking workers
-    # grew to 1-1.5 GB RSS each, kernel OOM-killed them for weeks, then
-    # froze the 4 GB host outright). Recycle each child after a bounded
-    # number of tasks AND whenever its RSS crosses 500 MB — well below
-    # the ~700 MB+ where the kernel started shooting workers.
+    # Memory-leak containment (prod incidents 2026-05-20 and 2026-09-01:
+    # leaking workers grew to 0.7-1.5 GB RSS each, kernel OOM-killed them
+    # for weeks, then froze the 4 GB host outright). Recycle each child
+    # after a bounded number of tasks AND whenever its RSS crosses the
+    # threshold below.
+    #
+    # 2026-09-01 follow-up: 500 MB was still too generous. A per-child cap
+    # only recycles a child *between* tasks, so the real fix is bounding
+    # the tasks themselves (see the streaming/batching work in
+    # src/exposure/tasks.py, src/tasks/automation_tasks.py,
+    # src/ueba/tasks.py, src/itdr/tasks.py and src/intel/feeds.py).
+    # Dropping the cap to 300 MB means that even if a *new* unbounded path
+    # appears, the child is recycled with ~1.2 GB of container headroom
+    # left instead of ~1 GB, so the kernel never has to shoot anything.
     worker_max_tasks_per_child=50,
-    worker_max_memory_per_child=500_000,  # KB == 500 MB
+    worker_max_memory_per_child=300_000,  # KB == 300 MB
     task_acks_late=True,
     task_reject_on_worker_lost=True,
     result_expires=86400,  # Results expire after 1 day
@@ -118,11 +127,37 @@ celery_app.conf.task_routes = {
 # Per-task limits: an investigation is capped at a 600 s wall clock inside the
 # runtime, so 900 s soft / 960 s hard leaves room for persistence and still
 # kills a wedged run well inside the global hour.
+#
+# The remaining entries are the known-heavy sweeps identified in the
+# 2026-09-01 OOM post-mortem. Each one now streams/batches its reads, but a
+# wall-clock limit is the backstop: a sweep that somehow starts growing again
+# gets killed in minutes instead of holding a child at multi-GB RSS for the
+# full global hour (long enough for the kernel OOM killer to pick a victim).
+_HEAVY_SWEEP_LIMITS = {
+    "soft_time_limit": 900,  # 15 min
+    "time_limit": 960,
+}
 celery_app.conf.task_annotations = {
     "src.agentic.tasks.run_investigation": {
         "soft_time_limit": 900,
         "time_limit": 960,
     },
+    # Full-table / all-org sweeps over log_entries, behavior_events,
+    # threat_indicators and alerts.
+    "src.exposure.tasks.run_asset_discovery": dict(_HEAVY_SWEEP_LIMITS),
+    "src.exposure.tasks.detect_attack_surface_changes": dict(_HEAVY_SWEEP_LIMITS),
+    "src.ueba.tasks.update_entity_baselines": dict(_HEAVY_SWEEP_LIMITS),
+    "src.ueba.tasks.calculate_entity_risks": dict(_HEAVY_SWEEP_LIMITS),
+    "src.ueba.tasks.update_peer_groups": dict(_HEAVY_SWEEP_LIMITS),
+    "src.ueba.tasks.cleanup_old_behavior_events": dict(_HEAVY_SWEEP_LIMITS),
+    "automation.periodic_ioc_sweep": dict(_HEAVY_SWEEP_LIMITS),
+    "automation.auto_escalate_stale_alerts": dict(_HEAVY_SWEEP_LIMITS),
+    "automation.auto_close_resolved_alerts": dict(_HEAVY_SWEEP_LIMITS),
+    "automation.hourly_correlation_sweep": dict(_HEAVY_SWEEP_LIMITS),
+    "intel.poll_threat_feeds": dict(_HEAVY_SWEEP_LIMITS),
+    "siem.poll_cloud_integrations": dict(_HEAVY_SWEEP_LIMITS),
+    "src.itdr.tasks.scheduled_identity_threat_sweep": dict(_HEAVY_SWEEP_LIMITS),
+    "src.supplychain.tasks.supplychain_cross_org_sweep": dict(_HEAVY_SWEEP_LIMITS),
 }
 
 # Beat schedule for periodic tasks

@@ -36,6 +36,7 @@ from urllib.parse import unquote
 
 from src.agentic.decisions import TrustHit, TrustState, TrustTier
 from src.core.logging import get_logger
+from src.core.metrics import AGENT_INJECTION_EVENTS_TOTAL, increment as metric_increment
 from src.core.redact import redact, redact_text
 
 logger = get_logger(__name__)
@@ -741,6 +742,7 @@ class TrustScanner:
                 families=sorted(scan.families),
             )
             self.state.tier = candidate
+            metric_increment(AGENT_INJECTION_EVENTS_TOTAL, tier=candidate.value)
         elif self.state.tier is TrustTier.CLEAN:
             self.state.tier = TrustTier.FLAGGED
         return self.state.tier

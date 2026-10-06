@@ -85,7 +85,20 @@ services:
       dockerfile: Dockerfile
       target: production
     container_name: pysoar-worker
-    command: celery -A src.workers.celery_app worker --loglevel=info --concurrency=2
+    # --max-memory-per-child=300000 (KB == 300 MB) is deliberately
+    # duplicated from `worker_max_memory_per_child` in
+    # src/workers/celery_app.py. Reason: the CLI flag is the only copy that
+    # is guaranteed to apply. `worker_max_memory_per_child` is read from the
+    # app config at child-boot time, so a bad/partial deploy, an older image
+    # layer, or an env override that shadows the config leaves the setting
+    # silently unset — which is exactly the state prod was in when a single
+    # sweep grew past 1.2 GB RSS and the kernel OOM-killed workers in a loop
+    # until the 4 GB t3.medium froze (2026-05-20 and again 2026-09-01).
+    # Declaring it on the command line makes the recycle threshold visible
+    # in `docker compose ps`/`ps aux` and survives config drift.
+    command: >
+      celery -A src.workers.celery_app worker --loglevel=info --concurrency=2
+      --max-memory-per-child=300000 --max-tasks-per-child=50
     env_file:
       - .env
     volumes:

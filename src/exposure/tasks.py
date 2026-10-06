@@ -25,6 +25,40 @@ logger = get_logger(__name__)
 # Helpers
 # ---------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# Memory bounds (prod OOM post-mortem 2026-09-01)
+# --------------------------------------------------------------------------
+# `log_entries` holds millions of rows on a month-old deployment. The SIEM
+# asset-discovery sweep used to run
+#   SELECT DISTINCT source_address, source_ip, hostname FROM log_entries ...
+# and materialise the whole result with `.all()`, then `session.add()` one
+# ExposureAsset per unseen IP with a single commit at the end. That is an
+# O(rows-in-24h) Python working set inside one task — the signature the
+# kernel OOM-killed (a per-child RSS cap only recycles a child *between*
+# tasks, never inside one).
+#
+# Everything below reads in fixed-size windows and commits per window, so
+# peak RSS is O(DISCOVERY_BATCH_SIZE) instead of O(table).
+DISCOVERY_BATCH_SIZE = 1_000
+
+# Hard per-run ceiling on scanned log rows. Generous enough that a normal
+# 24 h window is never truncated; when it *is* hit the task logs it loudly
+# rather than silently doing partial work. The next run picks up whatever is
+# still within its own 24 h window.
+MAX_DISCOVERY_LOG_ROWS = 500_000
+
+# Hard per-run ceiling on newly created assets. A runaway log source (one
+# log line per ephemeral container IP, say) must not turn into a million
+# ExposureAsset inserts in a single transaction.
+MAX_ASSETS_PER_RUN = 50_000
+
+# Attack-surface snapshots store every asset key / open-vuln key in a JSON
+# column. Past this many keys the snapshot is recorded as truncated instead
+# of serialising an unbounded list into one row (and reading it back the
+# next day).
+MAX_SNAPSHOT_KEYS = 100_000
+
+
 def _run_async(coro):
     """Execute an async coroutine from a synchronous Celery task."""
     try:
@@ -73,8 +107,25 @@ async def _run_asset_discovery_async(
     cutoff_iso = (now - timedelta(hours=24)).isoformat()
     created = 0
 
+    scanned = 0
+    row_cap_hit = False
+    asset_cap_hit = False
+
     async with async_session_factory() as session:
-        # Distinct source IPs/hostnames observed in the last 24h.
+        # Known asset IPs for this org (dedupe target). Streamed: an org can
+        # legitimately have hundreds of thousands of assets and only the IP
+        # strings are needed, never the ORM rows.
+        known_ips: set[str] = set()
+        known_result = await session.stream(
+            select(ExposureAsset.ip_address)
+            .where(ExposureAsset.organization_id == organization_id)
+            .execution_options(yield_per=DISCOVERY_BATCH_SIZE)
+        )
+        async for chunk in known_result.scalars().partitions(DISCOVERY_BATCH_SIZE):
+            known_ips.update(ip for ip in chunk if ip)
+
+        # Distinct source IPs/hostnames observed in the last 24h. Streamed in
+        # fixed windows with a per-window commit — never materialised whole.
         stmt = (
             select(
                 LogEntry.source_address,
@@ -86,48 +137,71 @@ async def _run_asset_discovery_async(
                 LogEntry.received_at >= cutoff_iso,
             )
             .distinct()
+            .limit(MAX_DISCOVERY_LOG_ROWS)
+            .execution_options(yield_per=DISCOVERY_BATCH_SIZE)
         )
-        rows = (await session.execute(stmt)).all()
 
-        # Known asset IPs for this org (dedupe target).
-        known = (
-            await session.execute(
-                select(ExposureAsset.ip_address).where(
-                    ExposureAsset.organization_id == organization_id
-                )
-            )
-        ).scalars().all()
-        known_ips = {ip for ip in known if ip}
         seen: set[str] = set()
-
-        for source_address, source_ip, hostname in rows:
-            ip = source_address or source_ip
-            if not ip or ip in known_ips or ip in seen:
-                continue
-            seen.add(ip)
-            session.add(
-                ExposureAsset(
-                    hostname=hostname,
-                    ip_address=ip,
-                    asset_type="host",
-                    is_active=True,
-                    last_seen=now,
-                    tags=["auto-discovered", "siem"],
-                    extra_metadata={
-                        "discovery_source": "siem_logs",
-                        "discovered_at": now.isoformat(),
-                    },
-                    organization_id=organization_id,
+        log_result = await session.stream(stmt)
+        async for chunk in log_result.partitions(DISCOVERY_BATCH_SIZE):
+            for source_address, source_ip, hostname in chunk:
+                scanned += 1
+                ip = source_address or source_ip
+                if not ip or ip in known_ips or ip in seen:
+                    continue
+                if created >= MAX_ASSETS_PER_RUN:
+                    asset_cap_hit = True
+                    break
+                seen.add(ip)
+                session.add(
+                    ExposureAsset(
+                        hostname=hostname,
+                        ip_address=ip,
+                        asset_type="host",
+                        is_active=True,
+                        last_seen=now,
+                        tags=["auto-discovered", "siem"],
+                        extra_metadata={
+                            "discovery_source": "siem_logs",
+                            "discovered_at": now.isoformat(),
+                        },
+                        organization_id=organization_id,
+                    )
                 )
-            )
-            created += 1
+                created += 1
+            # Drain the pending inserts (and the identity map) every window so
+            # the session never holds more than one batch of ORM objects.
+            await session.commit()
+            session.expunge_all()
+            if asset_cap_hit:
+                break
+
+        if scanned >= MAX_DISCOVERY_LOG_ROWS:
+            row_cap_hit = True
 
         await session.commit()
+
+    if row_cap_hit:
+        logger.warning(
+            "asset discovery hit its per-run log-row cap — remaining rows "
+            "deferred to the next run",
+            organization_id=organization_id,
+            max_log_rows=MAX_DISCOVERY_LOG_ROWS,
+        )
+    if asset_cap_hit:
+        logger.warning(
+            "asset discovery hit its per-run asset-creation cap — remaining "
+            "assets deferred to the next run",
+            organization_id=organization_id,
+            max_assets=MAX_ASSETS_PER_RUN,
+        )
 
     return {
         "organization_id": organization_id,
         "discovery_type": "siem",
         "assets_discovered": created,
+        "log_rows_scanned": scanned,
+        "truncated": row_cap_hit or asset_cap_hit,
         "timestamp": now.isoformat(),
     }
 
@@ -772,22 +846,51 @@ async def _detect_attack_surface_changes_async(organization_id: str) -> dict[str
     now = datetime.now(timezone.utc)
     async with async_session_factory() as session:
         # --- Current attack surface fingerprint ---
-        asset_rows = (await session.execute(
-            select(ExposureAsset.ip_address, ExposureAsset.hostname).where(
+        # Both reads are streamed and hard-capped: the fingerprint sets are
+        # serialised into a single JSON column, so an unbounded asset or
+        # open-vulnerability count used to mean an unbounded row (written
+        # daily, and read back in full the next day).
+        current_assets: set[str] = set()
+        asset_result = await session.stream(
+            select(ExposureAsset.ip_address, ExposureAsset.hostname)
+            .where(
                 ExposureAsset.organization_id == organization_id,
                 ExposureAsset.is_active == True,  # noqa: E712
             )
-        )).all()
-        current_assets = {(ip or host) for ip, host in asset_rows if (ip or host)}
+            .limit(MAX_SNAPSHOT_KEYS + 1)
+            .execution_options(yield_per=DISCOVERY_BATCH_SIZE)
+        )
+        async for chunk in asset_result.partitions(DISCOVERY_BATCH_SIZE):
+            current_assets.update((ip or host) for ip, host in chunk if (ip or host))
 
-        vuln_rows = (await session.execute(
+        current_vulns: set[str] = set()
+        vuln_result = await session.stream(
             select(AssetVulnerability.asset_id, AssetVulnerability.vulnerability_id)
             .where(
                 AssetVulnerability.organization_id == organization_id,
                 AssetVulnerability.status == "open",
             )
-        )).all()
-        current_vulns = {f"{aid}:{vid}" for aid, vid in vuln_rows}
+            .limit(MAX_SNAPSHOT_KEYS + 1)
+            .execution_options(yield_per=DISCOVERY_BATCH_SIZE)
+        )
+        async for chunk in vuln_result.partitions(DISCOVERY_BATCH_SIZE):
+            current_vulns.update(f"{aid}:{vid}" for aid, vid in chunk)
+
+        keys_truncated = (
+            len(current_assets) > MAX_SNAPSHOT_KEYS
+            or len(current_vulns) > MAX_SNAPSHOT_KEYS
+        )
+        if keys_truncated:
+            # Deterministic prefix so consecutive snapshots compare the same
+            # slice of the surface instead of two arbitrary samples.
+            current_assets = set(sorted(current_assets)[:MAX_SNAPSHOT_KEYS])
+            current_vulns = set(sorted(current_vulns)[:MAX_SNAPSHOT_KEYS])
+            logger.warning(
+                "attack-surface snapshot truncated at the per-snapshot key cap "
+                "— the diff covers the lexicographically first keys only",
+                organization_id=organization_id,
+                max_snapshot_keys=MAX_SNAPSHOT_KEYS,
+            )
 
         # --- Previous snapshot (most recent) ---
         previous = (await session.execute(
@@ -823,6 +926,7 @@ async def _detect_attack_surface_changes_async(organization_id: str) -> dict[str
                 "asset_keys": sorted(current_assets),
                 "vuln_keys": sorted(current_vulns),
                 "is_baseline": is_baseline,
+                "keys_truncated": keys_truncated,
             },
             organization_id=organization_id,
         )
@@ -832,6 +936,7 @@ async def _detect_attack_surface_changes_async(organization_id: str) -> dict[str
     return {
         "organization_id": organization_id,
         "is_baseline": is_baseline,
+        "keys_truncated": keys_truncated,
         "changes_detected": (
             len(changes["new_assets"])
             + len(changes["new_vulnerabilities"])

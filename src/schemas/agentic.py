@@ -247,7 +247,14 @@ class AgentActionResponse(AgentActionBase, DBModel):
 
 
 class ActionPendingApproval(BaseModel):
-    """Pending action requiring approval"""
+    """A proposal awaiting approval, with the full binding the card needs.
+
+    Design v2 section 8: an approve call must echo ``params_sha256`` and
+    ``evidence_sha256``, and the reviewer must see the concrete arguments,
+    every expanded target, the injection tier the evidence carried and when
+    the proposal expires. The legacy ``action_type``/``target``/agent fields
+    are kept so existing clients keep working.
+    """
 
     action_id: str = ""
     action_type: str = ""
@@ -258,6 +265,45 @@ class ActionPendingApproval(BaseModel):
     agent_name: str = ""
     confidence_score: float = 0.0
     created_at: datetime
+
+    # Proposal provenance + binding (agent_actions columns, migration 020).
+    tool_name: Optional[str] = None
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    effective_targets: list[dict[str, Any]] = Field(default_factory=list)
+    params_sha256: Optional[str] = None
+    evidence_sha256: Optional[str] = None
+    suspect: bool = False
+    injection_tier: Optional[str] = None
+    expires_at: Optional[datetime] = None
+    source: Optional[str] = None
+    proposed_by_user_id: Optional[str] = None
+    proposed_by_agent_id: Optional[str] = None
+    run_id: Optional[str] = None
+    requires_approval: bool = True
+    execution_status: str = ""
+
+
+class TrustAcknowledgeRequest(BaseModel):
+    """Body of ``POST /agentic/trust/acknowledge`` (design v2 section 4).
+
+    Names the persisted trust state to downgrade: a chat session, an
+    investigation, or both. ``record_hash`` narrows the acknowledgment to one
+    scanned content hash (``TrustHit.snippet_sha256``); without it every hit
+    on that state is acknowledged. ``reason`` is mandatory and audited.
+    """
+
+    session_id: Optional[str] = None
+    investigation_id: Optional[str] = None
+    record_hash: Optional[str] = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$", description="sha256 of the acknowledged snippet"
+    )
+    reason: str = Field(..., min_length=3, max_length=1000)
+
+    @model_validator(mode="after")
+    def _one_target(self) -> "TrustAcknowledgeRequest":
+        if not (self.session_id or self.investigation_id):
+            raise ValueError("session_id or investigation_id is required")
+        return self
 
 
 class ActionHistory(BaseModel):

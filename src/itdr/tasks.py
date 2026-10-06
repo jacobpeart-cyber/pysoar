@@ -25,6 +25,16 @@ def _run_async(coro):
         loop.close()
 
 
+# --- Memory bounds (prod OOM post-mortem 2026-09-01) -----------------------
+# Rows pulled per round-trip when streaming the open-threat dedupe set.
+ITDR_BATCH_SIZE = 1_000
+
+# Per-org ceiling on identities scanned in one pass. The sweep runs hourly
+# and the scan is idempotent (it skips identity/threat-type pairs that
+# already have an open threat), so a cap defers work rather than losing it.
+MAX_IDENTITIES_PER_SCAN = 50_000
+
+
 def _fresh_itdr_session_factory():
     """Per-task NullPool engine, same pattern as src.agentic.tasks.
     Avoids 'Future attached to a different loop' errors from the
@@ -53,25 +63,36 @@ async def _run_identity_scan_for_org(session, organization_id: str) -> dict:
     now = datetime.now(timezone.utc)
     cutoff_180d = now - timedelta(days=180)
 
-    identities = list(await session.scalars(
-        select(IdentityProfile).where(
-            IdentityProfile.organization_id == organization_id,
-        )
-    ))
-    existing = list(await session.scalars(
-        select(IdentityThreat).where(
+    # Only the two columns the dedupe needs, streamed in fixed windows: the
+    # old `select(IdentityThreat)` kept every open threat for the org as a
+    # full ORM row (evidence JSON included) for the whole scan, and the
+    # cross-org sweep shared one session so they accumulated across orgs too
+    # (prod OOM post-mortem 2026-09-01).
+    open_by_identity: dict[str, set[str]] = {}
+    existing_result = await session.stream(
+        select(IdentityThreat.identity_id, IdentityThreat.threat_type)
+        .where(
             IdentityThreat.organization_id == organization_id,
             IdentityThreat.status.in_([
                 ThreatStatus.DETECTED.value,
                 ThreatStatus.INVESTIGATING.value,
             ]),
         )
-    ))
-    open_by_identity: dict[str, set[str]] = {}
-    for t in existing:
-        open_by_identity.setdefault(t.identity_id, set()).add(t.threat_type)
+        .execution_options(yield_per=ITDR_BATCH_SIZE)
+    )
+    async for chunk in existing_result.partitions(ITDR_BATCH_SIZE):
+        for identity_id, threat_type in chunk:
+            open_by_identity.setdefault(identity_id, set()).add(threat_type)
+
+    identities_stmt = (
+        select(IdentityProfile)
+        .where(IdentityProfile.organization_id == organization_id)
+        .order_by(IdentityProfile.id)
+        .limit(MAX_IDENTITIES_PER_SCAN)
+    )
 
     created = 0
+    identities_scanned = 0
     fired: list[tuple[str, str, str, str]] = []
 
     def _parse_iso(ts):
@@ -96,6 +117,16 @@ async def _run_identity_scan_for_org(session, organization_id: str) -> dict:
             status=ThreatStatus.DETECTED.value,
         ))
         return True
+
+    identities = list(await session.scalars(identities_stmt))
+    identities_scanned = len(identities)
+    if identities_scanned >= MAX_IDENTITIES_PER_SCAN:
+        logger.warning(
+            "identity scan capped at %d identities for org %s — remainder "
+            "deferred to the next run",
+            MAX_IDENTITIES_PER_SCAN,
+            organization_id,
+        )
 
     for identity in identities:
         roles = getattr(identity, "role_assignments", None) or []
@@ -162,9 +193,12 @@ async def _run_identity_scan_for_org(session, organization_id: str) -> dict:
         logger.warning(f"AutomationService setup failed in identity scan: {exc}")
 
     await session.commit()
+    # Release this org's ORM rows so a cross-org sweep does not accumulate
+    # every org's identities in one session.
+    session.expunge_all()
     return {
         "organization_id": organization_id,
-        "identities_scanned": len(identities),
+        "identities_scanned": identities_scanned,
         "threats_created": created,
     }
 
@@ -211,17 +245,26 @@ def scheduled_identity_threat_sweep(self):
     async def _sweep():
         _engine, _sf = _fresh_itdr_session_factory()
         totals = {"orgs_scanned": 0, "identities_scanned": 0, "threats_created": 0}
-        async with _sf() as session:
-            orgs = list(await session.scalars(select(Organization)))
-            for org in orgs:
+        try:
+            # Org ids only — never the Organization ORM rows — and a fresh
+            # session per org so one org's identities/threats cannot stay
+            # reachable while the next org is scanned.
+            async with _sf() as session:
+                org_ids = list(await session.scalars(select(Organization.id)))
+
+            for org_id in org_ids:
                 try:
-                    r = await _run_identity_scan_for_org(session, org.id)
+                    async with _sf() as session:
+                        r = await _run_identity_scan_for_org(session, org_id)
                     totals["orgs_scanned"] += 1
                     totals["identities_scanned"] += r["identities_scanned"]
                     totals["threats_created"] += r["threats_created"]
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning(f"identity sweep: org {org.id} failed: {exc}")
-        await _engine.dispose()
+                    logger.warning(f"identity sweep: org {org_id} failed: {exc}")
+        finally:
+            # Was outside any try/finally: a failure mid-sweep leaked the
+            # engine (and its connections) for the life of the worker child.
+            await _engine.dispose()
         if totals["threats_created"]:
             logger.info(f"scheduled_identity_threat_sweep: {totals}")
         return totals

@@ -42,6 +42,36 @@ HIGH_RISK_ALERT_THRESHOLD = 50.0
 
 BASELINE_LOOKBACK_DAYS = 30
 
+# --- Memory bounds (prod OOM post-mortem 2026-09-01) -----------------------
+# `behavior_events` is the largest UEBA table by orders of magnitude. The
+# baseline rebuild used to run, per entity,
+#   events = list(select(BehaviorEvent).where(entity, org, created_at>=30d))
+# with every row kept as a full ORM object. Because the session is never
+# expunged between entities and `expire_on_commit=False`-style identity-map
+# retention keeps them reachable, one all-org run accumulated effectively the
+# whole 30-day table in a single Celery task — and a per-child RSS cap only
+# recycles a child *between* tasks, so the kernel OOM-killed the worker
+# instead.
+#
+# The reads below select only the columns the engine actually consumes,
+# stream them in fixed windows, and commit + expunge between entity batches.
+UEBA_BATCH_SIZE = 1_000
+
+# Per-entity ceiling on baseline input events. BaselineManager computes mean /
+# stdev / typical-hour histograms; 100k samples already pins every statistic.
+MAX_BASELINE_EVENTS_PER_ENTITY = 100_000
+
+# Per-entity ceiling on the 30-day risk-alert window read for scoring.
+MAX_RISK_ALERTS_PER_ENTITY = 10_000
+
+# `contributing_events` is a JSON column on UEBARiskAlert — cap how many ids
+# get serialised into one row.
+MAX_CONTRIBUTING_EVENTS = 5_000
+
+# Rows deleted per transaction by the retention task. One unbounded DELETE
+# over a multi-million-row table is a single huge server-side transaction.
+CLEANUP_DELETE_BATCH = 10_000
+
 # Map BehaviorEvent.event_type onto the behavior keys BaselineManager's
 # statistics extractor understands. Baselines are PERSISTED under the raw
 # event_type because that is the key `score_event_anomaly` (ingest path)
@@ -76,6 +106,40 @@ async def _load_target_entities(db, organization_id, entity_ids):
     if entity_ids:
         stmt = stmt.where(EntityProfile.id.in_(entity_ids))
     return list((await db.execute(stmt)).scalars().all())
+
+
+async def _iter_target_entity_batches(
+    db,
+    organization_id,
+    entity_ids,
+    batch_size: int = UEBA_BATCH_SIZE,
+):
+    """Yield target EntityProfiles in keyset-paginated batches.
+
+    Keyset pagination (``id > last_id``) rather than a streamed cursor,
+    because callers commit and ``expunge_all()`` between batches — which
+    would invalidate an open server-side cursor — and because it keeps the
+    Python working set at one batch regardless of how many entities exist.
+    """
+    from src.ueba.models import EntityProfile
+
+    last_id: Optional[str] = None
+    while True:
+        stmt = select(EntityProfile).order_by(EntityProfile.id).limit(batch_size)
+        if organization_id:
+            stmt = stmt.where(EntityProfile.organization_id == organization_id)
+        if entity_ids:
+            stmt = stmt.where(EntityProfile.id.in_(entity_ids))
+        if last_id is not None:
+            stmt = stmt.where(EntityProfile.id > last_id)
+
+        batch = list((await db.execute(stmt)).scalars().all())
+        if not batch:
+            return
+        last_id = batch[-1].id
+        yield batch
+        if len(batch) < batch_size:
+            return
 
 
 def _row_to_baseline_event(row) -> dict:
@@ -169,93 +233,122 @@ async def _update_entity_baselines_async(
     baselines_skipped = 0
 
     async with async_session_factory() as db:
-        entities = await _load_target_entities(db, organization_id, entity_ids)
+        async for entity_batch in _iter_target_entity_batches(
+            db, organization_id, entity_ids
+        ):
+            for entity in entity_batch:
+                entities_processed += 1
 
-        for entity in entities:
-            entities_processed += 1
-
-            events_result = await db.execute(
-                select(BehaviorEvent).where(
-                    and_(
-                        BehaviorEvent.entity_profile_id == entity.id,
-                        BehaviorEvent.organization_id == entity.organization_id,
-                        BehaviorEvent.created_at >= cutoff,
+                # Only the four columns BaselineManager consumes, streamed in
+                # fixed windows and mapped straight into the small event dicts.
+                # Full BehaviorEvent ORM rows (with their event_data /
+                # geo_location / device_info JSON) never enter the session.
+                events_stmt = (
+                    select(
+                        BehaviorEvent.event_type,
+                        BehaviorEvent.created_at,
+                        BehaviorEvent.source_ip,
+                        BehaviorEvent.event_data,
                     )
+                    .where(
+                        and_(
+                            BehaviorEvent.entity_profile_id == entity.id,
+                            BehaviorEvent.organization_id == entity.organization_id,
+                            BehaviorEvent.created_at >= cutoff,
+                        )
+                    )
+                    .limit(MAX_BASELINE_EVENTS_PER_ENTITY)
+                    .execution_options(yield_per=UEBA_BATCH_SIZE)
                 )
-            )
-            events = list(events_result.scalars().all())
-            if not events:
-                continue
 
-            by_type: dict[str, list] = {}
-            for ev in events:
-                by_type.setdefault(ev.event_type, []).append(ev)
-
-            for event_type, rows in by_type.items():
-                mapped = [_row_to_baseline_event(r) for r in rows]
-                kind = _BASELINE_KIND_FOR_EVENT_TYPE.get(event_type, "login_pattern")
-                built = baseline_manager.build_baseline(
-                    entity.entity_id, kind, mapped, lookback_days=BASELINE_LOOKBACK_DAYS
-                )
-                if not built.get("statistical_model") and kind != "login_pattern":
-                    # e.g. resource_access events without file_count in
-                    # event_data — fall back to time-of-day statistics,
-                    # which every event has.
-                    built = baseline_manager.build_baseline(
+                by_type: dict[str, list] = {}
+                total_events = 0
+                events_result = await db.stream(events_stmt)
+                async for chunk in events_result.partitions(UEBA_BATCH_SIZE):
+                    for row in chunk:
+                        total_events += 1
+                        by_type.setdefault(row.event_type, []).append(
+                            _row_to_baseline_event(row)
+                        )
+                if total_events >= MAX_BASELINE_EVENTS_PER_ENTITY:
+                    logger.warning(
+                        "baseline rebuild capped at %d events for entity %s "
+                        "(statistics computed from the capped sample)",
+                        MAX_BASELINE_EVENTS_PER_ENTITY,
                         entity.entity_id,
-                        "login_pattern",
-                        mapped,
-                        lookback_days=BASELINE_LOOKBACK_DAYS,
                     )
-
-                if not built.get("statistical_model"):
-                    # Below min_samples (or no usable values) — honest skip.
-                    baselines_skipped += 1
+                if not total_events:
                     continue
 
-                engine_time_patterns = built.get("time_patterns") or {}
-                time_patterns = {
-                    **engine_time_patterns,
-                    # Key that ingest scoring reads.
-                    "hours": engine_time_patterns.get("typical_hours", []),
-                }
-                typical_values = [v for v in built.get("typical_values", []) if v]
-
-                existing_result = await db.execute(
-                    select(BehaviorBaseline).where(
-                        and_(
-                            BehaviorBaseline.entity_profile_id == entity.id,
-                            BehaviorBaseline.behavior_type == event_type,
-                        )
-                    ).limit(1)
-                )
-                baseline_row = existing_result.scalar_one_or_none()
-                if baseline_row is None:
-                    baseline_row = BehaviorBaseline(
-                        id=str(uuid.uuid4()),
-                        entity_profile_id=entity.id,
-                        behavior_type=event_type,
+                for event_type, mapped in by_type.items():
+                    kind = _BASELINE_KIND_FOR_EVENT_TYPE.get(event_type, "login_pattern")
+                    built = baseline_manager.build_baseline(
+                        entity.entity_id, kind, mapped, lookback_days=BASELINE_LOOKBACK_DAYS
                     )
-                    db.add(baseline_row)
+                    if not built.get("statistical_model") and kind != "login_pattern":
+                        # e.g. resource_access events without file_count in
+                        # event_data — fall back to time-of-day statistics,
+                        # which every event has.
+                        built = baseline_manager.build_baseline(
+                            entity.entity_id,
+                            "login_pattern",
+                            mapped,
+                            lookback_days=BASELINE_LOOKBACK_DAYS,
+                        )
 
-                baseline_row.baseline_period_days = BASELINE_LOOKBACK_DAYS
-                baseline_row.statistical_model = built["statistical_model"]
-                baseline_row.typical_values = typical_values
-                baseline_row.time_patterns = time_patterns
-                baseline_row.confidence = round(built.get("confidence", 0.0), 3)
-                baseline_row.sample_count = built.get("sample_count", 0)
-                baseline_row.last_updated_at = now
-                baselines_updated += 1
+                    if not built.get("statistical_model"):
+                        # Below min_samples (or no usable values) — honest skip.
+                        baselines_skipped += 1
+                        continue
 
-            # Summary on the profile, same shape the rebuild endpoint writes.
-            entity.baseline_data = {
-                "baseline_days": BASELINE_LOOKBACK_DAYS,
-                "event_types": list(by_type.keys()),
-                "total_events": len(events),
-                "last_rebuild": now.isoformat(),
-            }
+                    engine_time_patterns = built.get("time_patterns") or {}
+                    time_patterns = {
+                        **engine_time_patterns,
+                        # Key that ingest scoring reads.
+                        "hours": engine_time_patterns.get("typical_hours", []),
+                    }
+                    typical_values = [v for v in built.get("typical_values", []) if v]
 
-        await db.commit()
+                    existing_result = await db.execute(
+                        select(BehaviorBaseline).where(
+                            and_(
+                                BehaviorBaseline.entity_profile_id == entity.id,
+                                BehaviorBaseline.behavior_type == event_type,
+                            )
+                        ).limit(1)
+                    )
+                    baseline_row = existing_result.scalar_one_or_none()
+                    if baseline_row is None:
+                        baseline_row = BehaviorBaseline(
+                            id=str(uuid.uuid4()),
+                            entity_profile_id=entity.id,
+                            behavior_type=event_type,
+                        )
+                        db.add(baseline_row)
+
+                    baseline_row.baseline_period_days = BASELINE_LOOKBACK_DAYS
+                    baseline_row.statistical_model = built["statistical_model"]
+                    baseline_row.typical_values = typical_values
+                    baseline_row.time_patterns = time_patterns
+                    baseline_row.confidence = round(built.get("confidence", 0.0), 3)
+                    baseline_row.sample_count = built.get("sample_count", 0)
+                    baseline_row.last_updated_at = now
+                    baselines_updated += 1
+
+                # Summary on the profile, same shape the rebuild endpoint writes.
+                entity.baseline_data = {
+                    "baseline_days": BASELINE_LOOKBACK_DAYS,
+                    "event_types": list(by_type.keys()),
+                    "total_events": total_events,
+                    "last_rebuild": now.isoformat(),
+                }
+                # Release this entity's mapped events before moving on.
+                by_type.clear()
+
+            # Drain pending baseline rows and the identity map once per entity
+            # batch, so peak memory is O(UEBA_BATCH_SIZE) not O(entities).
+            await db.commit()
+            db.expunge_all()
 
     return {
         "status": "completed",
@@ -288,53 +381,61 @@ async def _calculate_entity_risks_async(
     critical_risk_count = 0
 
     async with async_session_factory() as db:
-        entities = await _load_target_entities(db, organization_id, entity_ids)
+        async for entity_batch in _iter_target_entity_batches(
+            db, organization_id, entity_ids
+        ):
+            for entity in entity_batch:
+                # Columns only — the scorer reads severity + created_at and
+                # nothing else, so full UEBARiskAlert ORM rows (evidence /
+                # contributing_events JSON) never enter the session, and the
+                # window is capped per entity.
+                alerts_result = await db.execute(
+                    select(UEBARiskAlert.severity, UEBARiskAlert.created_at)
+                    .where(
+                        and_(
+                            UEBARiskAlert.entity_profile_id == entity.id,
+                            UEBARiskAlert.organization_id == entity.organization_id,
+                            UEBARiskAlert.created_at >= cutoff,
+                        )
+                    )
+                    .limit(MAX_RISK_ALERTS_PER_ENTITY)
+                )
+                recent_alerts = [
+                    {"severity": severity, "created_at": _as_naive_utc(created_at)}
+                    for severity, created_at in alerts_result.all()
+                ]
 
-        for entity in entities:
-            alerts_result = await db.execute(
-                select(UEBARiskAlert).where(
-                    and_(
-                        UEBARiskAlert.entity_profile_id == entity.id,
-                        UEBARiskAlert.organization_id == entity.organization_id,
-                        UEBARiskAlert.created_at >= cutoff,
+                risk_score = risk_scorer.calculate_entity_risk(
+                    entity.entity_id,
+                    recent_alerts,
+                    historical_risk=entity.risk_score or 0.0,
+                )
+                risk_level = risk_scorer.update_risk_level(risk_score)
+
+                anomaly_count_result = await db.execute(
+                    select(func.count(BehaviorEvent.id)).where(
+                        and_(
+                            BehaviorEvent.entity_profile_id == entity.id,
+                            BehaviorEvent.organization_id == entity.organization_id,
+                            BehaviorEvent.is_anomalous.is_(True),
+                            BehaviorEvent.created_at >= cutoff,
+                        )
                     )
                 )
-            )
-            recent_alerts = [
-                {"severity": a.severity, "created_at": _as_naive_utc(a.created_at)}
-                for a in alerts_result.scalars().all()
-            ]
+                anomaly_count = anomaly_count_result.scalar() or 0
 
-            risk_score = risk_scorer.calculate_entity_risk(
-                entity.entity_id,
-                recent_alerts,
-                historical_risk=entity.risk_score or 0.0,
-            )
-            risk_level = risk_scorer.update_risk_level(risk_score)
+                entity.risk_score = round(risk_score, 2)
+                entity.risk_level = risk_level
+                entity.anomaly_count_30d = anomaly_count
 
-            anomaly_count_result = await db.execute(
-                select(func.count(BehaviorEvent.id)).where(
-                    and_(
-                        BehaviorEvent.entity_profile_id == entity.id,
-                        BehaviorEvent.organization_id == entity.organization_id,
-                        BehaviorEvent.is_anomalous.is_(True),
-                        BehaviorEvent.created_at >= cutoff,
-                    )
-                )
-            )
-            anomaly_count = anomaly_count_result.scalar() or 0
+                entities_updated += 1
+                if risk_level == "critical":
+                    critical_risk_count += 1
+                elif risk_level == "high":
+                    high_risk_count += 1
 
-            entity.risk_score = round(risk_score, 2)
-            entity.risk_level = risk_level
-            entity.anomaly_count_30d = anomaly_count
-
-            entities_updated += 1
-            if risk_level == "critical":
-                critical_risk_count += 1
-            elif risk_level == "high":
-                high_risk_count += 1
-
-        await db.commit()
+            await db.commit()
+            db.expunge_all()
 
     return {
         "status": "completed",
@@ -365,98 +466,110 @@ async def _detect_impossible_travel_async(
     alerts_created = 0
 
     async with async_session_factory() as db:
-        entities = await _load_target_entities(db, organization_id, entity_ids)
+        async for entity_batch in _iter_target_entity_batches(
+            db, organization_id, entity_ids
+        ):
+            for entity in entity_batch:
+                checked_count += 1
 
-        for entity in entities:
-            checked_count += 1
-
-            events_result = await db.execute(
-                select(BehaviorEvent).where(
-                    and_(
-                        BehaviorEvent.entity_profile_id == entity.id,
-                        BehaviorEvent.organization_id == entity.organization_id,
-                        BehaviorEvent.event_type == "authentication",
-                        BehaviorEvent.geo_location.is_not(None),
-                    )
-                ).order_by(desc(BehaviorEvent.created_at)).limit(2)
-            )
-            recent = list(events_result.scalars().all())
-            if len(recent) < 2:
-                continue
-
-            latest, previous = recent
-            if not (latest.created_at and previous.created_at):
-                continue
-
-            detection = travel_detector.check_impossible_travel(
-                entity.entity_id,
-                latest.geo_location or {},
-                latest.created_at,
-                previous.geo_location or {},
-                previous.created_at,
-            )
-            if not detection:
-                continue
-
-            # Dedupe: never re-alert on the same latest event.
-            existing_result = await db.execute(
-                select(UEBARiskAlert).where(
-                    and_(
-                        UEBARiskAlert.entity_profile_id == entity.id,
-                        UEBARiskAlert.organization_id == entity.organization_id,
-                        UEBARiskAlert.alert_type == "impossible_travel",
-                        UEBARiskAlert.status != "dismissed",
-                    )
+                events_result = await db.execute(
+                    select(BehaviorEvent).where(
+                        and_(
+                            BehaviorEvent.entity_profile_id == entity.id,
+                            BehaviorEvent.organization_id == entity.organization_id,
+                            BehaviorEvent.event_type == "authentication",
+                            BehaviorEvent.geo_location.is_not(None),
+                        )
+                    ).order_by(desc(BehaviorEvent.created_at)).limit(2)
                 )
-            )
-            already_alerted = any(
-                latest.id in (existing.contributing_events or [])
-                for existing in existing_result.scalars().all()
-            )
-            if already_alerted:
-                continue
+                recent = list(events_result.scalars().all())
+                if len(recent) < 2:
+                    continue
 
-            severity = detection.get("severity", "critical")
-            risk_delta = float(risk_scorer.SEVERITY_WEIGHTS.get(severity, 20))
+                latest, previous = recent
+                if not (latest.created_at and previous.created_at):
+                    continue
 
-            alert = UEBARiskAlert(
-                id=str(uuid.uuid4()),
-                entity_profile_id=entity.id,
-                alert_type="impossible_travel",
-                severity=severity,
-                risk_score_delta=risk_delta,
-                description=detection["description"],
-                evidence=[detection.get("evidence", {})],
-                contributing_events=[latest.id, previous.id],
-                mitre_techniques=["T1078"],
-                status="new",
-                organization_id=entity.organization_id,
-            )
-            db.add(alert)
+                detection = travel_detector.check_impossible_travel(
+                    entity.entity_id,
+                    latest.geo_location or {},
+                    latest.created_at,
+                    previous.geo_location or {},
+                    previous.created_at,
+                )
+                if not detection:
+                    continue
 
-            entity.risk_score = min(100.0, (entity.risk_score or 0.0) + risk_delta)
-            entity.risk_level = risk_level_for_score(entity.risk_score)
-            entity.last_anomaly_at = now
+                # Dedupe: never re-alert on the same latest event. Only the
+                # contributing_events column is needed, streamed so a noisy
+                # entity's alert history is never materialised in full, and the
+                # scan short-circuits on the first hit.
+                already_alerted = False
+                existing_result = await db.stream(
+                    select(UEBARiskAlert.contributing_events)
+                    .where(
+                        and_(
+                            UEBARiskAlert.entity_profile_id == entity.id,
+                            UEBARiskAlert.organization_id == entity.organization_id,
+                            UEBARiskAlert.alert_type == "impossible_travel",
+                            UEBARiskAlert.status != "dismissed",
+                        )
+                    )
+                    .execution_options(yield_per=UEBA_BATCH_SIZE)
+                )
+                async for chunk in existing_result.scalars().partitions(
+                    UEBA_BATCH_SIZE
+                ):
+                    if any(latest.id in (ev or []) for ev in chunk):
+                        already_alerted = True
+                        break
+                await existing_result.close()
+                if already_alerted:
+                    continue
 
-            try:
-                automation = AutomationService(db)
-                await automation.on_ueba_anomaly(
-                    entity_type=entity.entity_type,
-                    entity_id=entity.entity_id,
-                    anomaly_type="impossible_travel",
-                    risk_score=entity.risk_score or 0.0,
-                    details=detection["description"],
+                severity = detection.get("severity", "critical")
+                risk_delta = float(risk_scorer.SEVERITY_WEIGHTS.get(severity, 20))
+
+                alert = UEBARiskAlert(
+                    id=str(uuid.uuid4()),
+                    entity_profile_id=entity.id,
+                    alert_type="impossible_travel",
+                    severity=severity,
+                    risk_score_delta=risk_delta,
+                    description=detection["description"],
+                    evidence=[detection.get("evidence", {})],
+                    contributing_events=[latest.id, previous.id],
+                    mitre_techniques=["T1078"],
+                    status="new",
                     organization_id=entity.organization_id,
                 )
-            except Exception as exc:  # noqa: BLE001
-                logger.error(f"Impossible-travel automation fanout failed: {exc}")
+                db.add(alert)
 
-            alerts_created += 1
-            logger.warning(
-                f"Impossible travel detected for {entity.entity_id}: {detection['description']}"
-            )
+                entity.risk_score = min(100.0, (entity.risk_score or 0.0) + risk_delta)
+                entity.risk_level = risk_level_for_score(entity.risk_score)
+                entity.last_anomaly_at = now
 
-        await db.commit()
+                try:
+                    automation = AutomationService(db)
+                    await automation.on_ueba_anomaly(
+                        entity_type=entity.entity_type,
+                        entity_id=entity.entity_id,
+                        anomaly_type="impossible_travel",
+                        risk_score=entity.risk_score or 0.0,
+                        details=detection["description"],
+                        organization_id=entity.organization_id,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(f"Impossible-travel automation fanout failed: {exc}")
+
+                alerts_created += 1
+                logger.warning(
+                    f"Impossible travel detected for {entity.entity_id}: {detection['description']}"
+                )
+
+            # Per entity batch: persist and drop the identity map.
+            await db.commit()
+            db.expunge_all()
 
     return {
         "status": "completed",
@@ -497,23 +610,35 @@ async def _update_peer_groups_async(
         for org_id in org_ids:
             orgs_processed += 1
 
-            entities_result = await db.execute(
-                select(EntityProfile).where(EntityProfile.organization_id == org_id)
-            )
-            entities = list(entities_result.scalars().all())
-            if not entities:
-                continue
-
+            # Columns only, streamed: clustering genuinely needs the whole
+            # org at once, but it only needs five scalar fields per entity —
+            # not full EntityProfile ORM rows with their baseline_data /
+            # attributes JSON, which is what used to pile up here for every
+            # org in a single all-org run.
             entity_dicts = []
             risk_by_id: dict[str, float] = {}
-            for e in entities:
-                d: dict[str, Any] = {"id": e.id, "entity_type": e.entity_type}
-                if e.department:
-                    d["department"] = e.department
-                if e.role:
-                    d["role"] = e.role
-                entity_dicts.append(d)
-                risk_by_id[e.id] = e.risk_score or 0.0
+            entities_result = await db.stream(
+                select(
+                    EntityProfile.id,
+                    EntityProfile.entity_type,
+                    EntityProfile.department,
+                    EntityProfile.role,
+                    EntityProfile.risk_score,
+                )
+                .where(EntityProfile.organization_id == org_id)
+                .execution_options(yield_per=UEBA_BATCH_SIZE)
+            )
+            async for chunk in entities_result.partitions(UEBA_BATCH_SIZE):
+                for eid, entity_type, department, role, risk_score in chunk:
+                    d: dict[str, Any] = {"id": eid, "entity_type": entity_type}
+                    if department:
+                        d["department"] = department
+                    if role:
+                        d["role"] = role
+                    entity_dicts.append(d)
+                    risk_by_id[eid] = risk_score or 0.0
+            if not entity_dicts:
+                continue
 
             department_groups = peer_analyzer.build_peer_groups(
                 entity_dicts, method="department"
@@ -579,6 +704,13 @@ async def _update_peer_groups_async(
                     else:
                         auto_count += 1
 
+            # Commit per org so neither the pending PeerGroup rows nor the
+            # per-org entity dicts accumulate across an all-org sweep.
+            await db.commit()
+            db.expunge_all()
+            entity_dicts.clear()
+            risk_by_id.clear()
+
         await db.commit()
 
     return {
@@ -612,89 +744,119 @@ async def _generate_ueba_alerts_async(
     skipped_existing = 0
 
     async with async_session_factory() as db:
-        stmt = select(EntityProfile).where(
-            EntityProfile.risk_score > HIGH_RISK_ALERT_THRESHOLD
-        )
-        if organization_id:
-            stmt = stmt.where(EntityProfile.organization_id == organization_id)
-        entities = list((await db.execute(stmt)).scalars().all())
+        # Keyset-paginated: an all-org sweep over a platform with a lot of
+        # high-risk entities used to hold every one of them as an ORM object
+        # for the whole run.
+        last_id: Optional[str] = None
+        while True:
+            stmt = (
+                select(EntityProfile)
+                .where(EntityProfile.risk_score > HIGH_RISK_ALERT_THRESHOLD)
+                .order_by(EntityProfile.id)
+                .limit(UEBA_BATCH_SIZE)
+            )
+            if organization_id:
+                stmt = stmt.where(EntityProfile.organization_id == organization_id)
+            if last_id is not None:
+                stmt = stmt.where(EntityProfile.id > last_id)
+            entities = list((await db.execute(stmt)).scalars().all())
+            if not entities:
+                break
+            last_id = entities[-1].id
+            batch_len = len(entities)
 
-        for entity in entities:
-            entities_evaluated += 1
+            for entity in entities:
+                entities_evaluated += 1
 
-            existing_result = await db.execute(
-                select(UEBARiskAlert.id).where(
-                    and_(
-                        UEBARiskAlert.entity_profile_id == entity.id,
-                        UEBARiskAlert.organization_id == entity.organization_id,
-                        UEBARiskAlert.alert_type == "high_risk_entity",
-                        UEBARiskAlert.status.in_(("new", "investigating")),
+                existing_result = await db.execute(
+                    select(UEBARiskAlert.id)
+                    .where(
+                        and_(
+                            UEBARiskAlert.entity_profile_id == entity.id,
+                            UEBARiskAlert.organization_id == entity.organization_id,
+                            UEBARiskAlert.alert_type == "high_risk_entity",
+                            UEBARiskAlert.status.in_(("new", "investigating")),
+                        )
                     )
-                ).limit(1)
-            )
-            if existing_result.scalar_one_or_none():
-                skipped_existing += 1
-                continue
+                    .limit(1)
+                )
+                if existing_result.scalar_one_or_none():
+                    skipped_existing += 1
+                    continue
 
-            alerts_result = await db.execute(
-                select(UEBARiskAlert).where(
-                    and_(
-                        UEBARiskAlert.entity_profile_id == entity.id,
-                        UEBARiskAlert.organization_id == entity.organization_id,
-                        UEBARiskAlert.created_at >= cutoff,
+                # Columns only (id + severity are all that is used) and capped:
+                # `contributing_events` is a JSON array persisted on the new row.
+                alerts_result = await db.execute(
+                    select(UEBARiskAlert.id, UEBARiskAlert.severity)
+                    .where(
+                        and_(
+                            UEBARiskAlert.entity_profile_id == entity.id,
+                            UEBARiskAlert.organization_id == entity.organization_id,
+                            UEBARiskAlert.created_at >= cutoff,
+                        )
+                    )
+                    .limit(MAX_CONTRIBUTING_EVENTS)
+                )
+                recent_alert_rows = alerts_result.all()
+                if len(recent_alert_rows) >= MAX_CONTRIBUTING_EVENTS:
+                    logger.warning(
+                        "high-risk-entity alert for %s capped at %d contributing "
+                        "events",
+                        entity.entity_id,
+                        MAX_CONTRIBUTING_EVENTS,
+                    )
+                risk_factors = risk_scorer.get_risk_factors(
+                    entity.entity_id,
+                    [{"severity": severity} for _, severity in recent_alert_rows],
+                )
+
+                severity = "critical" if (entity.risk_score or 0.0) >= 75 else "high"
+                factor_summary = ", ".join(
+                    f"{f['factor']}={f['count']}" for f in risk_factors
+                )
+                description = (
+                    f"Entity risk score {entity.risk_score:.1f} ({entity.risk_level}) "
+                    f"exceeds threshold {HIGH_RISK_ALERT_THRESHOLD:.0f}. "
+                    f"{entity.anomaly_count_30d or 0} anomalies in last 30 days."
+                )
+                if factor_summary:
+                    description += f" Risk factors: {factor_summary}."
+
+                db.add(
+                    UEBARiskAlert(
+                        id=str(uuid.uuid4()),
+                        entity_profile_id=entity.id,
+                        alert_type="high_risk_entity",
+                        severity=severity,
+                        # Summarizes existing risk; does not raise the score.
+                        risk_score_delta=0.0,
+                        description=description,
+                        evidence=risk_factors,
+                        contributing_events=[row_id for row_id, _ in recent_alert_rows],
+                        status="new",
+                        organization_id=entity.organization_id,
                     )
                 )
-            )
-            recent_alert_rows = list(alerts_result.scalars().all())
-            risk_factors = risk_scorer.get_risk_factors(
-                entity.entity_id,
-                [{"severity": a.severity} for a in recent_alert_rows],
-            )
 
-            severity = "critical" if (entity.risk_score or 0.0) >= 75 else "high"
-            factor_summary = ", ".join(
-                f"{f['factor']}={f['count']}" for f in risk_factors
-            )
-            description = (
-                f"Entity risk score {entity.risk_score:.1f} ({entity.risk_level}) "
-                f"exceeds threshold {HIGH_RISK_ALERT_THRESHOLD:.0f}. "
-                f"{entity.anomaly_count_30d or 0} anomalies in last 30 days."
-            )
-            if factor_summary:
-                description += f" Risk factors: {factor_summary}."
+                try:
+                    automation = AutomationService(db)
+                    await automation.on_ueba_anomaly(
+                        entity_type=entity.entity_type,
+                        entity_id=entity.entity_id,
+                        anomaly_type="high_risk_entity",
+                        risk_score=entity.risk_score or 0.0,
+                        details=description,
+                        organization_id=entity.organization_id,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.error(f"High-risk-entity automation fanout failed: {exc}")
 
-            db.add(
-                UEBARiskAlert(
-                    id=str(uuid.uuid4()),
-                    entity_profile_id=entity.id,
-                    alert_type="high_risk_entity",
-                    severity=severity,
-                    # Summarizes existing risk; does not raise the score.
-                    risk_score_delta=0.0,
-                    description=description,
-                    evidence=risk_factors,
-                    contributing_events=[a.id for a in recent_alert_rows],
-                    status="new",
-                    organization_id=entity.organization_id,
-                )
-            )
+                alerts_generated += 1
 
-            try:
-                automation = AutomationService(db)
-                await automation.on_ueba_anomaly(
-                    entity_type=entity.entity_type,
-                    entity_id=entity.entity_id,
-                    anomaly_type="high_risk_entity",
-                    risk_score=entity.risk_score or 0.0,
-                    details=description,
-                    organization_id=entity.organization_id,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.error(f"High-risk-entity automation fanout failed: {exc}")
-
-            alerts_generated += 1
-
-        await db.commit()
+            await db.commit()
+            db.expunge_all()
+            if batch_len < UEBA_BATCH_SIZE:
+                break
 
     return {
         "status": "completed",
@@ -713,14 +875,33 @@ async def _cleanup_old_behavior_events_async(
     from src.ueba.models import BehaviorEvent
 
     cutoff_date = datetime.now(timezone.utc) - timedelta(days=retention_days)
+    deleted_count = 0
 
     async with async_session_factory() as db:
-        stmt = delete(BehaviorEvent).where(BehaviorEvent.created_at < cutoff_date)
-        if organization_id:
-            stmt = stmt.where(BehaviorEvent.organization_id == organization_id)
-        result = await db.execute(stmt)
-        await db.commit()
-        deleted_count = result.rowcount or 0
+        # Batched: a single unbounded DELETE over a multi-million-row
+        # behavior_events table is one giant transaction (server-side undo
+        # log + locks held for its whole duration). Same rows removed, in
+        # CLEANUP_DELETE_BATCH-sized committed chunks.
+        while True:
+            id_stmt = (
+                select(BehaviorEvent.id)
+                .where(BehaviorEvent.created_at < cutoff_date)
+                .limit(CLEANUP_DELETE_BATCH)
+            )
+            if organization_id:
+                id_stmt = id_stmt.where(
+                    BehaviorEvent.organization_id == organization_id
+                )
+            batch_ids = list((await db.execute(id_stmt)).scalars().all())
+            if not batch_ids:
+                break
+            await db.execute(
+                delete(BehaviorEvent).where(BehaviorEvent.id.in_(batch_ids))
+            )
+            await db.commit()
+            deleted_count += len(batch_ids)
+            if len(batch_ids) < CLEANUP_DELETE_BATCH:
+                break
 
     return {
         "status": "completed",

@@ -1,0 +1,25 @@
+# LOCAL TEST ONLY — not for prod. Runs redis without auth so it matches the
+# passwordless REDIS_URL in the local .env, and exposes the api on :8000 so
+# Playwright/tests can reach it directly. Do not commit/deploy this file.
+services:
+  redis:
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    ports:
+      - "8000:8000"
+    environment:
+      # The dev .env points redis at localhost (host-run api); inside the
+      # container redis is the compose service hostname.
+      REDIS_URL: "redis://redis:6379/0"
+      CELERY_BROKER_URL: "redis://redis:6379/1"
+      CELERY_RESULT_BACKEND: "redis://redis:6379/2"
+      # Use Postgres locally to faithfully match prod (the dev .env defaults to
+      # SQLite, which lacks Postgres functions like date_trunc and yields false
+      # 500s). This points at the compose postgres service.
+      DATABASE_URL: "postgresql+asyncpg://pysoar:pysoar@postgres:5432/pysoar"

@@ -1,5 +1,6 @@
 """Threat feed parsing and management engine"""
 
+import io
 import ipaddress
 import json
 import re
@@ -16,6 +17,27 @@ from src.core.logging import get_logger
 from src.intel.models import ThreatFeed, ThreatIndicator
 
 logger = get_logger(__name__)
+
+# --- Memory bounds (prod OOM post-mortem 2026-09-01) -----------------------
+# `intel.poll_threat_feeds` runs every 30 minutes and was the most unbounded
+# path in the beat schedule:
+#   * `_fetch_feed_data` did `await resp.read()` — the whole feed body into
+#     memory with no size ceiling. Public blocklists run from kilobytes to
+#     hundreds of megabytes and the operator does not control their size.
+#   * the body was then decoded (a second full copy), `splitlines()` into a
+#     list of every line (a third), and turned into one dict per indicator.
+#   * `poll_feed` then issued ONE SELECT per parsed indicator and held every
+#     new ThreatIndicator ORM object in a single session until one commit at
+#     the very end. A million-line feed is ~1 GB of ORM objects inside one
+#     task — and `worker_max_memory_per_child` only recycles a child
+#     BETWEEN tasks, never inside one.
+#
+# The caps below are generous relative to real feeds (abuse.ch / Feodo /
+# Spamhaus / blocklist.de are all well under 32 MB) and every cap that fires
+# is logged, never silently applied.
+MAX_FEED_BYTES = 32 * 1024 * 1024  # 32 MB of feed body
+MAX_INDICATORS_PER_POLL = 200_000  # parsed indicators kept per poll
+FEED_INGEST_BATCH = 1_000          # rows per existence-check + commit window
 
 
 def _validate_url_not_internal(url: str) -> bool:
@@ -244,7 +266,16 @@ class PlainListFeedParser(FeedParser):
             return []
 
         indicators: list[dict[str, Any]] = []
-        for raw_line in text.splitlines():
+        # `io.StringIO` iterates lines lazily. `text.splitlines()` first built
+        # a list of every line in the feed — a full extra copy of a body that
+        # can be tens of megabytes.
+        for raw_line in io.StringIO(text):
+            if len(indicators) >= MAX_INDICATORS_PER_POLL:
+                logger.warning(
+                    "Plain-list feed truncated at the per-poll indicator cap",
+                    max_indicators=MAX_INDICATORS_PER_POLL,
+                )
+                break
             line = raw_line.strip()
             # Strip Spamhaus-style trailing "; comment" from data lines
             if ";" in line and not line.startswith(";"):
@@ -302,15 +333,26 @@ class CSVFeedParser(FeedParser):
     def parse(self, raw_data: bytes) -> list[dict[str, Any]]:
         """Parse CSV feed data"""
         try:
-            lines = raw_data.decode("utf-8").split("\n")
-            if not lines:
+            # Lazy line iteration with a per-poll cap — see MAX_FEED_BYTES /
+            # MAX_INDICATORS_PER_POLL at module scope. The old
+            # `decode().split("\n")` materialised every line of the feed.
+            stream = io.StringIO(raw_data.decode("utf-8"))
+            header_line = stream.readline()
+            if not header_line:
                 return []
 
             # Parse header
-            header = lines[0].split(",")
+            header = header_line.rstrip("\r\n").split(",")
             indicators = []
 
-            for line in lines[1:]:
+            for raw_line in stream:
+                if len(indicators) >= MAX_INDICATORS_PER_POLL:
+                    logger.warning(
+                        "CSV feed truncated at the per-poll indicator cap",
+                        max_indicators=MAX_INDICATORS_PER_POLL,
+                    )
+                    break
+                line = raw_line.rstrip("\r\n")
                 if not line.strip():
                     continue
 
@@ -670,17 +712,51 @@ class FeedManager:
                 return 0
 
             parsed_indicators = parser.parse(raw_data)
+            # The raw body is no longer needed; drop the reference so the
+            # (up to MAX_FEED_BYTES) bytes/str copies can be collected before
+            # the ingest loop allocates ORM rows.
+            raw_data = b""
+            if len(parsed_indicators) > MAX_INDICATORS_PER_POLL:
+                self.logger.warning(
+                    "Feed yielded more indicators than the per-poll cap; "
+                    "ingesting the first MAX_INDICATORS_PER_POLL",
+                    feed_id=feed_id,
+                    parsed=len(parsed_indicators),
+                    max_indicators=MAX_INDICATORS_PER_POLL,
+                )
+                del parsed_indicators[MAX_INDICATORS_PER_POLL:]
             self.logger.info("Parsed indicators from feed", feed_id=feed_id, count=len(parsed_indicators))
 
-            # Ingest parsed indicators into the database
+            # Ingest parsed indicators into the database, one
+            # FEED_INGEST_BATCH window at a time: one existence query per
+            # window instead of one per indicator, and a commit + expunge per
+            # window so the session never holds more than one window of ORM
+            # rows. Previously every new ThreatIndicator stayed in the session
+            # until a single commit at the very end.
             new_count = 0
-            for indicator_dict in parsed_indicators:
-                ind_type = indicator_dict.get("indicator_type")
-                ind_value = indicator_dict.get("value")
-                if not ind_type or not ind_value:
+            feed_pk = feed.id
+            feed_name = feed.name
+            for offset in range(0, len(parsed_indicators), FEED_INGEST_BATCH):
+                window = parsed_indicators[offset : offset + FEED_INGEST_BATCH]
+                # (type, value) -> [source dict, occurrences in this window].
+                # Occurrences are carried so a feed that lists the same
+                # indicator twice still advances sighting_count exactly as
+                # the old one-query-per-line loop did.
+                wanted: dict[tuple[str, str], list] = {}
+                for indicator_dict in window:
+                    ind_type = indicator_dict.get("indicator_type")
+                    ind_value = indicator_dict.get("value")
+                    if not ind_type or not ind_value:
+                        continue
+                    entry = wanted.get((ind_type, ind_value))
+                    if entry is None:
+                        wanted[(ind_type, ind_value)] = [indicator_dict, 1]
+                    else:
+                        entry[1] += 1
+                if not wanted:
                     continue
 
-                # Check for existing indicator. There is no uniqueness
+                # Check for existing indicators. There is no uniqueness
                 # constraint on (indicator_type, value, feed_id) in the
                 # current schema — rows written by earlier ingestions or
                 # manual API calls can duplicate the same tuple, so
@@ -689,35 +765,50 @@ class FeedManager:
                 # and last_seen advances on every surviving copy.
                 existing = await session.execute(
                     select(ThreatIndicator).where(
-                        ThreatIndicator.indicator_type == ind_type,
-                        ThreatIndicator.value == ind_value,
                         ThreatIndicator.feed_id == feed.id,
+                        ThreatIndicator.value.in_([v for _, v in wanted]),
                     )
                 )
-                existing_list = list(existing.scalars().all())
+                now_utc = datetime.now(timezone.utc)
+                seen_keys: set[tuple[str, str]] = set()
+                for existing_ind in existing.scalars().all():
+                    key = (existing_ind.indicator_type, existing_ind.value)
+                    if key not in wanted:
+                        continue
+                    seen_keys.add(key)
+                    existing_ind.last_seen = now_utc
+                    existing_ind.sighting_count = (existing_ind.sighting_count or 0) + 1
 
-                if existing_list:
-                    now_utc = datetime.now(timezone.utc)
-                    for existing_ind in existing_list:
-                        existing_ind.last_seen = now_utc
-                        existing_ind.sighting_count = (existing_ind.sighting_count or 0) + 1
-                else:
-                    new_indicator = ThreatIndicator(
-                        indicator_type=ind_type,
-                        value=ind_value,
-                        feed_id=feed.id,
-                        source=feed.name,
-                        confidence=indicator_dict.get("confidence", 50),
-                        severity=indicator_dict.get("severity", "medium"),
-                        tlp=indicator_dict.get("tlp", "amber"),
-                        first_seen=datetime.now(timezone.utc),
-                        last_seen=datetime.now(timezone.utc),
-                        is_active=True,
-                        mitre_techniques=indicator_dict.get("mitre_techniques", []),
-                        tags=indicator_dict.get("tags", []),
+                for key, indicator_dict in wanted.items():
+                    if key in seen_keys:
+                        continue
+                    ind_type, ind_value = key
+                    session.add(
+                        ThreatIndicator(
+                            indicator_type=ind_type,
+                            value=ind_value,
+                            feed_id=feed.id,
+                            source=feed.name,
+                            confidence=indicator_dict.get("confidence", 50),
+                            severity=indicator_dict.get("severity", "medium"),
+                            tlp=indicator_dict.get("tlp", "amber"),
+                            first_seen=now_utc,
+                            last_seen=now_utc,
+                            is_active=True,
+                            mitre_techniques=indicator_dict.get("mitre_techniques", []),
+                            tags=indicator_dict.get("tags", []),
+                        )
                     )
-                    session.add(new_indicator)
                     new_count += 1
+
+                await session.commit()
+                # `feed` is expired by the commit but stays attached; expunge
+                # only the indicator rows this window created/touched.
+                for obj in list(session.identity_map.values()):
+                    if isinstance(obj, ThreatIndicator):
+                        session.expunge(obj)
+
+            parsed_indicators.clear()
 
             # Update feed metadata
             feed.last_poll_at = datetime.now(timezone.utc)
@@ -783,8 +874,34 @@ class FeedManager:
             async with aiohttp.ClientSession() as session:
                 async with session.get(feed.url, headers=headers, timeout=30) as resp:
                     if resp.status == 200:
-                        self.logger.info("Feed fetch successful", feed_id=feed.id, feed_name=feed.name)
-                        return await resp.read()
+                        # Chunked read with a hard ceiling instead of
+                        # `resp.read()`, which pulls an arbitrarily large body
+                        # into the worker in one allocation. A feed over the
+                        # ceiling is rejected loudly rather than parsed from a
+                        # truncated (and therefore wrong) body.
+                        chunks: list[bytes] = []
+                        total = 0
+                        async for chunk in resp.content.iter_chunked(64 * 1024):
+                            total += len(chunk)
+                            if total > MAX_FEED_BYTES:
+                                self.logger.error(
+                                    "Feed body exceeds the size ceiling; refusing to ingest",
+                                    feed_id=feed.id,
+                                    feed_name=feed.name,
+                                    max_bytes=MAX_FEED_BYTES,
+                                )
+                                feed.last_error = (
+                                    f"Feed body exceeds the {MAX_FEED_BYTES} byte ceiling"
+                                )
+                                return b""
+                            chunks.append(chunk)
+                        self.logger.info(
+                            "Feed fetch successful",
+                            feed_id=feed.id,
+                            feed_name=feed.name,
+                            bytes=total,
+                        )
+                        return b"".join(chunks)
                     else:
                         self.logger.error(
                             "Feed fetch failed",

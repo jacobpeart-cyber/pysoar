@@ -445,120 +445,138 @@ async def investigate_threat(
 async def respond_to_threat(
     threat_id: str,
     data: ThreatResponseAction,
+    request: Request,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
+    redis: RedisClient = None,
 ):
-    """Run a real threat-response action via the AgentToolRegistry.
+    """Respond to an identity threat through the guarded agent runtime.
 
-    Previously this endpoint only set ``threat.status = 'contained'``
-    and returned success — no account was disabled, no session was
-    revoked. It now dispatches through the same tool registry the
-    autonomous investigator uses. Every call is audited into
-    ticket_activities (AU-2) and the tool result is persisted.
+    The response action is no longer dispatched with the ungated
+    ``AgentToolRegistry.execute``. It runs through ``guarded_tool_call`` --
+    the single implementation shared with
+    ``POST /agentic/tools/{tool_name}/execute`` -- so role, tier, reference
+    scoping, the per-(org, tool) rate limit and the pre/post audit pair all
+    apply, and a ``destructive`` tool is *proposed* for approval instead of
+    being executed inline (design v2 sections 1, 3 and 8). The policy/tool
+    audit pair is written by that path, so this endpoint adds no audit rows
+    of its own.
 
-    Supported action types:
-      - disable_account / disable_user  -> disable_user
-      - isolate_host                    -> isolate_host
-      - block_ip                        -> block_ip
-      - quarantine                      -> disable_user + isolate_host
-      - force_password_reset            -> disable_user (reason=reset)
-      - open_incident                   -> create_incident
-      - contain (default)               -> mark contained only
+    Identity comes from the JWT: the caller's organization, user id, agent
+    role and client IP. Viewers are refused; the threat is looked up inside
+    the caller's organization, so another tenant's threat is a 404.
+
+    ``action_details`` carries the tool arguments for the action
+    (``ip`` for ``block_ip``, ``hostname`` for ``isolate_host``) and
+    ``propose_actions`` (default ``false``): without it a destructive action
+    is denied with ``403 {"reason_code": ...}`` rather than silently
+    proposed.
+
+    Action types:
+      - ``disable_account`` / ``disable_user`` -> ``disable_user``
+      - ``force_password_reset``              -> ``disable_user`` (reset reason)
+      - ``isolate_host``                      -> ``isolate_host``
+      - ``block_ip``                          -> ``block_ip``
+      - ``quarantine``                        -> ``disable_user`` + ``isolate_host``
+      - ``open_incident``                     -> ``create_incident``
+      - ``contain`` (default)                 -> marks the threat contained only
+
+    Returns ``{"proposed": true, "proposal": {...}}`` for a destructive
+    action, exactly as the direct-execute surface does, and
+    ``{"executed": true, "results": [...]}`` once the tools actually ran.
     """
-    from src.services.agent_tools import AgentToolRegistry
-    import json as _json
+    from src.api.v1.endpoints.agentic import (
+        _agent_context,
+        _require_analyst,
+        guarded_tool_call,
+    )
 
-    org_id = getattr(current_user, "organization_id", None)
-    threat = await get_threat_or_404(db, threat_id, org_id)
-    action = (data.action_type or "contain").lower()
+    ctx = _agent_context(
+        current_user,
+        Mode.INTERACTIVE,
+        propose_actions=_propose_actions(data),
+        request=request,
+    )
+    _require_analyst(ctx)
 
-    registry = AgentToolRegistry(db)
-    tool_results: list[dict] = []
-    target_hint = None
+    threat = await get_threat_or_404(db, threat_id, ctx.org_id)
+    action = (data.action_type or "contain").strip().lower()
+    details = data.action_details if isinstance(data.action_details, dict) else {}
 
-    identity_row = None
-    try:
-        if threat.identity_id:
-            id_stmt = select(IdentityProfile).where(
-                IdentityProfile.id == threat.identity_id
+    identity_row: Optional[IdentityProfile] = None
+    if threat.identity_id:
+        identity_row = (await db.execute(
+            select(IdentityProfile).where(
+                IdentityProfile.id == threat.identity_id,
+                IdentityProfile.organization_id == ctx.org_id,
             )
-            if org_id is not None:
-                id_stmt = id_stmt.where(IdentityProfile.organization_id == org_id)
-            identity_row = (await db.execute(id_stmt)).scalar_one_or_none()
-    except Exception:
-        identity_row = None
-    username = getattr(identity_row, "username", None)
-    primary_email = getattr(identity_row, "primary_email", None)
-    target_user = primary_email or username
+        )).scalar_one_or_none()
+    target_user = getattr(identity_row, "primary_email", None) or getattr(
+        identity_row, "username", None
+    )
 
-    async def _call_tool(tool_name: str, args: dict) -> dict:
-        r = await registry.execute(tool_name, args)
-        tool_results.append({"tool": tool_name, "args": args, "result": r})
-        return r
+    calls = _response_tool_calls(action, threat, details, target_user)
 
-    params = getattr(data, "parameters", None) or {}
-    ev = threat.evidence if isinstance(threat.evidence, dict) else {}
-    try:
-        if action in ("disable_account", "disable_user"):
-            if target_user:
-                await _call_tool("disable_user", {"user_email": target_user, "reason": f"ITDR threat {threat.threat_type}"})
-                target_hint = target_user
-        elif action == "force_password_reset":
-            if target_user:
-                await _call_tool("disable_user", {"user_email": target_user, "reason": f"password reset required: {threat.threat_type}"})
-                target_hint = target_user
-        elif action == "isolate_host":
-            hostname = params.get("hostname") if isinstance(params, dict) else None
-            if hostname:
-                await _call_tool("isolate_host", {"hostname": hostname, "reason": f"ITDR threat {threat.threat_type}"})
-                target_hint = hostname
-        elif action == "block_ip":
-            ip = params.get("ip") if isinstance(params, dict) else None
-            if ip:
-                await _call_tool("block_ip", {"ip": ip, "reason": f"ITDR threat {threat.threat_type}"})
-                target_hint = ip
-        elif action == "quarantine":
-            if target_user:
-                await _call_tool("disable_user", {"user_email": target_user, "reason": f"ITDR quarantine: {threat.threat_type}"})
-            host = ev.get("hostname") if isinstance(ev, dict) else None
-            if host:
-                await _call_tool("isolate_host", {"hostname": host, "reason": f"ITDR quarantine: {threat.threat_type}"})
-            target_hint = target_user
-        elif action == "open_incident":
-            await _call_tool("create_incident", {
-                "title": f"ITDR: {threat.threat_type} on {target_user or threat.identity_id}",
-                "severity": threat.severity or "high",
-                "description": _json.dumps(threat.evidence or {}, default=str)[:1500],
-            })
-            target_hint = target_user
-    except Exception as err:  # noqa: BLE001
-        logger.warning(f"ITDR respond tool dispatch failed on threat={threat_id}: {err}")
-
-    threat.status = "contained"
-    try:
-        from src.tickethub.models import TicketActivity
-        db.add(TicketActivity(
-            source_type="itdr_threat",
-            source_id=threat_id,
-            activity_type="threat_respond",
-            description=(
-                f"action={action} target={target_hint or 'n/a'} "
-                f"user={getattr(current_user, 'email', 'system')} "
-                f"tools_dispatched={[t['tool'] for t in tool_results]}"
+    results: list[dict[str, Any]] = []
+    proposals: list[dict[str, Any]] = []
+    executed = 0
+    for tool_name, params in calls:
+        outcome = await guarded_tool_call(
+            db,
+            ctx,
+            redis,
+            tool_name,
+            params,
+            purpose="itdr_response",
+            proposal_trigger_type="itdr_threat",
+            proposal_source_id=threat_id,
+            proposal_title=f"ITDR response proposals: {threat.threat_type or 'identity threat'}",
+            proposal_hypothesis=(
+                "Destructive identity-threat responses are proposed for approval, "
+                "never executed inline."
             ),
-            organization_id=org_id,
-        ))
-    except Exception:
-        pass
+        )
+        results.append({"tool": tool_name, **outcome})
+        if outcome.get("proposed"):
+            proposals.append(outcome["proposal"])
+        else:
+            executed += 1
+
+    if executed and not proposals:
+        threat.status = "contained"
+    elif not calls:
+        threat.status = "contained"
     await db.commit()
-    logger.info(f"ITDR response {action} on threat={threat_id}: {len(tool_results)} tool(s) dispatched")
-    return {
+
+    logger.info(
+        "itdr_threat_response",
+        threat_id=threat_id,
+        organization_id=ctx.org_id,
+        actor_id=ctx.actor_user_id,
+        action=action,
+        tools=[tool for tool, _params in calls],
+        executed=executed,
+        proposed=len(proposals),
+    )
+
+    payload: dict[str, Any] = {
         "threat_id": threat_id,
         "action": action,
-        "status": "executed" if tool_results else "marked_contained",
-        "tool_results": tool_results,
+        "proposed": bool(proposals),
+        "executed": bool(executed),
+        "results": results,
+        "status": (
+            "proposed" if proposals
+            else "executed" if executed
+            else "marked_contained"
+        ),
+        "threat_status": threat.status,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
+    if proposals:
+        payload["proposal"] = proposals[0]
+        payload["proposals"] = proposals
+    return payload
 
 
 @router.post("/threats/scan")

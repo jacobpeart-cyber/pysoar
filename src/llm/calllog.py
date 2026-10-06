@@ -34,6 +34,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.config import Settings, settings as app_settings
 from src.core.logging import get_logger
+from src.core.metrics import LLM_CALLS_TOTAL, increment as metric_increment
 from src.core.redact import redact
 from src.llm._common import encode_json
 from src.llm.base import LLMError, LLMTurn, Message, ToolSpecForLLM, Usage
@@ -257,6 +258,9 @@ class LLMCallLogWriter:
                 error=str(exc),
             )
             raise CallLogWriteError(str(exc)) from exc
+        # One counter tick per persisted provider call (errors carry
+        # ``stop_reason='error'``); see src/core/metrics.py.
+        metric_increment(LLM_CALLS_TOTAL, provider=row.provider, stop_reason=row.stop_reason)
         return row
 
     @contextlib.asynccontextmanager

@@ -13,17 +13,20 @@ gets a typed 4xx/5xx and the user's message is persisted as ``failed`` so
 the UI can retry it.
 """
 
+import csv
 import hashlib
+import io
 import json
 import math
 import time
-from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Iterator, Optional
 
 import structlog
 from fastapi import APIRouter, Body, HTTPException, Path, Query, Request, status
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, func, select
+from sqlalchemy import String, and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -43,6 +46,7 @@ from src.agentic.models import (
 )
 from src.agentic.policy import (
     AUDIT_EVENT_POLICY,
+    AUDIT_EVENT_TOOL,
     OrgPolicySettings,
     PolicyEngine,
     audit_rows_fallback_counter,
@@ -58,9 +62,18 @@ from src.agentic.runtime import (
 )
 from src.agentic.tasks import run_investigation
 from src.agentic.toolspec import Tier
-from src.agentic.trust import TrustScanner, trust_state_from_dict
+from src.agentic.transcript import AgentRunTranscript
+from src.agentic.trust import (
+    LOCKDOWN_FAMILIES,
+    LOCKDOWN_THRESHOLD,
+    TrustScanner,
+    trust_state_from_dict,
+    trust_state_to_dict,
+)
 from src.api.deps import CurrentUser, DatabaseSession, RedisClient
 from src.audit_evidence.engine import AuditLogger
+from src.audit_evidence.models import AuditTrail
+from src.core.metrics import AGENT_INJECTION_EVENTS_TOTAL, increment as metric_increment
 from src.core.utils import safe_json_loads
 from src.llm.base import (
     LLMNotConfigured,
@@ -71,7 +84,7 @@ from src.llm.base import (
 )
 from src.llm.calllog import LLMCallLogWriter, price_call
 from src.llm import factory as llm_factory
-from src.llm.models import LLMCallLog
+from src.llm.models import LLMCallLog, LLMUsageDaily, actor_key_for
 from src.llm.quota import CircuitOpen, QuotaBackendUnavailable, TokenQuota
 from src.schemas.agentic import (
     AccuracyStats,
@@ -105,6 +118,7 @@ from src.schemas.agentic import (
     SOCAgentUpdate,
     ThreatHuntRequest,
     ThreatHuntResult,
+    TrustAcknowledgeRequest,
 )
 from src.services.agent_tools import AgentToolRegistry, render_json_schema
 
@@ -188,6 +202,14 @@ def _require_analyst(ctx: AgentContext) -> None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={"error": "role_not_permitted", "detail": "this operation requires the analyst role"},
+        )
+
+
+def _require_admin(ctx: AgentContext) -> None:
+    if ctx.role is not UserRole.ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "role_not_permitted", "detail": "this operation requires the admin role"},
         )
 
 
@@ -550,21 +572,34 @@ class StructuredHuntRequest(BaseModel):
 @router.post("/hunts")
 async def run_structured_hunt_endpoint(
     req: StructuredHuntRequest,
+    request: Request,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
+    redis: RedisClient = None,
 ):
     """Run a structured PY-HUNT-001 threat hunt by hypothesis.
 
-    Validates the hypothesis against the MITRE ATT&CK KB, runs the real
-    multi-source scan, maps findings to ATT&CK, scores a verdict, and
-    returns a structured report. Recommendations are advisory and always
-    flagged for human approval — the hunt never remediates.
+    Both hunt phases go through ``AgentToolRegistry.call`` (design v2
+    section 1), so the hunt runs as the authenticated analyst: the JWT
+    supplies the organization, the actor id, the role and the client IP, and
+    the request's Redis client backs the per-(org, tool) rate limit. Viewers
+    are refused -- ``scope_hunt``/``run_threat_hunt`` write hunt sessions and
+    findings. Recommendations are advisory and always flagged for human
+    approval; the hunt never remediates.
     """
     from src.agentic.structured_hunt import run_structured_hunt
-    org_id = getattr(current_user, "organization_id", None)
+
+    ctx = _agent_context(current_user, Mode.INTERACTIVE, request=request)
+    _require_analyst(ctx)
     return await run_structured_hunt(
-        db, hypothesis=req.hypothesis, organization_id=org_id,
+        db,
+        hypothesis=req.hypothesis,
+        organization_id=ctx.org_id,
         timeframe_hours=req.timeframe_hours,
+        actor_user_id=ctx.actor_user_id,
+        role=ctx.role,
+        actor_ip=ctx.actor_ip,
+        redis=redis,
     )
 
 
@@ -1135,50 +1170,79 @@ async def list_investigation_feedback(
 
 @router.get("/actions/pending-approval")
 async def list_pending_approvals(
+    request: Request,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
 ):
-    """List actions pending approval"""
-    org_id = getattr(current_user, "organization_id", None)
-    filters = [AgentAction.execution_status == ActionExecutionStatus.PENDING_APPROVAL.value]
-    if org_id:
-        filters.append(AgentAction.organization_id == org_id)
-    query = select(AgentAction).where(*filters)
+    """Proposals awaiting approval in the caller's organization (analyst+).
 
-    # Get total
-    count_result = await db.execute(
-        select(func.count()).select_from(query.subquery())
+    The projection carries the full design v2 section 8 binding, because an
+    approve call has to echo ``params_sha256``/``evidence_sha256`` and the
+    reviewer has to see what would actually run: the tool, its arguments,
+    every expanded target, who (or which agent) proposed it, the originating
+    run, the injection tier of the evidence it was raised from, and when it
+    expires. Arguments were value-redacted when the proposal was
+    materialized; nothing is re-expanded here.
+    """
+    ctx = _agent_context(current_user, Mode.APPROVAL, request=request)
+    _require_analyst(ctx)
+    org_id = ctx.org_id
+
+    pending = and_(
+        AgentAction.organization_id == org_id,
+        AgentAction.execution_status == ActionExecutionStatus.PENDING_APPROVAL.value,
     )
-    total = count_result.scalar() or 0
+    total = (await db.execute(
+        select(func.count()).select_from(select(AgentAction).where(pending).subquery())
+    )).scalar() or 0
 
-    # Apply sorting and pagination
-    query = query.order_by(AgentAction.created_at.desc())
-    query = query.offset((page - 1) * size).limit(size)
+    rows = (await db.execute(
+        select(AgentAction, Investigation, SOCAgent)
+        .select_from(AgentAction)
+        .outerjoin(
+            Investigation,
+            and_(
+                Investigation.id == AgentAction.investigation_id,
+                Investigation.organization_id == org_id,
+            ),
+        )
+        .outerjoin(SOCAgent, SOCAgent.id == Investigation.agent_id)
+        .where(pending)
+        .order_by(AgentAction.created_at.desc())
+        .offset((page - 1) * size)
+        .limit(size)
+    )).all()
 
-    result = await db.execute(query)
-    actions = list(result.scalars().all())
-
-    items = []
-    for action in actions:
-        inv = await db.get(Investigation, action.investigation_id)
-        if not inv:
-            continue
-        if org_id and getattr(inv, "organization_id", None) and inv.organization_id != org_id:
-            continue
-        agent = await db.get(SOCAgent, inv.agent_id) if inv.agent_id else None
-        items.append(ActionPendingApproval(
+    items = [
+        ActionPendingApproval(
             action_id=action.id,
             action_type=action.action_type,
             target=action.target,
-            investigation_id=action.investigation_id,
-            investigation_title=inv.title,
-            agent_id=agent.id if agent else "",
-            agent_name=agent.name if agent else "Unknown",
-            confidence_score=inv.confidence_score or 0,
+            investigation_id=action.investigation_id or "",
+            investigation_title=(inv.title if inv is not None else ""),
+            agent_id=(agent.id if agent is not None else ""),
+            agent_name=(agent.name if agent is not None else ""),
+            confidence_score=(inv.confidence_score or 0.0) if inv is not None else 0.0,
             created_at=action.created_at,
-        ))
+            tool_name=action.tool_name,
+            parameters=_params_dict(action.parameters),
+            effective_targets=list(action.effective_targets or []),
+            params_sha256=action.params_sha256,
+            evidence_sha256=action.evidence_sha256,
+            suspect=bool(action.suspect),
+            injection_tier=action.injection_tier,
+            expires_at=action.expires_at,
+            source=action.source,
+            proposed_by_user_id=action.proposed_by_user_id,
+            proposed_by_agent_id=action.proposed_by_agent_id,
+            run_id=action.run_id,
+            requires_approval=bool(action.requires_approval),
+            execution_status=action.execution_status,
+        )
+        for action, inv, agent in rows
+    ]
 
     return {
         "items": items,
@@ -1731,7 +1795,46 @@ async def execute_agent_tool(
     ctx = _agent_context(
         current_user, Mode.INTERACTIVE, propose_actions=propose_actions, request=request
     )
-    runtime = await _build_runtime(db, ctx, redis, purpose="chat", with_provider=False)
+    return await guarded_tool_call(
+        db, ctx, redis, tool_name, params,
+        proposal_trigger_type="direct_tool",
+        proposal_source_id=ctx.actor_user_id or "unknown",
+        proposal_title=f"Direct tool proposals: {getattr(current_user, 'email', ctx.actor_user_id)}",
+        proposal_hypothesis=(
+            "Destructive tools invoked directly are proposed for approval, never executed inline."
+        ),
+    )
+
+
+async def guarded_tool_call(
+    db: AsyncSession,
+    ctx: AgentContext,
+    redis: Any,
+    tool_name: str,
+    params: dict[str, Any],
+    *,
+    purpose: str = "chat",
+    proposal_trigger_type: str,
+    proposal_source_id: str,
+    proposal_title: str,
+    proposal_hypothesis: str,
+) -> dict[str, Any]:
+    """Run one tool for ``ctx`` through the policy gate, or propose it.
+
+    The single implementation behind every non-chat HTTP surface that invokes
+    a tool (``POST /agentic/tools/{name}/execute`` and
+    ``POST /itdr/threats/{id}/respond``), so they cannot drift apart: role,
+    tier, reference scoping, rate limit and the pre/post audit pair all
+    apply, and a ``destructive``/``privileged`` tier always yields a
+    *proposal* instead of an inline execution (design v2 sections 1, 3, 8).
+
+    Returns ``{"proposed": True, "executed": False, "proposal": {...}}`` or
+    ``{"proposed": False, "executed": True, "tool": ..., "result": {...}}``.
+    Raises ``HTTPException``: 404 unknown tool, 403 policy denial (with the
+    reason code), 409 when the proposal could not be recorded, 502 when the
+    tool itself failed.
+    """
+    runtime = await _build_runtime(db, ctx, redis, purpose=purpose, with_provider=False)
     spec = runtime.registry.specs.get(tool_name)
     if spec is None:
         raise HTTPException(
@@ -1746,10 +1849,10 @@ async def execute_agent_tool(
     if decision.kind == "propose":
         investigation = await _proposal_investigation(
             db, ctx.org_id,
-            trigger_type="direct_tool",
-            source_id=ctx.actor_user_id or "unknown",
-            title=f"Direct tool proposals: {getattr(current_user, 'email', ctx.actor_user_id)}",
-            hypothesis="Destructive tools invoked directly are proposed for approval, never executed inline.",
+            trigger_type=proposal_trigger_type,
+            source_id=proposal_source_id,
+            title=proposal_title,
+            hypothesis=proposal_hypothesis,
         )
         if investigation is None:
             raise _proposals_unavailable()
@@ -1804,7 +1907,10 @@ async def execute_agent_tool(
         ) from exc
     except Exception as exc:  # noqa: BLE001 - the failure class is recorded, never its secrets
         error_class = exc.__class__.__name__
-        logger.error("direct_tool_failed", tool=tool_name, error_class=error_class, organization_id=ctx.org_id)
+        logger.error(
+            "guarded_tool_failed",
+            tool=tool_name, purpose=purpose, error_class=error_class, organization_id=ctx.org_id,
+        )
         await runtime.runner._audit_post(state, tool_name, "failed", started, error_class=error_class)
         await db.commit()
         raise HTTPException(
@@ -2861,4 +2967,876 @@ async def clear_agent_memory(
     return {
         "status": "cleared",
         "memories_deleted": len(memories),
+    }
+
+
+# ============================================================================
+# Read surfaces (design v2 section 7, "Read surfaces")
+# ============================================================================
+
+#: The two audit event types every agent tool decision is recorded under.
+AGENT_AUDIT_EVENTS: tuple[str, str] = (AUDIT_EVENT_POLICY, AUDIT_EVENT_TOOL)
+
+#: Hard caps so a read surface can never stream an unbounded result set.
+RUN_TIMELINE_LIMIT = 500
+EVIDENCE_EXPORT_LIMIT = 20_000
+
+#: The NIST 800-53 controls the evidence export evidences (design v2 section
+#: 7 + 16). ``src/compliance`` has no automated-evidence-rule model to
+#: register against (checked: no ``AutomatedEvidenceRule``/``evidence_rule``),
+#: so the mapping is documented here instead of invented in the schema.
+EVIDENCE_EXPORT_CONTROLS: tuple[str, ...] = ("AC-3", "AC-6(1)", "AU-2", "AU-3", "SI-10")
+
+
+def _scope_organization(
+    current_user: Any, ctx: AgentContext, organization_id: Optional[str], all_orgs: bool
+) -> Optional[str]:
+    """The organization a read surface answers for; ``None`` means every org.
+
+    Only a superuser may look outside their own organization, and only by
+    asking for it explicitly (``organization_id=...`` or ``all=true``).
+    """
+    if not (organization_id or all_orgs):
+        return ctx.org_id
+    if not ctx.is_superuser:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "role_not_permitted",
+                "detail": "only a platform superuser may read another organization's agent records",
+            },
+        )
+    return None if all_orgs else str(organization_id)
+
+
+def _audit_view(row: AuditTrail) -> dict[str, Any]:
+    """One audit row as the UI renders it (payload already value-redacted)."""
+    return {
+        "id": row.id,
+        "created_at": row.created_at,
+        "event_type": row.event_type,
+        "action": row.action,
+        "actor_type": row.actor_type,
+        "actor_id": row.actor_id,
+        "actor_ip": row.actor_ip,
+        "resource_type": row.resource_type,
+        "resource_id": row.resource_id,
+        "description": row.description,
+        "result": row.result,
+        "risk_level": row.risk_level,
+        "run_id": row.run_id or row.request_id,
+        "organization_id": row.organization_id,
+        "payload": row.new_value if isinstance(row.new_value, dict) else {},
+        "row_hash": row.row_hash,
+    }
+
+
+def _call_log_view(row: LLMCallLog) -> dict[str, Any]:
+    """One provider call. Bodies are never included, only the hashes."""
+    return {
+        "id": row.id,
+        "created_at": row.created_at,
+        "purpose": row.purpose,
+        "mode": row.mode,
+        "role": row.role,
+        "provider": row.provider,
+        "model": row.model,
+        "credential_source": row.credential_source,
+        "actor_user_id": row.actor_user_id,
+        "soc_agent_id": row.soc_agent_id,
+        "session_id": row.session_id,
+        "investigation_id": row.investigation_id,
+        "input_uncached_tokens": row.input_uncached_tokens,
+        "cache_read_tokens": row.cache_read_tokens,
+        "cache_write_tokens": row.cache_write_tokens,
+        "output_tokens": row.output_tokens,
+        "thinking_tokens": row.thinking_tokens,
+        "total_billable_tokens": row.total_billable_tokens,
+        "usage_estimated": row.usage_estimated,
+        "latency_ms": row.latency_ms,
+        "stop_reason": row.stop_reason,
+        "error_class": row.error_class,
+        "injection_tier": row.injection_tier,
+        "redactions_applied": row.redactions_applied,
+        "messages_sha256": row.messages_sha256,
+        "system_prompt_sha256": row.system_prompt_sha256,
+        "cost_usd": row.cost_usd,
+    }
+
+
+def _action_view(row: AgentAction) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "created_at": row.created_at,
+        "tool_name": row.tool_name,
+        "action_type": row.action_type,
+        "target": row.target,
+        "parameters": _params_dict(row.parameters),
+        "effective_targets": list(row.effective_targets or []),
+        "execution_status": row.execution_status,
+        "requires_approval": bool(row.requires_approval),
+        "approved_by": row.approved_by,
+        "approval_timestamp": row.approval_timestamp,
+        "approver_role": row.approver_role,
+        "params_sha256": row.params_sha256,
+        "evidence_sha256": row.evidence_sha256,
+        "suspect": bool(row.suspect),
+        "injection_tier": row.injection_tier,
+        "expires_at": row.expires_at,
+        "source": row.source,
+        "investigation_id": row.investigation_id,
+        "rollback_available": bool(row.rollback_available),
+        "rollback_executed": bool(row.rollback_executed),
+    }
+
+
+def _usage_from_row(row: LLMCallLog) -> Usage:
+    return Usage(
+        input_uncached=row.input_uncached_tokens or 0,
+        cache_read=row.cache_read_tokens or 0,
+        cache_write=row.cache_write_tokens or 0,
+        output=row.output_tokens or 0,
+        thinking=row.thinking_tokens or 0,
+        estimated=bool(row.usage_estimated),
+    )
+
+
+# ----------------------------------------------------------------------------
+# POST /agentic/trust/acknowledge
+# ----------------------------------------------------------------------------
+
+
+def _acknowledged_tier(trust: TrustState, acknowledged: set[str]) -> TrustTier:
+    """The tier a persisted trust state keeps once ``acknowledged`` is allow-listed.
+
+    The same rule ``src/agentic/trust.py`` applies when a scan is run with
+    ``acknowledged_hashes`` (``_tier_for``): an acknowledged content hash no
+    longer justifies ``lockdown`` on its own, but a state that carries hits
+    never drops below ``flagged`` -- an analyst acknowledgment downgrades the
+    finding, it does not erase it.
+    """
+    if not trust.hits:
+        return TrustTier.CLEAN
+    remaining = [hit for hit in trust.hits if hit.snippet_sha256 not in acknowledged]
+    if any(hit.family in LOCKDOWN_FAMILIES for hit in remaining):
+        return TrustTier.LOCKDOWN
+    if trust.score >= LOCKDOWN_THRESHOLD and remaining:
+        return TrustTier.LOCKDOWN
+    return TrustTier.FLAGGED
+
+
+@router.post("/trust/acknowledge")
+async def acknowledge_injection(
+    body: TrustAcknowledgeRequest,
+    request: Request,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+):
+    """Acknowledge a prompt-injection finding, downgrading lockdown to flagged.
+
+    Design v2 section 4: an analyst who has read the flagged evidence can
+    acknowledge it by content hash. The persisted trust state is recomputed
+    with that hash allow-listed, so the run is no longer in ``lockdown`` and
+    write tools are admissible again -- but it stays ``flagged``, so every
+    proposal raised from it is still marked ``suspect``. Nothing is deleted
+    and the acknowledgment itself is audited
+    (``agent_policy/injection.acknowledged``, risk medium).
+
+    Body: ``{session_id?, investigation_id?, record_hash?, reason}``; at least
+    one of ``session_id``/``investigation_id`` is required. A session or
+    investigation outside the caller's organization is reported as 404.
+    """
+    ctx = _agent_context(current_user, Mode.INTERACTIVE, request=request)
+    _require_analyst(ctx)
+    org_id = ctx.org_id
+
+    session_row: Optional[AgentChatSession] = None
+    investigation: Optional[Investigation] = None
+
+    if body.session_id:
+        session_row = (await db.execute(
+            select(AgentChatSession).where(
+                AgentChatSession.id == body.session_id,
+                AgentChatSession.organization_id == org_id,
+            )
+        )).scalar_one_or_none()
+        if session_row is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"error": "session_not_found", "detail": "Session not found"},
+            )
+    if body.investigation_id:
+        investigation = (await db.execute(
+            select(Investigation).where(
+                Investigation.id == body.investigation_id,
+                Investigation.organization_id == org_id,
+            )
+        )).scalar_one_or_none()
+        if investigation is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"error": "investigation_not_found", "detail": "Investigation not found"},
+            )
+
+    downgraded: list[dict[str, Any]] = []
+
+    if session_row is not None:
+        trust = trust_state_from_dict(session_row.trust_state)
+        known = {hit.snippet_sha256 for hit in trust.hits}
+        if body.record_hash and body.record_hash not in known:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "error": "record_hash_not_found",
+                    "detail": "this session's trust state carries no hit with that content hash",
+                },
+            )
+        acknowledged = {body.record_hash} if body.record_hash else known
+        before = trust.tier
+        trust.tier = _acknowledged_tier(trust, acknowledged)
+        session_row.trust_state = trust_state_to_dict(trust)
+        downgraded.append({
+            "kind": "chat_session",
+            "id": session_row.id,
+            "from": before.value,
+            "to": trust.tier.value,
+            "acknowledged_hashes": sorted(acknowledged),
+        })
+
+    if investigation is not None:
+        before_tier = str(investigation.injection_tier or TrustTier.CLEAN.value)
+        after_tier = TrustTier.FLAGGED.value if before_tier == TrustTier.LOCKDOWN.value else before_tier
+        investigation.injection_tier = after_tier
+        downgraded.append({
+            "kind": "investigation",
+            "id": investigation.id,
+            "from": before_tier,
+            "to": after_tier,
+            # Investigations persist the settled tier, not the hit list, so a
+            # record_hash cannot be matched against one.
+            "acknowledged_hashes": [body.record_hash] if body.record_hash else [],
+        })
+
+    audit = AuditLogger(db, org_id)
+    await audit.log_event(
+        event_type=AUDIT_EVENT_POLICY,
+        action="injection.acknowledged",
+        actor_type="user",
+        actor_id=ctx.actor_user_id or "unknown",
+        resource_type="agent_trust",
+        resource_id=body.session_id or body.investigation_id or "unknown",
+        description="analyst acknowledged a prompt-injection finding",
+        new_value={
+            "session_id": body.session_id,
+            "investigation_id": body.investigation_id,
+            "record_hash": body.record_hash,
+            "reason": body.reason[:500],
+            "role": ctx.role.value,
+            "downgraded": downgraded,
+        },
+        result="success",
+        risk_level="medium",
+        actor_ip=ctx.actor_ip,
+        session_id=body.session_id,
+    )
+    metric_increment(AGENT_INJECTION_EVENTS_TOTAL, tier="acknowledged")
+    await db.commit()
+
+    logger.info(
+        "injection_acknowledged",
+        organization_id=org_id,
+        actor_id=ctx.actor_user_id,
+        session_id=body.session_id,
+        investigation_id=body.investigation_id,
+        record_hash=body.record_hash,
+    )
+    return {"acknowledged": True, "downgraded": downgraded, "reason": body.reason}
+
+
+# ----------------------------------------------------------------------------
+# GET /agentic/runs/{run_id}
+# ----------------------------------------------------------------------------
+
+
+@router.get("/runs/{run_id}")
+async def get_run_timeline(
+    request: Request,
+    run_id: str = Path(..., min_length=4, max_length=64),
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+):
+    """Everything the platform recorded about one agent run (analyst+).
+
+    Design v2 section 7 ("run id everywhere"): the audit pair per tool
+    decision, one row per provider call, the proposals the run raised, the
+    compact per-step transcript when the run persisted one, and the chat
+    turns that carry the run id. Every query is scoped to the caller's
+    organization, so a run belonging to another tenant is a 404. Arguments
+    and results were value-redacted at write time; nothing raw is added here.
+    """
+    ctx = _agent_context(current_user, Mode.INTERACTIVE, request=request)
+    _require_analyst(ctx)
+    org_id = ctx.org_id
+
+    audit_rows = (await db.execute(
+        select(AuditTrail)
+        .where(
+            AuditTrail.organization_id == org_id,
+            or_(AuditTrail.run_id == run_id, AuditTrail.request_id == run_id),
+        )
+        .order_by(AuditTrail.created_at.asc(), AuditTrail.id.asc())
+        .limit(RUN_TIMELINE_LIMIT)
+    )).scalars().all()
+
+    call_rows = (await db.execute(
+        select(LLMCallLog)
+        .where(LLMCallLog.organization_id == org_id, LLMCallLog.run_id == run_id)
+        .order_by(LLMCallLog.created_at.asc())
+        .limit(RUN_TIMELINE_LIMIT)
+    )).scalars().all()
+
+    action_rows = (await db.execute(
+        select(AgentAction)
+        .where(AgentAction.organization_id == org_id, AgentAction.run_id == run_id)
+        .order_by(AgentAction.created_at.asc())
+        .limit(RUN_TIMELINE_LIMIT)
+    )).scalars().all()
+
+    transcript = (await db.execute(
+        select(AgentRunTranscript).where(
+            AgentRunTranscript.organization_id == org_id,
+            AgentRunTranscript.run_id == run_id,
+        )
+    )).scalars().first()
+
+    # ``agent_chat_messages`` has no run_id column: the assistant turn carries
+    # it inside the ``tool_calls`` JSON. The LIKE narrows the scan on both
+    # backends (SQLAlchemy serializes the column as JSON text); the exact
+    # match is re-checked in Python so a substring can never widen it.
+    message_rows = (await db.execute(
+        select(AgentChatMessage)
+        .join(AgentChatSession, AgentChatSession.id == AgentChatMessage.session_id)
+        .where(
+            AgentChatSession.organization_id == org_id,
+            AgentChatMessage.tool_calls.is_not(None),
+            func.cast(AgentChatMessage.tool_calls, String).like(f"%{run_id}%"),
+        )
+        .order_by(AgentChatMessage.created_at.asc())
+        .limit(RUN_TIMELINE_LIMIT)
+    )).scalars().all()
+    messages = [
+        {
+            "id": row.id,
+            "created_at": row.created_at,
+            "session_id": row.session_id,
+            "role": row.role,
+            "stop_reason": (row.tool_calls or {}).get("stop_reason"),
+            "status": (row.tool_calls or {}).get("status"),
+            "injection_tier": (row.tool_calls or {}).get("injection_tier"),
+            "tools_invoked": (row.tool_calls or {}).get("tools_invoked", []),
+            "proposals": (row.tool_calls or {}).get("proposals", []),
+            "policy_events": (row.tool_calls or {}).get("policy_events", []),
+        }
+        for row in message_rows
+        if isinstance(row.tool_calls, dict) and row.tool_calls.get("run_id") == run_id
+    ]
+
+    if not (audit_rows or call_rows or action_rows or transcript or messages):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail={
+                "error": "run_not_found",
+                "detail": "no record of that run exists in this organization",
+            },
+        )
+
+    return {
+        "run_id": run_id,
+        "organization_id": org_id,
+        "audit_events": [_audit_view(row) for row in audit_rows],
+        "llm_calls": [_call_log_view(row) for row in call_rows],
+        "actions": [_action_view(row) for row in action_rows],
+        "chat_messages": messages,
+        "transcript": None if transcript is None else {
+            "mode": transcript.mode,
+            "actor_user_id": transcript.actor_user_id,
+            "soc_agent_id": transcript.soc_agent_id,
+            "session_id": transcript.session_id,
+            "investigation_id": transcript.investigation_id,
+            "step_count": transcript.step_count,
+            "steps": transcript.steps or [],
+            "outcome": transcript.outcome,
+            "injection_tier": transcript.injection_tier,
+            "provider": transcript.provider,
+            "model": transcript.model,
+            "tokens_used": transcript.tokens_used,
+            "error_class": transcript.error_class,
+            "started_at": transcript.started_at,
+            "finished_at": transcript.finished_at,
+        },
+        "totals": {
+            "audit_events": len(audit_rows),
+            "llm_calls": len(call_rows),
+            "actions": len(action_rows),
+            "chat_messages": len(messages),
+            "billable_tokens": sum(row.total_billable_tokens or 0 for row in call_rows),
+        },
+        "truncated": any(
+            len(rows) >= RUN_TIMELINE_LIMIT
+            for rows in (audit_rows, call_rows, action_rows, message_rows)
+        ),
+    }
+
+
+# ----------------------------------------------------------------------------
+# GET /agentic/usage
+# ----------------------------------------------------------------------------
+
+
+def _usage_bucket() -> dict[str, Any]:
+    return {
+        "calls": 0,
+        "errors": 0,
+        "input_uncached_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "output_tokens": 0,
+        "thinking_tokens": 0,
+        "total_billable_tokens": 0,
+        "cost_usd": 0.0,
+        "unpriced_calls": 0,
+    }
+
+
+def _usage_add(bucket: dict[str, Any], *, calls: int, errors: int, tokens: dict[str, int],
+               cost: Optional[float], unpriced: int) -> None:
+    bucket["calls"] += calls
+    bucket["errors"] += errors
+    for key, value in tokens.items():
+        bucket[key] += value
+    if cost is not None:
+        bucket["cost_usd"] = round(bucket["cost_usd"] + cost, 6)
+    bucket["unpriced_calls"] += unpriced
+
+
+@router.get("/usage")
+async def get_agent_usage(
+    request: Request,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+    redis: RedisClient = None,
+    days: int = Query(30, ge=1, le=365),
+    organization_id: Optional[str] = Query(None, description="superuser only"),
+    all_orgs: bool = Query(False, alias="all", description="superuser only: every organization"),
+):
+    """LLM token spend for the window, from ``llm_call_logs`` (analyst+).
+
+    Totals by day, by purpose/mode, by provider+model and by actor, plus the
+    estimated cost from ``src/llm/calllog.price_call`` (rows whose model has
+    no price in ``settings.llm_prices`` are counted as ``unpriced_calls``
+    rather than guessed at), and today's remaining interactive/autonomous
+    budget when the quota backend is reachable (``null`` when it is not).
+
+    Raw call logs are purged after ``settings.llm_log_retention_days``, so any
+    day in the window that has no raw rows is filled from the
+    ``llm_usage_daily`` rollup instead; those days are listed in
+    ``rolled_up_days``. Scoped to the caller's organization unless a
+    superuser passes ``organization_id`` or ``all=true``.
+    """
+    ctx = _agent_context(current_user, Mode.INTERACTIVE, request=request)
+    _require_analyst(ctx)
+    scope_org = _scope_organization(current_user, ctx, organization_id, all_orgs)
+
+    now = datetime.now(timezone.utc)
+    since = now - timedelta(days=days)
+    start_day = since.date()
+
+    totals = _usage_bucket()
+    by_day: dict[str, dict[str, Any]] = {}
+    by_purpose: dict[str, dict[str, Any]] = {}
+    by_provider_model: dict[str, dict[str, Any]] = {}
+    by_actor: dict[str, dict[str, Any]] = {}
+
+    raw_stmt = select(LLMCallLog).where(LLMCallLog.created_at >= since)
+    if scope_org is not None:
+        raw_stmt = raw_stmt.where(LLMCallLog.organization_id == scope_org)
+    raw_rows = (await db.execute(raw_stmt.order_by(LLMCallLog.created_at.asc()))).scalars().all()
+
+    raw_days: set[str] = set()
+    for row in raw_rows:
+        created = row.created_at or now
+        day = created.date().isoformat()
+        raw_days.add(day)
+        cost = row.cost_usd
+        if cost is None:
+            cost = price_call(row.model, _usage_from_row(row))
+        tokens = {
+            "input_uncached_tokens": row.input_uncached_tokens or 0,
+            "cache_read_tokens": row.cache_read_tokens or 0,
+            "cache_write_tokens": row.cache_write_tokens or 0,
+            "output_tokens": row.output_tokens or 0,
+            "thinking_tokens": row.thinking_tokens or 0,
+            "total_billable_tokens": row.total_billable_tokens or 0,
+        }
+        errors = 1 if (row.stop_reason == "error" or row.error_class) else 0
+        unpriced = 1 if cost is None else 0
+        for bucket in (
+            totals,
+            by_day.setdefault(day, _usage_bucket()),
+            by_purpose.setdefault(f"{row.purpose}:{row.mode}", _usage_bucket()),
+            by_provider_model.setdefault(f"{row.provider}/{row.model}", _usage_bucket()),
+            by_actor.setdefault(actor_key_for(row.actor_user_id, row.soc_agent_id), _usage_bucket()),
+        ):
+            _usage_add(bucket, calls=1, errors=errors, tokens=tokens, cost=cost, unpriced=unpriced)
+
+    # Rollup fallback for days whose raw rows have already been purged.
+    daily_stmt = select(LLMUsageDaily).where(LLMUsageDaily.day >= start_day)
+    if scope_org is not None:
+        daily_stmt = daily_stmt.where(LLMUsageDaily.organization_id == scope_org)
+    rolled_up_days: set[str] = set()
+    for row in (await db.execute(daily_stmt)).scalars().all():
+        day = row.day.isoformat() if isinstance(row.day, date) else str(row.day)
+        if day in raw_days:
+            continue
+        rolled_up_days.add(day)
+        tokens = {
+            "input_uncached_tokens": row.input_uncached_tokens or 0,
+            "cache_read_tokens": row.cache_read_tokens or 0,
+            "cache_write_tokens": row.cache_write_tokens or 0,
+            "output_tokens": row.output_tokens or 0,
+            "thinking_tokens": row.thinking_tokens or 0,
+            "total_billable_tokens": row.total_billable_tokens or 0,
+        }
+        for bucket in (
+            totals,
+            by_day.setdefault(day, _usage_bucket()),
+            by_purpose.setdefault(f"{row.purpose}:{row.mode}", _usage_bucket()),
+            by_provider_model.setdefault(f"{row.provider}/{row.model}", _usage_bucket()),
+            by_actor.setdefault(row.actor_key or "-", _usage_bucket()),
+        ):
+            _usage_add(
+                bucket,
+                calls=row.calls or 0,
+                errors=row.errors or 0,
+                tokens=tokens,
+                cost=row.cost_usd,
+                unpriced=0 if row.cost_usd is not None else (row.calls or 0),
+            )
+
+    budget: Optional[dict[str, Any]] = None
+    if scope_org is not None:
+        quota = _agent_quota(redis)
+        try:
+            usage = await quota.usage(scope_org)
+            budget = {
+                name: {"used": item.used, "cap": item.cap, "remaining": item.remaining}
+                for name, item in usage.items()
+            }
+        except Exception as exc:  # noqa: BLE001 - an unreachable budget is reported as null
+            logger.warning(
+                "agent_usage_budget_unavailable", organization_id=scope_org, error=str(exc)[:200]
+            )
+            budget = None
+
+    return {
+        "organization_id": scope_org,
+        "scope": "all_organizations" if scope_org is None else "organization",
+        "days": days,
+        "from": since,
+        "to": now,
+        "totals": totals,
+        "by_day": [{"day": day, **by_day[day]} for day in sorted(by_day)],
+        "by_purpose_mode": [{"key": key, **by_purpose[key]} for key in sorted(by_purpose)],
+        "by_provider_model": [
+            {"key": key, **by_provider_model[key]} for key in sorted(by_provider_model)
+        ],
+        "by_actor": [{"actor": key, **by_actor[key]} for key in sorted(by_actor)],
+        "rolled_up_days": sorted(rolled_up_days),
+        "budget_remaining_today": budget,
+    }
+
+
+# ----------------------------------------------------------------------------
+# GET /agentic/policy-events
+# ----------------------------------------------------------------------------
+
+
+@router.get("/policy-events")
+async def list_policy_events(
+    request: Request,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+    decision: Optional[str] = Query(
+        None, description="allow | deny | propose | executed | failed | blocked | proposed"
+    ),
+    reason_code: Optional[str] = Query(None, max_length=64),
+    tool: Optional[str] = Query(None, max_length=100),
+    since: Optional[datetime] = Query(None),
+    page: int = Query(1, ge=1),
+    size: int = Query(50, ge=1, le=200),
+):
+    """The agent's policy and tool audit rows, newest first (analyst+).
+
+    One pre-decision row (``agent_policy/tool.allow|deny|propose``) and one
+    post-execution row (``agent_tool/tool.executed|failed|blocked|proposed``)
+    per tool call, exactly as the policy engine and the runtime wrote them
+    (design v2 section 7). Always scoped to the caller's organization.
+
+    ``decision`` matches the audit action suffix; ``tool`` matches the audited
+    resource id; ``reason_code`` matches the code inside the recorded payload
+    (the JSON column is compared as text, which both SQLite and Postgres
+    store verbatim as SQLAlchemy serialized it).
+    """
+    ctx = _agent_context(current_user, Mode.INTERACTIVE, request=request)
+    _require_analyst(ctx)
+
+    filters = [
+        AuditTrail.organization_id == ctx.org_id,
+        AuditTrail.event_type.in_(AGENT_AUDIT_EVENTS),
+    ]
+    if decision:
+        filters.append(AuditTrail.action == f"tool.{decision}")
+    if tool:
+        filters.append(AuditTrail.resource_id == tool)
+    if since is not None:
+        filters.append(AuditTrail.created_at >= since)
+    if reason_code:
+        filters.append(
+            func.cast(AuditTrail.new_value, String).like(f'%"reason_code": "{reason_code}"%')
+        )
+
+    base = select(AuditTrail).where(*filters)
+    total = (await db.execute(select(func.count()).select_from(base.subquery()))).scalar() or 0
+    rows = (await db.execute(
+        base.order_by(AuditTrail.created_at.desc(), AuditTrail.id.desc())
+        .offset((page - 1) * size)
+        .limit(size)
+    )).scalars().all()
+
+    return {
+        "items": [_audit_view(row) for row in rows],
+        "total": total,
+        "page": page,
+        "size": size,
+        "pages": math.ceil(total / size) if total > 0 else 0,
+        "filters": {
+            "decision": decision,
+            "reason_code": reason_code,
+            "tool": tool,
+            "since": since,
+        },
+    }
+
+
+# ----------------------------------------------------------------------------
+# GET /agentic/evidence/export
+# ----------------------------------------------------------------------------
+
+EVIDENCE_COLUMNS: tuple[str, ...] = (
+    "timestamp",
+    "run_id",
+    "organization_id",
+    "actor_id",
+    "role",
+    "mode",
+    "tool",
+    "redacted_args",
+    "decision",
+    "reason_code",
+    "provider",
+    "model",
+    "input_tokens",
+    "output_tokens",
+    "approver_id",
+    "approval_timestamp",
+    "execution_status",
+    "result_sha256",
+    "injection_tier",
+)
+
+
+def _evidence_csv(rows: list[dict[str, Any]]) -> Iterator[str]:
+    """Stream the export as CSV, one chunk per row (header first)."""
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=list(EVIDENCE_COLUMNS), extrasaction="ignore")
+    writer.writeheader()
+    yield buffer.getvalue()
+    for row in rows:
+        buffer.seek(0)
+        buffer.truncate(0)
+        writer.writerow({key: row.get(key, "") for key in EVIDENCE_COLUMNS})
+        yield buffer.getvalue()
+
+
+async def _evidence_rows(
+    db: AsyncSession, *, scope_org: Optional[str], start: datetime, end: datetime
+) -> tuple[list[dict[str, Any]], bool]:
+    """One row per tool decision, joining audit + call log + proposal."""
+    filters = [
+        AuditTrail.event_type.in_(AGENT_AUDIT_EVENTS),
+        AuditTrail.created_at >= start,
+        AuditTrail.created_at <= end,
+    ]
+    if scope_org is not None:
+        filters.append(AuditTrail.organization_id == scope_org)
+    audit_rows = (await db.execute(
+        select(AuditTrail)
+        .where(*filters)
+        .order_by(AuditTrail.created_at.asc(), AuditTrail.id.asc())
+        .limit(EVIDENCE_EXPORT_LIMIT + 1)
+    )).scalars().all()
+    truncated = len(audit_rows) > EVIDENCE_EXPORT_LIMIT
+    audit_rows = list(audit_rows[:EVIDENCE_EXPORT_LIMIT])
+
+    run_ids = {row.run_id or row.request_id for row in audit_rows if (row.run_id or row.request_id)}
+
+    calls: dict[str, dict[str, Any]] = {}
+    actions: dict[tuple[str, Optional[str]], AgentAction] = {}
+    if run_ids:
+        run_list = list(run_ids)
+        call_stmt = select(LLMCallLog).where(LLMCallLog.run_id.in_(run_list))
+        if scope_org is not None:
+            call_stmt = call_stmt.where(LLMCallLog.organization_id == scope_org)
+        for row in (await db.execute(call_stmt)).scalars().all():
+            agg = calls.setdefault(
+                row.run_id,
+                {"provider": row.provider, "model": row.model, "input_tokens": 0, "output_tokens": 0},
+            )
+            agg["input_tokens"] += (row.input_uncached_tokens or 0) + (row.cache_read_tokens or 0) + (
+                row.cache_write_tokens or 0
+            )
+            agg["output_tokens"] += (row.output_tokens or 0) + (row.thinking_tokens or 0)
+
+        action_stmt = select(AgentAction).where(AgentAction.run_id.in_(run_list))
+        if scope_org is not None:
+            action_stmt = action_stmt.where(AgentAction.organization_id == scope_org)
+        for row in (await db.execute(action_stmt)).scalars().all():
+            actions.setdefault((row.run_id or "", row.tool_name), row)
+
+    merged: dict[tuple[str, Any, str], dict[str, Any]] = {}
+    order: list[tuple[str, Any, str]] = []
+    for row in audit_rows:
+        payload = row.new_value if isinstance(row.new_value, dict) else {}
+        run_id = row.run_id or row.request_id or ""
+        tool = str(payload.get("tool") or row.resource_id or "")
+        key = (run_id, payload.get("step"), tool)
+        entry = merged.get(key)
+        if entry is None:
+            entry = {column: "" for column in EVIDENCE_COLUMNS}
+            entry.update({
+                "timestamp": (row.created_at.isoformat() if row.created_at else ""),
+                "run_id": run_id,
+                "organization_id": row.organization_id,
+                "actor_id": row.actor_id,
+                "tool": tool,
+            })
+            merged[key] = entry
+            order.append(key)
+        outcome = row.action.split("tool.", 1)[-1] if row.action.startswith("tool.") else row.action
+        if row.event_type == AUDIT_EVENT_POLICY:
+            entry["decision"] = outcome
+            entry["reason_code"] = str(payload.get("reason_code") or "")
+            entry["role"] = str(payload.get("role") or "")
+            entry["mode"] = str(payload.get("mode") or "")
+            entry["redacted_args"] = json.dumps(payload.get("args") or {}, default=str, sort_keys=True)
+        else:
+            entry["execution_status"] = outcome
+            entry["result_sha256"] = str(payload.get("result_sha256") or "")
+            entry["injection_tier"] = str(payload.get("injection_tier") or "")
+        call = calls.get(run_id)
+        if call:
+            entry["provider"] = call["provider"]
+            entry["model"] = call["model"]
+            entry["input_tokens"] = call["input_tokens"]
+            entry["output_tokens"] = call["output_tokens"]
+        action = actions.get((run_id, tool))
+        if action is not None:
+            entry["approver_id"] = action.approved_by or ""
+            entry["approval_timestamp"] = action.approval_timestamp or ""
+            entry["execution_status"] = entry["execution_status"] or action.execution_status
+            entry["injection_tier"] = entry["injection_tier"] or (action.injection_tier or "")
+
+    return [merged[key] for key in order], truncated
+
+
+@router.get("/evidence/export")
+async def export_agent_evidence(
+    request: Request,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+    export_format: str = Query("json", alias="format", pattern="^(csv|json)$"),
+    date_from: Optional[datetime] = Query(None, alias="from"),
+    date_to: Optional[datetime] = Query(None, alias="to"),
+    organization_id: Optional[str] = Query(None, description="superuser only"),
+):
+    """Per-decision agent evidence for an assessor (admin only).
+
+    One row per tool decision: the policy pre-row and the tool post-row for
+    the same ``(run_id, step, tool)`` merged, joined to the run's provider
+    calls (``llm_call_logs.run_id``) and to the proposal the decision
+    produced (``agent_actions.run_id`` + ``tool_name``) for the approver and
+    the execution outcome. Arguments come from the audit payload, which the
+    policy engine value-redacted before writing it; this endpoint never
+    re-reads the live arguments.
+
+    Evidences, per design v2 sections 7 and 16:
+
+    * **AC-3** (access enforcement) -- every decision with its reason code.
+    * **AC-6(1)** (least privilege) -- the role and mode the call ran under.
+    * **AU-2** / **AU-3** (audit events / content) -- timestamp, actor,
+      resource, outcome, provider, tokens.
+    * **SI-10** (information input validation) -- ``invalid_arguments`` and
+      the argument hash binding behind each approval.
+
+    ``src/compliance`` has no automated-evidence-rule model to register
+    against, so the control mapping is documented here rather than invented
+    in the schema; the compliance module can read this endpoint directly.
+    """
+    ctx = _agent_context(current_user, Mode.INTERACTIVE, request=request)
+    _require_admin(ctx)
+    scope_org = _scope_organization(current_user, ctx, organization_id, False)
+
+    end = date_to or datetime.now(timezone.utc)
+    start = date_from or (end - timedelta(days=30))
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    if end.tzinfo is None:
+        end = end.replace(tzinfo=timezone.utc)
+    if start > end:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "invalid_range", "detail": "'from' must not be after 'to'"},
+        )
+
+    rows, truncated = await _evidence_rows(db, scope_org=scope_org, start=start, end=end)
+    logger.info(
+        "agent_evidence_exported",
+        organization_id=scope_org,
+        actor_id=ctx.actor_user_id,
+        rows=len(rows),
+        export_format=export_format,
+        truncated=truncated,
+    )
+
+    if export_format == "csv":
+        stamp = end.strftime("%Y%m%d")
+        return StreamingResponse(
+            _evidence_csv(rows),
+            media_type="text/csv",
+            headers={
+                "Content-Disposition": f'attachment; filename="agent-evidence-{stamp}.csv"',
+                "X-Evidence-Rows": str(len(rows)),
+                "X-Evidence-Truncated": "true" if truncated else "false",
+            },
+        )
+
+    return {
+        "organization_id": scope_org,
+        "from": start,
+        "to": end,
+        "columns": list(EVIDENCE_COLUMNS),
+        "controls": list(EVIDENCE_EXPORT_CONTROLS),
+        "rows": rows,
+        "total": len(rows),
+        "truncated": truncated,
     }

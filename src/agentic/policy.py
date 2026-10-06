@@ -33,6 +33,7 @@ from src.agentic.context import ROLE_RANK, AgentContext, Mode, UserRole
 from src.agentic.decisions import Decision, DecisionKind, ReasonCode, TrustState, TrustTier
 from src.agentic.toolspec import ParamSpec, Target, Tier, ToolSpec
 from src.core.logging import get_logger
+from src.core.metrics import AGENT_POLICY_DECISIONS_TOTAL, increment as metric_increment
 from src.core.redact import redact
 
 logger = get_logger(__name__)
@@ -337,7 +338,9 @@ class PolicyEngine:
     ) -> Decision:
         """Run the eight checks in order; always ends with the pre-decision audit row."""
         decision = await self._evaluate_unaudited(ctx, spec, args, trust)
-        return await self._audit_pre(ctx, decision, args, step=step)
+        audited = await self._audit_pre(ctx, decision, args, step=step)
+        metric_increment(AGENT_POLICY_DECISIONS_TOTAL, decision=audited.kind, reason=audited.reason_code)
+        return audited
 
     # ------------------------------------------------------------------
     # Steps 1-7
