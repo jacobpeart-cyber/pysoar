@@ -129,3 +129,7 @@ site/
 docker-compose.override.yml
 # Unrelated scratch script
 secret_message.py
+
+# Every env file is local-only; only the committed example may be tracked.
+.env.*
+!.env.example
