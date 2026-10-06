@@ -10,8 +10,11 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
     container_name: pysoar-frontend
-    ports:
-      - "80:80"
+    # No host port: the reverse proxy (nginx service) owns 80 and 443 and
+    # reaches this container over the internal network. When this service
+    # published 80:80 itself, the proxy's port-80 server block (the ACME
+    # challenge location and the HTTPS redirect) was unreachable, so
+    # certificate renewal silently failed from June 2026 onward.
     # Bind-mount the host's built dist over the baked-in one so a
     # `vite build` + `docker cp` (or a plain host-side copy) shows up
     # instantly without rebuilding the image. The image still has a
@@ -286,6 +289,10 @@ services:
     image: nginx:1.25-alpine
     container_name: pysoar-nginx
     ports:
+      # Port 80 belongs here, not on the frontend: nginx.conf's port-80
+      # server serves /.well-known/acme-challenge/ from ./nginx/certbot
+      # (certbot webroot) and redirects everything else to HTTPS.
+      - "80:80"
       - "443:443"
       - "8443:443"
     volumes:

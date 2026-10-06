@@ -272,6 +272,22 @@ corpus with a 5 % false-positive ceiling), `tests/unit/test_agent_runtime.py`.
 
 ## 12. Deploying this release
 
+0. TLS on the production host. The origin certificate expired on
+   2026-07-05 because certbot was configured with the `standalone`
+   authenticator (needs port 80) while the frontend container held port 80,
+   so every renewal failed and Cloudflare returned 526. Port 80 now belongs to
+   the `nginx` service, whose port-80 server serves the ACME webroot
+   (`./nginx/certbot`). One-time switch on the host, as root:
+
+   ```
+   certbot certonly --webroot -w /opt/pysoar/nginx/certbot -d pysoar.it.com \
+       --deploy-hook /opt/pysoar/deploy/certbot-deploy-hook.sh \
+       --non-interactive --agree-tos --force-renewal
+   ```
+
+   This rewrites the renewal config to webroot and registers the hook, which
+   copies the lineage into `nginx/ssl/` and restarts the proxy. The existing
+   `certbot.timer` then renews unattended.
 1. Prod requires `ENCRYPTION_MASTER_KEY` in `/opt/pysoar/.env` before
    `alembic upgrade head` (migration 020 backfills settings secrets and refuses
    to run without the key).
