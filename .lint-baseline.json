@@ -1,0 +1,6 @@
+{
+  "_comment": "Debt counts the ratchet compares against. Lower them as debt is paid down; never raise them to make CI green. eslint_warnings is applied via --max-warnings in CI.",
+  "eslint_warnings": 859,
+  "mypy": 6794,
+  "ruff_style": 7302
+}
