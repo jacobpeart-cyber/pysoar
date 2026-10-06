@@ -28,7 +28,7 @@ jobs:
           output: 'trivy-results.sarif'
 
       - name: Upload Trivy results to GitHub Security tab
-        uses: github/codeql-action/upload-sarif@v2
+        uses: github/codeql-action/upload-sarif@v3
         if: always()
         with:
           sarif_file: 'trivy-results.sarif'
@@ -59,19 +59,13 @@ jobs:
         # fails the job instead of being filed away in an artifact nobody reads.
         run: pip-audit -r requirements.txt --format json --output pip-audit-results.json
 
-      - name: Run safety check
-        run: safety check -r requirements.txt --json --output safety-results.json || true
+      # The former "safety check || true" step is gone: safety was never
+      # installed in this job, so the step always passed without scanning
+      # anything. pip-audit above is the enforcing dependency scan.
 
       - name: Upload pip-audit results
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         if: always()
         with:
           name: pip-audit-results
           path: pip-audit-results.json
-
-      - name: Upload safety results
-        uses: actions/upload-artifact@v3
-        if: always()
-        with:
-          name: safety-results
-          path: safety-results.json
