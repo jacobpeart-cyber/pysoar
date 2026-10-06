@@ -28,7 +28,6 @@ __all__ = [
     "OTPolicyRuleCreate",
     "OTPolicyRuleUpdate",
     "OTDashboardResponse",
-    "OTComplianceReportResponse",
     "OTRiskAssessmentResponse",
     "OTAssetListResponse",
     "OTAlertListResponse",

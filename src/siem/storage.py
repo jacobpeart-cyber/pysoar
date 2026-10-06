@@ -1,16 +1,22 @@
 """Log storage management with retention policies."""
 
+import gzip
+import json
+import os
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from sqlalchemy import and_, delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.core.logging import get_logger
 from src.siem.models import LogEntry
 from src.siem.parser import LogParserManager
 from src.siem.normalizer import LogNormalizer
-from src.siem.rules import RuleEngine
+from src.siem.rules.engine import RuleEngine
+
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -268,9 +274,10 @@ class LogStorageManager:
                 logs_to_archive = archive_result.scalars().all()
 
                 if logs_to_archive:
-                    # Export archived logs to compressed JSON file
-                    import json, gzip, os
-                    from datetime import datetime, timezone
+                    # Export archived logs to compressed JSON file. (A former
+                    # function-local `from datetime import datetime` here made
+                    # `datetime` local to the whole function, so the cutoff
+                    # computation above raised UnboundLocalError on every call.)
                     archive_dir = os.environ.get("ARCHIVE_DIR", "/app/archives")
                     os.makedirs(archive_dir, exist_ok=True)
                     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -285,7 +292,7 @@ class LogStorageManager:
                     logger.info(f"Archived {archived_count} logs to {archive_path}")
 
             except Exception as e:
-                print(f"Error archiving logs: {e}")
+                logger.error(f"Error archiving logs: {e}")
 
         # Delete logs older than cold_days
         delete_stmt = delete(LogEntry).where(

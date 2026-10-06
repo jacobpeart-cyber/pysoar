@@ -531,9 +531,9 @@ class EventAggregator:
     def _generate_group_key(self, event: dict) -> str:
         """Generate grouping key from event."""
         key_parts = []
-        for field in self.grouping_fields:
-            value = event.get(field, "unknown")
-            key_parts.append(f"{field}={value}")
+        for field_name in self.grouping_fields:
+            value = event.get(field_name, "unknown")
+            key_parts.append(f"{field_name}={value}")
         return "|".join(key_parts)
 
     def add_event(self, event: dict) -> Optional[AggregatedEvent]:

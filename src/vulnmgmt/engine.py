@@ -20,7 +20,6 @@ from src.vulnmgmt.models import (
     VulnerabilitySeverity,
     VulnerabilityStatus,
     PatchOperation,
-    VulnerabilitySeverity,
     DiscoverySource,
     Vulnerability,
 )

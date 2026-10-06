@@ -79,13 +79,13 @@ def test_constructor_requires_explicit_key_and_model() -> None:
 
 async def test_client_is_created_with_fixed_policy(provider: AnthropicProvider) -> None:
     with pytest.raises(RuntimeError):
-        provider.client  # not entered yet
+        _ = provider.client  # not entered yet
     async with provider as p:
         assert p.client.max_retries == 0
         assert p.client.timeout == ANTHROPIC_TIMEOUT
         assert str(p.client.base_url).startswith("https://api.anthropic.com")
     with pytest.raises(RuntimeError):
-        provider.client
+        _ = provider.client
 
 
 async def test_tool_round_trip_replays_native_content_verbatim(provider: AnthropicProvider) -> None:

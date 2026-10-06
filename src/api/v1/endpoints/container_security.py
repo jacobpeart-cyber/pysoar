@@ -656,7 +656,7 @@ async def get_cluster_findings(
     cluster_id: str,
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
-    status: Optional[str] = None,
+    status_filter: Optional[str] = Query(None, alias="status"),
     severity: Optional[str] = None,
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=200),
@@ -678,8 +678,8 @@ async def get_cluster_findings(
         K8sSecurityFinding.cluster_id == cluster_id
     )
 
-    if status:
-        stmt = stmt.where(K8sSecurityFinding.status == status)
+    if status_filter:
+        stmt = stmt.where(K8sSecurityFinding.status == status_filter)
 
     if severity:
         stmt = stmt.where(K8sSecurityFinding.severity == severity)
@@ -700,7 +700,7 @@ async def get_cluster_findings(
 async def list_findings(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
-    status: Optional[str] = None,
+    status_filter: Optional[str] = Query(None, alias="status"),
     severity: Optional[str] = None,
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=200),
@@ -710,8 +710,8 @@ async def list_findings(
         K8sSecurityFinding.organization_id == getattr(current_user, "organization_id", None)
     )
 
-    if status:
-        stmt = stmt.where(K8sSecurityFinding.status == status)
+    if status_filter:
+        stmt = stmt.where(K8sSecurityFinding.status == status_filter)
 
     if severity:
         stmt = stmt.where(K8sSecurityFinding.severity == severity)
@@ -808,7 +808,7 @@ async def update_finding(
 async def list_runtime_alerts(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
-    status: Optional[str] = None,
+    status_filter: Optional[str] = Query(None, alias="status"),
     severity: Optional[str] = None,
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=200),
@@ -818,8 +818,8 @@ async def list_runtime_alerts(
         RuntimeAlert.organization_id == getattr(current_user, "organization_id", None)
     )
 
-    if status:
-        stmt = stmt.where(RuntimeAlert.status == status)
+    if status_filter:
+        stmt = stmt.where(RuntimeAlert.status == status_filter)
 
     if severity:
         stmt = stmt.where(RuntimeAlert.severity == severity)

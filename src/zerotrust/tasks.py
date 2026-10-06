@@ -1,6 +1,6 @@
 """Celery tasks for Zero Trust operations"""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from celery import shared_task

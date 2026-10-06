@@ -5,6 +5,7 @@ Background tasks for asset discovery, protocol monitoring, firmware audits,
 zone compliance verification, and safety system checks.
 """
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List
 from celery import shared_task

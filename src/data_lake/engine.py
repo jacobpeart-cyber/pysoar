@@ -969,7 +969,8 @@ class QueryEngine:
         """Generate cache key from query and sources"""
         import hashlib
         key_data = f"{query_text}:{','.join(sorted(data_sources))}"
-        return hashlib.md5(key_data.encode()).hexdigest()
+        # Cache-key fingerprint only, not a security primitive.
+        return hashlib.md5(key_data.encode(), usedforsecurity=False).hexdigest()
 
 
 class PipelineOrchestrator:

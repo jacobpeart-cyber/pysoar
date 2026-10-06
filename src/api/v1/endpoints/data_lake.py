@@ -2041,8 +2041,10 @@ async def get_storage_breakdown(
         if total_rows == 0:
             continue
         # Estimate per-bucket bytes proportional to row counts.
-        def _b(n):
-            return int(table_bytes * (int(n or 0) / total_rows))
+        def _b(n, _table_bytes=table_bytes, _total_rows=total_rows):
+            # Defaults bind the loop's values; a bare closure would see the
+            # last iteration's table_bytes/total_rows if called late.
+            return int(_table_bytes * (int(n or 0) / _total_rows))
         tiers["hot"] += _b(hot)
         tiers["warm"] += _b(warm)
         tiers["cold"] += _b(cold)

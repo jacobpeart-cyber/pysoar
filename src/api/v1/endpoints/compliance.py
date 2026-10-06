@@ -369,7 +369,7 @@ async def get_framework_report(
 
 
 @router.post("/frameworks/{framework_id}/conmon")
-async def run_continuous_monitoring(
+async def trigger_continuous_monitoring(
     framework_id: str,
     db: DatabaseSession = None,
     current_user: CurrentUser = None,

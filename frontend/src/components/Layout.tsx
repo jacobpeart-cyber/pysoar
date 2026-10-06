@@ -182,20 +182,27 @@ export default function Layout() {
     return initial;
   });
 
-  // Keep the active route's group open as the user navigates.
-  useEffect(() => {
+  // Keep the active route's group open as the user navigates. This is the
+  // "adjust state when a prop changes" pattern (update during render, guarded
+  // by the previous pathname) rather than a setState inside an effect, which
+  // the react-hooks lint rule rejects because it causes cascading renders.
+  const [lastPathname, setLastPathname] = useState(location.pathname);
+  if (location.pathname !== lastPathname) {
+    setLastPathname(location.pathname);
     const active = groupForPath(location.pathname);
-    if (active) {
-      setExpandedGroups((prev) =>
-        prev.has(active) ? prev : new Set(prev).add(active)
-      );
+    if (active && !expandedGroups.has(active)) {
+      setExpandedGroups(new Set(expandedGroups).add(active));
     }
-  }, [location.pathname]);
+  }
 
   const toggleGroup = (label: string) =>
     setExpandedGroups((prev) => {
       const next = new Set(prev);
-      next.has(label) ? next.delete(label) : next.add(label);
+      if (next.has(label)) {
+        next.delete(label);
+      } else {
+        next.add(label);
+      }
       return next;
     });
 

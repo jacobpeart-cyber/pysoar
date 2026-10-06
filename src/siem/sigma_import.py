@@ -180,7 +180,6 @@ class SigmaFieldMapper:
         # File fields
         "TargetFilename": "file_path",
         "targetFilename": "file_path",
-        "Image": "file_path",
         # Event fields
         "EventID": "event_id",
         "eventID": "event_id",

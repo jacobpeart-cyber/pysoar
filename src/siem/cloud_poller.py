@@ -67,6 +67,19 @@ def _decrypt_config(integration: InstalledIntegration) -> dict[str, Any]:
         return {}
 
 
+def _tls_verify(config: dict[str, Any]) -> bool | str:
+    """httpx ``verify`` value for an integration: on by default (SC-8).
+
+    ``ca_bundle`` (a path) wins when set; ``verify_tls: false`` is the explicit
+    opt-out for appliances with self-signed certificates. Nothing here
+    disables verification silently.
+    """
+    ca_bundle = config.get("ca_bundle")
+    if ca_bundle:
+        return str(ca_bundle)
+    return bool(config.get("verify_tls", True))
+
+
 def _last_poll_cutoff(config: dict[str, Any], default_minutes: int = 60) -> datetime:
     """Return the start time for this poll window.
 
@@ -424,7 +437,7 @@ async def poll_splunk(db: AsyncSession, integration: InstalledIntegration) -> di
     now = datetime.now(timezone.utc)
     search = config.get("search") or f'search index=* earliest={int(cutoff.timestamp())} latest={int(now.timestamp())}'
     try:
-        async with httpx.AsyncClient(timeout=30.0, verify=False, headers={"Authorization": f"Bearer {token}"}) as client:
+        async with httpx.AsyncClient(timeout=30.0, verify=_tls_verify(config), headers={"Authorization": f"Bearer {token}"}) as client:
             r = await client.post(f"{base_url}/services/search/jobs", data={"search": search, "output_mode": "json", "exec_mode": "oneshot"})
             r.raise_for_status()
             data = r.json()
@@ -476,7 +489,7 @@ async def poll_elastic(db: AsyncSession, integration: InstalledIntegration) -> d
         "query": {"range": {ts_field: {"gte": cutoff.isoformat(), "lte": now.isoformat()}}},
     }
     try:
-        async with httpx.AsyncClient(timeout=30.0, verify=False, headers=headers, auth=auth) as client:
+        async with httpx.AsyncClient(timeout=30.0, verify=_tls_verify(config), headers=headers, auth=auth) as client:
             r = await client.post(f"{base_url}/{index}/_search", json=query)
             r.raise_for_status()
             hits = r.json().get("hits", {}).get("hits", [])
@@ -514,7 +527,7 @@ async def poll_qradar(db: AsyncSession, integration: InstalledIntegration) -> di
     # QRadar epoch ms filter on start_time
     filter_str = f"start_time>={int(cutoff.timestamp() * 1000)}"
     try:
-        async with httpx.AsyncClient(timeout=30.0, verify=False, headers=headers) as client:
+        async with httpx.AsyncClient(timeout=30.0, verify=_tls_verify(config), headers=headers) as client:
             r = await client.get(f"{base_url}/api/siem/offenses", params={"filter": filter_str})
             r.raise_for_status()
             events = r.json() if isinstance(r.json(), list) else []

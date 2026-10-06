@@ -1057,8 +1057,6 @@ async def license_audit(
     conflict detection, and populates ``conflicts`` with the
     specific components that carry conflicting licenses.
     """
-    from src.supplychain.engine import SupplyChainRiskAnalyzer
-
     result = await db.execute(
         select(SoftwareComponent).where(
             SoftwareComponent.organization_id == getattr(current_user, "organization_id", None)

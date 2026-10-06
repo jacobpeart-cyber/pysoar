@@ -9,7 +9,7 @@ from datetime import datetime
 from enum import Enum
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, Enum, Float, ForeignKey, Index, Integer, JSON, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, JSON, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.models.base import BaseModel, utc_now

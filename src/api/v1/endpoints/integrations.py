@@ -472,7 +472,10 @@ async def test_integration(
     if test_url:
         full_url = f"{test_url.rstrip('/')}{health_path}"
         try:
-            async with httpx.AsyncClient(timeout=10.0, verify=False) as client:
+            # TLS verification stays on unless the integration config supplies
+            # its own CA bundle or opts out explicitly (SC-8).
+            verify: bool | str = config.get("ca_bundle") or bool(config.get("verify_tls", True))
+            async with httpx.AsyncClient(timeout=10.0, verify=verify) as client:
                 resp = await client.get(full_url)
                 if resp.status_code < 400:
                     test_status = "healthy"

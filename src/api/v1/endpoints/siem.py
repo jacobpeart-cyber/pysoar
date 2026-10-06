@@ -1461,7 +1461,6 @@ async def _resolve_default_siem_org() -> Optional[str]:
     if env_org:
         return env_org
 
-    from src.core.database import async_session_factory
     from src.models.user import User
 
     try:
@@ -1489,7 +1488,6 @@ async def _syslog_batch_handler(messages: list):
     routers/firewalls are usable.
     """
     from src.siem.pipeline import process_log
-    from src.core.database import async_session_factory
 
     org_id = await _resolve_default_siem_org()
 

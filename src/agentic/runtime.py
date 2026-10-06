@@ -62,6 +62,10 @@ from src.models.base import generate_uuid, utc_now
 
 logger = get_logger(__name__)
 
+# Strong references to fire-and-forget step-callback futures so the event loop
+# cannot garbage-collect them mid-flight; each one removes itself on completion.
+_CALLBACK_TASKS: set[asyncio.Future[Any]] = set()
+
 __all__ = [
     "ACTIONS_HONESTY_NOTE",
     "Admission",
@@ -1060,7 +1064,9 @@ class AgentRunner:
         try:
             maybe = self.step_callback(event)
             if inspect.isawaitable(maybe):
-                asyncio.ensure_future(maybe)
+                task = asyncio.ensure_future(maybe)
+                _CALLBACK_TASKS.add(task)
+                task.add_done_callback(_CALLBACK_TASKS.discard)
         except Exception as exc:  # noqa: BLE001
             logger.warning("step_callback_failed", error=str(exc)[:200])
 

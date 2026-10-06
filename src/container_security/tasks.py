@@ -69,7 +69,14 @@ async def _list_cluster_pods(cluster) -> List[tuple[str, str]]:
     url = f"{api_url}/api/v1/pods?limit=500"
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
     try:
-        async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
+        # TLS verification is on by default. Clusters with a private CA set
+        # PYSOAR_KUBE_CA_BUNDLE to the bundle path; PYSOAR_KUBE_VERIFY_TLS=false
+        # is the explicit, logged opt-out (SC-8).
+        ca_bundle = os.getenv("PYSOAR_KUBE_CA_BUNDLE")
+        verify: bool | str = ca_bundle or os.getenv("PYSOAR_KUBE_VERIFY_TLS", "true").lower() != "false"
+        if verify is False:
+            logger.warning("TLS verification disabled for cluster %s via PYSOAR_KUBE_VERIFY_TLS", cluster.name)
+        async with httpx.AsyncClient(verify=verify, timeout=10.0) as client:
             r = await client.get(url, headers=headers)
         if r.status_code != 200:
             logger.error(
