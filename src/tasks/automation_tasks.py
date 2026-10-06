@@ -105,6 +105,7 @@ async def _auto_escalate_stale_alerts_async() -> dict[str, Any]:
         automation = AutomationService(db)
 
         while escalated < MAX_ESCALATE_PER_RUN:
+            window = min(BATCH_SIZE, MAX_ESCALATE_PER_RUN - escalated)
             result = await db.execute(
                 select(Alert)
                 .where(
@@ -113,7 +114,7 @@ async def _auto_escalate_stale_alerts_async() -> dict[str, Any]:
                     or_(Alert.assigned_to.is_(None), Alert.assigned_to == ""),
                 )
                 .order_by(Alert.created_at)
-                .limit(min(BATCH_SIZE, MAX_ESCALATE_PER_RUN - escalated))
+                .limit(window)
             )
             alerts = result.scalars().all()
             if not alerts:
@@ -144,7 +145,10 @@ async def _auto_escalate_stale_alerts_async() -> dict[str, Any]:
             await db.commit()
             db.expunge_all()
 
-            if len(alerts) < BATCH_SIZE:
+            # Compare against the window actually requested, not BATCH_SIZE:
+            # on the last window before the per-run cap the LIMIT is smaller,
+            # and a short read there means "backlog exhausted", not "capped".
+            if len(alerts) < window:
                 break
         else:
             cap_hit = True
@@ -192,6 +196,7 @@ async def _auto_close_resolved_alerts_async() -> dict[str, Any]:
 
     async with async_session_factory() as db:
         while closed < MAX_CLOSE_PER_RUN:
+            window = min(BATCH_SIZE, MAX_CLOSE_PER_RUN - closed)
             id_rows = await db.execute(
                 select(Alert.id)
                 .where(
@@ -203,7 +208,7 @@ async def _auto_close_resolved_alerts_async() -> dict[str, Any]:
                     Alert.updated_at <= cutoff,
                 )
                 .order_by(Alert.id)
-                .limit(min(BATCH_SIZE, MAX_CLOSE_PER_RUN - closed))
+                .limit(window)
             )
             batch_ids = list(id_rows.scalars().all())
             if not batch_ids:
@@ -217,7 +222,9 @@ async def _auto_close_resolved_alerts_async() -> dict[str, Any]:
             await db.commit()
             closed += len(batch_ids)
 
-            if len(batch_ids) < BATCH_SIZE:
+            # See the note in _auto_escalate_stale_alerts_async: compare with
+            # the window requested, which shrinks on the last pass.
+            if len(batch_ids) < window:
                 break
         else:
             cap_hit = True
@@ -266,6 +273,7 @@ async def _periodic_ioc_sweep_async() -> dict[str, Any]:
         last_id: str | None = None
 
         while checked < MAX_IOC_SWEEP_ALERTS:
+            window = min(BATCH_SIZE, MAX_IOC_SWEEP_ALERTS - checked)
             stmt = (
                 select(Alert)
                 .where(
@@ -276,7 +284,7 @@ async def _periodic_ioc_sweep_async() -> dict[str, Any]:
                     ),
                 )
                 .order_by(Alert.id)
-                .limit(min(BATCH_SIZE, MAX_IOC_SWEEP_ALERTS - checked))
+                .limit(window)
             )
             # Keyset pagination on the primary key: a plain OFFSET would skip
             # rows as the sweep rewrites descriptions underneath itself.
@@ -333,7 +341,8 @@ async def _periodic_ioc_sweep_async() -> dict[str, Any]:
             db.expunge_all()
             del alerts
 
-            if batch_len < BATCH_SIZE:
+            # See the note in _auto_escalate_stale_alerts_async.
+            if batch_len < window:
                 break
         else:
             cap_hit = True

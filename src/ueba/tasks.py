@@ -92,22 +92,6 @@ def _as_naive_utc(dt: Optional[datetime]) -> Optional[datetime]:
     return dt
 
 
-async def _load_target_entities(db, organization_id, entity_ids):
-    """Load target EntityProfiles: all in org (or all orgs) unless entity_ids given.
-
-    ``entity_ids`` are EntityProfile primary keys (same convention as the
-    /ueba/baselines/rebuild endpoint).
-    """
-    from src.ueba.models import EntityProfile
-
-    stmt = select(EntityProfile)
-    if organization_id:
-        stmt = stmt.where(EntityProfile.organization_id == organization_id)
-    if entity_ids:
-        stmt = stmt.where(EntityProfile.id.in_(entity_ids))
-    return list((await db.execute(stmt)).scalars().all())
-
-
 async def _iter_target_entity_batches(
     db,
     organization_id,

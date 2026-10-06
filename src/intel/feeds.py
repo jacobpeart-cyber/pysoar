@@ -500,8 +500,29 @@ class TAXIIFeedClient:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, headers=headers, params=params, timeout=30) as resp:
                     if resp.status == 200:
-                        self.logger.info("TAXII fetch successful", collection=self.collection_id)
-                        return await resp.read()
+                        # Same chunked read + MAX_FEED_BYTES ceiling as
+                        # FeedManager._fetch_feed_data: a TAXII collection is
+                        # just as operator-uncontrolled as a plain blocklist,
+                        # and `resp.read()` pulls the whole bundle into the
+                        # worker in one allocation.
+                        chunks: list[bytes] = []
+                        total = 0
+                        async for chunk in resp.content.iter_chunked(64 * 1024):
+                            total += len(chunk)
+                            if total > MAX_FEED_BYTES:
+                                self.logger.error(
+                                    "TAXII bundle exceeds the size ceiling; refusing to ingest",
+                                    collection=self.collection_id,
+                                    max_bytes=MAX_FEED_BYTES,
+                                )
+                                return b""
+                            chunks.append(chunk)
+                        self.logger.info(
+                            "TAXII fetch successful",
+                            collection=self.collection_id,
+                            bytes=total,
+                        )
+                        return b"".join(chunks)
                     else:
                         self.logger.error(
                             "TAXII fetch failed",
@@ -734,15 +755,13 @@ class FeedManager:
             # rows. Previously every new ThreatIndicator stayed in the session
             # until a single commit at the very end.
             new_count = 0
-            feed_pk = feed.id
-            feed_name = feed.name
             for offset in range(0, len(parsed_indicators), FEED_INGEST_BATCH):
                 window = parsed_indicators[offset : offset + FEED_INGEST_BATCH]
                 # (type, value) -> [source dict, occurrences in this window].
                 # Occurrences are carried so a feed that lists the same
                 # indicator twice still advances sighting_count exactly as
                 # the old one-query-per-line loop did.
-                wanted: dict[tuple[str, str], list] = {}
+                wanted: dict[tuple[str, str], list[Any]] = {}
                 for indicator_dict in window:
                     ind_type = indicator_dict.get("indicator_type")
                     ind_value = indicator_dict.get("value")
@@ -773,15 +792,22 @@ class FeedManager:
                 seen_keys: set[tuple[str, str]] = set()
                 for existing_ind in existing.scalars().all():
                     key = (existing_ind.indicator_type, existing_ind.value)
-                    if key not in wanted:
+                    entry = wanted.get(key)
+                    if entry is None:
                         continue
                     seen_keys.add(key)
                     existing_ind.last_seen = now_utc
-                    existing_ind.sighting_count = (existing_ind.sighting_count or 0) + 1
+                    # += occurrences, not += 1: the old one-query-per-line
+                    # loop bumped every surviving duplicate row once per
+                    # occurrence of the value in the feed body.
+                    existing_ind.sighting_count = (
+                        existing_ind.sighting_count or 0
+                    ) + entry[1]
 
-                for key, indicator_dict in wanted.items():
+                for key, entry in wanted.items():
                     if key in seen_keys:
                         continue
+                    indicator_dict, occurrences = entry
                     ind_type, ind_value = key
                     session.add(
                         ThreatIndicator(
@@ -795,6 +821,11 @@ class FeedManager:
                             first_seen=now_utc,
                             last_seen=now_utc,
                             is_active=True,
+                            # occurrences - 1: the old loop inserted the row on
+                            # the first occurrence (sighting_count default 0),
+                            # then every later occurrence in the same body found
+                            # the autoflushed row and bumped it by one.
+                            sighting_count=occurrences - 1,
                             mitre_techniques=indicator_dict.get("mitre_techniques", []),
                             tags=indicator_dict.get("tags", []),
                         )
