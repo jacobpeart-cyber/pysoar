@@ -5,10 +5,8 @@ Provides REST API for natural language queries, anomaly detection, threat
 predictions, incident analysis, and ML model management.
 """
 
-import asyncio
 import json
 import math
-import os
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any
 
@@ -94,11 +92,6 @@ def _compute_triage_priority(severity: str, source: str) -> dict[str, Any]:
         "reasoning": reasoning,
         "model_used": "heuristic-v1",
     }
-
-
-def _llm_available() -> bool:
-    """Check whether an LLM provider key is configured."""
-    return bool(os.environ.get("GEMINI_API_KEY"))
 
 
 def _parse_json_field(raw: Any) -> Any:
