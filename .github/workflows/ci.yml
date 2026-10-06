@@ -141,8 +141,17 @@ jobs:
           load: true
 
       - name: Test Docker image startup (enforcing)
+        # The image sets APP_ENV=production, which arms the Settings validator
+        # that refuses the 'prefer' default for database_ssl_mode (a real
+        # deployment must choose explicitly). This check imports the app on a
+        # local SQLite file, which has no TLS, so 'disable' is the truthful
+        # value here, not a bypass. Secret-strength and encryption-key checks
+        # run in the app lifespan, not at import, so they are not exercised by
+        # this step.
         run: >
-          docker run --rm -e DATABASE_URL="sqlite+aiosqlite:///./pysoar.db"
+          docker run --rm
+          -e DATABASE_URL="sqlite+aiosqlite:///./pysoar.db"
+          -e DATABASE_SSL_MODE=disable
           pysoar-backend:${{ github.sha }}
           python -c "from src.main import app; print('App imports successfully')"
 
