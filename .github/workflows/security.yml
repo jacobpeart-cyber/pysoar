@@ -8,6 +8,14 @@ on:
   pull_request:
     branches: [main]
 
+# The default GITHUB_TOKEN is read-only on this repository; uploading SARIF to
+# the Security tab needs security-events: write (the previous runs failed with
+# "Resource not accessible by integration").
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
 jobs:
   container-scan:
     name: Container Scanning
@@ -28,7 +36,7 @@ jobs:
           output: 'trivy-results.sarif'
 
       - name: Upload Trivy results to GitHub Security tab
-        uses: github/codeql-action/upload-sarif@v3
+        uses: github/codeql-action/upload-sarif@v4
         if: always()
         with:
           sarif_file: 'trivy-results.sarif'
