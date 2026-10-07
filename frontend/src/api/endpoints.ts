@@ -951,7 +951,7 @@ export const agenticApi = {
       reason?: string;
       approval_notes?: string;
     },
-  ): Promise<unknown> => {
+  ): Promise<ApproveActionResult> => {
     const payload: ApproveActionRequest = { approved: true, ...body };
     const response = await api.post(`/agentic/actions/${actionId}/approve`, payload);
     return response.data;
@@ -1739,6 +1739,23 @@ export interface PendingApprovalRow {
   confidence_score?: number | null;
   risk_score?: number | null;
   created_at?: string | null;
+  /** AC-5: the org requires two distinct approvers for this proposal's tier. */
+  requires_second_approver?: boolean | null;
+  /** Set once the first of the two approvals is in. */
+  first_approved_by?: string | null;
+  first_approved_at?: string | null;
+}
+
+/** Body of a successful POST /agentic/actions/{id}/approve. */
+export interface ApproveActionResult {
+  status: 'approved' | 'awaiting_second_approval' | string;
+  action_id: string;
+  executed?: boolean;
+  execution_status?: string;
+  approvals_required?: number;
+  approvals_received?: number;
+  first_approved_by?: string | null;
+  first_approved_at?: string | null;
 }
 
 export interface RollbackResult {
@@ -1814,7 +1831,24 @@ export interface LLMHealth {
   cached?: boolean;
 }
 
+/** Org agentic policy knobs (GET/PUT /settings/agentic-policy, admin). */
+export interface AgenticPolicySettings {
+  require_second_approver: boolean;
+  updated_at?: string | null;
+  updated_by?: string | null;
+}
+
 export const settingsApi = {
+  getAgenticPolicy: async (): Promise<AgenticPolicySettings> => {
+    const response = await api.get('/settings/agentic-policy');
+    return response.data;
+  },
+
+  putAgenticPolicy: async (body: { require_second_approver: boolean }): Promise<AgenticPolicySettings> => {
+    const response = await api.put('/settings/agentic-policy', body);
+    return response.data;
+  },
+
   getAi: async (): Promise<AISettings> => {
     const response = await api.get('/settings/ai');
     return response.data;

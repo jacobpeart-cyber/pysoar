@@ -12,10 +12,22 @@
  *    `approval_stale`) instead of silently executing;
  *  - a row with no hashes cannot be approved from the UI at all;
  *  - a suspect proposal can only be approved by an admin, with a written
- *    reason and an explicit acknowledgement.
+ *    reason and an explicit acknowledgement;
+ *  - when the org requires a second approver (AC-5), the card shows "1 of 2
+ *    approvals", and the approve button is disabled for the proposer and for
+ *    the user who already gave the first approval (the server enforces both:
+ *    403 `proposer_cannot_approve`, 409 `second_approver_required`).
  */
 import React, { useState } from 'react';
-import { CheckCircle2, ChevronDown, ChevronRight, Clock, Hash, ThumbsDown } from 'lucide-react';
+import {
+  CheckCircle2,
+  ChevronDown,
+  ChevronRight,
+  Clock,
+  Hash,
+  ThumbsDown,
+  Users,
+} from 'lucide-react';
 import clsx from 'clsx';
 import type { EffectiveTarget } from '../../api/endpoints';
 import { agenticApi } from '../../api/endpoints';
@@ -45,6 +57,13 @@ export interface ApprovalCardProps {
   meta?: Array<{ label: string; value: string }>;
   role?: string | null;
   isSuperuser?: boolean | null;
+  /** Id of the signed-in user (to recognise the proposer / first approver). */
+  currentUserId?: string | null;
+  /** The org requires two distinct approvers for this proposal's tier. */
+  requiresSecondApprover?: boolean | null;
+  firstApprovedBy?: string | null;
+  firstApprovedAt?: string | null;
+  proposedByUserId?: string | null;
   onResolved?: (actionId: string, outcome: 'approved' | 'denied') => void;
 }
 
@@ -64,6 +83,11 @@ const ApprovalCard: React.FC<ApprovalCardProps> = ({
   meta,
   role,
   isSuperuser,
+  currentUserId,
+  requiresSecondApprover,
+  firstApprovedBy,
+  firstApprovedAt,
+  proposedByUserId,
   onResolved,
 }) => {
   const [showHashes, setShowHashes] = useState(false);
@@ -74,6 +98,11 @@ const ApprovalCard: React.FC<ApprovalCardProps> = ({
   const [busy, setBusy] = useState(false);
   const [cardError, setCardError] = useState<string | null>(null);
   const [outcome, setOutcome] = useState<Outcome>(null);
+  // First of two approvals (server said `awaiting_second_approval`); seeded
+  // from the pending-list row.
+  const [firstApproval, setFirstApproval] = useState<{ by: string | null; at: string | null } | null>(
+    firstApprovedBy ? { by: firstApprovedBy, at: firstApprovedAt ?? null } : null,
+  );
 
   const { label: expiryLabel, expired } = useExpiryCountdown(expiresAt);
   const admin = isAdminRole(role, isSuperuser);
@@ -97,7 +126,19 @@ const ApprovalCard: React.FC<ApprovalCardProps> = ({
   } else if (isSuspect && !admin) {
     blockedReason =
       'This proposal was raised in a flagged or lockdown session (suspect). Only an admin may approve it, after re-investigating from trusted input.';
+  } else if (
+    (requiresSecondApprover || firstApproval) &&
+    currentUserId &&
+    proposedByUserId === currentUserId
+  ) {
+    blockedReason =
+      'You proposed this action. Your organization requires two approvers other than the proposer (separation of duties).';
+  } else if (firstApproval && currentUserId && firstApproval.by === currentUserId) {
+    blockedReason =
+      'You gave the first approval. A different user must give the second approval before it runs.';
   }
+
+  const twoStep = Boolean(requiresSecondApprover || firstApproval);
 
   const needsAdminAttestation = isSuspect && admin && !blockedReason;
   const approveDisabled =
@@ -111,12 +152,22 @@ const ApprovalCard: React.FC<ApprovalCardProps> = ({
     setBusy(true);
     setCardError(null);
     try {
-      await agenticApi.approveAction(actionId, {
+      const result = await agenticApi.approveAction(actionId, {
         params_sha256: paramsSha256,
         evidence_sha256: evidenceSha256,
         acknowledge_suspect: needsAdminAttestation ? true : undefined,
         reason: reason.trim() || undefined,
       });
+      if (result?.status === 'awaiting_second_approval') {
+        // Still pending: keep the card (and the list row) and show "1 of 2".
+        setFirstApproval({
+          by: result.first_approved_by ?? currentUserId ?? null,
+          at: result.first_approved_at ?? null,
+        });
+        setReason('');
+        setAcknowledged(false);
+        return;
+      }
       setOutcome('approved');
       onResolved?.(actionId, 'approved');
     } catch (err) {
@@ -164,6 +215,15 @@ const ApprovalCard: React.FC<ApprovalCardProps> = ({
         </span>
         <TierBadge tier={tier} />
         {isSuspect ? <SuspectBadge injectionTier={injectionTier} /> : null}
+        {twoStep ? (
+          <span
+            className="inline-flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-300"
+            title="Your organization requires two distinct approvers for destructive actions"
+          >
+            <Users className="w-3 h-3" />
+            {firstApproval ? '1 of 2 approvals' : '0 of 2 approvals'}
+          </span>
+        ) : null}
         {expiryLabel ? (
           <span
             className={clsx(
@@ -272,6 +332,19 @@ const ApprovalCard: React.FC<ApprovalCardProps> = ({
           </div>
         ) : null}
 
+        {firstApproval ? (
+          <p className="text-xs text-blue-800 dark:text-blue-200 bg-blue-50 dark:bg-blue-900/20 border border-blue-200 dark:border-blue-800 rounded px-2 py-1.5">
+            First approval recorded
+            {firstApproval.by
+              ? firstApproval.by === currentUserId
+                ? ' (by you)'
+                : ` by user ${firstApproval.by}`
+              : ''}
+            {firstApproval.at ? ` at ${new Date(firstApproval.at).toLocaleString()}` : ''}. A
+            second, different approver must approve before the action runs.
+          </p>
+        ) : null}
+
         {blockedReason ? (
           <p className="text-xs text-amber-800 dark:text-amber-200 bg-amber-100/70 dark:bg-amber-900/30 border border-amber-200 dark:border-amber-800 rounded px-2 py-1.5">
             {blockedReason}
@@ -313,7 +386,7 @@ const ApprovalCard: React.FC<ApprovalCardProps> = ({
                 className="inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded bg-green-600 hover:bg-green-700 disabled:bg-gray-300 dark:disabled:bg-gray-700 disabled:text-gray-500 dark:disabled:text-gray-400 text-white disabled:cursor-not-allowed"
               >
                 <CheckCircle2 className="w-3.5 h-3.5" />
-                {busy ? 'Working…' : 'Approve'}
+                {busy ? 'Working…' : firstApproval ? 'Give second approval' : 'Approve'}
               </button>
               <button
                 type="button"

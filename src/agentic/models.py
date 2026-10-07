@@ -11,7 +11,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from src.models.base import BaseModel
 
 if TYPE_CHECKING:
-    from src.models.organization import Organization
+    pass
 
 
 class AgentType(str, Enum):
@@ -172,49 +172,49 @@ class SOCAgent(BaseModel):
     # Identity
     name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     agent_type: Mapped[str] = mapped_column(
-        String(50), nullable=False, index=True
+        String(50), nullable=False, index=True,
     )  # AgentType enum
     organization_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("organizations.id"), nullable=False, index=True
+        String(36), ForeignKey("organizations.id"), nullable=False, index=True,
     )
 
     # Status
     status: Mapped[str] = mapped_column(
-        String(50), default=AgentStatus.IDLE.value, nullable=False, index=True
+        String(50), default=AgentStatus.IDLE.value, nullable=False, index=True,
     )
     current_task_id: Mapped[Optional[str]] = mapped_column(
-        String(36), nullable=True
+        String(36), nullable=True,
     )
 
     # Capabilities and configuration
     capabilities: Mapped[Optional[str]] = mapped_column(
-        JSON, nullable=True
+        JSON, nullable=True,
     )  # List of capability strings
     llm_model: Mapped[str] = mapped_column(
-        String(100), default="gpt-4-turbo", nullable=False
+        String(100), default="gpt-4-turbo", nullable=False,
     )
     temperature: Mapped[float] = mapped_column(
-        Float, default=0.3, nullable=False
+        Float, default=0.3, nullable=False,
     )  # Lower = more deterministic
     max_reasoning_steps: Mapped[int] = mapped_column(
-        Integer, default=15, nullable=False
+        Integer, default=15, nullable=False,
     )
     autonomy_level: Mapped[str] = mapped_column(
-        String(50), default=AutonomyLevel.SEMI_AUTO.value, nullable=False
+        String(50), default=AutonomyLevel.SEMI_AUTO.value, nullable=False,
     )
 
     # Performance metrics
     total_investigations: Mapped[int] = mapped_column(
-        Integer, default=0, nullable=False
+        Integer, default=0, nullable=False,
     )
     avg_resolution_time_minutes: Mapped[float] = mapped_column(
-        Float, default=0.0, nullable=False
+        Float, default=0.0, nullable=False,
     )
     accuracy_score: Mapped[float] = mapped_column(
-        Float, default=0.0, nullable=False
+        Float, default=0.0, nullable=False,
     )  # 0-100
     false_positive_rate: Mapped[float] = mapped_column(
-        Float, default=0.0, nullable=False
+        Float, default=0.0, nullable=False,
     )  # 0-100
 
     # Relationships
@@ -245,29 +245,29 @@ class Investigation(BaseModel):
 
     # Ownership
     agent_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("soc_agents.id"), nullable=False, index=True
+        String(36), ForeignKey("soc_agents.id"), nullable=False, index=True,
     )
     organization_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("organizations.id"), nullable=False, index=True
+        String(36), ForeignKey("organizations.id"), nullable=False, index=True,
     )
 
     # Trigger information
     trigger_type: Mapped[str] = mapped_column(
-        String(50), nullable=False
+        String(50), nullable=False,
     )  # TriggerType enum
     trigger_source_id: Mapped[Optional[str]] = mapped_column(
-        String(255), nullable=True
+        String(255), nullable=True,
     )  # Alert ID, anomaly ID, etc
 
     # Investigation metadata
     title: Mapped[str] = mapped_column(String(500), nullable=False, index=True)
     hypothesis: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     status: Mapped[str] = mapped_column(
-        String(50), default=InvestigationStatus.INITIATED.value, nullable=False, index=True
+        String(50), default=InvestigationStatus.INITIATED.value, nullable=False, index=True,
     )
     priority: Mapped[int] = mapped_column(Integer, default=3, nullable=False)
     confidence_score: Mapped[Optional[float]] = mapped_column(
-        Float, nullable=True
+        Float, nullable=True,
     )  # 0-100; NULL unless outcome == "verdict" (never a fabricated default)
 
     # Autonomous run outcome (design v2 §8). ``outcome`` is one of
@@ -283,34 +283,34 @@ class Investigation(BaseModel):
 
     # Investigation data
     reasoning_chain: Mapped[Optional[str]] = mapped_column(
-        JSON, nullable=True
+        JSON, nullable=True,
     )  # List of reasoning steps
     evidence_collected: Mapped[Optional[str]] = mapped_column(
-        JSON, nullable=True
+        JSON, nullable=True,
     )  # Evidence data
     actions_taken: Mapped[Optional[str]] = mapped_column(
-        JSON, nullable=True
+        JSON, nullable=True,
     )  # Summary of executed actions
     findings_summary: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     recommendations: Mapped[Optional[str]] = mapped_column(
-        JSON, nullable=True
+        JSON, nullable=True,
     )  # List of recommendations
 
     # Security context
     mitre_techniques: Mapped[Optional[str]] = mapped_column(
-        JSON, nullable=True
+        JSON, nullable=True,
     )  # MITRE ATT&CK techniques
     affected_assets: Mapped[Optional[str]] = mapped_column(
-        JSON, nullable=True
+        JSON, nullable=True,
     )  # Affected IPs, hosts, users, etc
     resolution_type: Mapped[Optional[str]] = mapped_column(
-        String(50), nullable=True
+        String(50), nullable=True,
     )  # ResolutionType enum
 
     # Feedback
     human_feedback: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     feedback_rating: Mapped[Optional[int]] = mapped_column(
-        Integer, nullable=True
+        Integer, nullable=True,
     )  # 1-5 rating
 
     # Relationships
@@ -345,32 +345,32 @@ class ReasoningStep(BaseModel):
 
     # Ownership
     investigation_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("investigations.id"), nullable=False, index=True
+        String(36), ForeignKey("investigations.id"), nullable=False, index=True,
     )
     organization_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("organizations.id"), nullable=False, index=True
+        String(36), ForeignKey("organizations.id"), nullable=False, index=True,
     )
 
     # Step identity
     step_number: Mapped[int] = mapped_column(Integer, nullable=False)
     step_type: Mapped[str] = mapped_column(
-        String(50), nullable=False
+        String(50), nullable=False,
     )  # StepType enum
 
     # Reasoning details
     thought_process: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     action_taken: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     action_tool: Mapped[Optional[str]] = mapped_column(
-        String(50), nullable=True
+        String(50), nullable=True,
     )  # ActionTool enum
     action_parameters: Mapped[Optional[str]] = mapped_column(
-        JSON, nullable=True
+        JSON, nullable=True,
     )  # Tool parameters
     observation: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
 
     # Confidence and metrics
     confidence_delta: Mapped[float] = mapped_column(
-        Float, default=0.0, nullable=False
+        Float, default=0.0, nullable=False,
     )  # Change in overall confidence
     duration_ms: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     tokens_used: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
@@ -397,28 +397,28 @@ class AgentAction(BaseModel):
 
     # Ownership
     investigation_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("investigations.id"), nullable=False, index=True
+        String(36), ForeignKey("investigations.id"), nullable=False, index=True,
     )
     organization_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("organizations.id"), nullable=False, index=True
+        String(36), ForeignKey("organizations.id"), nullable=False, index=True,
     )
 
     # Action definition
     action_type: Mapped[str] = mapped_column(
-        String(50), nullable=False
+        String(50), nullable=False,
     )  # ActionType enum
     target: Mapped[str] = mapped_column(String(255), nullable=False)  # IP, user, host, etc
     parameters: Mapped[Optional[str]] = mapped_column(JSON, nullable=True)
 
     # Approval workflow
     requires_approval: Mapped[bool] = mapped_column(
-        default=True, nullable=False
+        default=True, nullable=False,
     )
     approved_by: Mapped[Optional[str]] = mapped_column(
-        String(36), nullable=True
+        String(36), nullable=True,
     )  # User ID
     approval_timestamp: Mapped[Optional[str]] = mapped_column(
-        String(50), nullable=True
+        String(50), nullable=True,
     )  # ISO timestamp
 
     # Execution
@@ -437,13 +437,13 @@ class AgentAction(BaseModel):
     run_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True, index=True)
     tool_name: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
     proposed_by_user_id: Mapped[Optional[str]] = mapped_column(
-        String(36), ForeignKey("users.id"), nullable=True
+        String(36), ForeignKey("users.id"), nullable=True,
     )
     proposed_by_agent_id: Mapped[Optional[str]] = mapped_column(
-        String(36), ForeignKey("soc_agents.id"), nullable=True
+        String(36), ForeignKey("soc_agents.id"), nullable=True,
     )
     source: Mapped[Optional[str]] = mapped_column(
-        String(20), nullable=True
+        String(20), nullable=True,
     )  # chat | autonomous | skill | itdr
     params_sha256: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     evidence_sha256: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
@@ -456,6 +456,13 @@ class AgentAction(BaseModel):
     approver_role: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
     approver_ip: Mapped[Optional[str]] = mapped_column(String(45), nullable=True)
     approval_reason: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # First of two approvals when the org requires a second approver for
+    # destructive/privileged actions (AC-5, migration 021). The final
+    # approver lands in ``approved_by`` as before.
+    first_approved_by: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    first_approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    first_approver_role: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
 
     # Relationships
     investigation: Mapped["Investigation"] = relationship(
@@ -479,29 +486,29 @@ class AgentMemory(BaseModel):
 
     # Ownership
     agent_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("soc_agents.id"), nullable=False, index=True
+        String(36), ForeignKey("soc_agents.id"), nullable=False, index=True,
     )
     organization_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("organizations.id"), nullable=False, index=True
+        String(36), ForeignKey("organizations.id"), nullable=False, index=True,
     )
 
     # Memory content
     memory_type: Mapped[str] = mapped_column(
-        String(50), nullable=False, index=True
+        String(50), nullable=False, index=True,
     )  # MemoryType enum
     key: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     value: Mapped[Optional[str]] = mapped_column(JSON, nullable=True)
 
     # Confidence and decay
     confidence: Mapped[float] = mapped_column(
-        Float, default=1.0, nullable=False
+        Float, default=1.0, nullable=False,
     )  # 0-1
     access_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     last_accessed: Mapped[Optional[str]] = mapped_column(
-        String(50), nullable=True
+        String(50), nullable=True,
     )  # ISO timestamp
     decay_rate: Mapped[float] = mapped_column(
-        Float, default=0.95, nullable=False
+        Float, default=0.95, nullable=False,
     )  # Confidence *= decay_rate monthly
 
     # Relationships
@@ -526,10 +533,10 @@ class AgentChatSession(BaseModel):
     __tablename__ = "agent_chat_sessions"
 
     user_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("users.id"), nullable=False, index=True
+        String(36), ForeignKey("users.id"), nullable=False, index=True,
     )
     organization_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("organizations.id"), nullable=False, index=True
+        String(36), ForeignKey("organizations.id"), nullable=False, index=True,
     )
     title: Mapped[str] = mapped_column(String(255), nullable=False, default="New chat")
     is_archived: Mapped[bool] = mapped_column(default=False, nullable=False)
@@ -574,14 +581,14 @@ class InvestigationFeedback(BaseModel):
         index=True,
     )
     organization_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("organizations.id"), nullable=False, index=True
+        String(36), ForeignKey("organizations.id"), nullable=False, index=True,
     )
     reviewer_user_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("users.id"), nullable=False, index=True
+        String(36), ForeignKey("users.id"), nullable=False, index=True,
     )
     # Corrected verdict the reviewer believes is right.
     corrected_verdict: Mapped[str] = mapped_column(
-        String(50), nullable=False
+        String(50), nullable=False,
     )  # true_positive | false_positive | benign | inconclusive | escalated
     # Original verdict the agent emitted (snapshot for audit even if
     # the Investigation row is later deleted).

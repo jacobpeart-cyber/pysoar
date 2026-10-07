@@ -207,10 +207,15 @@ Autonomous investigator:
 
 ## 15. Open questions for JP
 
-1. `require_second_approver` for destructive actions: default off (solo SOCs) or on (defense customers)?
-2. `use_platform_default`: should existing tenants be grandfathered to `true` on migration so autonomous triage keeps running, or flipped to `false` (safer; triage pauses until an admin confirms)?
-3. Ingest-time scanning/quarantine of alerts and logs (phase 2) touches SIEM ingestion throughput — approve as the next phase?
-4. Retention defaults: 90 days for call logs and transcripts acceptable for FedRAMP customers, or make it a per-org setting from day one?
+Decided 2026-10-06:
+
+1. `require_second_approver` for destructive actions: **off by default, per-organization opt-in**. When enabled, two distinct approvers are required and the proposer never counts; suspect proposals keep the admin-plus-reason rule on top. (Implementation landing with the org settings surface.)
+2. `use_platform_default`: **stays `false` for existing tenants**. Autonomous triage records `llm_not_configured` until an admin configures a provider or opts into the platform key; nothing is sent to a provider under a key the tenant never agreed to.
+
+3. Ingest-time scanning of alerts and logs: **approved as the next phase, asynchronous after ingest**. The row is written first and scored by a background task so SIEM ingestion throughput is unaffected; the agent still re-scans at use time; lockdown-tier hits raise an alert. Not yet implemented.
+4. Retention: **365 days by default, with a per-organization setting from day one** (bounded 30 to 1095 days) that the purge job honours; changes are audited. Not yet implemented; the purge currently uses a fixed 90 days.
+
+No questions remain open.
 
 ## 16. Compliance mapping (delta)
 

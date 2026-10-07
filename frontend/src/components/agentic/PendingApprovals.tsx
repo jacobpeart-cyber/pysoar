@@ -12,6 +12,7 @@
 import React from 'react';
 import { CheckSquare, ShieldAlert } from 'lucide-react';
 import type { PendingApprovalRow } from '../../api/endpoints';
+import { useAuth } from '../../contexts/AuthContext';
 import {
   hasIntegrityBinding,
   parseParameters,
@@ -53,6 +54,14 @@ function metaFor(row: PendingApprovalRow): Array<{ label: string; value: string 
   if (typeof row.risk_score === 'number') {
     meta.push({ label: 'Risk score', value: String(row.risk_score) });
   }
+  if (row.requires_second_approver) {
+    meta.push({
+      label: 'Approvals',
+      value: row.first_approved_by
+        ? `1 of 2 (first by user ${row.first_approved_by})`
+        : '0 of 2 (two distinct approvers required)',
+    });
+  }
   return meta;
 }
 
@@ -62,8 +71,10 @@ const PendingApprovals: React.FC<PendingApprovalsProps> = ({
   isSuperuser,
   onResolved,
 }) => {
+  const { user } = useAuth();
   const unverifiable = rows.filter((r) => !hasIntegrityBinding(r)).length;
   const suspectCount = rows.filter((r) => Boolean(r.suspect)).length;
+  const awaitingSecond = rows.filter((r) => Boolean(r.first_approved_by)).length;
 
   return (
     <div>
@@ -76,6 +87,11 @@ const PendingApprovals: React.FC<PendingApprovalsProps> = ({
         {suspectCount > 0 ? (
           <span className="inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300">
             <ShieldAlert className="w-3 h-3" /> {suspectCount} suspect
+          </span>
+        ) : null}
+        {awaitingSecond > 0 ? (
+          <span className="inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-300">
+            {awaitingSecond} awaiting second approval
           </span>
         ) : null}
       </div>
@@ -116,6 +132,11 @@ const PendingApprovals: React.FC<PendingApprovalsProps> = ({
                 meta={metaFor(row)}
                 role={role}
                 isSuperuser={isSuperuser}
+                currentUserId={user?.id ?? null}
+                requiresSecondApprover={row.requires_second_approver}
+                firstApprovedBy={row.first_approved_by}
+                firstApprovedAt={row.first_approved_at}
+                proposedByUserId={row.proposed_by_user_id}
                 onResolved={onResolved}
               />
             );

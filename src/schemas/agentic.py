@@ -3,9 +3,9 @@
 from datetime import datetime
 from typing import Any, Optional
 
-from src.schemas.base import DBModel
 from pydantic import BaseModel, Field, model_validator
 
+from src.schemas.base import DBModel
 
 # ============================================================================
 # SOCAgent Schemas
@@ -223,7 +223,7 @@ class AgentActionApproval(BaseModel):
     def _hashes_required_when_approving(self) -> "AgentActionApproval":
         if self.approved and not (self.params_sha256 and self.evidence_sha256):
             raise ValueError(
-                "params_sha256 and evidence_sha256 must be echoed from the proposal when approving"
+                "params_sha256 and evidence_sha256 must be echoed from the proposal when approving",
             )
         return self
 
@@ -282,6 +282,13 @@ class ActionPendingApproval(BaseModel):
     requires_approval: bool = True
     execution_status: str = ""
 
+    # Separation of duties (AC-5, migration 021): true when the org requires
+    # two distinct approvers for this proposal's tier. ``first_approved_*``
+    # are set once the first of the two approvals is in.
+    requires_second_approver: bool = False
+    first_approved_by: Optional[str] = None
+    first_approved_at: Optional[datetime] = None
+
 
 class TrustAcknowledgeRequest(BaseModel):
     """Body of ``POST /agentic/trust/acknowledge`` (design v2 section 4).
@@ -295,7 +302,7 @@ class TrustAcknowledgeRequest(BaseModel):
     session_id: Optional[str] = None
     investigation_id: Optional[str] = None
     record_hash: Optional[str] = Field(
-        default=None, pattern=r"^[0-9a-f]{64}$", description="sha256 of the acknowledged snippet"
+        default=None, pattern=r"^[0-9a-f]{64}$", description="sha256 of the acknowledged snippet",
     )
     reason: str = Field(..., min_length=3, max_length=1000)
 

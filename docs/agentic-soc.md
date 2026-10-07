@@ -89,7 +89,12 @@ audit row. Tests: `tests/unit/test_policy_matrix.py`.
    Interactive runs turn destructive/privileged tools into **proposals**
    (decision `propose`), never executions; `proposal_disabled` when the user
    did not enable proposals. Approval mode executes after the remaining checks;
-   privileged tools require an admin approver.
+   privileged tools require an admin approver. **Separation of duties**: when
+   the organization enables `require_second_approver`, a destructive or
+   privileged proposal needs two distinct approvers before the approval-mode
+   evaluation runs; the proposer never counts (`proposer_cannot_approve`,
+   403) and the first approver cannot also give the second
+   (`second_approver_required`, 409). See section 5.
 4. **Trust** — in lockdown every write tool is denied except the two
    documentation tools (`add_incident_note`, `update_incident_findings`) →
    `injection_lockdown`. Approval mode inherits the originating run's tier.
@@ -149,6 +154,24 @@ corpus with a 5 % false-positive ceiling), `tests/unit/test_agent_runtime.py`.
   (`llm_not_configured`, `llm_unavailable`, `llm_provider_error`), quota as
   429 with `Retry-After`; the user's message is persisted with a failed status
   so the UI can retry. There is no heuristic fallback of any kind.
+* Approvals (`POST /agentic/actions/{id}/approve`) are hash-bound
+  (`params_sha256`/`evidence_sha256`), expire after 72 h and, for suspect
+  proposals, need an admin with `acknowledge_suspect` and a written reason.
+  With the org setting `require_second_approver` on (off by default; an org
+  admin sets it with `PUT /settings/agentic-policy` or Settings → AI Provider →
+  Agent approval policy, audited as `agentic_policy.set`), a destructive or
+  privileged proposal takes two approvals from two different users, neither of
+  them the proposer. The first approval is recorded on the action
+  (`first_approved_by`/`first_approved_at`, migration 021), audited as
+  `action.first_approval`, and leaves the action pending
+  (`{"status": "awaiting_second_approval"}`). The second approval, which must
+  echo the same hashes and pass the suspect rule again, is audited as
+  `action.second_approval` and executes exactly as a single approval does.
+  Refused attempts are audited as `action.approval_refused`. Expiry and
+  rollback are unchanged. `GET /agentic/actions/pending-approval` rows carry
+  `requires_second_approver`, `first_approved_by` and `first_approved_at`.
+  Proposals with no executable tool (recorded as human work) and denials are
+  not subject to the rule; the proposer may still deny (withdraw) a proposal.
 
 ## 6. Autonomous investigations
 
@@ -273,7 +296,7 @@ leaked key alone does not expose those values, but a leaked database dump does.
 |---|---|---|
 | AC-3, AC-6(1) | `PolicyEngine` role and tier gates; admin-only settings; approval endpoint | `test_policy_matrix.py`, `test_agentic_approval_endpoints.py`, `test_settings_ai.py` |
 | AC-4 | `AgentToolRegistry._scoped`, recursive tenant refs | `test_agent_tools_isolation.py` |
-| AC-5 | Suspect proposals require admin acknowledgement with a reason (second-approver setting: not implemented, see §11) | approval tests |
+| AC-5 | Separation of duties: org setting `require_second_approver` (two distinct approvers for destructive/privileged actions, proposer excluded, `evaluate_approval_quorum`); suspect proposals additionally require admin acknowledgement with a reason | `test_agentic_second_approver.py`, `test_agentic_approval_endpoints.py`, `test_migration_021.py` |
 | AU-2, AU-3, AU-12 | Pre/post audit rows per tool, `llm_call_logs` per turn | `test_audit_chain.py`, `test_call_log_records_are_complete_per_turn` |
 | AU-9, AU-10 | `audit_trails.prev_hash/row_hash` chain; fail-closed audit | `test_audit_chain.py`, `test_post_audit_failure_fails_closed` |
 | AU-6, AU-7 | Run timeline, policy-event review, usage totals and admin-only evidence export (JSON/CSV); ITDR respond routed through the same `guarded_tool_call` path | `test_agentic_read_surfaces.py`, `test_itdr_respond.py` |
@@ -286,21 +309,33 @@ leaked key alone does not expose those values, but a leaked database dump does.
 
 ## 11. Not implemented / decisions pending
 
-* **Second approver** (`require_second_approver`): no org setting exists yet;
-  separation of duties is enforced only for suspect proposals (admin + reason).
+* **Second approver scope**: `require_second_approver` is per organization and
+  off by default. When it is off, the proposer may approve their own proposal
+  (a single-analyst SOC must be able to act); the proposer exclusion applies
+  only while the setting is on.
 * **Ingest-time scanning** of alerts and logs: the columns exist
   (`injection_score`, `injection_hits`) but scanning happens when content
-  reaches the agent, not at ingestion.
-* **Platform-key grandfathering**: existing tenants default to
-  `use_platform_default=false`; autonomous triage for them records
+  reaches the agent, not at ingestion. Decided 2026-10-06: approved as the
+  next phase, scored asynchronously after the row is written (ingest
+  throughput unaffected; the agent still re-scans at use time; lockdown-tier
+  hits raise an alert). Not yet implemented.
+* **Platform-key grandfathering**: decided 2026-10-06, existing tenants stay
+  at `use_platform_default=false`; autonomous triage for them records
   `llm_not_configured` until an admin configures a provider or opts in.
+* **Retention**: decided 2026-10-06, LLM call logs and agent run transcripts
+  default to 365 days with a per-organization setting (bounded 30 to 1095
+  days) that the purge job honours. Not yet implemented; the current purge
+  uses the fixed 90-day default.
 * **Metrics**: `GET /metrics/agentic` is an in-process registry (no
   `prometheus_client`); counters reset on restart.
-* **Ingest-time memory bounds outside the agent**: the beat tasks that caused
-  the September 2026 worker OOM (IOC sweep, feed polling, UEBA baselines,
-  ITDR and exposure sweeps) are now windowed and capped, with per-child
-  recycling at 300 MB. The dark-web, STIG, integrations, supply-chain and
-  on-demand exposure tasks still load whole tables and are a follow-up.
+* **Memory bounds outside the agent**: every Celery task that read whole
+  tables is now windowed (keyset pages of 1000), capped per run with a
+  `truncated` flag, committed per window and time-limited, with per-child
+  worker recycling at 300 MB. Round one (2026-10-05) covered the beat tasks
+  behind the September 2026 OOM; round two (2026-10-06) covered dark-web,
+  STIG, integrations, supply-chain, deception, scheduled playbooks and the
+  on-demand exposure tasks. Regression tests:
+  `test_task_memory_bounds.py`, `test_task_memory_bounds_round2.py`.
 
 ## 12. Deploying this release
 

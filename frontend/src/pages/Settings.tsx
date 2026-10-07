@@ -22,7 +22,12 @@ import {
 import { api } from '../lib/api';
 import clsx from 'clsx';
 import { settingsApi, healthApi } from '../api/endpoints';
-import type { AIProviderName, AISettings, LLMHealth } from '../api/endpoints';
+import type {
+  AgenticPolicySettings as AgenticPolicySettingsData,
+  AIProviderName,
+  AISettings,
+  LLMHealth,
+} from '../api/endpoints';
 import { useAuth } from '../contexts/AuthContext';
 
 interface SettingsData {
@@ -190,7 +195,10 @@ export default function Settings() {
           )}
           {activeTab === 'ai' &&
             (isAdmin ? (
-              <AIProviderSettings />
+              <div className="space-y-8">
+                <AIProviderSettings />
+                <AgenticPolicySettings />
+              </div>
             ) : (
               <p className="text-sm text-gray-500 dark:text-gray-400">
                 Only an administrator can view or change the AI provider configuration.
@@ -1278,6 +1286,80 @@ function formatTimestamp(value?: string | null): string {
   if (!value) return 'never';
   const parsed = Date.parse(value);
   return Number.isNaN(parsed) ? value : new Date(parsed).toLocaleString();
+}
+
+/**
+ * Agentic approval policy (org admin): separation of duties for destructive
+ * agent actions. Off by default; when on, a destructive/privileged proposal
+ * needs two distinct approvers, neither of them the proposer.
+ */
+function AgenticPolicySettings() {
+  const queryClient = useQueryClient();
+  const [error, setError] = useState<string | null>(null);
+  const { data, isLoading } = useQuery<AgenticPolicySettingsData | null>({
+    queryKey: ['settings', 'agentic-policy'],
+    queryFn: async () => settingsApi.getAgenticPolicy(),
+  });
+
+  const mutation = useMutation({
+    mutationFn: async (value: boolean) =>
+      settingsApi.putAgenticPolicy({ require_second_approver: value }),
+    onSuccess: (saved) => {
+      setError(null);
+      queryClient.setQueryData(['settings', 'agentic-policy'], saved);
+    },
+    onError: () => {
+      setError('Could not save the approval policy. Your change was not applied.');
+    },
+  });
+
+  const enabled = Boolean(data?.require_second_approver);
+
+  return (
+    <div className="space-y-3 border-t border-gray-200 dark:border-gray-700 pt-6">
+      <div>
+        <h2 className="text-lg font-semibold text-gray-900 dark:text-white">Agent approval policy</h2>
+        <p className="text-sm text-gray-500 dark:text-gray-400">
+          Controls how destructive actions proposed by the agent are authorized.
+        </p>
+      </div>
+      <div className="flex items-center justify-between p-4 bg-gray-50 dark:bg-gray-900 rounded-lg border border-gray-200 dark:border-gray-700">
+        <div className="pr-4">
+          <h3 className="font-medium text-gray-900 dark:text-white">Require a second approver</h3>
+          <p className="text-sm text-gray-500 dark:text-gray-400">
+            Destructive and privileged agent actions need two different approvers before they run,
+            and the user who proposed the action cannot approve it (separation of duties, AC-5).
+            Suspect proposals still also need an admin acknowledgement.
+          </p>
+          {data?.updated_at ? (
+            <p className="mt-1 text-xs text-gray-400 dark:text-gray-500">
+              Last changed {formatTimestamp(data.updated_at)}
+            </p>
+          ) : null}
+        </div>
+        {isLoading ? (
+          <Loader2 className="w-5 h-5 animate-spin text-blue-500" />
+        ) : (
+          <label className="relative inline-flex items-center cursor-pointer shrink-0">
+            <input
+              type="checkbox"
+              aria-label="Require a second approver"
+              checked={enabled}
+              disabled={mutation.isPending}
+              onChange={(e) => mutation.mutate(e.target.checked)}
+              className="sr-only peer"
+            />
+            <div className="w-11 h-6 bg-gray-200 dark:bg-gray-700 peer-focus:ring-2 peer-focus:ring-blue-500 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600 peer-disabled:opacity-50"></div>
+          </label>
+        )}
+      </div>
+      {error ? (
+        <p className="text-sm text-red-600 dark:text-red-400 flex items-center gap-1">
+          <XCircle className="w-4 h-4" /> {error}
+        </p>
+      ) : null}
+    </div>
+  );
 }
 
 function AIProviderSettings() {

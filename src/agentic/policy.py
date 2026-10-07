@@ -27,23 +27,27 @@ import json
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional, Protocol, runtime_checkable
+from typing import Any, Literal, Optional, Protocol, runtime_checkable
 
 from src.agentic.context import ROLE_RANK, AgentContext, Mode, UserRole
 from src.agentic.decisions import Decision, DecisionKind, ReasonCode, TrustState, TrustTier
 from src.agentic.toolspec import ParamSpec, Target, Tier, ToolSpec
 from src.core.logging import get_logger
-from src.core.metrics import AGENT_POLICY_DECISIONS_TOTAL, increment as metric_increment
+from src.core.metrics import AGENT_POLICY_DECISIONS_TOTAL
+from src.core.metrics import increment as metric_increment
 from src.core.redact import redact
 
 logger = get_logger(__name__)
 
 __all__ = [
+    "AGENTIC_POLICY_SECTION",
     "ARGS_MAX_BYTES",
     "AUDIT_EVENT_POLICY",
     "AUDIT_EVENT_TOOL",
     "DOCUMENTATION_ONLY_TOOLS",
     "MAX_EFFECTIVE_TARGETS",
+    "SECOND_APPROVER_TIERS",
+    "ApprovalQuorum",
     "AuditSink",
     "OrgPolicySettings",
     "PolicyEngine",
@@ -53,6 +57,9 @@ __all__ = [
     "ToolRegistryProtocol",
     "audit_rows_fallback_counter",
     "canonical_json",
+    "evaluate_approval_quorum",
+    "load_org_policy_settings",
+    "org_policy_settings_from_section",
     "validate_args",
 ]
 
@@ -70,7 +77,7 @@ _RATE_LIMITED_TIERS: frozenset[Tier] = frozenset({Tier.WRITE, Tier.DESTRUCTIVE, 
 
 # Parameter names that carry an IP address and get the semantic IP validator.
 _IP_PARAM_NAMES: frozenset[str] = frozenset(
-    {"ip", "ip_address", "source_ip", "target_ip", "destination_ip", "src_ip", "dst_ip", "address"}
+    {"ip", "ip_address", "source_ip", "target_ip", "destination_ip", "src_ip", "dst_ip", "address"},
 )
 
 _JSON_TYPE_CHECKS: dict[str, Callable[[Any], bool]] = {
@@ -150,6 +157,110 @@ class OrgPolicySettings:
     # callable in autonomous mode even when absent from the allow-list, because
     # the allow-list enumerates *evidence* tools and the verdict is the exit.
     terminal_tools: frozenset[str] = frozenset({"submit_verdict"})
+    # Separation of duties (AC-5): when on, a destructive/privileged proposal
+    # needs two distinct approvers, neither of whom is the proposer. Off by
+    # default (a single-analyst SOC must still be able to act); an org admin
+    # opts in through ``PUT /settings/agentic-policy``.
+    require_second_approver: bool = False
+
+
+#: ``app_settings.section`` holding the org-admin-editable policy knobs.
+AGENTIC_POLICY_SECTION = "agentic_policy"
+
+#: Tiers that fall under ``require_second_approver``.
+SECOND_APPROVER_TIERS: frozenset[Tier] = frozenset({Tier.DESTRUCTIVE, Tier.PRIVILEGED})
+
+
+def org_policy_settings_from_section(value: Mapping[str, Any] | None, **overrides: Any) -> OrgPolicySettings:
+    """Build :class:`OrgPolicySettings` from a stored ``agentic_policy`` section.
+
+    Only keys an org admin may set are read; everything else keeps the safe
+    default. A non-boolean stored value is treated as unset (False), never
+    coerced from a truthy string.
+    """
+    raw = value.get("require_second_approver") if isinstance(value, Mapping) else None
+    return OrgPolicySettings(require_second_approver=raw is True, **overrides)
+
+
+async def load_org_policy_settings(session: Any, org_id: str, **overrides: Any) -> OrgPolicySettings:
+    """Read the org's ``agentic_policy`` section (organization-scoped) into settings.
+
+    Errors propagate: a caller gating an approval must not silently fall back
+    to the weaker single-approver default when the setting cannot be read.
+    """
+    from sqlalchemy import select
+
+    from src.models.settings import AppSetting
+
+    stmt = select(AppSetting.value).where(
+        AppSetting.organization_id == org_id,
+        AppSetting.section == AGENTIC_POLICY_SECTION,
+    )
+    stored = (await session.execute(stmt)).scalar_one_or_none()
+    return org_policy_settings_from_section(stored if isinstance(stored, dict) else None, **overrides)
+
+
+ApprovalOutcome = Literal["execute", "record_first", "deny"]
+
+
+@dataclass(frozen=True)
+class ApprovalQuorum:
+    """What an approve call may do given the org's separation-of-duties rule.
+
+    ``outcome``: ``execute`` (quorum met), ``record_first`` (store this as the
+    first of two approvals and leave the proposal pending) or ``deny``
+    (``reason_code`` is ``proposer_cannot_approve`` -> 403 or
+    ``second_approver_required`` -> 409).
+    """
+
+    outcome: ApprovalOutcome
+    requires_second_approver: bool
+    reason_code: Optional[str] = None
+    detail: Optional[str] = None
+
+
+def evaluate_approval_quorum(
+    settings: OrgPolicySettings,
+    *,
+    tier: Tier | None,
+    approver_user_id: Optional[str],
+    proposer_user_id: Optional[str],
+    first_approved_by: Optional[str],
+) -> ApprovalQuorum:
+    """Decide the separation-of-duties step of an approval (design v2 section 8).
+
+    Applies only when ``settings.require_second_approver`` is on and the tool
+    tier is destructive/privileged. The proposer never counts as an approver,
+    the same user can never supply both approvals, and an approver with no
+    user id (which cannot be told apart from anyone) is refused.
+    """
+    required = bool(settings.require_second_approver) and tier in SECOND_APPROVER_TIERS
+    if not required:
+        return ApprovalQuorum(outcome="execute", requires_second_approver=False)
+    if not approver_user_id:
+        return ApprovalQuorum(
+            outcome="deny",
+            requires_second_approver=True,
+            reason_code="proposer_cannot_approve",
+            detail="separation of duties requires an identified human approver",
+        )
+    if proposer_user_id and approver_user_id == proposer_user_id:
+        return ApprovalQuorum(
+            outcome="deny",
+            requires_second_approver=True,
+            reason_code="proposer_cannot_approve",
+            detail="the user who proposed this action cannot approve it (separation of duties)",
+        )
+    if not first_approved_by:
+        return ApprovalQuorum(outcome="record_first", requires_second_approver=True)
+    if first_approved_by == approver_user_id:
+        return ApprovalQuorum(
+            outcome="deny",
+            requires_second_approver=True,
+            reason_code="second_approver_required",
+            detail="you already gave the first approval; a different user must give the second",
+        )
+    return ApprovalQuorum(outcome="execute", requires_second_approver=True)
 
 
 def canonical_json(value: Any) -> str:
@@ -315,7 +426,7 @@ class PolicyEngine:
     # ------------------------------------------------------------------
 
     async def evaluate_tool(
-        self, ctx: AgentContext, tool: str, args: dict[str, Any], trust: TrustState, *, step: int = 0
+        self, ctx: AgentContext, tool: str, args: dict[str, Any], trust: TrustState, *, step: int = 0,
     ) -> Decision:
         """Look the tool up in the registry, then :meth:`evaluate`."""
         spec = self.registry.specs.get(tool)
@@ -334,7 +445,7 @@ class PolicyEngine:
         return await self.evaluate(ctx, spec, args, trust, step=step)
 
     async def evaluate(
-        self, ctx: AgentContext, spec: ToolSpec, args: dict[str, Any], trust: TrustState, *, step: int = 0
+        self, ctx: AgentContext, spec: ToolSpec, args: dict[str, Any], trust: TrustState, *, step: int = 0,
     ) -> Decision:
         """Run the eight checks in order; always ends with the pre-decision audit row."""
         decision = await self._evaluate_unaudited(ctx, spec, args, trust)
@@ -347,7 +458,7 @@ class PolicyEngine:
     # ------------------------------------------------------------------
 
     async def _evaluate_unaudited(
-        self, ctx: AgentContext, spec: ToolSpec, args: dict[str, Any], trust: TrustState
+        self, ctx: AgentContext, spec: ToolSpec, args: dict[str, Any], trust: TrustState,
     ) -> Decision:
         tool = spec.name
         tier = spec.tier
@@ -429,7 +540,7 @@ class PolicyEngine:
         if spec.effective_targets is not None:
             try:
                 targets = list(await spec.effective_targets(resolution.resolved_args, self.registry))
-            except Exception as exc:  # noqa: BLE001 - any failure to expand targets is a denial
+            except Exception as exc:
                 logger.warning("effective_targets_failed", tool=tool, error=str(exc))
                 return deny("invalid_target", f"could not expand targets: {exc.__class__.__name__}")
         elif tier in (Tier.DESTRUCTIVE, Tier.PRIVILEGED):
@@ -569,7 +680,7 @@ class PolicyEngine:
     # ------------------------------------------------------------------
 
     def _semantic_checks(
-        self, ctx: AgentContext, spec: ToolSpec, resolution: _RefResolution
+        self, ctx: AgentContext, spec: ToolSpec, resolution: _RefResolution,
     ) -> tuple[ReasonCode, str, Tier] | None:
         args = resolution.resolved_args
         for name, value in args.items():
@@ -644,12 +755,12 @@ class PolicyEngine:
                 if await self.limiter.try_acquire(ctx.org_id, tool):
                     return None
                 return f"per-organization rate limit for {tool} exceeded"
-            except Exception as exc:  # noqa: BLE001 - backend unavailable: fall through to fail-closed path
+            except Exception as exc:
                 logger.warning("tool_rate_limiter_unavailable", tool=tool, error=str(exc), organization_id=ctx.org_id)
         if self.rate_fallback_counter is not None:
             try:
                 recent = await self.rate_fallback_counter(ctx.org_id, tool, 60)
-            except Exception as exc:  # noqa: BLE001 - fallback also unavailable -> deny
+            except Exception as exc:
                 logger.error("tool_rate_fallback_unavailable", tool=tool, error=str(exc), organization_id=ctx.org_id)
                 return "rate-limit backend unavailable; write actions are denied (fail closed)"
             if recent >= self.settings.tool_rate_limit_per_minute:
@@ -696,7 +807,7 @@ class PolicyEngine:
                 request_id=ctx.run_id,
                 run_id=ctx.run_id,
             )
-        except Exception as exc:  # noqa: BLE001 - audit failure is a denial (fail closed)
+        except Exception as exc:
             logger.error("policy_audit_unavailable", tool=decision.tool, error=str(exc), run_id=ctx.run_id)
             return Decision(
                 kind="deny",

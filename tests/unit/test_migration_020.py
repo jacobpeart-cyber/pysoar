@@ -33,12 +33,12 @@ from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 # Every model module must be registered on Base.metadata before the pre-020
 # schema is derived from it.
-import src.agentic.models  # noqa: F401
-import src.agents.models  # noqa: F401
-import src.audit_evidence.models  # noqa: F401
-import src.intel.models  # noqa: F401
-import src.models  # noqa: F401
-import src.siem.models  # noqa: F401
+import src.agentic.models
+import src.agents.models
+import src.audit_evidence.models
+import src.intel.models
+import src.models
+import src.siem.models
 import src.tickethub.models  # noqa: F401
 from src.audit_evidence.models import AUDIT_CHAIN_FIELDS, AUDIT_GENESIS_HASH, audit_row_hash
 from src.core.config import settings
@@ -66,7 +66,7 @@ def _real_alembic() -> tuple[ModuleType, ModuleType, ModuleType]:
     site = sysconfig.get_paths()["purelib"]
     current = sys.modules.get("alembic")
     if current is not None and getattr(current, "__file__", "") and str(Path(current.__file__).parent) == str(
-        Path(site) / "alembic"
+        Path(site) / "alembic",
     ):
         import alembic.command
         import alembic.config
@@ -122,7 +122,7 @@ def _in_thread(fn: Callable[[], Any]) -> Any:
     def _target() -> None:
         try:
             box["result"] = fn()
-        except BaseException as exc:  # noqa: BLE001 - re-raised on the caller thread
+        except BaseException as exc:
             box["error"] = exc
 
     thread = threading.Thread(target=_target, name="alembic-runner")
@@ -199,7 +199,8 @@ def fixture_db(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, master_key: str)
     return {"path": db_path, "cfg": cfg, "url": _sync_url(db_path), "key": master_key}
 
 
-def _upgrade(db: dict[str, Any], target: str = "head") -> None:
+def _upgrade(db: dict[str, Any], target: str = "020") -> None:
+    # Pinned to 020: later revisions (021+) have their own round-trip tests.
     _, command, _ = _real_alembic()
     _in_thread(lambda: command.upgrade(db["cfg"], target))
 
@@ -265,7 +266,7 @@ def _insert_setting(conn: sa.Connection, section: str, value: Any, org: str | No
     conn.execute(
         sa.text(
             "INSERT INTO app_settings (id, organization_id, section, value, created_at, updated_at) "
-            "VALUES (:id, :org, :section, :value, :now, :now)"
+            "VALUES (:id, :org, :section, :value, :now, :now)",
         ),
         {"id": row_id, "org": org, "section": section, "value": json.dumps(value), "now": now},
     )
@@ -285,11 +286,13 @@ def _read_setting(conn: sa.Connection, row_id: str, with_backup: bool = True) ->
 # ---------------------------------------------------------------------------
 
 
-def test_revision_020_is_head_and_revises_019(tmp_path: Path) -> None:
+def test_revision_020_is_on_the_head_lineage_and_revises_019(tmp_path: Path) -> None:
     _, _, script = _real_alembic()
     cfg = _alembic_config(tmp_path / "unused.db")
     directory = script.ScriptDirectory.from_config(cfg)
-    assert directory.get_current_head() == "020"
+    head = directory.get_current_head()
+    # 020 stays on the linear history to head (later revisions build on it).
+    assert "020" in {r.revision for r in directory.walk_revisions("base", head)}
     rev = directory.get_revision("020")
     assert rev is not None and rev.down_revision == "019"
     assert migration.revision == "020" and migration.down_revision == "019"
@@ -355,7 +358,7 @@ def test_upgrade_head_then_downgrade_restores_pre020_schema(fixture_db: dict[str
 
 
 def test_missing_master_key_hard_fails_before_any_change(
-    fixture_db: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    fixture_db: dict[str, Any], monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     with _engine(fixture_db).begin() as conn:
         row_id = _insert_setting(conn, "integration:virustotal", {"api_key": "vt-plain", "enabled": True})
@@ -591,7 +594,7 @@ def test_audit_chain_backfilled_per_org_and_verifiable(fixture_db: dict[str, Any
     with _engine(fixture_db).connect() as conn:
         for org_id, expected_ids in ((ids["org_a"], a_ids), (ids["org_b"], b_ids)):
             rows = conn.execute(
-                sa.select(table).where(table.c.organization_id == org_id).order_by(table.c.created_at, table.c.id)
+                sa.select(table).where(table.c.organization_id == org_id).order_by(table.c.created_at, table.c.id),
             ).mappings().all()
             assert [r["id"] for r in rows] == expected_ids, "chained in (created_at, id) order"
             prev = AUDIT_GENESIS_HASH

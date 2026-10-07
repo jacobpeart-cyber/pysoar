@@ -40,17 +40,22 @@ from src.agentic.models import (
     AgentChatSession,
     AgentMemory,
     Investigation,
-    InvestigationFeedback as InvestigationFeedbackRow,
     InvestigationStatus,
     SOCAgent,
+)
+from src.agentic.models import (
+    InvestigationFeedback as InvestigationFeedbackRow,
 )
 from src.agentic.policy import (
     AUDIT_EVENT_POLICY,
     AUDIT_EVENT_TOOL,
+    SECOND_APPROVER_TIERS,
     OrgPolicySettings,
     PolicyEngine,
     audit_rows_fallback_counter,
     canonical_json,
+    evaluate_approval_quorum,
+    load_org_policy_settings,
 )
 from src.agentic.runtime import (
     AdmissionDenied,
@@ -73,8 +78,10 @@ from src.agentic.trust import (
 from src.api.deps import CurrentUser, DatabaseSession, RedisClient
 from src.audit_evidence.engine import AuditLogger
 from src.audit_evidence.models import AuditTrail
-from src.core.metrics import AGENT_INJECTION_EVENTS_TOTAL, increment as metric_increment
+from src.core.metrics import AGENT_INJECTION_EVENTS_TOTAL
+from src.core.metrics import increment as metric_increment
 from src.core.utils import safe_json_loads
+from src.llm import factory as llm_factory
 from src.llm.base import (
     LLMNotConfigured,
     LLMQuotaExceeded,
@@ -83,7 +90,6 @@ from src.llm.base import (
     Usage,
 )
 from src.llm.calllog import LLMCallLogWriter, price_call
-from src.llm import factory as llm_factory
 from src.llm.models import LLMCallLog, LLMUsageDaily, actor_key_for
 from src.llm.quota import CircuitOpen, QuotaBackendUnavailable, TokenQuota
 from src.schemas.agentic import (
@@ -619,7 +625,7 @@ async def list_agents(
 ):
     """List SOC agents with filtering and pagination"""
     query = select(SOCAgent).where(
-        SOCAgent.organization_id == getattr(current_user, "organization_id", None)
+        SOCAgent.organization_id == getattr(current_user, "organization_id", None),
     )
 
     if agent_type:
@@ -630,7 +636,7 @@ async def list_agents(
 
     # Get total
     count_result = await db.execute(
-        select(func.count()).select_from(query.subquery())
+        select(func.count()).select_from(query.subquery()),
     )
     total = count_result.scalar() or 0
 
@@ -812,7 +818,7 @@ async def list_investigations(
 ):
     """List investigations with filtering and pagination"""
     query = select(Investigation).where(
-        Investigation.organization_id == getattr(current_user, "organization_id", None)
+        Investigation.organization_id == getattr(current_user, "organization_id", None),
     )
 
     if agent_id:
@@ -826,7 +832,7 @@ async def list_investigations(
 
     # Get total
     count_result = await db.execute(
-        select(func.count()).select_from(query.subquery())
+        select(func.count()).select_from(query.subquery()),
     )
     total = count_result.scalar() or 0
 
@@ -980,7 +986,7 @@ async def get_reasoning_chain(
     result = await db.execute(
         select(Investigation)
         .options(selectinload(Investigation.reasoning_steps))
-        .where(Investigation.id == investigation_id)
+        .where(Investigation.id == investigation_id),
     )
     investigation = result.scalar_one_or_none()
 
@@ -1144,7 +1150,7 @@ async def list_investigation_feedback(
     rows = list(await db.scalars(
         select(InvestigationFeedbackRow)
         .where(InvestigationFeedbackRow.investigation_id == investigation_id)
-        .order_by(InvestigationFeedbackRow.created_at.desc())
+        .order_by(InvestigationFeedbackRow.created_at.desc()),
     ))
     return {
         "items": [
@@ -1195,7 +1201,7 @@ async def list_pending_approvals(
         AgentAction.execution_status == ActionExecutionStatus.PENDING_APPROVAL.value,
     )
     total = (await db.execute(
-        select(func.count()).select_from(select(AgentAction).where(pending).subquery())
+        select(func.count()).select_from(select(AgentAction).where(pending).subquery()),
     )).scalar() or 0
 
     rows = (await db.execute(
@@ -1212,8 +1218,20 @@ async def list_pending_approvals(
         .where(pending)
         .order_by(AgentAction.created_at.desc())
         .offset((page - 1) * size)
-        .limit(size)
+        .limit(size),
     )).all()
+
+    # Separation of duties (AC-5): flag rows whose tool tier falls under the
+    # org's require_second_approver rule so the card can show "1 of 2".
+    org_policy = await load_org_policy_settings(db, org_id)
+    tool_tiers: dict[str, Tier] = {}
+    if org_policy.require_second_approver and rows:
+        tool_tiers = {name: spec.tier for name, spec in AgentToolRegistry(db, ctx).specs.items()}
+
+    def _needs_second(action: AgentAction) -> bool:
+        if not org_policy.require_second_approver or not action.tool_name:
+            return False
+        return tool_tiers.get(action.tool_name) in SECOND_APPROVER_TIERS
 
     items = [
         ActionPendingApproval(
@@ -1240,6 +1258,9 @@ async def list_pending_approvals(
             run_id=action.run_id,
             requires_approval=bool(action.requires_approval),
             execution_status=action.execution_status,
+            requires_second_approver=_needs_second(action),
+            first_approved_by=action.first_approved_by,
+            first_approved_at=action.first_approved_at,
         )
         for action, inv, agent in rows
     ]
@@ -1268,6 +1289,10 @@ def _conflict(error: str, detail: str, **extra: Any) -> HTTPException:
     return HTTPException(status_code=status.HTTP_409_CONFLICT, detail=payload)
 
 
+def _risk_level_for_tier(tier: Tier) -> str:
+    return "critical" if tier is Tier.PRIVILEGED else "high"
+
+
 def _expired(action: AgentAction) -> bool:
     expires_at = getattr(action, "expires_at", None)
     if expires_at is None:
@@ -1294,13 +1319,23 @@ async def approve_action(
     tier, and executed through ``AgentToolRegistry.call`` with the approver
     as the actor. Both audit events (pre-decision + post-execution) are
     written by the same code the chat runtime uses.
+
+    Separation of duties (AC-5): when the organization enables
+    ``require_second_approver`` (``PUT /settings/agentic-policy``), a
+    destructive/privileged proposal needs two distinct approvers. The first
+    approval (hash-bound like any other) is recorded and audited and the
+    proposal stays pending (``status: awaiting_second_approval``); the second,
+    by a different user, executes it. The proposer is refused with 403
+    ``proposer_cannot_approve``; the first approver approving again gets 409
+    ``second_approver_required``. Suspect proposals keep the admin + reason
+    rule on each approval.
     """
     ctx_probe = _agent_context(current_user, Mode.APPROVAL, request=request)
     _require_analyst(ctx_probe)
     org_id = ctx_probe.org_id
 
     action = (await db.execute(
-        select(AgentAction).where(AgentAction.id == action_id, AgentAction.organization_id == org_id)
+        select(AgentAction).where(AgentAction.id == action_id, AgentAction.organization_id == org_id),
     )).scalar_one_or_none()
     if action is None:
         raise HTTPException(
@@ -1364,7 +1399,7 @@ async def approve_action(
         raise _conflict("approval_stale", "the approval does not match the proposal's bound arguments or evidence")
     if tool_name:
         recomputed = hashlib.sha256(
-            canonical_json({"tool": tool_name, "args": params}).encode("utf-8")
+            canonical_json({"tool": tool_name, "args": params}).encode("utf-8"),
         ).hexdigest()
         if recomputed != stored_params_sha:
             raise _conflict("approval_stale", "the stored arguments no longer hash to the proposal binding")
@@ -1423,7 +1458,7 @@ async def approve_action(
                 "executed": False,
                 "note": "approved as human work: this proposal carries no executable tool",
                 "target": action.target,
-            }
+            },
         )
         await db.commit()
         return {
@@ -1465,6 +1500,128 @@ async def approve_action(
             detail={"error": "role_not_permitted", "detail": "privileged actions require an admin approver"},
         )
 
+    # -- separation of duties (AC-5): require_second_approver --------------
+    org_policy = await load_org_policy_settings(db, org_id)
+    quorum = evaluate_approval_quorum(
+        org_policy,
+        tier=spec.tier,
+        approver_user_id=ctx.actor_user_id,
+        proposer_user_id=getattr(action, "proposed_by_user_id", None),
+        first_approved_by=getattr(action, "first_approved_by", None),
+    )
+    if quorum.outcome == "deny":
+        audit = AuditLogger(db, org_id)
+        await audit.log_event(
+            event_type=AUDIT_EVENT_POLICY,
+            action="action.approval_refused",
+            actor_type="user",
+            actor_id=ctx.actor_user_id or "unknown",
+            resource_type="agent_action",
+            resource_id=action.id,
+            description=f"approval refused ({quorum.reason_code}): {tool_name}",
+            new_value={
+                "tool": tool_name,
+                "tier": spec.tier.value,
+                "reason_code": quorum.reason_code,
+                "proposed_by_user_id": getattr(action, "proposed_by_user_id", None),
+                "first_approved_by": getattr(action, "first_approved_by", None),
+                "approver_role": approver_role,
+            },
+            result="denied",
+            risk_level="medium",
+            actor_ip=approver_ip,
+            request_id=action.run_id,
+            run_id=action.run_id,
+        )
+        await db.commit()
+        logger.warning(
+            "agent_action_approval_refused",
+            action_id=action.id,
+            organization_id=org_id,
+            reason_code=quorum.reason_code,
+            tool=tool_name,
+        )
+        error_body: dict[str, Any] = {"error": quorum.reason_code, "detail": quorum.detail}
+        if quorum.reason_code == "proposer_cannot_approve":
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=error_body)
+        error_body["first_approved_by"] = getattr(action, "first_approved_by", None)
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=error_body)
+
+    if quorum.outcome == "record_first":
+        action.first_approved_by = ctx.actor_user_id
+        action.first_approved_at = now
+        action.first_approver_role = approver_role
+        audit = AuditLogger(db, org_id)
+        await audit.log_event(
+            event_type=AUDIT_EVENT_POLICY,
+            action="action.first_approval",
+            actor_type="user",
+            actor_id=ctx.actor_user_id or "unknown",
+            resource_type="agent_action",
+            resource_id=action.id,
+            description=f"first of two approvals recorded: {tool_name}",
+            new_value={
+                "tool": tool_name,
+                "tier": spec.tier.value,
+                "params_sha256": stored_params_sha,
+                "evidence_sha256": stored_evidence_sha,
+                "approver_role": approver_role,
+                "reason": (approval.reason or approval.approval_notes or "")[:500],
+                "approvals_required": 2,
+            },
+            result="success",
+            risk_level=_risk_level_for_tier(spec.tier),
+            actor_ip=approver_ip,
+            request_id=action.run_id,
+            run_id=action.run_id,
+        )
+        await db.commit()
+        logger.info(
+            "agent_action_first_approval",
+            action_id=action.id,
+            organization_id=org_id,
+            tool=tool_name,
+            approver_role=approver_role,
+        )
+        return {
+            "status": "awaiting_second_approval",
+            "action_id": action_id,
+            "executed": False,
+            "tool": tool_name,
+            "execution_status": action.execution_status,
+            "approvals_required": 2,
+            "approvals_received": 1,
+            "first_approved_by": action.first_approved_by,
+            "first_approved_at": now.isoformat(),
+        }
+
+    if quorum.requires_second_approver:
+        audit = AuditLogger(db, org_id)
+        await audit.log_event(
+            event_type=AUDIT_EVENT_POLICY,
+            action="action.second_approval",
+            actor_type="user",
+            actor_id=ctx.actor_user_id or "unknown",
+            resource_type="agent_action",
+            resource_id=action.id,
+            description=f"second approval recorded; executing: {tool_name}",
+            new_value={
+                "tool": tool_name,
+                "tier": spec.tier.value,
+                "params_sha256": stored_params_sha,
+                "evidence_sha256": stored_evidence_sha,
+                "approver_role": approver_role,
+                "first_approved_by": action.first_approved_by,
+                "first_approver_role": action.first_approver_role,
+                "reason": (approval.reason or approval.approval_notes or "")[:500],
+            },
+            result="success",
+            risk_level=_risk_level_for_tier(spec.tier),
+            actor_ip=approver_ip,
+            request_id=action.run_id,
+            run_id=action.run_id,
+        )
+
     action.approved_by = ctx.actor_user_id
     action.approval_timestamp = now.isoformat()
     if hasattr(action, "approver_role"):
@@ -1504,7 +1661,7 @@ async def approve_action(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={"error": "policy_denied", "reason_code": str(exc), "detail": "the tool refused the approved call"},
         ) from exc
-    except Exception as exc:  # noqa: BLE001 - the failure class is recorded, never the secrets
+    except Exception as exc:
         error_class = exc.__class__.__name__
         logger.error("approved_action_failed", action_id=action.id, tool=tool_name, error_class=error_class)
         await runtime.runner._audit_post(state, tool_name, "failed", started, error_class=error_class)
@@ -1549,6 +1706,8 @@ async def approve_action(
         "rollback_available": action.rollback_available,
         "result": payload,
         "run_id": action.run_id,
+        "approvals_required": 2 if quorum.requires_second_approver else 1,
+        "first_approved_by": action.first_approved_by if quorum.requires_second_approver else None,
     }
 
 
@@ -1581,7 +1740,7 @@ async def rollback_action(
     org_id = ctx.org_id
 
     action = (await db.execute(
-        select(AgentAction).where(AgentAction.id == action_id, AgentAction.organization_id == org_id)
+        select(AgentAction).where(AgentAction.id == action_id, AgentAction.organization_id == org_id),
     )).scalar_one_or_none()
     if action is None:
         raise HTTPException(
@@ -1630,8 +1789,8 @@ async def rollback_action(
     if ioc_id:
         ioc = (await db.execute(
             select(ThreatIndicator).where(
-                ThreatIndicator.id == str(ioc_id), ThreatIndicator.organization_id == org_id
-            )
+                ThreatIndicator.id == str(ioc_id), ThreatIndicator.organization_id == org_id,
+            ),
         )).scalar_one_or_none()
         if ioc is None:
             problems.append(f"threat indicator {ioc_id} is no longer present in this organization")
@@ -1642,7 +1801,7 @@ async def rollback_action(
     user_id = recorded.get("user_id")
     if user_id:
         user = (await db.execute(
-            select(User).where(User.id == str(user_id), User.organization_id == org_id)
+            select(User).where(User.id == str(user_id), User.organization_id == org_id),
         )).scalar_one_or_none()
         if user is None:
             problems.append(f"user {user_id} is no longer present in this organization")
@@ -1653,11 +1812,11 @@ async def rollback_action(
     commands = recorded.get("agent_commands")
     if isinstance(commands, list) and commands:
         inverse = {"block_ip": "unblock_ip", "isolate_host": "release_host"}.get(
-            str(getattr(action, "tool_name", "") or action.action_type or "")
+            str(getattr(action, "tool_name", "") or action.action_type or ""),
         )
         if inverse is None:
             problems.append(
-                f"no inverse endpoint command is defined for {getattr(action, 'tool_name', None) or action.action_type}"
+                f"no inverse endpoint command is defined for {getattr(action, 'tool_name', None) or action.action_type}",
             )
         else:
             svc = AgentService(db)
@@ -1669,7 +1828,7 @@ async def rollback_action(
                     select(EndpointAgent).where(
                         EndpointAgent.id == str(entry["agent_id"]),
                         EndpointAgent.organization_id == org_id,
-                    )
+                    ),
                 )).scalar_one_or_none()
                 if agent is None:
                     problems.append(f"endpoint agent {entry.get('agent_id')} not found; cannot queue {inverse}")
@@ -1793,7 +1952,7 @@ async def execute_agent_tool(
         )
 
     ctx = _agent_context(
-        current_user, Mode.INTERACTIVE, propose_actions=propose_actions, request=request
+        current_user, Mode.INTERACTIVE, propose_actions=propose_actions, request=request,
     )
     return await guarded_tool_call(
         db, ctx, redis, tool_name, params,
@@ -1905,7 +2064,7 @@ async def guarded_tool_call(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={"error": "policy_denied", "reason_code": str(exc), "detail": f"{tool_name} was denied"},
         ) from exc
-    except Exception as exc:  # noqa: BLE001 - the failure class is recorded, never its secrets
+    except Exception as exc:
         error_class = exc.__class__.__name__
         logger.error(
             "guarded_tool_failed",
@@ -1922,7 +2081,7 @@ async def guarded_tool_call(
     await runtime.runner._audit_post(
         state, tool_name, "executed", started,
         extra={"result_sha256": hashlib.sha256(
-            json.dumps(payload, default=str, sort_keys=True).encode("utf-8")
+            json.dumps(payload, default=str, sort_keys=True).encode("utf-8"),
         ).hexdigest()},
     )
     await db.commit()
@@ -1945,7 +2104,7 @@ async def _chat_history(db: AsyncSession, session_id: str) -> list[Message]:
         select(AgentChatMessage)
         .where(AgentChatMessage.session_id == session_id)
         .order_by(AgentChatMessage.created_at.desc(), AgentChatMessage.id.desc())
-        .limit(CHAT_HISTORY_TURNS)
+        .limit(CHAT_HISTORY_TURNS),
     )).scalars().all()
     history: list[Message] = []
     for row in reversed(list(rows)):
@@ -1984,7 +2143,7 @@ async def _proposal_investigation(
             Investigation.trigger_type == trigger_type,
             Investigation.trigger_source_id == source_id,
         )
-        .limit(1)
+        .limit(1),
     )).scalars().first()
     if existing is not None:
         return existing
@@ -1995,7 +2154,7 @@ async def _proposal_investigation(
             select(SOCAgent)
             .where(SOCAgent.organization_id == org_id)
             .order_by(SOCAgent.created_at.asc())
-            .limit(1)
+            .limit(1),
         )).scalars().first()
     if host is None:
         return None
@@ -2029,7 +2188,7 @@ def _proposals_unavailable() -> HTTPException:
 
 
 async def _mark_message_failed(
-    db: AsyncSession, message: AgentChatMessage, run_id: str, error: str, detail: str
+    db: AsyncSession, message: AgentChatMessage, run_id: str, error: str, detail: str,
 ) -> None:
     """Record the failure on the user's turn so the UI can offer a retry."""
     message.tool_calls = {
@@ -2040,7 +2199,7 @@ async def _mark_message_failed(
     }
     try:
         await db.commit()
-    except Exception as exc:  # noqa: BLE001 - the original failure is the one the caller sees
+    except Exception as exc:
         logger.error("chat_failure_persist_failed", run_id=run_id, error=str(exc)[:300])
         await db.rollback()
 
@@ -2050,7 +2209,7 @@ async def _settle_reservation(quota: Any, reservation: Any, tokens: int) -> None
         return
     try:
         await quota.settle(reservation, tokens)
-    except Exception as exc:  # noqa: BLE001 - accounting must never fail the request
+    except Exception as exc:
         logger.warning("llm_quota_settle_failed", error=str(exc)[:200])
 
 
@@ -2092,7 +2251,7 @@ async def chat_with_agent(
                 AgentChatSession.id == query_data.session_id,
                 AgentChatSession.organization_id == org_id,
                 AgentChatSession.user_id == user_id,
-            )
+            ),
         )).scalar_one_or_none()
         if session is None:
             raise HTTPException(
@@ -2113,8 +2272,8 @@ async def chat_with_agent(
     if query_data.agent_id:
         agent = (await db.execute(
             select(SOCAgent).where(
-                SOCAgent.id == query_data.agent_id, SOCAgent.organization_id == org_id
-            )
+                SOCAgent.id == query_data.agent_id, SOCAgent.organization_id == org_id,
+            ),
         )).scalar_one_or_none()
         if agent is None:
             raise HTTPException(
@@ -2321,7 +2480,7 @@ async def list_chat_messages(
     """List messages in a chat session (oldest first so rendering is straight-forward)."""
     user_id = getattr(current_user, "id", None)
     session = (await db.execute(
-        select(AgentChatSession).where(AgentChatSession.id == session_id)
+        select(AgentChatSession).where(AgentChatSession.id == session_id),
     )).scalar_one_or_none()
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -2331,7 +2490,7 @@ async def list_chat_messages(
         select(AgentChatMessage)
         .where(AgentChatMessage.session_id == session_id)
         .order_by(AgentChatMessage.created_at.asc())
-        .limit(limit)
+        .limit(limit),
     )).scalars().all()
     items = []
     for m in rows:
@@ -2356,7 +2515,7 @@ async def delete_chat_session(
     """Delete a chat session and all its messages."""
     user_id = getattr(current_user, "id", None)
     session = (await db.execute(
-        select(AgentChatSession).where(AgentChatSession.id == session_id)
+        select(AgentChatSession).where(AgentChatSession.id == session_id),
     )).scalar_one_or_none()
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -2430,14 +2589,14 @@ async def get_dashboard_metrics(
     """Get SOC dashboard metrics"""
     # Count agents
     agent_query = select(func.count()).select_from(SOCAgent).where(
-        SOCAgent.organization_id == getattr(current_user, "organization_id", None)
+        SOCAgent.organization_id == getattr(current_user, "organization_id", None),
     )
     agent_result = await db.execute(agent_query)
     total_agents = agent_result.scalar() or 0
 
     # Count investigations
     inv_query = select(func.count()).select_from(Investigation).where(
-        Investigation.organization_id == getattr(current_user, "organization_id", None)
+        Investigation.organization_id == getattr(current_user, "organization_id", None),
     )
     inv_result = await db.execute(inv_query)
     total_investigations = inv_result.scalar() or 0
@@ -2524,7 +2683,7 @@ async def get_investigation_metrics(
 
     # Total investigations
     total_result = await db.execute(
-        select(func.count()).select_from(Investigation).where(base_filter)
+        select(func.count()).select_from(Investigation).where(base_filter),
     )
     total = total_result.scalar() or 0
 
@@ -2532,7 +2691,7 @@ async def get_investigation_metrics(
     status_result = await db.execute(
         select(Investigation.status, func.count())
         .where(base_filter)
-        .group_by(Investigation.status)
+        .group_by(Investigation.status),
     )
     by_status = {row[0]: row[1] for row in status_result.all()}
 
@@ -2540,7 +2699,7 @@ async def get_investigation_metrics(
     resolution_result = await db.execute(
         select(Investigation.resolution_type, func.count())
         .where(base_filter, Investigation.resolution_type.isnot(None))
-        .group_by(Investigation.resolution_type)
+        .group_by(Investigation.resolution_type),
     )
     by_resolution = {row[0]: row[1] for row in resolution_result.all()}
 
@@ -2548,15 +2707,15 @@ async def get_investigation_metrics(
     priority_result = await db.execute(
         select(Investigation.priority, func.count())
         .where(base_filter)
-        .group_by(Investigation.priority)
+        .group_by(Investigation.priority),
     )
     by_priority = {row[0]: row[1] for row in priority_result.all()}
 
     # Average confidence score
     avg_conf_result = await db.execute(
         select(func.avg(Investigation.confidence_score)).where(
-            base_filter, Investigation.confidence_score.isnot(None)
-        )
+            base_filter, Investigation.confidence_score.isnot(None),
+        ),
     )
     avg_confidence = avg_conf_result.scalar() or 0.0
 
@@ -2565,7 +2724,7 @@ async def get_investigation_metrics(
         select(func.avg(SOCAgent.avg_resolution_time_minutes)).where(
             SOCAgent.organization_id == org_id,
             SOCAgent.total_investigations > 0,
-        )
+        ),
     )
     avg_resolution_time = avg_time_result.scalar() or 0.0
 
@@ -2590,7 +2749,7 @@ async def get_accuracy_stats(
 
     # Total investigations
     total_result = await db.execute(
-        select(func.count()).select_from(Investigation).where(base_filter)
+        select(func.count()).select_from(Investigation).where(base_filter),
     )
     total = total_result.scalar() or 0
 
@@ -2598,7 +2757,7 @@ async def get_accuracy_stats(
     resolution_result = await db.execute(
         select(Investigation.resolution_type, func.count())
         .where(base_filter, Investigation.resolution_type.isnot(None))
-        .group_by(Investigation.resolution_type)
+        .group_by(Investigation.resolution_type),
     )
     resolution_counts = {row[0]: row[1] for row in resolution_result.all()}
 
@@ -2660,12 +2819,13 @@ async def start_threat_hunt(
     "apt", "ransomware", "default") filter which sources are queried.
     """
     import time
-    from src.models.alert import Alert
-    from src.itdr.models import IdentityThreat
+
     from src.darkweb.models import CredentialLeak
+    from src.itdr.models import IdentityThreat
+    from src.models.alert import Alert
     try:
         from src.hunting.models import HuntFinding
-    except Exception:  # noqa: BLE001
+    except Exception:
         HuntFinding = None
 
     org_id = getattr(current_user, "organization_id", None)
@@ -2675,7 +2835,7 @@ async def start_threat_hunt(
     agent_id = hunt_request.agent_id
     if not agent_id:
         result = await db.execute(
-            select(SOCAgent).where(SOCAgent.organization_id == org_id)
+            select(SOCAgent).where(SOCAgent.organization_id == org_id),
         )
         agent = result.scalars().first()
         if not agent:
@@ -2705,7 +2865,7 @@ async def start_threat_hunt(
                 Alert.organization_id == org_id,
                 Alert.severity.in_(["critical", "high"]),
                 Alert.status.in_(["new", "investigating"]),
-            )
+            ),
         )
         alerts = list((await db.execute(alert_query)).scalars().all())
         reasoning_chain.append({
@@ -2727,7 +2887,7 @@ async def start_threat_hunt(
             and_(
                 IdentityThreat.organization_id == org_id,
                 IdentityThreat.status.in_(["detected", "investigating"]),
-            )
+            ),
         )
         threats = list((await db.execute(id_query)).scalars().all())
         reasoning_chain.append({
@@ -2744,7 +2904,7 @@ async def start_threat_hunt(
             and_(
                 CredentialLeak.organization_id == org_id,
                 CredentialLeak.is_remediated == False,  # noqa: E712
-            )
+            ),
         )
         creds = list((await db.execute(cred_query)).scalars().all())
         reasoning_chain.append({
@@ -2772,7 +2932,7 @@ async def start_threat_hunt(
                     and_(
                         HuntFinding.severity.in_(["critical", "high"]),
                         HuntSession.created_by.in_(org_user_subq),
-                    )
+                    ),
                 )
             )
             hfs = list((await db.execute(hf_query)).scalars().all())
@@ -2783,7 +2943,7 @@ async def start_threat_hunt(
             })
             indicators_found += len(hfs)
             high_confidence_findings += sum(1 for h in hfs if h.severity == "critical")
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning(f"HuntFinding scan failed: {exc}")
 
     # Confidence: scale by how many sources returned hits
@@ -2832,7 +2992,7 @@ async def start_threat_hunt(
     logger.info(
         f"Threat hunt completed: profile={profile} agent={agent_id} "
         f"indicators={indicators_found} high_conf={high_confidence_findings} "
-        f"elapsed_min={elapsed:.2f}"
+        f"elapsed_min={elapsed:.2f}",
     )
 
     return ThreatHuntResult(
@@ -2878,7 +3038,7 @@ async def list_agent_memory(
 
     # Get total
     count_result = await db.execute(
-        select(func.count()).select_from(query.subquery())
+        select(func.count()).select_from(query.subquery()),
     )
     total = count_result.scalar() or 0
 
@@ -2989,7 +3149,7 @@ EVIDENCE_EXPORT_CONTROLS: tuple[str, ...] = ("AC-3", "AC-6(1)", "AU-2", "AU-3", 
 
 
 def _scope_organization(
-    current_user: Any, ctx: AgentContext, organization_id: Optional[str], all_orgs: bool
+    current_user: Any, ctx: AgentContext, organization_id: Optional[str], all_orgs: bool,
 ) -> Optional[str]:
     """The organization a read surface answers for; ``None`` means every org.
 
@@ -3158,7 +3318,7 @@ async def acknowledge_injection(
             select(AgentChatSession).where(
                 AgentChatSession.id == body.session_id,
                 AgentChatSession.organization_id == org_id,
-            )
+            ),
         )).scalar_one_or_none()
         if session_row is None:
             raise HTTPException(
@@ -3170,7 +3330,7 @@ async def acknowledge_injection(
             select(Investigation).where(
                 Investigation.id == body.investigation_id,
                 Investigation.organization_id == org_id,
-            )
+            ),
         )).scalar_one_or_none()
         if investigation is None:
             raise HTTPException(
@@ -3285,28 +3445,28 @@ async def get_run_timeline(
             or_(AuditTrail.run_id == run_id, AuditTrail.request_id == run_id),
         )
         .order_by(AuditTrail.created_at.asc(), AuditTrail.id.asc())
-        .limit(RUN_TIMELINE_LIMIT)
+        .limit(RUN_TIMELINE_LIMIT),
     )).scalars().all()
 
     call_rows = (await db.execute(
         select(LLMCallLog)
         .where(LLMCallLog.organization_id == org_id, LLMCallLog.run_id == run_id)
         .order_by(LLMCallLog.created_at.asc())
-        .limit(RUN_TIMELINE_LIMIT)
+        .limit(RUN_TIMELINE_LIMIT),
     )).scalars().all()
 
     action_rows = (await db.execute(
         select(AgentAction)
         .where(AgentAction.organization_id == org_id, AgentAction.run_id == run_id)
         .order_by(AgentAction.created_at.asc())
-        .limit(RUN_TIMELINE_LIMIT)
+        .limit(RUN_TIMELINE_LIMIT),
     )).scalars().all()
 
     transcript = (await db.execute(
         select(AgentRunTranscript).where(
             AgentRunTranscript.organization_id == org_id,
             AgentRunTranscript.run_id == run_id,
-        )
+        ),
     )).scalars().first()
 
     # ``agent_chat_messages`` has no run_id column: the assistant turn carries
@@ -3322,7 +3482,7 @@ async def get_run_timeline(
             func.cast(AgentChatMessage.tool_calls, String).like(f"%{run_id}%"),
         )
         .order_by(AgentChatMessage.created_at.asc())
-        .limit(RUN_TIMELINE_LIMIT)
+        .limit(RUN_TIMELINE_LIMIT),
     )).scalars().all()
     messages = [
         {
@@ -3532,9 +3692,9 @@ async def get_agent_usage(
                 name: {"used": item.used, "cap": item.cap, "remaining": item.remaining}
                 for name, item in usage.items()
             }
-        except Exception as exc:  # noqa: BLE001 - an unreachable budget is reported as null
+        except Exception as exc:
             logger.warning(
-                "agent_usage_budget_unavailable", organization_id=scope_org, error=str(exc)[:200]
+                "agent_usage_budget_unavailable", organization_id=scope_org, error=str(exc)[:200],
             )
             budget = None
 
@@ -3567,7 +3727,7 @@ async def list_policy_events(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     decision: Optional[str] = Query(
-        None, description="allow | deny | propose | executed | failed | blocked | proposed"
+        None, description="allow | deny | propose | executed | failed | blocked | proposed",
     ),
     reason_code: Optional[str] = Query(None, max_length=64),
     tool: Optional[str] = Query(None, max_length=100),
@@ -3602,7 +3762,7 @@ async def list_policy_events(
         filters.append(AuditTrail.created_at >= since)
     if reason_code:
         filters.append(
-            func.cast(AuditTrail.new_value, String).like(f'%"reason_code": "{reason_code}"%')
+            func.cast(AuditTrail.new_value, String).like(f'%"reason_code": "{reason_code}"%'),
         )
 
     base = select(AuditTrail).where(*filters)
@@ -3610,7 +3770,7 @@ async def list_policy_events(
     rows = (await db.execute(
         base.order_by(AuditTrail.created_at.desc(), AuditTrail.id.desc())
         .offset((page - 1) * size)
-        .limit(size)
+        .limit(size),
     )).scalars().all()
 
     return {
@@ -3669,7 +3829,7 @@ def _evidence_csv(rows: list[dict[str, Any]]) -> Iterator[str]:
 
 
 async def _evidence_rows(
-    db: AsyncSession, *, scope_org: Optional[str], start: datetime, end: datetime
+    db: AsyncSession, *, scope_org: Optional[str], start: datetime, end: datetime,
 ) -> tuple[list[dict[str, Any]], bool]:
     """One row per tool decision, joining audit + call log + proposal."""
     filters = [
@@ -3683,7 +3843,7 @@ async def _evidence_rows(
         select(AuditTrail)
         .where(*filters)
         .order_by(AuditTrail.created_at.asc(), AuditTrail.id.asc())
-        .limit(EVIDENCE_EXPORT_LIMIT + 1)
+        .limit(EVIDENCE_EXPORT_LIMIT + 1),
     )).scalars().all()
     truncated = len(audit_rows) > EVIDENCE_EXPORT_LIMIT
     audit_rows = list(audit_rows[:EVIDENCE_EXPORT_LIMIT])
@@ -3722,7 +3882,7 @@ async def _evidence_rows(
         key = (run_id, payload.get("step"), tool)
         entry = merged.get(key)
         if entry is None:
-            entry = {column: "" for column in EVIDENCE_COLUMNS}
+            entry = dict.fromkeys(EVIDENCE_COLUMNS, "")
             entry.update({
                 "timestamp": (row.created_at.isoformat() if row.created_at else ""),
                 "run_id": run_id,

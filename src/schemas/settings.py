@@ -178,3 +178,26 @@ class LLMHealthResponse(BaseModel):
     breaker_open: Optional[bool] = None
     checked_at: str
     cached: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Agentic policy settings (GET/PUT /settings/agentic-policy)
+# ---------------------------------------------------------------------------
+
+
+class AgenticPolicySettingsResponse(BaseModel):
+    """Read model for ``GET /settings/agentic-policy`` (org admin)."""
+
+    # Separation of duties (AC-5): destructive/privileged agent actions need
+    # two distinct approvers, neither of them the proposer. Off by default.
+    require_second_approver: bool = False
+    updated_at: Optional[str] = None
+    updated_by: Optional[str] = None
+
+
+class AgenticPolicySettingsUpdate(BaseModel):
+    """Write model for ``PUT /settings/agentic-policy``. Unknown keys are rejected."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    require_second_approver: bool

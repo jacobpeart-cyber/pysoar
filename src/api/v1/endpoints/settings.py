@@ -25,11 +25,10 @@ OpenAI-compatible endpoints come from platform settings only.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
-
 import asyncio
 import json
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
@@ -39,6 +38,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.agentic.policy import AGENTIC_POLICY_SECTION
 from src.api.deps import AdminUser, DatabaseSession, get_current_superuser
 from src.audit_evidence.engine import AuditLogger
 from src.core.config import settings as app_settings
@@ -64,17 +64,19 @@ from src.llm.factory import (
 from src.models.settings import AppSetting
 from src.models.user import User
 from src.schemas.settings import (
+    AgenticPolicySettingsResponse,
+    AgenticPolicySettingsUpdate,
+    AIModelsResponse,
     AISettingsResponse,
     AISettingsUpdate,
     AITenantRow,
     AITenantsResponse,
-    AIModelsResponse,
+    AlertCorrelationConfig,
+    GeneralSettings,
+    NotificationConfig,
     SettingsResponse,
     SettingsUpdate,
-    GeneralSettings,
     SMTPConfig,
-    NotificationConfig,
-    AlertCorrelationConfig,
 )
 
 logger = get_logger(__name__)
@@ -127,7 +129,7 @@ def _drop_unreadable_secrets(value: Any) -> Any:
 
 
 async def _load_section(
-    db: AsyncSession, organization_id: Optional[str], section: str
+    db: AsyncSession, organization_id: Optional[str], section: str,
 ) -> Dict[str, Any]:
     """Return the decrypted stored value for (org, section), or {} if no row exists.
 
@@ -224,7 +226,7 @@ async def _upsert_section(
                     section=section,
                     value=stored,
                     updated_by=updated_by,
-                )
+                ),
             )
         else:
             existing_row.value = stored
@@ -300,7 +302,7 @@ async def get_settings(
     # every dialect. (The previous raw-SQL version got a JSON *string* back on
     # SQLite and silently skipped every row, so Configured never lit up there.)
     stmt = select(AppSetting.section, AppSetting.value).where(
-        AppSetting.section.like("integration:%")
+        AppSetting.section.like("integration:%"),
     )
     stmt = (
         stmt.where(AppSetting.organization_id == org_id)
@@ -318,7 +320,7 @@ async def get_settings(
             or ovr.get("url")
             or ovr.get("host")
             or ovr.get("token")
-            or ovr.get("webhook_url")
+            or ovr.get("webhook_url"),
         ) or integrations.get(integ_id, {}).get("configured", False)
         integrations[integ_id] = {
             "enabled": bool(ovr.get("enabled", configured)),
@@ -372,13 +374,13 @@ async def get_settings(
             ),
             slack_webhook_url=_mask_secret(
                 pick(
-                    notif_override, "slack_webhook_url", app_settings.slack_webhook_url
-                )
+                    notif_override, "slack_webhook_url", app_settings.slack_webhook_url,
+                ),
             ),
             teams_webhook_url=_mask_secret(
                 pick(
-                    notif_override, "teams_webhook_url", app_settings.teams_webhook_url
-                )
+                    notif_override, "teams_webhook_url", app_settings.teams_webhook_url,
+                ),
             ),
         ),
         alert_correlation=AlertCorrelationConfig(
@@ -477,7 +479,7 @@ async def update_general_settings(
         date_format=merged.get("date_format", "YYYY-MM-DD"),
         time_format=merged.get("time_format", "HH:mm:ss"),
         session_timeout_minutes=int(
-            merged.get("session_timeout_minutes", app_settings.access_token_expire_minutes)
+            merged.get("session_timeout_minutes", app_settings.access_token_expire_minutes),
         ),
         max_login_attempts=int(merged.get("max_login_attempts", 5)),
         lockout_duration_minutes=int(merged.get("lockout_duration_minutes", 15)),
@@ -561,16 +563,16 @@ async def update_notification_settings(
     return NotificationConfig(
         email_enabled=bool(merged.get("email_enabled", bool(app_settings.smtp_user))),
         slack_enabled=bool(
-            merged.get("slack_enabled", bool(app_settings.slack_webhook_url))
+            merged.get("slack_enabled", bool(app_settings.slack_webhook_url)),
         ),
         teams_enabled=bool(
-            merged.get("teams_enabled", bool(app_settings.teams_webhook_url))
+            merged.get("teams_enabled", bool(app_settings.teams_webhook_url)),
         ),
         slack_webhook_url=_mask_secret(
-            merged.get("slack_webhook_url", app_settings.slack_webhook_url)
+            merged.get("slack_webhook_url", app_settings.slack_webhook_url),
         ),
         teams_webhook_url=_mask_secret(
-            merged.get("teams_webhook_url", app_settings.teams_webhook_url)
+            merged.get("teams_webhook_url", app_settings.teams_webhook_url),
         ),
     )
 
@@ -607,7 +609,7 @@ async def update_security_settings(
         max_login_attempts=int(merged.get("max_login_attempts", 5)),
         lockout_duration_minutes=int(merged.get("lockout_duration_minutes", 15)),
         session_timeout_minutes=int(
-            merged.get("session_timeout_minutes", app_settings.access_token_expire_minutes)
+            merged.get("session_timeout_minutes", app_settings.access_token_expire_minutes),
         ),
         password_min_length=int(merged.get("password_min_length", 8)),
         require_mfa=bool(merged.get("require_mfa", False)),
@@ -702,7 +704,7 @@ async def _upsert_installed_integration(
             InstalledIntegration.connector_id == integration_id,
             InstalledIntegration.organization_id == organization_id,
         )
-        .limit(1)
+        .limit(1),
     )
     existing = res.scalars().first()
     credential_keys = ("api_key", "token", "url", "host", "username", "password")
@@ -769,7 +771,7 @@ async def save_integration_config(
             pass
 
     merged = await _upsert_section(
-        db, org_id, f"integration:{integration_id}", config, uid
+        db, org_id, f"integration:{integration_id}", config, uid,
     )
 
     configured = bool(
@@ -777,7 +779,7 @@ async def save_integration_config(
         or merged.get("url")
         or merged.get("host")
         or merged.get("token")
-        or getattr(app_settings, attr, None)
+        or getattr(app_settings, attr, None),
     )
     enabled = bool(merged.get("enabled", configured))
 
@@ -845,7 +847,7 @@ async def test_email_settings(
     if not email_service.is_configured:
         raise HTTPException(
             status_code=400,
-            detail="Email service is not fully configured (missing credentials)"
+            detail="Email service is not fully configured (missing credentials)",
         )
 
     sent = await email_service.send_email(
@@ -857,7 +859,7 @@ async def test_email_settings(
     if not sent:
         raise HTTPException(
             status_code=500,
-            detail="Failed to send test email. Check SMTP configuration and server logs."
+            detail="Failed to send test email. Check SMTP configuration and server logs.",
         )
 
     return {"message": "Test email sent successfully", "to": current_user.email}
@@ -897,7 +899,7 @@ async def test_integration(
     if integration_name not in valid_integrations:
         raise HTTPException(
             status_code=400,
-            detail=f"Unknown integration: {integration_name}"
+            detail=f"Unknown integration: {integration_name}",
         )
 
     org_id = _user_org(current_user)
@@ -967,7 +969,7 @@ async def test_integration(
     if not primary_map.get(integration_name):
         raise HTTPException(
             status_code=400,
-            detail=f"Integration {integration_name} is not configured"
+            detail=f"Integration {integration_name} is not configured",
         )
 
     import httpx
@@ -1276,7 +1278,7 @@ async def last_successful_llm_call_at(db: AsyncSession, org_id: str) -> Optional
         newest = (await db.execute(stmt)).scalar_one_or_none()
     except SQLAlchemyError as exc:
         logger.warning(
-            "llm_last_call_lookup_failed", organization_id=org_id, error=type(exc).__name__
+            "llm_last_call_lookup_failed", organization_id=org_id, error=type(exc).__name__,
         )
         return None
     return newest.isoformat() if isinstance(newest, datetime) else None
@@ -1308,7 +1310,7 @@ def _model_matches(model: str, available: List[str]) -> bool:
 
 
 async def _list_models(
-    provider: str, model: str, api_key: Optional[str], source: str
+    provider: str, model: str, api_key: Optional[str], source: str,
 ) -> List[str]:
     """``build_provider(...).list_models()`` on a fixed host, with a 10s ceiling.
 
@@ -1348,7 +1350,7 @@ async def _list_models(
         ) from exc
     except LLMError as exc:
         logger.warning(
-            "ai_settings_provider_unavailable", provider=provider, error=type(exc).__name__
+            "ai_settings_provider_unavailable", provider=provider, error=type(exc).__name__,
         )
         raise _AIErrorResponse(
             502,
@@ -1361,7 +1363,7 @@ async def _list_models(
 
 
 async def _ai_credential_for_listing(
-    db: AsyncSession, org_id: str, provider: str, *, use_platform_default: bool
+    db: AsyncSession, org_id: str, provider: str, *, use_platform_default: bool,
 ) -> tuple[Optional[str], str]:
     """``(api_key, source)`` for a model-list call. Raises when nothing is configured."""
     if provider not in KEYED_PROVIDERS:
@@ -1374,13 +1376,13 @@ async def _ai_credential_for_listing(
             reason = getattr(exc, "reason", "missing_credential")
             if reason == "secret_unreadable":
                 raise _AIErrorResponse(
-                    503, {"error": "secret_unreadable", "provider": provider}
+                    503, {"error": "secret_unreadable", "provider": provider},
                 ) from exc
             platform_key = _platform_api_key(provider)
             if platform_key:
                 return platform_key, "platform"
             raise _AIErrorResponse(
-                503, {"error": "llm_not_configured", "provider": provider, "reason": reason}
+                503, {"error": "llm_not_configured", "provider": provider, "reason": reason},
             ) from exc
     platform_key = _platform_api_key(provider)
     if not platform_key:
@@ -1497,7 +1499,7 @@ async def update_ai_settings(
             prior = await _load_section(db, org_id, AI_SECTION)
         except SecretUnreadable as exc:
             raise _AIErrorResponse(
-                503, {"error": "secret_unreadable", "reason": exc.reason}
+                503, {"error": "secret_unreadable", "reason": exc.reason},
             ) from exc
 
         # Which credential validates the model?
@@ -1505,7 +1507,7 @@ async def update_ai_settings(
             validate_key, validate_source = api_key, "org"
         else:
             validate_key, validate_source = await _ai_credential_for_listing(
-                db, org_id, provider, use_platform_default=payload.use_platform_default
+                db, org_id, provider, use_platform_default=payload.use_platform_default,
             )
         if provider in KEYED_PROVIDERS and not validate_key:
             raise _AIErrorResponse(
@@ -1633,7 +1635,7 @@ async def list_ai_models(
             section = await _load_section(db, org_id, AI_SECTION)
         except SecretUnreadable as exc:
             raise _AIErrorResponse(
-                503, {"error": "secret_unreadable", "reason": exc.reason}
+                503, {"error": "secret_unreadable", "reason": exc.reason},
             ) from exc
 
         name = (provider or section.get("provider") or app_settings.llm_provider or "").strip()
@@ -1648,7 +1650,7 @@ async def list_ai_models(
             )
         use_platform_default = bool(section.get("use_platform_default", False))
         api_key, source = await _ai_credential_for_listing(
-            db, org_id, name, use_platform_default=use_platform_default
+            db, org_id, name, use_platform_default=use_platform_default,
         )
         # The model only selects a client here; list_models ignores it.
         probe_model = str(section.get("model") or app_settings.llm_model or name)
@@ -1682,7 +1684,7 @@ async def list_ai_tenants(
             select(AppSetting.organization_id, AppSetting.value).where(
                 AppSetting.section == AI_SECTION,
                 AppSetting.organization_id.is_not(None),
-            )
+            ),
         )
     ).all()
 
@@ -1691,8 +1693,8 @@ async def list_ai_tenants(
         for org, connector in (
             await db.execute(
                 select(
-                    InstalledIntegration.organization_id, InstalledIntegration.connector_id
-                )
+                    InstalledIntegration.organization_id, InstalledIntegration.connector_id,
+                ),
             )
         ).all()
     }
@@ -1707,7 +1709,7 @@ async def list_ai_tenants(
                         LLMCallLog.stop_reason.is_not(None),
                         LLMCallLog.stop_reason != "error",
                     )
-                    .group_by(LLMCallLog.organization_id)
+                    .group_by(LLMCallLog.organization_id),
                 )
             ).all():
                 last_calls[str(org)] = newest
@@ -1737,8 +1739,97 @@ async def list_ai_tenants(
                 last_successful_call_at=(
                     newest.isoformat() if isinstance(newest, datetime) else None
                 ),
-            )
+            ),
         )
 
     tenants.sort(key=lambda row: row.organization_id)
     return AITenantsResponse(tenants=tenants, count=len(tenants))
+
+
+# ---------------------------------------------------------------------------
+# Agentic policy settings (docs/agentic-soc.md sections 3, 10)
+#
+# GET/PUT /settings/agentic-policy -- org admin; the org's separation-of-duties
+# knob for agent proposals. Stored in ``app_settings`` section
+# ``agentic_policy`` and read by the approval endpoint through
+# ``src.agentic.policy.load_org_policy_settings``.
+# ---------------------------------------------------------------------------
+
+
+def _agentic_policy_response(section: Dict[str, Any]) -> AgenticPolicySettingsResponse:
+    return AgenticPolicySettingsResponse(
+        require_second_approver=section.get("require_second_approver") is True,
+        updated_at=section.get("updated_at"),
+        updated_by=section.get("updated_by"),
+    )
+
+
+@router.get("/agentic-policy", response_model=AgenticPolicySettingsResponse)
+async def get_agentic_policy_settings(
+    db: DatabaseSession = None,
+    current_user: AdminUser = None,
+) -> AgenticPolicySettingsResponse:
+    """The organization's agentic policy settings (admin)."""
+    org_id = _user_org(current_user)
+    if not org_id:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "no_organization", "detail": "agentic policy settings are per-organization"},
+        )
+    section = await _load_section(db, str(org_id), AGENTIC_POLICY_SECTION)
+    return _agentic_policy_response(section)
+
+
+@router.put("/agentic-policy", response_model=AgenticPolicySettingsResponse)
+async def update_agentic_policy_settings(
+    payload: AgenticPolicySettingsUpdate,
+    db: DatabaseSession = None,
+    current_user: AdminUser = None,
+) -> AgenticPolicySettingsResponse:
+    """Set the organization's agentic policy settings (admin); audited."""
+    org_id = _user_org(current_user)
+    if not org_id:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "no_organization", "detail": "agentic policy settings are per-organization"},
+        )
+    org_id = str(org_id)
+    uid = str(getattr(current_user, "id", "") or "")
+    prior = await _load_section(db, org_id, AGENTIC_POLICY_SECTION)
+    old_value = prior.get("require_second_approver") is True
+    merged = await _upsert_section(
+        db,
+        org_id,
+        AGENTIC_POLICY_SECTION,
+        {
+            "require_second_approver": payload.require_second_approver,
+            "updated_at": _utc_now_iso(),
+            "updated_by": uid or None,
+        },
+        uid or None,
+    )
+
+    audit = AuditLogger(db, org_id)
+    await audit.log_event(
+        event_type="change",
+        action="agentic_policy.set",
+        actor_type="user",
+        actor_id=uid or "unknown",
+        resource_type="app_settings",
+        resource_id=f"{AGENTIC_POLICY_SECTION}:{org_id}",
+        description=(
+            f"require_second_approver set to {payload.require_second_approver}"
+            + ("" if old_value != payload.require_second_approver else " (unchanged)")
+        ),
+        old_value={"require_second_approver": old_value},
+        new_value={"require_second_approver": payload.require_second_approver},
+        risk_level="medium" if not payload.require_second_approver else "low",
+    )
+    await db.commit()
+    logger.info(
+        "agentic_policy_settings_updated",
+        organization_id=org_id,
+        require_second_approver=payload.require_second_approver,
+        previous=old_value,
+    )
+    return _agentic_policy_response(merged)
