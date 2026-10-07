@@ -9,15 +9,15 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from celery import shared_task
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from src.core.config import settings
 from src.core.database import async_session_factory
 from src.core.logging import get_logger
 from src.darkweb.engine import (
-    DarkWebScanner,
-    CredentialAnalyzer,
     BrandProtection,
+    CredentialAnalyzer,
+    DarkWebScanner,
     ThreatIntelCorrelator,
 )
 from src.darkweb.models import (
@@ -25,16 +25,31 @@ from src.darkweb.models import (
     DarkWebFinding,
     DarkWebMonitor,
 )
-from src.models.incident import Incident
 from src.intel.models import ThreatIndicator as IOC
+from src.models.incident import Incident
 
 logger = get_logger(__name__)
+
+
+# --- Memory bounds ---------------------------------------------------------
+# darkweb_cross_org_sweep loaded every Organization and then every enabled
+# monitor per org as full ORM rows; credential_leak_check loaded every
+# monitor of the org as ORM rows; threat_correlation loaded every IOC the org
+# saw in 90 days and every incident created in 90 days (all tenants) as ORM
+# rows, just to compare one or two strings against them. All of these now
+# page in keyset windows of DARKWEB_BATCH_SIZE on the primary key and read
+# only the columns they use; caps that fire set ``truncated``.
+DARKWEB_BATCH_SIZE = 1_000
+MAX_DARKWEB_MONITORS_PER_SWEEP = 5_000
+MAX_MONITORS_PER_CREDENTIAL_CHECK = 10_000
+MAX_CORRELATION_IOC_MATCHES = 10_000
+MAX_CORRELATION_INCIDENTS = 50_000
 
 
 def _fresh_darkweb_session_factory():
     """Per-task NullPool engine to avoid 'Future attached to a different loop'
     errors under Celery prefork — same pattern as itdr/agentic/supplychain."""
-    from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+    from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
     from sqlalchemy.orm import sessionmaker
     from sqlalchemy.pool import NullPool
     e = create_async_engine(settings.database_url, echo=False, poolclass=NullPool)
@@ -128,7 +143,7 @@ async def _persist_findings(
             select(DarkWebFinding).where(
                 DarkWebFinding.organization_id == organization_id,
                 DarkWebFinding.raw_data_hash == content_hash,
-            )
+            ),
         )).scalar_one_or_none()
         if existing is not None:
             skipped += 1
@@ -246,7 +261,7 @@ def scheduled_dark_web_scan(
                 org_id = organization_id
                 if monitor_id:
                     monitor = (await db.execute(
-                        select(DarkWebMonitor).where(DarkWebMonitor.id == monitor_id)
+                        select(DarkWebMonitor).where(DarkWebMonitor.id == monitor_id),
                     )).scalar_one_or_none()
                     if monitor is None:
                         return {"status": "error", "error": f"monitor {monitor_id} not found"}
@@ -280,10 +295,11 @@ def scheduled_dark_web_scan(
                             item["source"] = source
                             # Engine's deduplicate_results sets content_hash; the
                             # quick path skips it so stamp one here.
-                            import hashlib as _h, json as _j
+                            import hashlib as _h
+                            import json as _j
                             if "content_hash" not in item:
                                 item["content_hash"] = _h.sha256(
-                                    _j.dumps(item, sort_keys=True, default=str).encode()
+                                    _j.dumps(item, sort_keys=True, default=str).encode(),
                                 ).hexdigest()
                             findings_list.append(item)
 
@@ -297,23 +313,23 @@ def scheduled_dark_web_scan(
                     if isinstance(emails, str):
                         try:
                             emails = _json.loads(emails)
-                        except Exception:  # noqa: BLE001
+                        except Exception:
                             emails = []
                     domains = monitor.domains_watched
                     if isinstance(domains, str):
                         try:
                             domains = _json.loads(domains)
-                        except Exception:  # noqa: BLE001
+                        except Exception:
                             domains = []
                     emails = list(emails or [])
                     domains = list(domains or [])
                     if emails:
                         findings_list.extend(
-                            await scanner.hibp_lookup_emails(emails)
+                            await scanner.hibp_lookup_emails(emails),
                         )
                     if domains:
                         findings_list.extend(
-                            await scanner.hibp_lookup_domains(domains)
+                            await scanner.hibp_lookup_domains(domains),
                         )
 
                 alert_severity = (monitor.alert_severity if monitor else "medium") or "medium"
@@ -350,7 +366,7 @@ def scheduled_dark_web_scan(
                                 organization_id=org_id,
                             )
                             automation_fired += 1
-                        except Exception as exc:  # noqa: BLE001
+                        except Exception as exc:
                             logger.warning(f"on_darkweb_finding fire failed: {exc}")
                     # on_darkweb_finding only flushes — without an explicit
                     # commit here every Alert row would roll back on session
@@ -378,9 +394,94 @@ def scheduled_dark_web_scan(
             return loop.run_until_complete(_run())
         finally:
             loop.close()
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         logger.error(f"Dark web scan failed: {exc}")
         raise self.retry(exc=exc, countdown=60 * (2 ** self.request.retries))
+
+
+async def _enabled_monitor_window(
+    factory: Any, after_id: str | None, limit: int,
+) -> list[tuple[str, str]]:
+    """One keyset window of (monitor id, org id) for enabled monitors whose
+    organization exists (the old per-org loop only visited those)."""
+    from src.models.organization import Organization
+
+    async with factory() as db:
+        stmt = select(DarkWebMonitor.id, DarkWebMonitor.organization_id).where(
+            DarkWebMonitor.enabled == True,  # noqa: E712
+            DarkWebMonitor.organization_id.in_(select(Organization.id)),
+        )
+        if after_id is not None:
+            stmt = stmt.where(DarkWebMonitor.id > after_id)
+        rows = (await db.execute(stmt.order_by(DarkWebMonitor.id).limit(limit))).all()
+    return [(r.id, r.organization_id) for r in rows]
+
+
+def _scan_monitor(monitor_id: str) -> Any:
+    """Run the per-monitor scan in-process (sync Celery ``.apply()`` so the
+    sweep can collect totals)."""
+    return scheduled_dark_web_scan.apply(
+        kwargs={"monitor_id": monitor_id, "scan_type": "full"},
+    ).get()
+
+
+def _run_darkweb_cross_org_sweep() -> dict[str, Any]:
+    """Synchronous driver for ``darkweb_cross_org_sweep``.
+
+    Monitor ids are fetched one window at a time on this function's own
+    event loop, and each per-monitor scan runs *between* those fetches, never
+    inside a running loop. (The previous version called
+    ``scheduled_dark_web_scan.apply(...)`` from inside its coroutine; that
+    task starts its own event loop, which raises "Cannot run the event loop
+    while another loop is running", so the sweep failed at the first
+    enabled monitor.)
+    """
+    totals: dict[str, Any] = {"orgs_scanned": 0, "monitors_scanned": 0, "findings_created": 0}
+    orgs_seen: set[str] = set()
+    cap_hit = False
+    last_id: str | None = None
+
+    engine, factory = _fresh_darkweb_session_factory()
+    loop = asyncio.new_event_loop()
+    try:
+        while totals["monitors_scanned"] < MAX_DARKWEB_MONITORS_PER_SWEEP:
+            window = min(
+                DARKWEB_BATCH_SIZE,
+                MAX_DARKWEB_MONITORS_PER_SWEEP - totals["monitors_scanned"],
+            )
+            monitors = loop.run_until_complete(
+                _enabled_monitor_window(factory, last_id, window),
+            )
+            if not monitors:
+                break
+            last_id = monitors[-1][0]
+
+            for monitor_id, org_id in monitors:
+                orgs_seen.add(org_id)
+                totals["monitors_scanned"] += 1
+                res = _scan_monitor(monitor_id)
+                if isinstance(res, dict):
+                    totals["findings_created"] += int(res.get("created") or 0)
+
+            if len(monitors) < window:
+                break
+        else:
+            cap_hit = True
+    finally:
+        try:
+            loop.run_until_complete(engine.dispose())
+        finally:
+            loop.close()
+
+    totals["orgs_scanned"] = len(orgs_seen)
+    totals["truncated"] = cap_hit
+    if cap_hit:
+        logger.warning(
+            f"darkweb_cross_org_sweep: hit per-run cap of {MAX_DARKWEB_MONITORS_PER_SWEEP} "
+            f"monitors; remainder deferred to the next run",
+        )
+    logger.info(f"darkweb_cross_org_sweep: {totals}")
+    return totals
 
 
 @shared_task(bind=True, max_retries=1)
@@ -392,46 +493,90 @@ def darkweb_cross_org_sweep(self) -> dict[str, Any]:
     a single beat-schedule entry that fans out properly instead of
     requiring one beat entry per monitor.
     """
-    async def _sweep():
-        from src.models.organization import Organization
-        engine, factory = _fresh_darkweb_session_factory()
-        totals = {"orgs_scanned": 0, "monitors_scanned": 0, "findings_created": 0}
-        try:
-            async with factory() as db:
-                orgs = list((await db.execute(select(Organization))).scalars().all())
-                for org in orgs:
-                    monitors = list((await db.execute(
-                        select(DarkWebMonitor).where(
-                            DarkWebMonitor.organization_id == org.id,
-                            DarkWebMonitor.enabled == True,  # noqa: E712
-                        )
-                    )).scalars().all())
-                    if not monitors:
-                        continue
-                    totals["orgs_scanned"] += 1
-                    for m in monitors:
-                        totals["monitors_scanned"] += 1
-                        # Delegate to the per-monitor task in-process
-                        # (sync Celery .apply() so we can collect totals).
-                        res = scheduled_dark_web_scan.apply(
-                            kwargs={"monitor_id": m.id, "scan_type": "full"}
-                        ).get()
-                        if isinstance(res, dict):
-                            totals["findings_created"] += int(res.get("created") or 0)
-        finally:
-            await engine.dispose()
-        logger.info(f"darkweb_cross_org_sweep: {totals}")
-        return totals
-
     try:
-        loop = asyncio.new_event_loop()
-        try:
-            return loop.run_until_complete(_sweep())
-        finally:
-            loop.close()
-    except Exception as exc:  # noqa: BLE001
+        return _run_darkweb_cross_org_sweep()
+    except Exception as exc:
         logger.warning(f"darkweb_cross_org_sweep failed: {exc}")
         return {"error": str(exc)[:200]}
+
+
+async def _credential_context_async(finding_id: str) -> dict[str, Any]:
+    """The finding's text plus its org's watched domains/emails.
+
+    Monitors are read as two JSON columns per keyset window instead of full
+    ORM rows.
+    """
+    async with async_session_factory() as session:
+        # Load the specific finding
+        finding_stmt = select(DarkWebFinding).where(
+            DarkWebFinding.id == finding_id,
+        )
+        finding = (await session.scalars(finding_stmt)).first()
+
+        raw_text = ""
+        org_id: str | None = None
+        monitor_id: str | None = None
+        if finding is not None:
+            org_id = finding.organization_id
+            monitor_id = finding.monitor_id
+            # DarkWebFinding stores a raw_data_hash, not raw text; use the
+            # finding description and any analyst notes as the credential
+            # text source. (Full raw payloads live in object storage
+            # which is not yet wired up to the DB layer.)
+            raw_text = "\n".join(
+                part
+                for part in (finding.description, finding.analyst_notes)
+                if part
+            )
+
+        monitored_domains: set[str] = set()
+        monitored_emails: set[str] = set()
+        monitors_read = 0
+        cap_hit = False
+        if org_id:
+            last_id: str | None = None
+            while monitors_read < MAX_MONITORS_PER_CREDENTIAL_CHECK:
+                window = min(
+                    DARKWEB_BATCH_SIZE, MAX_MONITORS_PER_CREDENTIAL_CHECK - monitors_read,
+                )
+                mon_stmt = select(
+                    DarkWebMonitor.id,
+                    DarkWebMonitor.domains_watched,
+                    DarkWebMonitor.emails_watched,
+                ).where(DarkWebMonitor.organization_id == org_id)
+                if last_id is not None:
+                    mon_stmt = mon_stmt.where(DarkWebMonitor.id > last_id)
+                monitors = (
+                    await session.execute(mon_stmt.order_by(DarkWebMonitor.id).limit(window))
+                ).all()
+                if not monitors:
+                    break
+                last_id = monitors[-1].id
+                monitors_read += len(monitors)
+                for m in monitors:
+                    if m.domains_watched:
+                        monitored_domains.update(m.domains_watched or [])
+                    if m.emails_watched:
+                        monitored_emails.update(m.emails_watched or [])
+                if len(monitors) < window:
+                    break
+            else:
+                cap_hit = True
+
+        if cap_hit:
+            logger.warning(
+                f"credential_leak_check: monitor cap {MAX_MONITORS_PER_CREDENTIAL_CHECK} "
+                f"hit for org {org_id}; watched assets beyond it not considered",
+            )
+        return {
+            "raw_text": raw_text,
+            "monitored_domains": sorted(monitored_domains),
+            "monitored_emails": sorted(monitored_emails),
+            "organization_id": org_id,
+            "monitor_id": monitor_id,
+            "finding_found": finding is not None,
+            "truncated": cap_hit,
+        }
 
 
 @shared_task(bind=True, max_retries=3)
@@ -456,58 +601,12 @@ def credential_leak_check(
     try:
         logger.info(
             f"Analyzing credential leak (finding={finding_id}, "
-            f"extract={extract_credentials})"
+            f"extract={extract_credentials})",
         )
 
         analyzer = CredentialAnalyzer()
 
-        async def _fetch_credential_context() -> dict[str, Any]:
-            async with async_session_factory() as session:
-                # Load the specific finding
-                finding_stmt = select(DarkWebFinding).where(
-                    DarkWebFinding.id == finding_id
-                )
-                finding = (await session.scalars(finding_stmt)).first()
-
-                raw_text = ""
-                org_id: str | None = None
-                monitor_id: str | None = None
-                if finding is not None:
-                    org_id = finding.organization_id
-                    monitor_id = finding.monitor_id
-                    # DarkWebFinding stores a raw_data_hash, not raw text; use the
-                    # finding description and any analyst notes as the credential
-                    # text source. (Full raw payloads live in object storage
-                    # which is not yet wired up to the DB layer.)
-                    raw_text = "\n".join(
-                        part
-                        for part in (finding.description, finding.analyst_notes)
-                        if part
-                    )
-
-                monitored_domains: list[str] = []
-                monitored_emails: list[str] = []
-                if org_id:
-                    mon_stmt = select(DarkWebMonitor).where(
-                        DarkWebMonitor.organization_id == org_id
-                    )
-                    monitors = list((await session.scalars(mon_stmt)).all())
-                    for m in monitors:
-                        if m.domains_watched:
-                            monitored_domains.extend(m.domains_watched or [])
-                        if m.emails_watched:
-                            monitored_emails.extend(m.emails_watched or [])
-
-                return {
-                    "raw_text": raw_text,
-                    "monitored_domains": sorted(set(monitored_domains)),
-                    "monitored_emails": sorted(set(monitored_emails)),
-                    "organization_id": org_id,
-                    "monitor_id": monitor_id,
-                    "finding_found": finding is not None,
-                }
-
-        ctx = asyncio.run(_fetch_credential_context())
+        ctx = asyncio.run(_credential_context_async(finding_id))
 
         if not ctx["finding_found"]:
             logger.warning(f"Credential leak check: finding {finding_id} not found")
@@ -517,6 +616,7 @@ def credential_leak_check(
                 "organizational_credentials": 0,
                 "analyzed_credentials": [],
                 "organizational_matches": [],
+                "truncated": False,
                 "status": "finding_not_found",
             }
 
@@ -538,7 +638,7 @@ def credential_leak_check(
                 {
                     "credential": cred,
                     "risk_assessment": risk_assessment,
-                }
+                },
             )
 
         # Identify organizational credentials against this org's monitored assets
@@ -556,6 +656,7 @@ def credential_leak_check(
             "organizational_credentials": len(organizational_creds),
             "analyzed_credentials": analyzed_creds,
             "organizational_matches": organizational_creds,
+            "truncated": ctx["truncated"],
             "status": "completed",
         }
 
@@ -588,7 +689,7 @@ def brand_monitoring_scan(
     try:
         logger.info(
             f"Starting brand monitoring scan (brand={target_brand}, "
-            f"monitor={monitor_id})"
+            f"monitor={monitor_id})",
         )
 
         brand_protection = BrandProtection()
@@ -608,7 +709,7 @@ def brand_monitoring_scan(
 
         # Monitor certificate transparency logs
         ct_anomalies = brand_protection.monitor_certificate_transparency_logs(
-            monitored_domains
+            monitored_domains,
         )
         threats["ct_anomalies"].extend(ct_anomalies)
 
@@ -655,13 +756,14 @@ def takedown_status_check(
 
         # Query the DarkWebMonitor/DarkWebFinding for real takedown status
         import asyncio
+
         from src.core.database import async_session_factory
 
         async def _check_status():
             async with async_session_factory() as db:
                 # Look up the finding associated with this takedown
                 finding_query = select(DarkWebFinding).where(
-                    DarkWebFinding.id == threat_id
+                    DarkWebFinding.id == threat_id,
                 )
                 result = await db.execute(finding_query)
                 finding = result.scalar_one_or_none()
@@ -695,6 +797,176 @@ def takedown_status_check(
         raise self.retry(exc=exc, countdown=60 * (2 ** self.request.retries))
 
 
+async def _threat_correlation_async(
+    finding_id: str, organization_id: str, correlator: ThreatIntelCorrelator,
+) -> dict[str, Any]:
+    """Correlate one finding with the org's recent IOCs and incidents.
+
+    ``correlate_with_iocs`` only ever matches an IOC whose value equals the
+    finding's domain or email, so instead of loading every 90-day IOC the
+    candidates are fetched with ``value IN (domain, email)`` and the 90-day
+    total comes from a COUNT. ``correlate_with_incidents`` only matches
+    incidents whose indicator list contains the finding's domain, so
+    incidents are scanned in keyset windows of five columns and only the
+    matches are kept.
+    """
+    import json as _json
+
+    async with async_session_factory() as session:
+        # Load finding
+        finding = (
+            await session.scalars(
+                select(DarkWebFinding).where(DarkWebFinding.id == finding_id),
+            )
+        ).first()
+        if finding is None:
+            return {"finding_found": False}
+
+        affected = finding.affected_assets or {}
+        if isinstance(affected, str):
+            try:
+                affected = _json.loads(affected)
+            except Exception:
+                affected = {}
+
+        finding_data = {
+            "id": finding.id,
+            "domain": affected.get("domain") if isinstance(affected, dict) else None,
+            "ip": affected.get("ip") if isinstance(affected, dict) else None,
+            "email": affected.get("email") if isinstance(affected, dict) else None,
+            "hash": finding.raw_data_hash,
+            "severity": finding.severity,
+            "confidence_score": finding.confidence_score,
+            "finding_type": finding.finding_type,
+            "source_platform": finding.source_platform,
+            "title": finding.title,
+            "description": finding.description,
+        }
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=90)
+        truncated = False
+
+        # --- IOCs (last 90 days) for this org ---
+        ioc_scope = (
+            (IOC.organization_id == organization_id) & (IOC.created_at >= cutoff)
+        )
+        ioc_count = (
+            await session.execute(select(func.count(IOC.id)).where(ioc_scope))
+        ).scalar_one()
+        match_values = sorted(
+            {v for v in (finding_data["domain"], finding_data["email"]) if v},
+        )
+        ioc_correlations: list[dict[str, Any]] = []
+        if match_values:
+            ioc_rows = (
+                await session.execute(
+                    select(
+                        IOC.id,
+                        IOC.value,
+                        IOC.indicator_type,
+                        IOC.source,
+                        IOC.severity,
+                        IOC.confidence,
+                    )
+                    .where(ioc_scope, IOC.value.in_(match_values))
+                    .order_by(IOC.id)
+                    .limit(MAX_CORRELATION_IOC_MATCHES + 1),
+                )
+            ).all()
+            if len(ioc_rows) > MAX_CORRELATION_IOC_MATCHES:
+                truncated = True
+                ioc_rows = ioc_rows[:MAX_CORRELATION_IOC_MATCHES]
+            ioc_correlations = await correlator.correlate_with_iocs(
+                finding_data,
+                [
+                    {
+                        "id": i.id,
+                        "value": i.value,
+                        "type": i.indicator_type,
+                        "source": i.source,
+                        "threat_level": i.severity,
+                        "confidence": i.confidence,
+                    }
+                    for i in ioc_rows
+                ],
+            )
+
+        # --- Incidents (last 90 days) for this org ---
+        # The previous query had no organization filter and correlated the
+        # finding with every tenant's incidents; scoped to the org now.
+        inc_scope = (Incident.created_at >= cutoff) & (
+            Incident.organization_id == organization_id
+        )
+        incident_count = (
+            await session.execute(select(func.count(Incident.id)).where(inc_scope))
+        ).scalar_one()
+        incident_correlations: list[dict[str, Any]] = []
+        if finding_data["domain"] is not None and incident_count:
+            scanned = 0
+            last_id: str | None = None
+            while scanned < MAX_CORRELATION_INCIDENTS:
+                window = min(DARKWEB_BATCH_SIZE, MAX_CORRELATION_INCIDENTS - scanned)
+                stmt = select(
+                    Incident.id,
+                    Incident.title,
+                    Incident.status,
+                    Incident.severity,
+                    Incident.indicators,
+                ).where(inc_scope)
+                if last_id is not None:
+                    stmt = stmt.where(Incident.id > last_id)
+                rows = (await session.execute(stmt.order_by(Incident.id).limit(window))).all()
+                if not rows:
+                    break
+                last_id = rows[-1].id
+                scanned += len(rows)
+
+                incident_window = []
+                for inc in rows:
+                    iocs_list: list[str] = []
+                    if inc.indicators:
+                        try:
+                            parsed = _json.loads(inc.indicators)
+                            if isinstance(parsed, list):
+                                iocs_list = [str(x) for x in parsed]
+                        except Exception:
+                            pass
+                    incident_window.append(
+                        {
+                            "id": inc.id,
+                            "title": inc.title,
+                            "status": inc.status,
+                            "severity": inc.severity,
+                            "iocs": iocs_list,
+                        },
+                    )
+                incident_correlations.extend(
+                    await correlator.correlate_with_incidents(finding_data, incident_window),
+                )
+                if len(rows) < window:
+                    break
+            else:
+                truncated = True
+
+        score = await correlator.calculate_risk_score(finding_data)
+
+        if truncated:
+            logger.warning(
+                f"threat_correlation finding={finding_id}: correlation cap hit; "
+                f"partial matches returned",
+            )
+        return {
+            "finding_found": True,
+            "finding_data": finding_data,
+            "ioc_correlations": ioc_correlations,
+            "incident_correlations": incident_correlations,
+            "risk_score": score,
+            "ioc_count": ioc_count,
+            "incident_count": incident_count,
+            "truncated": truncated,
+        }
+
+
 @shared_task(bind=True, max_retries=3)
 def threat_correlation(
     self,
@@ -717,110 +989,14 @@ def threat_correlation(
     try:
         logger.info(
             f"Correlating dark web finding (finding={finding_id}, "
-            f"org={organization_id})"
+            f"org={organization_id})",
         )
 
         correlator = ThreatIntelCorrelator()
 
-        async def _run_correlation() -> dict[str, Any]:
-            async with async_session_factory() as session:
-                # Load finding
-                finding = (
-                    await session.scalars(
-                        select(DarkWebFinding).where(DarkWebFinding.id == finding_id)
-                    )
-                ).first()
-                if finding is None:
-                    return {"finding_found": False}
-
-                affected = finding.affected_assets or {}
-                if isinstance(affected, str):
-                    try:
-                        import json as _json
-                        affected = _json.loads(affected)
-                    except Exception:  # noqa: BLE001
-                        affected = {}
-
-                finding_data = {
-                    "id": finding.id,
-                    "domain": affected.get("domain") if isinstance(affected, dict) else None,
-                    "ip": affected.get("ip") if isinstance(affected, dict) else None,
-                    "email": affected.get("email") if isinstance(affected, dict) else None,
-                    "hash": finding.raw_data_hash,
-                    "severity": finding.severity,
-                    "confidence_score": finding.confidence_score,
-                    "finding_type": finding.finding_type,
-                    "source_platform": finding.source_platform,
-                    "title": finding.title,
-                    "description": finding.description,
-                }
-
-                # Load recent IOCs (last 90 days) for this org
-                ioc_cutoff = datetime.now(timezone.utc) - timedelta(days=90)
-                ioc_stmt = select(IOC).where(
-                    (IOC.organization_id == organization_id)
-                    & (IOC.created_at >= ioc_cutoff)
-                )
-                iocs = list((await session.scalars(ioc_stmt)).all())
-                ioc_database = [
-                    {
-                        "id": i.id,
-                        "value": i.value,
-                        "type": i.indicator_type,
-                        "source": i.source,
-                        "threat_level": i.severity,
-                        "confidence": i.confidence,
-                    }
-                    for i in iocs
-                ]
-
-                # Load recent incidents (last 90 days) for this org
-                inc_cutoff = datetime.now(timezone.utc) - timedelta(days=90)
-                inc_stmt = select(Incident).where(
-                    Incident.created_at >= inc_cutoff
-                )
-                incidents = list((await session.scalars(inc_stmt)).all())
-
-                import json as _json
-                incident_database = []
-                for inc in incidents:
-                    iocs_list: list[str] = []
-                    if inc.indicators:
-                        try:
-                            parsed = _json.loads(inc.indicators)
-                            if isinstance(parsed, list):
-                                iocs_list = [str(x) for x in parsed]
-                        except Exception:  # noqa: BLE001
-                            pass
-                    incident_database.append(
-                        {
-                            "id": inc.id,
-                            "title": inc.title,
-                            "status": inc.status,
-                            "severity": inc.severity,
-                            "iocs": iocs_list,
-                        }
-                    )
-
-                ioc_corr = await correlator.correlate_with_iocs(
-                    finding_data, ioc_database
-                )
-                incident_corr = await correlator.correlate_with_incidents(
-                    finding_data, incident_database
-                )
-                score = await correlator.calculate_risk_score(finding_data)
-
-                return {
-                    "finding_found": True,
-                    "finding_data": finding_data,
-                    "ioc_correlations": ioc_corr,
-                    "incident_correlations": incident_corr,
-                    "risk_score": score,
-                    "ioc_count": len(ioc_database),
-                    "incident_count": len(incident_database),
-                }
-
-        result = asyncio.run(_run_correlation())
+        result = asyncio.run(
+            _threat_correlation_async(finding_id, organization_id, correlator),
+        )
 
         if not result.get("finding_found"):
             logger.warning(f"Threat correlation: finding {finding_id} not found")
@@ -831,6 +1007,7 @@ def threat_correlation(
                 "risk_score": 0,
                 "ioc_correlations": [],
                 "incident_correlations": [],
+                "truncated": False,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "status": "finding_not_found",
             }
@@ -842,7 +1019,7 @@ def threat_correlation(
         logger.info(
             f"Finding {finding_id} correlated: "
             f"{len(ioc_correlations)} IOC matches, "
-            f"risk_score={risk_score}"
+            f"risk_score={risk_score}",
         )
 
         return {
@@ -852,6 +1029,7 @@ def threat_correlation(
             "risk_score": risk_score,
             "ioc_correlations": ioc_correlations,
             "incident_correlations": incident_correlations,
+            "truncated": result["truncated"],
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "status": "completed",
         }

@@ -6,7 +6,6 @@ risk calculation, and exposure reporting.
 """
 
 import asyncio
-import json
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -14,7 +13,6 @@ import httpx
 from celery import shared_task
 from sqlalchemy import select, update
 
-from src.core.config import settings
 from src.core.database import async_session_factory
 from src.core.logging import get_logger
 
@@ -77,7 +75,7 @@ def _run_async(coro):
 # ---------------------------------------------------------------------------
 
 async def _run_asset_discovery_async(
-    organization_id: str, discovery_type: str = "siem"
+    organization_id: str, discovery_type: str = "siem",
 ) -> dict[str, Any]:
     """Discover assets from observed SIEM log traffic (or honestly decline
     network discovery, which needs an unconfigured active scanner)."""
@@ -101,8 +99,8 @@ async def _run_asset_discovery_async(
             "timestamp": now.isoformat(),
         }
 
-    from src.siem.models import LogEntry
     from src.exposure.models import ExposureAsset
+    from src.siem.models import LogEntry
 
     cutoff_iso = (now - timedelta(hours=24)).isoformat()
     created = 0
@@ -119,7 +117,7 @@ async def _run_asset_discovery_async(
         known_result = await session.stream(
             select(ExposureAsset.ip_address)
             .where(ExposureAsset.organization_id == organization_id)
-            .execution_options(yield_per=DISCOVERY_BATCH_SIZE)
+            .execution_options(yield_per=DISCOVERY_BATCH_SIZE),
         )
         async for chunk in known_result.scalars().partitions(DISCOVERY_BATCH_SIZE):
             known_ips.update(ip for ip in chunk if ip)
@@ -166,7 +164,7 @@ async def _run_asset_discovery_async(
                             "discovered_at": now.isoformat(),
                         },
                         organization_id=organization_id,
-                    )
+                    ),
                 )
                 created += 1
             # Drain the pending inserts (and the identity map) every window so
@@ -285,6 +283,126 @@ def run_asset_discovery(self, organization_id: str | None = None, discovery_type
         raise self.retry(exc=exc, countdown=min(2 ** self.request.retries, 600))
 
 
+# --------------------------------------------------------------------------
+# Memory bounds for the on-demand vulnerability-management tasks
+# --------------------------------------------------------------------------
+# run_vuln_scan / import_scanner_results / calculate_risk_scores /
+# check_sla_breaches used to load every matching scan_profiles /
+# exposure_scans / vulnerabilities / vulnerability_instances row as a full
+# ORM object with one `.scalars().all()` and commit once at the end
+# (calculate_risk_scores additionally loaded every instance of every CVE as
+# ORM objects, one SELECT per CVE). sync_kev_database ran one SELECT per KEV
+# entry and held every new indicator in one session.
+#
+# Each task now walks its table in keyset windows of VULN_BATCH_SIZE on the
+# primary key, selects only the columns it reads, writes with bulk UPDATEs
+# by id list, and commits + expunges per window. Every per-run cap that
+# fires sets ``truncated`` in the result; the remainder is picked up by the
+# next run.
+VULN_BATCH_SIZE = 1_000
+MAX_SCAN_PROFILES_PER_RUN = 50_000
+MAX_SCANNER_IMPORTS_PER_RUN = 50_000
+MAX_RISK_SCORE_VULNS_PER_RUN = 100_000
+MAX_SLA_INSTANCES_PER_RUN = 200_000
+MAX_KEV_ENTRIES_PER_RUN = 50_000
+
+# How many breached instance ids the SLA result carries (unchanged: 100).
+_SLA_BREACHED_IDS_IN_RESULT = 100
+
+_SEVERITY_BASE = {
+    "critical": 100.0,
+    "high": 75.0,
+    "medium": 50.0,
+    "low": 25.0,
+    "informational": 10.0,
+}
+_EXPLOIT_BONUS = {
+    "none": 0.0,
+    "poc": 5.0,
+    "functional": 10.0,
+    "weaponized": 20.0,
+}
+
+
+def _scan_profile_due(next_scan_date: str | None, now: datetime) -> bool:
+    """Same due rule as before: missing or unparseable dates are due."""
+    if not next_scan_date:
+        return True
+    try:
+        nsd = datetime.fromisoformat(next_scan_date)
+    except ValueError:
+        return True
+    if nsd.tzinfo is None:
+        nsd = nsd.replace(tzinfo=timezone.utc)
+    return nsd <= now
+
+
+def _vuln_risk_score(
+    severity: str | None, exploit_maturity: str | None, kev_listed: bool | None,
+) -> float:
+    """Severity baseline + exploit-maturity bonus (+15 for KEV), capped at 150."""
+    base = _SEVERITY_BASE.get((severity or "").lower(), 25.0)
+    bonus = _EXPLOIT_BONUS.get((exploit_maturity or "none").lower(), 0.0)
+    if kev_listed:
+        bonus += 15.0
+    return min(base + bonus, 150.0)
+
+
+async def _run_vuln_scan_async(organization_id: str | None = None) -> dict[str, Any]:
+    """Mark every due, enabled ScanProfile as executed (windowed)."""
+    from src.vulnmgmt.models import ScanProfile
+
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+    next_iso = (now + timedelta(days=1)).isoformat()
+    processed = 0
+    scanned = 0
+    cap_hit = False
+    last_id: str | None = None
+
+    async with async_session_factory() as session:
+        while scanned < MAX_SCAN_PROFILES_PER_RUN:
+            window = min(VULN_BATCH_SIZE, MAX_SCAN_PROFILES_PER_RUN - scanned)
+            stmt = select(ScanProfile.id, ScanProfile.next_scan_date).where(
+                ScanProfile.enabled == True,  # noqa: E712
+            )
+            if organization_id:
+                stmt = stmt.where(ScanProfile.organization_id == organization_id)
+            if last_id is not None:
+                stmt = stmt.where(ScanProfile.id > last_id)
+            rows = (await session.execute(stmt.order_by(ScanProfile.id).limit(window))).all()
+            if not rows:
+                break
+            last_id = rows[-1].id
+            scanned += len(rows)
+
+            due_ids = [r.id for r in rows if _scan_profile_due(r.next_scan_date, now)]
+            if due_ids:
+                await session.execute(
+                    update(ScanProfile)
+                    .where(ScanProfile.id.in_(due_ids))
+                    .values(last_scan_date=now_iso, next_scan_date=next_iso)
+                    .execution_options(synchronize_session=False),
+                )
+                processed += len(due_ids)
+            await session.commit()
+            session.expunge_all()
+
+            # Compare against the window actually requested: a short read on
+            # the last window before the cap means "exhausted", not "capped".
+            if len(rows) < window:
+                break
+        else:
+            cap_hit = True
+
+    if cap_hit:
+        logger.warning(
+            "run_vuln_scan hit per-run cap; remainder deferred to the next run",
+            cap=MAX_SCAN_PROFILES_PER_RUN,
+        )
+    return {"processed": processed, "truncated": cap_hit}
+
+
 @shared_task(bind=True, max_retries=3)
 def run_vuln_scan(self, organization_id: str | None = None) -> dict:
     """
@@ -301,46 +419,12 @@ def run_vuln_scan(self, organization_id: str | None = None) -> dict:
         Dictionary with dispatch summary
     """
     try:
-        from src.vulnmgmt.models import ScanProfile
-
-        async def _dispatch() -> int:
-            now = datetime.now(timezone.utc)
-            now_iso = now.isoformat()
-            next_iso = (now + timedelta(days=1)).isoformat()
-            processed = 0
-
-            async with async_session_factory() as session:
-                stmt = select(ScanProfile).where(ScanProfile.enabled == True)  # noqa: E712
-                if organization_id:
-                    stmt = stmt.where(ScanProfile.organization_id == organization_id)
-                result = await session.execute(stmt)
-                profiles = result.scalars().all()
-
-                for profile in profiles:
-                    due = True
-                    if profile.next_scan_date:
-                        try:
-                            nsd = datetime.fromisoformat(profile.next_scan_date)
-                            if nsd.tzinfo is None:
-                                nsd = nsd.replace(tzinfo=timezone.utc)
-                            due = nsd <= now
-                        except ValueError:
-                            due = True
-                    if not due:
-                        continue
-
-                    profile.last_scan_date = now_iso
-                    profile.next_scan_date = next_iso
-                    processed += 1
-
-                await session.commit()
-            return processed
-
-        processed = _run_async(_dispatch())
+        summary = _run_async(_run_vuln_scan_async(organization_id))
 
         result = {
             "organization_id": organization_id,
-            "profiles_processed": processed,
+            "profiles_processed": summary["processed"],
+            "truncated": summary["truncated"],
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
         logger.info("Vulnerability scan dispatch complete", **result)
@@ -353,6 +437,58 @@ def run_vuln_scan(self, organization_id: str | None = None) -> dict:
 
 # Backward-compatible alias used by existing callers
 run_vulnerability_scan = run_vuln_scan
+
+
+async def _import_scanner_results_async(
+    organization_id: str | None = None, scan_id: str | None = None,
+) -> dict[str, Any]:
+    """Flip pending ExposureScan rows to completed, in id windows."""
+    from src.exposure.models import ExposureScan
+
+    processed = 0
+    cap_hit = False
+    last_id: str | None = None
+
+    async with async_session_factory() as session:
+        while processed < MAX_SCANNER_IMPORTS_PER_RUN:
+            window = min(VULN_BATCH_SIZE, MAX_SCANNER_IMPORTS_PER_RUN - processed)
+            stmt = select(ExposureScan.id).where(ExposureScan.status == "pending")
+            if organization_id:
+                stmt = stmt.where(ExposureScan.organization_id == organization_id)
+            if scan_id:
+                stmt = stmt.where(ExposureScan.id == scan_id)
+            if last_id is not None:
+                stmt = stmt.where(ExposureScan.id > last_id)
+            ids = list(
+                (await session.execute(stmt.order_by(ExposureScan.id).limit(window))).scalars(),
+            )
+            if not ids:
+                break
+            last_id = ids[-1]
+
+            await session.execute(
+                update(ExposureScan)
+                .where(ExposureScan.id.in_(ids))
+                .values(status="completed", completed_at=datetime.now(timezone.utc))
+                .execution_options(synchronize_session=False),
+            )
+            processed += len(ids)
+            await session.commit()
+            session.expunge_all()
+
+            if len(ids) < window:
+                break
+        else:
+            cap_hit = True
+
+    if cap_hit:
+        logger.warning(
+            "import_scanner_results hit per-run cap; remainder deferred to the next run",
+            cap=MAX_SCANNER_IMPORTS_PER_RUN,
+        )
+    # The status flip is one UPDATE per window, so there is no per-row
+    # failure to count; errors stays 0 as it always was in practice.
+    return {"processed": processed, "errors": 0, "truncated": cap_hit}
 
 
 @shared_task(bind=True, max_retries=3)
@@ -373,42 +509,14 @@ def import_scanner_results(
         Dictionary with import summary
     """
     try:
-        from src.exposure.models import ExposureScan
-
-        async def _import() -> dict[str, int]:
-            processed = 0
-            errors = 0
-            async with async_session_factory() as session:
-                stmt = select(ExposureScan).where(ExposureScan.status == "pending")
-                if organization_id:
-                    stmt = stmt.where(ExposureScan.organization_id == organization_id)
-                if scan_id:
-                    stmt = stmt.where(ExposureScan.id == scan_id)
-                db_results = await session.execute(stmt)
-                scans = db_results.scalars().all()
-
-                for scan in scans:
-                    try:
-                        scan.status = "completed"
-                        scan.completed_at = datetime.now(timezone.utc)
-                        processed += 1
-                    except Exception as inner:
-                        logger.error(
-                            "Failed to process scan record",
-                            scan_id=scan.id,
-                            error=str(inner),
-                        )
-                        errors += 1
-                await session.commit()
-            return {"processed": processed, "errors": errors}
-
-        summary = _run_async(_import())
+        summary = _run_async(_import_scanner_results_async(organization_id, scan_id))
 
         result = {
             "scan_id": scan_id,
             "scanner": scanner,
             "scans_processed": summary["processed"],
             "errors": summary["errors"],
+            "truncated": summary["truncated"],
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -420,6 +528,70 @@ def import_scanner_results(
         raise self.retry(exc=exc, countdown=min(2 ** self.request.retries, 600))
 
 
+async def _calculate_risk_scores_async(organization_id: str | None = None) -> dict[str, Any]:
+    """Write each Vulnerability's computed score onto its instances.
+
+    Vulnerabilities are read in id windows (four columns, not ORM rows).
+    Instances are never loaded at all: one bulk UPDATE per distinct score in
+    the window sets ``risk_score`` on every instance of those CVEs, and the
+    UPDATE's matched-row count is the same "instances scored" number the
+    per-instance loop used to produce.
+    """
+    from src.vulnmgmt.models import Vulnerability, VulnerabilityInstance
+
+    scored = 0
+    vulns_seen = 0
+    cap_hit = False
+    last_id: str | None = None
+
+    async with async_session_factory() as session:
+        while vulns_seen < MAX_RISK_SCORE_VULNS_PER_RUN:
+            window = min(VULN_BATCH_SIZE, MAX_RISK_SCORE_VULNS_PER_RUN - vulns_seen)
+            stmt = select(
+                Vulnerability.id,
+                Vulnerability.severity,
+                Vulnerability.exploit_maturity,
+                Vulnerability.kev_listed,
+            )
+            if organization_id:
+                stmt = stmt.where(Vulnerability.organization_id == organization_id)
+            if last_id is not None:
+                stmt = stmt.where(Vulnerability.id > last_id)
+            rows = (await session.execute(stmt.order_by(Vulnerability.id).limit(window))).all()
+            if not rows:
+                break
+            last_id = rows[-1].id
+            vulns_seen += len(rows)
+
+            ids_by_score: dict[float, list[str]] = {}
+            for r in rows:
+                score = _vuln_risk_score(r.severity, r.exploit_maturity, r.kev_listed)
+                ids_by_score.setdefault(score, []).append(r.id)
+
+            for score, vuln_ids in ids_by_score.items():
+                res = await session.execute(
+                    update(VulnerabilityInstance)
+                    .where(VulnerabilityInstance.vulnerability_id.in_(vuln_ids))
+                    .values(risk_score=score)
+                    .execution_options(synchronize_session=False),
+                )
+                scored += res.rowcount or 0
+            await session.commit()
+            session.expunge_all()
+
+            if len(rows) < window:
+                break
+        else:
+            cap_hit = True
+
+    if cap_hit:
+        logger.warning(
+            "calculate_risk_scores hit per-run cap; remainder deferred to the next run",
+            cap=MAX_RISK_SCORE_VULNS_PER_RUN,
+        )
+    return {"scored": scored, "truncated": cap_hit}
+
+
 @shared_task(bind=True, max_retries=2)
 def calculate_risk_scores(self, organization_id: str | None = None) -> dict:
     """
@@ -429,55 +601,13 @@ def calculate_risk_scores(self, organization_id: str | None = None) -> dict:
     computed value to each Vulnerability's associated VulnerabilityInstance.risk_score
     records (Vulnerability rows don't have their own risk_score field).
     """
-    severity_base = {
-        "critical": 100.0,
-        "high": 75.0,
-        "medium": 50.0,
-        "low": 25.0,
-        "informational": 10.0,
-    }
-    exploit_bonus = {
-        "none": 0.0,
-        "poc": 5.0,
-        "functional": 10.0,
-        "weaponized": 20.0,
-    }
-
     try:
-        from src.vulnmgmt.models import Vulnerability, VulnerabilityInstance
-
-        async def _score() -> int:
-            scored = 0
-            async with async_session_factory() as session:
-                stmt = select(Vulnerability)
-                if organization_id:
-                    stmt = stmt.where(Vulnerability.organization_id == organization_id)
-                vulns = (await session.execute(stmt)).scalars().all()
-
-                for v in vulns:
-                    base = severity_base.get((v.severity or "").lower(), 25.0)
-                    bonus = exploit_bonus.get((v.exploit_maturity or "none").lower(), 0.0)
-                    if getattr(v, "kev_listed", False):
-                        bonus += 15.0
-                    score = min(base + bonus, 150.0)
-
-                    # Apply to each VulnerabilityInstance for this CVE.
-                    inst_stmt = select(VulnerabilityInstance).where(
-                        VulnerabilityInstance.vulnerability_id == v.id
-                    )
-                    instances = (await session.execute(inst_stmt)).scalars().all()
-                    for inst in instances:
-                        inst.risk_score = score
-                        scored += 1
-
-                await session.commit()
-            return scored
-
-        scored = _run_async(_score())
+        summary = _run_async(_calculate_risk_scores_async(organization_id))
 
         result = {
             "organization_id": organization_id,
-            "instances_scored": scored,
+            "instances_scored": summary["scored"],
+            "truncated": summary["truncated"],
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -489,6 +619,100 @@ def calculate_risk_scores(self, organization_id: str | None = None) -> dict:
         raise self.retry(exc=exc, countdown=300)
 
 
+async def _check_sla_breaches_async(organization_id: str | None = None) -> dict[str, Any]:
+    """Flag open instances whose remediation deadline has passed (windowed).
+
+    Rows already ``breached`` or without a deadline are filtered in SQL (the
+    old loop skipped them in Python). The rest are read as three columns per
+    window, flipped with one bulk UPDATE, and get their TicketActivity rows
+    in the same per-window commit.
+    """
+    from sqlalchemy import or_
+
+    from src.tickethub.models import TicketActivity
+    from src.vulnmgmt.models import VulnerabilityInstance as VI
+
+    now = datetime.now(timezone.utc)
+    breached_count = 0
+    breached_sample: list[str] = []
+    scanned = 0
+    cap_hit = False
+    last_id: str | None = None
+
+    async with async_session_factory() as session:
+        while scanned < MAX_SLA_INSTANCES_PER_RUN:
+            window = min(VULN_BATCH_SIZE, MAX_SLA_INSTANCES_PER_RUN - scanned)
+            stmt = select(VI.id, VI.remediation_deadline, VI.organization_id).where(
+                VI.status.notin_(["closed", "remediated", "accepted"]),
+                VI.remediation_deadline.isnot(None),
+                or_(VI.sla_status.is_(None), VI.sla_status != "breached"),
+            )
+            if organization_id:
+                stmt = stmt.where(VI.organization_id == organization_id)
+            if last_id is not None:
+                stmt = stmt.where(VI.id > last_id)
+            rows = (await session.execute(stmt.order_by(VI.id).limit(window))).all()
+            if not rows:
+                break
+            last_id = rows[-1].id
+            scanned += len(rows)
+
+            window_breached: list[Any] = []
+            for r in rows:
+                if not r.remediation_deadline:
+                    continue
+                try:
+                    due = datetime.fromisoformat(r.remediation_deadline)
+                except ValueError:
+                    continue
+                if due.tzinfo is None:
+                    due = due.replace(tzinfo=timezone.utc)
+                if due < now:
+                    window_breached.append(r)
+
+            if window_breached:
+                await session.execute(
+                    update(VI)
+                    .where(VI.id.in_([r.id for r in window_breached]))
+                    .values(sla_status="breached")
+                    .execution_options(synchronize_session=False),
+                )
+                session.add_all(
+                    [
+                        TicketActivity(
+                            source_type="vulnerability_instance",
+                            source_id=r.id,
+                            activity_type="sla_breach",
+                            description=f"SLA breached: deadline {r.remediation_deadline} passed",
+                            organization_id=r.organization_id,
+                        )
+                        for r in window_breached
+                    ],
+                )
+                breached_count += len(window_breached)
+                room = _SLA_BREACHED_IDS_IN_RESULT - len(breached_sample)
+                if room > 0:
+                    breached_sample.extend(r.id for r in window_breached[:room])
+            await session.commit()
+            session.expunge_all()
+
+            if len(rows) < window:
+                break
+        else:
+            cap_hit = True
+
+    if cap_hit:
+        logger.warning(
+            "check_sla_breaches hit per-run cap; remainder deferred to the next run",
+            cap=MAX_SLA_INSTANCES_PER_RUN,
+        )
+    return {
+        "breached_count": breached_count,
+        "breached_instances": breached_sample,
+        "truncated": cap_hit,
+    }
+
+
 @shared_task(bind=True, max_retries=2)
 def check_sla_breaches(self, organization_id: str | None = None) -> dict:
     """
@@ -498,61 +722,126 @@ def check_sla_breaches(self, organization_id: str | None = None) -> dict:
     status is not yet "closed"/"remediated". Also logs a TicketActivity entry.
     """
     try:
-        from src.tickethub.models import TicketActivity
-        from src.vulnmgmt.models import VulnerabilityInstance
-
-        async def _check() -> list[str]:
-            breached: list[str] = []
-            now = datetime.now(timezone.utc)
-
-            async with async_session_factory() as session:
-                stmt = select(VulnerabilityInstance).where(
-                    VulnerabilityInstance.status.notin_(["closed", "remediated", "accepted"])
-                )
-                if organization_id:
-                    stmt = stmt.where(VulnerabilityInstance.organization_id == organization_id)
-                instances = (await session.execute(stmt)).scalars().all()
-
-                for inst in instances:
-                    if not inst.remediation_deadline:
-                        continue
-                    try:
-                        due = datetime.fromisoformat(inst.remediation_deadline)
-                        if due.tzinfo is None:
-                            due = due.replace(tzinfo=timezone.utc)
-                    except ValueError:
-                        continue
-
-                    if due < now and inst.sla_status != "breached":
-                        inst.sla_status = "breached"
-                        breached.append(inst.id)
-                        activity = TicketActivity(
-                            source_type="vulnerability_instance",
-                            source_id=inst.id,
-                            activity_type="sla_breach",
-                            description=f"SLA breached: deadline {inst.remediation_deadline} passed",
-                            organization_id=inst.organization_id,
-                        )
-                        session.add(activity)
-
-                await session.commit()
-            return breached
-
-        breached = _run_async(_check())
+        summary = _run_async(_check_sla_breaches_async(organization_id))
 
         result = {
             "organization_id": organization_id,
-            "breached_count": len(breached),
-            "breached_instances": breached[:100],
+            "breached_count": summary["breached_count"],
+            "breached_instances": summary["breached_instances"],
+            "truncated": summary["truncated"],
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
-        logger.info("SLA breach check complete", breached_count=len(breached))
+        logger.info("SLA breach check complete", breached_count=summary["breached_count"])
         return result
 
     except Exception as exc:
         logger.error("SLA breach check failed", error=str(exc), exc_info=True)
         raise self.retry(exc=exc, countdown=300)
+
+
+KEV_FEED_URL = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
+
+
+async def _fetch_kev_catalog() -> dict[str, Any] | None:
+    """Fetch the public KEV JSON; None (logged) on any fetch failure."""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(KEV_FEED_URL)
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as fetch_err:
+        logger.warning("KEV feed fetch failed; skipping sync", error=str(fetch_err))
+        return None
+
+
+async def _sync_kev_database_async() -> dict[str, Any]:
+    """Upsert each KEV CVE as a ``cve`` ThreatIndicator, one window at a time.
+
+    One ``value IN (...)`` lookup per window instead of one SELECT per entry,
+    and a commit + expunge per window instead of one session holding every
+    new indicator.
+    """
+    from src.intel.models import ThreatIndicator
+
+    data = await _fetch_kev_catalog()
+    if data is None:
+        return {"updated": 0, "created": 0, "fetched": 0, "truncated": False}
+
+    vulns = data.get("vulnerabilities", []) or []
+    entries = [e for e in vulns if isinstance(e, dict) and e.get("cveID")]
+    cap_hit = len(entries) > MAX_KEV_ENTRIES_PER_RUN
+    if cap_hit:
+        logger.warning(
+            "sync_kev_database hit per-run cap; remainder deferred to the next run",
+            cap=MAX_KEV_ENTRIES_PER_RUN,
+            entries=len(entries),
+        )
+        entries = entries[:MAX_KEV_ENTRIES_PER_RUN]
+
+    updated = 0
+    created = 0
+    async with async_session_factory() as session:
+        for offset in range(0, len(entries), VULN_BATCH_SIZE):
+            chunk = entries[offset : offset + VULN_BATCH_SIZE]
+            cve_ids = sorted({e["cveID"] for e in chunk})
+            existing_rows = (
+                await session.execute(
+                    select(ThreatIndicator)
+                    .where(
+                        ThreatIndicator.value.in_(cve_ids),
+                        ThreatIndicator.indicator_type == "cve",
+                    )
+                    .order_by(ThreatIndicator.id),
+                )
+            ).scalars()
+            by_value: dict[str, list[Any]] = {}
+            for row in existing_rows:
+                by_value.setdefault(row.value, []).append(row)
+
+            for entry in chunk:
+                cve_id = entry["cveID"]
+                description = entry.get("shortDescription") or entry.get("vulnerabilityName")
+                source_ref = entry.get("vendorProject")
+                matches = by_value.get(cve_id)
+                if matches:
+                    for existing in matches:
+                        existing.is_active = True
+                        existing.severity = "high"
+                        existing.source = "CISA KEV"
+                        ctx = dict(existing.context) if isinstance(existing.context, dict) else {}
+                        if description:
+                            ctx["description"] = description
+                        if source_ref:
+                            ctx["source_reference"] = source_ref
+                        ctx["source_url"] = KEV_FEED_URL
+                        existing.context = ctx
+                    updated += 1
+                else:
+                    ioc = ThreatIndicator(
+                        value=cve_id,
+                        indicator_type="cve",
+                        is_active=True,
+                        is_whitelisted=False,
+                        severity="high",
+                        confidence=95,
+                        source="CISA KEV",
+                        context={
+                            "description": description,
+                            "source_url": KEV_FEED_URL,
+                            "source_reference": source_ref,
+                        },
+                    )
+                    session.add(ioc)
+                    # A CVE listed twice in one feed updates the row it just
+                    # created, exactly as the per-entry SELECT (autoflush) did.
+                    by_value[cve_id] = [ioc]
+                    created += 1
+
+            await session.commit()
+            session.expunge_all()
+
+    return {"updated": updated, "created": created, "fetched": len(vulns), "truncated": cap_hit}
 
 
 @shared_task(bind=True, max_retries=3)
@@ -563,83 +852,15 @@ def sync_kev_database(self, organization_id: str | None = None) -> dict:
     Fetches the public KEV JSON feed and upserts each listed CVE as an IOC
     record. A fetch failure is logged as a warning but does not crash the task.
     """
-    kev_url = "https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json"
-
     try:
-        from src.intel.models import ThreatIndicator
-
-        async def _sync() -> dict[str, int]:
-            updated = 0
-            created = 0
-            try:
-                async with httpx.AsyncClient(timeout=30.0) as client:
-                    resp = await client.get(kev_url)
-                    resp.raise_for_status()
-                    data = resp.json()
-            except Exception as fetch_err:  # noqa: BLE001
-                logger.warning(
-                    "KEV feed fetch failed; skipping sync",
-                    error=str(fetch_err),
-                )
-                return {"updated": 0, "created": 0, "fetched": 0}
-
-            vulns = data.get("vulnerabilities", []) or []
-
-            async with async_session_factory() as session:
-                for entry in vulns:
-                    cve_id = entry.get("cveID")
-                    if not cve_id:
-                        continue
-
-                    stmt = select(ThreatIndicator).where(
-                        ThreatIndicator.value == cve_id,
-                        ThreatIndicator.indicator_type == "cve",
-                    )
-                    existing = (await session.execute(stmt)).scalar_one_or_none()
-
-                    description = entry.get("shortDescription") or entry.get("vulnerabilityName")
-                    source_ref = entry.get("vendorProject")
-
-                    if existing:
-                        existing.is_active = True
-                        existing.severity = "high"
-                        existing.source = "CISA KEV"
-                        ctx = dict(existing.context) if isinstance(existing.context, dict) else {}
-                        if description:
-                            ctx["description"] = description
-                        if source_ref:
-                            ctx["source_reference"] = source_ref
-                        ctx["source_url"] = kev_url
-                        existing.context = ctx
-                        updated += 1
-                    else:
-                        ioc = ThreatIndicator(
-                            value=cve_id,
-                            indicator_type="cve",
-                            is_active=True,
-                            is_whitelisted=False,
-                            severity="high",
-                            confidence=95,
-                            source="CISA KEV",
-                            context={
-                                "description": description,
-                                "source_url": kev_url,
-                                "source_reference": source_ref,
-                            },
-                        )
-                        session.add(ioc)
-                        created += 1
-
-                await session.commit()
-            return {"updated": updated, "created": created, "fetched": len(vulns)}
-
-        summary = _run_async(_sync())
+        summary = _run_async(_sync_kev_database_async())
 
         result = {
             "status": "completed",
             "vulnerabilities_fetched": summary["fetched"],
             "iocs_updated": summary["updated"],
             "iocs_created": summary["created"],
+            "truncated": summary["truncated"],
             "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
@@ -673,7 +894,7 @@ def generate_exposure_report(self, organization_id: str, report_format: str = "p
             format=report_format,
         )
         result = _run_async(
-            _generate_exposure_report_async(organization_id, report_format)
+            _generate_exposure_report_async(organization_id, report_format),
         )
         logger.info(
             "Exposure report generation complete",
@@ -689,15 +910,16 @@ def generate_exposure_report(self, organization_id: str, report_format: str = "p
 
 
 async def _generate_exposure_report_async(
-    organization_id: str, report_format: str = "pdf"
+    organization_id: str, report_format: str = "pdf",
 ) -> dict[str, Any]:
     """Compile a real exposure report (asset inventory, vuln summary,
     remediation progress, top risky assets) from the org's rows."""
     from sqlalchemy import func
+
     from src.exposure.models import (
+        AssetVulnerability,
         ExposureAsset,
         ExposureVulnerability,
-        AssetVulnerability,
         RemediationTicket,
     )
 
@@ -706,21 +928,21 @@ async def _generate_exposure_report_async(
         # --- Asset inventory ---
         total_assets = (await session.execute(
             select(func.count(ExposureAsset.id)).where(
-                ExposureAsset.organization_id == organization_id
-            )
+                ExposureAsset.organization_id == organization_id,
+            ),
         )).scalar() or 0
         internet_facing = (await session.execute(
             select(func.count(ExposureAsset.id)).where(
                 ExposureAsset.organization_id == organization_id,
                 ExposureAsset.is_internet_facing == True,  # noqa: E712
-            )
+            ),
         )).scalar() or 0
 
         # --- Vulnerability summary by severity ---
         sev_rows = (await session.execute(
             select(ExposureVulnerability.severity, func.count(ExposureVulnerability.id))
             .where(ExposureVulnerability.organization_id == organization_id)
-            .group_by(ExposureVulnerability.severity)
+            .group_by(ExposureVulnerability.severity),
         )).all()
         vulns_by_severity = {sev or "unknown": n for sev, n in sev_rows}
 
@@ -728,7 +950,7 @@ async def _generate_exposure_report_async(
         inst_rows = (await session.execute(
             select(AssetVulnerability.status, func.count(AssetVulnerability.id))
             .where(AssetVulnerability.organization_id == organization_id)
-            .group_by(AssetVulnerability.status)
+            .group_by(AssetVulnerability.status),
         )).all()
         instances_by_status = {st or "unknown": n for st, n in inst_rows}
 
@@ -737,13 +959,13 @@ async def _generate_exposure_report_async(
             select(func.count(RemediationTicket.id)).where(
                 RemediationTicket.organization_id == organization_id,
                 RemediationTicket.status != "resolved",
-            )
+            ),
         )).scalar() or 0
         sla_breached = (await session.execute(
             select(func.count(RemediationTicket.id)).where(
                 RemediationTicket.organization_id == organization_id,
                 RemediationTicket.sla_breach == True,  # noqa: E712
-            )
+            ),
         )).scalar() or 0
 
         # --- Top risky assets ---
@@ -751,7 +973,7 @@ async def _generate_exposure_report_async(
             select(ExposureAsset)
             .where(ExposureAsset.organization_id == organization_id)
             .order_by(ExposureAsset.risk_score.desc())
-            .limit(5)
+            .limit(5),
         )).scalars().all()
         top_risky = [
             {
@@ -838,9 +1060,9 @@ async def _detect_attack_surface_changes_async(organization_id: str) -> dict[str
     """Diff the org's current attack surface (active assets + open vulns)
     against the last stored snapshot, then persist a new snapshot."""
     from src.exposure.models import (
-        ExposureAsset,
         AssetVulnerability,
         AttackSurface,
+        ExposureAsset,
     )
 
     now = datetime.now(timezone.utc)
@@ -858,7 +1080,7 @@ async def _detect_attack_surface_changes_async(organization_id: str) -> dict[str
                 ExposureAsset.is_active == True,  # noqa: E712
             )
             .limit(MAX_SNAPSHOT_KEYS + 1)
-            .execution_options(yield_per=DISCOVERY_BATCH_SIZE)
+            .execution_options(yield_per=DISCOVERY_BATCH_SIZE),
         )
         async for chunk in asset_result.partitions(DISCOVERY_BATCH_SIZE):
             current_assets.update((ip or host) for ip, host in chunk if (ip or host))
@@ -871,7 +1093,7 @@ async def _detect_attack_surface_changes_async(organization_id: str) -> dict[str
                 AssetVulnerability.status == "open",
             )
             .limit(MAX_SNAPSHOT_KEYS + 1)
-            .execution_options(yield_per=DISCOVERY_BATCH_SIZE)
+            .execution_options(yield_per=DISCOVERY_BATCH_SIZE),
         )
         async for chunk in vuln_result.partitions(DISCOVERY_BATCH_SIZE):
             current_vulns.update(f"{aid}:{vid}" for aid, vid in chunk)
@@ -900,7 +1122,7 @@ async def _detect_attack_surface_changes_async(organization_id: str) -> dict[str
                 AttackSurface.surface_type == "snapshot",
             )
             .order_by(AttackSurface.last_assessed_at.desc())
-            .limit(1)
+            .limit(1),
         )).scalars().first()
 
         is_baseline = previous is None

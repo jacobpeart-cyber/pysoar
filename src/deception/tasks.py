@@ -4,9 +4,10 @@ Celery tasks for Deception Technology module.
 Asynchronous tasks for monitoring, analyzing, and managing deception infrastructure.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime
 
 from celery import shared_task
+
 from src.core.logging import get_logger
 from src.deception.engine import InteractionAnalyzer
 
@@ -30,7 +31,7 @@ def monitor_decoy_interactions(self):
 
         interaction_count = 0
         logger.info(
-            f"Monitored decoy interactions",
+            "Monitored decoy interactions",
             extra={"new_interactions": interaction_count},
         )
 
@@ -59,7 +60,7 @@ def rotate_honey_tokens(self):
 
         tokens_rotated = 0
         logger.info(
-            f"Rotated honey tokens",
+            "Rotated honey tokens",
             extra={"tokens_rotated": tokens_rotated},
         )
 
@@ -87,7 +88,7 @@ def check_token_canaries(self):
 
         triggered_count = 0
         logger.info(
-            f"Checked token canaries",
+            "Checked token canaries",
             extra={"triggered_tokens": triggered_count},
         )
 
@@ -117,7 +118,7 @@ def analyze_new_interactions(self):
 
         analyzed_count = 0
         logger.info(
-            f"Analyzed new interactions",
+            "Analyzed new interactions",
             extra={"interactions_analyzed": analyzed_count},
         )
 
@@ -147,7 +148,7 @@ def update_campaign_stats(self):
 
         campaigns_updated = 0
         logger.info(
-            f"Updated campaign statistics",
+            "Updated campaign statistics",
             extra={"campaigns_updated": campaigns_updated},
         )
 
@@ -177,7 +178,7 @@ def deploy_scheduled_decoys(self):
 
         deployed_count = 0
         logger.info(
-            f"Deployed scheduled decoys",
+            "Deployed scheduled decoys",
             extra={"decoys_deployed": deployed_count},
         )
 
@@ -208,7 +209,7 @@ def cleanup_expired_tokens(self):
 
         cleaned_count = 0
         logger.info(
-            f"Cleaned up expired tokens",
+            "Cleaned up expired tokens",
             extra={"tokens_cleaned": cleaned_count},
         )
 
@@ -229,6 +230,7 @@ def cleanup_expired_tokens(self):
 # ---------------------------------------------------------------------------
 
 import asyncio
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
@@ -241,64 +243,121 @@ _engine = create_async_engine(settings.database_url, echo=False, poolclass=NullP
 _AsyncSessionLocal = sessionmaker(_engine, class_=AsyncSession, expire_on_commit=False)
 
 
+# Memory bounds: the reconcile used to load every deploying honeypot as an
+# ORM row in one ``.scalars().all()`` and run two point SELECTs per decoy
+# under a single commit. It now walks deploying honeypots in keyset windows
+# on the primary key, resolves each window's agent results / commands with
+# one ``IN (...)`` lookup each, and commits + expunges per window.
+RECONCILE_BATCH_SIZE = 1_000
+MAX_RECONCILE_DECOYS_PER_RUN = 20_000
+
+
 async def _reconcile_honeypot_dispatches() -> dict:
     from src.agents.models import AgentCommand, AgentResult
     from src.deception.models import Decoy
 
+    activated = failed = pending = 0
+    scanned = 0
+    cap_hit = False
+    last_id: str | None = None
+
     async with _AsyncSessionLocal() as db:
-        decoys = (
-            await db.execute(
-                select(Decoy).where(
-                    Decoy.decoy_type == "honeypot",
-                    Decoy.status == "deploying",
-                )
+        while scanned < MAX_RECONCILE_DECOYS_PER_RUN:
+            window = min(RECONCILE_BATCH_SIZE, MAX_RECONCILE_DECOYS_PER_RUN - scanned)
+            stmt = select(Decoy).where(
+                Decoy.decoy_type == "honeypot",
+                Decoy.status == "deploying",
             )
-        ).scalars().all()
+            if last_id is not None:
+                stmt = stmt.where(Decoy.id > last_id)
+            decoys = list(
+                (await db.execute(stmt.order_by(Decoy.id).limit(window))).scalars(),
+            )
+            if not decoys:
+                break
+            last_id = decoys[-1].id
+            scanned += len(decoys)
 
-        activated = failed = pending = 0
-        for decoy in decoys:
-            config = dict(decoy.configuration or {})
-            listener = dict(config.get("listener") or {})
-            command_id = listener.get("command_id")
-            if not command_id:
-                continue
-
-            result = (
-                await db.execute(
-                    select(AgentResult).where(AgentResult.command_id == command_id)
-                )
-            ).scalar_one_or_none()
-
-            if result is not None:
-                if result.status == "success":
-                    decoy.status = "active"
-                    listener["state"] = "listening"
-                    activated += 1
-                else:
-                    decoy.status = "failed"
-                    listener["state"] = "failed"
-                    listener["error"] = (result.stderr or result.status or "")[:300]
-                    failed += 1
-            else:
-                cmd = (
+            command_ids = {
+                (dict((d.configuration or {}).get("listener") or {})).get("command_id")
+                for d in decoys
+            }
+            command_ids.discard(None)
+            results_by_command: dict[str, Any] = {}
+            commands_by_id: dict[str, str] = {}
+            if command_ids:
+                for row in (
                     await db.execute(
-                        select(AgentCommand).where(AgentCommand.id == command_id)
+                        select(
+                            AgentResult.command_id,
+                            AgentResult.status,
+                            AgentResult.stderr,
+                        ).where(AgentResult.command_id.in_(sorted(command_ids))),
                     )
-                ).scalar_one_or_none()
-                if cmd is not None and cmd.status in ("rejected", "expired", "failed"):
-                    decoy.status = "failed"
-                    listener["state"] = "failed"
-                    listener["error"] = f"command {cmd.status}"
-                    failed += 1
-                else:
-                    pending += 1
+                ).all():
+                    results_by_command.setdefault(row.command_id, row)
+                without_result = sorted(command_ids - set(results_by_command))
+                if without_result:
+                    for row in (
+                        await db.execute(
+                            select(AgentCommand.id, AgentCommand.status).where(
+                                AgentCommand.id.in_(without_result),
+                            ),
+                        )
+                    ).all():
+                        commands_by_id[row.id] = row.status
+
+            for decoy in decoys:
+                config = dict(decoy.configuration or {})
+                listener = dict(config.get("listener") or {})
+                command_id = listener.get("command_id")
+                if not command_id:
                     continue
 
-            config["listener"] = listener
-            decoy.configuration = config
+                result = results_by_command.get(command_id)
+                if result is not None:
+                    if result.status == "success":
+                        decoy.status = "active"
+                        listener["state"] = "listening"
+                        activated += 1
+                    else:
+                        decoy.status = "failed"
+                        listener["state"] = "failed"
+                        listener["error"] = (result.stderr or result.status or "")[:300]
+                        failed += 1
+                else:
+                    cmd_status = commands_by_id.get(command_id)
+                    if cmd_status in ("rejected", "expired", "failed"):
+                        decoy.status = "failed"
+                        listener["state"] = "failed"
+                        listener["error"] = f"command {cmd_status}"
+                        failed += 1
+                    else:
+                        pending += 1
+                        continue
 
-        await db.commit()
-        return {"activated": activated, "failed": failed, "pending": pending}
+                config["listener"] = listener
+                decoy.configuration = config
+
+            await db.commit()
+            db.expunge_all()
+
+            if len(decoys) < window:
+                break
+        else:
+            cap_hit = True
+
+    if cap_hit:
+        logger.warning(
+            "reconcile_honeypot_dispatches hit per-run cap; remainder deferred",
+            extra={"cap": MAX_RECONCILE_DECOYS_PER_RUN},
+        )
+    return {
+        "activated": activated,
+        "failed": failed,
+        "pending": pending,
+        "truncated": cap_hit,
+    }
 
 
 @shared_task(name="deception.reconcile_honeypot_dispatches")

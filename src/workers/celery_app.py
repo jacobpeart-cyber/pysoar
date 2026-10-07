@@ -1,8 +1,7 @@
 """Celery application configuration"""
 
-from celery.schedules import crontab
-
 from celery import Celery
+from celery.schedules import crontab
 from kombu import Queue
 
 from src.core.config import settings
@@ -137,6 +136,10 @@ _HEAVY_SWEEP_LIMITS = {
     "soft_time_limit": 900,  # 15 min
     "time_limit": 960,
 }
+_NETWORK_SWEEP_LIMITS = {
+    "soft_time_limit": 1800,  # 30 min
+    "time_limit": 1860,
+}
 celery_app.conf.task_annotations = {
     "src.agentic.tasks.run_investigation": {
         "soft_time_limit": 900,
@@ -158,6 +161,32 @@ celery_app.conf.task_annotations = {
     "siem.poll_cloud_integrations": dict(_HEAVY_SWEEP_LIMITS),
     "src.itdr.tasks.scheduled_identity_threat_sweep": dict(_HEAVY_SWEEP_LIMITS),
     "src.supplychain.tasks.supplychain_cross_org_sweep": dict(_HEAVY_SWEEP_LIMITS),
+    # Round 2 of the memory bounding: these tasks now page their tables in
+    # fixed windows with per-run caps; the wall clock is the backstop.
+    "src.stig.tasks.scheduled_fleet_stig_sweep": dict(_HEAVY_SWEEP_LIMITS),
+    # run_stig_scan polls agent results for up to 600 s by design.
+    "src.stig.tasks.run_stig_scan": dict(_HEAVY_SWEEP_LIMITS),
+    "src.stig.tasks.auto_remediate_findings": dict(_HEAVY_SWEEP_LIMITS),
+    "src.integrations.tasks.rate_limit_reset": dict(_HEAVY_SWEEP_LIMITS),
+    "src.integrations.tasks.connector_update_check": dict(_HEAVY_SWEEP_LIMITS),
+    "src.supplychain.tasks.vulnerability_cross_reference": dict(_HEAVY_SWEEP_LIMITS),
+    "src.supplychain.tasks.vendor_certification_expiry_check": dict(_HEAVY_SWEEP_LIMITS),
+    "src.supplychain.tasks.typosquatting_scan": dict(_HEAVY_SWEEP_LIMITS),
+    "src.darkweb.tasks.credential_leak_check": dict(_HEAVY_SWEEP_LIMITS),
+    "src.darkweb.tasks.threat_correlation": dict(_HEAVY_SWEEP_LIMITS),
+    "deception.reconcile_honeypot_dispatches": dict(_HEAVY_SWEEP_LIMITS),
+    "playbooks.check_scheduled_playbooks": dict(_HEAVY_SWEEP_LIMITS),
+    "src.exposure.tasks.run_vuln_scan": dict(_HEAVY_SWEEP_LIMITS),
+    "src.exposure.tasks.import_scanner_results": dict(_HEAVY_SWEEP_LIMITS),
+    "src.exposure.tasks.calculate_risk_scores": dict(_HEAVY_SWEEP_LIMITS),
+    "src.exposure.tasks.check_sla_breaches": dict(_HEAVY_SWEEP_LIMITS),
+    "src.exposure.tasks.sync_kev_database": dict(_HEAVY_SWEEP_LIMITS),
+    # These two make one outbound network call per row (a full dark-web
+    # scan per monitor / an HTTP probe per integration), so a 15-minute
+    # ceiling would cut off legitimate work; they get 30 minutes, still
+    # well inside the global hour.
+    "src.darkweb.tasks.darkweb_cross_org_sweep": dict(_NETWORK_SWEEP_LIMITS),
+    "src.integrations.tasks.health_check_all_integrations": dict(_NETWORK_SWEEP_LIMITS),
 }
 
 # Beat schedule for periodic tasks

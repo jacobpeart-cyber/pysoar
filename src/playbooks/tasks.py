@@ -27,7 +27,7 @@ from typing import Any, Optional
 
 from celery import shared_task
 from celery.schedules import crontab
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
@@ -112,60 +112,103 @@ def schedule_is_due(
 # Scheduler sweep
 # ---------------------------------------------------------------------------
 
+# Memory bounds: this beat task runs every minute. It used to load every
+# enabled scheduled playbook as a full ORM row (steps JSON and all) with one
+# ``.scalars().all()`` and then run one "latest execution" SELECT per
+# playbook. It now pages (id, trigger_conditions) in keyset windows on the
+# primary key and resolves each window's latest schedule run with a single
+# grouped ``MAX(created_at)`` lookup.
+SCHEDULE_SWEEP_BATCH_SIZE = 1_000
+MAX_SCHEDULED_PLAYBOOKS_PER_SWEEP = 20_000
+
+
 async def sweep_scheduled_playbooks(db: AsyncSession) -> dict[str, Any]:
     """Find due scheduled playbooks, create executions, dispatch the runner.
 
     Per-playbook try/except: one broken playbook must not starve the rest.
     """
     now = datetime.now(timezone.utc).replace(tzinfo=None)  # created_at is naive UTC
-    result = await db.execute(
-        select(Playbook).where(
+    executed = 0
+    checked = 0
+    cap_hit = False
+    last_id: Optional[str] = None
+
+    while checked < MAX_SCHEDULED_PLAYBOOKS_PER_SWEEP:
+        window = min(SCHEDULE_SWEEP_BATCH_SIZE, MAX_SCHEDULED_PLAYBOOKS_PER_SWEEP - checked)
+        stmt = select(Playbook.id, Playbook.trigger_conditions).where(
             Playbook.trigger_type == PlaybookTrigger.SCHEDULED.value,
             Playbook.is_enabled == True,  # noqa: E712
         )
-    )
-    playbooks = result.scalars().all()
+        if last_id is not None:
+            stmt = stmt.where(Playbook.id > last_id)
+        rows = (await db.execute(stmt.order_by(Playbook.id).limit(window))).all()
+        if not rows:
+            break
+        last_id = rows[-1].id
+        checked += len(rows)
 
-    executed = 0
-    for pb in playbooks:
-        try:
-            try:
-                conditions = json.loads(pb.trigger_conditions) if pb.trigger_conditions else None
-            except json.JSONDecodeError:
-                logger.warning("Unparseable trigger_conditions", playbook_id=pb.id)
-                continue
-
-            last = (
+        last_runs: dict[str, Any] = dict(
+            (
                 await db.execute(
-                    select(PlaybookExecution)
+                    select(
+                        PlaybookExecution.playbook_id,
+                        func.max(PlaybookExecution.created_at),
+                    )
                     .where(
-                        PlaybookExecution.playbook_id == pb.id,
+                        PlaybookExecution.playbook_id.in_([r.id for r in rows]),
                         PlaybookExecution.trigger_source == "schedule",
                     )
-                    .order_by(PlaybookExecution.created_at.desc())
-                    .limit(1)
+                    .group_by(PlaybookExecution.playbook_id),
                 )
-            ).scalar_one_or_none()
+            ).all(),
+        )
 
-            if not schedule_is_due(conditions, last.created_at if last else None, now):
-                continue
+        for pb_id, trigger_conditions in rows:
+            try:
+                try:
+                    conditions = json.loads(trigger_conditions) if trigger_conditions else None
+                except json.JSONDecodeError:
+                    logger.warning("Unparseable trigger_conditions", playbook_id=pb_id)
+                    continue
 
-            execution = PlaybookExecution(
-                playbook_id=pb.id,
-                status=ExecutionStatus.PENDING.value,
-                trigger_source="schedule",
-                input_data=json.dumps({"scheduled_at": now.isoformat()}),
-            )
-            db.add(execution)
-            await db.commit()
-            run_playbook_execution.delay(execution.id)
-            executed += 1
-            logger.info("Dispatched scheduled playbook", playbook_id=pb.id, execution_id=execution.id)
-        except Exception as exc:
-            logger.error("Scheduled-playbook sweep failed for playbook", playbook_id=pb.id, error=str(exc))
-            await db.rollback()
+                if not schedule_is_due(conditions, last_runs.get(pb_id), now):
+                    continue
 
-    return {"executed": executed, "checked": len(playbooks), "task": "check_scheduled_playbooks"}
+                execution = PlaybookExecution(
+                    playbook_id=pb_id,
+                    status=ExecutionStatus.PENDING.value,
+                    trigger_source="schedule",
+                    input_data=json.dumps({"scheduled_at": now.isoformat()}),
+                )
+                db.add(execution)
+                await db.commit()
+                execution_id = execution.id
+                # Don't let a long sweep accumulate every new execution in
+                # the (caller's) identity map.
+                db.expunge(execution)
+                run_playbook_execution.delay(execution_id)
+                executed += 1
+                logger.info("Dispatched scheduled playbook", playbook_id=pb_id, execution_id=execution_id)
+            except Exception as exc:
+                logger.error("Scheduled-playbook sweep failed for playbook", playbook_id=pb_id, error=str(exc))
+                await db.rollback()
+
+        if len(rows) < window:
+            break
+    else:
+        cap_hit = True
+
+    if cap_hit:
+        logger.warning(
+            "Scheduled-playbook sweep hit per-run cap; remainder deferred",
+            cap=MAX_SCHEDULED_PLAYBOOKS_PER_SWEEP,
+        )
+    return {
+        "executed": executed,
+        "checked": checked,
+        "truncated": cap_hit,
+        "task": "check_scheduled_playbooks",
+    }
 
 
 async def _sweep_entry() -> dict[str, Any]:
@@ -183,7 +226,7 @@ async def _run_playbook_execution(execution_id: str) -> dict[str, Any]:
     async with AsyncSessionLocal() as db:
         execution = (
             await db.execute(
-                select(PlaybookExecution).where(PlaybookExecution.id == execution_id)
+                select(PlaybookExecution).where(PlaybookExecution.id == execution_id),
             )
         ).scalar_one_or_none()
         if not execution:
@@ -217,7 +260,7 @@ async def _run_playbook_execution(execution_id: str) -> dict[str, Any]:
             # so the execution-history UI shows the truth.
             execution = (
                 await db.execute(
-                    select(PlaybookExecution).where(PlaybookExecution.id == execution_id)
+                    select(PlaybookExecution).where(PlaybookExecution.id == execution_id),
                 )
             ).scalar_one_or_none()
             if execution:

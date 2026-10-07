@@ -11,12 +11,26 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from celery import shared_task
-from sqlalchemy import delete, or_, select
+from sqlalchemy import delete, or_, select, update
 
 from src.core.logging import get_logger
 from src.siem.tasks import run_async
 
 logger = get_logger(__name__)
+
+
+# --- Memory bounds ---------------------------------------------------------
+# Every housekeeping task here used to materialise its whole candidate set
+# with one ``.scalars().all()`` (rate_limit_reset as full ORM rows mutated
+# one by one under a single commit; connector_update_check as every
+# connector row; the health check as every installed-integration id). They
+# now walk the table in keyset windows of INTEGRATIONS_BATCH_SIZE on the
+# primary key, read only the columns they use, write with bulk UPDATEs by
+# id, and commit per window. A per-run cap that fires sets ``truncated``.
+INTEGRATIONS_BATCH_SIZE = 1_000
+MAX_HEALTH_CHECKS_PER_RUN = 10_000
+MAX_RATE_LIMIT_RESETS_PER_RUN = 50_000
+MAX_CONNECTORS_PER_RUN = 50_000
 
 
 def _version_tuple(version: Optional[str]) -> tuple:
@@ -53,16 +67,6 @@ async def _health_check_all_integrations_async(
     from src.integrations.engine import ConnectorRegistry, IntegrationManager
     from src.integrations.models import InstalledIntegration
 
-    async with async_session_factory() as db:
-        stmt = select(InstalledIntegration.id).where(
-            InstalledIntegration.status != "inactive"
-        )
-        if organization_id:
-            stmt = stmt.where(
-                InstalledIntegration.organization_id == organization_id
-            )
-        integration_ids = list((await db.execute(stmt)).scalars().all())
-
     manager = IntegrationManager(ConnectorRegistry())
     health_results: dict[str, Any] = {
         "total_checked": 0,
@@ -71,15 +75,57 @@ async def _health_check_all_integrations_async(
         "unhealthy": 0,
         "unknown": 0,
     }
+    status_keys = ("healthy", "degraded", "unhealthy", "unknown")
 
-    for integration_id in integration_ids:
-        outcome = await manager.test_connection(integration_id)
-        status_key = outcome.get("status") or "unknown"
-        if status_key not in health_results:
-            status_key = "unknown"
-        health_results[status_key] += 1
-        health_results["total_checked"] += 1
+    # Ids are paged one window at a time (each window's session closed
+    # before its probes run, as before) instead of listing every id up front.
+    last_id: Optional[str] = None
+    cap_hit = False
+    while health_results["total_checked"] < MAX_HEALTH_CHECKS_PER_RUN:
+        window = min(
+            INTEGRATIONS_BATCH_SIZE,
+            MAX_HEALTH_CHECKS_PER_RUN - health_results["total_checked"],
+        )
+        async with async_session_factory() as db:
+            stmt = select(InstalledIntegration.id).where(
+                InstalledIntegration.status != "inactive",
+            )
+            if organization_id:
+                stmt = stmt.where(
+                    InstalledIntegration.organization_id == organization_id,
+                )
+            if last_id is not None:
+                stmt = stmt.where(InstalledIntegration.id > last_id)
+            integration_ids = list(
+                (
+                    await db.execute(
+                        stmt.order_by(InstalledIntegration.id).limit(window),
+                    )
+                ).scalars(),
+            )
+        if not integration_ids:
+            break
+        last_id = integration_ids[-1]
 
+        for integration_id in integration_ids:
+            outcome = await manager.test_connection(integration_id)
+            status_key = outcome.get("status") or "unknown"
+            if status_key not in status_keys:
+                status_key = "unknown"
+            health_results[status_key] += 1
+            health_results["total_checked"] += 1
+
+        if len(integration_ids) < window:
+            break
+    else:
+        cap_hit = True
+
+    if cap_hit:
+        logger.warning(
+            f"health_check_all_integrations: hit per-run cap of "
+            f"{MAX_HEALTH_CHECKS_PER_RUN} integrations; remainder deferred",
+        )
+    health_results["truncated"] = cap_hit
     health_results["timestamp"] = datetime.now(timezone.utc).isoformat()
     return health_results
 
@@ -101,7 +147,7 @@ async def _webhook_cleanup_async(days_old: int = 90) -> dict[str, Any]:
             delete(WebhookEndpoint).where(
                 WebhookEndpoint.is_active.is_(False),
                 WebhookEndpoint.updated_at < cutoff_date,
-            )
+            ),
         )
         await db.commit()
         deleted_count = result.rowcount or 0
@@ -124,8 +170,8 @@ async def _execution_cleanup_async(days_old: int = 30) -> dict[str, Any]:
     async with async_session_factory() as db:
         result = await db.execute(
             delete(IntegrationExecution).where(
-                IntegrationExecution.created_at < cutoff_date
-            )
+                IntegrationExecution.created_at < cutoff_date,
+            ),
         )
         await db.commit()
         deleted_count = result.rowcount or 0
@@ -151,33 +197,78 @@ async def _rate_limit_reset_async() -> dict[str, Any]:
 
     now = datetime.now(timezone.utc)
     reset_count = 0
+    scanned = 0
+    cap_hit = False
+    last_id: Optional[str] = None
+    rate_limited = IntegrationStatus.RATE_LIMITED.value
 
     async with async_session_factory() as db:
-        stmt = select(InstalledIntegration).where(
-            or_(
-                InstalledIntegration.rate_limit_remaining.isnot(None),
-                InstalledIntegration.rate_limit_reset.isnot(None),
-                InstalledIntegration.status == IntegrationStatus.RATE_LIMITED.value,
+        while scanned < MAX_RATE_LIMIT_RESETS_PER_RUN:
+            window = min(INTEGRATIONS_BATCH_SIZE, MAX_RATE_LIMIT_RESETS_PER_RUN - scanned)
+            stmt = select(
+                InstalledIntegration.id,
+                InstalledIntegration.rate_limit_reset,
+                InstalledIntegration.status,
+            ).where(
+                or_(
+                    InstalledIntegration.rate_limit_remaining.isnot(None),
+                    InstalledIntegration.rate_limit_reset.isnot(None),
+                    InstalledIntegration.status == rate_limited,
+                ),
             )
+            if last_id is not None:
+                stmt = stmt.where(InstalledIntegration.id > last_id)
+            rows = (
+                await db.execute(stmt.order_by(InstalledIntegration.id).limit(window))
+            ).all()
+            if not rows:
+                break
+            last_id = rows[-1].id
+            scanned += len(rows)
+
+            to_reset: list[str] = []
+            to_reactivate: list[str] = []
+            for row in rows:
+                reset_at = _parse_timestamp(row.rate_limit_reset)
+                if reset_at and reset_at > now:
+                    # Rate-limit window still open — don't lie about capacity.
+                    continue
+                to_reset.append(row.id)
+                if row.status == rate_limited:
+                    to_reactivate.append(row.id)
+
+            if to_reset:
+                await db.execute(
+                    update(InstalledIntegration)
+                    .where(InstalledIntegration.id.in_(to_reset))
+                    .values(rate_limit_remaining=None, rate_limit_reset=None)
+                    .execution_options(synchronize_session=False),
+                )
+            if to_reactivate:
+                await db.execute(
+                    update(InstalledIntegration)
+                    .where(InstalledIntegration.id.in_(to_reactivate))
+                    .values(status=IntegrationStatus.ACTIVE.value)
+                    .execution_options(synchronize_session=False),
+                )
+            reset_count += len(to_reset)
+            await db.commit()
+            db.expunge_all()
+
+            if len(rows) < window:
+                break
+        else:
+            cap_hit = True
+
+    if cap_hit:
+        logger.warning(
+            f"rate_limit_reset: hit per-run cap of {MAX_RATE_LIMIT_RESETS_PER_RUN} "
+            f"integrations; remainder deferred",
         )
-        integrations = (await db.execute(stmt)).scalars().all()
-
-        for integration in integrations:
-            reset_at = _parse_timestamp(integration.rate_limit_reset)
-            if reset_at and reset_at > now:
-                # Rate-limit window still open — don't lie about capacity.
-                continue
-            integration.rate_limit_remaining = None
-            integration.rate_limit_reset = None
-            if integration.status == IntegrationStatus.RATE_LIMITED.value:
-                integration.status = IntegrationStatus.ACTIVE.value
-            reset_count += 1
-
-        await db.commit()
-
     return {
         "status": "success",
         "reset_count": reset_count,
+        "truncated": cap_hit,
         "timestamp": now.isoformat(),
     }
 
@@ -197,29 +288,60 @@ async def _connector_update_check_async() -> dict[str, Any]:
 
     registry = ConnectorRegistry()
 
+    available_updates: list[dict[str, Any]] = []
+    scanned = 0
+    cap_hit = False
+    last_id: Optional[str] = None
+
     async with async_session_factory() as db:
-        rows = (await db.execute(select(IntegrationConnector))).scalars().all()
+        while scanned < MAX_CONNECTORS_PER_RUN:
+            window = min(INTEGRATIONS_BATCH_SIZE, MAX_CONNECTORS_PER_RUN - scanned)
+            stmt = select(
+                IntegrationConnector.id,
+                IntegrationConnector.name,
+                IntegrationConnector.display_name,
+                IntegrationConnector.version,
+            )
+            if last_id is not None:
+                stmt = stmt.where(IntegrationConnector.id > last_id)
+            rows = (
+                await db.execute(stmt.order_by(IntegrationConnector.id).limit(window))
+            ).all()
+            if not rows:
+                break
+            last_id = rows[-1].id
+            scanned += len(rows)
 
-        available_updates: list[dict[str, Any]] = []
-        for row in rows:
-            registry_meta = registry.get_connector_details(row.name)
-            if not registry_meta:
-                continue
-            registry_version = registry_meta.get("version") or "1.0.0"
-            if _version_tuple(registry_version) > _version_tuple(row.version):
-                available_updates.append(
-                    {
-                        "connector": row.name,
-                        "display_name": row.display_name,
-                        "installed_version": row.version,
-                        "available_version": registry_version,
-                    }
-                )
+            for row in rows:
+                registry_meta = registry.get_connector_details(row.name)
+                if not registry_meta:
+                    continue
+                registry_version = registry_meta.get("version") or "1.0.0"
+                if _version_tuple(registry_version) > _version_tuple(row.version):
+                    available_updates.append(
+                        {
+                            "connector": row.name,
+                            "display_name": row.display_name,
+                            "installed_version": row.version,
+                            "available_version": registry_version,
+                        },
+                    )
 
+            if len(rows) < window:
+                break
+        else:
+            cap_hit = True
+
+    if cap_hit:
+        logger.warning(
+            f"connector_update_check: hit per-run cap of {MAX_CONNECTORS_PER_RUN} "
+            f"connectors; remainder deferred",
+        )
     return {
         "status": "success",
         "source": "builtin_registry",
         "available_updates": available_updates,
+        "truncated": cap_hit,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -246,7 +368,7 @@ def health_check_all_integrations(self, organization_id: Optional[str] = None):
         )
 
         health_results = run_async(
-            _health_check_all_integrations_async(organization_id)
+            _health_check_all_integrations_async(organization_id),
         )
 
         logger.info(f"Health check complete: {health_results}")
@@ -280,7 +402,7 @@ def webhook_cleanup(self, days_old: int = 90):
         result = run_async(_webhook_cleanup_async(days_old))
 
         logger.info(
-            f"Webhook cleanup complete: {result['deleted_count']} records deleted"
+            f"Webhook cleanup complete: {result['deleted_count']} records deleted",
         )
 
         return result
@@ -310,7 +432,7 @@ def execution_cleanup(self, days_old: int = 30):
         result = run_async(_execution_cleanup_async(days_old))
 
         logger.info(
-            f"Execution cleanup complete: {result['deleted_count']} records deleted"
+            f"Execution cleanup complete: {result['deleted_count']} records deleted",
         )
 
         return result
@@ -338,7 +460,7 @@ def rate_limit_reset(self):
         result = run_async(_rate_limit_reset_async())
 
         logger.info(
-            f"Rate limit reset complete: {result['reset_count']} integrations reset"
+            f"Rate limit reset complete: {result['reset_count']} integrations reset",
         )
 
         return result
@@ -368,7 +490,7 @@ def connector_update_check(self):
         result = run_async(_connector_update_check_async())
 
         logger.info(
-            f"Update check complete: {len(result['available_updates'])} updates available"
+            f"Update check complete: {len(result['available_updates'])} updates available",
         )
 
         return result
