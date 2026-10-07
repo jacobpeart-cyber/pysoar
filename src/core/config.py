@@ -180,7 +180,7 @@ class Settings(BaseSettings):
     # Call log bodies are never stored unless explicitly enabled; raw rows are
     # rolled up nightly and deleted after the retention window.
     llm_log_bodies: bool = False
-    llm_log_retention_days: int = 90
+    llm_log_retention_days: int = 365  # platform default; orgs override 30..1095
     # Per-model price table, USD per 1M tokens, e.g.
     # {"claude-opus-5": {"input": 5, "output": 25, "cache_read": 0.5, "cache_write": 6.25}}
     llm_prices: Annotated[dict[str, dict[str, float]], NoDecode] = {}

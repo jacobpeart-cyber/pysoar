@@ -1831,9 +1831,22 @@ export interface LLMHealth {
   cached?: boolean;
 }
 
+/** Body of PUT /settings/agentic-policy (omitted fields are unchanged). */
+export interface AgenticPolicySettingsUpdate {
+  require_second_approver?: boolean;
+  llm_call_log_retention_days?: number;
+  agent_transcript_retention_days?: number;
+}
+
 /** Org agentic policy knobs (GET/PUT /settings/agentic-policy, admin). */
 export interface AgenticPolicySettings {
   require_second_approver: boolean;
+  /** Days raw LLM call logs are kept (30..1095, default 365). */
+  llm_call_log_retention_days: number;
+  /** Days agent run transcripts are kept, stamped when written (30..1095, default 365). */
+  agent_transcript_retention_days: number;
+  retention_min_days?: number;
+  retention_max_days?: number;
   updated_at?: string | null;
   updated_by?: string | null;
 }
@@ -1844,7 +1857,8 @@ export const settingsApi = {
     return response.data;
   },
 
-  putAgenticPolicy: async (body: { require_second_approver: boolean }): Promise<AgenticPolicySettings> => {
+  /** Partial update: only the fields sent change. */
+  putAgenticPolicy: async (body: AgenticPolicySettingsUpdate): Promise<AgenticPolicySettings> => {
     const response = await api.put('/settings/agentic-policy', body);
     return response.data;
   },

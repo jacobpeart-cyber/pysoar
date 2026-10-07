@@ -32,9 +32,11 @@ from typing import Any, AsyncIterator, Callable, Optional
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.core.config import Settings, settings as app_settings
+from src.core.config import Settings
+from src.core.config import settings as app_settings
 from src.core.logging import get_logger
-from src.core.metrics import LLM_CALLS_TOTAL, increment as metric_increment
+from src.core.metrics import LLM_CALLS_TOTAL
+from src.core.metrics import increment as metric_increment
 from src.core.redact import redact
 from src.llm._common import encode_json
 from src.llm.base import LLMError, LLMTurn, Message, ToolSpecForLLM, Usage
@@ -197,11 +199,11 @@ class LLMCallLogWriter:
         response_body: Optional[str] = None
         if self.cfg.llm_log_bodies:
             request_body = json.dumps(
-                {"system": redacted_system, "messages": redacted_messages}, ensure_ascii=False, separators=(",", ":")
+                {"system": redacted_system, "messages": redacted_messages}, ensure_ascii=False, separators=(",", ":"),
             )
             if turn is not None:
                 redacted_turn, n = redact(
-                    {"text": turn.text, "tool_calls": [vars(c) for c in turn.tool_calls], "provider_native": turn.provider_native}
+                    {"text": turn.text, "tool_calls": [vars(c) for c in turn.tool_calls], "provider_native": turn.provider_native},
                 )
                 redactions += n
                 response_body = json.dumps(redacted_turn, ensure_ascii=False, separators=(",", ":"))
@@ -373,7 +375,7 @@ async def rollup_usage_daily(db: AsyncSession, day: date, *, organization_id: Op
                     LLMUsageDaily.mode == mode,
                     LLMUsageDaily.credential_source == credential_source,
                     LLMUsageDaily.actor_key == actor_key,
-                )
+                ),
             )
         ).scalar_one_or_none()
         target = existing or LLMUsageDaily(
@@ -398,17 +400,29 @@ async def rollup_usage_daily(db: AsyncSession, day: date, *, organization_id: Op
 async def purge_call_logs(
     db: AsyncSession,
     *,
-    retention_days: Optional[int] = None,
-    now: Optional[datetime] = None,
-    organization_id: Optional[str] = None,
+    organization_id: str,
+    cutoff: datetime,
+    limit: int = 10_000,
 ) -> int:
-    """Delete raw ``llm_call_logs`` older than the retention window. Caller commits."""
-    days = int(retention_days if retention_days is not None else app_settings.llm_log_retention_days)
-    cutoff = (now or datetime.now(timezone.utc)) - timedelta(days=days)
-    stmt = delete(LLMCallLog).where(LLMCallLog.created_at < cutoff)
-    if organization_id is not None:
-        stmt = stmt.where(LLMCallLog.organization_id == organization_id)
-    result = await db.execute(stmt)
+    """Delete at most ``limit`` raw ``llm_call_logs`` rows of one organization
+    created before ``cutoff``; returns the number deleted. Caller commits.
+
+    One bounded window: the nightly retention task
+    (:func:`src.agentic.retention.run_retention_purge`) calls this in a loop,
+    committing after each window, with the organization's own cutoff and only
+    after the days being deleted have been rolled up into ``llm_usage_daily``.
+    """
+    window = (
+        select(LLMCallLog.id)
+        .where(LLMCallLog.organization_id == organization_id, LLMCallLog.created_at < cutoff)
+        .order_by(LLMCallLog.id)
+        .limit(int(limit))
+    )
+    result = await db.execute(
+        delete(LLMCallLog)
+        .where(LLMCallLog.organization_id == organization_id, LLMCallLog.id.in_(window))
+        .execution_options(synchronize_session=False),
+    )
     return int(result.rowcount or 0)
 
 

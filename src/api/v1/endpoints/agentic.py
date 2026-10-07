@@ -3597,7 +3597,9 @@ async def get_agent_usage(
     rather than guessed at), and today's remaining interactive/autonomous
     budget when the quota backend is reachable (``null`` when it is not).
 
-    Raw call logs are purged after ``settings.llm_log_retention_days``, so any
+    Raw call logs are purged after the organization's
+    ``llm_call_log_retention_days`` (default 365, see
+    ``src.agentic.retention``), so any
     day in the window that has no raw rows is filled from the
     ``llm_usage_daily`` rollup instead; those days are listed in
     ``rolled_up_days``. Scoped to the caller's organization unless a

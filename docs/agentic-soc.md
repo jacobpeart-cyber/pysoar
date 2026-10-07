@@ -205,9 +205,33 @@ corpus with a 5 % false-positive ceiling), `tests/unit/test_agent_runtime.py`.
   `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OLLAMA_BASE_URL`,
   `LLM_DAILY_TOKEN_BUDGET`, `LLM_AUTONOMOUS_DAILY_TOKEN_BUDGET`,
   `LLM_USER_RUNS_PER_MINUTE`, `LLM_USER_CONCURRENCY`, `LLM_ORG_CONCURRENCY`,
-  `LLM_LOG_RETENTION_DAYS`. `ENCRYPTION_MASTER_KEY` is **required**: migration
+  `LLM_LOG_RETENTION_DAYS` (platform default for call logs, 365).
+  `ENCRYPTION_MASTER_KEY` is **required**: migration
   020 refuses to run without it and the API refuses to start the ephemeral-key
   path outside development.
+* Retention (`GET/PUT /api/v1/settings/agentic-policy`, org admin, same
+  `agentic_policy` section as `require_second_approver`):
+  `llm_call_log_retention_days` and `agent_transcript_retention_days`, whole
+  days from 30 to 1095. Values outside that range, non-integers and unknown
+  keys get a 422. With no setting the default is 365 days; for call logs that
+  default is `LLM_LOG_RETENTION_DAYS`, clamped to 30..1095. A PUT is partial,
+  and every change writes one `agentic_policy.set` audit row with the old and
+  new effective values. Shortening a window is logged at medium risk.
+  Settings > AI Provider has the two inputs. The Celery task
+  `src.agentic.tasks.purge_agentic_retention` runs daily at 05:15 UTC with
+  15/16-minute limits (`src/agentic/retention.py`). For each organization it:
+  (1) rolls up into `llm_usage_daily` each whole UTC day about to leave the
+  call-log window that has no rollup yet, so `/agentic/usage` keeps the
+  totals; (2) deletes `llm_call_logs` older than UTC midnight of
+  `now - retention`; (3) deletes transcripts whose `retention_until` has
+  passed. Writers stamp `retention_until` from the organization's setting
+  (`transcript_retention_until`), so a change applies to new transcripts and
+  existing rows keep their stamp. Deletes run in committed windows of 10,000
+  rows. A run stops after 100 windows (and rolls up at most 400 days per
+  organization), reporting `truncated: true`, and the next night continues.
+  The result carries `call_logs_deleted`, `transcripts_deleted`,
+  `days_rolled_up`, `batches`, `failed_organizations` and per-organization
+  counts.
 * Egress: `deploy/kubernetes/base/networkpolicy-llm-egress.yaml` restricts the
   api/worker/scheduler pods to DNS, in-cluster dependencies and TCP/443 to
   public address space (metadata and private ranges blocked); the Cilium
@@ -322,10 +346,13 @@ leaked key alone does not expose those values, but a leaked database dump does.
 * **Platform-key grandfathering**: decided 2026-10-06, existing tenants stay
   at `use_platform_default=false`; autonomous triage for them records
   `llm_not_configured` until an admin configures a provider or opts in.
-* **Retention**: decided 2026-10-06, LLM call logs and agent run transcripts
-  default to 365 days with a per-organization setting (bounded 30 to 1095
-  days) that the purge job honours. Not yet implemented; the current purge
-  uses the fixed 90-day default.
+* **Retention**: decided 2026-10-06 and implemented: LLM call logs and agent
+  run transcripts default to 365 days with a per-organization setting
+  (`llm_call_log_retention_days`, `agent_transcript_retention_days`, 30 to
+  1095 days, audited) honoured by the nightly `purge_agentic_retention` task.
+  See section 7. Transcript expiry is stamped when the row is written. The
+  runtime does not write transcripts yet, so the purge currently has no
+  transcript rows to delete.
 * **Metrics**: `GET /metrics/agentic` is an in-process registry (no
   `prometheus_client`); counters reset on restart.
 * **Memory bounds outside the agent**: every Celery task that read whole

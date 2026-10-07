@@ -865,3 +865,30 @@ def cleanup_stale_investigations(self, days_old: int = 30):
     result = asyncio.run(_run())
     logger.info("cleanup_stale_investigations", **result)
     return result
+
+
+@shared_task(max_retries=0)
+def purge_agentic_retention() -> dict[str, Any]:
+    """Nightly retention purge of ``llm_call_logs`` and ``agent_run_transcripts``.
+
+    Honours each organization's ``llm_call_log_retention_days`` and
+    ``agent_transcript_retention_days`` (``agentic_policy`` settings, 30..1095
+    days, default 365); see :mod:`src.agentic.retention` for the rollup-then-
+    delete order and the window/commit bounds. ``truncated`` in the result
+    means the per-run cap was reached and the next run continues.
+    """
+    from src.agentic.retention import run_retention_purge
+
+    async def _run() -> dict[str, Any]:
+        engine, session_factory = _fresh_async_session_factory()
+        try:
+            return (await run_retention_purge(session_factory)).as_dict()
+        finally:
+            await engine.dispose()
+
+    result = asyncio.run(_run())
+    logger.info(
+        "agentic_retention_purge_complete",
+        **{k: v for k, v in result.items() if k != "per_org"},
+    )
+    return result

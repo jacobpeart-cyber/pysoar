@@ -3,8 +3,9 @@
 ``llm_call_logs`` gets one row per provider call -- also when the call raised
 (``stop_reason='error'``, ``usage_estimated=true``). Prompt/response bodies
 are stored only when ``settings.llm_log_bodies`` is on, already redacted, and
-raw rows are purged after ``settings.llm_log_retention_days`` once they have
-been rolled up into ``llm_usage_daily``.
+raw rows are purged after the organization's ``llm_call_log_retention_days``
+(``agentic_policy`` settings, 30..1095 days, default 365) once they have been
+rolled up into ``llm_usage_daily`` (``src.agentic.retention``).
 
 Column names match ``alembic/versions/020_agentic_guardrails.py`` (owned by
 work package 4) exactly; change both together.

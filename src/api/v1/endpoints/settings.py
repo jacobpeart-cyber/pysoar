@@ -38,7 +38,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.agentic.policy import AGENTIC_POLICY_SECTION
+from src.agentic.policy import AGENTIC_POLICY_SECTION, org_policy_settings_from_section
 from src.api.deps import AdminUser, DatabaseSession, get_current_superuser
 from src.audit_evidence.engine import AuditLogger
 from src.core.config import settings as app_settings
@@ -1757,11 +1757,28 @@ async def list_ai_tenants(
 
 
 def _agentic_policy_response(section: Dict[str, Any]) -> AgenticPolicySettingsResponse:
+    effective = org_policy_settings_from_section(section)
     return AgenticPolicySettingsResponse(
-        require_second_approver=section.get("require_second_approver") is True,
+        require_second_approver=effective.require_second_approver,
+        llm_call_log_retention_days=effective.llm_call_log_retention_days,
+        agent_transcript_retention_days=effective.agent_transcript_retention_days,
         updated_at=section.get("updated_at"),
         updated_by=section.get("updated_by"),
     )
+
+
+def _agentic_policy_snapshot(section: Dict[str, Any]) -> Dict[str, Any]:
+    """Effective values of every org-admin-editable agentic policy key."""
+    effective = org_policy_settings_from_section(section)
+    return {key: getattr(effective, key) for key in _AGENTIC_POLICY_KEYS}
+
+
+#: Keys ``PUT /settings/agentic-policy`` may change (mirrors the schema).
+_AGENTIC_POLICY_KEYS: tuple[str, ...] = (
+    "require_second_approver",
+    "llm_call_log_retention_days",
+    "agent_transcript_retention_days",
+)
 
 
 @router.get("/agentic-policy", response_model=AgenticPolicySettingsResponse)
@@ -1786,7 +1803,13 @@ async def update_agentic_policy_settings(
     db: DatabaseSession = None,
     current_user: AdminUser = None,
 ) -> AgenticPolicySettingsResponse:
-    """Set the organization's agentic policy settings (admin); audited."""
+    """Set the organization's agentic policy settings (admin); audited.
+
+    Partial update: only the fields in the body change. One audit row
+    (``agentic_policy.set``) records the old and new effective value of every
+    field in the body. Shortening a retention window or turning the second
+    approver off is logged at medium risk.
+    """
     org_id = _user_org(current_user)
     if not org_id:
         raise HTTPException(
@@ -1796,17 +1819,27 @@ async def update_agentic_policy_settings(
     org_id = str(org_id)
     uid = str(getattr(current_user, "id", "") or "")
     prior = await _load_section(db, org_id, AGENTIC_POLICY_SECTION)
-    old_value = prior.get("require_second_approver") is True
+    before = _agentic_policy_snapshot(prior)
+    requested = payload.model_dump(exclude_none=True)
+    changes = {key: requested[key] for key in _AGENTIC_POLICY_KEYS if key in requested}
+
     merged = await _upsert_section(
         db,
         org_id,
         AGENTIC_POLICY_SECTION,
-        {
-            "require_second_approver": payload.require_second_approver,
-            "updated_at": _utc_now_iso(),
-            "updated_by": uid or None,
-        },
+        {**changes, "updated_at": _utc_now_iso(), "updated_by": uid or None},
         uid or None,
+    )
+
+    old_value = {key: before[key] for key in changes}
+    new_value = dict(changes)
+    weakened = (before["require_second_approver"] and changes.get("require_second_approver") is False) or any(
+        key in changes and changes[key] < before[key]
+        for key in ("llm_call_log_retention_days", "agent_transcript_retention_days")
+    )
+    description = "; ".join(
+        f"{key} set to {value}" + (" (unchanged)" if before[key] == value else f" (was {before[key]})")
+        for key, value in changes.items()
     )
 
     audit = AuditLogger(db, org_id)
@@ -1817,19 +1850,17 @@ async def update_agentic_policy_settings(
         actor_id=uid or "unknown",
         resource_type="app_settings",
         resource_id=f"{AGENTIC_POLICY_SECTION}:{org_id}",
-        description=(
-            f"require_second_approver set to {payload.require_second_approver}"
-            + ("" if old_value != payload.require_second_approver else " (unchanged)")
-        ),
-        old_value={"require_second_approver": old_value},
-        new_value={"require_second_approver": payload.require_second_approver},
-        risk_level="medium" if not payload.require_second_approver else "low",
+        description=description,
+        old_value=old_value,
+        new_value=new_value,
+        risk_level="medium" if weakened or changes.get("require_second_approver") is False else "low",
     )
     await db.commit()
     logger.info(
         "agentic_policy_settings_updated",
         organization_id=org_id,
-        require_second_approver=payload.require_second_approver,
+        changed=sorted(changes),
+        new=new_value,
         previous=old_value,
     )
     return _agentic_policy_response(merged)

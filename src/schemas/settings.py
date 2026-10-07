@@ -2,7 +2,9 @@
 
 from typing import List, Literal, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
+
+from src.agentic.policy import RETENTION_DEFAULT_DAYS, RETENTION_MAX_DAYS, RETENTION_MIN_DAYS
 
 
 class IntegrationConfig(BaseModel):
@@ -191,13 +193,40 @@ class AgenticPolicySettingsResponse(BaseModel):
     # Separation of duties (AC-5): destructive/privileged agent actions need
     # two distinct approvers, neither of them the proposer. Off by default.
     require_second_approver: bool = False
+    # Retention (AU-11), effective values: the org's own setting or the
+    # 365-day platform default.
+    llm_call_log_retention_days: int = RETENTION_DEFAULT_DAYS
+    agent_transcript_retention_days: int = RETENTION_DEFAULT_DAYS
+    retention_min_days: int = RETENTION_MIN_DAYS
+    retention_max_days: int = RETENTION_MAX_DAYS
     updated_at: Optional[str] = None
     updated_by: Optional[str] = None
 
 
 class AgenticPolicySettingsUpdate(BaseModel):
-    """Write model for ``PUT /settings/agentic-policy``. Unknown keys are rejected."""
+    """Write model for ``PUT /settings/agentic-policy``.
+
+    Partial update: omitted fields keep their stored value; at least one field
+    is required. Unknown keys are rejected, and a retention value outside
+    30..1095 days (or not an integer) is a 422.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
-    require_second_approver: bool
+    require_second_approver: Optional[bool] = None
+    llm_call_log_retention_days: Optional[StrictInt] = Field(
+        default=None, ge=RETENTION_MIN_DAYS, le=RETENTION_MAX_DAYS,
+    )
+    agent_transcript_retention_days: Optional[StrictInt] = Field(
+        default=None, ge=RETENTION_MIN_DAYS, le=RETENTION_MAX_DAYS,
+    )
+
+    @model_validator(mode="after")
+    def _at_least_one_field(self) -> "AgenticPolicySettingsUpdate":
+        if (
+            self.require_second_approver is None
+            and self.llm_call_log_retention_days is None
+            and self.agent_transcript_retention_days is None
+        ):
+            raise ValueError("at least one setting is required")
+        return self

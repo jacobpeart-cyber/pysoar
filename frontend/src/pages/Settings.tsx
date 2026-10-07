@@ -24,6 +24,7 @@ import clsx from 'clsx';
 import { settingsApi, healthApi } from '../api/endpoints';
 import type {
   AgenticPolicySettings as AgenticPolicySettingsData,
+  AgenticPolicySettingsUpdate,
   AIProviderName,
   AISettings,
   LLMHealth,
@@ -1288,10 +1289,23 @@ function formatTimestamp(value?: string | null): string {
   return Number.isNaN(parsed) ? value : new Date(parsed).toLocaleString();
 }
 
+const RETENTION_DEFAULT_DAYS = 365;
+const RETENTION_MIN_DAYS = 30;
+const RETENTION_MAX_DAYS = 1095;
+
+/** A whole number of days inside the allowed range, or null. */
+function parseRetentionDays(raw: string, min: number, max: number): number | null {
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return null;
+  const value = Number(trimmed);
+  return value >= min && value <= max ? value : null;
+}
+
 /**
- * Agentic approval policy (org admin): separation of duties for destructive
- * agent actions. Off by default; when on, a destructive/privileged proposal
- * needs two distinct approvers, neither of them the proposer.
+ * Agentic policy (org admin): separation of duties for destructive agent
+ * actions (off by default; when on, a destructive/privileged proposal needs
+ * two distinct approvers, neither of them the proposer) and retention of LLM
+ * call logs and agent run transcripts (30..1095 days, default 365).
  */
 function AgenticPolicySettings() {
   const queryClient = useQueryClient();
@@ -1301,19 +1315,43 @@ function AgenticPolicySettings() {
     queryFn: async () => settingsApi.getAgenticPolicy(),
   });
 
+  // null = show the saved value; a string = the admin is editing.
+  const [callLogDraft, setCallLogDraft] = useState<string | null>(null);
+  const [transcriptDraft, setTranscriptDraft] = useState<string | null>(null);
+
   const mutation = useMutation({
-    mutationFn: async (value: boolean) =>
-      settingsApi.putAgenticPolicy({ require_second_approver: value }),
+    mutationFn: async (body: AgenticPolicySettingsUpdate) => settingsApi.putAgenticPolicy(body),
     onSuccess: (saved) => {
       setError(null);
+      setCallLogDraft(null);
+      setTranscriptDraft(null);
       queryClient.setQueryData(['settings', 'agentic-policy'], saved);
     },
     onError: () => {
-      setError('Could not save the approval policy. Your change was not applied.');
+      setError('Could not save the agent policy. Your change was not applied.');
     },
   });
 
   const enabled = Boolean(data?.require_second_approver);
+  const minDays = data?.retention_min_days ?? RETENTION_MIN_DAYS;
+  const maxDays = data?.retention_max_days ?? RETENTION_MAX_DAYS;
+  const savedCallLog = data?.llm_call_log_retention_days ?? RETENTION_DEFAULT_DAYS;
+  const savedTranscript = data?.agent_transcript_retention_days ?? RETENTION_DEFAULT_DAYS;
+  const callLogText = callLogDraft ?? String(savedCallLog);
+  const transcriptText = transcriptDraft ?? String(savedTranscript);
+  const callLogDays = parseRetentionDays(callLogText, minDays, maxDays);
+  const transcriptDays = parseRetentionDays(transcriptText, minDays, maxDays);
+  const retentionValid = callLogDays !== null && transcriptDays !== null;
+  const retentionDirty =
+    retentionValid && (callLogDays !== savedCallLog || transcriptDays !== savedTranscript);
+
+  const saveRetention = () => {
+    if (callLogDays === null || transcriptDays === null) return;
+    const body: AgenticPolicySettingsUpdate = {};
+    if (callLogDays !== savedCallLog) body.llm_call_log_retention_days = callLogDays;
+    if (transcriptDays !== savedTranscript) body.agent_transcript_retention_days = transcriptDays;
+    mutation.mutate(body);
+  };
 
   return (
     <div className="space-y-3 border-t border-gray-200 dark:border-gray-700 pt-6">
@@ -1346,12 +1384,75 @@ function AgenticPolicySettings() {
               aria-label="Require a second approver"
               checked={enabled}
               disabled={mutation.isPending}
-              onChange={(e) => mutation.mutate(e.target.checked)}
+              onChange={(e) => mutation.mutate({ require_second_approver: e.target.checked })}
               className="sr-only peer"
             />
             <div className="w-11 h-6 bg-gray-200 dark:bg-gray-700 peer-focus:ring-2 peer-focus:ring-blue-500 rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:border-gray-300 after:border after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-blue-600 peer-disabled:opacity-50"></div>
           </label>
         )}
+      </div>
+      <div className="p-4 bg-gray-50 dark:bg-gray-900 rounded-lg border border-gray-200 dark:border-gray-700 space-y-3">
+        <div>
+          <h3 className="font-medium text-gray-900 dark:text-white">Retention</h3>
+          <p className="text-sm text-gray-500 dark:text-gray-400">
+            How long raw LLM call logs and agent run transcripts are kept before the nightly purge
+            deletes them ({minDays} to {maxDays} days, default {RETENTION_DEFAULT_DAYS}). Daily usage
+            totals remain after the raw call logs are deleted. A transcript keeps the retention in
+            force when it was written, so a change applies to new transcripts.
+          </p>
+        </div>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <label className="block">
+            <span className="block text-sm font-medium text-gray-700 dark:text-gray-300">
+              LLM call logs (days)
+            </span>
+            <input
+              type="number"
+              inputMode="numeric"
+              min={minDays}
+              max={maxDays}
+              step={1}
+              aria-label="LLM call log retention in days"
+              value={callLogText}
+              disabled={isLoading || mutation.isPending}
+              onChange={(e) => setCallLogDraft(e.target.value)}
+              className="mt-1 block w-full rounded-lg border border-gray-300 dark:border-gray-600 dark:bg-gray-800 dark:text-white px-3 py-2 text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
+            />
+          </label>
+          <label className="block">
+            <span className="block text-sm font-medium text-gray-700 dark:text-gray-300">
+              Agent run transcripts (days)
+            </span>
+            <input
+              type="number"
+              inputMode="numeric"
+              min={minDays}
+              max={maxDays}
+              step={1}
+              aria-label="Agent run transcript retention in days"
+              value={transcriptText}
+              disabled={isLoading || mutation.isPending}
+              onChange={(e) => setTranscriptDraft(e.target.value)}
+              className="mt-1 block w-full rounded-lg border border-gray-300 dark:border-gray-600 dark:bg-gray-800 dark:text-white px-3 py-2 text-sm focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
+            />
+          </label>
+        </div>
+        {!retentionValid ? (
+          <p className="text-sm text-red-600 dark:text-red-400">
+            Enter a whole number of days between {minDays} and {maxDays}.
+          </p>
+        ) : null}
+        <div className="flex justify-end">
+          <button
+            type="button"
+            onClick={saveRetention}
+            disabled={!retentionDirty || mutation.isPending}
+            className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
+          >
+            {mutation.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+            Save retention
+          </button>
+        </div>
       </div>
       {error ? (
         <p className="text-sm text-red-600 dark:text-red-400 flex items-center gap-1">

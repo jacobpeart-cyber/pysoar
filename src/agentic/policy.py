@@ -46,6 +46,9 @@ __all__ = [
     "AUDIT_EVENT_TOOL",
     "DOCUMENTATION_ONLY_TOOLS",
     "MAX_EFFECTIVE_TARGETS",
+    "RETENTION_DEFAULT_DAYS",
+    "RETENTION_MAX_DAYS",
+    "RETENTION_MIN_DAYS",
     "SECOND_APPROVER_TIERS",
     "ApprovalQuorum",
     "AuditSink",
@@ -60,6 +63,8 @@ __all__ = [
     "evaluate_approval_quorum",
     "load_org_policy_settings",
     "org_policy_settings_from_section",
+    "platform_call_log_retention_days",
+    "retention_days_or_default",
     "validate_args",
 ]
 
@@ -162,6 +167,49 @@ class OrgPolicySettings:
     # default (a single-analyst SOC must still be able to act); an org admin
     # opts in through ``PUT /settings/agentic-policy``.
     require_second_approver: bool = False
+    # Retention (decision 2026-10-06): raw ``llm_call_logs`` rows and
+    # ``agent_run_transcripts`` are kept this many days (30..1095, default
+    # 365); the nightly purge (``src.agentic.retention``) honours the value
+    # per organization and transcripts are stamped with it at write time.
+    llm_call_log_retention_days: int = 365
+    agent_transcript_retention_days: int = 365
+
+
+#: Retention bounds, in days, for ``llm_call_log_retention_days`` and
+#: ``agent_transcript_retention_days``.
+RETENTION_DEFAULT_DAYS = 365
+RETENTION_MIN_DAYS = 30
+RETENTION_MAX_DAYS = 1095
+
+
+def retention_days_or_default(raw: Any, default: int = RETENTION_DEFAULT_DAYS) -> int:
+    """A stored retention value, or ``default`` when it is unset or invalid.
+
+    Only a real integer (never a bool or a numeric string) inside
+    ``RETENTION_MIN_DAYS..RETENTION_MAX_DAYS`` is honoured; anything else is
+    treated as unset so a corrupt row can never shorten retention below the
+    floor or disable the purge.
+    """
+    if isinstance(raw, bool) or not isinstance(raw, int):
+        return default
+    if raw < RETENTION_MIN_DAYS or raw > RETENTION_MAX_DAYS:
+        return default
+    return raw
+
+
+def platform_call_log_retention_days() -> int:
+    """Platform default for call-log retention (``LLM_LOG_RETENTION_DAYS``, default 365).
+
+    Clamped into the allowed range so a mis-set environment variable cannot
+    purge below 30 days or keep rows past 1095.
+    """
+    from src.core.config import settings as app_settings
+
+    try:
+        days = int(app_settings.llm_log_retention_days)
+    except (TypeError, ValueError):
+        return RETENTION_DEFAULT_DAYS
+    return max(RETENTION_MIN_DAYS, min(RETENTION_MAX_DAYS, days))
 
 
 #: ``app_settings.section`` holding the org-admin-editable policy knobs.
@@ -176,10 +224,21 @@ def org_policy_settings_from_section(value: Mapping[str, Any] | None, **override
 
     Only keys an org admin may set are read; everything else keeps the safe
     default. A non-boolean stored value is treated as unset (False), never
-    coerced from a truthy string.
+    coerced from a truthy string; an invalid retention value falls back to
+    the platform default (see :func:`retention_days_or_default`).
     """
-    raw = value.get("require_second_approver") if isinstance(value, Mapping) else None
-    return OrgPolicySettings(require_second_approver=raw is True, **overrides)
+    section: Mapping[str, Any] = value if isinstance(value, Mapping) else {}
+    fields: dict[str, Any] = {
+        "require_second_approver": section.get("require_second_approver") is True,
+        "llm_call_log_retention_days": retention_days_or_default(
+            section.get("llm_call_log_retention_days"), platform_call_log_retention_days(),
+        ),
+        "agent_transcript_retention_days": retention_days_or_default(
+            section.get("agent_transcript_retention_days"),
+        ),
+    }
+    fields.update(overrides)
+    return OrgPolicySettings(**fields)
 
 
 async def load_org_policy_settings(session: Any, org_id: str, **overrides: Any) -> OrgPolicySettings:

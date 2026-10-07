@@ -181,6 +181,10 @@ celery_app.conf.task_annotations = {
     "src.exposure.tasks.calculate_risk_scores": dict(_HEAVY_SWEEP_LIMITS),
     "src.exposure.tasks.check_sla_breaches": dict(_HEAVY_SWEEP_LIMITS),
     "src.exposure.tasks.sync_kev_database": dict(_HEAVY_SWEEP_LIMITS),
+    # All-org retention purge of llm_call_logs / agent_run_transcripts:
+    # 10k-row committed windows with a per-run cap; the wall clock is the
+    # backstop.
+    "src.agentic.tasks.purge_agentic_retention": dict(_HEAVY_SWEEP_LIMITS),
     # These two make one outbound network call per row (a full dark-web
     # scan per monitor / an HTTP probe per integration), so a 15-minute
     # ceiling would cut off legitimate work; they get 30 minutes, still
@@ -350,6 +354,14 @@ celery_app.conf.beat_schedule = {
     "ueba-event-cleanup": {
         "task": "src.ueba.tasks.cleanup_old_behavior_events",
         "schedule": 86400.0,  # Daily — 90-day retention by default
+    },
+    # --- Agentic retention (src.agentic.tasks.purge_agentic_retention) ---
+    # Rolls expiring call-log days into llm_usage_daily, then deletes raw
+    # llm_call_logs and agent_run_transcripts past each organization's
+    # retention (agentic_policy settings, 30..1095 days, default 365).
+    "agentic-retention-purge": {
+        "task": "src.agentic.tasks.purge_agentic_retention",
+        "schedule": crontab(hour=5, minute=15),  # Daily 05:15 UTC, off-peak
     },
     # --- Weekly STIG fleet sweep (src.stig.tasks.scheduled_fleet_stig_sweep) ---
     # FedRAMP/NIST SP 800-137 continuous monitoring: every active endpoint
