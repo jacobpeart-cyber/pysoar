@@ -664,7 +664,8 @@ def test_new_tables_have_expected_shape(fixture_db: dict[str, Any]) -> None:
         # agent_run_transcripts matches the ORM model column-for-column.
         from src.agentic.transcript import AgentRunTranscript
 
-        orm_cols = {c.name for c in AgentRunTranscript.__table__.columns}
+        # ``summary`` is added by revision 022 (its own round-trip test).
+        orm_cols = {c.name for c in AgentRunTranscript.__table__.columns} - {"summary"}
         assert _columns(conn, "agent_run_transcripts") == orm_cols
         transcript_indexes = {i["name"]: i for i in inspector.get_indexes("agent_run_transcripts")}
         assert transcript_indexes["ix_agent_run_transcripts_run_id"]["unique"]

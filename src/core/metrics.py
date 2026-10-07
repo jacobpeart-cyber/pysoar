@@ -30,6 +30,8 @@ Where the increments belong (this module does **not** wire them; WP5b/WP6 do):
 * ``agent_injection_events_total{tier}`` -- ``src/agentic/trust.py``, where the
   scanner settles the run's tier (``clean``/``suspect``/``lockdown``), once per
   scan.
+* ``agent_transcripts_total{mode,outcome}`` -- ``src/agentic/transcript.py``,
+  once per run transcript write (``written`` or ``failed``).
 """
 
 from __future__ import annotations
@@ -45,6 +47,7 @@ logger = get_logger(__name__)
 LLM_CALLS_TOTAL = "llm_calls_total"
 AGENT_POLICY_DECISIONS_TOTAL = "agent_policy_decisions_total"
 AGENT_INJECTION_EVENTS_TOTAL = "agent_injection_events_total"
+AGENT_TRANSCRIPTS_TOTAL = "agent_transcripts_total"
 
 # name -> ordered label names. A counter not listed here cannot be incremented:
 # typos become loud errors instead of silent new series.
@@ -52,6 +55,7 @@ COUNTER_SPECS: Dict[str, Tuple[str, ...]] = {
     LLM_CALLS_TOTAL: ("provider", "stop_reason"),
     AGENT_POLICY_DECISIONS_TOTAL: ("decision", "reason"),
     AGENT_INJECTION_EVENTS_TOTAL: ("tier",),
+    AGENT_TRANSCRIPTS_TOTAL: ("mode", "outcome"),
 }
 
 # Guards runaway cardinality from an unexpected label value (e.g. a provider
@@ -148,6 +152,7 @@ def value(name: str, labels: Mapping[str, Any] | None = None) -> int:
 __all__ = [
     "AGENT_INJECTION_EVENTS_TOTAL",
     "AGENT_POLICY_DECISIONS_TOTAL",
+    "AGENT_TRANSCRIPTS_TOTAL",
     "COUNTER_SPECS",
     "LLM_CALLS_TOTAL",
     "MAX_SERIES_PER_COUNTER",

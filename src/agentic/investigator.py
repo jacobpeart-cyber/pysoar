@@ -46,6 +46,7 @@ from src.agentic.policy import OrgPolicySettings, canonical_json
 from src.agentic.runtime import RunResult, StepEvent
 from src.agentic.runtime_factory import build_runtime
 from src.agentic.toolspec import Target, Tier, ToolSpec
+from src.agentic.transcript import persist_run_transcript
 from src.agentic.trust import trust_state_to_dict
 from src.core.logging import get_logger
 from src.llm.base import LLMNotConfigured
@@ -248,6 +249,7 @@ class AutonomousInvestigator:
         query = self._build_query(investigation)
 
         provider = runtime.provider
+        run_started_at = datetime.now(timezone.utc)
         try:
             async with provider:  # type: ignore[union-attr]
                 result = await runtime.runner.run(ctx, query, seed_context=seed, seed_label="trigger")
@@ -257,7 +259,7 @@ class AutonomousInvestigator:
             if self.quota is None:
                 await self._close_quota(runtime)
 
-        await self._persist_run(investigation, agent, result, trigger)
+        await self._persist_run(investigation, agent, result, trigger, ctx=ctx, started_at=run_started_at)
         return investigation
 
     # ------------------------------------------------------------------
@@ -574,6 +576,9 @@ class AutonomousInvestigator:
         agent: SOCAgent,
         result: RunResult,
         trigger: dict[str, Any],
+        *,
+        ctx: AgentContext,
+        started_at: datetime,
     ) -> None:
         verdict = result.verdict if isinstance(result.verdict, dict) else None
         lockdown = result.trust.tier is TrustTier.LOCKDOWN
@@ -629,6 +634,11 @@ class AutonomousInvestigator:
                 "tokens": result.usage.total_billable,
             }),
         ))
+        # Evidence record of the run (AU-3/AU-12), committed with the
+        # conclusion below. Never raises.
+        await persist_run_transcript(
+            self.db, ctx, result, mode=ctx.mode, started_at=started_at, outcome=outcome,
+        )
         await self.db.commit()
         await _broadcast_investigation_event(investigation.organization_id, {
             "type": "investigation_concluded",

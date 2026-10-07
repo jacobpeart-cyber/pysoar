@@ -67,7 +67,7 @@ from src.agentic.runtime import (
 )
 from src.agentic.tasks import run_investigation
 from src.agentic.toolspec import Tier
-from src.agentic.transcript import AgentRunTranscript
+from src.agentic.transcript import AgentRunTranscript, persist_run_transcript
 from src.agentic.trust import (
     LOCKDOWN_FAMILIES,
     LOCKDOWN_THRESHOLD,
@@ -2329,6 +2329,7 @@ async def chat_with_agent(
         await _mark_message_failed(db, user_message, ctx.run_id, getattr(exc, "code", "llm_quota_exceeded"), str(exc))
         raise _quota_error(exc) from exc
 
+    run_started_at = datetime.now(timezone.utc)
     try:
         async with runtime.provider:
             result = await runtime.runner.run(
@@ -2352,6 +2353,9 @@ async def chat_with_agent(
 
     await _settle_reservation(runtime.quota, reservation, result.usage.total_billable)
     session.trust_state = result.trust_state_dict
+    # Evidence record of the run (AU-3/AU-12); committed with the turn below
+    # (or with the failed-turn marker). Never raises.
+    await persist_run_transcript(db, ctx, result, mode=ctx.mode, started_at=run_started_at)
 
     if result.stop_reason == "error":
         await _mark_message_failed(
@@ -3429,7 +3433,8 @@ async def get_run_timeline(
 
     Design v2 section 7 ("run id everywhere"): the audit pair per tool
     decision, one row per provider call, the proposals the run raised, the
-    compact per-step transcript when the run persisted one, and the chat
+    compact per-step transcript every run persists (redacted, capped steps
+    plus the run-level summary), and the chat
     turns that carry the run id. Every query is scoped to the caller's
     organization, so a run belonging to another tenant is a 404. Arguments
     and results were value-redacted at write time; nothing raw is added here.
@@ -3525,6 +3530,7 @@ async def get_run_timeline(
             "investigation_id": transcript.investigation_id,
             "step_count": transcript.step_count,
             "steps": transcript.steps or [],
+            "summary": transcript.summary or {},
             "outcome": transcript.outcome,
             "injection_tier": transcript.injection_tier,
             "provider": transcript.provider,
@@ -3533,6 +3539,7 @@ async def get_run_timeline(
             "error_class": transcript.error_class,
             "started_at": transcript.started_at,
             "finished_at": transcript.finished_at,
+            "retention_until": transcript.retention_until,
         },
         "totals": {
             "audit_events": len(audit_rows),

@@ -71,6 +71,19 @@ request/task ──► AgentContext (src/agentic/context.py)
   injection scanner in §4.
 * **Runtime** (`src/agentic/runtime.py`): the loop in §5.
 * **Investigator** (`src/agentic/investigator.py`): autonomous mode in §6.
+* **Run transcripts** (`src/agentic/transcript.py`, table
+  `agent_run_transcripts`): one row per agent run, written by
+  `persist_run_transcript` at the end of every chat turn and autonomous
+  investigation. Per tool call: tool, tier, decision/reason, duration, error
+  flag, audit pair ids, hashes and redacted previews (≤ 1 KB each); per run:
+  prompt version, usage totals, trust summary, proposal ids and hashes,
+  policy events, honesty-note flag and the redacted final answer (≤ 8 000
+  chars). `steps` and `summary` (migration 022) are encrypted at rest; the
+  step list is capped at 200 entries / 256 KB with the cut recorded in
+  `summary.truncation`; `retention_until` is stamped from the org's
+  `agent_transcript_retention_days`. A failed write is logged
+  (`agent_transcript_persist_failed`), counted
+  (`agent_transcripts_total{outcome="failed"}`) and never fails the run.
 * **Settings** (`src/api/v1/endpoints/settings.py`): `GET/PUT /settings/ai`,
   live model discovery, encrypted secrets at rest (§7).
 
@@ -154,6 +167,10 @@ corpus with a 5 % false-positive ceiling), `tests/unit/test_agent_runtime.py`.
   (`llm_not_configured`, `llm_unavailable`, `llm_provider_error`), quota as
   429 with `Retry-After`; the user's message is persisted with a failed status
   so the UI can retry. There is no heuristic fallback of any kind.
+* Every completed run (including one that ends in a provider error) writes
+  one redacted, capped transcript row (§2, *Run transcripts*), readable with
+  `GET /agentic/runs/{run_id}`; a run rejected before it starts (admission,
+  quota, open breaker) has no transcript, only its call-log and audit rows.
 * Approvals (`POST /agentic/actions/{id}/approve`) are hash-bound
   (`params_sha256`/`evidence_sha256`), expire after 72 h and, for suspect
   proposals, need an admin with `acknowledge_suspect` and a written reason.
@@ -321,7 +338,7 @@ leaked key alone does not expose those values, but a leaked database dump does.
 | AC-3, AC-6(1) | `PolicyEngine` role and tier gates; admin-only settings; approval endpoint | `test_policy_matrix.py`, `test_agentic_approval_endpoints.py`, `test_settings_ai.py` |
 | AC-4 | `AgentToolRegistry._scoped`, recursive tenant refs | `test_agent_tools_isolation.py` |
 | AC-5 | Separation of duties: org setting `require_second_approver` (two distinct approvers for destructive/privileged actions, proposer excluded, `evaluate_approval_quorum`); suspect proposals additionally require admin acknowledgement with a reason | `test_agentic_second_approver.py`, `test_agentic_approval_endpoints.py`, `test_migration_021.py` |
-| AU-2, AU-3, AU-12 | Pre/post audit rows per tool, `llm_call_logs` per turn | `test_audit_chain.py`, `test_call_log_records_are_complete_per_turn` |
+| AU-2, AU-3, AU-12 | Pre/post audit rows per tool, `llm_call_logs` per turn, one encrypted `agent_run_transcripts` row per run (redacted steps + run summary) | `test_audit_chain.py`, `test_call_log_records_are_complete_per_turn`, `test_agent_run_transcripts.py` |
 | AU-9, AU-10 | `audit_trails.prev_hash/row_hash` chain; fail-closed audit | `test_audit_chain.py`, `test_post_audit_failure_fails_closed` |
 | AU-6, AU-7 | Run timeline, policy-event review, usage totals and admin-only evidence export (JSON/CSV); ITDR respond routed through the same `guarded_tool_call` path | `test_agentic_read_surfaces.py`, `test_itdr_respond.py` |
 | CM-7 | Autonomous read-only allow-list; effects-based tiers | `test_autonomous_offers_only_allowlisted_read_tools_and_ends_on_verdict` |
@@ -350,9 +367,7 @@ leaked key alone does not expose those values, but a leaked database dump does.
   run transcripts default to 365 days with a per-organization setting
   (`llm_call_log_retention_days`, `agent_transcript_retention_days`, 30 to
   1095 days, audited) honoured by the nightly `purge_agentic_retention` task.
-  See section 7. Transcript expiry is stamped when the row is written. The
-  runtime does not write transcripts yet, so the purge currently has no
-  transcript rows to delete.
+  See section 7. Transcript expiry is stamped when the row is written.
 * **Metrics**: `GET /metrics/agentic` is an in-process registry (no
   `prometheus_client`); counters reset on restart.
 * **Memory bounds outside the agent**: every Celery task that read whole
@@ -393,7 +408,8 @@ leaked key alone does not expose those values, but a leaked database dump does.
 2. New Python dependency (`anthropic`): rebuild the image
    (`docker compose build api` then `docker builder prune -af` on the
    disk-constrained host).
-3. `alembic upgrade head` (one revision, 020), then restart api/worker/scheduler.
+3. `alembic upgrade head` (020 through 022; 022 adds `agent_run_transcripts.summary`, which every run writes and `GET /agentic/runs/{run_id}` reads; without it transcript writes fail (runs still complete) and the run endpoint errors), then restart api/worker/scheduler.
 4. Frontend bundle changed: swap `dist` and restart frontend + nginx.
 5. Verify: `GET /health`, `GET /health/llm` (admin token), one chat turn with
-   `propose_actions=false`.
+   `propose_actions=false`, then `GET /agentic/runs/{run_id}` for that turn
+   shows a non-null `transcript`.
