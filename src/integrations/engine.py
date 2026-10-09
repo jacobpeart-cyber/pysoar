@@ -1046,6 +1046,10 @@ class IntegrationManager:
             }
 
 
+class OutboundTargetRefused(ValueError):
+    """A generic HTTP action asked for a URL outside the integration's base URL."""
+
+
 class ActionExecutor:
     """Execute integration actions with rate limiting and retry logic"""
 
@@ -1155,33 +1159,88 @@ class ActionExecutor:
             return await connector.execute_action(action_name, input_data)
 
         # Fallback to generic HTTP based connector execution when no wrapper exists.
-        return await self._call_generic_http_action(installation_id, action_name, input_data)
+        return await self._call_generic_http_action(installation_id, action_name, input_data, config)
+
+    @staticmethod
+    def _effective_port(scheme: str, port: Optional[int]) -> Optional[int]:
+        if port is not None:
+            return port
+        return {"http": 80, "https": 443}.get(scheme)
+
+    async def _resolve_generic_target(self, requested_url: str, config: dict[str, Any]) -> str:
+        """Pin a generic HTTP action to the integration's configured base URL.
+
+        The caller may give a path (joined to the base URL) or an absolute
+        URL with the same scheme, host and port as the stored config. The
+        final host must not resolve to a private, loopback, link-local or
+        reserved address. Raises OutboundTargetRefused otherwise.
+        """
+        import asyncio
+        from urllib.parse import urljoin, urlsplit
+
+        from src.core.url_validator import validate_url
+
+        base_url = str(config.get("base_url") or config.get("url") or "").strip()
+        base = urlsplit(base_url)
+        if base.scheme not in ("http", "https") or not base.hostname:
+            raise OutboundTargetRefused("integration has no configured http(s) base_url")
+
+        is_relative = not urlsplit(requested_url).scheme and not requested_url.startswith("//")
+        if is_relative:
+            target_url = urljoin(base_url.rstrip("/") + "/", requested_url.lstrip("/"))
+        else:
+            target_url = requested_url
+        target = urlsplit(target_url)
+        try:
+            same_origin = (
+                target.scheme == base.scheme
+                and (target.hostname or "").lower() == base.hostname.lower()
+                and self._effective_port(target.scheme, target.port) == self._effective_port(base.scheme, base.port)
+            )
+        except ValueError:
+            same_origin = False
+        if not same_origin:
+            raise OutboundTargetRefused("url must target the integration's configured base_url")
+
+        ok, reason = await asyncio.to_thread(validate_url, target_url)
+        if not ok:
+            raise OutboundTargetRefused(f"url refused: {reason}")
+        return target_url
 
     async def _call_generic_http_action(
         self,
         installation_id: str,
         action_name: str,
         input_data: dict[str, Any],
+        config: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        """Call connector action via HTTP using httpx."""
+        """Call connector action via HTTP using httpx.
+
+        The request is confined to the installed integration's configured
+        base URL (see _resolve_generic_target) so this is not an open proxy.
+        """
         import httpx
 
         # Build request from input data
         url = input_data.get("url", "")
-        method = input_data.get("method", "POST").upper()
+        method = str(input_data.get("method", "POST")).upper()
         headers = input_data.get("headers", {})
+        if not isinstance(headers, dict):
+            headers = {}
         body = input_data.get("body", {})
         timeout = input_data.get("timeout", 30)
         params = input_data.get("params", {})
 
-        if not url:
+        if not url or not isinstance(url, str):
             raise ValueError("Input data must include a 'url' field")
+
+        url = await self._resolve_generic_target(url, config or {})
 
         # Add installation context header
         headers.setdefault("X-Installation-Id", installation_id)
         headers.setdefault("X-Action-Name", action_name)
 
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
             response = await client.request(
                 method=method,
                 url=url,

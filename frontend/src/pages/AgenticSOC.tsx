@@ -257,7 +257,7 @@ const AgenticSOC: React.FC = () => {
     try {
       const alertIds = triagedAlerts.map((a) => a.id);
       const res = await api.post('/ai/triage/batch', { alert_ids: alertIds, limit: 10 });
-      const count = res.data?.results?.length || res.data?.triaged_count || 0;
+      const count = res.data?.alerts_triaged ?? res.data?.triaged_alerts?.length ?? 0;
       const refresh = await api.get('/ai/alerts/triaged');
       setTriagedAlerts(Array.isArray(refresh?.data) ? refresh.data : []);
       showStatus('success', `Triaged ${count} alerts successfully`);

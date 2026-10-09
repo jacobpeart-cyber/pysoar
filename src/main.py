@@ -448,18 +448,24 @@ app.include_router(api_router, prefix=settings.api_v1_prefix)
 # Direct WebSocket mount — bypasses BaseHTTPMiddleware which breaks WS
 from fastapi import WebSocket, Query as WSQuery
 from src.services.websocket_manager import manager as ws_manager
-from src.api.v1.endpoints.websocket import get_user_from_token
+from src.api.v1.endpoints.websocket import handle_subscribe, resolve_ws_principal
 
 @app.websocket("/api/v1/ws")
 async def ws_direct(websocket: WebSocket, token: str = WSQuery(default="")):
     """WebSocket endpoint mounted directly on app to bypass middleware."""
-    user_id = await get_user_from_token(token) if token else None
-    if not user_id:
+    principal = await resolve_ws_principal(token) if token else None
+    if principal is None:
         await websocket.accept()
         await websocket.close(code=4001, reason="Authentication required")
         return
+    user_id = principal.user_id
     try:
-        await ws_manager.connect(websocket, user_id)
+        await ws_manager.connect(
+            websocket,
+            user_id,
+            organization_id=principal.organization_id,
+            is_superuser=principal.is_superuser,
+        )
         while True:
             try:
                 data = await websocket.receive_json()
@@ -467,7 +473,7 @@ async def ws_direct(websocket: WebSocket, token: str = WSQuery(default="")):
                 if action == "ping":
                     await websocket.send_json({"type": "pong"})
                 elif action == "subscribe":
-                    await ws_manager.subscribe(user_id, data.get("channel", ""))
+                    await handle_subscribe(websocket, principal, data.get("channel", ""))
                 elif action == "unsubscribe":
                     await ws_manager.unsubscribe(user_id, data.get("channel", ""))
             except Exception:
@@ -475,7 +481,7 @@ async def ws_direct(websocket: WebSocket, token: str = WSQuery(default="")):
     except Exception:
         pass
     finally:
-        ws_manager.disconnect(user_id)
+        ws_manager.disconnect(websocket, user_id)
 
 
 # Root endpoint

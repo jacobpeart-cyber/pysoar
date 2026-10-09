@@ -539,9 +539,14 @@ async def bulk_alert_action(
     alert_ids: list = Query(...),
     action: str = Query(...),
 ):
-    """Perform bulk action on multiple alerts"""
+    """Perform bulk action on alerts in the caller's organization.
+
+    Ids that do not exist in the caller's organization are not touched and
+    are returned in ``ignored_ids``.
+    """
+    org_id = getattr(current_user, "organization_id", None)
     result = await db.execute(
-        select(OTAlert).where(OTAlert.id.in_(alert_ids))
+        select(OTAlert).where(OTAlert.id.in_(alert_ids), OTAlert.organization_id == org_id)
     )
     alerts = result.scalars().all()
 
@@ -553,9 +558,20 @@ async def bulk_alert_action(
 
     await db.commit()
 
+    updated_ids = {str(a.id) for a in alerts}
+    ignored_ids = [str(i) for i in dict.fromkeys(alert_ids) if str(i) not in updated_ids]
+    if ignored_ids:
+        logger.warning(
+            "ot_alert_bulk_action_ignored_ids",
+            user_id=str(getattr(current_user, "id", "")),
+            organization_id=org_id,
+            ignored_count=len(ignored_ids),
+        )
+
     return {
         "action": action,
         "alerts_updated": len(alerts),
+        "ignored_ids": ignored_ids,
     }
 
 

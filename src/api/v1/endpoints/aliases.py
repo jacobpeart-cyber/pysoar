@@ -19,13 +19,14 @@ from datetime import datetime, timedelta, timezone
 from ipaddress import ip_network
 from typing import Any, Dict, List, Optional
 
-from fastapi import APIRouter, Body, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import and_, desc, func, select
 
-from src.api.deps import CurrentUser, DatabaseSession
+from src.api.deps import CurrentUser, DatabaseSession, require_role
 from src.core.logging import get_logger
+from src.models.user import User, UserRole
 
 logger = get_logger(__name__)
 
@@ -976,7 +977,7 @@ class OTDiscoverRequest(BaseModel):
 async def ot_security_bulk_discover(
     payload: OTDiscoverRequest = Body(...),
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    current_user: User = Depends(require_role([UserRole.ADMIN])),
 ):
     """
     Bulk discover OT assets across an entire CIDR.
@@ -987,6 +988,9 @@ async def ot_security_bulk_discover(
     least one OT/ICS port.
 
     Safety gates:
+      * Admin role only: the sweep runs from the API host's network.
+      * When the organization has OT zones configured, the CIDR must lie
+        inside one of their ``network_cidr`` ranges.
       * CIDRs larger than /22 are refused (same cap the engine enforces).
       * If ``PYSOAR_DISABLE_NETWORK_SCAN=1`` is set, no sockets are opened
         and the endpoint returns a skipped-result payload.
@@ -1017,6 +1021,44 @@ async def ot_security_bulk_discover(
                 "Refusing bulk scan of networks larger than /22."
             ),
         )
+
+    # Confine the sweep to the organization's configured OT subnets.
+    from src.ot_security.models import OTZone
+
+    zone_cidrs = (
+        await db.execute(select(OTZone.network_cidr).where(OTZone.organization_id == org_id))
+    ).scalars().all()
+    configured = []
+    for raw in zone_cidrs:
+        try:
+            configured.append(ip_network(str(raw).strip(), strict=False))
+        except ValueError:
+            continue
+    if configured and not any(
+        net.version == zone.version and net.subnet_of(zone)  # type: ignore[arg-type]
+        for zone in configured
+    ):
+        logger.warning(
+            "ot_discover_refused_outside_zones",
+            user_id=str(getattr(current_user, "id", "")),
+            organization_id=org_id,
+            cidr=str(net),
+        )
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "cidr_outside_ot_zones",
+                "detail": "the CIDR must lie inside one of the organization's OT zone networks",
+            },
+        )
+
+    logger.info(
+        "ot_discover_requested",
+        user_id=str(getattr(current_user, "id", "")),
+        organization_id=org_id,
+        cidr=str(net),
+        zone_restricted=bool(configured),
+    )
 
     if os.environ.get("PYSOAR_DISABLE_NETWORK_SCAN") == "1":
         return {

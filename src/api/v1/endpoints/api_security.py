@@ -1,21 +1,24 @@
 """API Security Governance endpoints"""
 
+import asyncio
 import json
 import math
 from datetime import datetime, timedelta, timezone
 from typing import Optional, List
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, status, Body
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status, Body
 from sqlalchemy import func, select, and_, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import CurrentUser, DatabaseSession
+from src.api.deps import CurrentUser, DatabaseSession, require_role
 from src.core.database import async_session_factory
 from src.core.logging import get_logger
+from src.core.url_validator import validate_url
 from src.services.automation import AutomationService
 
 logger = get_logger(__name__)
 from src.models.alert import Alert
+from src.models.user import User, UserRole
 from src.api_security.models import (
     APIEndpointInventory,
     APIVulnerability,
@@ -359,9 +362,17 @@ async def bulk_update_vulnerabilities(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Bulk update vulnerabilities"""
+    """Bulk update vulnerabilities in the caller's organization.
+
+    Ids that do not exist in the caller's organization are not touched and
+    are returned in ``ignored_ids``.
+    """
+    org_id = getattr(current_user, "organization_id", None)
     result = await db.execute(
-        select(APIVulnerability).where(APIVulnerability.id.in_(bulk_data.vulnerability_ids))
+        select(APIVulnerability).where(
+            APIVulnerability.id.in_(bulk_data.vulnerability_ids),
+            APIVulnerability.organization_id == org_id,
+        )
     )
     vulns = result.scalars().all()
 
@@ -372,7 +383,16 @@ async def bulk_update_vulnerabilities(
             vuln.remediation = bulk_data.remediation
 
     await db.commit()
-    return {"updated_count": len(vulns)}
+    updated_ids = {str(v.id) for v in vulns}
+    ignored_ids = [i for i in dict.fromkeys(bulk_data.vulnerability_ids) if i not in updated_ids]
+    if ignored_ids:
+        logger.warning(
+            "api_security_bulk_update_ignored_ids",
+            user_id=str(getattr(current_user, "id", "")),
+            organization_id=org_id,
+            ignored_count=len(ignored_ids),
+        )
+    return {"updated_count": len(vulns), "ignored_ids": ignored_ids}
 
 
 # ============================================================================
@@ -1044,12 +1064,39 @@ async def trigger_security_scan(endpoint_id: str, current_user: CurrentUser = No
 
 
 @router.post("/scan/compliance/{endpoint_id}")
-async def trigger_compliance_check(endpoint_id: str, current_user: CurrentUser = None, db: DatabaseSession = None, background_tasks: BackgroundTasks = None):
-    """Trigger compliance checks for endpoint"""
+async def trigger_compliance_check(
+    endpoint_id: str,
+    current_user: User = Depends(require_role([UserRole.ADMIN])),
+    db: DatabaseSession = None,
+    background_tasks: BackgroundTasks = None,
+):
+    """Trigger compliance checks for an endpoint in the caller's organization.
+
+    The check issues a live server-side GET to the endpoint's URL, so it is
+    admin-only, limited to the caller's own inventory, and refused for
+    private / loopback / link-local targets.
+    """
+    org_id = getattr(current_user, "organization_id", None)
+    endpoint = await get_endpoint_or_404(db, endpoint_id, org_id)
+    base_url = (endpoint.base_url or "").strip()
+    if base_url:
+        target = f"{base_url.rstrip('/')}/{(endpoint.path or '').lstrip('/')}"
+        allowed, reason = await asyncio.to_thread(validate_url, target)
+        if not allowed:
+            logger.warning(
+                "api_security_compliance_scan_refused",
+                user_id=str(getattr(current_user, "id", "")),
+                endpoint_id=endpoint_id,
+                reason=reason,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"error": "scan_target_not_allowed", "detail": reason},
+            )
     background_tasks.add_task(
         compliance_check,
         endpoint_id,
-        getattr(current_user, "organization_id", None),
+        org_id,
     )
     return {"status": "compliance_check_queued", "endpoint_id": endpoint_id}
 

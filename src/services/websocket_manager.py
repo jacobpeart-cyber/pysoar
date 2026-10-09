@@ -20,19 +20,65 @@ class ConnectionManager:
     # demand via subscribe() / broadcast_channel().
     _DEFAULT_CHANNELS = ("alerts", "incidents", "playbooks", "system")
 
+    # Dynamic channels carry one tenant's events and are named
+    # ``<prefix>:<org scope>[:<sub id>]``. The org scope is the
+    # organisation id, or ``global`` for rows that have no organisation
+    # (see src/agents/service.py). Maps prefix -> number of ``:`` parts.
+    _ORG_SCOPED_CHANNEL_PARTS = {"agents": 2, "purple": 3}
+    _GLOBAL_SCOPE = "global"
+
     def __init__(self):
         # Active connections by user ID
         self.active_connections: dict[str, list[WebSocket]] = {}
+        # Tenant scope of each connected user, recorded at connect():
+        # user_id -> (organization_id, is_superuser). subscribe() refuses
+        # users with no recorded scope.
+        self._user_scope: dict[str, tuple[Optional[str], bool]] = {}
         # Connections by channel/room. Starts with the defaults but
         # new channels are auto-created by subscribe/broadcast so
         # dynamic channels like `agents:<org>` or
         # `purple:<org>:<sim>` work without a hardcoded allowlist.
         self.channels: dict[str, set[str]] = {c: set() for c in self._DEFAULT_CHANNELS}
 
-    async def connect(self, websocket: WebSocket, user_id: str):
+    @classmethod
+    def authorize_channel(
+        cls,
+        channel: str,
+        *,
+        organization_id: Optional[str],
+        is_superuser: bool,
+    ) -> bool:
+        """Return True if a user in ``organization_id`` may join ``channel``.
+
+        The default channels are allowed for everyone (every connection is
+        auto-joined to them). Org-scoped channels must name the caller's own
+        organisation (``global`` for users without one); superusers may join
+        any well-formed org channel. Anything else is refused.
+        """
+        if not isinstance(channel, str) or not channel:
+            return False
+        if channel in cls._DEFAULT_CHANNELS:
+            return True
+        parts = channel.split(":")
+        expected_parts = cls._ORG_SCOPED_CHANNEL_PARTS.get(parts[0])
+        if expected_parts is None or len(parts) != expected_parts or not all(parts):
+            return False
+        if is_superuser:
+            return True
+        own_scope = organization_id or cls._GLOBAL_SCOPE
+        return parts[1] == own_scope
+
+    async def connect(
+        self,
+        websocket: WebSocket,
+        user_id: str,
+        organization_id: Optional[str] = None,
+        is_superuser: bool = False,
+    ):
         """Accept a new WebSocket connection"""
         await websocket.accept()
 
+        self._user_scope[user_id] = (organization_id, bool(is_superuser))
         if user_id not in self.active_connections:
             self.active_connections[user_id] = []
         self.active_connections[user_id].append(websocket)
@@ -60,15 +106,28 @@ class ConnectionManager:
             # If no more connections for this user, remove from channels
             if not self.active_connections[user_id]:
                 del self.active_connections[user_id]
+                self._user_scope.pop(user_id, None)
                 for channel in self.channels.values():
                     channel.discard(user_id)
 
         logger.info(f"WebSocket disconnected: user {user_id}")
 
-    async def subscribe(self, user_id: str, channel: str):
-        """Subscribe a user to a channel (auto-creates the channel)."""
+    async def subscribe(self, user_id: str, channel: str) -> bool:
+        """Subscribe a user to a channel the user's tenant may read.
+
+        Returns False (and subscribes nothing) when the channel belongs to
+        another organisation, is malformed, or the user has no recorded
+        scope from connect().
+        """
+        scope = self._user_scope.get(user_id)
+        if scope is None or not self.authorize_channel(
+            channel, organization_id=scope[0], is_superuser=scope[1]
+        ):
+            logger.warning("websocket_subscribe_denied", user_id=user_id, channel=channel[:200])
+            return False
         self.channels.setdefault(channel, set()).add(user_id)
         logger.info(f"User {user_id} subscribed to {channel}")
+        return True
 
     async def unsubscribe(self, user_id: str, channel: str):
         """Unsubscribe a user from a channel."""

@@ -991,15 +991,33 @@ async def batch_triage_alerts(
     If alert_ids are provided, triages those specific alerts. Otherwise triages
     the most recent untriaged alerts up to the limit.
     """
+    # Batch triage writes back to alert rows, so it is strictly scoped to the
+    # caller's organization; a user without one has no alerts to triage.
+    org_id = getattr(current_user, "organization_id", None)
+    if not org_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "organization_required", "detail": "batch triage requires an organization"},
+        )
+
     try:
         from src.models.alert import Alert
 
         logger.info(f"Batch triaging up to {request.limit} alerts")
 
         if request.alert_ids:
-            query = select(Alert).where(Alert.id.in_(request.alert_ids)).limit(request.limit)
+            query = (
+                select(Alert)
+                .where(Alert.id.in_(request.alert_ids), Alert.organization_id == org_id)
+                .limit(request.limit)
+            )
         else:
-            query = select(Alert).order_by(Alert.created_at.desc()).limit(request.limit)
+            query = (
+                select(Alert)
+                .where(Alert.organization_id == org_id)
+                .order_by(Alert.created_at.desc())
+                .limit(request.limit)
+            )
 
         result = await db.execute(query)
         alerts = list(result.scalars().all())

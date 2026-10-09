@@ -233,6 +233,13 @@ class TestOpenAPISpecParsing:
 class TestHeaderComplianceCheck:
     """Tests for _check_security_headers in compliance tasks"""
 
+    @pytest.fixture(autouse=True)
+    def _public_targets(self, monkeypatch):
+        # The check now refuses private/unresolvable targets (SSRF guard,
+        # covered in tests/unit/test_ssrf_and_scan_gates.py). These tests mock
+        # the HTTP client, so treat their example hostnames as public.
+        monkeypatch.setattr("src.api_security.tasks.validate_url", lambda url: (True, "OK"))
+
     async def test_all_required_headers_present_passes(self):
         endpoint = _endpoint()
         response = httpx.Response(

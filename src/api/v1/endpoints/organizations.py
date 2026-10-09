@@ -393,11 +393,26 @@ async def list_teams(
     current_user: CurrentUser = None,
     organization_id: Optional[str] = None,
 ):
-    """List all teams"""
+    """List teams in the caller's organization.
+
+    Only platform superusers may list another organization's teams (by
+    passing ``organization_id``); everyone else is scoped to their own.
+    """
     query = select(Team)
 
-    if organization_id:
-        query = query.where(Team.organization_id == organization_id)
+    if getattr(current_user, "is_superuser", False):
+        if organization_id:
+            query = query.where(Team.organization_id == organization_id)
+    else:
+        own_org = getattr(current_user, "organization_id", None)
+        if not own_org:
+            return []
+        if organization_id and organization_id != own_org:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Not a member of this organization",
+            )
+        query = query.where(Team.organization_id == own_org)
 
     if not current_user.is_admin:
         # Get teams the user is a member of
@@ -559,14 +574,15 @@ async def add_team_member(
     current_user: CurrentUser = None,
 ):
     """Add a member to a team"""
-    await _get_team(db, team_id, current_user)
+    team = await _get_team(db, team_id, current_user)
 
     # Resolve user_id from email if not provided
     target_user_id = data.user_id
     if not target_user_id and data.email:
-        by_email = await db.execute(
-            select(User).where(User.email == data.email.lower().strip())
-        )
+        email_query = select(User).where(User.email == data.email.lower().strip())
+        if not getattr(current_user, "is_superuser", False):
+            email_query = email_query.where(User.organization_id == team.organization_id)
+        by_email = await db.execute(email_query)
         user_row = by_email.scalar_one_or_none()
         if not user_row:
             raise HTTPException(
@@ -579,6 +595,17 @@ async def add_team_member(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Either user_id or email must be provided",
         )
+
+    # The new member must belong to the team's organization (superusers excepted).
+    if not getattr(current_user, "is_superuser", False):
+        target_org = (
+            await db.execute(select(User.organization_id).where(User.id == target_user_id))
+        ).scalar_one_or_none()
+        if target_org != team.organization_id:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found in this organization",
+            )
 
     # Check if already a member
     existing = await db.execute(
@@ -703,6 +730,14 @@ async def _get_team(
     """
     result = await db.execute(select(Team).where(Team.id == team_id))
     team = result.scalar_one_or_none()
+
+    # A team outside the caller's organization is reported as missing, so
+    # tenant admins can neither read nor modify another tenant's teams.
+    # Only platform superusers cross organizations.
+    if team is not None and not getattr(user, "is_superuser", False):
+        own_org = getattr(user, "organization_id", None)
+        if not own_org or team.organization_id != own_org:
+            team = None
 
     if not team:
         raise HTTPException(

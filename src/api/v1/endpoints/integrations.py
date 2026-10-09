@@ -5,12 +5,12 @@ import math
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from fastapi import APIRouter, Path, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Path, HTTPException, Query, status
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from src.api.deps import CurrentUser, DatabaseSession
+from src.api.deps import CurrentUser, DatabaseSession, require_role
 # Credential envelope helpers live in src.core.secrets (design v2 section 10);
 # re-exported here because settings.py, main.py and siem/cloud_poller.py
 # import them from this module.
@@ -18,6 +18,7 @@ from src.core.secrets import _decrypt_secret_json, _encrypt_secret_json  # noqa:
 from src.core.security import get_password_hash
 from src.core.utils import safe_json_loads
 from src.integrations.engine import ConnectorRegistry, IntegrationManager, ActionExecutor
+from src.models.user import User, UserRole
 from src.integrations.models import (
     IntegrationAction,
     IntegrationConnector,
@@ -671,12 +672,16 @@ async def list_integration_actions(
 )
 async def execute_action(
     request: ActionExecutionRequest,
-    current_user: CurrentUser = None,
+    current_user: User = Depends(require_role([UserRole.ADMIN, UserRole.ANALYST])),
     db: DatabaseSession = None,
     integration_id: str = Path(...),
     action_id: str = Path(...),
 ):
-    """Execute an integration action"""
+    """Execute an integration action (analyst role or above).
+
+    Actions run outbound calls with the integration's stored credentials;
+    viewers are refused.
+    """
     integration = await get_installed_integration_or_404(
         db, integration_id, getattr(current_user, "organization_id", None)
     )
@@ -694,7 +699,7 @@ async def execute_action(
 
     # Execute action
     execution_result = await executor.execute_action(
-        integration_id=integration_id,
+        installation_id=integration_id,
         action_name=action.action_name,
         input_data=request.input_data,
         playbook_run_id=request.playbook_run_id,

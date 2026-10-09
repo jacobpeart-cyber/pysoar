@@ -5,6 +5,7 @@ Background tasks for API discovery, security scanning, anomaly detection,
 compliance checking, and shadow API detection.
 """
 
+import asyncio
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Tuple
 
@@ -15,6 +16,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy import select
 
 from src.core.logging import get_logger
+from src.core.url_validator import validate_url
 from src.core.config import settings
 from src.api_security.models import (
     APIEndpointInventory,
@@ -232,7 +234,8 @@ def compliance_check(self, endpoint_id: str, org_id: str):
             async with AsyncSessionLocal() as db:
                 # Fetch endpoint
                 stmt = select(APIEndpointInventory).where(
-                    APIEndpointInventory.id == endpoint_id
+                    APIEndpointInventory.id == endpoint_id,
+                    APIEndpointInventory.organization_id == org_id,
                 )
                 result = await db.execute(stmt)
                 endpoint = result.scalar_one_or_none()
@@ -421,8 +424,19 @@ async def _check_security_headers(
         }
 
     url = f"{base_url.rstrip('/')}/{(endpoint.path or '').lstrip('/')}"
+
+    # The URL is tenant-supplied inventory data: never let the scanner reach
+    # private, loopback, link-local or metadata addresses, and do not follow
+    # redirects that could bounce it there.
+    allowed, reason = await asyncio.to_thread(validate_url, url)
+    if not allowed:
+        logger.warning("api_security_header_check_refused", checked_url=url[:300], reason=reason)
+        return False, {
+            "reason": f"target refused: {reason}",
+            "checked_url": url,
+        }
     try:
-        async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=5.0, follow_redirects=False) as client:
             response = await client.get(url)
     except httpx.HTTPError as exc:
         return False, {
