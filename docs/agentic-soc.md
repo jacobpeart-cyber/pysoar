@@ -378,6 +378,14 @@ leaked key alone does not expose those values, but a leaked database dump does.
   STIG, integrations, supply-chain, deception, scheduled playbooks and the
   on-demand exposure tasks. Regression tests:
   `test_task_memory_bounds.py`, `test_task_memory_bounds_round2.py`.
+* **Data-lake raw SQL tenant guard is unsafe**: `_build_tenant_scoped_sql`
+  in `src/api/v1/endpoints/data_lake.py` is regex based (first FROM table
+  only; comma joins, JOIN targets and subqueries unscoped; column whitelist
+  not enforced), so since 2026-10-08 the raw SQL path of
+  `POST /data-lake/query` is platform-superuser only (403
+  `raw_sql_requires_superuser` for everyone else, tenant admins included).
+  Pending: rewrite the guard on a real SQL parser before reopening it to
+  tenant users. Regression test: `test_data_lake_raw_sql_gate.py`.
 
 ## 12. Deploying this release
 

@@ -1,4 +1,11 @@
-"""Backup and Restore API endpoints for PySOAR."""
+"""Backup and Restore API endpoints for PySOAR.
+
+Backups are whole-database dumps covering every tenant, so creating,
+restoring and deleting them is limited to platform superusers
+(``PlatformSuperUser``: ``is_superuser``; the tenant ``admin`` role is not
+enough). Before 2026-10-08 any tenant admin could dump or replace every
+tenant's data.
+"""
 
 import os
 import subprocess
@@ -7,7 +14,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException, Query, Body
-from src.api.deps import AdminUser, CurrentUser, DatabaseSession
+from src.api.deps import AdminUser, PlatformSuperUser
 from src.core.config import settings
 from src.core.logging import get_logger
 
@@ -36,8 +43,13 @@ def _safe_backup_path(filename: str) -> str:
 
 
 @router.get("/status")
-async def get_backup_status(current_user: CurrentUser = None):
-    """Get backup system status and list available backups."""
+async def get_backup_status(current_user: AdminUser = None):
+    """Get backup system status and list available backups.
+
+    Read-only, so tenant admins may view it (previously any user could);
+    it exposes file names and sizes only, never contents. Every operation
+    that writes, restores or deletes a backup requires a platform superuser.
+    """
     backups = []
 
     if os.path.exists(BACKUP_DIR):
@@ -62,9 +74,9 @@ async def get_backup_status(current_user: CurrentUser = None):
 
 
 @router.post("/create")
-async def create_backup(current_user: AdminUser = None):
-    """Trigger an immediate database backup. Admin-only — dumps the entire
-    multi-tenant database."""
+async def create_backup(current_user: PlatformSuperUser):
+    """Trigger an immediate database backup. Platform superuser only: dumps
+    the entire multi-tenant database."""
     os.makedirs(BACKUP_DIR, exist_ok=True)
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -169,11 +181,11 @@ async def create_backup(current_user: AdminUser = None):
 
 @router.post("/restore")
 async def restore_backup(
+    current_user: PlatformSuperUser,
     data: dict = Body(...),
-    current_user: AdminUser = None,
 ):
-    """Restore database from a backup file. Admin-only — this REPLACES the
-    entire database (pg_restore --clean) for ALL tenants."""
+    """Restore database from a backup file. Platform superuser only: this
+    REPLACES the entire database (pg_restore --clean) for ALL tenants."""
     filename = data.get("filename")
     if not filename:
         raise HTTPException(status_code=400, detail="filename is required")
@@ -228,9 +240,9 @@ async def restore_backup(
 @router.delete("/backups/{filename}")
 async def delete_backup(
     filename: str,
-    current_user: AdminUser = None,
+    current_user: PlatformSuperUser,
 ):
-    """Delete a backup file. Admin-only."""
+    """Delete a backup file. Platform superuser only."""
     filepath = _safe_backup_path(filename)
     if not os.path.exists(filepath):
         raise HTTPException(status_code=404, detail="Backup not found")
@@ -240,8 +252,11 @@ async def delete_backup(
 
 
 @router.get("/notifications/test")
-async def test_email_notification(current_user: CurrentUser = None):
-    """Send a test email notification to verify SMTP configuration."""
+async def test_email_notification(current_user: PlatformSuperUser):
+    """Send a test email notification to verify SMTP configuration.
+
+    Platform superuser only: it mails the platform's first-admin address
+    and reports the platform SMTP host."""
     from src.services.email_service import EmailService
     email_service = EmailService()
 

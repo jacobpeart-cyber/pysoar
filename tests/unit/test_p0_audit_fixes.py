@@ -37,14 +37,16 @@ def test_safe_backup_path_accepts_plain_filename():
 
 
 def test_backup_mutations_require_admin():
-    # The destructive endpoints must depend on AdminUser, not CurrentUser.
+    # The destructive endpoints dump or replace every tenant's data, so since
+    # 2026-10-08 they require a platform superuser (stricter than AdminUser,
+    # which any tenant's admin satisfies). See test_backup_superuser_gate.py.
     import inspect
     from src.api.v1.endpoints import backup
-    from src.api.deps import AdminUser
+    from src.api.deps import PlatformSuperUser
 
     for fn in (backup.create_backup, backup.restore_backup, backup.delete_backup):
         ann = inspect.signature(fn).parameters["current_user"].annotation
-        assert ann is AdminUser, f"{fn.__name__} must require AdminUser, got {ann}"
+        assert ann is PlatformSuperUser, f"{fn.__name__} must require PlatformSuperUser, got {ann}"
 
 
 # --------------------------------------------------------------------------

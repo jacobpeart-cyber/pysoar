@@ -3,9 +3,9 @@
 from datetime import datetime
 from typing import Any, Optional, Union
 
-from src.schemas.base import DBModel
 from pydantic import BaseModel, Field
 
+from src.schemas.base import DBModel
 
 # ============================================================================
 # Forensic Case Schemas

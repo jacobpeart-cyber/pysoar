@@ -217,7 +217,7 @@ async def test_another_organization_cannot_reach_the_evidence(client, db_session
     _, headers = await _org_user(db_session, email="dfir6@dfir-org.test")
     case_id = await _case(client, headers)
     resp = await client.post(
-        "/api/v1/dfir/evidence", headers=headers, json=_evidence_payload(case_id, "s3://bucket/object")
+        "/api/v1/dfir/evidence", headers=headers, json=_evidence_payload(case_id, "s3://bucket/object"),
     )
     assert resp.status_code == 201, resp.text
     evidence_id = resp.json()["id"]

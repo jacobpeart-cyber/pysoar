@@ -377,30 +377,53 @@ async def generate_remediation_script(
 # ============================================================================
 
 
+# Where uploaded XCCDF files are persisted on disk. A bind mount in
+# production, a tmp dir in tests. Kept outside /tmp so the file survives
+# container restarts; the SCAPProfile row stores the absolute path so
+# later re-scans can hash-verify content integrity. It is also the only
+# directory POST /stig/scap/import will read from.
+STIG_CONTENT_DIR = os.environ.get("PYSOAR_STIG_CONTENT_DIR", "/app/data/stig/xccdf")
+
+
+def _stig_content_path(content_path: Optional[str]) -> str:
+    """Resolve a client-supplied content path; 403 unless it is a file
+    inside STIG_CONTENT_DIR.
+
+    Before 2026-10-08 /scap/import parsed any server-side path the caller
+    named (e.g. /opt/pysoar/.env), leaking file existence and parse errors.
+    """
+    root = os.path.realpath(STIG_CONTENT_DIR)
+    real = os.path.realpath(content_path or "")
+    if not content_path or not real.startswith(root + os.sep):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "content_path_outside_stig_root",
+                "detail": "content_path must name a file previously uploaded through POST /stig/scap/upload",
+            },
+        )
+    return real
+
+
 @router.post("/scap/import", response_model=SCAPProfileResponse)
 async def import_scap_content(
     request: SCAPImportRequest,
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
 ):
-    """Import SCAP content (XCCDF, OVAL) by server-side path."""
+    """Import SCAP content (XCCDF, OVAL) from a file already under the STIG
+    content directory (see POST /stig/scap/upload)."""
+    xccdf_path = _stig_content_path(request.content_path)
     try:
         engine = SCAPEngine(db)
         result = await engine.import_scap_content(
-            xccdf_path=request.content_path,
+            xccdf_path=xccdf_path,
             org_id=getattr(current_user, "organization_id", None),
         )
         return result
     except Exception as e:
         logger.error(f"Error importing SCAP content: {str(e)}")
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
-
-
-# Where uploaded XCCDF files are persisted on disk. A bind mount in
-# production, a tmp dir in tests. Kept outside /tmp so the file survives
-# container restarts; the SCAPProfile row stores the absolute path so
-# later re-scans can hash-verify content integrity.
-STIG_CONTENT_DIR = os.environ.get("PYSOAR_STIG_CONTENT_DIR", "/app/data/stig/xccdf")
 
 
 @router.post("/scap/upload")

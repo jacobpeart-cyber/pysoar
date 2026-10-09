@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.core.logging import get_logger
 from src.services.automation import AutomationService
 from src.api.deps import get_current_active_user as get_current_user
+from src.api.v1.endpoints.audit_evidence import REMOTE_EVIDENCE_SCHEMES
 from src.core.database import get_db
 from src.schemas.compliance import (
     ComplianceFrameworkResponse,
@@ -900,14 +901,31 @@ async def upload_evidence(
     file_path: Optional[str] = None,
     current_user: CurrentUser = None,
 ):
-    """Upload compliance evidence."""
+    """Register compliance evidence.
+
+    ``file_path`` may only be an https:// or s3:// object URL. Local files are
+    registered solely through POST /audit-evidence/evidence/upload, which
+    writes under EVIDENCE_UPLOAD_ROOT; accepting a local path here let any
+    user register "/opt/pysoar/.env" and download it (fixed 2026-10-08).
+    """
+    if file_path and not file_path.startswith(REMOTE_EVIDENCE_SCHEMES):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": "invalid_evidence_location",
+                "detail": (
+                    "file_path must be an https:// or s3:// object URL; local files are "
+                    "registered through POST /audit-evidence/evidence/upload"
+                ),
+            },
+        )
     evidence = ComplianceEvidence(
         control_id_ref=control_id_ref,
         evidence_type=evidence_type,
         title=title,
         description=description,
         content=content,
-        file_path=file_path,
+        file_path=file_path or None,
         collected_at=datetime.now(timezone.utc),
         collected_by=current_user.id,
         organization_id=getattr(current_user, "organization_id", None),

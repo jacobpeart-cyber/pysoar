@@ -166,7 +166,7 @@ class PolicyDecisionPoint:
                     f"Risk score {combined_risk:.1f} exceeds threshold {policy.risk_threshold}"
                 )
                 risk_factors.append(
-                    f"elevated_risk_score_{combined_risk:.1f}"
+                    f"elevated_risk_score_{combined_risk:.1f}",
                 )
             # Check MFA requirement
             elif policy.requires_mfa and not mfa_completed:
@@ -185,7 +185,7 @@ class PolicyDecisionPoint:
                     f"minimum {policy.minimum_device_trust_score}"
                 )
                 risk_factors.append(
-                    f"low_device_trust_{device_trust_score:.1f}"
+                    f"low_device_trust_{device_trust_score:.1f}",
                 )
             else:
                 # Check policy actions
@@ -246,7 +246,7 @@ class PolicyDecisionPoint:
             try:
                 from src.zerotrust.session_gate import invalidate_session_cache
                 await invalidate_session_cache(sid, decision)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 logger.warning(
                     "zt_session_cache_push_failed",
                     session_id=sid[:8] if isinstance(sid, str) else None,
@@ -271,7 +271,7 @@ class PolicyDecisionPoint:
             select(AccessDecision)
             .where(AccessDecision.session_id == session_id)
             .order_by(desc(AccessDecision.created_at))
-            .limit(1)
+            .limit(1),
         )
         last_decision = result.scalar_one_or_none()
 
@@ -332,8 +332,8 @@ class PolicyDecisionPoint:
                     AccessDecision.organization_id == self.organization_id,
                     AccessDecision.decision == "deny",
                     AccessDecision.created_at >= recent_cutoff,
-                )
-            )
+                ),
+            ),
         )
         recent_failures = failed_result.scalars().all()
         # Each recent denied access adds to risk
@@ -347,8 +347,8 @@ class PolicyDecisionPoint:
                     AccessDecision.organization_id == self.organization_id,
                     AccessDecision.decision.in_(["step_up", "challenge"]),
                     AccessDecision.created_at >= recent_cutoff,
-                )
-            )
+                ),
+            ),
         )
         recent_stepups = stepup_result.scalars().all()
         risk_score += len(recent_stepups) * 3.0
@@ -361,8 +361,8 @@ class PolicyDecisionPoint:
                     IdentityVerification.organization_id == self.organization_id,
                     IdentityVerification.result == "failure",
                     IdentityVerification.created_at >= recent_cutoff,
-                )
-            )
+                ),
+            ),
         )
         failed_verifications = failed_verif_result.scalars().all()
         risk_score += len(failed_verifications) * 10.0
@@ -423,9 +423,9 @@ class PolicyDecisionPoint:
                 and_(
                     DeviceTrustProfile.device_id == device_id,
                     DeviceTrustProfile.organization_id == self.organization_id,
-                )
+                ),
             )
-            .limit(1)
+            .limit(1),
         )
         return result.scalar_one_or_none()
 
@@ -449,9 +449,9 @@ class PolicyDecisionPoint:
                 and_(
                     ZeroTrustPolicy.organization_id == self.organization_id,
                     ZeroTrustPolicy.is_enabled == True,  # noqa: E712
-                )
+                ),
             )
-            .order_by(desc(ZeroTrustPolicy.priority))
+            .order_by(desc(ZeroTrustPolicy.priority)),
         )
         all_policies = result.scalars().all()
 
@@ -688,9 +688,9 @@ class DeviceTrustAssessor:
                 and_(
                     DeviceTrustProfile.device_id == device_id,
                     DeviceTrustProfile.organization_id == self.organization_id,
-                )
+                ),
             )
-            .limit(1)
+            .limit(1),
         )
         device = result.scalar_one_or_none()
 
@@ -761,7 +761,7 @@ class DeviceTrustAssessor:
         return min(score, 100.0)
 
     async def update_device_compliance(
-        self, device_id: str, compliance_data: dict[str, Any]
+        self, device_id: str, compliance_data: dict[str, Any],
     ) -> DeviceTrustProfile:
         """Update device compliance data and recalculate trust score"""
         result = await self.db.execute(
@@ -770,9 +770,9 @@ class DeviceTrustAssessor:
                 and_(
                     DeviceTrustProfile.device_id == device_id,
                     DeviceTrustProfile.organization_id == self.organization_id,
-                )
+                ),
             )
-            .limit(1)
+            .limit(1),
         )
         device = result.scalar_one_or_none()
 
@@ -817,8 +817,8 @@ class DeviceTrustAssessor:
                 and_(
                     DeviceTrustProfile.organization_id == self.organization_id,
                     DeviceTrustProfile.trust_score < 70,
-                )
-            )
+                ),
+            ),
         )
         return result.scalars().all()
 
@@ -924,8 +924,8 @@ class MicroSegmentationEngine:
                 and_(
                     MicroSegment.organization_id == self.organization_id,
                     MicroSegment.is_active == True,
-                )
-            )
+                ),
+            ),
         )
         segments = result.scalars().all()
 
@@ -977,7 +977,7 @@ class MicroSegmentationEngine:
         }
 
     async def detect_lateral_movement(
-        self, traffic_data: list[dict[str, Any]]
+        self, traffic_data: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         """Detect suspicious lateral movement patterns
 
@@ -1034,9 +1034,9 @@ class MicroSegmentationEngine:
                 and_(
                     MicroSegment.id == segment_id,
                     MicroSegment.organization_id == self.organization_id,
-                )
+                ),
             )
-            .limit(1)
+            .limit(1),
         )
         segment = result.scalar_one_or_none()
 
@@ -1051,8 +1051,8 @@ class MicroSegmentationEngine:
                     AccessDecision.decision.in_(["deny", "isolate"]),
                     AccessDecision.resource_type == "network_segment",
                     AccessDecision.resource_id == segment_id,
-                )
-            ).order_by(desc(AccessDecision.created_at)).limit(100)
+                ),
+            ).order_by(desc(AccessDecision.created_at)).limit(100),
         )
         denied_decisions = result_decisions.scalars().all()
 
@@ -1077,8 +1077,8 @@ class MicroSegmentationEngine:
         """
         result = await self.db.execute(
             select(MicroSegment).where(
-                MicroSegment.organization_id == self.organization_id
-            )
+                MicroSegment.organization_id == self.organization_id,
+            ),
         )
         segments = result.scalars().all()
 
@@ -1206,10 +1206,10 @@ class ContinuousAuthEngine:
                 and_(
                     AccessDecision.session_id == session_id,
                     AccessDecision.organization_id == self.organization_id,
-                )
+                ),
             )
             .order_by(desc(AccessDecision.created_at))
-            .limit(1)
+            .limit(1),
         )
         last_decision = result.scalar_one_or_none()
 
@@ -1229,7 +1229,7 @@ class ContinuousAuthEngine:
         return True
 
     async def _should_reauthenticate(
-        self, session_data: dict[str, Any], risk_delta: float
+        self, session_data: dict[str, Any], risk_delta: float,
     ) -> bool:
         """Determine if re-authentication is needed
 
@@ -1333,8 +1333,8 @@ class ZeroTrustScorer:
                         ZeroTrustPolicy.organization_id == self.organization_id,
                         ZeroTrustPolicy.is_enabled == True,
                         ZeroTrustPolicy.policy_type == "identity",
-                    )
-                )
+                    ),
+                ),
             )
             identity_policies = policy_result.scalars().all()
             mfa_policies = [p for p in identity_policies if p.requires_mfa]
@@ -1351,8 +1351,8 @@ class ZeroTrustScorer:
             # Assess device pillar: check device trust scores
             device_result = await self.db.execute(
                 select(DeviceTrustProfile).where(
-                    DeviceTrustProfile.organization_id == self.organization_id
-                )
+                    DeviceTrustProfile.organization_id == self.organization_id,
+                ),
             )
             devices = device_result.scalars().all()
             details["total_devices"] = len(devices)
@@ -1372,8 +1372,8 @@ class ZeroTrustScorer:
                     and_(
                         MicroSegment.organization_id == self.organization_id,
                         MicroSegment.is_active == True,
-                    )
-                )
+                    ),
+                ),
             )
             segments = segment_result.scalars().all()
             details["total_segments"] = len(segments)
@@ -1392,8 +1392,8 @@ class ZeroTrustScorer:
                         ZeroTrustPolicy.organization_id == self.organization_id,
                         ZeroTrustPolicy.is_enabled == True,
                         ZeroTrustPolicy.policy_type.in_(["access", "workload"]),
-                    )
-                )
+                    ),
+                ),
             )
             app_policies = app_policy_result.scalars().all()
             details["total_app_policies"] = len(app_policies)
@@ -1412,8 +1412,8 @@ class ZeroTrustScorer:
                         ZeroTrustPolicy.organization_id == self.organization_id,
                         ZeroTrustPolicy.is_enabled == True,
                         ZeroTrustPolicy.policy_type == "data",
-                    )
-                )
+                    ),
+                ),
             )
             data_policies = data_policy_result.scalars().all()
             classified = [p for p in data_policies if p.data_classification_required]
@@ -1430,7 +1430,8 @@ class ZeroTrustScorer:
             # ingestion, and UEBA entity coverage. The idea is that
             # zero trust requires continuous monitoring, so we give
             # credit for each of those signals existing.
-            from datetime import datetime as _dt, timedelta as _td
+            from datetime import datetime as _dt
+            from datetime import timedelta as _td
 
             active_rules = 0
             log_count_24h = 0
@@ -1439,27 +1440,27 @@ class ZeroTrustScorer:
                 from src.siem.models import DetectionRule, LogEntry, RuleStatus
                 rules_q = await self.db.execute(
                     select(func.count(DetectionRule.id)).where(
-                        DetectionRule.status == RuleStatus.ACTIVE.value
-                    )
+                        DetectionRule.status == RuleStatus.ACTIVE.value,
+                    ),
                 )
                 active_rules = rules_q.scalar() or 0
                 logs_q = await self.db.execute(
                     select(func.count(LogEntry.id)).where(
-                        LogEntry.created_at >= _dt.utcnow() - _td(hours=24)
-                    )
+                        LogEntry.created_at >= _dt.utcnow() - _td(hours=24),
+                    ),
                 )
                 log_count_24h = logs_q.scalar() or 0
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
             try:
                 from src.ueba.models import EntityProfile
                 entities_q = await self.db.execute(
                     select(func.count(EntityProfile.id)).where(
-                        EntityProfile.organization_id == self.organization_id
-                    )
+                        EntityProfile.organization_id == self.organization_id,
+                    ),
                 )
                 entity_count = entities_q.scalar() or 0
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
 
             details["active_detection_rules"] = active_rules
@@ -1485,11 +1486,11 @@ class ZeroTrustScorer:
                 from src.models.playbook import Playbook
                 pb_q = await self.db.execute(
                     select(func.count(Playbook.id)).where(
-                        Playbook.is_enabled == True  # noqa: E712
-                    )
+                        Playbook.is_enabled == True,  # noqa: E712
+                    ),
                 )
                 enabled_playbooks = pb_q.scalar() or 0
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
             try:
                 from src.remediation.models import RemediationPolicy
@@ -1498,21 +1499,21 @@ class ZeroTrustScorer:
                         and_(
                             RemediationPolicy.is_enabled == True,  # noqa: E712
                             RemediationPolicy.organization_id == self.organization_id,
-                        )
-                    )
+                        ),
+                    ),
                 )
                 enabled_policies = rp_q.scalar() or 0
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
             try:
                 from src.agents.models import EndpointAgent
                 ag_q = await self.db.execute(
                     select(func.count(EndpointAgent.id)).where(
-                        EndpointAgent.organization_id == self.organization_id
-                    )
+                        EndpointAgent.organization_id == self.organization_id,
+                    ),
                 )
                 agent_count = ag_q.scalar() or 0
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
 
             details["enabled_playbooks"] = enabled_playbooks
@@ -1559,7 +1560,7 @@ class ZeroTrustScorer:
             return "traditional"
 
     async def generate_recommendations(
-        self, pillars: dict[str, dict[str, Any]]
+        self, pillars: dict[str, dict[str, Any]],
     ) -> list[dict[str, Any]]:
         """Generate improvement recommendations
 

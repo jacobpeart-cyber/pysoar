@@ -1,4 +1,14 @@
-"""Data Lake / Data Mesh API endpoints"""
+"""Data Lake / Data Mesh API endpoints
+
+SECURITY NOTE (2026-10-08): the raw SQL path of ``POST /data-lake/query`` is
+restricted to platform superusers. ``_build_tenant_scoped_sql`` is NOT a safe
+per-tenant guard: it is regex based, scopes only the first FROM table, ignores
+comma joins, JOIN targets and subqueries, and never enforces the column
+whitelist, so ``SELECT users.email, users.hashed_password FROM alerts, users``
+passed it. The guard is kept as defence in depth for superusers. Opening the
+route to tenant users again requires rewriting the guard on a real SQL parser
+(see docs/agentic-soc.md section 11).
+"""
 
 import json
 import math
@@ -1467,6 +1477,26 @@ async def run_catalog_filter_query(
     query_language = (payload.get("query_language") or "sql").lower() if isinstance(payload, dict) else "sql"
 
     if raw_sql and isinstance(raw_sql, str) and raw_sql.strip():
+        # Raw SQL is platform-superuser only: the tenant guard below is not
+        # sound (see the module docstring). The tenant "admin" role is not
+        # enough, since a tenant admin must not read other tenants' rows.
+        if not getattr(current_user, "is_superuser", False):
+            logger.warning(
+                "data_lake.raw_sql_refused",
+                user_id=str(getattr(current_user, "id", "")),
+                organization_id=org_id,
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "error": "raw_sql_requires_superuser",
+                    "detail": (
+                        "raw SQL queries are limited to platform superusers until the "
+                        "per-tenant SQL guard is rewritten on a real parser; use the "
+                        "catalog filter or the saved queries instead"
+                    ),
+                },
+            )
         if query_language not in ("sql", "dialect_sql"):
             raise HTTPException(
                 status_code=400,

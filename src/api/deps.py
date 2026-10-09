@@ -163,6 +163,27 @@ async def get_current_superuser(
     return current_user
 
 
+async def get_platform_superuser(
+    current_user: Annotated[User, Depends(get_current_user)],
+) -> User:
+    """Platform operator only: ``is_superuser`` is required, the tenant admin
+    role is NOT enough.
+
+    ``get_current_superuser`` above also admits ``is_admin`` (any tenant's
+    admin role), so it cannot gate operations that touch every tenant, such
+    as whole-database backups or raw SQL. Use this dependency for those.
+    """
+    if not current_user.is_superuser:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "platform_superuser_required",
+                "detail": "this operation affects every tenant and is limited to platform superusers",
+            },
+        )
+    return current_user
+
+
 async def get_optional_user(
     credentials: Annotated[Optional[HTTPAuthorizationCredentials], Depends(security)],
     db: Annotated[AsyncSession, Depends(get_db)],
@@ -199,6 +220,7 @@ def require_role(allowed_roles: list[UserRole]):
 # Common dependency types
 CurrentUser = Annotated[User, Depends(get_current_active_user)]
 AdminUser = Annotated[User, Depends(get_current_admin_user)]
+PlatformSuperUser = Annotated[User, Depends(get_platform_superuser)]
 OptionalUser = Annotated[Optional[User], Depends(get_optional_user)]
 DatabaseSession = Annotated[AsyncSession, Depends(get_db)]
 RedisClient = Annotated[aioredis.Redis, Depends(get_redis_client)]

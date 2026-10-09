@@ -5,16 +5,18 @@ REST endpoints for audit logging, evidence collection, packaging,
 continuous monitoring, and audit readiness checking.
 """
 
-from typing import Optional
+import os
+from typing import Annotated, Optional
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Body, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Body, Request, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, func
 
-from src.api.deps import CurrentUser, DatabaseSession, get_current_active_user
+from src.api.deps import CurrentUser, DatabaseSession, get_current_active_user, require_role
 from src.core.database import get_db
 from src.core.logging import get_logger
+from src.models.user import User, UserRole
 from src.audit_evidence.engine import (
     AuditLogger,
     EvidenceCollector,
@@ -48,6 +50,39 @@ logger = get_logger(__name__)
 
 router = APIRouter(prefix="/audit-evidence", tags=["audit-evidence"])
 
+# The only directory compliance evidence files are written to (by
+# POST /audit-evidence/evidence/upload, under <root>/<org>/<control>/) and
+# therefore the only directory the download route will serve from. Before
+# 2026-10-08 POST /compliance/evidence stored any client-supplied file_path
+# and the download route streamed it, so "/opt/pysoar/.env" was one request
+# away. Remote evidence is limited to these object-URL schemes.
+EVIDENCE_UPLOAD_ROOT = os.getenv("EVIDENCE_UPLOAD_DIR", "uploads/evidence")
+REMOTE_EVIDENCE_SCHEMES = ("https://", "s3://")
+
+
+def _evidence_org_root(org_id: Optional[str]) -> str:
+    return os.path.realpath(os.path.join(EVIDENCE_UPLOAD_ROOT, str(org_id or "unknown")))
+
+
+def local_evidence_path(location: str, org_id: Optional[str]) -> str:
+    """Resolve a stored local evidence path; 403 unless it lies inside the
+    caller's organisation directory under EVIDENCE_UPLOAD_ROOT."""
+    root = _evidence_org_root(org_id)
+    real = os.path.realpath(location)
+    if not real.startswith(root + os.sep):
+        raise HTTPException(
+            status_code=403,
+            detail={
+                "error": "evidence_path_outside_storage_root",
+                "detail": "this evidence item points outside the evidence storage root and cannot be served",
+            },
+        )
+    return real
+
+
+# Writing audit events by hand is an analyst action; viewers may only read.
+AuditWriter = Annotated[User, Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
+
 
 # ============================================================================
 # Audit Trail Endpoints
@@ -57,17 +92,35 @@ router = APIRouter(prefix="/audit-evidence", tags=["audit-evidence"])
 @router.post("/audit/log", response_model=AuditTrailResponse)
 async def log_audit_event(
     request: AuditLogRequest,
+    http_request: Request,
+    current_user: AuditWriter,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
-    """Log audit event"""
+    """Log an audit event as the calling user.
+
+    The actor (id and type) is always the authenticated caller and the IP is
+    the connection's client address; the ``actor_id``, ``actor_type`` and
+    ``actor_ip`` fields of the request body are ignored, so a caller cannot
+    write audit rows attributed to someone else (fixed 2026-10-08).
+    """
+    ignored = [
+        f for f in ("actor_id", "actor_type", "actor_ip")
+        if getattr(request, f, None) not in (None, "")
+    ]
+    if ignored:
+        logger.info(
+            "audit.log: ignoring client-supplied actor fields",
+            user_id=str(current_user.id),
+            ignored_fields=ignored,
+        )
+    client = getattr(http_request, "client", None)
     try:
         audit_logger = AuditLogger(db, getattr(current_user, "organization_id", None))
         trail = await audit_logger.log_event(
             event_type=request.event_type,
             action=request.action,
-            actor_type=request.actor_type,
-            actor_id=request.actor_id,
+            actor_type="user",
+            actor_id=str(current_user.id),
             resource_type=request.resource_type,
             resource_id=request.resource_id,
             description=request.description,
@@ -75,7 +128,7 @@ async def log_audit_event(
             new_value=request.new_value,
             result=request.result,
             risk_level=request.risk_level,
-            actor_ip=request.actor_ip,
+            actor_ip=getattr(client, "host", None),
         )
         # AuditLogger only flushes (design v2 §7); the request owns the commit.
         await db.commit()
@@ -215,8 +268,7 @@ async def upload_evidence_file(
         )
 
     # Persist file to disk under an org + control namespaced directory
-    upload_root = os.getenv("EVIDENCE_UPLOAD_DIR", "uploads/evidence")
-    target_dir = os.path.join(upload_root, str(org_id or "unknown"), control_id)
+    target_dir = os.path.join(EVIDENCE_UPLOAD_ROOT, str(org_id or "unknown"), control_id)
     os.makedirs(target_dir, exist_ok=True)
 
     safe_name = (file.filename or "evidence").replace("/", "_").replace("\\", "_")
@@ -288,8 +340,7 @@ async def download_evidence_file(
     Tenant-scoped via organization_id — a user in org A cannot download
     evidence from org B even by ID.
     """
-    import os
-    from fastapi.responses import FileResponse
+    from fastapi.responses import FileResponse, RedirectResponse
     from src.compliance.models import ComplianceEvidence
 
     org_id = getattr(current_user, "organization_id", None)
@@ -304,14 +355,27 @@ async def download_evidence_file(
     evidence = result.scalar_one_or_none()
     if not evidence:
         raise HTTPException(status_code=404, detail="Evidence not found")
-    if not evidence.file_path or not os.path.exists(evidence.file_path):
+    loc = evidence.file_path or ""
+    if not loc:
+        raise HTTPException(status_code=404, detail="Evidence file missing on disk")
+    # Remote object URL: redirect, but only to the schemes a client may register.
+    if loc.startswith(REMOTE_EVIDENCE_SCHEMES):
+        return RedirectResponse(url=loc)
+    if "://" in loc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid_storage_location", "detail": "only https:// and s3:// evidence URLs are served"},
+        )
+    # Local path: must resolve inside this organisation's evidence root (403 otherwise).
+    path = local_evidence_path(loc, org_id)
+    if not os.path.isfile(path):
         raise HTTPException(
             status_code=404,
             detail="Evidence file missing on disk",
         )
-    original_name = os.path.basename(evidence.file_path).split("_", 1)[-1] or "evidence"
+    original_name = os.path.basename(path).split("_", 1)[-1] or "evidence"
     return FileResponse(
-        path=evidence.file_path,
+        path=path,
         media_type="application/octet-stream",
         filename=original_name,
     )

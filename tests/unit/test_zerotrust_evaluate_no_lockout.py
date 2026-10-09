@@ -134,6 +134,6 @@ async def test_engine_pushes_the_gate_only_with_enforce_session(db_session, gate
     assert gate_spy == []
 
     await pdp.evaluate_access_request(
-        "user", "u1", "application", "app", {"session_id": "jti-1", "enforce_session": True}
+        "user", "u1", "application", "app", {"session_id": "jti-1", "enforce_session": True},
     )
     assert [c[0] for c in gate_spy] == ["jti-1"]

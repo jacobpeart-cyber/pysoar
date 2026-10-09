@@ -4,20 +4,17 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, Response, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
 from sqlalchemy import and_, desc, func, select
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.api.deps import CurrentUser, DatabaseSession, require_role
-from src.models.user import User, UserRole
 from src.core.logging import get_logger
-from src.services.automation import AutomationService
 from src.core.utils import safe_json_loads
+from src.models.user import User, UserRole
 from src.schemas.zerotrust import (
     AccessDecisionResponse,
     AccessRequestSchema,
     DeviceComplianceUpdate,
-    DeviceTrustProfileCreate,
     DeviceTrustProfileResponse,
     IdentityVerificationCreate,
     IdentityVerificationResponse,
@@ -32,6 +29,7 @@ from src.schemas.zerotrust import (
     ZeroTrustPolicyResponse,
     ZeroTrustPolicyUpdate,
 )
+from src.services.automation import AutomationService
 from src.zerotrust.engine import (
     ContinuousAuthEngine,
     DeviceTrustAssessor,
@@ -219,7 +217,7 @@ async def list_access_decisions(
     org_id = getattr(current_user, "organization_id", None)
 
     query = select(AccessDecision).where(
-        AccessDecision.organization_id == org_id
+        AccessDecision.organization_id == org_id,
     )
 
     if decision_filter:
@@ -228,14 +226,14 @@ async def list_access_decisions(
     # Get total count
     count_result = await db.execute(
         select(func.count(AccessDecision.id)).where(
-            AccessDecision.organization_id == org_id
-        )
+            AccessDecision.organization_id == org_id,
+        ),
     )
     total = count_result.scalar_one()
 
     # Get paginated results
     result = await db.execute(
-        query.order_by(desc(AccessDecision.created_at)).offset(skip).limit(limit)
+        query.order_by(desc(AccessDecision.created_at)).offset(skip).limit(limit),
     )
     decisions = result.scalars().all()
 
@@ -313,7 +311,7 @@ async def list_policies(
     org_id = getattr(current_user, "organization_id", None)
 
     query = select(ZeroTrustPolicy).where(
-        ZeroTrustPolicy.organization_id == org_id
+        ZeroTrustPolicy.organization_id == org_id,
     )
 
     if enabled_only:
@@ -322,14 +320,14 @@ async def list_policies(
     # Get total count
     count_result = await db.execute(
         select(func.count(ZeroTrustPolicy.id)).where(
-            ZeroTrustPolicy.organization_id == org_id
-        )
+            ZeroTrustPolicy.organization_id == org_id,
+        ),
     )
     total = count_result.scalar_one()
 
     # Get paginated results
     result = await db.execute(
-        query.order_by(desc(ZeroTrustPolicy.priority)).offset(skip).limit(limit)
+        query.order_by(desc(ZeroTrustPolicy.priority)).offset(skip).limit(limit),
     )
     policies = result.scalars().all()
 
@@ -354,14 +352,14 @@ async def get_policy(
             and_(
                 ZeroTrustPolicy.id == policy_id,
                 ZeroTrustPolicy.organization_id == org_id,
-            )
-        )
+            ),
+        ),
     )
     policy = result.scalar_one_or_none()
 
     if not policy:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Policy not found"
+            status_code=status.HTTP_404_NOT_FOUND, detail="Policy not found",
         )
 
     return ZeroTrustPolicyResponse.model_validate(policy)
@@ -381,14 +379,14 @@ async def update_policy(
             and_(
                 ZeroTrustPolicy.id == policy_id,
                 ZeroTrustPolicy.organization_id == org_id,
-            )
-        )
+            ),
+        ),
     )
     policy = result.scalar_one_or_none()
 
     if not policy:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Policy not found"
+            status_code=status.HTTP_404_NOT_FOUND, detail="Policy not found",
         )
 
     # Update fields
@@ -420,14 +418,14 @@ async def delete_policy(
             and_(
                 ZeroTrustPolicy.id == policy_id,
                 ZeroTrustPolicy.organization_id == org_id,
-            )
-        )
+            ),
+        ),
     )
     policy = result.scalar_one_or_none()
 
     if not policy:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Policy not found"
+            status_code=status.HTTP_404_NOT_FOUND, detail="Policy not found",
         )
 
     await db.delete(policy)
@@ -448,14 +446,14 @@ async def test_policy(
             and_(
                 ZeroTrustPolicy.id == policy_id,
                 ZeroTrustPolicy.organization_id == org_id,
-            )
-        )
+            ),
+        ),
     )
     policy = result.scalar_one_or_none()
 
     if not policy:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Policy not found"
+            status_code=status.HTTP_404_NOT_FOUND, detail="Policy not found",
         )
 
     # Evaluate test request
@@ -491,8 +489,8 @@ async def get_device_stats(
 
     total_result = await db.execute(
         select(func.count(DeviceTrustProfile.id)).where(
-            DeviceTrustProfile.organization_id == org_id
-        )
+            DeviceTrustProfile.organization_id == org_id,
+        ),
     )
     total = total_result.scalar_one() or 0
 
@@ -501,8 +499,8 @@ async def get_device_stats(
             and_(
                 DeviceTrustProfile.organization_id == org_id,
                 DeviceTrustProfile.trust_level == "trusted",
-            )
-        )
+            ),
+        ),
     )
     trusted = trusted_result.scalar_one() or 0
 
@@ -511,8 +509,8 @@ async def get_device_stats(
             and_(
                 DeviceTrustProfile.organization_id == org_id,
                 DeviceTrustProfile.trust_level == "conditional",
-            )
-        )
+            ),
+        ),
     )
     conditional = conditional_result.scalar_one() or 0
 
@@ -521,8 +519,8 @@ async def get_device_stats(
             and_(
                 DeviceTrustProfile.organization_id == org_id,
                 DeviceTrustProfile.trust_level == "untrusted",
-            )
-        )
+            ),
+        ),
     )
     untrusted = untrusted_result.scalar_one() or 0
 
@@ -531,8 +529,8 @@ async def get_device_stats(
             and_(
                 DeviceTrustProfile.organization_id == org_id,
                 DeviceTrustProfile.trust_level == "blocked",
-            )
-        )
+            ),
+        ),
     )
     blocked = blocked_result.scalar_one() or 0
 
@@ -568,8 +566,8 @@ async def assess_all_devices(
     else:
         result = await db.execute(
             select(DeviceTrustProfile.device_id).where(
-                DeviceTrustProfile.organization_id == org_id
-            )
+                DeviceTrustProfile.organization_id == org_id,
+            ),
         )
         device_ids = [row[0] for row in result.all()]
 
@@ -602,7 +600,7 @@ async def list_devices(
     org_id = getattr(current_user, "organization_id", None)
 
     query = select(DeviceTrustProfile).where(
-        DeviceTrustProfile.organization_id == org_id
+        DeviceTrustProfile.organization_id == org_id,
     )
 
     if trust_level:
@@ -611,14 +609,14 @@ async def list_devices(
     # Get total count
     count_result = await db.execute(
         select(func.count(DeviceTrustProfile.id)).where(
-            DeviceTrustProfile.organization_id == org_id
-        )
+            DeviceTrustProfile.organization_id == org_id,
+        ),
     )
     total = count_result.scalar_one()
 
     # Get paginated results
     result = await db.execute(
-        query.order_by(desc(DeviceTrustProfile.trust_score)).offset(skip).limit(limit)
+        query.order_by(desc(DeviceTrustProfile.trust_score)).offset(skip).limit(limit),
     )
     devices = result.scalars().all()
 
@@ -679,14 +677,14 @@ async def get_device(
             and_(
                 DeviceTrustProfile.device_id == device_id,
                 DeviceTrustProfile.organization_id == org_id,
-            )
-        )
+            ),
+        ),
     )
     device = result.scalar_one_or_none()
 
     if not device:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Device not found"
+            status_code=status.HTTP_404_NOT_FOUND, detail="Device not found",
         )
 
     return DeviceTrustProfileResponse.model_validate(device)
@@ -759,20 +757,20 @@ async def list_segments(
     org_id = getattr(current_user, "organization_id", None)
 
     query = select(MicroSegment).where(
-        MicroSegment.organization_id == org_id
+        MicroSegment.organization_id == org_id,
     )
 
     # Get total count
     count_result = await db.execute(
         select(func.count(MicroSegment.id)).where(
-            MicroSegment.organization_id == org_id
-        )
+            MicroSegment.organization_id == org_id,
+        ),
     )
     total = count_result.scalar_one()
 
     # Get paginated results
     result = await db.execute(
-        query.order_by(MicroSegment.created_at).offset(skip).limit(limit)
+        query.order_by(MicroSegment.created_at).offset(skip).limit(limit),
     )
     segments = result.scalars().all()
 
@@ -797,14 +795,14 @@ async def get_segment(
             and_(
                 MicroSegment.id == segment_id,
                 MicroSegment.organization_id == org_id,
-            )
-        )
+            ),
+        ),
     )
     segment = result.scalar_one_or_none()
 
     if not segment:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Segment not found"
+            status_code=status.HTTP_404_NOT_FOUND, detail="Segment not found",
         )
 
     return MicroSegmentResponse.model_validate(segment)
@@ -824,14 +822,14 @@ async def update_segment(
             and_(
                 MicroSegment.id == segment_id,
                 MicroSegment.organization_id == org_id,
-            )
-        )
+            ),
+        ),
     )
     segment = result.scalar_one_or_none()
 
     if not segment:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Segment not found"
+            status_code=status.HTTP_404_NOT_FOUND, detail="Segment not found",
         )
 
     # Update fields
@@ -863,14 +861,14 @@ async def delete_segment(
             and_(
                 MicroSegment.id == segment_id,
                 MicroSegment.organization_id == org_id,
-            )
-        )
+            ),
+        ),
     )
     segment = result.scalar_one_or_none()
 
     if not segment:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Segment not found"
+            status_code=status.HTTP_404_NOT_FOUND, detail="Segment not found",
         )
 
     await db.delete(segment)
@@ -979,7 +977,7 @@ async def list_verifications(
     org_id = getattr(current_user, "organization_id", None)
 
     query = select(IdentityVerification).where(
-        IdentityVerification.organization_id == org_id
+        IdentityVerification.organization_id == org_id,
     )
 
     if user_id:
@@ -988,8 +986,8 @@ async def list_verifications(
     # Get total count
     count_result = await db.execute(
         select(func.count(IdentityVerification.id)).where(
-            IdentityVerification.organization_id == org_id
-        )
+            IdentityVerification.organization_id == org_id,
+        ),
     )
     total = count_result.scalar_one()
 
@@ -997,7 +995,7 @@ async def list_verifications(
     result = await db.execute(
         query.order_by(desc(IdentityVerification.created_at))
         .offset(skip)
-        .limit(limit)
+        .limit(limit),
     )
     verifications = result.scalars().all()
 
@@ -1083,8 +1081,8 @@ async def get_dashboard_stats(
     # Get policy stats
     policy_result = await db.execute(
         select(func.count(ZeroTrustPolicy.id)).where(
-            ZeroTrustPolicy.organization_id == org_id
-        )
+            ZeroTrustPolicy.organization_id == org_id,
+        ),
     )
     total_policies = policy_result.scalar_one() or 0
 
@@ -1093,16 +1091,16 @@ async def get_dashboard_stats(
             and_(
                 ZeroTrustPolicy.organization_id == org_id,
                 ZeroTrustPolicy.is_enabled == True,
-            )
-        )
+            ),
+        ),
     )
     enabled_policies = enabled_result.scalar_one() or 0
 
     # Get device stats
     device_result = await db.execute(
         select(func.count(DeviceTrustProfile.id)).where(
-            DeviceTrustProfile.organization_id == org_id
-        )
+            DeviceTrustProfile.organization_id == org_id,
+        ),
     )
     total_devices = device_result.scalar_one() or 0
 
@@ -1111,8 +1109,8 @@ async def get_dashboard_stats(
             and_(
                 DeviceTrustProfile.organization_id == org_id,
                 DeviceTrustProfile.trust_level.in_(["trusted", "conditional"]),
-            )
-        )
+            ),
+        ),
     )
     compliant_devices = compliant_result.scalar_one() or 0
     non_compliant = total_devices - compliant_devices
@@ -1120,16 +1118,16 @@ async def get_dashboard_stats(
     # Get average device trust
     avg_trust_result = await db.execute(
         select(func.avg(DeviceTrustProfile.trust_score)).where(
-            DeviceTrustProfile.organization_id == org_id
-        )
+            DeviceTrustProfile.organization_id == org_id,
+        ),
     )
     avg_trust = avg_trust_result.scalar_one() or 0.0
 
     # Get decision stats
     decision_result = await db.execute(
         select(func.count(AccessDecision.id)).where(
-            AccessDecision.organization_id == org_id
-        )
+            AccessDecision.organization_id == org_id,
+        ),
     )
     total_decisions = decision_result.scalar_one() or 0
 
@@ -1138,8 +1136,8 @@ async def get_dashboard_stats(
             and_(
                 AccessDecision.organization_id == org_id,
                 AccessDecision.decision == "allow",
-            )
-        )
+            ),
+        ),
     )
     allowed = allowed_result.scalar_one() or 0
 
@@ -1148,8 +1146,8 @@ async def get_dashboard_stats(
             and_(
                 AccessDecision.organization_id == org_id,
                 AccessDecision.decision == "deny",
-            )
-        )
+            ),
+        ),
     )
     denied = denied_result.scalar_one() or 0
 
@@ -1158,16 +1156,16 @@ async def get_dashboard_stats(
             and_(
                 AccessDecision.organization_id == org_id,
                 AccessDecision.decision.in_(["challenge", "step_up"]),
-            )
-        )
+            ),
+        ),
     )
     challenged = challenged_result.scalar_one() or 0
 
     # Get segment stats
     segment_result = await db.execute(
         select(func.count(MicroSegment.id)).where(
-            MicroSegment.organization_id == org_id
-        )
+            MicroSegment.organization_id == org_id,
+        ),
     )
     total_segments = segment_result.scalar_one() or 0
 
@@ -1176,15 +1174,15 @@ async def get_dashboard_stats(
             and_(
                 MicroSegment.organization_id == org_id,
                 MicroSegment.is_active == True,
-            )
-        )
+            ),
+        ),
     )
     active_segments = active_result.scalar_one() or 0
 
     violation_result = await db.execute(
         select(func.sum(MicroSegment.violation_count)).where(
-            MicroSegment.organization_id == org_id
-        )
+            MicroSegment.organization_id == org_id,
+        ),
     )
     violations = violation_result.scalar_one() or 0
 

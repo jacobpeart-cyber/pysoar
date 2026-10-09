@@ -62,53 +62,45 @@ def _hash_file(path: str, algorithm: str) -> str:
         for chunk in iter(lambda: fh.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
-from src.models.user import User
+from src.dfir.engine import (
+    ArtifactAnalyzer,
+)
 from src.dfir.models import (
+    CaseStatus,
+    ForensicArtifact,
     ForensicCase,
     ForensicEvidence,
     ForensicTimeline,
-    ForensicArtifact,
     LegalHold,
-    CaseStatus,
-)
-from src.dfir.engine import (
-    ForensicEngine,
-    EvidenceManager,
-    TimelineReconstructor,
-    ArtifactAnalyzer,
-    LegalHoldManager,
 )
 from src.schemas.dfir import (
-    ForensicCaseCreate,
-    ForensicCaseUpdate,
-    ForensicCaseResponse,
-    ForensicCaseListResponse,
-    ForensicEvidenceCreate,
-    ForensicEvidenceUpdate,
-    ForensicEvidenceResponse,
-    ForensicEvidenceListResponse,
-    ForensicTimelineCreate,
-    ForensicTimelineUpdate,
-    ForensicTimelineResponse,
-    ForensicTimelineListResponse,
-    ForensicArtifactCreate,
-    ForensicArtifactUpdate,
-    ForensicArtifactResponse,
-    ForensicArtifactListResponse,
-    LegalHoldCreate,
-    LegalHoldUpdate,
-    LegalHoldResponse,
-    LegalHoldListResponse,
-    EvidenceVerifyRequest,
-    ChainOfCustodyUpdateRequest,
     ArtifactAnalysisRequest,
     ArtifactAnalysisResponse,
-    IOCExtractionResponse,
-    CaseReportResponse,
-    TimelineExportResponse,
-    ChainOfCustodyReportResponse,
     CaseMetrics,
+    CaseReportResponse,
+    ChainOfCustodyReportResponse,
+    ChainOfCustodyUpdateRequest,
     DFIRDashboardResponse,
+    EvidenceVerifyRequest,
+    ForensicArtifactCreate,
+    ForensicArtifactListResponse,
+    ForensicArtifactResponse,
+    ForensicCaseCreate,
+    ForensicCaseListResponse,
+    ForensicCaseResponse,
+    ForensicCaseUpdate,
+    ForensicEvidenceCreate,
+    ForensicEvidenceListResponse,
+    ForensicEvidenceResponse,
+    ForensicTimelineCreate,
+    ForensicTimelineListResponse,
+    ForensicTimelineResponse,
+    IOCExtractionResponse,
+    LegalHoldCreate,
+    LegalHoldListResponse,
+    LegalHoldResponse,
+    LegalHoldUpdate,
+    TimelineExportResponse,
 )
 
 router = APIRouter(prefix="/dfir", tags=["DFIR"])
@@ -197,7 +189,7 @@ async def list_cases(
         query = query.where(
             (ForensicCase.case_number.ilike(search_filter))
             | (ForensicCase.title.ilike(search_filter))
-            | (ForensicCase.description.ilike(search_filter))
+            | (ForensicCase.description.ilike(search_filter)),
         )
 
     if case_type:
@@ -211,7 +203,7 @@ async def list_cases(
 
     # Get total count
     count_query = select(func.count()).select_from(
-        select(ForensicCase.id).where(query.whereclause) if query.whereclause is not None else select(ForensicCase.id)
+        select(ForensicCase.id).where(query.whereclause) if query.whereclause is not None else select(ForensicCase.id),
     )
     count_result = await db.execute(count_query)
     total = count_result.scalar() or 0
@@ -261,7 +253,7 @@ async def create_case(
     """Create a new forensic case"""
     # Check for duplicate case number
     result = await db.execute(
-        select(ForensicCase).where(ForensicCase.case_number == case_data.case_number)
+        select(ForensicCase).where(ForensicCase.case_number == case_data.case_number),
     )
     if result.scalar_one_or_none():
         raise HTTPException(
@@ -371,7 +363,7 @@ async def list_evidence(
 
     # Get total count
     count_query = select(func.count()).select_from(
-        select(ForensicEvidence.id).where(query.whereclause) if query.whereclause is not None else select(ForensicEvidence.id)
+        select(ForensicEvidence.id).where(query.whereclause) if query.whereclause is not None else select(ForensicEvidence.id),
     )
     count_result = await db.execute(count_query)
     total = count_result.scalar() or 0
@@ -420,6 +412,7 @@ async def download_evidence(
     at access time.
     """
     import os
+
     from fastapi.responses import FileResponse, RedirectResponse
 
     org_id = getattr(current_user, "organization_id", None)
@@ -499,8 +492,8 @@ async def collect_evidence(
                     "actor": getattr(current_user, "full_name", None) or current_user.email,
                     "action": "collected",
                     "hash": evidence_data.original_hash_sha256,
-                }
-            ]
+                },
+            ],
         },
     )
 
@@ -658,7 +651,7 @@ async def upload_evidence_file(
                     "size_bytes": total_bytes,
                     "original_filename": file.filename or sanitized,
                     "details": description,
-                }
+                },
             ],
             "sha512": sha512_hex,
         },
@@ -778,7 +771,7 @@ async def update_chain_of_custody(
             "action": coc_data.action,
             "hash": coc_data.evidence_hash,
             "details": coc_data.details,
-        }
+        },
     )
 
     evidence.chain_of_custody_log = coc_log
@@ -822,7 +815,7 @@ async def get_timeline(
 
     # Get total count
     count_query = select(func.count()).select_from(
-        select(ForensicTimeline.id).where(query.whereclause) if query.whereclause is not None else select(ForensicTimeline.id)
+        select(ForensicTimeline.id).where(query.whereclause) if query.whereclause is not None else select(ForensicTimeline.id),
     )
     count_result = await db.execute(count_query)
     total = count_result.scalar() or 0
@@ -938,7 +931,7 @@ async def list_artifacts(
 
     # Get total count
     count_query = select(func.count()).select_from(
-        select(ForensicArtifact.id).where(query.whereclause) if query.whereclause is not None else select(ForensicArtifact.id)
+        select(ForensicArtifact.id).where(query.whereclause) if query.whereclause is not None else select(ForensicArtifact.id),
     )
     count_result = await db.execute(count_query)
     total = count_result.scalar() or 0
@@ -1099,7 +1092,7 @@ async def list_legal_holds(
         query = query.where(LegalHold.organization_id == org_id)
 
     count_query = select(func.count()).select_from(
-        select(LegalHold.id).where(query.whereclause) if query.whereclause is not None else select(LegalHold.id)
+        select(LegalHold.id).where(query.whereclause) if query.whereclause is not None else select(LegalHold.id),
     )
     count_result = await db.execute(count_query)
     total = count_result.scalar() or 0
@@ -1261,7 +1254,7 @@ async def get_dfir_dashboard(
     total_cases = all_cases.scalar() or 0
 
     active_query = select(func.count()).select_from(ForensicCase).where(
-        ForensicCase.status.in_([CaseStatus.OPEN.value, CaseStatus.IN_PROGRESS.value])
+        ForensicCase.status.in_([CaseStatus.OPEN.value, CaseStatus.IN_PROGRESS.value]),
     )
     if org_id:
         active_query = active_query.where(ForensicCase.organization_id == org_id)
@@ -1269,7 +1262,7 @@ async def get_dfir_dashboard(
     active_count = active_cases.scalar() or 0
 
     analysis_query = select(func.count()).select_from(ForensicCase).where(
-        ForensicCase.status == CaseStatus.ANALYSIS.value
+        ForensicCase.status == CaseStatus.ANALYSIS.value,
     )
     if org_id:
         analysis_query = analysis_query.where(ForensicCase.organization_id == org_id)
@@ -1298,7 +1291,7 @@ async def get_dfir_dashboard(
     holds_count = active_holds.scalar() or 0
 
     holds_cases_query = select(func.count()).select_from(ForensicCase).where(
-        ForensicCase.legal_hold_active == True
+        ForensicCase.legal_hold_active == True,
     )
     if org_id:
         holds_cases_query = holds_cases_query.where(ForensicCase.organization_id == org_id)
