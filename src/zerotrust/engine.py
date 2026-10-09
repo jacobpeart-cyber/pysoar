@@ -238,8 +238,11 @@ class PolicyDecisionPoint:
         # middleware picks up the new state on the very next request —
         # revocation propagates within a single request cycle instead of
         # waiting 30s for the cache to expire.
+        # Only the continuous-verification path (which sets enforce_session)
+        # may write the per-request gate cache. What-if evaluations from the
+        # API carry a session_id for the record but must never revoke it.
         sid = context.get("session_id")
-        if sid:
+        if sid and context.get("enforce_session") is True:
             try:
                 from src.zerotrust.session_gate import invalidate_session_cache
                 await invalidate_session_cache(sid, decision)
@@ -296,12 +299,14 @@ class PolicyDecisionPoint:
             # If current decision was allow and new risk is high, challenge
             if last_decision.decision == "allow" and new_risk > 70:
                 # Trigger step-up authentication
+                # Continuous verification is the one path allowed to write the
+                # per-request session gate (see evaluate_access_request).
                 return await self.evaluate_access_request(
                     last_decision.subject_type,
                     last_decision.subject_id,
                     last_decision.resource_type,
                     last_decision.resource_id,
-                    {**context, "risk_change": risk_delta},
+                    {**context, "risk_change": risk_delta, "enforce_session": True},
                 )
 
         return None

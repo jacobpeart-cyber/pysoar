@@ -77,27 +77,17 @@ async def evaluate_access_request(
         org_id = getattr(current_user, "organization_id", None)
         pdp = PolicyDecisionPoint(db, org_id)
 
-        # Thread the caller's JWT jti into context as session_id so the
-        # Zero Trust session gate can use the decision for subsequent
-        # per-request gating (NIST SP 800-207 continuous verification).
+        # This endpoint is a what-if evaluation of a principal/resource pair.
+        # It used to inject the CALLER's own JWT jti as the session under
+        # evaluation, and the engine pushed the verdict into the session gate
+        # with a 24 h TTL for denies, so one evaluation in an organisation
+        # with no policies (default deny) locked the analyst out of the whole
+        # API for a day. The caller's session is never bound here; a
+        # client-supplied session_id is evaluated but not enforced (the
+        # enforce_session flag is reserved for the continuous-verification
+        # task, which is the only legitimate writer of the gate cache).
         context = dict(request.context or {})
-        if "session_id" not in context or not context["session_id"]:
-            auth = raw_request.headers.get("Authorization", "")
-            if auth.startswith("Bearer "):
-                try:
-                    import jwt
-                    from src.core.config import settings as _settings
-                    payload = jwt.decode(
-                        auth.split(" ", 1)[1].strip(),
-                        _settings.jwt_secret_key,
-                        algorithms=["HS256"],
-                        options={"verify_exp": False},
-                    )
-                    jti = payload.get("jti")
-                    if jti:
-                        context["session_id"] = jti
-                except Exception:  # noqa: BLE001
-                    pass
+        context.pop("enforce_session", None)
 
         decision = await pdp.evaluate_access_request(
             subject_type=request.subject_type,
