@@ -4,11 +4,12 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Body, HTTPException, Query, Request, Response, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, Response, status
 from sqlalchemy import and_, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import CurrentUser, DatabaseSession
+from src.api.deps import CurrentUser, DatabaseSession, require_role
+from src.models.user import User, UserRole
 from src.core.logging import get_logger
 from src.services.automation import AutomationService
 from src.core.utils import safe_json_loads
@@ -60,7 +61,9 @@ async def evaluate_access_request(
     request: AccessRequestSchema,
     raw_request: Request,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    # Analyst or above: an evaluation records an AccessDecision and can fire
+    # violation automation, so viewers may not run one.
+    current_user: User = Depends(require_role([UserRole.ADMIN, UserRole.ANALYST])),
 ) -> AccessDecisionResponse:
     """Evaluate access request and return decision (Policy Decision Point)
 
@@ -148,7 +151,9 @@ async def evaluate_access_alias(
     request: AccessRequestSchema,
     raw_request: Request,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    # Analyst or above: an evaluation records an AccessDecision and can fire
+    # violation automation, so viewers may not run one.
+    current_user: User = Depends(require_role([UserRole.ADMIN, UserRole.ANALYST])),
 ) -> AccessDecisionResponse:
     """Alias for /evaluate — evaluate access request and return decision"""
     return await evaluate_access_request(request, raw_request, db, current_user)

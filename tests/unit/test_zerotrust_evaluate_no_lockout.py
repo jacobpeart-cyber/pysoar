@@ -106,6 +106,22 @@ async def test_client_supplied_session_id_is_recorded_but_not_enforced(client, d
 
 
 @pytest.mark.asyncio
+async def test_viewers_cannot_run_evaluations(client, db_session, gate_spy):
+    """An evaluation records a decision and can fire violation automation."""
+    _, headers = await _org_user(db_session, email="zt-viewer@zt-org.io", role="viewer")
+
+    resp = await client.post(
+        "/api/v1/zerotrust/evaluate",
+        headers=headers,
+        json={"subject_type": "user", "subject_id": "x", "resource_type": "application", "resource_id": "y", "context": {}},
+    )
+    assert resp.status_code == 403, resp.text
+    assert gate_spy == []
+    rows = (await db_session.execute(select(AccessDecision).where(AccessDecision.organization_id == ORG))).scalars().all()
+    assert all(r.subject_id != "x" for r in rows)
+
+
+@pytest.mark.asyncio
 async def test_engine_pushes_the_gate_only_with_enforce_session(db_session, gate_spy):
     pdp = zt_engine.PolicyDecisionPoint(db_session, ORG)
     from src.models.organization import Organization
