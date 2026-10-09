@@ -1,7 +1,7 @@
 """DFIR schemas for API request/response validation"""
 
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Optional, Union
 
 from src.schemas.base import DBModel
 from pydantic import BaseModel, Field
@@ -128,7 +128,11 @@ class ForensicEvidenceResponse(ForensicEvidenceBase, DBModel):
     case_id: str = ""
     original_hash_md5: Optional[str] = None
     original_hash_sha256: Optional[str] = None
-    chain_of_custody_log: list[ChainOfCustodyEntry] = Field(default_factory=list)
+    # Writers store {"entries": [...]} (see dfir.py create/upload/download/verify);
+    # typing this as a bare list made every evidence create, list and upload
+    # fail response validation with a 500. Accept the stored shape, and the
+    # older list shape for rows written before the entries wrapper existed.
+    chain_of_custody_log: Union[dict[str, Any], list[ChainOfCustodyEntry]] = Field(default_factory=dict)
     file_size_bytes: Optional[int] = None
     is_verified: bool = False
     verified_by: Optional[str] = None

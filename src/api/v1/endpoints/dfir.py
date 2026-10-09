@@ -16,6 +16,52 @@ from sqlalchemy.orm import selectinload
 
 from src.api.deps import CurrentUser, DatabaseSession
 from src.core.utils import safe_json_loads
+
+# Evidence locations a client may register directly. Local filesystem paths are
+# assigned only by the upload endpoint, which writes under DFIR_UPLOAD_ROOT:
+# accepting them from a request body let any user register "/opt/pysoar/.env"
+# as evidence and download it (fixed 2026-10-08).
+_REMOTE_EVIDENCE_SCHEMES = ("https://", "s3://")
+
+
+def _validate_client_storage_location(location: Optional[str]) -> str:
+    if location is None or location == "":
+        return ""  # column is NOT NULL; "" means "no object registered yet"
+    if location.startswith(_REMOTE_EVIDENCE_SCHEMES):
+        return location
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail={
+            "error": "invalid_storage_location",
+            "detail": (
+                "storage_location must be an https:// or s3:// object URL; local files "
+                "are registered through POST /dfir/cases/{case_id}/evidence/upload"
+            ),
+        },
+    )
+
+
+def _local_evidence_path(location: str) -> str:
+    """Resolve a stored local path and refuse anything outside DFIR_UPLOAD_ROOT."""
+    root = os.path.realpath(DFIR_UPLOAD_ROOT)
+    real = os.path.realpath(location)
+    if real != root and not real.startswith(root + os.sep):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "evidence_path_outside_storage_root",
+                "detail": "this evidence item points outside the evidence storage root and cannot be served",
+            },
+        )
+    return real
+
+
+def _hash_file(path: str, algorithm: str) -> str:
+    digest = hashlib.new(algorithm)
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 from src.models.user import User
 from src.dfir.models import (
     ForensicCase,
@@ -399,19 +445,25 @@ async def download_evidence(
     await db.flush()
 
     loc = evidence.storage_location
-    # Remote URL — redirect
-    if loc.startswith("http://") or loc.startswith("https://") or loc.startswith("s3://"):
+    # Remote object URL: redirect, but only to the schemes a client may register.
+    if loc.startswith(_REMOTE_EVIDENCE_SCHEMES):
         return RedirectResponse(url=loc)
+    if "://" in loc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "invalid_storage_location", "detail": "only https:// and s3:// evidence URLs are served"},
+        )
 
-    # Local path — stream
-    if not os.path.exists(loc):
+    # Local path: must resolve inside the evidence storage root (403 otherwise).
+    path = _local_evidence_path(loc)
+    if not os.path.isfile(path):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Evidence file missing at storage_location",
         )
-    filename = os.path.basename(loc) or f"evidence-{evidence_id}"
+    filename = os.path.basename(path) or f"evidence-{evidence_id}"
     return FileResponse(
-        path=loc,
+        path=path,
         media_type="application/octet-stream",
         filename=filename,
     )
@@ -436,7 +488,7 @@ async def collect_evidence(
         acquisition_method=evidence_data.acquisition_method,
         original_hash_md5=evidence_data.original_hash_md5,
         original_hash_sha256=evidence_data.original_hash_sha256,
-        storage_location=evidence_data.storage_location,
+        storage_location=_validate_client_storage_location(evidence_data.storage_location),
         file_size_bytes=evidence_data.file_size_bytes,
         handling_notes=evidence_data.handling_notes,
         organization_id=getattr(current_user, "organization_id", None),
@@ -642,19 +694,56 @@ async def verify_evidence_integrity(
     org_id = getattr(current_user, "organization_id", None)
     evidence = await get_evidence_or_404(db, evidence_id, org_id)
 
-    # Verify hash
-    is_valid = True
-    if verify_data.original_hash:
-        is_valid = verify_data.evidence_hash.lower() == verify_data.original_hash.lower()
+    # Integrity check against a reference the client does not control: the
+    # file's actual digest when it is stored locally, otherwise the hash
+    # recorded at collection. (The previous version compared two client-sent
+    # strings and then overwrote the stored hash with one of them.)
+    algorithm = (verify_data.hash_algorithm or "sha256").lower()
+    if algorithm not in ("sha256", "md5"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "unsupported_hash_algorithm", "detail": "hash_algorithm must be sha256 or md5"},
+        )
+    claimed = (verify_data.evidence_hash or "").strip().lower()
+    if not claimed:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "missing_evidence_hash", "detail": "evidence_hash is required"},
+        )
 
+    computed: Optional[str] = None
+    loc = evidence.storage_location or ""
+    if loc and "://" not in loc:
+        path = _local_evidence_path(loc)
+        if os.path.isfile(path):
+            computed = _hash_file(path, algorithm)
+    stored = evidence.original_hash_sha256 if algorithm == "sha256" else evidence.original_hash_md5
+    reference = computed or (stored.strip().lower() if stored else None)
+    if reference is None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "no_reference_hash",
+                "detail": f"no stored {algorithm} hash and no local file to compute one from",
+            },
+        )
+
+    is_valid = claimed == reference
     evidence.is_verified = is_valid
     evidence.verified_by = getattr(current_user, "full_name", None) or current_user.email
     evidence.verification_date = datetime.now(timezone.utc).isoformat()
 
-    if verify_data.hash_algorithm == "sha256":
-        evidence.original_hash_sha256 = verify_data.evidence_hash
-    elif verify_data.hash_algorithm == "md5":
-        evidence.original_hash_md5 = verify_data.evidence_hash
+    chain = dict(evidence.chain_of_custody_log or {})
+    entries = list(chain.get("entries", []))
+    entries.append({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "actor": evidence.verified_by,
+        "action": "verified" if is_valid else "verification_failed",
+        "algorithm": algorithm,
+        "reference": "file" if computed else "stored_hash",
+    })
+    chain["entries"] = entries
+    evidence.chain_of_custody_log = chain
 
     await db.flush()
     await db.refresh(evidence)
