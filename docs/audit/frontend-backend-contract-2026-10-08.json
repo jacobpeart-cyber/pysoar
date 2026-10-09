@@ -1,0 +1,3616 @@
+{
+  "backend_routes": 1134,
+  "frontend_calls": 486,
+  "frontend_calls_with_no_backend_route": [
+    {
+      "method": "DELETE",
+      "path": "/api/v1/compliance/poams/{x}",
+      "files": [
+        "frontend\\src\\pages\\ComplianceDashboard.tsx"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agentic/investigations/{x}/reasoning",
+      "files": [
+        "frontend\\src\\api\\endpoints.ts"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/audit/evidence",
+      "files": [
+        "frontend\\src\\api\\endpoints.ts"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/audit/readiness-score",
+      "files": [
+        "frontend\\src\\api\\endpoints.ts"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/compliance/frameworks/{x}/controls",
+      "files": [
+        "frontend\\src\\api\\endpoints.ts"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/deception/alerts",
+      "files": [
+        "frontend\\src\\api\\endpoints.ts"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/deception/honeypots",
+      "files": [
+        "frontend\\src\\api\\endpoints.ts"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/deception/honeytokens",
+      "files": [
+        "frontend\\src\\api\\endpoints.ts"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/itdr/credential-monitors",
+      "files": [
+        "frontend\\src\\api\\endpoints.ts"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/playbooks/{x}/nodes",
+      "files": [
+        "frontend\\src\\api\\endpoints.ts"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/simulation/campaigns",
+      "files": [
+        "frontend\\src\\api\\endpoints.ts"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/simulation/campaigns/{x}/results",
+      "files": [
+        "frontend\\src\\api\\endpoints.ts"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/stig/benchmarks/{x}/findings",
+      "files": [
+        "frontend\\src\\api\\endpoints.ts"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ueba/anomalies",
+      "files": [
+        "frontend\\src\\api\\endpoints.ts"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ueba/behaviors",
+      "files": [
+        "frontend\\src\\api\\endpoints.ts"
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ueba/risk-scores",
+      "files": [
+        "frontend\\src\\api\\endpoints.ts"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/ai/analyze",
+      "files": [
+        "frontend\\src\\api\\endpoints.ts"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/ai/natural-language",
+      "files": [
+        "frontend\\src\\api\\endpoints.ts"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/alerts/bulk-update",
+      "files": [
+        "frontend\\src\\api\\endpoints.ts"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/audit/evidence",
+      "files": [
+        "frontend\\src\\api\\endpoints.ts"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/hunting/sessions/{x}/{x}",
+      "files": [
+        "frontend\\src\\pages\\ThreatHunting.tsx"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/integrations/connectors/{x}/execute",
+      "files": [
+        "frontend\\src\\api\\endpoints.ts"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/integrations/connectors/{x}/install",
+      "files": [
+        "frontend\\src\\api\\endpoints.ts"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/integrations/connectors/{x}/test",
+      "files": [
+        "frontend\\src\\api\\endpoints.ts"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/integrations/webhooks",
+      "files": [
+        "frontend\\src\\api\\endpoints.ts"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/remediation/actions/{x}/approve",
+      "files": [
+        "frontend\\src\\api\\endpoints.ts"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/remediation/actions/{x}/execute",
+      "files": [
+        "frontend\\src\\api\\endpoints.ts"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/simulation/campaigns",
+      "files": [
+        "frontend\\src\\api\\endpoints.ts"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/stig/benchmarks/{x}/scan",
+      "files": [
+        "frontend\\src\\api\\endpoints.ts"
+      ]
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/threat-intel/enrich",
+      "files": [
+        "frontend\\src\\api\\endpoints.ts"
+      ]
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/integrations/connectors/{x}/config",
+      "files": [
+        "frontend\\src\\api\\endpoints.ts"
+      ]
+    }
+  ],
+  "backend_routes_never_called_by_frontend": [
+    {
+      "method": "DELETE",
+      "path": "/api/v1/agentic/agents/{x}/memory",
+      "handler": "clear_agent_memory_api_v1_agentic_agents__agent_id__memory_delete"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/ai/models/{x}",
+      "handler": "retire_model_api_v1_ai_models__model_id__delete"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/api-security/endpoints/{x}",
+      "handler": "delete_endpoint_api_v1_api_security_endpoints__endpoint_id__delete"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/api-security/policies/{x}",
+      "handler": "delete_policy_api_v1_api_security_policies__policy_id__delete"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/backup/backups/{x}",
+      "handler": "delete_backup_api_v1_backup_backups__filename__delete"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/deception/decoys/{x}",
+      "handler": "undeploy_decoy_api_v1_deception_decoys__decoy_id__delete"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/deception/tokens/{x}",
+      "handler": "delete_token_api_v1_deception_tokens__token_id__delete"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/dlp/policies/{x}",
+      "handler": "delete_policy_api_v1_dlp_policies__policy_id__delete"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/exposure/assets/{x}",
+      "handler": "deactivate_asset_api_v1_exposure_assets__asset_id__delete"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/exposure/vulnerabilities/{x}",
+      "handler": "delete_vulnerability_api_v1_exposure_vulnerabilities__vuln_id__delete"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/integrations/installed/{x}",
+      "handler": "uninstall_integration_api_v1_integrations_installed__integration_id__delete"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/organizations/{x}/members/{x}",
+      "handler": "remove_organization_member_api_v1_organizations__org_id__members__user_id__delete"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/ot_security/assets/{x}",
+      "handler": "delete_asset_api_v1_ot_security_assets__asset_id__delete"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/ot_security/policies/{x}",
+      "handler": "delete_policy_api_v1_ot_security_policies__policy_id__delete"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/ot_security/zones/{x}",
+      "handler": "delete_zone_api_v1_ot_security_zones__zone_id__delete"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/phishing_sim/target-groups/{x}",
+      "handler": "delete_target_group_api_v1_phishing_sim_target_groups__group_id__delete"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/remediation/policies/{x}",
+      "handler": "delete_policy_api_v1_remediation_policies__policy_id__delete"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/risk-quantification/bias/{x}",
+      "handler": "delete_bia_api_v1_risk_quantification_bias__bia_id__delete"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/risk-quantification/controls/{x}",
+      "handler": "delete_risk_control_api_v1_risk_quantification_controls__control_id__delete"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/risk-quantification/risk-registers/{x}",
+      "handler": "delete_risk_register_api_v1_risk_quantification_risk_registers__register_id__delete"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/risk-quantification/scenarios/{x}",
+      "handler": "delete_risk_scenario_api_v1_risk_quantification_scenarios__scenario_id__delete"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/siem/saved-searches/{x}",
+      "handler": "delete_saved_search_api_v1_siem_saved_searches__search_id__delete"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/siem/sources/{x}",
+      "handler": "delete_source_api_v1_siem_sources__source_id__delete"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/teams/{x}/members/{x}",
+      "handler": "remove_team_member_api_v1_teams__team_id__members__user_id__delete"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/threat-intel/actors/{x}",
+      "handler": "delete_actor"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/threat-intel/campaigns/{x}",
+      "handler": "delete_campaign"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/threat-intel/feeds/{x}",
+      "handler": "delete_threat_feed"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/threat-intel/indicators/{x}",
+      "handler": "delete_indicator"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/threat-intel/reports/{x}",
+      "handler": "delete_report"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/threat-modeling/{x}/threats/{x}",
+      "handler": "delete_threat_api_v1_threat_modeling__model_id__threats__threat_id__delete"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/tickethub/automation/rules/{x}",
+      "handler": "delete_automation_rule_api_v1_tickethub_automation_rules__rule_id__delete"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/tickethub/comments/{x}",
+      "handler": "delete_comment_api_v1_tickethub_comments__comment_id__delete"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/zerotrust/policies/{x}",
+      "handler": "delete_policy_api_v1_zerotrust_policies__policy_id__delete"
+    },
+    {
+      "method": "DELETE",
+      "path": "/api/v1/zerotrust/segments/{x}",
+      "handler": "delete_segment_api_v1_zerotrust_segments__segment_id__delete"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/",
+      "handler": "root_api_v1__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agentic/agents/{x}",
+      "handler": "get_agent_api_v1_agentic_agents__agent_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agentic/agents/{x}/memory",
+      "handler": "list_agent_memory_api_v1_agentic_agents__agent_id__memory_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agentic/agents/{x}/memory/stats",
+      "handler": "get_memory_stats_api_v1_agentic_agents__agent_id__memory_stats_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agentic/agents/{x}/performance",
+      "handler": "get_agent_performance_api_v1_agentic_agents__agent_id__performance_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agentic/alerts/{x}/explain",
+      "handler": "explain_alert_api_v1_agentic_alerts__alert_id__explain_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agentic/anomalies",
+      "handler": "agentic_anomalies_api_v1_agentic_anomalies_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agentic/approvals",
+      "handler": "agentic_approvals_api_v1_agentic_approvals_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agentic/dashboard/accuracy-stats",
+      "handler": "get_accuracy_stats_api_v1_agentic_dashboard_accuracy_stats_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agentic/dashboard/investigation-metrics",
+      "handler": "get_investigation_metrics_api_v1_agentic_dashboard_investigation_metrics_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agentic/dashboard/metrics",
+      "handler": "get_dashboard_metrics_api_v1_agentic_dashboard_metrics_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agentic/evidence/export",
+      "handler": "export_agent_evidence_api_v1_agentic_evidence_export_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agentic/investigations/{x}",
+      "handler": "get_investigation_api_v1_agentic_investigations__investigation_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agentic/investigations/{x}/explain",
+      "handler": "explain_investigation_api_v1_agentic_investigations__investigation_id__explain_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agentic/investigations/{x}/feedback",
+      "handler": "list_investigation_feedback_api_v1_agentic_investigations__investigation_id__feedback_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agentic/investigations/{x}/timeline",
+      "handler": "get_investigation_timeline_api_v1_agentic_investigations__investigation_id__timeline_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agentic/models",
+      "handler": "agentic_models_api_v1_agentic_models_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agentic/policy-events",
+      "handler": "list_policy_events_api_v1_agentic_policy_events_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agentic/predictions",
+      "handler": "agentic_predictions_api_v1_agentic_predictions_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agentic/reasoning-chain",
+      "handler": "agentic_reasoning_chain_flat_api_v1_agentic_reasoning_chain_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agentic/runs/{x}",
+      "handler": "get_run_timeline_api_v1_agentic_runs__run_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agentic/triaged-alerts",
+      "handler": "agentic_triaged_alerts_api_v1_agentic_triaged_alerts_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agentic/usage",
+      "handler": "get_agent_usage_api_v1_agentic_usage_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agents/_agent/poll",
+      "handler": "agent_poll_api_v1_agents__agent_poll_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agents/commands/pending",
+      "handler": "agents_commands_pending_api_v1_agents_commands_pending_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/agents/{x}/verify-chain",
+      "handler": "verify_chain_api_v1_agents__agent_id__verify_chain_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ai/anomalies/stats",
+      "handler": "anomaly_statistics_api_v1_ai_anomalies_stats_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ai/anomalies/{x}",
+      "handler": "get_anomaly_api_v1_ai_anomalies__anomaly_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ai/models/{x}",
+      "handler": "get_model_api_v1_ai_models__model_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ai/models/{x}/drift",
+      "handler": "check_model_drift_api_v1_ai_models__model_id__drift_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ai/predictions/dashboard",
+      "handler": "prediction_dashboard_api_v1_ai_predictions_dashboard_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ai/queries",
+      "handler": "query_history_api_v1_ai_queries_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ai/triage/stats",
+      "handler": "triage_statistics_api_v1_ai_triage_stats_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/api-keys/admin/all",
+      "handler": "list_all_api_keys_api_v1_api_keys_admin_all_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/api-keys/permissions/available",
+      "handler": "list_available_permissions_v2_api_v1_api_keys_permissions_available_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/api-keys/{x}",
+      "handler": "get_api_key_api_v1_api_keys__key_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/api-security/anomalies/{x}",
+      "handler": "get_anomaly_api_v1_api_security_anomalies__anomaly_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/api-security/compliance-checks",
+      "handler": "list_compliance_checks_api_v1_api_security_compliance_checks_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/api-security/compliance-checks/{x}",
+      "handler": "get_compliance_check_api_v1_api_security_compliance_checks__check_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/api-security/dashboard",
+      "handler": "get_dashboard_api_v1_api_security_dashboard_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/api-security/endpoints/{x}",
+      "handler": "get_endpoint_api_v1_api_security_endpoints__endpoint_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/api-security/policies/{x}",
+      "handler": "get_policy_api_v1_api_security_policies__policy_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/api-security/reports/compliance",
+      "handler": "get_compliance_report_api_v1_api_security_reports_compliance_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/api-security/vulnerabilities/{x}",
+      "handler": "get_vulnerability_api_v1_api_security_vulnerabilities__vuln_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/attack/coverage",
+      "handler": "attack_coverage_api_v1_attack_coverage_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/attack/search",
+      "handler": "search_attack_api_v1_attack_search_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/attack/status",
+      "handler": "attack_status_api_v1_attack_status_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/attack/techniques",
+      "handler": "list_techniques_api_v1_attack_techniques_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/attack/techniques/{x}",
+      "handler": "get_technique_api_v1_attack_techniques__external_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/audit-evidence/audit/export",
+      "handler": "export_audit_trail_api_v1_audit_evidence_audit_export_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/audit-evidence/audit/suspicious-activity",
+      "handler": "detect_suspicious_activity_api_v1_audit_evidence_audit_suspicious_activity_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/audit-evidence/conmon/report",
+      "handler": "get_conmon_report_api_v1_audit_evidence_conmon_report_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/audit-evidence/evidence/{x}/download",
+      "handler": "download_evidence_file_api_v1_audit_evidence_evidence__evidence_id__download_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/audit-evidence/packages/{x}",
+      "handler": "get_evidence_package_api_v1_audit_evidence_packages__package_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/audit-evidence/readiness/assessor-package",
+      "handler": "generate_assessor_package_api_v1_audit_evidence_readiness_assessor_package_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/audit-evidence/readiness/check",
+      "handler": "check_audit_readiness_api_v1_audit_evidence_readiness_check_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/audit-evidence/readiness/coverage",
+      "handler": "check_evidence_coverage_api_v1_audit_evidence_readiness_coverage_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/audit-evidence/readiness/freshness",
+      "handler": "check_evidence_freshness_api_v1_audit_evidence_readiness_freshness_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/audit-evidence/rules",
+      "handler": "list_evidence_rules_api_v1_audit_evidence_rules_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/backup/notifications/test",
+      "handler": "test_email_notification_api_v1_backup_notifications_test_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/backup/status",
+      "handler": "get_backup_status_api_v1_backup_status_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/collaboration/artifacts/{x}",
+      "handler": "get_artifact_api_v1_collaboration_artifacts__artifact_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/collaboration/rooms/{x}",
+      "handler": "get_war_room_api_v1_collaboration_rooms__room_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/collaboration/rooms/{x}/actions/report",
+      "handler": "get_action_report_api_v1_collaboration_rooms__room_id__actions_report_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/collaboration/rooms/{x}/activity-metrics",
+      "handler": "get_room_activity_metrics_api_v1_collaboration_rooms__room_id__activity_metrics_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/collaboration/rooms/{x}/artifacts",
+      "handler": "list_room_artifacts_api_v1_collaboration_rooms__room_id__artifacts_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/collaboration/rooms/{x}/artifacts/index",
+      "handler": "get_artifact_index_api_v1_collaboration_rooms__room_id__artifacts_index_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/collaboration/rooms/{x}/messages/search",
+      "handler": "search_messages_api_v1_collaboration_rooms__room_id__messages_search_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/collaboration/rooms/{x}/messages/{x}/thread",
+      "handler": "get_message_thread_api_v1_collaboration_rooms__room_id__messages__message_id__thread_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/collaboration/rooms/{x}/summary",
+      "handler": "get_room_summary_api_v1_collaboration_rooms__room_id__summary_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/collaboration/rooms/{x}/timeline",
+      "handler": "get_timeline_api_v1_collaboration_rooms__room_id__timeline_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/collaboration/rooms/{x}/timeline/export",
+      "handler": "export_timeline_api_v1_collaboration_rooms__room_id__timeline_export_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/collaboration/rooms/{x}/timeline/report",
+      "handler": "get_timeline_report_api_v1_collaboration_rooms__room_id__timeline_report_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/collaboration/search",
+      "handler": "search_collaboration_api_v1_collaboration_search_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/compliance/cisa/directives/{x}",
+      "handler": "get_cisa_directive_api_v1_compliance_cisa_directives__directive_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/compliance/controls/cross-map",
+      "handler": "cross_map_controls_api_v1_compliance_controls_cross_map_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/compliance/controls/{x}",
+      "handler": "get_control_api_v1_compliance_controls__control_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/compliance/cui/audit",
+      "handler": "audit_cui_handling_api_v1_compliance_cui_audit_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/compliance/evidence",
+      "handler": "list_evidence_api_v1_compliance_evidence_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/compliance/evidence/{x}",
+      "handler": "get_evidence_api_v1_compliance_evidence__evidence_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/compliance/frameworks/{x}",
+      "handler": "get_framework_api_v1_compliance_frameworks__framework_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/compliance/frameworks/{x}/gaps",
+      "handler": "get_control_gaps_api_v1_compliance_frameworks__framework_id__gaps_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/compliance/frameworks/{x}/report",
+      "handler": "get_framework_report_api_v1_compliance_frameworks__framework_id__report_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/compliance/frameworks/{x}/ssp",
+      "handler": "generate_ssp_api_v1_compliance_frameworks__framework_id__ssp_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/compliance/frameworks/{x}/ssp/download",
+      "handler": "download_ssp_api_v1_compliance_frameworks__framework_id__ssp_download_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/compliance/poams/overdue",
+      "handler": "get_overdue_poams_api_v1_compliance_poams_overdue_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/compliance/poams/report",
+      "handler": "get_poam_report_api_v1_compliance_poams_report_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/compliance/poams/{x}",
+      "handler": "get_poam_api_v1_compliance_poams__poam_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/compliance/score-history",
+      "handler": "get_score_history_api_v1_compliance_score_history_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/container-security/alerts",
+      "handler": "container_security_alerts_api_v1_container_security_alerts_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/container-security/clusters/{x}",
+      "handler": "get_cluster_api_v1_container_security_clusters__cluster_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/container-security/clusters/{x}/compliance-check",
+      "handler": "check_cluster_compliance_api_v1_container_security_clusters__cluster_id__compliance_check_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/container-security/clusters/{x}/findings",
+      "handler": "get_cluster_findings_api_v1_container_security_clusters__cluster_id__findings_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/container-security/images/{x}",
+      "handler": "get_image_api_v1_container_security_images__image_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/container-security/images/{x}/risk-assessment",
+      "handler": "assess_image_risk_api_v1_container_security_images__image_id__risk_assessment_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/container-security/images/{x}/vulnerabilities",
+      "handler": "get_image_vulnerabilities_api_v1_container_security_images__image_id__vulnerabilities_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/darkweb/dashboard",
+      "handler": "get_dashboard_api_v1_darkweb_dashboard_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/darkweb/findings/{x}",
+      "handler": "get_finding_api_v1_darkweb_findings__finding_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/darkweb/monitors/{x}",
+      "handler": "get_monitor_api_v1_darkweb_monitors__monitor_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/data-lake/catalog/datasets",
+      "handler": "search_datasets_api_v1_data_lake_catalog_datasets_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/data-lake/catalog/lineage/{x}",
+      "handler": "get_data_lineage_api_v1_data_lake_catalog_lineage__dataset_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/data-lake/catalog/quality/{x}",
+      "handler": "get_data_quality_api_v1_data_lake_catalog_quality__dataset_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/data-lake/dashboard/metrics",
+      "handler": "get_dashboard_metrics_api_v1_data_lake_dashboard_metrics_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/data-lake/dashboard/pipeline-status",
+      "handler": "get_pipeline_status_api_v1_data_lake_dashboard_pipeline_status_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/data-lake/models",
+      "handler": "list_unified_models_api_v1_data_lake_models_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/data-lake/partitions",
+      "handler": "list_partitions_api_v1_data_lake_partitions_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/data-lake/queries",
+      "handler": "list_queries_api_v1_data_lake_queries_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/data-lake/queries/{x}",
+      "handler": "get_query_api_v1_data_lake_queries__query_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/data-lake/sources/{x}",
+      "handler": "get_data_source_api_v1_data_lake_sources__source_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/deception/campaigns/{x}",
+      "handler": "get_campaign_detail_api_v1_deception_campaigns__campaign_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/deception/campaigns/{x}/effectiveness",
+      "handler": "get_campaign_effectiveness_api_v1_deception_campaigns__campaign_id__effectiveness_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/deception/coverage",
+      "handler": "get_coverage_map_api_v1_deception_coverage_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/deception/decoys/{x}",
+      "handler": "get_decoy_detail_api_v1_deception_decoys__decoy_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/deception/interactions/timeline",
+      "handler": "get_interaction_timeline_api_v1_deception_interactions_timeline_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/deception/interactions/{x}",
+      "handler": "get_interaction_api_v1_deception_interactions__interaction_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/deception/recommendations",
+      "handler": "get_recommendations_api_v1_deception_recommendations_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/deception/tokens/{x}",
+      "handler": "get_token_api_v1_deception_tokens__token_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/dfir/cases/{x}",
+      "handler": "get_case_api_v1_dfir_cases__case_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/dfir/cases/{x}/metrics",
+      "handler": "get_case_metrics_api_v1_dfir_cases__case_id__metrics_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/dfir/cases/{x}/report",
+      "handler": "generate_case_report_api_v1_dfir_cases__case_id__report_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/dfir/evidence",
+      "handler": "dfir_evidence_flat_api_v1_dfir_evidence_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/dfir/evidence/{x}",
+      "handler": "get_evidence_api_v1_dfir_evidence__evidence_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/dfir/evidence/{x}/chain-of-custody",
+      "handler": "get_chain_of_custody_report_api_v1_dfir_evidence__evidence_id__chain_of_custody_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/dfir/legal-holds",
+      "handler": "dfir_legal_holds_flat_api_v1_dfir_legal_holds_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/dlp/classifications/{x}",
+      "handler": "get_classification_api_v1_dlp_classifications__classification_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/dlp/classifications/{x}/handling-requirements",
+      "handler": "get_handling_requirements_api_v1_dlp_classifications__classification_id__handling_requirements_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/dlp/compliance-status",
+      "handler": "get_compliance_status_api_v1_dlp_compliance_status_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/dlp/dashboard",
+      "handler": "get_dlp_dashboard_api_v1_dlp_dashboard_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/dlp/discovery/data-map",
+      "handler": "get_data_map_api_v1_dlp_discovery_data_map_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/dlp/discovery/lineage/{x}",
+      "handler": "get_data_lineage_api_v1_dlp_discovery_lineage__data_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/dlp/discovery/scans",
+      "handler": "list_discovery_scans_api_v1_dlp_discovery_scans_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/dlp/discovery/scans/{x}",
+      "handler": "get_discovery_scan_api_v1_dlp_discovery_scans__scan_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/dlp/incidents/{x}",
+      "handler": "get_incident_api_v1_dlp_incidents__incident_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/dlp/incidents/{x}/notification-tracking",
+      "handler": "get_notification_tracking_api_v1_dlp_incidents__incident_id__notification_tracking_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/dlp/policies/{x}",
+      "handler": "get_policy_api_v1_dlp_policies__policy_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/dlp/trends",
+      "handler": "get_violation_trends_api_v1_dlp_trends_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/dlp/violations",
+      "handler": "list_violations_api_v1_dlp_violations_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/dlp/violations/{x}",
+      "handler": "get_violation_api_v1_dlp_violations__violation_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/docs",
+      "handler": "swagger_ui_html"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/exposure/asset-vulns/prioritized",
+      "handler": "get_prioritized_remediation_list_api_v1_exposure_asset_vulns_prioritized_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/exposure/assets/{x}",
+      "handler": "get_asset_api_v1_exposure_assets__asset_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/exposure/assets/{x}/vulnerabilities",
+      "handler": "get_asset_vulnerabilities_api_v1_exposure_assets__asset_id__vulnerabilities_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/exposure/attack-surface/{x}",
+      "handler": "get_attack_surface_api_v1_exposure_attack_surface__surface_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/exposure/risk-matrix",
+      "handler": "get_risk_matrix_api_v1_exposure_risk_matrix_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/exposure/scans",
+      "handler": "list_scans_api_v1_exposure_scans_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/exposure/scans/{x}",
+      "handler": "get_scan_api_v1_exposure_scans__scan_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/exposure/tickets/overdue",
+      "handler": "get_overdue_tickets_api_v1_exposure_tickets_overdue_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/exposure/tickets/{x}",
+      "handler": "get_remediation_ticket_api_v1_exposure_tickets__ticket_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/exposure/vulnerabilities/kev",
+      "handler": "get_cisa_kev_list_early_api_v1_exposure_vulnerabilities_kev_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/exposure/vulnerabilities/{x}",
+      "handler": "get_vulnerability_api_v1_exposure_vulnerabilities__vuln_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/fedramp/cmp/generate",
+      "handler": "generate_cmp_api_v1_fedramp_cmp_generate_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/fedramp/conmon-plan/generate",
+      "handler": "generate_conmon_plan_api_v1_fedramp_conmon_plan_generate_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/fedramp/documents",
+      "handler": "fedramp_documents_api_v1_fedramp_documents_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/fedramp/irp/generate",
+      "handler": "generate_irp_api_v1_fedramp_irp_generate_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/fedramp/ssp/generate",
+      "handler": "generate_ssp_api_v1_fedramp_ssp_generate_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/health/detailed",
+      "handler": "health_check_detailed_api_v1_health_detailed_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/health/ready",
+      "handler": "readiness_probe_api_v1_health_ready_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/hunting/findings/{x}",
+      "handler": "get_finding_api_v1_hunting_findings__finding_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/hunting/hypotheses/{x}",
+      "handler": "get_hypothesis_api_v1_hunting_hypotheses__hypothesis_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/hunting/notebooks/{x}",
+      "handler": "get_notebook_api_v1_hunting_notebooks__notebook_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/hunting/sessions/{x}",
+      "handler": "get_session_api_v1_hunting_sessions__session_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/hunting/templates/{x}",
+      "handler": "get_template_api_v1_hunting_templates__template_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/integrations/connectors/{x}",
+      "handler": "get_connector_details_api_v1_integrations_connectors__connector_name__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/integrations/dashboard/health",
+      "handler": "get_health_dashboard_api_v1_integrations_dashboard_health_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/integrations/dashboard/stats",
+      "handler": "get_execution_stats_api_v1_integrations_dashboard_stats_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/integrations/dashboard/summary",
+      "handler": "get_dashboard_summary_api_v1_integrations_dashboard_summary_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/integrations/executions",
+      "handler": "integrations_executions_flat_api_v1_integrations_executions_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/integrations/installed/{x}",
+      "handler": "get_installed_integration_api_v1_integrations_installed__integration_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/integrations/installed/{x}/actions",
+      "handler": "list_integration_actions_api_v1_integrations_installed__integration_id__actions_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/integrations/installed/{x}/executions",
+      "handler": "get_execution_history_api_v1_integrations_installed__integration_id__executions_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/integrations/installed/{x}/webhooks",
+      "handler": "list_webhooks_api_v1_integrations_installed__integration_id__webhooks_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/integrations/webhooks",
+      "handler": "integrations_webhooks_flat_api_v1_integrations_webhooks_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/intel/feeds",
+      "handler": "intel_feeds_flat_api_v1_intel_feeds_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/intel/iocs",
+      "handler": "intel_iocs_flat_api_v1_intel_iocs_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/itdr/access-anomalies",
+      "handler": "itdr_access_anomalies_alias_api_v1_itdr_access_anomalies_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/itdr/anomalies/{x}",
+      "handler": "get_anomaly_api_v1_itdr_anomalies__anomaly_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/itdr/credential-exposures/{x}",
+      "handler": "get_exposure_api_v1_itdr_credential_exposures__exposure_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/itdr/dashboard/risk-overview",
+      "handler": "get_risk_overview_api_v1_itdr_dashboard_risk_overview_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/itdr/identities/{x}",
+      "handler": "get_identity_api_v1_itdr_identities__identity_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/itdr/identities/{x}/risk-score",
+      "handler": "get_identity_risk_score_api_v1_itdr_identities__identity_id__risk_score_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/itdr/threats/{x}",
+      "handler": "get_threat_api_v1_itdr_threats__threat_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/metrics",
+      "handler": "prometheus_metrics_api_v1_metrics_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/metrics/agentic",
+      "handler": "agentic_metrics_snapshot_api_v1_metrics_agentic_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/metrics/alerts/by-severity",
+      "handler": "get_alerts_by_severity_api_v1_metrics_alerts_by_severity_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/metrics/alerts/by-source",
+      "handler": "get_alerts_by_source_api_v1_metrics_alerts_by_source_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/metrics/alerts/by-status",
+      "handler": "get_alerts_by_status_api_v1_metrics_alerts_by_status_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/metrics/incidents/by-type",
+      "handler": "get_incidents_by_type_api_v1_metrics_incidents_by_type_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/metrics/iocs/by-threat-level",
+      "handler": "get_iocs_by_threat_level_api_v1_metrics_iocs_by_threat_level_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/metrics/iocs/by-type",
+      "handler": "get_iocs_by_type_api_v1_metrics_iocs_by_type_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/metrics/playbooks/executions",
+      "handler": "get_playbook_execution_stats_api_v1_metrics_playbooks_executions_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/openapi.json",
+      "handler": "openapi"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/organizations/{x}",
+      "handler": "get_organization_api_v1_organizations__org_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ot-security/alerts",
+      "handler": "ot_security_alerts_dash_api_v1_ot_security_alerts_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ot-security/assets",
+      "handler": "ot_security_assets_dash_api_v1_ot_security_assets_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ot-security/export",
+      "handler": "ot_security_export_api_v1_ot_security_export_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ot-security/purdue-map",
+      "handler": "ot_security_purdue_map_dash_api_v1_ot_security_purdue_map_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ot-security/zones",
+      "handler": "ot_security_zones_dash_api_v1_ot_security_zones_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ot_security/alerts/{x}",
+      "handler": "get_alert_api_v1_ot_security_alerts__alert_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ot_security/assets/{x}",
+      "handler": "get_asset_api_v1_ot_security_assets__asset_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ot_security/assets/{x}/risk_assessment",
+      "handler": "get_asset_risk_assessment_api_v1_ot_security_assets__asset_id__risk_assessment_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ot_security/assets/{x}/status",
+      "handler": "get_asset_status_api_v1_ot_security_assets__asset_id__status_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ot_security/compliance/report",
+      "handler": "get_compliance_report_api_v1_ot_security_compliance_report_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ot_security/dashboard",
+      "handler": "get_ot_dashboard_api_v1_ot_security_dashboard_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ot_security/incidents",
+      "handler": "list_incidents_api_v1_ot_security_incidents_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ot_security/incidents/{x}",
+      "handler": "get_incident_api_v1_ot_security_incidents__incident_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ot_security/incidents/{x}/post_incident",
+      "handler": "get_post_incident_report_api_v1_ot_security_incidents__incident_id__post_incident_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ot_security/policies",
+      "handler": "list_policies_api_v1_ot_security_policies_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ot_security/policies/{x}",
+      "handler": "get_policy_api_v1_ot_security_policies__policy_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ot_security/policies/{x}/violation_history",
+      "handler": "get_policy_violation_history_api_v1_ot_security_policies__policy_id__violation_history_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ot_security/risk_assessment",
+      "handler": "get_risk_assessment_api_v1_ot_security_risk_assessment_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ot_security/zones/{x}",
+      "handler": "get_zone_api_v1_ot_security_zones__zone_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ot_security/zones/{x}/communication_matrix",
+      "handler": "get_zone_communication_matrix_api_v1_ot_security_zones__zone_id__communication_matrix_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/phishing_sim/awareness-scores/department/{x}",
+      "handler": "get_department_scores_api_v1_phishing_sim_awareness_scores_department__department__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/phishing_sim/awareness-scores/high-risk",
+      "handler": "get_high_risk_users_api_v1_phishing_sim_awareness_scores_high_risk_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/phishing_sim/awareness-scores/{x}",
+      "handler": "get_user_awareness_score_api_v1_phishing_sim_awareness_scores__user_email__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/phishing_sim/campaigns/{x}",
+      "handler": "get_campaign_api_v1_phishing_sim_campaigns__campaign_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/phishing_sim/campaigns/{x}/events",
+      "handler": "list_campaign_events_api_v1_phishing_sim_campaigns__campaign_id__events_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/phishing_sim/campaigns/{x}/events/timeline",
+      "handler": "get_event_timeline_api_v1_phishing_sim_campaigns__campaign_id__events_timeline_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/phishing_sim/dashboard",
+      "handler": "get_dashboard_api_v1_phishing_sim_dashboard_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/phishing_sim/reports/risk",
+      "handler": "get_risk_report_api_v1_phishing_sim_reports_risk_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/phishing_sim/target-groups/{x}",
+      "handler": "get_target_group_api_v1_phishing_sim_target_groups__group_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/phishing_sim/templates/{x}",
+      "handler": "get_template_api_v1_phishing_sim_templates__template_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/phishing_sim/templates/{x}/effectiveness",
+      "handler": "get_template_effectiveness_api_v1_phishing_sim_templates__template_id__effectiveness_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/playbook-builder/dashboard",
+      "handler": "get_dashboard_early_api_v1_playbook_builder_dashboard_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/playbook-builder/executions/{x}",
+      "handler": "get_execution_status_api_v1_playbook_builder_executions__execution_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/playbook-builder/{x}/executions",
+      "handler": "list_executions_api_v1_playbook_builder__playbook_id__executions_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/playbooks/executions/recent",
+      "handler": "playbooks_executions_recent_api_v1_playbooks_executions_recent_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/privacy/consent",
+      "handler": "privacy_consent_flat_api_v1_privacy_consent_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/privacy/dsr",
+      "handler": "privacy_dsr_flat_api_v1_privacy_dsr_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/privacy/dsr/requests/{x}",
+      "handler": "get_dsr_api_v1_privacy_dsr_requests__request_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/privacy/incidents",
+      "handler": "privacy_incidents_flat_api_v1_privacy_incidents_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/privacy/incidents/reports/{x}",
+      "handler": "get_incident_api_v1_privacy_incidents_reports__incident_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/privacy/pia",
+      "handler": "privacy_pia_flat_api_v1_privacy_pia_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/privacy/pia/assessments/{x}",
+      "handler": "get_pia_api_v1_privacy_pia_assessments__assessment_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/privacy/ropa",
+      "handler": "privacy_ropa_flat_api_v1_privacy_ropa_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/privacy/ropa/generate-ropa",
+      "handler": "generate_ropa_api_v1_privacy_ropa_generate_ropa_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/redoc",
+      "handler": "redoc_html"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/remediation/actions/{x}",
+      "handler": "get_action_api_v1_remediation_actions__action_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/remediation/effectiveness",
+      "handler": "get_effectiveness_metrics_api_v1_remediation_effectiveness_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/remediation/executions/{x}/progress",
+      "handler": "get_execution_progress_api_v1_remediation_executions__execution_id__progress_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/remediation/integrations/{x}/health",
+      "handler": "get_integration_health_api_v1_remediation_integrations__integration_id__health_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/remediation/playbooks",
+      "handler": "list_playbooks_api_v1_remediation_playbooks_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/remediation/playbooks/{x}",
+      "handler": "get_playbook_api_v1_remediation_playbooks__playbook_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/remediation/policies/builtin",
+      "handler": "list_builtin_policies_api_v1_remediation_policies_builtin_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/remediation/policies/{x}",
+      "handler": "get_policy_api_v1_remediation_policies__policy_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/remediation/timeline",
+      "handler": "get_remediation_timeline_api_v1_remediation_timeline_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/risk-quantification/analysis",
+      "handler": "risk_quant_analysis_flat_api_v1_risk_quantification_analysis_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/risk-quantification/bias",
+      "handler": "list_bias_api_v1_risk_quantification_bias_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/risk-quantification/bias/{x}",
+      "handler": "get_bia_api_v1_risk_quantification_bias__bia_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/risk-quantification/controls",
+      "handler": "list_risk_controls_api_v1_risk_quantification_controls_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/risk-quantification/controls/{x}",
+      "handler": "get_risk_control_api_v1_risk_quantification_controls__control_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/risk-quantification/fair-analyses/{x}",
+      "handler": "get_fair_analysis_api_v1_risk_quantification_fair_analyses__analysis_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/risk-quantification/fair-analyses/{x}/loss-exceedance-curve",
+      "handler": "get_loss_exceedance_curve_api_v1_risk_quantification_fair_analyses__analysis_id__loss_exceedance_curve_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/risk-quantification/heatmap",
+      "handler": "get_risk_heatmap_api_v1_risk_quantification_heatmap_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/risk-quantification/risk-registers",
+      "handler": "list_risk_registers_api_v1_risk_quantification_risk_registers_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/risk-quantification/risk-registers/{x}",
+      "handler": "get_risk_register_api_v1_risk_quantification_risk_registers__register_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/risk-quantification/scenarios/{x}",
+      "handler": "get_risk_scenario_api_v1_risk_quantification_scenarios__scenario_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/settings/ai/tenants",
+      "handler": "list_ai_tenants_api_v1_settings_ai_tenants_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/siem/correlations/{x}",
+      "handler": "get_correlation_api_v1_siem_correlations__correlation_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/siem/dashboard",
+      "handler": "siem_dashboard_api_v1_siem_dashboard_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/siem/ingest/status",
+      "handler": "ingest_status_api_v1_siem_ingest_status_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/siem/rules/{x}",
+      "handler": "get_rule_api_v1_siem_rules__rule_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/simulation/adversaries/{x}",
+      "handler": "get_adversary_api_v1_simulation_adversaries__adversary_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/simulation/posture-trend",
+      "handler": "simulation_posture_trend_api_v1_simulation_posture_trend_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/simulation/posture/gaps",
+      "handler": "get_gap_analysis_api_v1_simulation_posture_gaps_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/simulation/simulations/{x}",
+      "handler": "get_simulation_detail_api_v1_simulation_simulations__simulation_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/simulation/simulations/{x}/progress",
+      "handler": "get_simulation_progress_api_v1_simulation_simulations__simulation_id__progress_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/simulation/simulations/{x}/report",
+      "handler": "get_simulation_report_api_v1_simulation_simulations__simulation_id__report_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/simulation/techniques/coverage",
+      "handler": "get_coverage_map_api_v1_simulation_techniques_coverage_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/stig/benchmarks/{x}",
+      "handler": "get_benchmark_api_v1_stig_benchmarks__benchmark_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/stig/benchmarks/{x}/rules",
+      "handler": "list_benchmark_rules_api_v1_stig_benchmarks__benchmark_id__rules_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/stig/remediations",
+      "handler": "stig_remediations_api_v1_stig_remediations_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/stig/rules/search",
+      "handler": "search_rules_api_v1_stig_rules_search_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/stig/rules/{x}",
+      "handler": "get_rule_api_v1_stig_rules__rule_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/stig/scap/profiles",
+      "handler": "list_scap_profiles_api_v1_stig_scap_profiles_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/supplychain/compliance/license-audit",
+      "handler": "license_audit_api_v1_supplychain_compliance_license_audit_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/supplychain/components/{x}",
+      "handler": "get_component_api_v1_supplychain_components__component_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/supplychain/components/{x}/dependency-tree",
+      "handler": "get_component_dependency_tree_api_v1_supplychain_components__component_id__dependency_tree_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/supplychain/components/{x}/vulnerabilities",
+      "handler": "get_component_vulnerabilities_api_v1_supplychain_components__component_id__vulnerabilities_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/supplychain/dashboard/overview",
+      "handler": "dashboard_overview_api_v1_supplychain_dashboard_overview_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/supplychain/dashboard/top-risky-components",
+      "handler": "get_top_risky_components_api_v1_supplychain_dashboard_top_risky_components_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/supplychain/dashboard/vendor-scores",
+      "handler": "get_vendor_scores_api_v1_supplychain_dashboard_vendor_scores_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/supplychain/risks/{x}",
+      "handler": "get_risk_api_v1_supplychain_risks__risk_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/supplychain/sboms/{x}",
+      "handler": "get_sbom_api_v1_supplychain_sboms__sbom_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/supplychain/vendor-assessments",
+      "handler": "supplychain_vendor_assessments_alias_api_v1_supplychain_vendor_assessments_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/supplychain/vendors/{x}",
+      "handler": "get_vendor_api_v1_supplychain_vendors__vendor_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/teams/{x}",
+      "handler": "get_team_api_v1_teams__team_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/teams/{x}/members",
+      "handler": "list_team_members_api_v1_teams__team_id__members_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/threat-intel/actors",
+      "handler": "list_actors"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/threat-intel/actors/{x}",
+      "handler": "get_actor"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/threat-intel/campaigns",
+      "handler": "list_campaigns"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/threat-intel/campaigns/{x}",
+      "handler": "get_campaign"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/threat-intel/dashboard",
+      "handler": "get_dashboard_stats"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/threat-intel/export",
+      "handler": "export_indicators"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/threat-intel/feeds/{x}",
+      "handler": "get_threat_feed"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/threat-intel/feeds/{x}/stats",
+      "handler": "get_feed_stats"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/threat-intel/indicators/{x}/sightings",
+      "handler": "get_indicator_sightings"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/threat-intel/indicators/{x}/timeline",
+      "handler": "get_indicator_timeline"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/threat-intel/reports",
+      "handler": "list_reports"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/threat-intel/reports/{x}",
+      "handler": "get_report"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/threat-modeling/models",
+      "handler": "threat_modeling_models_flat_api_v1_threat_modeling_models_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/threat-modeling/{x}",
+      "handler": "get_threat_model_api_v1_threat_modeling__model_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/threat-modeling/{x}/mitigations/recommendations/{x}",
+      "handler": "get_mitigation_recommendations_api_v1_threat_modeling__model_id__mitigations_recommendations__threat_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/threat-modeling/{x}/threats/{x}",
+      "handler": "get_threat_api_v1_threat_modeling__model_id__threats__threat_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/tickethub/tickets/{x}/{x}",
+      "handler": "get_ticket_detail_api_v1_tickethub_tickets__source_type___source_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/tickethub/tickets/{x}/{x}/links",
+      "handler": "get_ticket_links_api_v1_tickethub_tickets__source_type___source_id__links_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ueba/alerts/{x}",
+      "handler": "get_alert_api_v1_ueba_alerts__alert_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ueba/baselines/{x}",
+      "handler": "get_baselines_api_v1_ueba_baselines__entity_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ueba/entities/{x}",
+      "handler": "get_entity_api_v1_ueba_entities__entity_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ueba/entities/{x}/peers",
+      "handler": "get_peer_comparison_api_v1_ueba_entities__entity_id__peers_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ueba/entities/{x}/risk",
+      "handler": "get_entity_risk_api_v1_ueba_entities__entity_id__risk_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ueba/events",
+      "handler": "search_events_api_v1_ueba_events_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ueba/peer-groups/{x}",
+      "handler": "get_peer_group_api_v1_ueba_peer_groups__group_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/ueba/risk-heatmap",
+      "handler": "get_risk_heatmap_api_v1_ueba_risk_heatmap_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/vulnmgmt/instances",
+      "handler": "list_instances_api_v1_vulnmgmt_instances_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/vulnmgmt/instances/{x}",
+      "handler": "get_instance_api_v1_vulnmgmt_instances__instance_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/vulnmgmt/report/executive",
+      "handler": "get_executive_report_api_v1_vulnmgmt_report_executive_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/vulnmgmt/report/kev-compliance",
+      "handler": "get_kev_compliance_report_api_v1_vulnmgmt_report_kev_compliance_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/vulnmgmt/vulnerabilities/{x}",
+      "handler": "get_vulnerability_api_v1_vulnmgmt_vulnerabilities__vuln_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/zerotrust/devices/non-compliant",
+      "handler": "list_non_compliant_devices_api_v1_zerotrust_devices_non_compliant_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/zerotrust/maturity",
+      "handler": "get_maturity_score_api_v1_zerotrust_maturity_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/zerotrust/maturity/pillars",
+      "handler": "get_maturity_pillars_api_v1_zerotrust_maturity_pillars_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/zerotrust/policies/{x}",
+      "handler": "get_policy_api_v1_zerotrust_policies__policy_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/zerotrust/recommendations",
+      "handler": "get_recommendations_api_v1_zerotrust_recommendations_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/zerotrust/segments/{x}",
+      "handler": "get_segment_api_v1_zerotrust_segments__segment_id__get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/zerotrust/segments/{x}/violations",
+      "handler": "get_segment_violations_api_v1_zerotrust_segments__segment_id__violations_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/zerotrust/topology",
+      "handler": "get_segment_topology_api_v1_zerotrust_topology_get"
+    },
+    {
+      "method": "GET",
+      "path": "/api/v1/zerotrust/verifications",
+      "handler": "list_verifications_api_v1_zerotrust_verifications_get"
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/api-keys/{x}",
+      "handler": "update_api_key_api_v1_api_keys__key_id__patch"
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/collaboration/actions/{x}",
+      "handler": "update_action_item_api_v1_collaboration_actions__action_id__patch"
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/collaboration/messages/{x}",
+      "handler": "edit_message_api_v1_collaboration_messages__message_id__patch"
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/collaboration/rooms/{x}",
+      "handler": "update_war_room_api_v1_collaboration_rooms__room_id__patch"
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/container-security/clusters/{x}",
+      "handler": "update_cluster_api_v1_container_security_clusters__cluster_id__patch"
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/container-security/findings/{x}",
+      "handler": "update_finding_api_v1_container_security_findings__finding_id__patch"
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/container-security/images/{x}",
+      "handler": "update_image_api_v1_container_security_images__image_id__patch"
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/container-security/runtime-alerts/{x}",
+      "handler": "update_runtime_alert_api_v1_container_security_runtime_alerts__alert_id__patch"
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/darkweb/brand-threats/{x}",
+      "handler": "update_brand_threat_api_v1_darkweb_brand_threats__threat_id__patch"
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/darkweb/credentials/{x}",
+      "handler": "update_credential_api_v1_darkweb_credentials__credential_id__patch"
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/data-lake/models/{x}",
+      "handler": "update_unified_model_api_v1_data_lake_models__model_id__patch"
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/data-lake/partitions/{x}",
+      "handler": "update_partition_api_v1_data_lake_partitions__partition_id__patch"
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/data-lake/pipelines/{x}",
+      "handler": "update_pipeline_api_v1_data_lake_pipelines__pipeline_id__patch"
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/data-lake/sources/{x}",
+      "handler": "update_data_source_api_v1_data_lake_sources__source_id__patch"
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/dlp/classifications/{x}",
+      "handler": "update_classification_api_v1_dlp_classifications__classification_id__patch"
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/dlp/violations/{x}",
+      "handler": "investigate_violation_api_v1_dlp_violations__violation_id__patch"
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/incidents/{x}/notes/{x}",
+      "handler": "update_note_api_v1_incidents__incident_id__notes__note_id__patch"
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/integrations/installed/{x}",
+      "handler": "update_installed_integration_api_v1_integrations_installed__integration_id__patch"
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/phishing_sim/campaigns/{x}",
+      "handler": "update_campaign_api_v1_phishing_sim_campaigns__campaign_id__patch"
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/phishing_sim/target-groups/{x}",
+      "handler": "update_target_group_api_v1_phishing_sim_target_groups__group_id__patch"
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/phishing_sim/templates/{x}",
+      "handler": "update_template_api_v1_phishing_sim_templates__template_id__patch"
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/privacy/dsr/requests/{x}",
+      "handler": "update_dsr_api_v1_privacy_dsr_requests__request_id__patch"
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/risk-quantification/bias/{x}",
+      "handler": "update_bia_api_v1_risk_quantification_bias__bia_id__patch"
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/risk-quantification/controls/{x}",
+      "handler": "update_risk_control_api_v1_risk_quantification_controls__control_id__patch"
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/risk-quantification/risk-registers/{x}",
+      "handler": "update_risk_register_api_v1_risk_quantification_risk_registers__register_id__patch"
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/risk-quantification/scenarios/{x}",
+      "handler": "update_risk_scenario_api_v1_risk_quantification_scenarios__scenario_id__patch"
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/settings",
+      "handler": "update_settings_api_v1_settings_patch"
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/supplychain/components/{x}",
+      "handler": "update_component_api_v1_supplychain_components__component_id__patch"
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/supplychain/risks/{x}",
+      "handler": "update_risk_api_v1_supplychain_risks__risk_id__patch"
+    },
+    {
+      "method": "PATCH",
+      "path": "/api/v1/supplychain/vendors/{x}",
+      "handler": "update_vendor_api_v1_supplychain_vendors__vendor_id__patch"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agentic/agents",
+      "handler": "create_agent_api_v1_agentic_agents_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agentic/agents/{x}/start",
+      "handler": "start_agent_api_v1_agentic_agents__agent_id__start_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agentic/agents/{x}/stop",
+      "handler": "stop_agent_api_v1_agentic_agents__agent_id__stop_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agentic/hunts",
+      "handler": "run_structured_hunt_endpoint_api_v1_agentic_hunts_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agentic/investigations/{x}/feedback",
+      "handler": "submit_investigation_feedback_api_v1_agentic_investigations__investigation_id__feedback_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agentic/threat-hunts",
+      "handler": "start_threat_hunt_api_v1_agentic_threat_hunts_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agentic/tools/{x}/execute",
+      "handler": "execute_agent_tool_api_v1_agentic_tools__tool_name__execute_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agentic/trust/acknowledge",
+      "handler": "acknowledge_injection_api_v1_agentic_trust_acknowledge_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agents/_agent/commands/{x}/result",
+      "handler": "agent_post_result_api_v1_agents__agent_commands__command_id__result_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agents/_agent/exchange",
+      "handler": "exchange_api_v1_agents__agent_exchange_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agents/_agent/heartbeat",
+      "handler": "agent_heartbeat_api_v1_agents__agent_heartbeat_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agents/_agent/honeypot-interactions",
+      "handler": "agent_honeypot_interactions_api_v1_agents__agent_honeypot_interactions_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agents/_agent/host_events",
+      "handler": "agent_host_events_api_v1_agents__agent_host_events_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agents/{x}/disable",
+      "handler": "disable_agent_api_v1_agents__agent_id__disable_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agents/{x}/enable",
+      "handler": "enable_agent_api_v1_agents__agent_id__enable_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/agents/{x}/revoke",
+      "handler": "revoke_agent_api_v1_agents__agent_id__revoke_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/ai/alerts/triage",
+      "handler": "triage_pending_alerts_api_v1_ai_alerts_triage_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/ai/analyze/incident/{x}",
+      "handler": "analyze_incident_api_v1_ai_analyze_incident__incident_id__post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/ai/analyze/root-cause/{x}",
+      "handler": "analyze_root_cause_api_v1_ai_analyze_root_cause__incident_id__post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/ai/feedback",
+      "handler": "submit_ai_feedback_api_v1_ai_feedback_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/ai/generate/playbook",
+      "handler": "generate_playbook_api_v1_ai_generate_playbook_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/ai/predictions/entity/{x}",
+      "handler": "predict_entity_threat_api_v1_ai_predictions_entity__entity_id__post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/ai/query",
+      "handler": "natural_language_query_api_v1_ai_query_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/ai/recommend/response/{x}",
+      "handler": "recommend_response_api_v1_ai_recommend_response__incident_id__post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/ai/triage/alert/{x}",
+      "handler": "triage_single_alert_api_v1_ai_triage_alert__alert_id__post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/api-security/anomalies",
+      "handler": "create_anomaly_api_v1_api_security_anomalies_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/api-security/compliance-checks",
+      "handler": "create_compliance_check_api_v1_api_security_compliance_checks_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/api-security/policies",
+      "handler": "create_policy_api_v1_api_security_policies_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/api-security/scan/compliance/{x}",
+      "handler": "trigger_compliance_check_api_v1_api_security_scan_compliance__endpoint_id__post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/api-security/scan/discover",
+      "handler": "trigger_api_discovery_api_v1_api_security_scan_discover_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/api-security/scan/security/{x}",
+      "handler": "trigger_security_scan_api_v1_api_security_scan_security__endpoint_id__post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/api-security/scan/shadows",
+      "handler": "trigger_shadow_api_detection_api_v1_api_security_scan_shadows_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/api-security/vulnerabilities",
+      "handler": "create_vulnerability_api_v1_api_security_vulnerabilities_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/api-security/vulnerabilities/bulk-update",
+      "handler": "bulk_update_vulnerabilities_api_v1_api_security_vulnerabilities_bulk_update_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/attack/sync",
+      "handler": "sync_attack_api_v1_attack_sync_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/audit-evidence/audit/log",
+      "handler": "log_audit_event_api_v1_audit_evidence_audit_log_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/audit-evidence/conmon/run-cycle",
+      "handler": "run_conmon_cycle_api_v1_audit_evidence_conmon_run_cycle_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/audit-evidence/evidence/collect",
+      "handler": "collect_evidence_api_v1_audit_evidence_evidence_collect_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/audit-evidence/packages/{x}/package",
+      "handler": "package_evidence_api_v1_audit_evidence_packages__package_id__package_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/audit-evidence/rules/create",
+      "handler": "create_evidence_rule_api_v1_audit_evidence_rules_create_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/auth/mfa/verify",
+      "handler": "mfa_verify_alias_api_v1_auth_mfa_verify_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/auth/password-reset/consume",
+      "handler": "password_reset_consume_api_v1_auth_password_reset_consume_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/auth/password-reset/validate",
+      "handler": "password_reset_validate_api_v1_auth_password_reset_validate_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/auth/revoke-all",
+      "handler": "revoke_all_tokens_api_v1_auth_revoke_all_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/backup/create",
+      "handler": "create_backup_api_v1_backup_create_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/backup/restore",
+      "handler": "restore_backup_api_v1_backup_restore_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/collaboration/artifacts/{x}/download",
+      "handler": "download_artifact_api_v1_collaboration_artifacts__artifact_id__download_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/collaboration/messages/{x}/pin",
+      "handler": "pin_message_api_v1_collaboration_messages__message_id__pin_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/collaboration/rooms/{x}/artifacts",
+      "handler": "upload_artifact_api_v1_collaboration_rooms__room_id__artifacts_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/collaboration/rooms/{x}/commander/{x}",
+      "handler": "set_war_room_commander_api_v1_collaboration_rooms__room_id__commander__user_id__post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/collaboration/rooms/{x}/join",
+      "handler": "join_war_room_api_v1_collaboration_rooms__room_id__join_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/collaboration/rooms/{x}/leave",
+      "handler": "leave_war_room_api_v1_collaboration_rooms__room_id__leave_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/collaboration/rooms/{x}/postmortem",
+      "handler": "generate_post_mortem_api_v1_collaboration_rooms__room_id__postmortem_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/collaboration/rooms/{x}/timeline",
+      "handler": "add_timeline_event_api_v1_collaboration_rooms__room_id__timeline_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/compliance/controls/{x}/assess",
+      "handler": "run_control_assessment_api_v1_compliance_controls__control_id__assess_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/compliance/evidence",
+      "handler": "upload_evidence_api_v1_compliance_evidence_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/compliance/frameworks/{x}/attest",
+      "handler": "run_auto_attestation_api_v1_compliance_frameworks__framework_id__attest_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/compliance/frameworks/{x}/conmon",
+      "handler": "trigger_continuous_monitoring_api_v1_compliance_frameworks__framework_id__conmon_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/container-security/clusters",
+      "handler": "create_cluster_api_v1_container_security_clusters_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/container-security/images",
+      "handler": "create_image_api_v1_container_security_images_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/container-security/images/{x}/verify-signature",
+      "handler": "verify_image_signature_api_v1_container_security_images__image_id__verify_signature_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/container-security/runtime-alerts/{x}/investigate",
+      "handler": "investigate_alert_api_v1_container_security_runtime_alerts__alert_id__investigate_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/container-security/runtime-alerts/{x}/quarantine-pod",
+      "handler": "quarantine_pod_from_alert_api_v1_container_security_runtime_alerts__alert_id__quarantine_pod_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/darkweb/credentials/bulk-remediate",
+      "handler": "bulk_remediate_credentials_api_v1_darkweb_credentials_bulk_remediate_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/darkweb/findings",
+      "handler": "create_finding_api_v1_darkweb_findings_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/darkweb/findings/bulk-action",
+      "handler": "bulk_finding_action_api_v1_darkweb_findings_bulk_action_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/darkweb/monitors/{x}/trigger-scan",
+      "handler": "trigger_monitor_scan_api_v1_darkweb_monitors__monitor_id__trigger_scan_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/data-lake/models",
+      "handler": "create_unified_model_api_v1_data_lake_models_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/data-lake/partitions",
+      "handler": "create_partition_api_v1_data_lake_partitions_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/data-lake/pipelines",
+      "handler": "create_pipeline_api_v1_data_lake_pipelines_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/data-lake/queries",
+      "handler": "submit_query_api_v1_data_lake_queries_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/data-lake/queries/{x}/estimate-cost",
+      "handler": "estimate_query_cost_api_v1_data_lake_queries__query_id__estimate_cost_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/data-lake/sources/{x}/start",
+      "handler": "start_data_source_ingestion_api_v1_data_lake_sources__source_id__start_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/data-lake/sources/{x}/stop",
+      "handler": "stop_data_source_ingestion_api_v1_data_lake_sources__source_id__stop_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/deception/decoys/{x}/interactions",
+      "handler": "record_decoy_interaction_api_v1_deception_decoys__decoy_id__interactions_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/deception/decoys/{x}/rotate",
+      "handler": "rotate_decoy_api_v1_deception_decoys__decoy_id__rotate_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/deception/interactions/{x}/investigate",
+      "handler": "investigate_interaction_api_v1_deception_interactions__interaction_id__investigate_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/deception/tokens/rotate",
+      "handler": "rotate_tokens_api_v1_deception_tokens_rotate_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/dfir/artifacts/analyze",
+      "handler": "analyze_artifact_api_v1_dfir_artifacts_analyze_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/dfir/cases/{x}/artifacts",
+      "handler": "create_artifact_api_v1_dfir_cases__case_id__artifacts_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/dfir/cases/{x}/close",
+      "handler": "close_case_api_v1_dfir_cases__case_id__close_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/dfir/cases/{x}/evidence/upload",
+      "handler": "upload_evidence_file_api_v1_dfir_cases__case_id__evidence_upload_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/dfir/cases/{x}/timeline/events",
+      "handler": "add_timeline_event_api_v1_dfir_cases__case_id__timeline_events_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/dfir/cases/{x}/timeline/export",
+      "handler": "export_timeline_api_v1_dfir_cases__case_id__timeline_export_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/dfir/evidence/{x}/chain-of-custody",
+      "handler": "update_chain_of_custody_api_v1_dfir_evidence__evidence_id__chain_of_custody_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/dfir/evidence/{x}/verify",
+      "handler": "verify_evidence_integrity_api_v1_dfir_evidence__evidence_id__verify_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/dlp/classifications",
+      "handler": "create_classification_api_v1_dlp_classifications_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/dlp/classifications/classify-document",
+      "handler": "classify_document_api_v1_dlp_classifications_classify_document_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/dlp/discovery/scan",
+      "handler": "trigger_discovery_scan_api_v1_dlp_discovery_scan_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/dlp/incidents",
+      "handler": "create_incident_api_v1_dlp_incidents_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/dlp/incidents/{x}/assess-breach",
+      "handler": "assess_breach_api_v1_dlp_incidents__incident_id__assess_breach_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/dlp/violations",
+      "handler": "create_violation_api_v1_dlp_violations_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/dlp/violations/bulk-action",
+      "handler": "bulk_action_violations_api_v1_dlp_violations_bulk_action_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/exposure/asset-vulns",
+      "handler": "create_asset_vulnerability_api_v1_exposure_asset_vulns_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/exposure/asset-vulns/{x}/remediate",
+      "handler": "mark_as_remediated_api_v1_exposure_asset_vulns__mapping_id__remediate_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/exposure/assets",
+      "handler": "create_asset_api_v1_exposure_assets_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/exposure/assets/discover",
+      "handler": "trigger_asset_discovery_api_v1_exposure_assets_discover_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/exposure/assets/import",
+      "handler": "import_assets_api_v1_exposure_assets_import_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/exposure/attack-surface",
+      "handler": "define_attack_surface_api_v1_exposure_attack_surface_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/exposure/report",
+      "handler": "generate_exposure_report_api_v1_exposure_report_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/exposure/scans/{x}/cancel",
+      "handler": "cancel_scan_api_v1_exposure_scans__scan_id__cancel_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/exposure/tickets/{x}/verify",
+      "handler": "verify_remediation_api_v1_exposure_tickets__ticket_id__verify_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/exposure/vulnerabilities",
+      "handler": "create_vulnerability_api_v1_exposure_vulnerabilities_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/exposure/vulnerabilities/search",
+      "handler": "advanced_vulnerability_search_api_v1_exposure_vulnerabilities_search_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/hunting/findings",
+      "handler": "create_finding_api_v1_hunting_findings_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/hunting/notebooks/{x}/publish",
+      "handler": "publish_notebook_api_v1_hunting_notebooks__notebook_id__publish_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/hunting/sessions/{x}/pause",
+      "handler": "pause_session_api_v1_hunting_sessions__session_id__pause_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/hunting/sessions/{x}/resume",
+      "handler": "resume_session_api_v1_hunting_sessions__session_id__resume_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/incidents/{x}/timeline",
+      "handler": "create_timeline_event_api_v1_incidents__incident_id__timeline_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/integrations/installed/{x}/actions/{x}/execute",
+      "handler": "execute_action_api_v1_integrations_installed__integration_id__actions__action_id__execute_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/integrations/installed/{x}/disable",
+      "handler": "disable_integration_api_v1_integrations_installed__integration_id__disable_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/integrations/installed/{x}/enable",
+      "handler": "enable_integration_api_v1_integrations_installed__integration_id__enable_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/iocs/bulk",
+      "handler": "bulk_create_iocs_api_v1_iocs_bulk_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/iocs/search",
+      "handler": "search_ioc_api_v1_iocs_search_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/iocs/{x}/enrich",
+      "handler": "enrich_ioc_api_v1_iocs__ioc_id__enrich_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/itdr/anomalies/{x}/review",
+      "handler": "review_anomaly_api_v1_itdr_anomalies__anomaly_id__review_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/itdr/credential-exposures/remediate",
+      "handler": "remediate_exposures_api_v1_itdr_credential_exposures_remediate_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/itdr/identities",
+      "handler": "create_identity_api_v1_itdr_identities_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/itdr/privileged-access/request",
+      "handler": "request_elevation_api_v1_itdr_privileged_access_request_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/itdr/privileged-access/{x}/approve",
+      "handler": "approve_elevation_api_v1_itdr_privileged_access__event_id__approve_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/itdr/privileged-access/{x}/revoke",
+      "handler": "revoke_access_api_v1_itdr_privileged_access__event_id__revoke_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/itdr/threats/{x}/investigate",
+      "handler": "investigate_threat_api_v1_itdr_threats__threat_id__investigate_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/itdr/threats/{x}/respond",
+      "handler": "respond_to_threat_api_v1_itdr_threats__threat_id__respond_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/mfa/backup-codes",
+      "handler": "regenerate_backup_codes_api_v1_mfa_backup_codes_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/mfa/disable",
+      "handler": "disable_mfa_api_v1_mfa_disable_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/mfa/setup",
+      "handler": "setup_mfa_api_v1_mfa_setup_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/mfa/verify",
+      "handler": "verify_mfa_login_api_v1_mfa_verify_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/mfa/verify-setup",
+      "handler": "verify_mfa_setup_api_v1_mfa_verify_setup_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/ot-security/discover",
+      "handler": "ot_security_bulk_discover_api_v1_ot_security_discover_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/ot_security/alerts",
+      "handler": "create_alert_api_v1_ot_security_alerts_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/ot_security/alerts/bulk_action",
+      "handler": "bulk_alert_action_api_v1_ot_security_alerts_bulk_action_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/ot_security/alerts/{x}/investigate",
+      "handler": "investigate_alert_api_v1_ot_security_alerts__alert_id__investigate_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/ot_security/alerts/{x}/respond",
+      "handler": "respond_to_alert_api_v1_ot_security_alerts__alert_id__respond_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/ot_security/assets",
+      "handler": "create_asset_api_v1_ot_security_assets_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/ot_security/assets/{x}/discover",
+      "handler": "discover_asset_networks_api_v1_ot_security_assets__asset_id__discover_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/ot_security/assets/{x}/firmware_check",
+      "handler": "check_asset_firmware_api_v1_ot_security_assets__asset_id__firmware_check_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/ot_security/incidents",
+      "handler": "create_incident_api_v1_ot_security_incidents_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/ot_security/incidents/{x}/containment_strategy",
+      "handler": "set_containment_strategy_api_v1_ot_security_incidents__incident_id__containment_strategy_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/ot_security/incidents/{x}/safe_shutdown",
+      "handler": "initiate_safe_shutdown_api_v1_ot_security_incidents__incident_id__safe_shutdown_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/ot_security/policies",
+      "handler": "create_policy_api_v1_ot_security_policies_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/ot_security/policies/{x}/disable",
+      "handler": "disable_policy_api_v1_ot_security_policies__policy_id__disable_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/ot_security/policies/{x}/enable",
+      "handler": "enable_policy_api_v1_ot_security_policies__policy_id__enable_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/ot_security/zones",
+      "handler": "create_zone_api_v1_ot_security_zones_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/ot_security/zones/{x}/compliance_check",
+      "handler": "check_zone_compliance_api_v1_ot_security_zones__zone_id__compliance_check_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/ot_security/zones/{x}/segmentation_audit",
+      "handler": "audit_zone_segmentation_api_v1_ot_security_zones__zone_id__segmentation_audit_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/phishing_sim/awareness-scores/{x}/calculate",
+      "handler": "calculate_user_score_api_v1_phishing_sim_awareness_scores__user_email__calculate_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/phishing_sim/campaigns/{x}/clone",
+      "handler": "clone_campaign_api_v1_phishing_sim_campaigns__campaign_id__clone_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/phishing_sim/campaigns/{x}/events",
+      "handler": "record_event_api_v1_phishing_sim_campaigns__campaign_id__events_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/phishing_sim/campaigns/{x}/schedule",
+      "handler": "schedule_campaign_api_v1_phishing_sim_campaigns__campaign_id__schedule_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/phishing_sim/templates",
+      "handler": "create_template_api_v1_phishing_sim_templates_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/phishing_sim/templates/{x}/render",
+      "handler": "render_template_api_v1_phishing_sim_templates__template_id__render_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/phishing_sim/templates/{x}/validate",
+      "handler": "validate_template_api_v1_phishing_sim_templates__template_id__validate_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/phishing_sim/training/{x}/assign",
+      "handler": "assign_training_api_v1_phishing_sim_training__user_email__assign_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/phishing_sim/training/{x}/certificate",
+      "handler": "generate_certificate_api_v1_phishing_sim_training__user_email__certificate_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/phishing_sim/training/{x}/track-completion",
+      "handler": "track_training_completion_api_v1_phishing_sim_training__user_email__track_completion_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/playbook-builder/import",
+      "handler": "import_playbook_api_v1_playbook_builder_import_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/playbook-builder/{x}/export",
+      "handler": "export_playbook_api_v1_playbook_builder__playbook_id__export_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/playbook-builder/{x}/validate",
+      "handler": "validate_playbook_api_v1_playbook_builder__playbook_id__validate_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/privacy/consent/records/{x}/withdraw",
+      "handler": "withdraw_consent_api_v1_privacy_consent_records__record_id__withdraw_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/privacy/dsr/requests/{x}/compile-data",
+      "handler": "compile_data_package_api_v1_privacy_dsr_requests__request_id__compile_data_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/privacy/dsr/requests/{x}/deadline-alerts",
+      "handler": "get_deadline_alerts_api_v1_privacy_dsr_requests__request_id__deadline_alerts_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/privacy/dsr/requests/{x}/search-systems",
+      "handler": "search_data_systems_api_v1_privacy_dsr_requests__request_id__search_systems_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/privacy/dsr/requests/{x}/verify-identity",
+      "handler": "verify_dsr_identity_api_v1_privacy_dsr_requests__request_id__verify_identity_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/privacy/incidents/reports/{x}/mark-notified",
+      "handler": "mark_incident_notified_api_v1_privacy_incidents_reports__incident_id__mark_notified_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/privacy/incidents/reports/{x}/notification-deadlines",
+      "handler": "get_notification_deadlines_api_v1_privacy_incidents_reports__incident_id__notification_deadlines_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/privacy/monitoring/trigger-consent-expiry-check",
+      "handler": "trigger_consent_check_api_v1_privacy_monitoring_trigger_consent_expiry_check_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/privacy/monitoring/trigger-dsr-deadline-check",
+      "handler": "trigger_dsr_deadline_check_api_v1_privacy_monitoring_trigger_dsr_deadline_check_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/privacy/monitoring/trigger-pia-review-reminder",
+      "handler": "trigger_pia_reminder_api_v1_privacy_monitoring_trigger_pia_review_reminder_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/privacy/monitoring/trigger-retention-check",
+      "handler": "trigger_retention_check_api_v1_privacy_monitoring_trigger_retention_check_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/privacy/pia/assessments/{x}/assess-risks",
+      "handler": "assess_pia_risks_api_v1_privacy_pia_assessments__assessment_id__assess_risks_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/privacy/pia/assessments/{x}/mitigations",
+      "handler": "recommend_mitigations_api_v1_privacy_pia_assessments__assessment_id__mitigations_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/privacy/pia/assessments/{x}/submit-dpo-review",
+      "handler": "submit_pia_for_dpo_review_api_v1_privacy_pia_assessments__assessment_id__submit_dpo_review_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/privacy/ropa/retention-violations",
+      "handler": "get_retention_violations_api_v1_privacy_ropa_retention_violations_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/remediation/actions",
+      "handler": "create_action_api_v1_remediation_actions_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/remediation/actions/{x}/test",
+      "handler": "test_action_api_v1_remediation_actions__action_id__test_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/remediation/execute",
+      "handler": "execute_manual_remediation_api_v1_remediation_execute_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/remediation/executions/{x}/cancel",
+      "handler": "cancel_execution_api_v1_remediation_executions__execution_id__cancel_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/remediation/executions/{x}/rollback",
+      "handler": "rollback_execution_api_v1_remediation_executions__execution_id__rollback_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/remediation/integrations",
+      "handler": "create_integration_api_v1_remediation_integrations_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/remediation/integrations/{x}/test",
+      "handler": "test_integration_api_v1_remediation_integrations__integration_id__test_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/remediation/playbooks",
+      "handler": "create_playbook_api_v1_remediation_playbooks_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/remediation/playbooks/{x}/execute",
+      "handler": "execute_playbook_api_v1_remediation_playbooks__playbook_id__execute_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/remediation/policies/{x}/test",
+      "handler": "test_policy_api_v1_remediation_policies__policy_id__test_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/risk-quantification/bias",
+      "handler": "create_bia_api_v1_risk_quantification_bias_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/risk-quantification/controls",
+      "handler": "create_risk_control_api_v1_risk_quantification_controls_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/risk-quantification/controls/{x}/audit",
+      "handler": "audit_control_effectiveness_api_v1_risk_quantification_controls__control_id__audit_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/risk-quantification/fair-analyses",
+      "handler": "create_fair_analysis_api_v1_risk_quantification_fair_analyses_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/risk-quantification/fair-analyses/{x}/run-simulation",
+      "handler": "run_fair_simulation_endpoint_api_v1_risk_quantification_fair_analyses__analysis_id__run_simulation_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/risk-quantification/risk-registers",
+      "handler": "create_risk_register_api_v1_risk_quantification_risk_registers_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/siem/cloud/poll-all",
+      "handler": "trigger_cloud_poll_api_v1_siem_cloud_poll_all_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/siem/logs/aggregate",
+      "handler": "aggregate_logs_api_v1_siem_logs_aggregate_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/siem/logs/backfill",
+      "handler": "backfill_log_entries_api_v1_siem_logs_backfill_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/siem/logs/batch",
+      "handler": "batch_ingest_logs_api_v1_siem_logs_batch_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/siem/logs/ingest",
+      "handler": "ingest_log_api_v1_siem_logs_ingest_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/siem/logs/ingest/bulk",
+      "handler": "bulk_ingest_logs_apikey_api_v1_siem_logs_ingest_bulk_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/siem/rules/validate",
+      "handler": "validate_rule_api_v1_siem_rules_validate_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/simulation/simulations/{x}/cancel",
+      "handler": "cancel_simulation_api_v1_simulation_simulations__simulation_id__cancel_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/simulation/simulations/{x}/pause",
+      "handler": "pause_simulation_api_v1_simulation_simulations__simulation_id__pause_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/simulation/simulations/{x}/start",
+      "handler": "start_simulation_api_v1_simulation_simulations__simulation_id__start_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/stig/remediate/script",
+      "handler": "generate_remediation_script_api_v1_stig_remediate_script_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/stig/scans/compare",
+      "handler": "compare_scans_api_v1_stig_scans_compare_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/stig/scans/fleet",
+      "handler": "launch_fleet_scan_api_v1_stig_scans_fleet_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/stig/scap/arf-report",
+      "handler": "generate_arf_report_api_v1_stig_scap_arf_report_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/stig/scap/import",
+      "handler": "import_scap_content_api_v1_stig_scap_import_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/stig/scap/scan",
+      "handler": "run_scap_scan_api_v1_stig_scap_scan_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/stig/scap/validate-oval",
+      "handler": "validate_oval_api_v1_stig_scap_validate_oval_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/supplychain/compliance/validate-sbom",
+      "handler": "validate_sbom_compliance_api_v1_supplychain_compliance_validate_sbom_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/supplychain/risks",
+      "handler": "create_risk_api_v1_supplychain_risks_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/supplychain/sboms/compare",
+      "handler": "compare_sboms_api_v1_supplychain_sboms_compare_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/supplychain/sboms/import",
+      "handler": "import_sbom_api_v1_supplychain_sboms_import_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/supplychain/vendors",
+      "handler": "create_vendor_api_v1_supplychain_vendors_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/threat-intel/actors",
+      "handler": "create_actor"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/threat-intel/campaigns",
+      "handler": "create_campaign"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/threat-intel/feeds",
+      "handler": "create_threat_feed_api_v1_threat_intel_feeds_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/threat-intel/feeds/register-builtins",
+      "handler": "register_builtin_feeds"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/threat-intel/feeds/{x}/poll",
+      "handler": "poll_threat_feed"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/threat-intel/indicators",
+      "handler": "create_indicator_api_v1_threat_intel_indicators_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/threat-intel/indicators/bulk",
+      "handler": "bulk_import_indicators"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/threat-intel/indicators/search",
+      "handler": "advanced_search_indicators"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/threat-intel/indicators/{x}/enrich",
+      "handler": "enrich_indicator"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/threat-intel/indicators/{x}/whitelist",
+      "handler": "whitelist_indicator"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/threat-intel/reports",
+      "handler": "create_report"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/threat-intel/reports/{x}/publish",
+      "handler": "publish_report"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/threat-intel/sightings",
+      "handler": "record_sighting"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/threat-modeling/{x}/analyze/pasta",
+      "handler": "run_pasta_analysis_api_v1_threat_modeling__model_id__analyze_pasta_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/threat-modeling/{x}/threats/{x}/mitigations",
+      "handler": "create_mitigation_api_v1_threat_modeling__model_id__threats__threat_id__mitigations_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/threat-modeling/{x}/validate",
+      "handler": "validate_model_api_v1_threat_modeling__model_id__validate_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/tickethub/tickets/{x}/{x}/links",
+      "handler": "create_ticket_link_api_v1_tickethub_tickets__source_type___source_id__links_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/ueba/baselines/rebuild",
+      "handler": "rebuild_baselines_api_v1_ueba_baselines_rebuild_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/ueba/events",
+      "handler": "ingest_event_api_v1_ueba_events_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/ueba/events/batch",
+      "handler": "ingest_batch_api_v1_ueba_events_batch_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/ueba/peer-groups",
+      "handler": "create_peer_group_api_v1_ueba_peer_groups_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/vulnmgmt/instances",
+      "handler": "create_instance_api_v1_vulnmgmt_instances_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/vulnmgmt/patch-operations/{x}/rollback",
+      "handler": "rollback_patch_api_v1_vulnmgmt_patch_operations__patch_id__rollback_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/vulnmgmt/patch-operations/{x}/schedule",
+      "handler": "schedule_patch_api_v1_vulnmgmt_patch_operations__patch_id__schedule_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/vulnmgmt/patch-operations/{x}/verify",
+      "handler": "verify_patch_api_v1_vulnmgmt_patch_operations__patch_id__verify_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/vulnmgmt/vulnerabilities/sync-kev",
+      "handler": "sync_kev_api_v1_vulnmgmt_vulnerabilities_sync_kev_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/zerotrust/continuous-eval/{x}",
+      "handler": "continuous_session_evaluation_api_v1_zerotrust_continuous_eval__session_id__post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/zerotrust/devices/{x}/assess",
+      "handler": "assess_device_api_v1_zerotrust_devices__device_id__assess_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/zerotrust/evaluate",
+      "handler": "evaluate_access_request_api_v1_zerotrust_evaluate_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/zerotrust/policies/{x}/test",
+      "handler": "test_policy_api_v1_zerotrust_policies__policy_id__test_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/zerotrust/segments/{x}/evaluate-traffic",
+      "handler": "evaluate_segment_traffic_api_v1_zerotrust_segments__segment_id__evaluate_traffic_post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/zerotrust/step-up/{x}",
+      "handler": "step_up_authentication_api_v1_zerotrust_step_up__session_id__post"
+    },
+    {
+      "method": "POST",
+      "path": "/api/v1/zerotrust/verify",
+      "handler": "initiate_verification_api_v1_zerotrust_verify_post"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/agentic/agents/{x}",
+      "handler": "update_agent_api_v1_agentic_agents__agent_id__put"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/agentic/investigations/{x}",
+      "handler": "update_investigation_api_v1_agentic_investigations__investigation_id__put"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/api-security/anomalies/{x}",
+      "handler": "update_anomaly_api_v1_api_security_anomalies__anomaly_id__put"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/api-security/compliance-checks/{x}",
+      "handler": "update_compliance_check_api_v1_api_security_compliance_checks__check_id__put"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/api-security/endpoints/{x}",
+      "handler": "update_endpoint_api_v1_api_security_endpoints__endpoint_id__put"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/api-security/policies/{x}",
+      "handler": "update_policy_api_v1_api_security_policies__policy_id__put"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/api-security/vulnerabilities/{x}",
+      "handler": "update_vulnerability_api_v1_api_security_vulnerabilities__vuln_id__put"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/compliance/controls/{x}",
+      "handler": "update_control_api_v1_compliance_controls__control_id__put"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/compliance/cui/{x}",
+      "handler": "update_cui_marking_api_v1_compliance_cui__marking_id__put"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/compliance/evidence/{x}/review",
+      "handler": "review_evidence_api_v1_compliance_evidence__evidence_id__review_put"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/compliance/poams/{x}",
+      "handler": "update_poam_api_v1_compliance_poams__poam_id__put"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/deception/campaigns/{x}/status",
+      "handler": "update_campaign_status_api_v1_deception_campaigns__campaign_id__status_put"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/exposure/asset-vulns/{x}",
+      "handler": "update_asset_vulnerability_api_v1_exposure_asset_vulns__mapping_id__put"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/exposure/assets/{x}",
+      "handler": "update_asset_api_v1_exposure_assets__asset_id__put"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/exposure/attack-surface/{x}",
+      "handler": "update_attack_surface_api_v1_exposure_attack_surface__surface_id__put"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/exposure/tickets/{x}",
+      "handler": "update_remediation_ticket_api_v1_exposure_tickets__ticket_id__put"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/exposure/vulnerabilities/{x}",
+      "handler": "update_vulnerability_api_v1_exposure_vulnerabilities__vuln_id__put"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/hunting/findings/{x}",
+      "handler": "update_finding_api_v1_hunting_findings__finding_id__put"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/itdr/identities/{x}",
+      "handler": "update_identity_api_v1_itdr_identities__identity_id__put"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/ot_security/alerts/{x}",
+      "handler": "update_alert_api_v1_ot_security_alerts__alert_id__put"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/ot_security/assets/{x}",
+      "handler": "update_asset_api_v1_ot_security_assets__asset_id__put"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/ot_security/incidents/{x}",
+      "handler": "update_incident_api_v1_ot_security_incidents__incident_id__put"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/ot_security/policies/{x}",
+      "handler": "update_policy_api_v1_ot_security_policies__policy_id__put"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/ot_security/zones/{x}",
+      "handler": "update_zone_api_v1_ot_security_zones__zone_id__put"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/playbook-builder/{x}/edges/{x}",
+      "handler": "update_edge_api_v1_playbook_builder__playbook_id__edges__edge_id__put"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/remediation/integrations/{x}",
+      "handler": "update_integration_api_v1_remediation_integrations__integration_id__put"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/remediation/playbooks/{x}",
+      "handler": "update_playbook_api_v1_remediation_playbooks__playbook_id__put"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/siem/correlations/{x}/status",
+      "handler": "update_correlation_status_api_v1_siem_correlations__correlation_id__status_put"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/threat-intel/actors/{x}",
+      "handler": "update_actor"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/threat-intel/campaigns/{x}",
+      "handler": "update_campaign"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/threat-intel/feeds/{x}",
+      "handler": "update_threat_feed"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/threat-intel/indicators/{x}",
+      "handler": "update_indicator"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/threat-intel/reports/{x}",
+      "handler": "update_report"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/threat-modeling/{x}",
+      "handler": "update_threat_model_api_v1_threat_modeling__model_id__put"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/threat-modeling/{x}/threats/{x}",
+      "handler": "update_threat_api_v1_threat_modeling__model_id__threats__threat_id__put"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/threat-modeling/{x}/threats/{x}/mitigations/{x}",
+      "handler": "update_mitigation_api_v1_threat_modeling__model_id__threats__threat_id__mitigations__mitigation_id__put"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/ueba/entities/{x}/watch",
+      "handler": "update_watchlist_api_v1_ueba_entities__entity_id__watch_put"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/vulnmgmt/instances/{x}",
+      "handler": "update_instance_api_v1_vulnmgmt_instances__instance_id__put"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/zerotrust/devices/{x}/compliance",
+      "handler": "update_device_compliance_api_v1_zerotrust_devices__device_id__compliance_put"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/zerotrust/policies/{x}",
+      "handler": "update_policy_api_v1_zerotrust_policies__policy_id__put"
+    },
+    {
+      "method": "PUT",
+      "path": "/api/v1/zerotrust/segments/{x}",
+      "handler": "update_segment_api_v1_zerotrust_segments__segment_id__put"
+    }
+  ],
+  "unparsed_dynamic_calls": [
+    [
+      "frontend\\src\\lib\\api.ts",
+      "`${API_BASE_URL}/auth/refresh`"
+    ]
+  ]
+}
