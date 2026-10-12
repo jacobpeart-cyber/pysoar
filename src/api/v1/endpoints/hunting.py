@@ -6,10 +6,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from fastapi import APIRouter, BackgroundTasks, Body, HTTPException, Query, status
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import CurrentUser, DatabaseSession
+from src.api.deps import CurrentUser, DatabaseSession, OrganizationId
 from src.core.database import async_session_factory
 from src.core.logging import get_logger
 from src.core.utils import safe_json_loads
@@ -98,10 +98,13 @@ async def get_finding_or_404(
     return finding
 
 
-async def get_notebook_or_404(db: AsyncSession, notebook_id: str) -> HuntNotebook:
-    """Get notebook by ID or raise 404"""
+async def get_notebook_or_404(db: AsyncSession, notebook_id: str, org_id: str) -> HuntNotebook:
+    """Get the caller's notebook by ID or raise 404 (always tenant-scoped)"""
     result = await db.execute(
-        select(HuntNotebook).where(HuntNotebook.id == notebook_id)
+        select(HuntNotebook).where(
+            HuntNotebook.id == notebook_id,
+            HuntNotebook.organization_id == org_id,
+        )
     )
     notebook = result.scalar_one_or_none()
     if not notebook:
@@ -1108,13 +1111,14 @@ def notebook_to_response(notebook: HuntNotebook) -> HuntNotebookResponse:
 @router.get("/notebooks", response_model=HuntNotebookListResponse)
 async def list_notebooks(
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     session_id: Optional[str] = None,
 ):
-    """List hunt notebooks with pagination"""
-    query = select(HuntNotebook)
+    """List the caller's hunt notebooks with pagination"""
+    query = select(HuntNotebook).where(HuntNotebook.organization_id == org_id)
 
     if session_id:
         query = query.where(HuntNotebook.session_id == session_id)
@@ -1145,15 +1149,15 @@ async def list_notebooks(
 async def create_notebook(
     notebook_data: HuntNotebookCreate,
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
-    """Create a new hunt notebook"""
-    # Verify session exists
-    session = await get_session_or_404(
-        db, notebook_data.session_id, getattr(current_user, "organization_id", None)
-    )
+    """Create a new hunt notebook in the caller's organisation"""
+    # Verify the session exists in the caller's tenant
+    session = await get_session_or_404(db, notebook_data.session_id, org_id)
 
     notebook = HuntNotebook(
+        organization_id=org_id,
         session_id=notebook_data.session_id,
         title=notebook_data.title,
         content=[],
@@ -1172,10 +1176,11 @@ async def create_notebook(
 async def get_notebook(
     notebook_id: str,
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Get a notebook by ID"""
-    notebook = await get_notebook_or_404(db, notebook_id)
+    notebook = await get_notebook_or_404(db, notebook_id, org_id)
     return notebook_to_response(notebook)
 
 
@@ -1184,10 +1189,11 @@ async def update_notebook(
     notebook_id: str,
     notebook_data: HuntNotebookUpdate,
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Update a notebook"""
-    notebook = await get_notebook_or_404(db, notebook_id)
+    notebook = await get_notebook_or_404(db, notebook_id, org_id)
 
     update_data = notebook_data.model_dump(exclude_unset=True, exclude_none=True)
 
@@ -1213,6 +1219,7 @@ async def execute_notebook_cell(
     notebook_id: str,
     cell_data: HuntNotebookCellExecute,
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Execute a query cell in a notebook.
@@ -1226,7 +1233,7 @@ async def execute_notebook_cell(
 
     Anything else falls back to showing the session's findings.
     """
-    notebook = await get_notebook_or_404(db, notebook_id)
+    notebook = await get_notebook_or_404(db, notebook_id, org_id)
 
     start_time = datetime.now(timezone.utc)
     cells = _coerce_notebook_cells(notebook.content)
@@ -1249,7 +1256,10 @@ async def execute_notebook_cell(
         keyword = query_text[4:].strip()
         from src.siem.models import LogEntry
         since = datetime.now(timezone.utc) - timedelta(days=1)
-        log_query = select(LogEntry).where(LogEntry.timestamp >= since.isoformat())
+        log_query = select(LogEntry).where(
+            LogEntry.timestamp >= since.isoformat(),
+            LogEntry.organization_id == org_id,
+        )
         if keyword:
             like = f"%{keyword}%"
             log_query = log_query.where(
@@ -1274,7 +1284,16 @@ async def execute_notebook_cell(
         if ioc_value:
             from src.intel.models import ThreatIndicator
             ioc_result = await db.execute(
-                select(ThreatIndicator).where(ThreatIndicator.value == ioc_value).limit(25)
+                select(ThreatIndicator)
+                .where(
+                    ThreatIndicator.value == ioc_value,
+                    # own indicators plus platform-wide feed intel (NULL org)
+                    or_(
+                        ThreatIndicator.organization_id == org_id,
+                        ThreatIndicator.organization_id.is_(None),
+                    ),
+                )
+                .limit(25)
             )
             for ind in ioc_result.scalars().all():
                 results.append({
@@ -1351,10 +1370,11 @@ async def execute_notebook_cell(
 async def publish_notebook(
     notebook_id: str,
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Publish a notebook as a report"""
-    notebook = await get_notebook_or_404(db, notebook_id)
+    notebook = await get_notebook_or_404(db, notebook_id, org_id)
 
     notebook.is_published = True
     notebook.published_at = datetime.now(timezone.utc)
@@ -1369,6 +1389,7 @@ async def publish_notebook(
 async def export_notebook(
     notebook_id: str,
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     format: str = Query("json", pattern="^(json|markdown|html)$"),
 ):
@@ -1379,7 +1400,7 @@ async def export_notebook(
     referenced `notebook.tags` — the HuntNotebook model has no `tags`
     column.
     """
-    notebook = await get_notebook_or_404(db, notebook_id)
+    notebook = await get_notebook_or_404(db, notebook_id, org_id)
 
     cells = _coerce_notebook_cells(notebook.content)
 

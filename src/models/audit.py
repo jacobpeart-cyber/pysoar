@@ -3,8 +3,9 @@
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
-from sqlalchemy import ForeignKey, String, Text
-from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy import ForeignKey, String, Text, event, select
+from sqlalchemy.engine import Connection
+from sqlalchemy.orm import Mapped, Mapper, mapped_column, relationship
 
 from src.models.base import BaseModel
 
@@ -63,6 +64,14 @@ class AuditLog(BaseModel):
         nullable=True,
     )
 
+    # Tenant of the acting user. Stamped on insert by ``_stamp_audit_organization``
+    # below; rows written before migration 023 stay NULL (historic).
+    organization_id: Mapped[Optional[str]] = mapped_column(
+        String(36),
+        nullable=True,
+        index=True,
+    )
+
     # Action details
     action: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
     resource_type: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
@@ -90,3 +99,21 @@ class AuditLog(BaseModel):
 
     def __repr__(self) -> str:
         return f"<AuditLog {self.action} on {self.resource_type}>"
+
+
+@event.listens_for(AuditLog, "before_insert")
+def _stamp_audit_organization(mapper: Mapper, connection: Connection, target: AuditLog) -> None:
+    """Stamp every new audit row with the acting user's organisation.
+
+    AuditLog rows are written from many places (alerts, incidents, remediation,
+    automation, collaboration, websocket). Doing it at the mapper level means no
+    writer can forget it. A writer that sets ``organization_id`` explicitly wins;
+    rows without a user (e.g. failed logins for unknown accounts) stay NULL.
+    """
+    if target.organization_id or not target.user_id:
+        return
+    from src.models.user import User
+
+    target.organization_id = connection.execute(
+        select(User.__table__.c.organization_id).where(User.__table__.c.id == target.user_id)
+    ).scalar_one_or_none()

@@ -337,6 +337,14 @@ class HuntNotebook(BaseModel):
 
     __tablename__ = "hunt_notebooks"
 
+    # Tenant. Stamped from the caller on create; migration 023 backfills
+    # existing rows from their parent hunt session.
+    organization_id: Mapped[Optional[str]] = mapped_column(
+        String(36),
+        nullable=True,
+        index=True,
+    )
+
     # Relationship to session
     session_id: Mapped[str] = mapped_column(
         String(36),

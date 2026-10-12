@@ -1,4 +1,29 @@
-"""API dependencies for authentication and authorization"""
+"""API dependencies for authentication, authorization and tenancy.
+
+Which dependency to use:
+
+* ``CurrentUser``: any authenticated, active user.
+* ``require_role([...])``: role gate (``viewer`` / ``analyst`` / ``admin``);
+  platform superusers always pass.
+* ``AdminUser`` / ``get_current_superuser``: NOTE ``get_current_superuser``
+  admits tenant admins (``is_admin`` is true for every tenant's admin role).
+  Never use it for platform-wide or cross-tenant actions.
+* ``PlatformSuperUser``: platform operator only (``is_superuser``). Use this for
+  anything that touches every tenant or the host (backups, raw SQL, ...).
+
+Tenancy (wave 1, see docs/audit/2026-10-08/PLAN.md):
+
+* ``OrganizationId``: the caller's organisation id, or 403
+  ``organization_required`` when the user has none. Superusers are NOT exempt:
+  an org-less superuser must name a tenant explicitly through
+  ``resolve_organization_scope``. Every tenant-owned query filters on it and
+  every created row is stamped with it; never write ``if org_id:`` guards.
+* ``resolve_organization_scope(user, organization_id)``: for routes that take
+  an optional ``organization_id`` query/body value. A platform superuser's
+  explicit value selects the tenant; for anyone else the explicit value must
+  equal their own organisation (403 ``organization_mismatch``). With no
+  explicit value it falls back to ``get_current_organization_id`` rules.
+"""
 
 from typing import Annotated, Optional
 
@@ -184,6 +209,59 @@ async def get_platform_superuser(
     return current_user
 
 
+def _organization_required() -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail={
+            "error": "organization_required",
+            "detail": "this operation is tenant-scoped and the account belongs to no organisation; "
+            "platform superusers must pass an explicit organization_id",
+        },
+    )
+
+
+async def get_current_organization_id(
+    current_user: Annotated[User, Depends(get_current_active_user)],
+) -> str:
+    """The caller's organisation id; 403 ``organization_required`` if none.
+
+    Superusers get no implicit platform-wide scope here: an org-less superuser
+    is refused and must use a route that accepts an explicit
+    ``organization_id`` (see ``resolve_organization_scope``).
+    """
+    org_id = getattr(current_user, "organization_id", None)
+    if not org_id:
+        raise _organization_required()
+    return str(org_id)
+
+
+def resolve_organization_scope(current_user: User, organization_id: Optional[str]) -> str:
+    """Effective tenant for a route with an optional explicit ``organization_id``.
+
+    * platform superuser + explicit value: that organisation;
+    * anyone else + explicit value: must equal their own organisation, else
+      403 ``organization_mismatch``;
+    * no explicit value: the caller's own organisation, else 403
+      ``organization_required``.
+    """
+    own = getattr(current_user, "organization_id", None)
+    if organization_id:
+        if current_user.is_superuser:
+            return str(organization_id)
+        if own and str(own) == str(organization_id):
+            return str(own)
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "organization_mismatch",
+                "detail": "organization_id does not match the caller's organisation",
+            },
+        )
+    if not own:
+        raise _organization_required()
+    return str(own)
+
+
 async def get_optional_user(
     credentials: Annotated[Optional[HTTPAuthorizationCredentials], Depends(security)],
     db: Annotated[AsyncSession, Depends(get_db)],
@@ -221,6 +299,7 @@ def require_role(allowed_roles: list[UserRole]):
 CurrentUser = Annotated[User, Depends(get_current_active_user)]
 AdminUser = Annotated[User, Depends(get_current_admin_user)]
 PlatformSuperUser = Annotated[User, Depends(get_platform_superuser)]
+OrganizationId = Annotated[str, Depends(get_current_organization_id)]
 OptionalUser = Annotated[Optional[User], Depends(get_optional_user)]
 DatabaseSession = Annotated[AsyncSession, Depends(get_db)]
 RedisClient = Annotated[aioredis.Redis, Depends(get_redis_client)]

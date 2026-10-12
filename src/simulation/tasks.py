@@ -5,14 +5,14 @@ Handles long-running simulation execution, detection monitoring,
 posture scoring, and report generation.
 """
 
-from datetime import datetime, timedelta
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from datetime import datetime
 
-from celery import Celery; app = Celery()
+from celery import shared_task
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from src.core.database import async_session_factory
 from src.core.logging import get_logger
-from src.core.config import settings
-from src.models.base import utc_now
 from src.simulation.engine import (
     SimulationOrchestrator,
     AtomicTestLibrary,
@@ -27,7 +27,33 @@ from src.simulation.models import (
 logger = get_logger(__name__)
 
 
-@app.task(bind=True, max_retries=3)
+def run_async(coro):
+    """Run a coroutine on this worker's persistent loop (the shared async
+    engine's pooled connections are bound to the loop that opened them, so a
+    fresh ``asyncio.run`` loop per task would strand them)."""
+    from src.workers.tasks import run_async as _run_async
+
+    return _run_async(coro)
+
+
+async def _owned_simulation(
+    session: AsyncSession, simulation_id: str, organization_id: str
+) -> AttackSimulation:
+    """The simulation, only if it belongs to ``organization_id``."""
+    simulation = (
+        await session.execute(
+            select(AttackSimulation).where(
+                AttackSimulation.id == simulation_id,
+                AttackSimulation.organization_id == organization_id,
+            )
+        )
+    ).scalar_one_or_none()
+    if simulation is None:
+        raise ValueError(f"Simulation {simulation_id} not found in organization {organization_id}")
+    return simulation
+
+
+@shared_task(bind=True, max_retries=3)
 def execute_simulation(self, simulation_id: str, organization_id: str) -> dict:
     """
     Execute a complete simulation asynchronously.
@@ -42,15 +68,10 @@ def execute_simulation(self, simulation_id: str, organization_id: str) -> dict:
         Dictionary with execution results and statistics
     """
     try:
-        from src.database import get_async_session
-
         async def run():
-            async with get_async_session() as session:
+            async with async_session_factory() as session:
                 orchestrator = SimulationOrchestrator(session)
-                simulation = await orchestrator._get_simulation(simulation_id)
-
-                if not simulation:
-                    raise ValueError(f"Simulation {simulation_id} not found")
+                simulation = await _owned_simulation(session, simulation_id, organization_id)
 
                 logger.info(f"Starting execution of simulation {simulation_id}")
 
@@ -94,9 +115,7 @@ def execute_simulation(self, simulation_id: str, organization_id: str) -> dict:
                 }
 
         # Run async function
-        import asyncio
-        result = asyncio.run(run())
-        return result
+        return run_async(run())
 
     except Exception as exc:
         logger.error(f"Error in execute_simulation: {str(exc)}")
@@ -104,7 +123,7 @@ def execute_simulation(self, simulation_id: str, organization_id: str) -> dict:
         raise self.retry(exc=exc, countdown=60 * (2 ** self.request.retries))
 
 
-@app.task(bind=True, max_retries=3)
+@shared_task(bind=True, max_retries=3)
 def execute_single_test(self, test_id: str, organization_id: str) -> dict:
     """
     Execute a single technique test.
@@ -117,11 +136,16 @@ def execute_single_test(self, test_id: str, organization_id: str) -> dict:
         Dictionary with test execution results
     """
     try:
-        from src.database import get_async_session
-
         async def run():
-            async with get_async_session() as session:
-                stmt = select(SimulationTest).where(SimulationTest.id == test_id)
+            async with async_session_factory() as session:
+                stmt = select(SimulationTest).where(
+                    SimulationTest.id == test_id,
+                    SimulationTest.simulation_id.in_(
+                        select(AttackSimulation.id).where(
+                            AttackSimulation.organization_id == organization_id
+                        )
+                    ),
+                )
                 result = await session.execute(stmt)
                 test = result.scalar_one_or_none()
 
@@ -133,15 +157,14 @@ def execute_single_test(self, test_id: str, organization_id: str) -> dict:
 
                 return result
 
-        import asyncio
-        return asyncio.run(run())
+        return run_async(run())
 
     except Exception as exc:
         logger.error(f"Error in execute_single_test: {str(exc)}")
         raise self.retry(exc=exc, countdown=30 * (2 ** self.request.retries))
 
 
-@app.task(bind=True, max_retries=2)
+@shared_task(bind=True, max_retries=2)
 def check_detection_results(self, simulation_id: str, organization_id: str) -> dict:
     """
     Check if SIEM detected simulation activity.
@@ -156,10 +179,9 @@ def check_detection_results(self, simulation_id: str, organization_id: str) -> d
         Dictionary with detection statistics
     """
     try:
-        from src.database import get_async_session
-
         async def run():
-            async with get_async_session() as session:
+            async with async_session_factory() as session:
+                await _owned_simulation(session, simulation_id, organization_id)
                 stmt = select(SimulationTest).where(
                     (SimulationTest.simulation_id == simulation_id) &
                     (SimulationTest.status == "running")
@@ -173,10 +195,6 @@ def check_detection_results(self, simulation_id: str, organization_id: str) -> d
                     if detected:
                         detected_count += 1
 
-                stmt = select(AttackSimulation).where(AttackSimulation.id == simulation_id)
-                result = await session.execute(stmt)
-                simulation = result.scalar_one_or_none()
-
                 return {
                     "simulation_id": simulation_id,
                     "tests_detected": detected_count,
@@ -184,15 +202,14 @@ def check_detection_results(self, simulation_id: str, organization_id: str) -> d
                     "detection_rate": (detected_count / len(tests) * 100) if tests else 0,
                 }
 
-        import asyncio
-        return asyncio.run(run())
+        return run_async(run())
 
     except Exception as exc:
         logger.error(f"Error in check_detection_results: {str(exc)}")
         raise self.retry(exc=exc, countdown=30 * (2 ** self.request.retries))
 
 
-@app.task(bind=True, max_retries=2)
+@shared_task(bind=True, max_retries=2)
 def calculate_posture_scores(self, simulation_id: str, organization_id: str) -> dict:
     """
     Calculate and store security posture scores.
@@ -207,10 +224,9 @@ def calculate_posture_scores(self, simulation_id: str, organization_id: str) -> 
         Dictionary with score information
     """
     try:
-        from src.database import get_async_session
-
         async def run():
-            async with get_async_session() as session:
+            async with async_session_factory() as session:
+                await _owned_simulation(session, simulation_id, organization_id)
                 scorer = PostureScorer(session)
                 posture_score = await scorer.calculate_posture_score(simulation_id)
 
@@ -221,15 +237,14 @@ def calculate_posture_scores(self, simulation_id: str, organization_id: str) -> 
                     "breakdown": posture_score.breakdown,
                 }
 
-        import asyncio
-        return asyncio.run(run())
+        return run_async(run())
 
     except Exception as exc:
         logger.error(f"Error in calculate_posture_scores: {str(exc)}")
         raise self.retry(exc=exc, countdown=60 * (2 ** self.request.retries))
 
 
-@app.task(bind=True)
+@shared_task(bind=True)
 def run_continuous_validation(self, organization_id: str) -> dict:
     """
     Run periodic automated security testing.
@@ -243,10 +258,8 @@ def run_continuous_validation(self, organization_id: str) -> dict:
         Dictionary with validation results
     """
     try:
-        from src.database import get_async_session
-
         async def run():
-            async with get_async_session() as session:
+            async with async_session_factory() as session:
                 # Get safe techniques for continuous testing
                 library = AtomicTestLibrary(session)
                 await library.load_builtin_techniques()
@@ -282,8 +295,7 @@ def run_continuous_validation(self, organization_id: str) -> dict:
                     "status": "started"
                 }
 
-        import asyncio
-        return asyncio.run(run())
+        return run_async(run())
 
     except Exception as exc:
         logger.error(f"Error in run_continuous_validation: {str(exc)}")
@@ -291,7 +303,7 @@ def run_continuous_validation(self, organization_id: str) -> dict:
         return {"status": "error", "message": str(exc)}
 
 
-@app.task(bind=True, max_retries=2)
+@shared_task(bind=True, max_retries=2)
 def generate_simulation_report(self, simulation_id: str, organization_id: str) -> dict:
     """
     Generate comprehensive simulation report.
@@ -306,25 +318,23 @@ def generate_simulation_report(self, simulation_id: str, organization_id: str) -
         Dictionary with report information
     """
     try:
-        from src.database import get_async_session
-
         async def run():
-            async with get_async_session() as session:
+            async with async_session_factory() as session:
+                await _owned_simulation(session, simulation_id, organization_id)
                 scorer = PostureScorer(session)
                 report = await scorer.generate_executive_report(simulation_id)
 
                 logger.info(f"Generated report for simulation {simulation_id}")
                 return report
 
-        import asyncio
-        return asyncio.run(run())
+        return run_async(run())
 
     except Exception as exc:
         logger.error(f"Error in generate_simulation_report: {str(exc)}")
         raise self.retry(exc=exc, countdown=60 * (2 ** self.request.retries))
 
 
-@app.task(bind=True)
+@shared_task(bind=True)
 def cleanup_simulation_artifacts(self, simulation_id: str, organization_id: str) -> dict:
     """
     Clean up any artifacts from simulation tests.
@@ -339,10 +349,9 @@ def cleanup_simulation_artifacts(self, simulation_id: str, organization_id: str)
         Dictionary with cleanup status
     """
     try:
-        from src.database import get_async_session
-
         async def run():
-            async with get_async_session() as session:
+            async with async_session_factory() as session:
+                await _owned_simulation(session, simulation_id, organization_id)
                 stmt = select(SimulationTest).where(SimulationTest.simulation_id == simulation_id)
                 result = await session.execute(stmt)
                 tests = result.scalars().all()
@@ -362,8 +371,7 @@ def cleanup_simulation_artifacts(self, simulation_id: str, organization_id: str)
                     "status": "completed"
                 }
 
-        import asyncio
-        return asyncio.run(run())
+        return run_async(run())
 
     except Exception as exc:
         logger.error(f"Error in cleanup_simulation_artifacts: {str(exc)}")

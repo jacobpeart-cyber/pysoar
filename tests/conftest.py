@@ -351,3 +351,22 @@ async def cleanup(db_session: AsyncSession):
         for table in reversed(Base.metadata.sorted_tables):
             await db_session.execute(table.delete())
         await db_session.commit()
+
+
+# Wave 1 tenancy kit: two-tenant fixtures (org_a_headers, org_b_headers,
+# org_a_admin_headers, viewer_headers, superuser_headers, ...). The isolation
+# assertion is imported where used: `from tests.helpers.tenancy import assert_tenant_isolated`.
+from tests.helpers.tenancy import (  # noqa: E402,F401
+    org_a,
+    org_a_admin,
+    org_a_admin_headers,
+    org_a_headers,
+    org_a_user,
+    org_a_viewer,
+    org_b,
+    org_b_headers,
+    org_b_user,
+    platform_superuser,
+    superuser_headers,
+    viewer_headers,
+)

@@ -63,6 +63,30 @@ celery_app = Celery(
         # CTEM / exposure background pipeline — SIEM-driven asset
         # discovery and attack-surface change detection (snapshot diffing).
         "src.exposure.tasks",
+        # Wave 1 (2026-10-12): every other `src/*/tasks.py` module. These
+        # were never imported by the worker, so `.delay()` calls from their
+        # routes went to a worker that did not know the task name. Included
+        # so they register; none of them has a beat entry yet (scheduling is
+        # per-module work in waves 2-4). tests/unit/test_wave1_kit.py keeps
+        # this list in sync with the filesystem.
+        "src.ai.tasks",
+        "src.api_security.tasks",
+        "src.audit_evidence.tasks",
+        "src.collaboration.tasks",
+        "src.compliance.tasks",
+        "src.container_security.tasks",
+        "src.data_lake.tasks",
+        "src.dfir.tasks",
+        "src.dlp.tasks",
+        "src.ot_security.tasks",
+        "src.playbook_builder.tasks",
+        "src.privacy.tasks",
+        "src.remediation.tasks",
+        "src.risk_quant.tasks",
+        "src.simulation.tasks",
+        "src.threat_modeling.tasks",
+        "src.vulnmgmt.tasks",
+        "src.zerotrust.tasks",
     ],
 )
 
