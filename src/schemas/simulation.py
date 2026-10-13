@@ -204,7 +204,7 @@ class PostureScoreResponse(BaseModel):
 
     simulation_id: Optional[str] = None
     score_type: str = ""
-    score: float = 0.0
+    score: Optional[float] = None
     max_score: float = 0.0
     breakdown: Dict[str, Any] = Field(default_factory=dict)
     comparison_to_previous: Optional[float] = None
@@ -313,8 +313,8 @@ class DashboardStatsResponse(BaseModel):
     total_simulations: int = 0
     completed_simulations: int = 0
     running_simulations: int = 0
-    average_detection_rate: float = 0.0
-    average_posture_score: float = 0.0
+    average_detection_rate: Optional[float] = None
+    average_posture_score: Optional[float] = None
     techniques_in_library: int = 0
     adversary_profiles: int = 0
     top_tactics: List[Dict[str, Any]]

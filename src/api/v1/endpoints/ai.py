@@ -14,11 +14,12 @@ from fastapi import APIRouter, Depends, Query, HTTPException, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import CurrentUser, DatabaseSession
+from src.api.deps import CurrentUser, DatabaseSession, OrganizationId, require_role
 from src.core.logging import get_logger
 from src.ai.engine import AIAnalyzer, AnomalyDetector, ThreatPredictor
 from src.llm.base import LLMNotConfigured
 from src.ai.models import MLModel, AnomalyDetection, AIAnalysis, ThreatPrediction, NLQuery
+from src.models.user import User, UserRole
 from src.schemas.ai import (
     NLQueryRequest,
     NLQueryResponse,
@@ -109,7 +110,7 @@ def _parse_json_field(raw: Any) -> Any:
 
 
 async def _load_incident_context(
-    db: AsyncSession, incident_id: str, org_id: str | None = None
+    db: AsyncSession, incident_id: str, org_id: str
 ) -> dict[str, Any]:
     """
     Load an incident plus its linked alerts and derived facts from the DB.
@@ -119,16 +120,15 @@ async def _load_incident_context(
     mitre_techniques (list[str]), mitre_tactics (list[str]),
     earliest_alert_at (datetime|None), dwell_time_days (int|None).
 
-    When ``org_id`` is provided the incident lookup is scoped to that
-    organization (cross-tenant IDOR guard); when None the filter is
-    skipped so system/internal callers still work.
+    The incident and its alerts are scoped to ``org_id`` (cross-tenant IDOR
+    guard); an incident of another organisation is reported as missing.
     """
     from src.models.alert import Alert
     from src.models.incident import Incident
 
-    inc_stmt = select(Incident).where(Incident.id == incident_id)
-    if org_id is not None:
-        inc_stmt = inc_stmt.where(Incident.organization_id == org_id)
+    inc_stmt = select(Incident).where(
+        Incident.id == incident_id, Incident.organization_id == org_id,
+    )
     inc_result = await db.execute(inc_stmt)
     incident = inc_result.scalar_one_or_none()
 
@@ -136,7 +136,7 @@ async def _load_incident_context(
     if incident is not None:
         alert_q = (
             select(Alert)
-            .where(Alert.incident_id == incident_id)
+            .where(Alert.incident_id == incident_id, Alert.organization_id == org_id)
             .order_by(Alert.created_at.asc())
         )
         alerts = list((await db.execute(alert_q)).scalars().all())
@@ -469,7 +469,7 @@ def _heuristic_response_recommendations(
 
 
 async def _load_entity_risk_signals(
-    db: AsyncSession, entity_type: str, entity_id: str, org_id: str | None
+    db: AsyncSession, entity_type: str, entity_id: str, org_id: str
 ) -> dict[str, Any]:
     """
     Pull real risk signals for an entity:
@@ -495,9 +495,8 @@ async def _load_entity_risk_signals(
     profile_q = select(EntityProfile).where(
         EntityProfile.entity_type == entity_type,
         EntityProfile.entity_id == entity_id,
+        EntityProfile.organization_id == org_id,
     )
-    if org_id:
-        profile_q = profile_q.where(EntityProfile.organization_id == org_id)
     profile = (await db.execute(profile_q)).scalar_one_or_none()
     if profile is not None:
         signals["ueba_risk_score"] = float(profile.risk_score or 0.0)
@@ -525,9 +524,8 @@ async def _load_entity_risk_signals(
         AnomalyDetection.entity_type == entity_type,
         AnomalyDetection.entity_id == entity_id,
         AnomalyDetection.created_at >= recent_cutoff,
+        AnomalyDetection.organization_id == org_id,
     )
-    if org_id:
-        anom_q = anom_q.where(AnomalyDetection.organization_id == org_id)
     signals["recent_anomalies"] = int((await db.execute(anom_q)).scalar() or 0)
 
     # Asset metadata if entity is a host
@@ -538,10 +536,9 @@ async def _load_entity_risk_signals(
                 Asset.id == entity_id,
                 Asset.hostname == entity_id,
                 Asset.name == entity_id,
-            )
+            ),
+            Asset.organization_id == org_id,
         )
-        if org_id:
-            asset_q = asset_q.where(Asset.organization_id == org_id)
         asset = (await db.execute(asset_q)).scalars().first()
         if asset is not None:
             signals["asset_criticality"] = asset.criticality
@@ -637,8 +634,9 @@ def _compute_threat_prediction_from_signals(
 
 @router.post("/query", response_model=NLQueryResponse, summary="Natural language query")
 async def natural_language_query(
+    org_id: OrganizationId,
     request: NLQueryRequest,
-    current_user: CurrentUser = None,
+    current_user: User = Depends(require_role([UserRole.ADMIN, UserRole.ANALYST])),
     db: DatabaseSession = None,
 ):
     """
@@ -699,6 +697,7 @@ async def natural_language_query(
                     .order_by(Incident.created_at.desc())
                     .limit(20)
                 )
+            incident_query = incident_query.where(Incident.organization_id == org_id)
             inc_result = await db.execute(incident_query)
             incidents = list(inc_result.scalars().all())
             for i, inc in enumerate(incidents):
@@ -804,6 +803,7 @@ async def natural_language_query(
                         .limit(20)
                     )
 
+            alert_query = alert_query.where(Alert.organization_id == org_id)
             alert_result = await db.execute(alert_query)
             alerts = list(alert_result.scalars().all())
             for i, a in enumerate(alerts):
@@ -822,14 +822,6 @@ async def natural_language_query(
         execution_time_ms = int((_time.monotonic() - _query_start) * 1000)
         summary = f"Found {results_count} results matching your query about '{request.natural_language[:60]}'."
 
-        # Resolve org_id
-        org_id = getattr(current_user, "organization_id", None)
-        if not org_id:
-            from src.models.organization import Organization
-            org_result = await db.execute(select(Organization).limit(1))
-            org = org_result.scalars().first()
-            org_id = org.id if org else None
-
         # Persist to database
         nl_query = NLQuery(
             natural_language=request.natural_language,
@@ -841,7 +833,7 @@ async def natural_language_query(
             execution_time_ms=execution_time_ms,
             user_id=current_user.id,
             was_helpful=None,
-            organization_id=org_id or "",
+            organization_id=org_id,
         )
         db.add(nl_query)
         await db.flush()
@@ -867,7 +859,7 @@ async def natural_language_query(
 
 @router.get("/queries", response_model=list[QueryHistoryResponse], summary="Query history")
 async def query_history(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     limit: Annotated[int, Query(ge=1, le=100)] = 10,
     skip: Annotated[int, Query(ge=0)] = 0,
@@ -877,7 +869,7 @@ async def query_history(
     """
     query = (
         select(NLQuery)
-        .where(NLQuery.organization_id == getattr(current_user, "organization_id", None))
+        .where(NLQuery.organization_id == org_id)
         .order_by(NLQuery.created_at.desc())
         .offset(skip)
         .limit(limit)
@@ -904,9 +896,10 @@ async def query_history(
 
 @router.post("/triage/alert/{alert_id}", response_model=AlertTriageResponse, summary="Triage single alert")
 async def triage_single_alert(
+    org_id: OrganizationId,
     alert_id: str,
     request: AlertTriageRequest,
-    current_user: CurrentUser = None,
+    current_user: User = Depends(require_role([UserRole.ADMIN, UserRole.ANALYST])),
     db: DatabaseSession = None,
 ):
     """
@@ -916,33 +909,34 @@ async def triage_single_alert(
     the analysis result to the database.
     """
     try:
-        logger.info(f"Triaging alert {alert_id}")
+        logger.info(f"Triaging alert {alert_id}", user_id=current_user.id, organization_id=org_id)
 
         # Try to fetch the real alert for context — scoped to the
         # caller's organization (cross-tenant IDOR guard).
         from src.models.alert import Alert
 
-        alert_stmt = select(Alert).where(Alert.id == alert_id)
-        _org_id = getattr(current_user, "organization_id", None)
-        if _org_id is not None:
-            alert_stmt = alert_stmt.where(Alert.organization_id == _org_id)
+        alert_stmt = select(Alert).where(
+            Alert.id == alert_id, Alert.organization_id == org_id,
+        )
         alert_result = await db.execute(alert_stmt)
         alert = alert_result.scalar_one_or_none()
+        if alert is None:
+            # A missing or foreign alert is not triaged (no fabricated
+            # "medium" record for an id the caller cannot see).
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Alert not found",
+            )
 
-        if alert:
-            severity = getattr(alert, "severity", "medium") or "medium"
-            source = getattr(alert, "source", "unknown") or "unknown"
-        else:
-            severity = "medium"
-            source = "unknown"
+        severity = getattr(alert, "severity", "medium") or "medium"
+        source = getattr(alert, "source", "unknown") or "unknown"
 
         triage = _compute_triage_priority(severity, source)
 
         # Write back the triage priority to the alert record
-        if alert:
-            priority_map = {"p1": 1, "p2": 2, "p3": 3, "p4": 4}
-            alert.priority = priority_map.get(triage["priority"], 3)
-            await db.flush()
+        priority_map = {"p1": 1, "p2": 2, "p3": 3, "p4": 4}
+        alert.priority = priority_map.get(triage["priority"], 3)
+        await db.flush()
 
         # Persist analysis
         analysis = AIAnalysis(
@@ -956,7 +950,7 @@ async def triage_single_alert(
             model_used=triage["model_used"],
             tokens_used=0,
             latency_ms=0,
-            organization_id=getattr(current_user, "organization_id", None),
+            organization_id=org_id,
         )
         db.add(analysis)
         await db.flush()
@@ -981,8 +975,9 @@ async def triage_single_alert(
 
 @router.post("/triage/batch", response_model=BatchTriageResponse, summary="Batch triage alerts")
 async def batch_triage_alerts(
+    org_id: OrganizationId,
     request: BatchTriageRequest,
-    current_user: CurrentUser = None,
+    current_user: User = Depends(require_role([UserRole.ADMIN, UserRole.ANALYST])),
     db: DatabaseSession = None,
 ):
     """
@@ -992,18 +987,11 @@ async def batch_triage_alerts(
     the most recent untriaged alerts up to the limit.
     """
     # Batch triage writes back to alert rows, so it is strictly scoped to the
-    # caller's organization; a user without one has no alerts to triage.
-    org_id = getattr(current_user, "organization_id", None)
-    if not org_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={"error": "organization_required", "detail": "batch triage requires an organization"},
-        )
-
+    # caller's organization (OrganizationId refuses org-less callers).
     try:
         from src.models.alert import Alert
 
-        logger.info(f"Batch triaging up to {request.limit} alerts")
+        logger.info(f"Batch triaging up to {request.limit} alerts", user_id=current_user.id, organization_id=org_id)
 
         if request.alert_ids:
             query = (
@@ -1047,7 +1035,7 @@ async def batch_triage_alerts(
                 model_used=triage["model_used"],
                 tokens_used=0,
                 latency_ms=0,
-                organization_id=getattr(current_user, "organization_id", None),
+                organization_id=org_id,
             )
             db.add(analysis)
 
@@ -1086,7 +1074,7 @@ async def batch_triage_alerts(
 
 @router.get("/alerts/triaged", summary="List triaged alerts")
 async def list_triaged_alerts(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     skip: Annotated[int, Query(ge=0)] = 0,
     limit: Annotated[int, Query(ge=1, le=100)] = 20,
@@ -1096,7 +1084,6 @@ async def list_triaged_alerts(
 
     Queries AIAnalysis rows where analysis_type='alert_triage'.
     """
-    org_id = getattr(current_user, "organization_id", None)
 
     query = (
         select(AIAnalysis)
@@ -1128,7 +1115,8 @@ async def list_triaged_alerts(
 
 @router.post("/alerts/triage", summary="Triage pending alerts (alias)")
 async def triage_pending_alerts(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    current_user: User = Depends(require_role([UserRole.ADMIN, UserRole.ANALYST])),
     db: DatabaseSession = None,
 ):
     """
@@ -1137,18 +1125,19 @@ async def triage_pending_alerts(
     Delegates to the batch triage logic with default parameters.
     """
     batch_request = BatchTriageRequest(alert_ids=[], limit=10)
-    return await batch_triage_alerts(batch_request, current_user, db)
+    return await batch_triage_alerts(
+        org_id=org_id, request=batch_request, current_user=current_user, db=db,
+    )
 
 
 @router.get("/triage/stats", response_model=TriageStatsResponse, summary="Triage statistics")
 async def triage_statistics(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """
     Get alert triage performance statistics from the database.
     """
-    org_id = getattr(current_user, "organization_id", None)
 
     # Total triage analyses
     total_result = await db.execute(
@@ -1207,9 +1196,10 @@ async def triage_statistics(
 
 @router.post("/analyze/incident/{incident_id}", response_model=IncidentAnalysisResponse, summary="Analyze incident")
 async def analyze_incident(
+    org_id: OrganizationId,
     incident_id: str,
     request: IncidentAnalysisRequest,
-    current_user: CurrentUser = None,
+    current_user: User = Depends(require_role([UserRole.ADMIN, UserRole.ANALYST])),
     db: DatabaseSession = None,
 ):
     """
@@ -1219,10 +1209,10 @@ async def analyze_incident(
     AIAnalyzer.summarize_incident or derives a summary from real DB fields
     when no LLM is configured. Persists the result to AIAnalysis.
     """
-    logger.info(f"Analyzing incident {incident_id}")
+    logger.info(f"Analyzing incident {incident_id}", user_id=current_user.id, organization_id=org_id)
 
     ctx = await _load_incident_context(
-        db, incident_id, getattr(current_user, "organization_id", None)
+        db, incident_id, org_id
     )
     incident = ctx["incident"]
     if incident is None:
@@ -1248,7 +1238,7 @@ async def analyze_incident(
         _serialize_incident(incident),
         related_alerts_serialized,
         timeline,
-        org_id=getattr(current_user, "organization_id", None),
+        org_id=org_id,
     )
     if llm_out.get("status") == "ok":
         try:
@@ -1321,7 +1311,7 @@ async def analyze_incident(
         model_used=model_used,
         tokens_used=0,
         latency_ms=0,
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
     )
     db.add(analysis)
     await db.flush()
@@ -1346,8 +1336,9 @@ async def analyze_incident(
 
 @router.post("/analyze/root-cause/{incident_id}", response_model=RootCauseAnalysis, summary="Root cause analysis")
 async def analyze_root_cause(
+    org_id: OrganizationId,
     incident_id: str,
-    current_user: CurrentUser = None,
+    current_user: User = Depends(require_role([UserRole.ADMIN, UserRole.ANALYST])),
     db: DatabaseSession = None,
 ):
     """
@@ -1357,10 +1348,10 @@ async def analyze_root_cause(
     otherwise derives a chain from the alerts attached to the incident and
     computes dwell time as (incident.created_at - earliest_alert.created_at).
     """
-    logger.info(f"Analyzing root cause for incident {incident_id}")
+    logger.info(f"Analyzing root cause for incident {incident_id}", user_id=current_user.id, organization_id=org_id)
 
     ctx = await _load_incident_context(
-        db, incident_id, getattr(current_user, "organization_id", None)
+        db, incident_id, org_id
     )
     incident = ctx["incident"]
     if incident is None:
@@ -1385,7 +1376,7 @@ async def analyze_root_cause(
         _serialize_incident(incident),
         log_evidence,
         timeline,
-        org_id=getattr(current_user, "organization_id", None),
+        org_id=org_id,
     )
     if llm_out.get("status") == "ok":
         try:
@@ -1442,7 +1433,7 @@ async def analyze_root_cause(
         model_used=model_used,
         tokens_used=0,
         latency_ms=0,
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
     )
     db.add(analysis)
     await db.flush()
@@ -1461,9 +1452,10 @@ async def analyze_root_cause(
 
 @router.post("/recommend/response/{incident_id}", response_model=ResponseRecommendation, summary="Response recommendations")
 async def recommend_response(
+    org_id: OrganizationId,
     incident_id: str,
     request: ResponseRecommendationRequest,
-    current_user: CurrentUser = None,
+    current_user: User = Depends(require_role([UserRole.ADMIN, UserRole.ANALYST])),
     db: DatabaseSession = None,
 ):
     """
@@ -1474,10 +1466,10 @@ async def recommend_response(
     an LLM is configured; otherwise derives action lists from real DB
     fields (no canned text).
     """
-    logger.info(f"Generating response recommendations for incident {incident_id}")
+    logger.info(f"Generating response recommendations for incident {incident_id}", user_id=current_user.id, organization_id=org_id)
 
     ctx = await _load_incident_context(
-        db, incident_id, getattr(current_user, "organization_id", None)
+        db, incident_id, org_id
     )
     incident = ctx["incident"]
     if incident is None:
@@ -1500,7 +1492,7 @@ async def recommend_response(
             "alert_count": len(ctx["alerts"]),
             "mitre_techniques": ctx["mitre_techniques"],
         },
-        org_id=getattr(current_user, "organization_id", None),
+        org_id=org_id,
     )
     if llm_out.get("status") == "ok":
         try:
@@ -1567,7 +1559,7 @@ async def recommend_response(
         model_used=model_used,
         tokens_used=0,
         latency_ms=0,
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
     )
     db.add(analysis)
     await db.flush()
@@ -1583,8 +1575,9 @@ async def recommend_response(
 
 @router.post("/generate/playbook", response_model=None, summary="Generate playbook")
 async def generate_playbook(
+    org_id: OrganizationId,
     incident_pattern: str,
-    current_user: CurrentUser = None,
+    current_user: User = Depends(require_role([UserRole.ADMIN, UserRole.ANALYST])),
     db: DatabaseSession = None,
     limit: int = 5,
 ):
@@ -1596,11 +1589,10 @@ async def generate_playbook(
     from prior incidents in the DB whose type/title match the pattern,
     rather than returning an identical 5-step canned playbook.
     """
-    logger.info(f"Generating playbook for pattern: {incident_pattern}")
+    logger.info(f"Generating playbook for pattern: {incident_pattern}", user_id=current_user.id, organization_id=org_id)
 
     from src.models.incident import Incident
 
-    org_id = getattr(current_user, "organization_id", None)
     pattern_lower = (incident_pattern or "").lower().strip()
 
     # Pull up to 10 prior incidents matching the pattern to ground the playbook.
@@ -1639,7 +1631,7 @@ async def generate_playbook(
     llm_out = await AIAnalyzer(db=db).generate_playbook(
         incident_pattern,
         historical_responses,
-        org_id=getattr(current_user, "organization_id", None),
+        org_id=org_id,
     )
     if llm_out.get("status") == "ok":
         try:
@@ -1791,7 +1783,7 @@ def _derive_playbook_from_history(
 
 @router.get("/anomalies", response_model=AnomalyListResponse, summary="List anomalies")
 async def list_anomalies(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     entity_type: str | None = None,
     entity_id: str | None = None,
@@ -1809,7 +1801,7 @@ async def list_anomalies(
     logger.info(f"Listing anomalies (skip={skip}, limit={limit}, status={status})")
 
     query = select(AnomalyDetection).where(
-        AnomalyDetection.organization_id == getattr(current_user, "organization_id", None)
+        AnomalyDetection.organization_id == org_id
     )
 
     if entity_type:
@@ -1871,11 +1863,10 @@ async def list_anomalies(
 
 @router.get("/anomalies/stats", response_model=AnomalyStatsResponse, summary="Anomaly statistics")
 async def anomaly_statistics(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get anomaly detection statistics from the database."""
-    org_id = getattr(current_user, "organization_id", None)
 
     # Total detected
     total_result = await db.execute(
@@ -1942,8 +1933,8 @@ async def anomaly_statistics(
 
 @router.get("/anomalies/{anomaly_id}", response_model=AnomalyDetectionResponse, summary="Get anomaly")
 async def get_anomaly(
+    org_id: OrganizationId,
     anomaly_id: str,
-    current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Get detailed anomaly information."""
@@ -1952,7 +1943,7 @@ async def get_anomaly(
     result = await db.execute(
         select(AnomalyDetection).where(
             AnomalyDetection.id == anomaly_id,
-            AnomalyDetection.organization_id == getattr(current_user, "organization_id", None),
+            AnomalyDetection.organization_id == org_id,
         )
     )
     anomaly = result.scalar_one_or_none()
@@ -1984,9 +1975,10 @@ async def get_anomaly(
 
 @router.post("/anomalies/{anomaly_id}/feedback", summary="Provide anomaly feedback")
 async def submit_anomaly_feedback(
+    org_id: OrganizationId,
     anomaly_id: str,
     feedback: AnomalyFeedback,
-    current_user: CurrentUser = None,
+    current_user: User = Depends(require_role([UserRole.ADMIN, UserRole.ANALYST])),
     db: DatabaseSession = None,
 ):
     """
@@ -1994,12 +1986,12 @@ async def submit_anomaly_feedback(
 
     Used to confirm/reject anomalies and improve model accuracy.
     """
-    logger.info(f"Recording feedback for anomaly {anomaly_id}")
+    logger.info(f"Recording feedback for anomaly {anomaly_id}", user_id=current_user.id, organization_id=org_id)
 
     result = await db.execute(
         select(AnomalyDetection).where(
             AnomalyDetection.id == anomaly_id,
-            AnomalyDetection.organization_id == getattr(current_user, "organization_id", None),
+            AnomalyDetection.organization_id == org_id,
         )
     )
     anomaly = result.scalar_one_or_none()
@@ -2025,7 +2017,7 @@ async def submit_anomaly_feedback(
 
 @router.get("/predictions", response_model=list[ThreatPredictionResponse], summary="List predictions")
 async def list_threat_predictions(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     entity_type: str | None = None,
     skip: Annotated[int, Query(ge=0)] = 0,
@@ -2035,7 +2027,7 @@ async def list_threat_predictions(
     logger.info("Listing threat predictions")
 
     query = select(ThreatPrediction).where(
-        ThreatPrediction.organization_id == getattr(current_user, "organization_id", None),
+        ThreatPrediction.organization_id == org_id,
         ThreatPrediction.expires_at > _utc_now(),
     )
 
@@ -2068,9 +2060,10 @@ async def list_threat_predictions(
 
 @router.post("/predictions/entity/{entity_id}", response_model=ThreatPredictionResponse, summary="Predict entity threat")
 async def predict_entity_threat(
+    org_id: OrganizationId,
     entity_id: str,
     request: ThreatPredictionRequest,
-    current_user: CurrentUser = None,
+    current_user: User = Depends(require_role([UserRole.ADMIN, UserRole.ANALYST])),
     db: DatabaseSession = None,
 ):
     """
@@ -2086,9 +2079,8 @@ async def predict_entity_threat(
 
     No hash-of-id fakery.
     """
-    logger.info(f"Generating threat prediction for {request.entity_type}/{entity_id}")
+    logger.info(f"Generating threat prediction for {request.entity_type}/{entity_id}", user_id=current_user.id, organization_id=org_id)
 
-    org_id = getattr(current_user, "organization_id", None)
     signals = await _load_entity_risk_signals(db, request.entity_type, entity_id, org_id)
     pred = _compute_threat_prediction_from_signals(request.entity_type, entity_id, signals)
 
@@ -2163,11 +2155,10 @@ async def predict_entity_threat(
 
 @router.get("/predictions/dashboard", response_model=PredictionDashboard, summary="Prediction dashboard")
 async def prediction_dashboard(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get threat prediction dashboard data from the database."""
-    org_id = getattr(current_user, "organization_id", None)
     now = _utc_now()
 
     # Active predictions (not expired)
@@ -2246,7 +2237,7 @@ async def prediction_dashboard(
 
 @router.get("/models", response_model=list[MLModelResponse], summary="List ML models")
 async def list_models(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """List all ML models."""
@@ -2254,7 +2245,7 @@ async def list_models(
 
     result = await db.execute(
         select(MLModel)
-        .where(MLModel.organization_id == getattr(current_user, "organization_id", None))
+        .where(MLModel.organization_id == org_id)
         .order_by(MLModel.created_at.desc())
     )
     models = list(result.scalars().all())
@@ -2285,87 +2276,38 @@ async def list_models(
 
 @router.post("/models/train", response_model=None, summary="Train ML model")
 async def train_model(
+    org_id: OrganizationId,
     request: ModelTrainingRequest,
-    current_user: CurrentUser = None,
-    db: DatabaseSession = None,
+    current_user: User = Depends(require_role([UserRole.ADMIN])),
 ):
     """
-    Register or train an ML model.
+    Train an ML model: not implemented (honest 501).
 
-    Behavior:
-      - If ``trigger_retraining`` is True: a real training backend is required.
-        We currently have no async training pipeline that can ingest a
-        labelled dataset from this endpoint, so we return 503 rather than
-        fabricating metrics like {accuracy: 0.90}.
-      - Otherwise: register the model record with status=``pending_data`` and
-        an empty metrics dict so the frontend can list it without showing
-        invented performance numbers. Real metrics are populated only after
-        an actual training job runs (e.g. via ``AnomalyDetector.train_model``
-        in src/ai/engine.py, called from a background task with real data).
+    This route used to register a ``pending_data`` shell row and answer 200,
+    and the UI reported "training initiated", but nothing ever trained it:
+    there is no training job behind this endpoint. It now says so.
     """
     logger.info(
-        f"Train-model request: type={request.model_type} algo={request.algorithm} "
-        f"trigger_retraining={request.trigger_retraining}"
-    )
-
-    if request.trigger_retraining:
-        # No training data was supplied by the request schema and there is
-        # no in-process training service that pulls labelled data on demand.
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=(
-                "training backend not configured: no labelled dataset is available "
-                "via this endpoint and no async training service is wired up. "
-                "Register the model without trigger_retraining and run training "
-                "out-of-band (e.g. via src/ai/engine.py AnomalyDetector.train_model)."
-            ),
-        )
-
-    version = request.version or "1.0.0"
-    name = f"{request.model_type}_{request.algorithm}_{version}"
-
-    model = MLModel(
-        name=name,
+        "ai_model_train_not_implemented",
         model_type=request.model_type,
         algorithm=request.algorithm,
-        version=version,
-        status="pending_data",
-        description=request.description,
-        feature_columns=[],
-        hyperparameters=request.hyperparameters or {},
-        # Empty metrics — DO NOT insert fake numbers. Real metrics get
-        # written once an actual training job finishes.
-        training_metrics={},
-        training_data_size=0,
-        last_trained_at=None,
-        prediction_count=0,
-        drift_score=0.0,
-        tags=request.tags or [],
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
+        user_id=current_user.id,
     )
-    db.add(model)
-    await db.flush()
-    await db.refresh(model)
-
-    return {
-        "status": "registered",
-        "model_id": model.id,
-        "model_type": model.model_type,
-        "algorithm": model.algorithm,
-        "metrics": model.training_metrics,
-        "training_data_size": model.training_data_size,
-        "note": (
-            "Model registered without training. Run "
-            "src/ai/engine.py AnomalyDetector.train_model with real data to "
-            "populate training_metrics and set status=ready."
-        ),
-    }
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail={
+            "error": "not_implemented",
+            "detail": "model training is not implemented: no training pipeline consumes "
+            "this request, so no model would ever be trained",
+        },
+    )
 
 
 @router.get("/models/{model_id}", response_model=MLModelResponse, summary="Get model details")
 async def get_model(
+    org_id: OrganizationId,
     model_id: str,
-    current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Get ML model details and metrics."""
@@ -2374,7 +2316,7 @@ async def get_model(
     result = await db.execute(
         select(MLModel).where(
             MLModel.id == model_id,
-            MLModel.organization_id == getattr(current_user, "organization_id", None),
+            MLModel.organization_id == org_id,
         )
     )
     model = result.scalar_one_or_none()
@@ -2407,8 +2349,8 @@ async def get_model(
 
 @router.get("/models/{model_id}/drift", response_model=ModelDriftResponse, summary="Check model drift")
 async def check_model_drift(
+    org_id: OrganizationId,
     model_id: str,
-    current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Check for model drift in deployed model."""
@@ -2417,7 +2359,7 @@ async def check_model_drift(
     result = await db.execute(
         select(MLModel).where(
             MLModel.id == model_id,
-            MLModel.organization_id == getattr(current_user, "organization_id", None),
+            MLModel.organization_id == org_id,
         )
     )
     model = result.scalar_one_or_none()
@@ -2449,17 +2391,18 @@ async def check_model_drift(
 
 @router.delete("/models/{model_id}", summary="Retire model")
 async def retire_model(
+    org_id: OrganizationId,
     model_id: str,
-    current_user: CurrentUser = None,
+    current_user: User = Depends(require_role([UserRole.ADMIN])),
     db: DatabaseSession = None,
 ):
     """Retire ML model from service."""
-    logger.info(f"Retiring model {model_id}")
+    logger.info(f"Retiring model {model_id}", user_id=current_user.id, organization_id=org_id)
 
     result = await db.execute(
         select(MLModel).where(
             MLModel.id == model_id,
-            MLModel.organization_id == getattr(current_user, "organization_id", None),
+            MLModel.organization_id == org_id,
         )
     )
     model = result.scalar_one_or_none()
@@ -2481,8 +2424,9 @@ async def retire_model(
 
 @router.post("/feedback", summary="Submit AI feedback")
 async def submit_ai_feedback(
+    org_id: OrganizationId,
     feedback: AIFeedbackRequest,
-    current_user: CurrentUser = None,
+    current_user: User = Depends(require_role([UserRole.ADMIN, UserRole.ANALYST])),
     db: DatabaseSession = None,
 ):
     """
@@ -2490,12 +2434,12 @@ async def submit_ai_feedback(
 
     Updates the corresponding AIAnalysis record with the feedback score and notes.
     """
-    logger.info(f"Recording feedback for analysis {feedback.analysis_id}")
+    logger.info(f"Recording feedback for analysis {feedback.analysis_id}", user_id=current_user.id, organization_id=org_id)
 
     result = await db.execute(
         select(AIAnalysis).where(
             AIAnalysis.id == feedback.analysis_id,
-            AIAnalysis.organization_id == getattr(current_user, "organization_id", None),
+            AIAnalysis.organization_id == org_id,
         )
     )
     analysis = result.scalar_one_or_none()
@@ -2520,7 +2464,7 @@ async def submit_ai_feedback(
 
 @router.get("/dashboard", response_model=AIDashboardResponse, summary="AI engine dashboard")
 async def ai_dashboard(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """
@@ -2528,7 +2472,6 @@ async def ai_dashboard(
     """
     logger.info("Fetching AI dashboard")
 
-    org_id = getattr(current_user, "organization_id", None)
     now = _utc_now()
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
 

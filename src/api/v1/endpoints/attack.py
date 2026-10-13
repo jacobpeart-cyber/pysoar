@@ -5,7 +5,7 @@ from typing import Optional
 from fastapi import APIRouter, HTTPException, Query
 from sqlalchemy import func, select
 
-from src.api.deps import CurrentUser, DatabaseSession
+from src.api.deps import CurrentUser, DatabaseSession, PlatformSuperUser
 from src.attack.models import AttackSyncState, AttackTechnique
 from src.attack.service import AttackService
 from src.core.logging import get_logger
@@ -100,10 +100,8 @@ async def attack_coverage(
 
 
 @router.post("/sync")
-async def sync_attack(db: DatabaseSession = None, current_user: CurrentUser = None):
+async def sync_attack(db: DatabaseSession = None, _platform_user: PlatformSuperUser = None):
     """Download + load the pinned ATT&CK dataset (Enterprise + ICS). Superuser only."""
-    if not getattr(current_user, "is_superuser", False):
-        raise HTTPException(status_code=403, detail="ATT&CK sync requires superuser")
     from src.attack.sync import sync_attack_kb
     result = await sync_attack_kb(db)
     if result.get("status") == "failed":

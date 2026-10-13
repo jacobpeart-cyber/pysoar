@@ -3,24 +3,52 @@
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 import logging
 
 from src.core.config import settings
+
+if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    from src.services.tenant_settings import SMTPSettings
 
 logger = logging.getLogger(__name__)
 
 
 class EmailService:
-    """Service for sending email notifications"""
+    """Service for sending email notifications.
 
-    def __init__(self):
+    ``EmailService()`` uses the platform SMTP relay from the environment
+    (platform events such as backups). Tenant mail must use
+    :meth:`for_organization`, which reads the organisation's stored SMTP
+    section (Settings > SMTP) and falls back to the platform relay.
+    """
+
+    def __init__(self, smtp: Optional["SMTPSettings"] = None):
+        if smtp is not None:
+            self.host = smtp.host
+            self.port = smtp.port
+            self.username = smtp.username
+            self.password = smtp.password
+            self.from_address = smtp.from_address
+            self.use_tls = smtp.use_tls
+            return
         self.host = settings.smtp_host
         self.port = settings.smtp_port
         self.username = settings.smtp_user
         self.password = settings.smtp_password
         self.from_address = settings.smtp_from
         self.use_tls = settings.smtp_tls
+
+    @classmethod
+    async def for_organization(
+        cls, db: "AsyncSession", organization_id: Optional[str],
+    ) -> "EmailService":
+        """An EmailService configured with ``organization_id``'s SMTP settings."""
+        from src.services.tenant_settings import smtp_settings_for
+
+        return cls(await smtp_settings_for(db, organization_id))
 
     @property
     def is_configured(self) -> bool:

@@ -9,13 +9,40 @@ import uuid as uuid_mod
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from src.api.deps import CurrentUser, DatabaseSession
+from src.api.deps import CurrentUser, DatabaseSession, OrganizationId, require_role
 from src.core.utils import safe_json_loads
+from src.models.user import User, UserRole
+
+# Case, evidence, timeline, artifact and legal-hold writes need analyst or
+# admin; releasing a legal hold needs admin. Viewers are read-only.
+_ANALYST_ROLES = [UserRole.ADMIN, UserRole.ANALYST]
+
+
+def _session_actor(user: User) -> str:
+    """Chain-of-custody actor: always the authenticated session user."""
+    return getattr(user, "full_name", None) or user.email
+
+
+def _require_admin_to_release(user: User, what: str) -> None:
+    if user.is_superuser or user.role == UserRole.ADMIN.value:
+        return
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail={"error": "admin_required", "detail": f"{what} requires the admin role"},
+    )
+
+
+def _not_implemented(detail: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail={"error": "not_implemented", "detail": detail},
+    )
 
 # Evidence locations a client may register directly. Local filesystem paths are
 # assigned only by the upload endpoint, which writes under DFIR_UPLOAD_ROOT:
@@ -111,7 +138,7 @@ router = APIRouter(prefix="/dfir", tags=["DFIR"])
 # ============================================================================
 
 
-async def get_case_or_404(db: AsyncSession, case_id: str, org_id: Optional[str] = None) -> ForensicCase:
+async def get_case_or_404(db: AsyncSession, case_id: str, org_id: str) -> ForensicCase:
     """Get forensic case by ID or raise 404"""
     stmt = (
         select(ForensicCase)
@@ -123,8 +150,7 @@ async def get_case_or_404(db: AsyncSession, case_id: str, org_id: Optional[str] 
         )
         .where(ForensicCase.id == case_id)
     )
-    if org_id is not None:
-        stmt = stmt.where(ForensicCase.organization_id == org_id)
+    stmt = stmt.where(ForensicCase.organization_id == org_id)
     result = await db.execute(stmt)
     case = result.scalar_one_or_none()
     if not case:
@@ -135,15 +161,14 @@ async def get_case_or_404(db: AsyncSession, case_id: str, org_id: Optional[str] 
     return case
 
 
-async def get_evidence_or_404(db: AsyncSession, evidence_id: str, org_id: Optional[str] = None) -> ForensicEvidence:
+async def get_evidence_or_404(db: AsyncSession, evidence_id: str, org_id: str) -> ForensicEvidence:
     """Get forensic evidence by ID or raise 404"""
     stmt = (
         select(ForensicEvidence)
         .options(selectinload(ForensicEvidence.case))
         .where(ForensicEvidence.id == evidence_id)
     )
-    if org_id is not None:
-        stmt = stmt.where(ForensicEvidence.organization_id == org_id)
+    stmt = stmt.where(ForensicEvidence.organization_id == org_id)
     result = await db.execute(stmt)
     evidence = result.scalar_one_or_none()
     if not evidence:
@@ -161,7 +186,7 @@ async def get_evidence_or_404(db: AsyncSession, evidence_id: str, org_id: Option
 
 @router.get("/cases", response_model=ForensicCaseListResponse)
 async def list_cases(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -179,9 +204,7 @@ async def list_cases(
     )
 
     # Filter by organization
-    org_id = getattr(current_user, "organization_id", None)
-    if org_id:
-        query = query.where(ForensicCase.organization_id == org_id)
+    query = query.where(ForensicCase.organization_id == org_id)
 
     # Apply filters
     if search:
@@ -235,11 +258,10 @@ async def list_cases(
 @router.get("/cases/{case_id}", response_model=ForensicCaseResponse)
 async def get_case(
     case_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Get a specific forensic case"""
-    org_id = getattr(current_user, "organization_id", None)
     case = await get_case_or_404(db, case_id, org_id)
     return ForensicCaseResponse.model_validate(case)
 
@@ -247,19 +269,36 @@ async def get_case(
 @router.post("/cases", response_model=ForensicCaseResponse, status_code=status.HTTP_201_CREATED)
 async def create_case(
     case_data: ForensicCaseCreate,
-    current_user: CurrentUser = None,
+    current_user: User = Depends(require_role(_ANALYST_ROLES)),
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Create a new forensic case"""
-    # Check for duplicate case number
-    result = await db.execute(
-        select(ForensicCase).where(ForensicCase.case_number == case_data.case_number),
+    # forensic_cases.case_number is unique across the whole table, so a number
+    # held by any tenant cannot be reused. The 409 is identical whichever
+    # tenant holds it and nothing about the other row is read or returned.
+    in_use_conflict = HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail=f"Case number {case_data.case_number} is already in use; choose another",
     )
-    if result.scalar_one_or_none():
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Case number {case_data.case_number} already exists",
+    result = await db.execute(
+        select(ForensicCase.id).where(ForensicCase.case_number == case_data.case_number).limit(1),
+    )
+    if result.scalar_one_or_none() is not None:
+        raise in_use_conflict
+
+    if case_data.lead_investigator_id:
+        lead = await db.execute(
+            select(User.id).where(
+                User.id == case_data.lead_investigator_id,
+                User.organization_id == org_id,
+            ),
         )
+        if lead.scalar_one_or_none() is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"error": "invalid_lead_investigator", "detail": "lead investigator is not a user in this organisation"},
+            )
 
     case = ForensicCase(
         case_number=case_data.case_number,
@@ -269,13 +308,17 @@ async def create_case(
         severity=case_data.severity,
         lead_investigator_id=case_data.lead_investigator_id,
         assigned_team=json.dumps(case_data.assigned_team) if case_data.assigned_team else None,
-        created_by=case_data.created_by,
-        organization_id=getattr(current_user, "organization_id", None),
+        created_by=str(current_user.id),
+        organization_id=org_id,
         status=CaseStatus.OPEN.value,
     )
 
     db.add(case)
-    await db.flush()
+    try:
+        await db.flush()
+    except IntegrityError:
+        # Lost a race for the same globally-unique case number.
+        raise in_use_conflict from None
     await db.refresh(case)
 
     return ForensicCaseResponse.model_validate(case)
@@ -285,14 +328,29 @@ async def create_case(
 async def update_case(
     case_id: str,
     case_data: ForensicCaseUpdate,
-    current_user: CurrentUser = None,
+    current_user: User = Depends(require_role(_ANALYST_ROLES)),
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Update a forensic case"""
-    org_id = getattr(current_user, "organization_id", None)
     case = await get_case_or_404(db, case_id, org_id)
 
     update_data = case_data.model_dump(exclude_unset=True)
+
+    if update_data.get("legal_hold_active") is False and case.legal_hold_active:
+        _require_admin_to_release(current_user, "clearing a case's legal hold")
+    if update_data.get("lead_investigator_id"):
+        lead = await db.execute(
+            select(User.id).where(
+                User.id == update_data["lead_investigator_id"],
+                User.organization_id == org_id,
+            ),
+        )
+        if lead.scalar_one_or_none() is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"error": "invalid_lead_investigator", "detail": "lead investigator is not a user in this organisation"},
+            )
 
     # Handle JSON fields
     if "assigned_team" in update_data and update_data["assigned_team"] is not None:
@@ -311,12 +369,12 @@ async def update_case(
 @router.post("/cases/{case_id}/close", response_model=ForensicCaseResponse)
 async def close_case(
     case_id: str,
-    current_user: CurrentUser = None,
+    _current_user: User = Depends(require_role(_ANALYST_ROLES)),
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     conclusion: Optional[str] = None,
 ):
     """Close a forensic case"""
-    org_id = getattr(current_user, "organization_id", None)
     case = await get_case_or_404(db, case_id, org_id)
 
     case.status = CaseStatus.CLOSED.value
@@ -336,7 +394,7 @@ async def close_case(
 @router.get("/cases/{case_id}/evidence", response_model=ForensicEvidenceListResponse)
 async def list_evidence(
     case_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -345,15 +403,13 @@ async def list_evidence(
 ):
     """List evidence for a forensic case"""
     # Filter by organization
-    org_id = getattr(current_user, "organization_id", None)
 
     # Verify case exists
     await get_case_or_404(db, case_id, org_id)
 
     query = select(ForensicEvidence).where(ForensicEvidence.case_id == case_id)
 
-    if org_id:
-        query = query.where(ForensicEvidence.organization_id == org_id)
+    query = query.where(ForensicEvidence.organization_id == org_id)
 
     if evidence_type:
         query = query.where(ForensicEvidence.evidence_type == evidence_type)
@@ -388,11 +444,10 @@ async def list_evidence(
 @router.get("/evidence/{evidence_id}", response_model=ForensicEvidenceResponse)
 async def get_evidence(
     evidence_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Get a specific evidence item"""
-    org_id = getattr(current_user, "organization_id", None)
     evidence = await get_evidence_or_404(db, evidence_id, org_id)
     return ForensicEvidenceResponse.model_validate(evidence)
 
@@ -401,6 +456,7 @@ async def get_evidence(
 async def download_evidence(
     evidence_id: str,
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Download forensic evidence, appending a chain-of-custody entry.
@@ -415,7 +471,6 @@ async def download_evidence(
 
     from fastapi.responses import FileResponse, RedirectResponse
 
-    org_id = getattr(current_user, "organization_id", None)
     evidence = await get_evidence_or_404(db, evidence_id, org_id)
 
     if not evidence.storage_location:
@@ -429,7 +484,7 @@ async def download_evidence(
     entries = list(chain.get("entries", []))
     entries.append({
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "actor": getattr(current_user, "full_name", None) or current_user.email,
+        "actor": _session_actor(current_user),
         "action": "accessed_download",
         "hash": evidence.original_hash_sha256,
     })
@@ -465,11 +520,11 @@ async def download_evidence(
 @router.post("/evidence", response_model=ForensicEvidenceResponse, status_code=status.HTTP_201_CREATED)
 async def collect_evidence(
     evidence_data: ForensicEvidenceCreate,
-    current_user: CurrentUser = None,
+    current_user: User = Depends(require_role(_ANALYST_ROLES)),
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Collect and register forensic evidence"""
-    org_id = getattr(current_user, "organization_id", None)
     # Verify case exists
     await get_case_or_404(db, evidence_data.case_id, org_id)
 
@@ -484,12 +539,12 @@ async def collect_evidence(
         storage_location=_validate_client_storage_location(evidence_data.storage_location),
         file_size_bytes=evidence_data.file_size_bytes,
         handling_notes=evidence_data.handling_notes,
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         chain_of_custody_log={
             "entries": [
                 {
                     "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "actor": getattr(current_user, "full_name", None) or current_user.email,
+                    "actor": _session_actor(current_user),
                     "action": "collected",
                     "hash": evidence_data.original_hash_sha256,
                 },
@@ -529,7 +584,8 @@ def _sanitize_filename(filename: str) -> str:
 )
 async def upload_evidence_file(
     case_id: str,
-    current_user: CurrentUser = None,
+    current_user: User = Depends(require_role(_ANALYST_ROLES)),
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     file: UploadFile = File(...),
     title: Optional[str] = Form(None),
@@ -549,9 +605,7 @@ async def upload_evidence_file(
     - Transactional: if the DB insert fails the on-disk file is deleted so we
       never leave an orphan.
     """
-    org_id = getattr(current_user, "organization_id", None)
-    case = await get_case_or_404(db, case_id, org_id)
-    org_id = org_id or case.organization_id or "default"
+    await get_case_or_404(db, case_id, org_id)
 
     # Determine final storage path
     target_dir = os.path.join(DFIR_UPLOAD_ROOT, str(org_id), str(case_id))
@@ -611,13 +665,9 @@ async def upload_evidence_file(
     sha256_hex = sha256.hexdigest()
     sha512_hex = sha512.hexdigest()
 
-    # Build chain-of-custody entry
-    actor = (
-        collector
-        or getattr(current_user, "full_name", None)
-        or getattr(current_user, "email", None)
-        or "unknown"
-    )
+    # Build chain-of-custody entry. The actor is the session user; a
+    # client-supplied ``collector`` is kept only as a reported note.
+    actor = _session_actor(current_user)
     now_iso = datetime.now(timezone.utc).isoformat()
     handling_suffix = []
     if title:
@@ -651,6 +701,7 @@ async def upload_evidence_file(
                     "size_bytes": total_bytes,
                     "original_filename": file.filename or sanitized,
                     "details": description,
+                    **({"reported_collector": collector} if collector else {}),
                 },
             ],
             "sha512": sha512_hex,
@@ -680,11 +731,11 @@ async def upload_evidence_file(
 async def verify_evidence_integrity(
     evidence_id: str,
     verify_data: EvidenceVerifyRequest,
-    current_user: CurrentUser = None,
+    current_user: User = Depends(require_role(_ANALYST_ROLES)),
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Verify evidence integrity through hash comparison"""
-    org_id = getattr(current_user, "organization_id", None)
     evidence = await get_evidence_or_404(db, evidence_id, org_id)
 
     # Integrity check against a reference the client does not control: the
@@ -723,7 +774,7 @@ async def verify_evidence_integrity(
 
     is_valid = claimed == reference
     evidence.is_verified = is_valid
-    evidence.verified_by = getattr(current_user, "full_name", None) or current_user.email
+    evidence.verified_by = _session_actor(current_user)
     evidence.verification_date = datetime.now(timezone.utc).isoformat()
 
     chain = dict(evidence.chain_of_custody_log or {})
@@ -748,11 +799,11 @@ async def verify_evidence_integrity(
 async def update_chain_of_custody(
     evidence_id: str,
     coc_data: ChainOfCustodyUpdateRequest,
-    current_user: CurrentUser = None,
+    current_user: User = Depends(require_role(_ANALYST_ROLES)),
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Update chain of custody log"""
-    org_id = getattr(current_user, "organization_id", None)
     evidence = await get_evidence_or_404(db, evidence_id, org_id)
 
     # Parse existing log
@@ -760,14 +811,18 @@ async def update_chain_of_custody(
     if isinstance(coc_log, str):
         coc_log = safe_json_loads(coc_log, {})
 
-    if "entries" not in coc_log:
-        coc_log["entries"] = []
+    # Copy before appending: mutating the loaded JSON in place is not seen
+    # by SQLAlchemy change tracking, so the entry could be silently dropped.
+    coc_log = dict(coc_log)
+    coc_log["entries"] = list(coc_log.get("entries", []))
 
     # Add new entry
     coc_log["entries"].append(
         {
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "actor": coc_data.actor,
+            # Bound to the session user: a body ``actor`` is ignored so the
+            # chain of custody cannot be forged.
+            "actor": _session_actor(current_user),
             "action": coc_data.action,
             "hash": coc_data.evidence_hash,
             "details": coc_data.details,
@@ -789,7 +844,7 @@ async def update_chain_of_custody(
 @router.get("/cases/{case_id}/timeline", response_model=ForensicTimelineListResponse)
 async def get_timeline(
     case_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=200),
@@ -798,14 +853,12 @@ async def get_timeline(
 ):
     """Get case timeline"""
     # Filter by organization
-    org_id = getattr(current_user, "organization_id", None)
 
     await get_case_or_404(db, case_id, org_id)
 
     query = select(ForensicTimeline).where(ForensicTimeline.case_id == case_id)
 
-    if org_id:
-        query = query.where(ForensicTimeline.organization_id == org_id)
+    query = query.where(ForensicTimeline.organization_id == org_id)
 
     if event_type:
         query = query.where(ForensicTimeline.event_type == event_type)
@@ -841,11 +894,11 @@ async def get_timeline(
 async def add_timeline_event(
     case_id: str,
     event_data: ForensicTimelineCreate,
-    current_user: CurrentUser = None,
+    _current_user: User = Depends(require_role(_ANALYST_ROLES)),
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Add event to case timeline"""
-    org_id = getattr(current_user, "organization_id", None)
     await get_case_or_404(db, case_id, org_id)
 
     event = ForensicTimeline(
@@ -859,7 +912,7 @@ async def add_timeline_event(
         mitre_technique_id=event_data.mitre_technique_id,
         severity_score=event_data.severity_score,
         is_pivotal=event_data.is_pivotal,
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
     )
 
     db.add(event)
@@ -872,11 +925,10 @@ async def add_timeline_event(
 @router.post("/cases/{case_id}/timeline/export", response_model=TimelineExportResponse)
 async def export_timeline(
     case_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Export case timeline"""
-    org_id = getattr(current_user, "organization_id", None)
     case = await get_case_or_404(db, case_id, org_id)
 
     timeline_stmt = (
@@ -884,8 +936,7 @@ async def export_timeline(
         .where(ForensicTimeline.case_id == case_id)
         .order_by(ForensicTimeline.event_timestamp.asc())
     )
-    if org_id:
-        timeline_stmt = timeline_stmt.where(ForensicTimeline.organization_id == org_id)
+    timeline_stmt = timeline_stmt.where(ForensicTimeline.organization_id == org_id)
     result = await db.execute(timeline_stmt)
     events = list(result.scalars().all())
 
@@ -905,7 +956,7 @@ async def export_timeline(
 @router.get("/cases/{case_id}/artifacts", response_model=ForensicArtifactListResponse)
 async def list_artifacts(
     case_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -914,14 +965,12 @@ async def list_artifacts(
 ):
     """List artifacts for a case"""
     # Filter by organization
-    org_id = getattr(current_user, "organization_id", None)
 
     await get_case_or_404(db, case_id, org_id)
 
     query = select(ForensicArtifact).where(ForensicArtifact.case_id == case_id)
 
-    if org_id:
-        query = query.where(ForensicArtifact.organization_id == org_id)
+    query = query.where(ForensicArtifact.organization_id == org_id)
 
     if artifact_type:
         query = query.where(ForensicArtifact.artifact_type == artifact_type)
@@ -957,11 +1006,11 @@ async def list_artifacts(
 async def create_artifact(
     case_id: str,
     artifact_data: ForensicArtifactCreate,
-    current_user: CurrentUser = None,
+    _current_user: User = Depends(require_role(_ANALYST_ROLES)),
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Create forensic artifact"""
-    org_id = getattr(current_user, "organization_id", None)
     await get_case_or_404(db, case_id, org_id)
     await get_evidence_or_404(db, artifact_data.evidence_id, org_id)
 
@@ -974,7 +1023,7 @@ async def create_artifact(
         ioc_extracted=artifact_data.ioc_extracted or {},
         mitre_mapping=artifact_data.mitre_mapping,
         risk_score=artifact_data.risk_score,
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
     )
 
     db.add(artifact)
@@ -986,54 +1035,34 @@ async def create_artifact(
 
 @router.post("/artifacts/analyze", response_model=ArtifactAnalysisResponse)
 async def analyze_artifact(
-    analysis_data: ArtifactAnalysisRequest,
-    current_user: CurrentUser = None,
-    db: DatabaseSession = None,
+    _analysis_data: ArtifactAnalysisRequest,
+    _current_user: User = Depends(require_role(_ANALYST_ROLES)),
+    _org_id: OrganizationId = None,
+    _db: DatabaseSession = None,
 ):
-    """Analyze a forensic artifact"""
-    analyzer = ArtifactAnalyzer()
+    """Analyze a forensic artifact.
 
-    # Perform analysis
-    if analysis_data.artifact_type.startswith("disk_"):
-        analysis = analyzer.analyze_disk_artifacts(analysis_data.artifact_type, analysis_data.artifact_data)
-    elif analysis_data.artifact_type.startswith("memory_"):
-        analysis = analyzer.analyze_memory_artifacts(analysis_data.artifact_type, analysis_data.artifact_data)
-    elif analysis_data.artifact_type.startswith("network_"):
-        analysis = analyzer.analyze_network_artifacts(analysis_data.artifact_type, analysis_data.artifact_data)
-    else:
-        analysis = {"status": "error", "message": f"Unknown artifact type: {analysis_data.artifact_type}"}
-
-    if analysis["status"] != "success":
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=analysis.get("message"))
-
-    # Extract IOCs
-    ioc_result = analyzer.extract_iocs(analysis_data.artifact_data, analysis_data.artifact_type)
-
-    # Map to MITRE
-    mitre_result = analyzer.map_to_mitre(analysis_data.artifact_type, analysis_data.artifact_data)
-
-    return ArtifactAnalysisResponse(
-        status="success",
-        artifact_type=analysis_data.artifact_type,
-        analysis=analysis.get("analysis", {}),
-        iocs_extracted=ioc_result.get("total_extracted", 0),
-        mitre_mapping=mitre_result.get("mapping", {}),
+    Not implemented: the route dispatched on a ``disk_``/``memory_``/``network_``
+    prefix while the analyzers match unprefixed names, so every call returned
+    "success" with nothing parsed, and nothing was persisted.
+    """
+    raise _not_implemented(
+        "artifact analysis is not implemented: no artifact parser runs behind this route, "
+        "so it no longer reports success",
     )
 
 
 @router.post("/cases/{case_id}/artifacts/extract-iocs", response_model=IOCExtractionResponse)
 async def extract_case_iocs(
     case_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Extract all IOCs from case artifacts"""
-    org_id = getattr(current_user, "organization_id", None)
     await get_case_or_404(db, case_id, org_id)
 
     artifact_stmt = select(ForensicArtifact).where(ForensicArtifact.case_id == case_id)
-    if org_id:
-        artifact_stmt = artifact_stmt.where(ForensicArtifact.organization_id == org_id)
+    artifact_stmt = artifact_stmt.where(ForensicArtifact.organization_id == org_id)
     result = await db.execute(artifact_stmt)
     artifacts = list(result.scalars().all())
 
@@ -1075,21 +1104,19 @@ async def extract_case_iocs(
 @router.get("/cases/{case_id}/legal-holds", response_model=LegalHoldListResponse)
 async def list_legal_holds(
     case_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
 ):
     """List legal holds for a case"""
     # Filter by organization
-    org_id = getattr(current_user, "organization_id", None)
 
     await get_case_or_404(db, case_id, org_id)
 
     query = select(LegalHold).where(LegalHold.case_id == case_id)
 
-    if org_id:
-        query = query.where(LegalHold.organization_id == org_id)
+    query = query.where(LegalHold.organization_id == org_id)
 
     count_query = select(func.count()).select_from(
         select(LegalHold.id).where(query.whereclause) if query.whereclause is not None else select(LegalHold.id),
@@ -1117,11 +1144,11 @@ async def list_legal_holds(
 async def create_legal_hold(
     case_id: str,
     hold_data: LegalHoldCreate,
-    current_user: CurrentUser = None,
+    current_user: User = Depends(require_role(_ANALYST_ROLES)),
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Create a legal hold"""
-    org_id = getattr(current_user, "organization_id", None)
     case = await get_case_or_404(db, case_id, org_id)
 
     hold = LegalHold(
@@ -1129,11 +1156,11 @@ async def create_legal_hold(
         hold_type=hold_data.hold_type,
         custodians=hold_data.custodians,
         data_sources=hold_data.data_sources,
-        issued_by=hold_data.issued_by,
+        issued_by=_session_actor(current_user),
         issued_date=hold_data.issued_date or datetime.now(timezone.utc).isoformat(),
         expiry_date=hold_data.expiry_date,
         status="active",
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
     )
 
     db.add(hold)
@@ -1148,14 +1175,13 @@ async def create_legal_hold(
 async def update_legal_hold(
     hold_id: str,
     hold_data: LegalHoldUpdate,
-    current_user: CurrentUser = None,
+    current_user: User = Depends(require_role(_ANALYST_ROLES)),
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Update legal hold"""
-    org_id = getattr(current_user, "organization_id", None)
     hold_stmt = select(LegalHold).where(LegalHold.id == hold_id)
-    if org_id is not None:
-        hold_stmt = hold_stmt.where(LegalHold.organization_id == org_id)
+    hold_stmt = hold_stmt.where(LegalHold.organization_id == org_id)
     result = await db.execute(hold_stmt)
     hold = result.scalar_one_or_none()
 
@@ -1163,6 +1189,9 @@ async def update_legal_hold(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Legal hold not found")
 
     update_data = hold_data.model_dump(exclude_unset=True)
+    new_status = update_data.get("status")
+    if new_status is not None and new_status != "active" and hold.status == "active":
+        _require_admin_to_release(current_user, "releasing a legal hold")
     for field, value in update_data.items():
         setattr(hold, field, value)
 
@@ -1181,38 +1210,29 @@ async def update_legal_hold(
 @router.get("/cases/{case_id}/report", response_model=CaseReportResponse)
 async def generate_case_report(
     case_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
-    """Generate comprehensive case report"""
-    org_id = getattr(current_user, "organization_id", None)
-    case = await get_case_or_404(db, case_id, org_id)
+    """Generate comprehensive case report.
 
-    # Get counts
-    evidence_count = len(case.evidence or [])
-    artifact_count = len(case.artifacts or [])
-    timeline_count = len(case.timeline_events or [])
-    legal_holds = len(case.legal_holds or [])
-
-    return CaseReportResponse(
-        case_id=case_id,
-        generated_at=datetime.now(timezone.utc),
-        sections=["timeline_reconstruction", "artifact_analysis", "findings_and_conclusions"],
-        evidence_count=evidence_count,
-        artifact_count=artifact_count,
-        timeline_events=timeline_count,
-        legal_holds_active=legal_holds,
+    Not implemented: the route returned four counts and a hard-coded list of
+    section names with no report content. Per-case counts are available from
+    GET /dfir/cases/{case_id}/metrics.
+    """
+    await get_case_or_404(db, case_id, org_id)
+    raise _not_implemented(
+        "case report generation is not implemented: no report content is produced; "
+        "per-case counts are at GET /dfir/cases/{case_id}/metrics",
     )
 
 
 @router.get("/evidence/{evidence_id}/chain-of-custody", response_model=ChainOfCustodyReportResponse)
 async def get_chain_of_custody_report(
     evidence_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Get chain of custody report"""
-    org_id = getattr(current_user, "organization_id", None)
     evidence = await get_evidence_or_404(db, evidence_id, org_id)
 
     coc_log = evidence.chain_of_custody_log or {}
@@ -1240,61 +1260,53 @@ async def get_chain_of_custody_report(
 
 @router.get("/dashboard/metrics", response_model=DFIRDashboardResponse)
 async def get_dfir_dashboard(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Get DFIR dashboard metrics"""
-    org_id = getattr(current_user, "organization_id", None)
 
     # Count cases by status
     cases_query = select(func.count()).select_from(ForensicCase)
-    if org_id:
-        cases_query = cases_query.where(ForensicCase.organization_id == org_id)
+    cases_query = cases_query.where(ForensicCase.organization_id == org_id)
     all_cases = await db.execute(cases_query)
     total_cases = all_cases.scalar() or 0
 
     active_query = select(func.count()).select_from(ForensicCase).where(
         ForensicCase.status.in_([CaseStatus.OPEN.value, CaseStatus.IN_PROGRESS.value]),
     )
-    if org_id:
-        active_query = active_query.where(ForensicCase.organization_id == org_id)
+    active_query = active_query.where(ForensicCase.organization_id == org_id)
     active_cases = await db.execute(active_query)
     active_count = active_cases.scalar() or 0
 
     analysis_query = select(func.count()).select_from(ForensicCase).where(
         ForensicCase.status == CaseStatus.ANALYSIS.value,
     )
-    if org_id:
-        analysis_query = analysis_query.where(ForensicCase.organization_id == org_id)
+    analysis_query = analysis_query.where(ForensicCase.organization_id == org_id)
     analysis_cases = await db.execute(analysis_query)
     analysis_count = analysis_cases.scalar() or 0
 
     # Count evidence
     evidence_query = select(func.count()).select_from(ForensicEvidence)
-    if org_id:
-        evidence_query = evidence_query.where(ForensicEvidence.organization_id == org_id)
+    evidence_query = evidence_query.where(ForensicEvidence.organization_id == org_id)
     total_evidence = await db.execute(evidence_query)
     evidence_count = total_evidence.scalar() or 0
 
     # Count artifacts
     artifacts_query = select(func.count()).select_from(ForensicArtifact)
-    if org_id:
-        artifacts_query = artifacts_query.where(ForensicArtifact.organization_id == org_id)
+    artifacts_query = artifacts_query.where(ForensicArtifact.organization_id == org_id)
     total_artifacts = await db.execute(artifacts_query)
     artifacts_count = total_artifacts.scalar() or 0
 
     # Count legal holds
     holds_query = select(func.count()).select_from(LegalHold).where(LegalHold.status == "active")
-    if org_id:
-        holds_query = holds_query.where(LegalHold.organization_id == org_id)
+    holds_query = holds_query.where(LegalHold.organization_id == org_id)
     active_holds = await db.execute(holds_query)
     holds_count = active_holds.scalar() or 0
 
     holds_cases_query = select(func.count()).select_from(ForensicCase).where(
         ForensicCase.legal_hold_active == True,
     )
-    if org_id:
-        holds_cases_query = holds_cases_query.where(ForensicCase.organization_id == org_id)
+    holds_cases_query = holds_cases_query.where(ForensicCase.organization_id == org_id)
     cases_with_holds = await db.execute(holds_cases_query)
     holds_cases = cases_with_holds.scalar() or 0
 
@@ -1312,11 +1324,10 @@ async def get_dfir_dashboard(
 @router.get("/cases/{case_id}/metrics", response_model=CaseMetrics)
 async def get_case_metrics(
     case_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Get metrics for a specific case"""
-    org_id = getattr(current_user, "organization_id", None)
     case = await get_case_or_404(db, case_id, org_id)
 
     evidence_count = len(case.evidence or [])

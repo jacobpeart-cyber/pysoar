@@ -13,7 +13,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import CurrentUser, DatabaseSession, get_current_active_user
+from src.api.deps import DatabaseSession, OrganizationId, require_role
 from src.core.database import get_db
 from src.core.logging import get_logger
 from src.deception.models import (
@@ -48,9 +48,20 @@ from src.schemas.deception import (
     RecommendationsResponse,
 )
 
+from src.models.user import User, UserRole
 from src.services.automation import AutomationService
 
 logger = get_logger(__name__)
+
+# Operational writes (disable a decoy, record/investigate interactions,
+# tokens and campaigns) need analyst or admin. Creating, configuring,
+# deleting and rotating decoys, and deleting/rotating tokens, need admin.
+_ANALYST_ROLES = [UserRole.ADMIN, UserRole.ANALYST]
+_ADMIN_ROLES = [UserRole.ADMIN]
+
+# Request fields that must never be taken from the client: the tenant and
+# the deploying user come from the session.
+_SERVER_OWNED_DECOY_FIELDS = {"organization_id", "deployed_by"}
 
 router = APIRouter(prefix="/deception", tags=["deception"])
 
@@ -61,12 +72,11 @@ router = APIRouter(prefix="/deception", tags=["deception"])
 
 
 async def get_decoy_or_404(
-    db: AsyncSession, decoy_id: UUID, org_id: Optional[str] = None
+    db: AsyncSession, decoy_id: UUID, org_id: str
 ) -> Decoy:
-    """Get decoy by ID or raise 404 (org-scoped when org_id given)."""
+    """Get decoy by ID or raise 404 within the caller's organisation."""
     stmt = select(Decoy).where(Decoy.id == str(decoy_id))
-    if org_id is not None:
-        stmt = stmt.where(Decoy.organization_id == org_id)
+    stmt = stmt.where(Decoy.organization_id == org_id)
     result = await db.execute(stmt)
     decoy = result.scalar_one_or_none()
     if not decoy:
@@ -78,12 +88,11 @@ async def get_decoy_or_404(
 
 
 async def get_token_or_404(
-    db: AsyncSession, token_id: UUID, org_id: Optional[str] = None
+    db: AsyncSession, token_id: UUID, org_id: str
 ) -> HoneyToken:
-    """Get honey token by ID or raise 404 (org-scoped when org_id given)."""
+    """Get honey token by ID or raise 404 within the caller's organisation."""
     stmt = select(HoneyToken).where(HoneyToken.id == str(token_id))
-    if org_id is not None:
-        stmt = stmt.where(HoneyToken.organization_id == org_id)
+    stmt = stmt.where(HoneyToken.organization_id == org_id)
     result = await db.execute(stmt)
     token = result.scalar_one_or_none()
     if not token:
@@ -95,14 +104,13 @@ async def get_token_or_404(
 
 
 async def get_interaction_or_404(
-    db: AsyncSession, interaction_id: UUID, org_id: Optional[str] = None
+    db: AsyncSession, interaction_id: UUID, org_id: str
 ) -> DecoyInteraction:
-    """Get interaction by ID or raise 404 (org-scoped when org_id given)."""
+    """Get interaction by ID or raise 404 within the caller's organisation."""
     stmt = select(DecoyInteraction).where(
         DecoyInteraction.id == str(interaction_id)
     )
-    if org_id is not None:
-        stmt = stmt.where(DecoyInteraction.organization_id == org_id)
+    stmt = stmt.where(DecoyInteraction.organization_id == org_id)
     result = await db.execute(stmt)
     interaction = result.scalar_one_or_none()
     if not interaction:
@@ -114,14 +122,13 @@ async def get_interaction_or_404(
 
 
 async def get_campaign_or_404(
-    db: AsyncSession, campaign_id: UUID, org_id: Optional[str] = None
+    db: AsyncSession, campaign_id: UUID, org_id: str
 ) -> DeceptionCampaign:
-    """Get campaign by ID or raise 404 (org-scoped when org_id given)."""
+    """Get campaign by ID or raise 404 within the caller's organisation."""
     stmt = select(DeceptionCampaign).where(
         DeceptionCampaign.id == str(campaign_id)
     )
-    if org_id is not None:
-        stmt = stmt.where(DeceptionCampaign.organization_id == org_id)
+    stmt = stmt.where(DeceptionCampaign.organization_id == org_id)
     result = await db.execute(stmt)
     campaign = result.scalar_one_or_none()
     if not campaign:
@@ -145,16 +152,16 @@ async def get_campaign_or_404(
 async def deploy_decoy(
     request: DecoyDeployRequest,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    current_user: User = Depends(require_role(_ADMIN_ROLES)),
+    org_id: OrganizationId = None,
 ):
     """Deploy a new decoy asset."""
     try:
-        data = request.model_dump()
-        user_id = str(getattr(current_user, 'id', '')) if current_user else ''
-        data["deployed_by"] = data.get("deployed_by") or user_id
+        data = request.model_dump(exclude=_SERVER_OWNED_DECOY_FIELDS)
+        data["deployed_by"] = str(current_user.id)
         data["deployed_at"] = datetime.utcnow()
         data["status"] = "active"
-        data["organization_id"] = getattr(current_user, 'organization_id', None) or data.get("organization_id")
+        data["organization_id"] = org_id
 
         decoy = Decoy(**data)
         db.add(decoy)
@@ -191,7 +198,7 @@ async def deploy_decoy(
 @router.get("/decoys", response_model=list[DecoyResponse])
 async def list_decoys(
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     decoy_type: str | None = Query(None),
     decoy_status: str | None = Query(None, alias="status"),
     category: str | None = Query(None),
@@ -216,9 +223,7 @@ async def list_decoys(
         if category:
             filters.append(Decoy.category == category)
 
-        org_id = getattr(current_user, "organization_id", None)
-        if org_id:
-            filters.append(Decoy.organization_id == org_id)
+        filters.append(Decoy.organization_id == org_id)
 
         if filters:
             query = query.where(and_(*filters))
@@ -254,18 +259,21 @@ async def list_decoys(
 async def get_decoy_detail(
     decoy_id: UUID,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
 ):
     """Get detailed information about a specific decoy."""
     try:
         decoy = await get_decoy_or_404(
-            db, decoy_id, getattr(current_user, "organization_id", None)
+            db, decoy_id, org_id
         )
 
         # Fetch recent interactions for this decoy
         interactions_result = await db.execute(
             select(DecoyInteraction)
-            .where(DecoyInteraction.decoy_id == str(decoy_id))
+            .where(
+                DecoyInteraction.decoy_id == str(decoy_id),
+                DecoyInteraction.organization_id == org_id,
+            )
             .order_by(DecoyInteraction.created_at.desc())
             .limit(20)
         )
@@ -303,15 +311,20 @@ async def update_decoy(
     decoy_id: UUID,
     request: DecoyDeployRequest,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    current_user: User = Depends(require_role(_ADMIN_ROLES)),
+    org_id: OrganizationId = None,
 ):
     """Update decoy configuration."""
     try:
         decoy = await get_decoy_or_404(
-            db, decoy_id, getattr(current_user, "organization_id", None)
+            db, decoy_id, org_id
         )
 
-        update_data = request.model_dump(exclude_unset=True)
+        # organization_id / deployed_by in the body are ignored: a decoy can
+        # never be moved to another tenant through this route.
+        update_data = request.model_dump(
+            exclude_unset=True, exclude=_SERVER_OWNED_DECOY_FIELDS
+        )
         for key, value in update_data.items():
             setattr(decoy, key, value)
 
@@ -339,12 +352,13 @@ async def update_decoy(
 async def disable_decoy(
     decoy_id: UUID,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    current_user: User = Depends(require_role(_ANALYST_ROLES)),
+    org_id: OrganizationId = None,
 ):
     """Disable a decoy."""
     try:
         decoy = await get_decoy_or_404(
-            db, decoy_id, getattr(current_user, "organization_id", None)
+            db, decoy_id, org_id
         )
         decoy.status = "disabled"
 
@@ -369,36 +383,23 @@ async def disable_decoy(
 async def rotate_decoy(
     decoy_id: UUID,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _current_user: User = Depends(require_role(_ADMIN_ROLES)),
+    org_id: OrganizationId = None,
 ):
-    """Rotate/refresh a decoy to avoid fingerprinting."""
-    try:
-        decoy = await get_decoy_or_404(
-            db, decoy_id, getattr(current_user, "organization_id", None)
-        )
+    """Rotate/refresh a decoy to avoid fingerprinting.
 
-        decoy.status = "active"
-        decoy.deployed_at = datetime.now(timezone.utc)
-        decoy.interaction_count = 0
-
-        await db.flush()
-        await db.refresh(decoy)
-
-        logger.info(
-            f"Rotated decoy: {decoy_id}",
-            extra={"decoy_id": str(decoy_id), "user_id": str(getattr(current_user, 'id', '')) if current_user else ''},
-        )
-
-        return DecoyResponse.model_validate(decoy)
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to rotate decoy: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to rotate decoy",
-        )
+    Not implemented: rotation previously only reset ``status`` and wiped
+    ``interaction_count`` without re-fingerprinting anything on the agent.
+    """
+    await get_decoy_or_404(db, decoy_id, org_id)
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail={
+            "error": "not_implemented",
+            "detail": "decoy rotation is not implemented: nothing re-fingerprints "
+            "the decoy on its agent, so the route no longer reports success",
+        },
+    )
 
 
 @router.post(
@@ -409,7 +410,8 @@ async def record_decoy_interaction(
     decoy_id: UUID,
     payload: dict = Body(...),
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _current_user: User = Depends(require_role(_ANALYST_ROLES)),
+    org_id: OrganizationId = None,
 ):
     """Record an attacker interaction with a deployed decoy.
 
@@ -428,7 +430,7 @@ async def record_decoy_interaction(
 
     try:
         decoy = await get_decoy_or_404(
-            db, decoy_id, getattr(current_user, "organization_id", None)
+            db, decoy_id, org_id
         )
 
         interaction = DecoyInteraction(
@@ -451,6 +453,7 @@ async def record_decoy_interaction(
             raw_traffic=payload.get("raw_traffic"),
             alert_generated=bool(payload.get("alert_generated", True)),
             mitre_techniques=payload.get("mitre_techniques") or [],
+            organization_id=org_id,
         )
         db.add(interaction)
 
@@ -483,7 +486,7 @@ async def record_decoy_interaction(
                     "commands_captured": interaction.commands_captured,
                     "mitre_techniques": interaction.mitre_techniques,
                 }),
-                organization_id=getattr(current_user, "organization_id", None),
+                organization_id=org_id,
                 created_at=now_utc,
                 updated_at=now_utc,
             )
@@ -515,12 +518,13 @@ async def record_decoy_interaction(
 async def undeploy_decoy(
     decoy_id: UUID,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    current_user: User = Depends(require_role(_ADMIN_ROLES)),
+    org_id: OrganizationId = None,
 ):
     """Undeploy and delete a decoy."""
     try:
         decoy = await get_decoy_or_404(
-            db, decoy_id, getattr(current_user, "organization_id", None)
+            db, decoy_id, org_id
         )
         await db.delete(decoy)
         await db.flush()
@@ -553,7 +557,8 @@ async def undeploy_decoy(
 async def generate_token(
     request: HoneyTokenGenerateRequest,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    current_user: User = Depends(require_role(_ANALYST_ROLES)),
+    org_id: OrganizationId = None,
 ):
     """Generate a new honeytoken."""
     try:
@@ -583,8 +588,8 @@ async def generate_token(
             token_value=token_value,
             token_hash=token_hash,
             status="active",
-            organization_id=getattr(current_user, 'organization_id', None) or data.get("organization_id"),
-            deployed_by=str(current_user.id) if current_user else None,
+            organization_id=org_id,
+            deployed_by=str(current_user.id),
         )
 
         db.add(token)
@@ -613,7 +618,7 @@ async def generate_token(
 @router.get("/tokens", response_model=list[HoneyTokenResponse])
 async def list_tokens(
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     token_type: str | None = Query(None),
     token_status: str | None = Query(None, alias="status"),
     skip: int = Query(0, ge=0),
@@ -632,9 +637,7 @@ async def list_tokens(
             filters.append(HoneyToken.token_type == token_type)
         if token_status:
             filters.append(HoneyToken.status == token_status)
-        org_id = getattr(current_user, "organization_id", None)
-        if org_id:
-            filters.append(HoneyToken.organization_id == org_id)
+        filters.append(HoneyToken.organization_id == org_id)
 
         if filters:
             query = query.where(and_(*filters))
@@ -666,12 +669,12 @@ async def list_tokens(
 async def get_token(
     token_id: UUID,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
 ):
     """Get details about a specific honeytoken."""
     try:
         token = await get_token_or_404(
-            db, token_id, getattr(current_user, "organization_id", None)
+            db, token_id, org_id
         )
 
         logger.info(f"Retrieved token: {token_id}")
@@ -692,12 +695,13 @@ async def get_token(
 async def check_token(
     token_id: UUID,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _current_user: User = Depends(require_role(_ANALYST_ROLES)),
+    org_id: OrganizationId = None,
 ):
     """Check if a honeytoken has been used/triggered."""
     try:
         token = await get_token_or_404(
-            db, token_id, getattr(current_user, "organization_id", None)
+            db, token_id, org_id
         )
 
         logger.info(
@@ -731,12 +735,13 @@ async def check_token(
 async def delete_token(
     token_id: UUID,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    current_user: User = Depends(require_role(_ADMIN_ROLES)),
+    org_id: OrganizationId = None,
 ):
     """Disable/delete a honeytoken."""
     try:
         token = await get_token_or_404(
-            db, token_id, getattr(current_user, "organization_id", None)
+            db, token_id, org_id
         )
         await db.delete(token)
         await db.flush()
@@ -758,59 +763,24 @@ async def delete_token(
 
 @router.post("/tokens/rotate", status_code=status.HTTP_200_OK)
 async def rotate_tokens(
-    db: DatabaseSession = None,
-    token_type: str = Query(...),
-    current_user: CurrentUser = None,
+    _db: DatabaseSession = None,
+    _token_type: str = Query(..., alias="token_type"),
+    _current_user: User = Depends(require_role(_ADMIN_ROLES)),
+    _org_id: OrganizationId = None,
 ):
     """Rotate all tokens of a specific type.
 
-    Org-scoped: only rotates tokens belonging to the caller's
-    organization. Previous version accepted an ``organization_id``
-    query parameter which would let an authenticated caller rotate
-    another tenant's tokens and break their active honeypot bait.
+    Not implemented: rotation previously replaced token values that were
+    never returned or re-deployed, and wiped the trigger evidence.
     """
-    try:
-        import hashlib
-        import secrets
-
-        query = select(HoneyToken).where(
-            and_(
-                HoneyToken.token_type == token_type,
-                HoneyToken.status == "active",
-            )
-        )
-        organization_id = getattr(current_user, "organization_id", None)
-        if organization_id:
-            query = query.where(HoneyToken.organization_id == organization_id)
-
-        result = await db.execute(query)
-        tokens = list(result.scalars().all())
-
-        rotated_count = 0
-        for token in tokens:
-            new_value = secrets.token_urlsafe(32)
-            token.token_value = new_value
-            token.token_hash = hashlib.sha256(new_value.encode()).hexdigest()
-            token.triggered_count = 0
-            token.last_triggered_at = None
-            token.last_triggered_by = None
-            rotated_count += 1
-
-        await db.flush()
-
-        logger.info(
-            f"Rotated tokens of type: {token_type}",
-            extra={"token_type": token_type, "rotated": rotated_count},
-        )
-
-        return {"status": "success", "tokens_rotated": rotated_count}
-
-    except Exception as e:
-        logger.error(f"Failed to rotate tokens: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to rotate tokens",
-        )
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail={
+            "error": "not_implemented",
+            "detail": "honeytoken rotation is not implemented: new token values "
+            "are not deployed anywhere, so the route no longer reports success",
+        },
+    )
 
 
 # ============================================================================
@@ -821,7 +791,7 @@ async def rotate_tokens(
 @router.get("/interactions", response_model=list[DecoyInteractionResponse])
 async def list_interactions(
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     decoy_id: UUID | None = Query(None),
     source_ip: str | None = Query(None),
     threat_level: str | None = Query(None),
@@ -843,9 +813,7 @@ async def list_interactions(
             filters.append(DecoyInteraction.source_ip == source_ip)
         if threat_level:
             filters.append(DecoyInteraction.threat_assessment == threat_level)
-        org_id = getattr(current_user, "organization_id", None)
-        if org_id:
-            filters.append(DecoyInteraction.organization_id == org_id)
+        filters.append(DecoyInteraction.organization_id == org_id)
 
         if filters:
             query = query.where(and_(*filters))
@@ -888,12 +856,14 @@ async def list_interactions(
 )
 async def get_interaction_timeline(
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     decoy_id: UUID = Query(...),
     hours: int = Query(24, ge=1, le=720),
 ):
-    """Get interaction timeline for a decoy."""
+    """Get interaction timeline for a decoy (404 outside the caller's organisation)."""
     try:
+        decoy = await get_decoy_or_404(db, decoy_id, org_id)
+        decoy_name = decoy.name
         cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
 
         result = await db.execute(
@@ -901,19 +871,13 @@ async def get_interaction_timeline(
             .where(
                 and_(
                     DecoyInteraction.decoy_id == str(decoy_id),
+                    DecoyInteraction.organization_id == org_id,
                     DecoyInteraction.created_at >= cutoff,
                 )
             )
             .order_by(DecoyInteraction.created_at.asc())
         )
         interactions = list(result.scalars().all())
-
-        # Get decoy name for timeline entries
-        decoy_result = await db.execute(
-            select(Decoy).where(Decoy.id == str(decoy_id))
-        )
-        decoy = decoy_result.scalar_one_or_none()
-        decoy_name = decoy.name if decoy else "Unknown"
 
         entries = [
             InteractionTimelineEntry(
@@ -945,6 +909,8 @@ async def get_interaction_timeline(
             time_span_hours=hours,
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to get interaction timeline: {e}")
         raise HTTPException(
@@ -960,12 +926,12 @@ async def get_interaction_timeline(
 async def get_interaction(
     interaction_id: UUID,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
 ):
     """Get details about a specific interaction."""
     try:
         interaction = await get_interaction_or_404(
-            db, interaction_id, getattr(current_user, "organization_id", None)
+            db, interaction_id, org_id
         )
 
         logger.info(f"Retrieved interaction: {interaction_id}")
@@ -990,12 +956,13 @@ async def investigate_interaction(
     interaction_id: UUID,
     request: InteractionInvestigationRequest,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    current_user: User = Depends(require_role(_ANALYST_ROLES)),
+    org_id: OrganizationId = None,
 ):
     """Trigger deep investigation of an interaction."""
     try:
         interaction = await get_interaction_or_404(
-            db, interaction_id, getattr(current_user, "organization_id", None)
+            db, interaction_id, org_id
         )
 
         # Find correlated interactions (same source IP)
@@ -1005,6 +972,7 @@ async def investigate_interaction(
                 and_(
                     DecoyInteraction.source_ip == interaction.source_ip,
                     DecoyInteraction.id != str(interaction_id),
+                    DecoyInteraction.organization_id == org_id,
                 )
             )
             .order_by(DecoyInteraction.created_at.desc())
@@ -1012,6 +980,9 @@ async def investigate_interaction(
         )
         correlated = list(correlated_result.scalars().all())
 
+        # Only facts recorded on the interaction. No analyzer runs here, so
+        # skill level and confidence are left empty rather than invented
+        # (previously a hard-coded "unknown" / 0.7).
         analysis = InteractionAnalysisResponse(
             interaction_id=interaction_id,
             interaction_type=interaction.interaction_type,
@@ -1019,9 +990,9 @@ async def investigate_interaction(
             is_automated=interaction.is_automated_scan,
             tools_detected=[],
             techniques=interaction.mitre_techniques or [],
-            skill_level="unknown",
+            skill_level="",
             objectives=[],
-            confidence=0.7,
+            confidence=0.0,
         )
 
         logger.info(
@@ -1036,11 +1007,13 @@ async def investigate_interaction(
         try:
             # Look up the decoy for this interaction
             decoy_result = await db.execute(
-                select(Decoy).where(Decoy.id == interaction.decoy_id)
+                select(Decoy).where(
+                    Decoy.id == interaction.decoy_id,
+                    Decoy.organization_id == org_id,
+                )
             )
             decoy = decoy_result.scalar_one_or_none()
             if decoy:
-                org_id = getattr(decoy, "organization_id", None) or getattr(current_user, "organization_id", None)
                 automation = AutomationService(db)
                 await automation.on_deception_triggered(
                     decoy_name=decoy.name,
@@ -1088,7 +1061,8 @@ async def investigate_interaction(
 async def create_campaign(
     request: DeceptionCampaignCreateRequest,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    current_user: User = Depends(require_role(_ANALYST_ROLES)),
+    org_id: OrganizationId = None,
 ):
     """Create a new deception campaign."""
     try:
@@ -1100,8 +1074,8 @@ async def create_campaign(
             decoy_ids=[],
             status="active",
             started_at=datetime.utcnow(),
-            created_by=str(current_user.id) if current_user else None,
-            organization_id=getattr(current_user, 'organization_id', None) or request.organization_id,
+            created_by=str(current_user.id),
+            organization_id=org_id,
         )
 
         db.add(campaign)
@@ -1130,7 +1104,7 @@ async def create_campaign(
 @router.get("/campaigns", response_model=list[DeceptionCampaignResponse])
 async def list_campaigns(
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     objective: str | None = Query(None),
     campaign_status: str | None = Query(None, alias="status"),
     skip: int = Query(0, ge=0),
@@ -1148,9 +1122,7 @@ async def list_campaigns(
             filters.append(DeceptionCampaign.objective == objective)
         if campaign_status:
             filters.append(DeceptionCampaign.status == campaign_status)
-        org_id = getattr(current_user, "organization_id", None)
-        if org_id:
-            filters.append(DeceptionCampaign.organization_id == org_id)
+        filters.append(DeceptionCampaign.organization_id == org_id)
 
         if filters:
             query = query.where(and_(*filters))
@@ -1191,19 +1163,22 @@ async def list_campaigns(
 async def get_campaign_detail(
     campaign_id: UUID,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
 ):
     """Get detailed information about a campaign."""
     try:
         campaign = await get_campaign_or_404(
-            db, campaign_id, getattr(current_user, "organization_id", None)
+            db, campaign_id, org_id
         )
 
         # Fetch associated decoys
         decoys = []
         if campaign.decoy_ids:
             decoy_result = await db.execute(
-                select(Decoy).where(Decoy.id.in_(campaign.decoy_ids))
+                select(Decoy).where(
+                    Decoy.id.in_(campaign.decoy_ids),
+                    Decoy.organization_id == org_id,
+                )
             )
             decoys = list(decoy_result.scalars().all())
 
@@ -1237,12 +1212,13 @@ async def update_campaign_status(
     campaign_id: UUID,
     request: CampaignStatusUpdateRequest,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    current_user: User = Depends(require_role(_ANALYST_ROLES)),
+    org_id: OrganizationId = None,
 ):
     """Update campaign status (pause/resume/complete)."""
     try:
         campaign = await get_campaign_or_404(
-            db, campaign_id, getattr(current_user, "organization_id", None)
+            db, campaign_id, org_id
         )
 
         campaign.status = request.status
@@ -1280,12 +1256,12 @@ async def update_campaign_status(
 async def get_campaign_effectiveness(
     campaign_id: UUID,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
 ):
     """Get effectiveness assessment of a campaign."""
     try:
         campaign = await get_campaign_or_404(
-            db, campaign_id, getattr(current_user, "organization_id", None)
+            db, campaign_id, org_id
         )
 
         # Count interactions across campaign decoys
@@ -1294,7 +1270,8 @@ async def get_campaign_effectiveness(
         if campaign.decoy_ids:
             interaction_count_result = await db.execute(
                 select(func.count(DecoyInteraction.id)).where(
-                    DecoyInteraction.decoy_id.in_(campaign.decoy_ids)
+                    DecoyInteraction.decoy_id.in_(campaign.decoy_ids),
+                    DecoyInteraction.organization_id == org_id,
                 )
             )
             total_interactions = interaction_count_result.scalar() or 0
@@ -1303,7 +1280,8 @@ async def get_campaign_effectiveness(
                 select(
                     func.count(func.distinct(DecoyInteraction.source_ip))
                 ).where(
-                    DecoyInteraction.decoy_id.in_(campaign.decoy_ids)
+                    DecoyInteraction.decoy_id.in_(campaign.decoy_ids),
+                    DecoyInteraction.organization_id == org_id,
                 )
             )
             unique_attackers = attacker_count_result.scalar() or 0
@@ -1330,7 +1308,8 @@ async def get_campaign_effectiveness(
         if campaign.decoy_ids and campaign.start_date:
             first_hit_res = await db.execute(
                 select(func.min(DecoyInteraction.created_at)).where(
-                    DecoyInteraction.decoy_id.in_(campaign.decoy_ids)
+                    DecoyInteraction.decoy_id.in_(campaign.decoy_ids),
+                    DecoyInteraction.organization_id == org_id,
                 )
             )
             first_hit = first_hit_res.scalar()
@@ -1400,7 +1379,7 @@ async def get_campaign_effectiveness(
 @router.get("/dashboard", response_model=DeceptionDashboardResponse)
 async def get_dashboard(
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
 ):
     """Get deception module dashboard statistics.
 
@@ -1409,17 +1388,16 @@ async def get_dashboard(
     vector that let anonymous callers dump any tenant's stats.
     """
     try:
-        organization_id = getattr(current_user, "organization_id", None)
+        organization_id = org_id
         now = datetime.now(timezone.utc)
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         week_start = today_start - timedelta(days=today_start.weekday())
 
         # --- Decoy stats ---
         decoy_base = select(func.count(Decoy.id))
-        if organization_id:
-            decoy_base = decoy_base.where(
-                Decoy.organization_id == organization_id
-            )
+        decoy_base = decoy_base.where(
+            Decoy.organization_id == organization_id
+        )
 
         total_decoys_r = await db.execute(decoy_base)
         total_decoys = total_decoys_r.scalar() or 0
@@ -1436,10 +1414,9 @@ async def get_dashboard(
 
         # --- Token stats ---
         token_base = select(func.count(HoneyToken.id))
-        if organization_id:
-            token_base = token_base.where(
-                HoneyToken.organization_id == organization_id
-            )
+        token_base = token_base.where(
+            HoneyToken.organization_id == organization_id
+        )
 
         total_tokens_r = await db.execute(token_base)
         total_tokens = total_tokens_r.scalar() or 0
@@ -1456,10 +1433,9 @@ async def get_dashboard(
 
         # --- Campaign stats ---
         campaign_base = select(func.count(DeceptionCampaign.id))
-        if organization_id:
-            campaign_base = campaign_base.where(
-                DeceptionCampaign.organization_id == organization_id
-            )
+        campaign_base = campaign_base.where(
+            DeceptionCampaign.organization_id == organization_id
+        )
 
         active_campaigns_r = await db.execute(
             campaign_base.where(DeceptionCampaign.status == "active")
@@ -1473,10 +1449,9 @@ async def get_dashboard(
 
         # --- Interaction stats ---
         interaction_base = select(func.count(DecoyInteraction.id))
-        if organization_id:
-            interaction_base = interaction_base.where(
-                DecoyInteraction.organization_id == organization_id
-            )
+        interaction_base = interaction_base.where(
+            DecoyInteraction.organization_id == organization_id
+        )
 
         interactions_today_r = await db.execute(
             interaction_base.where(
@@ -1496,20 +1471,18 @@ async def get_dashboard(
         attacker_today_q = select(
             func.count(func.distinct(DecoyInteraction.source_ip))
         ).where(DecoyInteraction.created_at >= today_start)
-        if organization_id:
-            attacker_today_q = attacker_today_q.where(
-                DecoyInteraction.organization_id == organization_id
-            )
+        attacker_today_q = attacker_today_q.where(
+            DecoyInteraction.organization_id == organization_id
+        )
         unique_today_r = await db.execute(attacker_today_q)
         unique_attackers_today = unique_today_r.scalar() or 0
 
         attacker_week_q = select(
             func.count(func.distinct(DecoyInteraction.source_ip))
         ).where(DecoyInteraction.created_at >= week_start)
-        if organization_id:
-            attacker_week_q = attacker_week_q.where(
-                DecoyInteraction.organization_id == organization_id
-            )
+        attacker_week_q = attacker_week_q.where(
+            DecoyInteraction.organization_id == organization_id
+        )
         unique_week_r = await db.execute(attacker_week_q)
         unique_attackers_week = unique_week_r.scalar() or 0
 
@@ -1539,10 +1512,9 @@ async def get_dashboard(
                 DecoyInteraction.session_duration_seconds.is_not(None),
             )
         )
-        if organization_id:
-            avg_duration_q = avg_duration_q.where(
-                DecoyInteraction.organization_id == organization_id
-            )
+        avg_duration_q = avg_duration_q.where(
+            DecoyInteraction.organization_id == organization_id
+        )
         avg_duration_r = await db.execute(avg_duration_q)
         avg_session_duration = float(avg_duration_r.scalar() or 0.0)
 
@@ -1570,10 +1542,9 @@ async def get_dashboard(
             .order_by(DecoyInteraction.created_at.desc())
             .limit(10)
         )
-        if organization_id:
-            recent_q = recent_q.where(
-                DecoyInteraction.organization_id == organization_id
-            )
+        recent_q = recent_q.where(
+            DecoyInteraction.organization_id == organization_id
+        )
         recent_result = await db.execute(recent_q)
         recent_interactions = list(recent_result.scalars().all())
 
@@ -1581,10 +1552,9 @@ async def get_dashboard(
         active_campaigns_q = select(DeceptionCampaign).where(
             DeceptionCampaign.status == "active"
         )
-        if organization_id:
-            active_campaigns_q = active_campaigns_q.where(
-                DeceptionCampaign.organization_id == organization_id
-            )
+        active_campaigns_q = active_campaigns_q.where(
+            DeceptionCampaign.organization_id == organization_id
+        )
         active_camp_result = await db.execute(active_campaigns_q)
         active_camp_list = list(active_camp_result.scalars().all())
 
@@ -1604,10 +1574,9 @@ async def get_dashboard(
             .order_by(func.count(DecoyInteraction.id).desc())
             .limit(5)
         )
-        if organization_id:
-            top_attackers_q = top_attackers_q.where(
-                DecoyInteraction.organization_id == organization_id
-            )
+        top_attackers_q = top_attackers_q.where(
+            DecoyInteraction.organization_id == organization_id
+        )
         top_attackers_result = await db.execute(top_attackers_q)
         top_attacker_profiles = [
             {
@@ -1676,17 +1645,16 @@ async def get_dashboard(
 @router.get("/coverage", response_model=CoverageMapResponse)
 async def get_coverage_map(
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
 ):
     """Get network coverage map for deception infrastructure.
 
     Authenticated and org-scoped. No client-supplied organization_id.
     """
     try:
-        organization_id = getattr(current_user, "organization_id", None)
+        organization_id = org_id
         query = select(Decoy).where(Decoy.status == "active")
-        if organization_id:
-            query = query.where(Decoy.organization_id == organization_id)
+        query = query.where(Decoy.organization_id == organization_id)
 
         result = await db.execute(query)
         decoys = list(result.scalars().all())
@@ -1740,22 +1708,21 @@ async def get_coverage_map(
 @router.get("/recommendations", response_model=RecommendationsResponse)
 async def get_recommendations(
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
 ):
     """Get recommendations for improving deception coverage.
 
     Authenticated and org-scoped. No client-supplied organization_id.
     """
     try:
-        organization_id = getattr(current_user, "organization_id", None)
+        organization_id = org_id
         # Count decoys by category to find gaps
         query = (
             select(Decoy.category, func.count(Decoy.id))
             .where(Decoy.status == "active")
             .group_by(Decoy.category)
         )
-        if organization_id:
-            query = query.where(Decoy.organization_id == organization_id)
+        query = query.where(Decoy.organization_id == organization_id)
 
         result = await db.execute(query)
         coverage_by_category = dict(result.all())

@@ -58,9 +58,13 @@ async def _org_user(db_session, *, email: str, org: str | None, role: str = "ana
 
 def test_authorize_channel_rules() -> None:
     allow = ConnectionManager.authorize_channel
-    # Default channels are open to every authenticated user.
-    for channel in ("alerts", "incidents", "playbooks", "system"):
-        assert allow(channel, organization_id=ORG_A, is_superuser=False)
+    # Default channels are per tenant: own org allowed, other orgs and the
+    # bare (formerly cross-tenant) names refused.
+    for prefix in ("alerts", "incidents", "playbooks", "system"):
+        assert allow(f"{prefix}:{ORG_A}", organization_id=ORG_A, is_superuser=False)
+        assert not allow(f"{prefix}:{ORG_B}", organization_id=ORG_A, is_superuser=False)
+        assert not allow(prefix, organization_id=ORG_A, is_superuser=False)
+        assert not allow(prefix, organization_id=ORG_A, is_superuser=True)
     # Own-org channels are allowed, other orgs are not.
     assert allow(f"agents:{ORG_A}", organization_id=ORG_A, is_superuser=False)
     assert allow(f"purple:{ORG_A}:sim-1", organization_id=ORG_A, is_superuser=False)
@@ -99,7 +103,7 @@ async def test_manager_refuses_other_tenant_channel_and_does_not_deliver() -> No
 @pytest.mark.asyncio
 async def test_manager_refuses_unknown_user_and_allows_superuser() -> None:
     mgr = ConnectionManager()
-    assert await mgr.subscribe("never-connected", "alerts") is False
+    assert await mgr.subscribe("never-connected", f"alerts:{ORG_A}") is False
     await mgr.connect(_FakeSocket(), "root", organization_id=None, is_superuser=True)
     assert await mgr.subscribe("root", f"agents:{ORG_B}") is True
 

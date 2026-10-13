@@ -18,7 +18,7 @@ from types import SimpleNamespace
 import pytest
 
 from src.siem.models import CorrelationEvent, DetectionRule, LogEntry
-from src.simulation.models import SimulationTest
+from src.simulation.models import AttackSimulation, SimulationTest
 
 
 TECH = "T1059.001"
@@ -28,9 +28,9 @@ def _technique():
     return SimpleNamespace(mitre_id=TECH)
 
 
-def _test_obj(mode="real", started_minutes_ago=2):
+def _test_obj(simulation_id: str, mode="real", started_minutes_ago=2):
     return SimulationTest(
-        simulation_id="sim-1",
+        simulation_id=simulation_id,
         technique_id="tech-1",
         test_name="purple test",
         status="running",
@@ -40,8 +40,30 @@ def _test_obj(mode="real", started_minutes_ago=2):
 
 
 @pytest.fixture
-async def active_rule(db_session):
+async def simulation(db_session, org_a, org_a_user):
+    """A real simulation owned by org A: detection is judged per tenant."""
+    sim = AttackSimulation(
+        name="purple sim",
+        simulation_type="atomic_test",
+        status="running",
+        target_environment="lab",
+        scope={},
+        mitre_tactics=[],
+        mitre_techniques=[TECH],
+        created_by=org_a_user.id,
+        organization_id=org_a.id,
+    )
+    db_session.add(sim)
+    await db_session.commit()
+    await db_session.refresh(sim)
+    # Plain values: later commits in a test expire ORM attributes.
+    return SimpleNamespace(id=sim.id, organization_id=sim.organization_id)
+
+
+@pytest.fixture
+async def active_rule(db_session, simulation):
     rule = DetectionRule(
+        organization_id=simulation.organization_id,
         name=f"win-powershell-spawn-{datetime.now(timezone.utc).timestamp()}",
         title="PowerShell spawned by Office app",
         status="active",
@@ -54,8 +76,9 @@ async def active_rule(db_session):
     return rule
 
 
-def _log_entry(rule_id: str, received: datetime) -> LogEntry:
+def _log_entry(rule_id: str, received: datetime, organization_id: str) -> LogEntry:
     return LogEntry(
+        organization_id=organization_id,
         timestamp=received.isoformat(),
         received_at=received.isoformat(),
         source_type="endpoint",
@@ -74,13 +97,13 @@ async def _orchestrator(db_session):
 
 
 @pytest.mark.asyncio
-async def test_real_execution_detected_when_rule_fired_in_window(db_session, active_rule):
+async def test_real_execution_detected_when_rule_fired_in_window(db_session, simulation, active_rule):
     fired = datetime.now(timezone.utc) - timedelta(seconds=60)
-    db_session.add(_log_entry(active_rule.id, fired))
+    db_session.add(_log_entry(active_rule.id, fired, active_rule.organization_id))
     await db_session.commit()
 
     orch = await _orchestrator(db_session)
-    test = _test_obj(mode="real", started_minutes_ago=2)
+    test = _test_obj(simulation.id, mode="real", started_minutes_ago=2)
     detected = await orch._check_detection(test, _technique())
 
     assert detected is True
@@ -93,9 +116,9 @@ async def test_real_execution_detected_when_rule_fired_in_window(db_session, act
 
 
 @pytest.mark.asyncio
-async def test_real_execution_not_detected_when_nothing_fired(db_session, active_rule):
+async def test_real_execution_not_detected_when_nothing_fired(db_session, simulation, active_rule):
     orch = await _orchestrator(db_session)
-    test = _test_obj(mode="real")
+    test = _test_obj(simulation.id, mode="real")
     detected = await orch._check_detection(test, _technique())
 
     assert detected is False
@@ -107,13 +130,13 @@ async def test_real_execution_not_detected_when_nothing_fired(db_session, active
 
 
 @pytest.mark.asyncio
-async def test_real_execution_ignores_matches_outside_window(db_session, active_rule):
+async def test_real_execution_ignores_matches_outside_window(db_session, simulation, active_rule):
     stale = datetime.now(timezone.utc) - timedelta(hours=3)
-    db_session.add(_log_entry(active_rule.id, stale))
+    db_session.add(_log_entry(active_rule.id, stale, active_rule.organization_id))
     await db_session.commit()
 
     orch = await _orchestrator(db_session)
-    test = _test_obj(mode="real", started_minutes_ago=2)
+    test = _test_obj(simulation.id, mode="real", started_minutes_ago=2)
     detected = await orch._check_detection(test, _technique())
 
     assert detected is False
@@ -121,9 +144,10 @@ async def test_real_execution_ignores_matches_outside_window(db_session, active_
 
 
 @pytest.mark.asyncio
-async def test_real_execution_detects_via_correlation_event(db_session, active_rule):
+async def test_real_execution_detects_via_correlation_event(db_session, simulation, active_rule):
     now = datetime.now(timezone.utc)
     event = CorrelationEvent(
+        organization_id=active_rule.organization_id,
         correlation_id="corr-1",
         name="Office spawning shells",
         severity="high",
@@ -135,7 +159,7 @@ async def test_real_execution_detects_via_correlation_event(db_session, active_r
     await db_session.commit()
 
     orch = await _orchestrator(db_session)
-    test = _test_obj(mode="real", started_minutes_ago=2)
+    test = _test_obj(simulation.id, mode="real", started_minutes_ago=2)
     detected = await orch._check_detection(test, _technique())
 
     assert detected is True
@@ -144,9 +168,9 @@ async def test_real_execution_detects_via_correlation_event(db_session, active_r
 
 
 @pytest.mark.asyncio
-async def test_coverage_only_mode_keeps_mapping_score(db_session, active_rule):
+async def test_coverage_only_mode_keeps_mapping_score(db_session, simulation, active_rule):
     orch = await _orchestrator(db_session)
-    test = _test_obj(mode="coverage_only")
+    test = _test_obj(simulation.id, mode="coverage_only")
     detected = await orch._check_detection(test, _technique())
 
     assert detected is True
@@ -156,8 +180,8 @@ async def test_coverage_only_mode_keeps_mapping_score(db_session, active_rule):
 
 
 @pytest.mark.asyncio
-async def test_no_rule_at_all_is_never_detected(db_session):
+async def test_no_rule_at_all_is_never_detected(db_session, simulation):
     orch = await _orchestrator(db_session)
     for mode in ("real", "coverage_only"):
-        test = _test_obj(mode=mode)
+        test = _test_obj(simulation.id, mode=mode)
         assert await orch._check_detection(test, _technique()) is False

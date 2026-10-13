@@ -10,7 +10,7 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from src.api.deps import CurrentUser, DatabaseSession, require_role
+from src.api.deps import CurrentUser, DatabaseSession, OrganizationId, require_role
 # Credential envelope helpers live in src.core.secrets (design v2 section 10);
 # re-exported here because settings.py, main.py and siem/cloud_poller.py
 # import them from this module.
@@ -18,7 +18,7 @@ from src.core.secrets import _decrypt_secret_json, _encrypt_secret_json  # noqa:
 from src.core.security import get_password_hash
 from src.core.utils import safe_json_loads
 from src.integrations.engine import ConnectorRegistry, IntegrationManager, ActionExecutor
-from src.models.user import User, UserRole
+from src.models.user import UserRole
 from src.integrations.models import (
     IntegrationAction,
     IntegrationConnector,
@@ -55,6 +55,14 @@ from src.schemas.integrations import (
 
 router = APIRouter(prefix="/integrations", tags=["Integrations"])
 
+# Role gates (wave 1). The connector catalogue is a global, read-only
+# registry; installed integrations, executions and webhooks are tenant-owned.
+# Install / uninstall / configure / credential updates / enable / disable and
+# webhook registration are configuration (admin); running actions and
+# connection tests are operational (analyst+); viewers are read-only.
+_ADMIN = Depends(require_role([UserRole.ADMIN]))
+_ANALYST = Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))
+
 # Shared instances (in production, use dependency injection)
 registry = ConnectorRegistry()
 manager = IntegrationManager(registry)
@@ -65,16 +73,17 @@ executor = ActionExecutor()
 async def get_installed_integration_or_404(
     db: AsyncSession,
     integration_id: str,
-    org_id: Optional[str] = None,
+    org_id: str,
 ) -> InstalledIntegration:
-    """Get installed integration by ID or raise 404"""
+    """Get the caller's installed integration by ID; another tenant's is a 404."""
     stmt = (
         select(InstalledIntegration)
         .options(selectinload(InstalledIntegration.connector))
-        .where(InstalledIntegration.id == integration_id)
+        .where(
+            InstalledIntegration.id == integration_id,
+            InstalledIntegration.organization_id == org_id,
+        )
     )
-    if org_id is not None:
-        stmt = stmt.where(InstalledIntegration.organization_id == org_id)
     result = await db.execute(stmt)
     integration = result.scalar_one_or_none()
     if not integration:
@@ -215,10 +224,15 @@ async def get_connector_details(
 
 
 # Installed integrations endpoints
-@router.post("/install", response_model=InstalledIntegrationResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/install",
+    response_model=InstalledIntegrationResponse,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[_ADMIN],
+)
 async def install_connector(
     request: IntegrationInstallRequest,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Install a connector"""
@@ -234,7 +248,7 @@ async def install_connector(
     result = await db.execute(
         select(InstalledIntegration).where(
             and_(
-                InstalledIntegration.organization_id == getattr(current_user, "organization_id", None),
+                InstalledIntegration.organization_id == org_id,
                 InstalledIntegration.connector_id == request.connector_id,
             ),
         ),
@@ -249,7 +263,7 @@ async def install_connector(
     # serialize through the encrypt helper for consistency; credentials
     # are AES-256-GCM encrypted at rest.
     installation = InstalledIntegration(
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         connector_id=request.connector_id,
         display_name=request.display_name,
         config_encrypted=json.dumps(request.config),  # non-secret
@@ -279,7 +293,7 @@ async def install_connector(
 
 @router.get("/installed", response_model=InstalledIntegrationListResponse)
 async def list_installed_integrations(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -292,7 +306,7 @@ async def list_installed_integrations(
     )
 
     # Filter by organization
-    query = query.where(InstalledIntegration.organization_id == getattr(current_user, "organization_id", None))
+    query = query.where(InstalledIntegration.organization_id == org_id)
 
     # Apply status filter
     if status:
@@ -350,21 +364,12 @@ async def list_installed_integrations(
 
 @router.get("/installed/{integration_id}", response_model=InstalledIntegrationResponse)
 async def get_installed_integration(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     integration_id: str = Path(...),
 ):
     """Get details of installed integration"""
-    integration = await get_installed_integration_or_404(
-        db, integration_id, getattr(current_user, "organization_id", None)
-    )
-
-    # Check authorization
-    if integration.organization_id != getattr(current_user, "organization_id", None):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access denied",
-        )
+    integration = await get_installed_integration_or_404(db, integration_id, org_id)
 
     return InstalledIntegrationResponse(
         id=integration.id,
@@ -383,24 +388,15 @@ async def get_installed_integration(
     )
 
 
-@router.patch("/installed/{integration_id}", response_model=InstalledIntegrationResponse)
+@router.patch("/installed/{integration_id}", response_model=InstalledIntegrationResponse, dependencies=[_ADMIN])
 async def update_installed_integration(
     request: InstalledIntegrationUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     integration_id: str = Path(...),
 ):
     """Update installed integration configuration"""
-    integration = await get_installed_integration_or_404(
-        db, integration_id, getattr(current_user, "organization_id", None)
-    )
-
-    # Check authorization
-    if integration.organization_id != getattr(current_user, "organization_id", None):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access denied",
-        )
+    integration = await get_installed_integration_or_404(db, integration_id, org_id)
 
     # Update fields — credentials always encrypted at rest.
     if request.display_name:
@@ -430,23 +426,14 @@ async def update_installed_integration(
     )
 
 
-@router.post("/installed/{integration_id}/test", response_model=IntegrationTestResponse)
+@router.post("/installed/{integration_id}/test", response_model=IntegrationTestResponse, dependencies=[_ANALYST])
 async def test_integration(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     integration_id: str = Path(...),
 ):
     """Test connection to installed integration"""
-    integration = await get_installed_integration_or_404(
-        db, integration_id, getattr(current_user, "organization_id", None)
-    )
-
-    # Check authorization
-    if integration.organization_id != getattr(current_user, "organization_id", None):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access denied",
-        )
+    integration = await get_installed_integration_or_404(db, integration_id, org_id)
 
     # Real connection test: resolve the connector's test URL and probe it.
     # If the connector has no built-in test URL we check the stored
@@ -507,23 +494,14 @@ async def test_integration(
     )
 
 
-@router.post("/installed/{integration_id}/enable", response_model=IntegrationStatusResponse)
+@router.post("/installed/{integration_id}/enable", response_model=IntegrationStatusResponse, dependencies=[_ADMIN])
 async def enable_integration(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     integration_id: str = Path(...),
 ):
     """Enable integration"""
-    integration = await get_installed_integration_or_404(
-        db, integration_id, getattr(current_user, "organization_id", None)
-    )
-
-    # Check authorization
-    if integration.organization_id != getattr(current_user, "organization_id", None):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access denied",
-        )
+    integration = await get_installed_integration_or_404(db, integration_id, org_id)
 
     integration.status = "active"
     await db.commit()
@@ -540,23 +518,14 @@ async def enable_integration(
     )
 
 
-@router.post("/installed/{integration_id}/disable", response_model=IntegrationStatusResponse)
+@router.post("/installed/{integration_id}/disable", response_model=IntegrationStatusResponse, dependencies=[_ADMIN])
 async def disable_integration(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     integration_id: str = Path(...),
 ):
     """Disable integration"""
-    integration = await get_installed_integration_or_404(
-        db, integration_id, getattr(current_user, "organization_id", None)
-    )
-
-    # Check authorization
-    if integration.organization_id != getattr(current_user, "organization_id", None):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access denied",
-        )
+    integration = await get_installed_integration_or_404(db, integration_id, org_id)
 
     integration.status = "inactive"
     await db.commit()
@@ -573,23 +542,14 @@ async def disable_integration(
     )
 
 
-@router.delete("/installed/{integration_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/installed/{integration_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=[_ADMIN])
 async def uninstall_integration(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     integration_id: str = Path(...),
 ):
     """Uninstall integration"""
-    integration = await get_installed_integration_or_404(
-        db, integration_id, getattr(current_user, "organization_id", None)
-    )
-
-    # Check authorization
-    if integration.organization_id != getattr(current_user, "organization_id", None):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access denied",
-        )
+    integration = await get_installed_integration_or_404(db, integration_id, org_id)
 
     await db.delete(integration)
     await db.commit()
@@ -598,23 +558,14 @@ async def uninstall_integration(
 # Action endpoints
 @router.get("/installed/{integration_id}/actions", response_model=IntegrationActionListResponse)
 async def list_integration_actions(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     integration_id: str = Path(...),
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
 ):
     """List available actions for integration"""
-    integration = await get_installed_integration_or_404(
-        db, integration_id, getattr(current_user, "organization_id", None)
-    )
-
-    # Check authorization
-    if integration.organization_id != getattr(current_user, "organization_id", None):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access denied",
-        )
+    integration = await get_installed_integration_or_404(db, integration_id, org_id)
 
     # Get actions for this connector
     query = select(IntegrationAction).where(
@@ -669,10 +620,11 @@ async def list_integration_actions(
     "/installed/{integration_id}/actions/{action_id}/execute",
     response_model=IntegrationExecutionResponse,
     status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[_ANALYST],
 )
 async def execute_action(
     request: ActionExecutionRequest,
-    current_user: User = Depends(require_role([UserRole.ADMIN, UserRole.ANALYST])),
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     integration_id: str = Path(...),
     action_id: str = Path(...),
@@ -682,16 +634,7 @@ async def execute_action(
     Actions run outbound calls with the integration's stored credentials;
     viewers are refused.
     """
-    integration = await get_installed_integration_or_404(
-        db, integration_id, getattr(current_user, "organization_id", None)
-    )
-
-    # Check authorization
-    if integration.organization_id != getattr(current_user, "organization_id", None):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access denied",
-        )
+    integration = await get_installed_integration_or_404(db, integration_id, org_id)
 
     # Get action — scoped to the installed integration's connector so an
     # action belonging to a different connector can't be executed here.
@@ -707,7 +650,7 @@ async def execute_action(
 
     # Create execution record
     execution = IntegrationExecution(
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         installed_id=integration_id,
         action_id=action_id,
         triggered_by="manual",
@@ -746,7 +689,7 @@ async def execute_action(
     response_model=ExecutionHistoryListResponse,
 )
 async def get_execution_history(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     integration_id: str = Path(...),
     page: int = Query(1, ge=1),
@@ -754,19 +697,11 @@ async def get_execution_history(
     status: Optional[str] = None,
 ):
     """Get execution history for integration"""
-    integration = await get_installed_integration_or_404(
-        db, integration_id, getattr(current_user, "organization_id", None)
-    )
-
-    # Check authorization
-    if integration.organization_id != getattr(current_user, "organization_id", None):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access denied",
-        )
+    await get_installed_integration_or_404(db, integration_id, org_id)
 
     query = select(IntegrationExecution).where(
         IntegrationExecution.installed_id == integration_id,
+        IntegrationExecution.organization_id == org_id,
     )
 
     # Filter by status
@@ -823,28 +758,20 @@ async def get_execution_history(
     "/installed/{integration_id}/webhooks",
     response_model=WebhookResponse,
     status_code=status.HTTP_201_CREATED,
+    dependencies=[_ADMIN],
 )
 async def register_webhook(
     request: WebhookRegisterRequest,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     integration_id: str = Path(...),
 ):
     """Register webhook for integration"""
-    integration = await get_installed_integration_or_404(
-        db, integration_id, getattr(current_user, "organization_id", None)
-    )
-
-    # Check authorization
-    if integration.organization_id != getattr(current_user, "organization_id", None):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access denied",
-        )
+    await get_installed_integration_or_404(db, integration_id, org_id)
 
     # Create webhook
     webhook = WebhookEndpoint(
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         installed_id=integration_id,
         endpoint_path=request.endpoint_path,
         http_method=request.http_method,
@@ -876,26 +803,18 @@ async def register_webhook(
     response_model=WebhookListResponse,
 )
 async def list_webhooks(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     integration_id: str = Path(...),
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
 ):
     """List webhooks for integration"""
-    integration = await get_installed_integration_or_404(
-        db, integration_id, getattr(current_user, "organization_id", None)
-    )
-
-    # Check authorization
-    if integration.organization_id != getattr(current_user, "organization_id", None):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access denied",
-        )
+    await get_installed_integration_or_404(db, integration_id, org_id)
 
     query = select(WebhookEndpoint).where(
         WebhookEndpoint.installed_id == integration_id,
+        WebhookEndpoint.organization_id == org_id,
     )
 
     # Get total count
@@ -941,88 +860,58 @@ async def list_webhooks(
 
 @router.post(
     "/installed/{integration_id}/webhooks/{webhook_id}/test",
+    dependencies=[_ANALYST],
 )
 async def test_webhook(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     integration_id: str = Path(...),
     webhook_id: str = Path(...),
 ):
-    """Fire a synthetic test event through the webhook processing pipeline.
+    """Webhook test: not implemented.
 
-    Looks up the webhook, verifies tenant ownership, constructs a
-    ``pysoar.webhook.test`` payload, and records the test in the webhook's
-    ``last_received`` / ``received_count`` counters. Returns the synthetic
-    payload so the UI can display what was fired.
+    PySOAR has no public inbound receiver route for registered webhook
+    endpoints, so there is no pipeline a test event could pass through. This
+    route used to bump ``received_count``/``last_received`` with a synthetic
+    payload, inflating the inbound counters with events that never arrived.
+    It now returns 501 after the tenant-scoped lookup.
     """
-    integration = await get_installed_integration_or_404(
-        db, integration_id, getattr(current_user, "organization_id", None)
-    )
-    if integration.organization_id != getattr(current_user, "organization_id", None):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access denied",
-        )
-
+    await get_installed_integration_or_404(db, integration_id, org_id)
     result = await db.execute(
         select(WebhookEndpoint).where(
             WebhookEndpoint.id == webhook_id,
             WebhookEndpoint.installed_id == integration_id,
+            WebhookEndpoint.organization_id == org_id,
         )
     )
-    webhook = result.scalar_one_or_none()
-    if not webhook:
+    if result.scalar_one_or_none() is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Webhook not found",
         )
-
-    test_payload = {
-        "event": "pysoar.webhook.test",
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "webhook_id": webhook_id,
-        "integration_id": integration_id,
-        "source": "ui_test_button",
-        "actor_id": getattr(current_user, "id", None),
-    }
-
-    # Record the synthetic test in the webhook's counters so operators see it
-    # reflected in the UI immediately.
-    webhook.last_received = datetime.utcnow()
-    webhook.received_count = (webhook.received_count or 0) + 1
-    await db.commit()
-    await db.refresh(webhook)
-
-    return {
-        "status": "test_fired",
-        "webhook_id": webhook_id,
-        "endpoint_path": webhook.endpoint_path,
-        "payload": test_payload,
-        "received_count": webhook.received_count,
-    }
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail={
+            "error": "not_implemented",
+            "detail": "PySOAR has no inbound webhook receiver yet, so a test event "
+            "cannot be delivered through a registered webhook endpoint",
+        },
+    )
 
 
 @router.delete(
     "/installed/{integration_id}/webhooks/{webhook_id}",
     status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[_ADMIN],
 )
 async def delete_webhook(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     integration_id: str = Path(...),
     webhook_id: str = Path(...),
 ):
     """Delete webhook"""
-    integration = await get_installed_integration_or_404(
-        db, integration_id, getattr(current_user, "organization_id", None)
-    )
-
-    # Check authorization
-    if integration.organization_id != getattr(current_user, "organization_id", None):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access denied",
-        )
+    await get_installed_integration_or_404(db, integration_id, org_id)
 
     # Get webhook — scoped to this installed integration so a webhook
     # belonging to another tenant's install can't be deleted by id.
@@ -1031,6 +920,7 @@ async def delete_webhook(
             and_(
                 WebhookEndpoint.id == webhook_id,
                 WebhookEndpoint.installed_id == integration_id,
+                WebhookEndpoint.organization_id == org_id,
             )
         ),
     )
@@ -1052,7 +942,7 @@ async def delete_webhook(
 
 
 async def _compute_integration_health(
-    db: AsyncSession, org_id: Optional[str]
+    db: AsyncSession, org_id: str
 ) -> tuple[list[InstalledIntegration], dict[str, int]]:
     query = select(InstalledIntegration).where(
         InstalledIntegration.organization_id == org_id
@@ -1072,7 +962,7 @@ async def _compute_integration_health(
 
 async def _compute_execution_stats(
     db: AsyncSession,
-    org_id: Optional[str],
+    org_id: str,
     period: str,
 ) -> dict[str, Any]:
     """Real IntegrationExecution aggregates over the requested window."""
@@ -1112,7 +1002,10 @@ async def _compute_execution_stats(
         inst_rows = await db.execute(
             select(InstalledIntegration)
             .options(selectinload(InstalledIntegration.connector))
-            .where(InstalledIntegration.id.in_(installed_ids))
+            .where(
+                InstalledIntegration.id.in_(installed_ids),
+                InstalledIntegration.organization_id == org_id,
+            )
         )
         for inst in inst_rows.scalars().all():
             cname = getattr(inst.connector, "name", None) if inst.connector else None
@@ -1130,7 +1023,7 @@ async def _compute_execution_stats(
             select(IntegrationAction).where(IntegrationAction.id.in_(action_ids))
         )
         for a in act_rows.scalars().all():
-            action_map[a.id] = getattr(a, "action_type", None) or a.name or "unknown"
+            action_map[a.id] = getattr(a, "action_type", None) or a.action_name or "unknown"
     for e in executions:
         atype = action_map.get(e.action_id, "unknown")
         by_action_type[atype] = by_action_type.get(atype, 0) + 1
@@ -1153,7 +1046,7 @@ async def _compute_execution_stats(
 
 @router.get("/dashboard/health", response_model=DashboardIntegrationHealthResponse)
 async def get_health_dashboard(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Get integration health overview dashboard.
@@ -1162,7 +1055,6 @@ async def get_health_dashboard(
     so the per-integration table on the frontend had no rows. Now
     serializes the actual installed integrations into the list.
     """
-    org_id = getattr(current_user, "organization_id", None)
     integrations, health_counts = await _compute_integration_health(db, org_id)
 
     # Re-fetch with connector eager-loaded so we can resolve the
@@ -1209,7 +1101,7 @@ async def get_health_dashboard(
 
 @router.get("/dashboard/stats", response_model=DashboardExecutionStatsResponse)
 async def get_execution_stats(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     period: str = Query("day", pattern="^(hour|day|week|month)$"),
 ):
@@ -1219,7 +1111,6 @@ async def get_execution_stats(
     tenant regardless of how many IntegrationExecution rows existed.
     Now runs real aggregates over the requested window.
     """
-    org_id = getattr(current_user, "organization_id", None)
     stats = await _compute_execution_stats(db, org_id, period)
 
     return DashboardExecutionStatsResponse(
@@ -1235,7 +1126,7 @@ async def get_execution_stats(
 
 @router.get("/dashboard/summary", response_model=DashboardSummaryResponse)
 async def get_dashboard_summary(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Get complete dashboard summary with real top_connectors + high_error_rate.
@@ -1250,7 +1141,6 @@ async def get_dashboard_summary(
       - success_rate and avg_execution_time_ms come from the same
         window.
     """
-    org_id = getattr(current_user, "organization_id", None)
     integrations, health_counts = await _compute_integration_health(db, org_id)
     stats = await _compute_execution_stats(db, org_id, period="day")
 

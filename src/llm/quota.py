@@ -640,6 +640,7 @@ async def record_budget_event(
             "llm_budget",
             f"LLM {bucket} token budget at {pct}%",
             {"organization_id": org_id, "bucket": bucket, "pct": pct, "used": used, "cap": cap},
+            organization_id=org_id,
         )
     except Exception as exc:  # noqa: BLE001 - notification is best effort, audit row is not
         logger.warning("llm_budget_notify_failed", organization_id=org_id, error=str(exc))

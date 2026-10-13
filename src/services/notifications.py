@@ -28,7 +28,6 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 import httpx
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.logging import get_logger
@@ -41,16 +40,20 @@ HTTP_TIMEOUT = 6.0  # seconds
 async def _load_integration(
     db: AsyncSession, org_id: Optional[str], integration_id: str
 ) -> Optional[dict[str, Any]]:
-    """Return the stored config dict for (org, integration), or None."""
-    from src.models.settings import AppSetting
-    section = f"integration:{integration_id}"
-    stmt = select(AppSetting).where(AppSetting.section == section)
-    if org_id is not None:
-        stmt = stmt.where(AppSetting.organization_id == org_id)
-    row = (await db.execute(stmt)).scalar_one_or_none()
-    if row and isinstance(row.value, dict) and row.value:
-        return row.value
-    return None
+    """Return the organisation's stored config for ``integration_id``, or None.
+
+    Always scoped to ``org_id`` (None reads nothing: no cross-tenant default)
+    with ``enc:v1:`` secrets opened. Slack / Teams also honour the webhook
+    saved under Settings > Notifications.
+    """
+    from src.services.tenant_settings import load_tenant_section, notification_webhook_for
+
+    config = await load_tenant_section(db, org_id, f"integration:{integration_id}")
+    if integration_id in ("slack", "teams") and not config.get("webhook_url"):
+        webhook = await notification_webhook_for(db, org_id, integration_id)
+        if webhook:
+            config = {**config, "webhook_url": webhook}
+    return config or None
 
 
 def _severity_color(severity: str) -> str:

@@ -107,6 +107,9 @@ async def _user(db_session: AsyncSession, email: str, role: str, *, superuser: b
     db_session.add(user)
     await db_session.commit()
     await db_session.refresh(user)
+    # Later commits expire session-bound rows; a detached copy keeps ``user.id``
+    # readable from a sync context (no MissingGreenlet).
+    db_session.expunge(user)
     return user
 
 
@@ -546,7 +549,7 @@ async def test_health_llm_requires_authentication(client: AsyncClient) -> None:
 # ---------------------------------------------------------------------------
 
 async def test_metrics_agentic_exposes_the_three_counters(
-    client: AsyncClient, ai_admin: User
+    client: AsyncClient, ai_admin: User, ai_superuser: User
 ) -> None:
     from src.core import metrics
 
@@ -556,7 +559,10 @@ async def test_metrics_agentic_exposes_the_three_counters(
     metrics.increment(metrics.AGENT_POLICY_DECISIONS_TOTAL, decision="deny", reason="role")
     metrics.increment(metrics.AGENT_INJECTION_EVENTS_TOTAL, tier="lockdown")
 
-    resp = await client.get("/api/v1/metrics/agentic", headers=_headers(ai_admin))
+    # Process-wide counters span every tenant: platform superusers only.
+    denied = await client.get("/api/v1/metrics/agentic", headers=_headers(ai_admin))
+    assert denied.status_code == 403
+    resp = await client.get("/api/v1/metrics/agentic", headers=_headers(ai_superuser))
     assert resp.status_code == 200, resp.text
     body = resp.json()
     counters = body["counters"]

@@ -25,8 +25,9 @@ from sqlalchemy import desc, select
 from src.agents.capabilities import AgentAction
 from src.agents.models import AgentCommand, AgentResult, EndpointAgent
 from src.agents.service import AgentService, AgentServiceError
-from src.api.deps import CurrentUser, DatabaseSession
+from src.api.deps import DatabaseSession, OrganizationId, require_role
 from src.core.logging import get_logger
+from src.models.user import User, UserRole
 from src.schemas.agents import (
     AgentEnrollRequest,
     AgentEnrollResponse,
@@ -48,6 +49,47 @@ from src.agents.attestation import verify_request_signature
 
 logger = get_logger(__name__)
 router = APIRouter(prefix="/agents", tags=["agents"])
+
+# Role gates (wave 1): enrolment, revocation and fleet state changes are
+# configuration (admin); issuing commands is operational (analyst+);
+# approving or rejecting a high-blast command is admin-only and never the
+# issuer. Viewers are read-only.
+_ADMIN = Depends(require_role([UserRole.ADMIN]))
+_ANALYST = Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))
+
+
+async def _get_agent_or_404(session: DatabaseSession, agent_id: str, org_id: str) -> EndpointAgent:
+    """Tenant-scoped agent lookup; another tenant's agent is a 404."""
+    stmt = select(EndpointAgent).where(
+        EndpointAgent.id == agent_id, EndpointAgent.organization_id == org_id,
+    )
+    agent = (await session.execute(stmt)).scalar_one_or_none()
+    if agent is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    return agent
+
+
+async def _get_command_or_404(session: DatabaseSession, command_id: str, org_id: str) -> AgentCommand:
+    """Tenant-scoped command lookup; another tenant's command is a 404."""
+    stmt = select(AgentCommand).where(
+        AgentCommand.id == command_id, AgentCommand.organization_id == org_id,
+    )
+    cmd = (await session.execute(stmt)).scalar_one_or_none()
+    if cmd is None:
+        raise HTTPException(status_code=404, detail="Command not found")
+    return cmd
+
+
+def _refuse_self_approval(cmd: AgentCommand, current_user: User, verb: str) -> None:
+    """Two-person rule: the issuer of a command can never approve or reject it."""
+    if cmd.issued_by and cmd.issued_by == str(current_user.id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "self_approval_forbidden",
+                "detail": f"the user who issued a command cannot {verb} it",
+            },
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -92,7 +134,8 @@ async def _require_agent(
 @router.post("/enroll", response_model=AgentEnrollResponse, status_code=201)
 async def enroll_agent(
     request: AgentEnrollRequest,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    current_user: User = _ADMIN,
     session: DatabaseSession = None,
 ) -> AgentEnrollResponse:
     """Create a new endpoint agent and return its one-time enrollment token.
@@ -109,8 +152,8 @@ async def enroll_agent(
             capabilities=request.capabilities,
             display_name=request.display_name,
             tags=request.tags,
-            enrolled_by=str(current_user.id) if current_user else None,
-            organization_id=getattr(current_user, "organization_id", None),
+            enrolled_by=str(current_user.id),
+            organization_id=org_id,
         )
     except AgentServiceError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -127,7 +170,7 @@ async def enroll_agent(
 
 @router.get("/dashboard")
 async def agents_dashboard(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     session: DatabaseSession = None,
 ) -> dict:
     """Stats feed for the AgentManagement UI tile row.
@@ -143,16 +186,10 @@ async def agents_dashboard(
     except Exception as e:  # noqa: BLE001
         logger.warning(f"mark_stale_agents_offline failed: {e}")
 
-    org_id = getattr(current_user, "organization_id", None)
-
     def _scope(q):
-        if org_id is None:
-            return q
         return q.where(EndpointAgent.organization_id == org_id)
 
     def _scope_cmd(q):
-        if org_id is None:
-            return q
         return q.where(AgentCommand.organization_id == org_id)
 
     total = (await session.execute(_scope(select(_func.count(EndpointAgent.id))))).scalar() or 0
@@ -222,7 +259,7 @@ async def agents_dashboard(
 
 @router.get("", response_model=AgentListResponse)
 async def list_agents(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     session: DatabaseSession = None,
     status_filter: Optional[str] = Query(None, alias="status"),
     capability: Optional[str] = Query(None),
@@ -235,10 +272,7 @@ async def list_agents(
     except Exception as e:  # noqa: BLE001
         logger.warning(f"mark_stale_agents_offline failed: {e}")
 
-    org_id = getattr(current_user, "organization_id", None)
-    stmt = select(EndpointAgent)
-    if org_id is not None:
-        stmt = stmt.where(EndpointAgent.organization_id == org_id)
+    stmt = select(EndpointAgent).where(EndpointAgent.organization_id == org_id)
     if status_filter:
         stmt = stmt.where(EndpointAgent.status == status_filter)
 
@@ -257,56 +291,38 @@ async def list_agents(
 @router.get("/{agent_id}", response_model=AgentSummary)
 async def get_agent(
     agent_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     session: DatabaseSession = None,
 ) -> AgentSummary:
-    org_id = getattr(current_user, "organization_id", None)
-    stmt = select(EndpointAgent).where(EndpointAgent.id == agent_id)
-    if org_id is not None:
-        stmt = stmt.where(EndpointAgent.organization_id == org_id)
-    agent = (await session.execute(stmt)).scalar_one_or_none()
-    if agent is None:
-        raise HTTPException(status_code=404, detail="Agent not found")
+    agent = await _get_agent_or_404(session, agent_id, org_id)
     return AgentSummary.model_validate(agent)
 
 
-@router.post("/{agent_id}/disable")
+@router.post("/{agent_id}/disable", dependencies=[_ADMIN])
 async def disable_agent(
     agent_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     session: DatabaseSession = None,
 ) -> dict:
     """Disable an enrolled agent — future commands are rejected until
     re-enabled. Keeps the agent record and credentials intact so the
     same host can come back online with its existing enrollment.
     """
-    org_id = getattr(current_user, "organization_id", None)
-    stmt = select(EndpointAgent).where(EndpointAgent.id == agent_id)
-    if org_id is not None:
-        stmt = stmt.where(EndpointAgent.organization_id == org_id)
-    agent = (await session.execute(stmt)).scalar_one_or_none()
-    if agent is None:
-        raise HTTPException(status_code=404, detail="Agent not found")
+    agent = await _get_agent_or_404(session, agent_id, org_id)
     agent.status = "disabled"
     await session.flush()
     return {"agent_id": agent.id, "status": agent.status}
 
 
-@router.post("/{agent_id}/enable")
+@router.post("/{agent_id}/enable", dependencies=[_ADMIN])
 async def enable_agent(
     agent_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     session: DatabaseSession = None,
 ) -> dict:
     """Re-enable a disabled agent. Cannot re-enable a revoked agent —
     revocation is permanent."""
-    org_id = getattr(current_user, "organization_id", None)
-    stmt = select(EndpointAgent).where(EndpointAgent.id == agent_id)
-    if org_id is not None:
-        stmt = stmt.where(EndpointAgent.organization_id == org_id)
-    agent = (await session.execute(stmt)).scalar_one_or_none()
-    if agent is None:
-        raise HTTPException(status_code=404, detail="Agent not found")
+    agent = await _get_agent_or_404(session, agent_id, org_id)
     if agent.status == "revoked":
         raise HTTPException(
             status_code=400,
@@ -317,23 +333,17 @@ async def enable_agent(
     return {"agent_id": agent.id, "status": agent.status}
 
 
-@router.post("/{agent_id}/revoke")
+@router.post("/{agent_id}/revoke", dependencies=[_ADMIN])
 async def revoke_agent(
     agent_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     session: DatabaseSession = None,
 ) -> dict:
     """Permanently revoke an agent's credentials. Invalidates its token
     hash so even a replay of the previous token is rejected. Requires
     re-enrollment to reconnect.
     """
-    org_id = getattr(current_user, "organization_id", None)
-    stmt = select(EndpointAgent).where(EndpointAgent.id == agent_id)
-    if org_id is not None:
-        stmt = stmt.where(EndpointAgent.organization_id == org_id)
-    agent = (await session.execute(stmt)).scalar_one_or_none()
-    if agent is None:
-        raise HTTPException(status_code=404, detail="Agent not found")
+    agent = await _get_agent_or_404(session, agent_id, org_id)
     agent.status = "revoked"
     # Invalidate agent token so any replay fails.
     if hasattr(agent, "agent_token_hash"):
@@ -346,16 +356,11 @@ async def revoke_agent(
 async def issue_command(
     agent_id: str,
     request: IssueCommandRequest,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    current_user: User = _ANALYST,
     session: DatabaseSession = None,
 ) -> CommandSummary:
-    org_id = getattr(current_user, "organization_id", None)
-    stmt = select(EndpointAgent).where(EndpointAgent.id == agent_id)
-    if org_id is not None:
-        stmt = stmt.where(EndpointAgent.organization_id == org_id)
-    agent = (await session.execute(stmt)).scalar_one_or_none()
-    if agent is None:
-        raise HTTPException(status_code=404, detail="Agent not found")
+    agent = await _get_agent_or_404(session, agent_id, org_id)
 
     svc = AgentService(session)
     try:
@@ -375,14 +380,13 @@ async def issue_command(
 @router.get("/{agent_id}/commands", response_model=list[CommandSummary])
 async def list_commands(
     agent_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     session: DatabaseSession = None,
     limit: int = Query(50, ge=1, le=500),
 ) -> list[CommandSummary]:
-    org_id = getattr(current_user, "organization_id", None)
-    stmt = select(AgentCommand).where(AgentCommand.agent_id == agent_id)
-    if org_id is not None:
-        stmt = stmt.where(AgentCommand.organization_id == org_id)
+    stmt = select(AgentCommand).where(
+        AgentCommand.agent_id == agent_id, AgentCommand.organization_id == org_id,
+    )
     stmt = stmt.order_by(desc(AgentCommand.created_at)).limit(limit)
     rows = list((await session.execute(stmt)).scalars().all())
     return [CommandSummary.model_validate(r) for r in rows]
@@ -390,7 +394,7 @@ async def list_commands(
 
 @router.get("/commands/pending-approval", response_model=list[CommandSummary])
 async def pending_approval_queue(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     session: DatabaseSession = None,
     limit: int = Query(100, ge=1, le=500),
 ) -> list[CommandSummary]:
@@ -402,10 +406,9 @@ async def pending_approval_queue(
     caller's organization so one tenant's approvers never see another
     tenant's pending commands.
     """
-    org_id = getattr(current_user, "organization_id", None)
-    stmt = select(AgentCommand).where(AgentCommand.status == "awaiting_approval")
-    if org_id is not None:
-        stmt = stmt.where(AgentCommand.organization_id == org_id)
+    stmt = select(AgentCommand).where(
+        AgentCommand.status == "awaiting_approval", AgentCommand.organization_id == org_id,
+    )
     stmt = stmt.order_by(AgentCommand.created_at.asc()).limit(limit)
     rows = list((await session.execute(stmt)).scalars().all())
     return [CommandSummary.model_validate(r) for r in rows]
@@ -415,17 +418,15 @@ async def pending_approval_queue(
 async def approve_command(
     command_id: str,
     request: ApprovalRequest,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    current_user: User = _ADMIN,
     session: DatabaseSession = None,
 ) -> CommandSummary:
-    org_id = getattr(current_user, "organization_id", None)
-    stmt = select(AgentCommand).where(AgentCommand.id == command_id)
-    if org_id is not None:
-        stmt = stmt.where(AgentCommand.organization_id == org_id)
-    cmd = (await session.execute(stmt)).scalar_one_or_none()
-    if cmd is None:
-        raise HTTPException(status_code=404, detail="Command not found")
+    cmd = await _get_command_or_404(session, command_id, org_id)
+    _refuse_self_approval(cmd, current_user, "approve")
 
+    # The approver is always the authenticated session user; the request
+    # body carries only a reason and can never name an approver.
     svc = AgentService(session)
     try:
         cmd = await svc.approve_command(
@@ -442,31 +443,22 @@ async def approve_command(
 async def reject_command(
     command_id: str,
     request: ApprovalRequest,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    current_user: User = _ADMIN,
     session: DatabaseSession = None,
 ) -> CommandSummary:
     """Deny a pending-approval high-blast command.
 
     Rejection is terminal — the rejected row stays in the audit chain
-    so the rejection itself is a signed record. Rejecter must be a
-    different user from the issuer."""
-    org_id = getattr(current_user, "organization_id", None)
-    stmt = select(AgentCommand).where(AgentCommand.id == command_id)
-    if org_id is not None:
-        stmt = stmt.where(AgentCommand.organization_id == org_id)
-    cmd = (await session.execute(stmt)).scalar_one_or_none()
-    if cmd is None:
-        raise HTTPException(status_code=404, detail="Command not found")
+    so the rejection itself is a signed record. Admin only; the rejecter
+    must be a different user from the issuer (403 otherwise)."""
+    cmd = await _get_command_or_404(session, command_id, org_id)
     if cmd.status != "awaiting_approval":
         raise HTTPException(
             status_code=400,
             detail=f"Command status is {cmd.status}; cannot reject",
         )
-    if cmd.issued_by and cmd.issued_by == str(current_user.id):
-        raise HTTPException(
-            status_code=400,
-            detail="Rejecter cannot be the same user who issued the command",
-        )
+    _refuse_self_approval(cmd, current_user, "reject")
     cmd.status = "rejected"
     cmd.approved_by = str(current_user.id)  # audit: who performed the rejection
     from datetime import datetime, timezone
@@ -480,16 +472,10 @@ async def reject_command(
 @router.get("/{agent_id}/verify-chain", response_model=ChainVerificationResponse)
 async def verify_chain(
     agent_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     session: DatabaseSession = None,
 ) -> ChainVerificationResponse:
-    org_id = getattr(current_user, "organization_id", None)
-    stmt = select(EndpointAgent).where(EndpointAgent.id == agent_id)
-    if org_id is not None:
-        stmt = stmt.where(EndpointAgent.organization_id == org_id)
-    agent = (await session.execute(stmt)).scalar_one_or_none()
-    if agent is None:
-        raise HTTPException(status_code=404, detail="Agent not found")
+    agent = await _get_agent_or_404(session, agent_id, org_id)
     svc = AgentService(session)
     result = await svc.verify_chain(agent)
     return ChainVerificationResponse(**result)
@@ -567,7 +553,7 @@ async def agent_heartbeat(
         agent.ip_address = hb_request.ip_address
 
     svc = AgentService(session)
-    await svc.record_heartbeat(agent, telemetry=request.telemetry)
+    await svc.record_heartbeat(agent, telemetry=hb_request.telemetry)
 
     # Zero Trust continuous verification: fold the agent's fresh posture
     # telemetry into its DeviceTrustProfile so the PDP evaluates against

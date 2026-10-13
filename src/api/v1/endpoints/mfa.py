@@ -7,7 +7,6 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select
 
 from src.api.deps import CurrentUser, DatabaseSession, RedisClient
-from src.core.config import settings
 from src.core.mfa import MFAManager
 from src.core.security import create_access_token, create_refresh_token, decode_token_full, verify_token
 from src.core.token_blacklist import TokenBlacklist
@@ -20,6 +19,7 @@ from src.schemas.mfa import (
     MFAVerifyResponse,
     MFAVerifySetupRequest,
 )
+from src.services.tenant_settings import session_timeout_minutes_for
 from src.services.user_service import UserService
 
 logger = logging.getLogger(__name__)
@@ -214,8 +214,12 @@ async def verify_mfa_login(
     await user_service.update_last_login(user_id)
 
     # Issue access and refresh tokens
+    # Token lifetime is the organisation's session timeout (Settings >
+    # Security / General), else the platform default.
+    session_minutes = await session_timeout_minutes_for(db, user.organization_id)
     access_token = create_access_token(
         subject=user.id,
+        expires_delta=timedelta(minutes=session_minutes),
         extra_claims={"role": user.role},
     )
     refresh_token = create_refresh_token(subject=user.id)
@@ -225,7 +229,7 @@ async def verify_mfa_login(
     return MFAVerifyResponse(
         access_token=access_token,
         refresh_token=refresh_token,
-        expires_in=settings.access_token_expire_minutes * 60,
+        expires_in=session_minutes * 60,
     )
 
 

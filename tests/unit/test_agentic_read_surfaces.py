@@ -750,7 +750,10 @@ async def test_metrics_snapshot_counts_a_chat_turns_policy_decisions(
     )
     assert chat.status_code == 200, chat.text
 
-    resp = await client.get("/api/v1/metrics/agentic", headers=_token(admin))
+    # Process-wide counters span every tenant: platform superusers only.
+    operator = await _user(db_session, email="root@read-a.test", role="admin", superuser=True)
+    await db_session.commit()
+    resp = await client.get("/api/v1/metrics/agentic", headers=_token(operator))
     assert resp.status_code == 200, resp.text
     snapshot = resp.json()
     assert snapshot["scope"] == "process"
@@ -772,7 +775,14 @@ async def test_metrics_snapshot_counts_a_chat_turns_policy_decisions(
 async def test_metrics_snapshot_is_admin_only(client, db_session):
     await _orgs(db_session)
     analyst = await _user(db_session, email="analyst2@read-a.test", role="analyst")
+    tenant_admin = await _user(db_session, email="admin2@read-a.test", role="admin")
+    # Build the tokens before commit: commit expires the rows and a lazy
+    # refresh of ``user.id`` outside the greenlet raises MissingGreenlet.
+    analyst_headers, admin_headers = _token(analyst), _token(tenant_admin)
     await db_session.commit()
 
-    resp = await client.get("/api/v1/metrics/agentic", headers=_token(analyst))
+    resp = await client.get("/api/v1/metrics/agentic", headers=analyst_headers)
+    assert resp.status_code == 403
+    # A tenant admin is not a platform operator either.
+    resp = await client.get("/api/v1/metrics/agentic", headers=admin_headers)
     assert resp.status_code == 403

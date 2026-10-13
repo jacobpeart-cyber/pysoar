@@ -186,7 +186,7 @@ async def test_settings_rejects_analyst_and_unknown_keys(client, db_session):
 @pytest.mark.asyncio
 async def test_disabled_setting_keeps_single_approval(client, db_session):
     await _orgs(db_session)
-    analyst = await _user(db_session, email="sod-single@org-c.test", role="analyst")
+    analyst = await _user(db_session, email="sod-single@org-c.test", role="admin")
     action = await _proposal(db_session, proposed_by=analyst.id)
     await db_session.commit()
 
@@ -201,9 +201,9 @@ async def test_disabled_setting_keeps_single_approval(client, db_session):
 async def test_two_distinct_approvers_execute_once(client, db_session):
     await _orgs(db_session)
     await _enable(db_session)
-    proposer = await _user(db_session, email="sod-proposer@org-c.test", role="analyst")
-    first = await _user(db_session, email="sod-first@org-c.test", role="analyst")
-    second = await _user(db_session, email="sod-second@org-c.test", role="analyst")
+    proposer = await _user(db_session, email="sod-proposer@org-c.test", role="admin")
+    first = await _user(db_session, email="sod-first@org-c.test", role="admin")
+    second = await _user(db_session, email="sod-second@org-c.test", role="admin")
     action = await _proposal(db_session, proposed_by=proposer.id)
     await db_session.commit()
     first_id, second_id = first.id, second.id
@@ -221,7 +221,7 @@ async def test_two_distinct_approvers_execute_once(client, db_session):
     assert action.execution_status == ActionExecutionStatus.PENDING_APPROVAL.value
     assert action.first_approved_by == first_id
     assert action.first_approved_at is not None
-    assert action.first_approver_role == "analyst"
+    assert action.first_approver_role == "admin"
     assert action.approved_by is None
 
     # The first approver cannot supply the second approval.
@@ -269,8 +269,8 @@ async def test_two_distinct_approvers_execute_once(client, db_session):
 async def test_proposer_cannot_approve_when_enabled(client, db_session):
     await _orgs(db_session)
     await _enable(db_session)
-    proposer = await _user(db_session, email="sod-self@org-c.test", role="analyst")
-    other = await _user(db_session, email="sod-other@org-c.test", role="analyst")
+    proposer = await _user(db_session, email="sod-self@org-c.test", role="admin")
+    other = await _user(db_session, email="sod-other@org-c.test", role="admin")
     action = await _proposal(db_session, proposed_by=proposer.id)
     await db_session.commit()
 
@@ -293,7 +293,7 @@ async def test_proposer_cannot_approve_when_enabled(client, db_session):
 async def test_proposer_may_still_deny_when_enabled(client, db_session):
     await _orgs(db_session)
     await _enable(db_session)
-    proposer = await _user(db_session, email="sod-withdraw@org-c.test", role="analyst")
+    proposer = await _user(db_session, email="sod-withdraw@org-c.test", role="admin")
     action = await _proposal(db_session, proposed_by=proposer.id)
     await db_session.commit()
 
@@ -310,7 +310,7 @@ async def test_proposer_may_still_deny_when_enabled(client, db_session):
 async def test_setting_of_another_org_does_not_apply(client, db_session):
     await _orgs(db_session)
     await _enable(db_session, org_id=ORG_B)
-    analyst = await _user(db_session, email="sod-orga@org-c.test", role="analyst")
+    analyst = await _user(db_session, email="sod-orga@org-c.test", role="admin")
     action = await _proposal(db_session, proposed_by=analyst.id)
     await db_session.commit()
 
@@ -331,10 +331,10 @@ async def test_suspect_with_second_approver_needs_two_admin_acknowledgements(cli
 
     ack = {"acknowledge_suspect": True, "reason": "raw alert re-read; injected text is irrelevant"}
 
-    # The suspect rule still applies on top: an analyst cannot even record the first approval.
+    # Approving is admin-only (wave 1): an analyst cannot even record the first approval.
     resp = await _approve(client, db_session, analyst, action, reason="fine")
     assert resp.status_code == 403
-    assert resp.json()["detail"]["error"] == "suspect_action_requires_reinvestigation"
+    assert resp.json()["detail"]["error"] == "role_not_permitted"
 
     resp = await _approve(client, db_session, admin1, action, **ack)
     assert resp.status_code == 200, resp.text
@@ -359,8 +359,8 @@ async def test_expiry_between_approvals_blocks_the_second(client, db_session):
 
     await _orgs(db_session)
     await _enable(db_session)
-    first = await _user(db_session, email="sod-exp1@org-c.test", role="analyst")
-    second = await _user(db_session, email="sod-exp2@org-c.test", role="analyst")
+    first = await _user(db_session, email="sod-exp1@org-c.test", role="admin")
+    second = await _user(db_session, email="sod-exp2@org-c.test", role="admin")
     action = await _proposal(db_session)
     await db_session.commit()
 
@@ -384,7 +384,7 @@ async def test_expiry_between_approvals_blocks_the_second(client, db_session):
 async def test_pending_projection_carries_second_approver_state(client, db_session):
     await _orgs(db_session)
     analyst = await _user(db_session, email="sod-list@org-c.test", role="analyst")
-    first = await _user(db_session, email="sod-list-first@org-c.test", role="analyst")
+    first = await _user(db_session, email="sod-list-first@org-c.test", role="admin")
     action = await _proposal(db_session)
     await db_session.commit()
 

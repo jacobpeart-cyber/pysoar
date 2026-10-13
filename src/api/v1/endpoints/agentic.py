@@ -20,10 +20,10 @@ import json
 import math
 import time
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Iterator, Optional
+from typing import Annotated, Any, Iterator, Optional
 
 import structlog
-from fastapi import APIRouter, Body, HTTPException, Path, Query, Request, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query, Request, status
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import String, and_, func, or_, select
@@ -75,7 +75,13 @@ from src.agentic.trust import (
     trust_state_from_dict,
     trust_state_to_dict,
 )
-from src.api.deps import CurrentUser, DatabaseSession, RedisClient
+from src.api.deps import (
+    CurrentUser,
+    DatabaseSession,
+    OrganizationId,
+    RedisClient,
+    resolve_organization_scope,
+)
 from src.audit_evidence.engine import AuditLogger
 from src.audit_evidence.models import AuditTrail
 from src.core.metrics import AGENT_INJECTION_EVENTS_TOTAL
@@ -92,6 +98,7 @@ from src.llm.base import (
 from src.llm.calllog import LLMCallLogWriter, price_call
 from src.llm.models import LLMCallLog, LLMUsageDaily, actor_key_for
 from src.llm.quota import CircuitOpen, QuotaBackendUnavailable, TokenQuota
+from src.models.user import User
 from src.schemas.agentic import (
     AccuracyStats,
     ActionPendingApproval,
@@ -144,17 +151,13 @@ MESSAGE_RESULT_CAP = 8_000
 
 
 def _org_id(current_user: Any) -> str:
-    """The caller's organization; every agent query is scoped to it."""
-    org_id = getattr(current_user, "organization_id", None)
-    if not org_id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail={
-                "error": "no_organization",
-                "detail": "the account is not attached to an organization; agent tools are org-scoped",
-            },
-        )
-    return str(org_id)
+    """The caller's organization; 403 ``organization_required`` when it has none.
+
+    Routes in this module receive the organisation through ``OrganizationId``
+    and pass it to ``_agent_context`` explicitly; this is the fail-closed
+    derivation for callers outside the module (``itdr.respond``).
+    """
+    return resolve_organization_scope(current_user, None)
 
 
 def _agent_role(current_user: Any) -> UserRole:
@@ -186,10 +189,15 @@ def _agent_context(
     request: Optional[Request] = None,
     origin_trust_tier: Optional[TrustTier] = None,
     approving_action_id: Optional[str] = None,
+    org_id: Optional[str] = None,
 ) -> AgentContext:
-    """Build the run context from the JWT user. 403 when the user has no org."""
+    """Build the run context from the JWT user and the route's organisation.
+
+    Routes pass ``org_id`` from ``OrganizationId``; without it the caller's
+    own organisation is required (403 ``organization_required``).
+    """
     return AgentContext(
-        org_id=_org_id(current_user),
+        org_id=str(org_id) if org_id else _org_id(current_user),
         role=_agent_role(current_user),
         mode=mode,
         actor_user_id=str(getattr(current_user, "id", "") or ""),
@@ -217,6 +225,35 @@ def _require_admin(ctx: AgentContext) -> None:
             status_code=status.HTTP_403_FORBIDDEN,
             detail={"error": "role_not_permitted", "detail": "this operation requires the admin role"},
         )
+
+
+def _agentic_role_gate(*allowed: UserRole):
+    """Router-level role dependency (``require_role`` semantics: superusers
+    pass) that keeps this module's ``role_not_permitted`` error contract."""
+    allowed_values = frozenset(role.value for role in allowed)
+
+    async def _check(current_user: CurrentUser) -> User:
+        if bool(getattr(current_user, "is_superuser", False)):
+            return current_user
+        if str(getattr(current_user, "role", "") or "").lower() not in allowed_values:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={
+                    "error": "role_not_permitted",
+                    "detail": f"this operation requires one of the roles: {sorted(allowed_values)}",
+                },
+            )
+        return current_user
+
+    return _check
+
+
+#: Operational agent work (chat, hunts, investigations, tool calls, trust
+#: acknowledgement): analyst or admin. Viewers read only.
+AgentAnalystUser = Annotated[User, Depends(_agentic_role_gate(UserRole.ADMIN, UserRole.ANALYST))]
+#: Agent configuration, memory wipes, and approving/rolling back actions
+#: (containment): admin only.
+AgentAdminUser = Annotated[User, Depends(_agentic_role_gate(UserRole.ADMIN))]
 
 
 class _RedisToolRateLimiter:
@@ -577,9 +614,10 @@ class StructuredHuntRequest(BaseModel):
 
 @router.post("/hunts")
 async def run_structured_hunt_endpoint(
+    org_id: OrganizationId,
     req: StructuredHuntRequest,
     request: Request,
-    current_user: CurrentUser = None,
+    current_user: AgentAnalystUser = None,
     db: DatabaseSession = None,
     redis: RedisClient = None,
 ):
@@ -595,7 +633,7 @@ async def run_structured_hunt_endpoint(
     """
     from src.agentic.structured_hunt import run_structured_hunt
 
-    ctx = _agent_context(current_user, Mode.INTERACTIVE, request=request)
+    ctx = _agent_context(current_user, Mode.INTERACTIVE, org_id=org_id, request=request)
     _require_analyst(ctx)
     return await run_structured_hunt(
         db,
@@ -616,7 +654,7 @@ async def run_structured_hunt_endpoint(
 
 @router.get("/agents", response_model=SOCAgentListResponse)
 async def list_agents(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -625,7 +663,7 @@ async def list_agents(
 ):
     """List SOC agents with filtering and pagination"""
     query = select(SOCAgent).where(
-        SOCAgent.organization_id == getattr(current_user, "organization_id", None),
+        SOCAgent.organization_id == org_id,
     )
 
     if agent_type:
@@ -658,14 +696,14 @@ async def list_agents(
 
 @router.get("/agents/{agent_id}", response_model=SOCAgentResponse)
 async def get_agent(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     agent_id: str = Path(...),
 ):
     """Get specific agent details"""
     agent = await db.get(SOCAgent, agent_id)
 
-    if not agent or agent.organization_id != getattr(current_user, "organization_id", None):
+    if not agent or agent.organization_id != org_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Agent not found",
@@ -676,13 +714,14 @@ async def get_agent(
 
 @router.post("/agents", response_model=SOCAgentResponse, status_code=status.HTTP_201_CREATED)
 async def create_agent(
+    org_id: OrganizationId,
     agent_data: SOCAgentCreate,
-    current_user: CurrentUser = None,
+    _current_user: AgentAdminUser = None,
     db: DatabaseSession = None,
 ):
     """Create new SOC agent"""
     agent = SOCAgent(
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         name=agent_data.name,
         agent_type=agent_data.agent_type,
         capabilities=json.dumps(agent_data.capabilities or []),
@@ -701,15 +740,16 @@ async def create_agent(
 
 @router.put("/agents/{agent_id}", response_model=SOCAgentResponse)
 async def update_agent(
+    org_id: OrganizationId,
     agent_data: SOCAgentUpdate,
-    current_user: CurrentUser = None,
+    _current_user: AgentAdminUser = None,
     db: DatabaseSession = None,
     agent_id: str = Path(...),
 ):
     """Update agent configuration"""
     agent = await db.get(SOCAgent, agent_id)
 
-    if not agent or agent.organization_id != getattr(current_user, "organization_id", None):
+    if not agent or agent.organization_id != org_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Agent not found",
@@ -735,14 +775,15 @@ async def update_agent(
 
 @router.post("/agents/{agent_id}/start")
 async def start_agent(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _current_user: AgentAdminUser = None,
     db: DatabaseSession = None,
     agent_id: str = Path(...),
 ):
     """Start agent operation"""
     agent = await db.get(SOCAgent, agent_id)
 
-    if not agent or agent.organization_id != getattr(current_user, "organization_id", None):
+    if not agent or agent.organization_id != org_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Agent not found",
@@ -756,14 +797,15 @@ async def start_agent(
 
 @router.post("/agents/{agent_id}/stop")
 async def stop_agent(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _current_user: AgentAdminUser = None,
     db: DatabaseSession = None,
     agent_id: str = Path(...),
 ):
     """Stop agent operation"""
     agent = await db.get(SOCAgent, agent_id)
 
-    if not agent or agent.organization_id != getattr(current_user, "organization_id", None):
+    if not agent or agent.organization_id != org_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Agent not found",
@@ -777,14 +819,14 @@ async def stop_agent(
 
 @router.get("/agents/{agent_id}/performance", response_model=SOCAgentPerformance)
 async def get_agent_performance(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     agent_id: str = Path(...),
 ):
     """Get agent performance metrics"""
     agent = await db.get(SOCAgent, agent_id)
 
-    if not agent or agent.organization_id != getattr(current_user, "organization_id", None):
+    if not agent or agent.organization_id != org_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Agent not found",
@@ -808,7 +850,7 @@ async def get_agent_performance(
 
 @router.get("/investigations", response_model=InvestigationListResponse)
 async def list_investigations(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -818,7 +860,7 @@ async def list_investigations(
 ):
     """List investigations with filtering and pagination"""
     query = select(Investigation).where(
-        Investigation.organization_id == getattr(current_user, "organization_id", None),
+        Investigation.organization_id == org_id,
     )
 
     if agent_id:
@@ -854,14 +896,14 @@ async def list_investigations(
 
 @router.get("/investigations/{investigation_id}", response_model=InvestigationResponse)
 async def get_investigation(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     investigation_id: str = Path(...),
 ):
     """Get investigation details"""
     investigation = await db.get(Investigation, investigation_id)
 
-    if not investigation or investigation.organization_id != getattr(current_user, "organization_id", None):
+    if not investigation or investigation.organization_id != org_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Investigation not found",
@@ -899,21 +941,22 @@ async def get_investigation(
 
 @router.post("/investigations", response_model=InvestigationResponse, status_code=status.HTTP_201_CREATED)
 async def start_investigation(
+    org_id: OrganizationId,
     inv_data: InvestigationCreate,
-    current_user: CurrentUser = None,
+    _current_user: AgentAnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Start manual investigation"""
     # Verify agent exists
     agent = await db.get(SOCAgent, inv_data.agent_id)
-    if not agent or agent.organization_id != getattr(current_user, "organization_id", None):
+    if not agent or agent.organization_id != org_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Agent not found",
         )
 
     investigation = Investigation(
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         agent_id=inv_data.agent_id,
         trigger_type=inv_data.trigger_type,
         trigger_source_id=inv_data.trigger_source_id,
@@ -930,7 +973,7 @@ async def start_investigation(
     # Start async investigation
     run_investigation.delay(
         agent_id=inv_data.agent_id,
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         trigger_type=inv_data.trigger_type,
         trigger_source_id=inv_data.trigger_source_id,
         title=inv_data.title,
@@ -943,15 +986,16 @@ async def start_investigation(
 
 @router.put("/investigations/{investigation_id}", response_model=InvestigationResponse)
 async def update_investigation(
+    org_id: OrganizationId,
     inv_data: InvestigationUpdate,
-    current_user: CurrentUser = None,
+    _current_user: AgentAnalystUser = None,
     db: DatabaseSession = None,
     investigation_id: str = Path(...),
 ):
     """Update investigation"""
     investigation = await db.get(Investigation, investigation_id)
 
-    if not investigation or investigation.organization_id != getattr(current_user, "organization_id", None):
+    if not investigation or investigation.organization_id != org_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Investigation not found",
@@ -978,7 +1022,7 @@ async def update_investigation(
 
 @router.get("/investigations/{investigation_id}/reasoning-chain")
 async def get_reasoning_chain(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     investigation_id: str = Path(...),
 ):
@@ -990,7 +1034,7 @@ async def get_reasoning_chain(
     )
     investigation = result.scalar_one_or_none()
 
-    if not investigation or investigation.organization_id != getattr(current_user, "organization_id", None):
+    if not investigation or investigation.organization_id != org_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Investigation not found",
@@ -1016,14 +1060,14 @@ async def get_reasoning_chain(
 
 @router.get("/investigations/{investigation_id}/timeline")
 async def get_investigation_timeline(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     investigation_id: str = Path(...),
 ):
     """Get timeline view of investigation"""
     investigation = await db.get(Investigation, investigation_id)
 
-    if not investigation or investigation.organization_id != getattr(current_user, "organization_id", None):
+    if not investigation or investigation.organization_id != org_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Investigation not found",
@@ -1043,15 +1087,16 @@ async def get_investigation_timeline(
 
 @router.post("/investigations/{investigation_id}/feedback")
 async def submit_investigation_feedback(
+    org_id: OrganizationId,
     feedback: InvestigationFeedback,
-    current_user: CurrentUser = None,
+    _current_user: AgentAnalystUser = None,
     db: DatabaseSession = None,
     investigation_id: str = Path(...),
 ):
     """Submit quality-rating feedback on an investigation."""
     investigation = await db.get(Investigation, investigation_id)
 
-    if not investigation or investigation.organization_id != getattr(current_user, "organization_id", None):
+    if not investigation or investigation.organization_id != org_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Investigation not found",
@@ -1071,8 +1116,9 @@ async def submit_investigation_feedback(
 
 @router.post("/investigations/{investigation_id}/correct")
 async def correct_investigation_verdict(
+    org_id: OrganizationId,
     correction: InvestigationCorrection,
-    current_user: CurrentUser = None,
+    current_user: AgentAnalystUser = None,
     db: DatabaseSession = None,
     investigation_id: str = Path(...),
 ):
@@ -1086,7 +1132,6 @@ async def correct_investigation_verdict(
     the next investigation understands WHY the prior call was wrong.
     """
     investigation = await db.get(Investigation, investigation_id)
-    org_id = getattr(current_user, "organization_id", None)
     if not investigation or investigation.organization_id != org_id:
         raise HTTPException(status_code=404, detail="Investigation not found")
 
@@ -1108,23 +1153,21 @@ async def correct_investigation_verdict(
         investigation.human_feedback = correction.correction_note
 
     # AU-2 audit — record the correction so a 3PAO can see who
-    # overrode which agent call.
-    try:
-        from src.tickethub.models import TicketActivity
-        db.add(TicketActivity(
-            source_type="investigation",
-            source_id=investigation_id,
-            activity_type="verdict_corrected",
-            description=(
-                f"user={current_user.email} "
-                f"agent_verdict={row.agent_verdict}@{row.agent_confidence or 0:.0f}% "
-                f"→ corrected={correction.corrected_verdict} "
-                f"note={(correction.correction_note or '')[:300]}"
-            ),
-            organization_id=org_id,
-        ))
-    except Exception:
-        pass
+    # overrode which agent call. Written in the same transaction as the
+    # correction: no correction without its audit row.
+    from src.tickethub.models import TicketActivity
+    db.add(TicketActivity(
+        source_type="investigation",
+        source_id=investigation_id,
+        activity_type="verdict_corrected",
+        description=(
+            f"user={current_user.email} "
+            f"agent_verdict={row.agent_verdict}@{row.agent_confidence or 0:.0f}% "
+            f"→ corrected={correction.corrected_verdict} "
+            f"note={(correction.correction_note or '')[:300]}"
+        )[:500],  # TicketActivity.description is String(500)
+        organization_id=org_id,
+    ))
 
     await db.commit()
     await db.refresh(row)
@@ -1138,18 +1181,20 @@ async def correct_investigation_verdict(
 
 @router.get("/investigations/{investigation_id}/feedback")
 async def list_investigation_feedback(
+    org_id: OrganizationId,
     investigation_id: str = Path(...),
-    current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Return corrections recorded for this investigation."""
     investigation = await db.get(Investigation, investigation_id)
-    org_id = getattr(current_user, "organization_id", None)
     if not investigation or investigation.organization_id != org_id:
         raise HTTPException(status_code=404, detail="Investigation not found")
     rows = list(await db.scalars(
         select(InvestigationFeedbackRow)
-        .where(InvestigationFeedbackRow.investigation_id == investigation_id)
+        .where(
+            InvestigationFeedbackRow.investigation_id == investigation_id,
+            InvestigationFeedbackRow.organization_id == org_id,
+        )
         .order_by(InvestigationFeedbackRow.created_at.desc()),
     ))
     return {
@@ -1176,6 +1221,7 @@ async def list_investigation_feedback(
 
 @router.get("/actions/pending-approval")
 async def list_pending_approvals(
+    org_id: OrganizationId,
     request: Request,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
@@ -1192,9 +1238,8 @@ async def list_pending_approvals(
     expires. Arguments were value-redacted when the proposal was
     materialized; nothing is re-expanded here.
     """
-    ctx = _agent_context(current_user, Mode.APPROVAL, request=request)
+    ctx = _agent_context(current_user, Mode.APPROVAL, org_id=org_id, request=request)
     _require_analyst(ctx)
-    org_id = ctx.org_id
 
     pending = and_(
         AgentAction.organization_id == org_id,
@@ -1304,9 +1349,10 @@ def _expired(action: AgentAction) -> bool:
 
 @router.post("/actions/{action_id}/approve")
 async def approve_action(
+    org_id: OrganizationId,
     approval: AgentActionApproval,
     request: Request,
-    current_user: CurrentUser = None,
+    current_user: AgentAdminUser = None,
     db: DatabaseSession = None,
     redis: RedisClient = None,
     action_id: str = Path(...),
@@ -1330,9 +1376,8 @@ async def approve_action(
     ``second_approver_required``. Suspect proposals keep the admin + reason
     rule on each approval.
     """
-    ctx_probe = _agent_context(current_user, Mode.APPROVAL, request=request)
+    ctx_probe = _agent_context(current_user, Mode.APPROVAL, org_id=org_id, request=request)
     _require_analyst(ctx_probe)
-    org_id = ctx_probe.org_id
 
     action = (await db.execute(
         select(AgentAction).where(AgentAction.id == action_id, AgentAction.organization_id == org_id),
@@ -1479,7 +1524,7 @@ async def approve_action(
 
     ctx = _agent_context(
         current_user,
-        Mode.APPROVAL,
+        Mode.APPROVAL, org_id=org_id,
         propose_actions=True,
         investigation_id=action.investigation_id,
         request=request,
@@ -1713,8 +1758,9 @@ async def approve_action(
 
 @router.post("/actions/{action_id}/rollback")
 async def rollback_action(
+    org_id: OrganizationId,
     request: Request,
-    current_user: CurrentUser = None,
+    current_user: AgentAdminUser = None,
     db: DatabaseSession = None,
     action_id: str = Path(...),
 ):
@@ -1733,11 +1779,9 @@ async def rollback_action(
     from src.agents.models import EndpointAgent
     from src.agents.service import AgentService, AgentServiceError
     from src.intel.models import ThreatIndicator
-    from src.models.user import User
 
-    ctx = _agent_context(current_user, Mode.APPROVAL, request=request)
+    ctx = _agent_context(current_user, Mode.APPROVAL, org_id=org_id, request=request)
     _require_analyst(ctx)
-    org_id = ctx.org_id
 
     action = (await db.execute(
         select(AgentAction).where(AgentAction.id == action_id, AgentAction.organization_id == org_id),
@@ -1903,12 +1947,13 @@ async def rollback_action(
 
 @router.get("/tools")
 async def list_agent_tools(
+    org_id: OrganizationId,
     request: Request,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """The tools the caller's role may invoke (ToolSpec-driven, org-bound)."""
-    ctx = _agent_context(current_user, Mode.INTERACTIVE, request=request)
+    ctx = _agent_context(current_user, Mode.INTERACTIVE, org_id=org_id, request=request)
     registry = AgentToolRegistry(db, ctx)
     tools = [
         {
@@ -1925,10 +1970,11 @@ async def list_agent_tools(
 
 @router.post("/tools/{tool_name}/execute")
 async def execute_agent_tool(
+    org_id: OrganizationId,
     tool_name: str,
     request: Request,
     body: dict[str, Any] = Body(default_factory=dict),
-    current_user: CurrentUser = None,
+    current_user: AgentAnalystUser = None,
     db: DatabaseSession = None,
     redis: RedisClient = None,
 ):
@@ -1952,7 +1998,7 @@ async def execute_agent_tool(
         )
 
     ctx = _agent_context(
-        current_user, Mode.INTERACTIVE, propose_actions=propose_actions, request=request,
+        current_user, Mode.INTERACTIVE, org_id=org_id, propose_actions=propose_actions, request=request,
     )
     return await guarded_tool_call(
         db, ctx, redis, tool_name, params,
@@ -2215,9 +2261,10 @@ async def _settle_reservation(quota: Any, reservation: Any, tokens: int) -> None
 
 @router.post("/chat", response_model=NaturalLanguageResponse)
 async def chat_with_agent(
+    org_id: OrganizationId,
     query_data: NaturalLanguageQuery,
     request: Request,
-    current_user: CurrentUser = None,
+    current_user: AgentAnalystUser = None,
     db: DatabaseSession = None,
     redis: RedisClient = None,
 ):
@@ -2230,7 +2277,6 @@ async def chat_with_agent(
     a provider or budget failure is a 503/429 and the user's message is
     persisted as ``failed``.
     """
-    org_id = _org_id(current_user)
     role = _agent_role(current_user)
     user_id = str(getattr(current_user, "id", "") or "")
     propose_actions = bool(query_data.propose_actions)
@@ -2305,7 +2351,7 @@ async def chat_with_agent(
 
     ctx = _agent_context(
         current_user,
-        Mode.INTERACTIVE,
+        Mode.INTERACTIVE, org_id=org_id,
         propose_actions=propose_actions,
         session_id=session.id,
         investigation_id=investigation_id,
@@ -2426,6 +2472,7 @@ async def chat_with_agent(
 
 @router.get("/chat/sessions", response_model=ChatSessionListResponse)
 async def list_chat_sessions(
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     limit: int = Query(50, ge=1, le=200),
@@ -2435,7 +2482,9 @@ async def list_chat_sessions(
     user_id = getattr(current_user, "id", None)
     if not user_id:
         raise HTTPException(status_code=401, detail="Authentication required")
-    q = select(AgentChatSession).where(AgentChatSession.user_id == user_id)
+    q = select(AgentChatSession).where(
+        AgentChatSession.user_id == user_id, AgentChatSession.organization_id == org_id,
+    )
     if not include_archived:
         q = q.where(AgentChatSession.is_archived == False)  # noqa: E712
     q = q.order_by(AgentChatSession.updated_at.desc()).limit(limit)
@@ -2453,14 +2502,14 @@ async def list_chat_sessions(
 
 @router.post("/chat/sessions", response_model=ChatSessionResponse)
 async def create_chat_session(
+    org_id: OrganizationId,
     body: ChatSessionCreate,
-    current_user: CurrentUser = None,
+    current_user: AgentAnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Create a new chat session."""
     user_id = getattr(current_user, "id", None)
-    org_id = getattr(current_user, "organization_id", None)
-    if not user_id or not org_id:
+    if not user_id:
         raise HTTPException(status_code=401, detail="Authentication required")
     s = AgentChatSession(
         user_id=user_id, organization_id=org_id, title=body.title or "New chat",
@@ -2476,6 +2525,7 @@ async def create_chat_session(
 
 @router.get("/chat/sessions/{session_id}/messages", response_model=ChatMessageListResponse)
 async def list_chat_messages(
+    org_id: OrganizationId,
     session_id: str = Path(...),
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
@@ -2484,7 +2534,9 @@ async def list_chat_messages(
     """List messages in a chat session (oldest first so rendering is straight-forward)."""
     user_id = getattr(current_user, "id", None)
     session = (await db.execute(
-        select(AgentChatSession).where(AgentChatSession.id == session_id),
+        select(AgentChatSession).where(
+            AgentChatSession.id == session_id, AgentChatSession.organization_id == org_id,
+        ),
     )).scalar_one_or_none()
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -2512,14 +2564,17 @@ async def list_chat_messages(
 
 @router.delete("/chat/sessions/{session_id}", status_code=204)
 async def delete_chat_session(
+    org_id: OrganizationId,
     session_id: str = Path(...),
-    current_user: CurrentUser = None,
+    current_user: AgentAnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Delete a chat session and all its messages."""
     user_id = getattr(current_user, "id", None)
     session = (await db.execute(
-        select(AgentChatSession).where(AgentChatSession.id == session_id),
+        select(AgentChatSession).where(
+            AgentChatSession.id == session_id, AgentChatSession.organization_id == org_id,
+        ),
     )).scalar_one_or_none()
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -2531,36 +2586,48 @@ async def delete_chat_session(
 
 @router.get("/alerts/{alert_id}/explain", response_model=AlertExplanation)
 async def explain_alert(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     alert_id: str = Path(...),
 ):
-    """Get natural language explanation of alert"""
-    nl_interface = NaturalLanguageInterface(db)
+    """Natural language explanation of one of the caller's organisation's alerts.
+
+    The alert is looked up inside the caller's organisation (404 otherwise), so
+    another tenant's alert can be neither read nor explained on that tenant's
+    LLM budget. ``risk_assessment`` is the alert's own severity and no canned
+    recommendations are returned.
+    """
+    from src.models.alert import Alert
+
+    alert = (
+        await db.execute(
+            select(Alert).where(Alert.id == alert_id, Alert.organization_id == org_id),
+        )
+    ).scalar_one_or_none()
+    if alert is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Alert not found")
+
+    nl_interface = NaturalLanguageInterface(db, organization_id=org_id)
     explanation = await nl_interface.explain_alert(alert_id)
 
     return AlertExplanation(
         alert_id=alert_id,
         explanation=explanation,
-        risk_assessment="High",
-        recommended_actions=[
-            "Review login details",
-            "Check for lateral movement",
-            "Verify account status",
-        ],
+        risk_assessment=str(alert.severity or ""),
+        recommended_actions=[],
     )
 
 
 @router.get("/investigations/{investigation_id}/explain", response_model=InvestigationExplanation)
 async def explain_investigation(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     investigation_id: str = Path(...),
 ):
     """Get natural language explanation of investigation"""
     investigation = await db.get(Investigation, investigation_id)
 
-    if not investigation or investigation.organization_id != getattr(current_user, "organization_id", None):
+    if not investigation or investigation.organization_id != org_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Investigation not found",
@@ -2587,27 +2654,27 @@ async def explain_investigation(
 
 @router.get("/dashboard/metrics", response_model=DashboardMetrics)
 async def get_dashboard_metrics(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get SOC dashboard metrics"""
     # Count agents
     agent_query = select(func.count()).select_from(SOCAgent).where(
-        SOCAgent.organization_id == getattr(current_user, "organization_id", None),
+        SOCAgent.organization_id == org_id,
     )
     agent_result = await db.execute(agent_query)
     total_agents = agent_result.scalar() or 0
 
     # Count investigations
     inv_query = select(func.count()).select_from(Investigation).where(
-        Investigation.organization_id == getattr(current_user, "organization_id", None),
+        Investigation.organization_id == org_id,
     )
     inv_result = await db.execute(inv_query)
     total_investigations = inv_result.scalar() or 0
 
     # Count by status
     in_progress_query = select(func.count()).select_from(Investigation).where(
-        Investigation.organization_id == getattr(current_user, "organization_id", None),
+        Investigation.organization_id == org_id,
         Investigation.status == InvestigationStatus.REASONING.value,
     )
     in_progress_result = await db.execute(in_progress_query)
@@ -2615,7 +2682,7 @@ async def get_dashboard_metrics(
 
     # Count pending approvals
     approval_query = select(func.count()).select_from(AgentAction).where(
-        AgentAction.organization_id == getattr(current_user, "organization_id", None),
+        AgentAction.organization_id == org_id,
         AgentAction.execution_status == ActionExecutionStatus.PENDING_APPROVAL.value,
     )
     approval_result = await db.execute(approval_query)
@@ -2623,7 +2690,7 @@ async def get_dashboard_metrics(
 
     # Count active agents (status != 'paused')
     active_agent_query = select(func.count()).select_from(SOCAgent).where(
-        SOCAgent.organization_id == getattr(current_user, "organization_id", None),
+        SOCAgent.organization_id == org_id,
         SOCAgent.status != "paused",
     )
     active_agent_result = await db.execute(active_agent_query)
@@ -2632,7 +2699,7 @@ async def get_dashboard_metrics(
     # Investigations completed in last 24h
     cutoff_24h = datetime.now(timezone.utc) - timedelta(hours=24)
     completed_24h_query = select(func.count()).select_from(Investigation).where(
-        Investigation.organization_id == getattr(current_user, "organization_id", None),
+        Investigation.organization_id == org_id,
         Investigation.status == InvestigationStatus.COMPLETED.value,
         Investigation.updated_at >= cutoff_24h.isoformat(),
     )
@@ -2641,7 +2708,7 @@ async def get_dashboard_metrics(
 
     # Average resolution time from agent stats
     avg_time_query = select(func.avg(SOCAgent.avg_resolution_time_minutes)).where(
-        SOCAgent.organization_id == getattr(current_user, "organization_id", None),
+        SOCAgent.organization_id == org_id,
         SOCAgent.total_investigations > 0,
     )
     avg_time_result = await db.execute(avg_time_query)
@@ -2649,7 +2716,7 @@ async def get_dashboard_metrics(
 
     # Overall accuracy from agent stats
     accuracy_query = select(func.avg(SOCAgent.accuracy_score)).where(
-        SOCAgent.organization_id == getattr(current_user, "organization_id", None),
+        SOCAgent.organization_id == org_id,
         SOCAgent.total_investigations > 0,
     )
     accuracy_result = await db.execute(accuracy_query)
@@ -2657,7 +2724,7 @@ async def get_dashboard_metrics(
 
     # Overall false positive rate from agent stats
     fpr_query = select(func.avg(SOCAgent.false_positive_rate)).where(
-        SOCAgent.organization_id == getattr(current_user, "organization_id", None),
+        SOCAgent.organization_id == org_id,
         SOCAgent.total_investigations > 0,
     )
     fpr_result = await db.execute(fpr_query)
@@ -2678,11 +2745,10 @@ async def get_dashboard_metrics(
 
 @router.get("/dashboard/investigation-metrics", response_model=InvestigationMetrics)
 async def get_investigation_metrics(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get investigation statistics from real database data"""
-    org_id = getattr(current_user, "organization_id", None)
     base_filter = Investigation.organization_id == org_id
 
     # Total investigations
@@ -2744,11 +2810,10 @@ async def get_investigation_metrics(
 
 @router.get("/dashboard/accuracy-stats", response_model=AccuracyStats)
 async def get_accuracy_stats(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get accuracy and false positive statistics from real database data"""
-    org_id = getattr(current_user, "organization_id", None)
     base_filter = Investigation.organization_id == org_id
 
     # Total investigations
@@ -2797,8 +2862,9 @@ async def get_accuracy_stats(
 
 @router.post("/threat-hunts", response_model=ThreatHuntResult)
 async def start_threat_hunt(
+    org_id: OrganizationId,
     hunt_request: ThreatHuntRequest,
-    current_user: CurrentUser = None,
+    _current_user: AgentAnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Run a threat hunt against real platform data.
@@ -2825,19 +2891,22 @@ async def start_threat_hunt(
     import time
 
     from src.darkweb.models import CredentialLeak
+    from src.hunting.models import HuntFinding
     from src.itdr.models import IdentityThreat
     from src.models.alert import Alert
-    try:
-        from src.hunting.models import HuntFinding
-    except Exception:
-        HuntFinding = None
 
-    org_id = getattr(current_user, "organization_id", None)
     start_t = time.time()
 
-    # Resolve the agent
+    # Resolve the agent (always one of the caller's organisation's agents)
     agent_id = hunt_request.agent_id
-    if not agent_id:
+    if agent_id:
+        agent = await db.get(SOCAgent, agent_id)
+        if not agent or agent.organization_id != org_id:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Agent not found",
+            )
+    else:
         result = await db.execute(
             select(SOCAgent).where(SOCAgent.organization_id == org_id),
         )
@@ -2919,36 +2988,23 @@ async def start_threat_hunt(
         indicators_found += len(creds)
 
     # 4. Hunt findings (SIEM hunting module)
-    # NOTE: HuntFinding/HuntSession/HuntHypothesis don't carry organization_id
-    # directly — they're scoped via the users.created_by chain. To keep this
-    # tenant-safe we scope HuntFindings via HuntSession.created_by being a
-    # member of the caller's org.
-    if want_hunt_findings and HuntFinding is not None:
-        try:
-            from src.hunting.models import HuntSession
-            from src.models.user import User as _User
-
-            org_user_subq = select(_User.id).where(_User.organization_id == org_id)
-            hf_query = (
-                select(HuntFinding)
-                .join(HuntSession, HuntSession.id == HuntFinding.session_id)
-                .where(
-                    and_(
-                        HuntFinding.severity.in_(["critical", "high"]),
-                        HuntSession.created_by.in_(org_user_subq),
-                    ),
-                )
-            )
-            hfs = list((await db.execute(hf_query)).scalars().all())
-            reasoning_chain.append({
-                "source": "hunt_findings",
-                "query": "severity in (critical, high), tenant-scoped via session.created_by",
-                "count": len(hfs),
-            })
-            indicators_found += len(hfs)
-            high_confidence_findings += sum(1 for h in hfs if h.severity == "critical")
-        except Exception as exc:
-            logger.warning(f"HuntFinding scan failed: {exc}")
+    # Scoped on the finding's own organization_id (stamped by the hunting
+    # module); a failure here surfaces instead of reading as "no findings".
+    if want_hunt_findings:
+        hf_query = select(HuntFinding).where(
+            and_(
+                HuntFinding.organization_id == org_id,
+                HuntFinding.severity.in_(["critical", "high"]),
+            ),
+        )
+        hfs = list((await db.execute(hf_query)).scalars().all())
+        reasoning_chain.append({
+            "source": "hunt_findings",
+            "query": "severity in (critical, high), organization-scoped",
+            "count": len(hfs),
+        })
+        indicators_found += len(hfs)
+        high_confidence_findings += sum(1 for h in hfs if h.severity == "critical")
 
     # Confidence: scale by how many sources returned hits
     sources_with_hits = sum(1 for r in reasoning_chain if r["count"] > 0)
@@ -2958,7 +3014,7 @@ async def start_threat_hunt(
     from src.agentic.models import InvestigationStatus
     investigation = Investigation(
         agent_id=agent_id,
-        organization_id=org_id or "",
+        organization_id=org_id,
         trigger_type="threat_hunt",
         trigger_source_id=None,
         title=f"Threat hunt: {profile}",
@@ -3019,7 +3075,7 @@ async def start_threat_hunt(
 
 @router.get("/agents/{agent_id}/memory", response_model=AgentMemoryListResponse)
 async def list_agent_memory(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     agent_id: str = Path(...),
     page: int = Query(1, ge=1),
@@ -3029,13 +3085,15 @@ async def list_agent_memory(
     """List agent memory entries"""
     agent = await db.get(SOCAgent, agent_id)
 
-    if not agent or agent.organization_id != getattr(current_user, "organization_id", None):
+    if not agent or agent.organization_id != org_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Agent not found",
         )
 
-    query = select(AgentMemory).where(AgentMemory.agent_id == agent_id)
+    query = select(AgentMemory).where(
+        AgentMemory.agent_id == agent_id, AgentMemory.organization_id == org_id,
+    )
 
     if memory_type:
         query = query.where(AgentMemory.memory_type == memory_type)
@@ -3064,20 +3122,22 @@ async def list_agent_memory(
 
 @router.get("/agents/{agent_id}/memory/stats", response_model=MemoryStats)
 async def get_memory_stats(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     agent_id: str = Path(...),
 ):
     """Get agent memory statistics"""
     agent = await db.get(SOCAgent, agent_id)
 
-    if not agent or agent.organization_id != getattr(current_user, "organization_id", None):
+    if not agent or agent.organization_id != org_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Agent not found",
         )
 
-    query = select(AgentMemory).where(AgentMemory.agent_id == agent_id)
+    query = select(AgentMemory).where(
+        AgentMemory.agent_id == agent_id, AgentMemory.organization_id == org_id,
+    )
     result = await db.execute(query)
     memories = list(result.scalars().all())
 
@@ -3101,7 +3161,8 @@ async def get_memory_stats(
 
 @router.delete("/agents/{agent_id}/memory")
 async def clear_agent_memory(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _current_user: AgentAdminUser = None,
     db: DatabaseSession = None,
     agent_id: str = Path(...),
     memory_type: Optional[str] = None,
@@ -3109,13 +3170,15 @@ async def clear_agent_memory(
     """Clear agent memory (optional filter by type)"""
     agent = await db.get(SOCAgent, agent_id)
 
-    if not agent or agent.organization_id != getattr(current_user, "organization_id", None):
+    if not agent or agent.organization_id != org_id:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Agent not found",
         )
 
-    query = select(AgentMemory).where(AgentMemory.agent_id == agent_id)
+    query = select(AgentMemory).where(
+        AgentMemory.agent_id == agent_id, AgentMemory.organization_id == org_id,
+    )
 
     if memory_type:
         query = query.where(AgentMemory.memory_type == memory_type)
@@ -3153,16 +3216,19 @@ EVIDENCE_EXPORT_CONTROLS: tuple[str, ...] = ("AC-3", "AC-6(1)", "AU-2", "AU-3", 
 
 
 def _scope_organization(
-    current_user: Any, ctx: AgentContext, organization_id: Optional[str], all_orgs: bool,
+    current_user: Any, organization_id: Optional[str], all_orgs: bool,
 ) -> Optional[str]:
     """The organization a read surface answers for; ``None`` means every org.
 
-    Only a superuser may look outside their own organization, and only by
-    asking for it explicitly (``organization_id=...`` or ``all=true``).
+    Only a platform superuser may look outside their own organization, and
+    only by asking for it explicitly (``organization_id=...`` or ``all=true``);
+    an org-less superuser must name the tenant. Everyone else is confined to
+    their own organisation (403 ``organization_required`` without one).
     """
-    if not (organization_id or all_orgs):
-        return ctx.org_id
-    if not ctx.is_superuser:
+    is_superuser = bool(getattr(current_user, "is_superuser", False))
+    own_org = getattr(current_user, "organization_id", None)
+    explicit_other = bool(organization_id) and str(organization_id) != str(own_org or "")
+    if (explicit_other or all_orgs) and not is_superuser:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={
@@ -3170,7 +3236,9 @@ def _scope_organization(
                 "detail": "only a platform superuser may read another organization's agent records",
             },
         )
-    return None if all_orgs else str(organization_id)
+    if all_orgs:
+        return None
+    return resolve_organization_scope(current_user, organization_id)
 
 
 def _audit_view(row: AuditTrail) -> dict[str, Any]:
@@ -3291,9 +3359,10 @@ def _acknowledged_tier(trust: TrustState, acknowledged: set[str]) -> TrustTier:
 
 @router.post("/trust/acknowledge")
 async def acknowledge_injection(
+    org_id: OrganizationId,
     body: TrustAcknowledgeRequest,
     request: Request,
-    current_user: CurrentUser = None,
+    current_user: AgentAnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Acknowledge a prompt-injection finding, downgrading lockdown to flagged.
@@ -3310,9 +3379,8 @@ async def acknowledge_injection(
     one of ``session_id``/``investigation_id`` is required. A session or
     investigation outside the caller's organization is reported as 404.
     """
-    ctx = _agent_context(current_user, Mode.INTERACTIVE, request=request)
+    ctx = _agent_context(current_user, Mode.INTERACTIVE, org_id=org_id, request=request)
     _require_analyst(ctx)
-    org_id = ctx.org_id
 
     session_row: Optional[AgentChatSession] = None
     investigation: Optional[Investigation] = None
@@ -3424,6 +3492,7 @@ async def acknowledge_injection(
 
 @router.get("/runs/{run_id}")
 async def get_run_timeline(
+    org_id: OrganizationId,
     request: Request,
     run_id: str = Path(..., min_length=4, max_length=64),
     current_user: CurrentUser = None,
@@ -3439,9 +3508,8 @@ async def get_run_timeline(
     organization, so a run belonging to another tenant is a 404. Arguments
     and results were value-redacted at write time; nothing raw is added here.
     """
-    ctx = _agent_context(current_user, Mode.INTERACTIVE, request=request)
+    ctx = _agent_context(current_user, Mode.INTERACTIVE, org_id=org_id, request=request)
     _require_analyst(ctx)
-    org_id = ctx.org_id
 
     audit_rows = (await db.execute(
         select(AuditTrail)
@@ -3588,8 +3656,7 @@ def _usage_add(bucket: dict[str, Any], *, calls: int, errors: int, tokens: dict[
 
 @router.get("/usage")
 async def get_agent_usage(
-    request: Request,
-    current_user: CurrentUser = None,
+    current_user: AgentAnalystUser = None,
     db: DatabaseSession = None,
     redis: RedisClient = None,
     days: int = Query(30, ge=1, le=365),
@@ -3612,9 +3679,7 @@ async def get_agent_usage(
     ``rolled_up_days``. Scoped to the caller's organization unless a
     superuser passes ``organization_id`` or ``all=true``.
     """
-    ctx = _agent_context(current_user, Mode.INTERACTIVE, request=request)
-    _require_analyst(ctx)
-    scope_org = _scope_organization(current_user, ctx, organization_id, all_orgs)
+    scope_org = _scope_organization(current_user, organization_id, all_orgs)
 
     now = datetime.now(timezone.utc)
     since = now - timedelta(days=days)
@@ -3732,6 +3797,7 @@ async def get_agent_usage(
 
 @router.get("/policy-events")
 async def list_policy_events(
+    org_id: OrganizationId,
     request: Request,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
@@ -3756,7 +3822,7 @@ async def list_policy_events(
     (the JSON column is compared as text, which both SQLite and Postgres
     store verbatim as SQLAlchemy serialized it).
     """
-    ctx = _agent_context(current_user, Mode.INTERACTIVE, request=request)
+    ctx = _agent_context(current_user, Mode.INTERACTIVE, org_id=org_id, request=request)
     _require_analyst(ctx)
 
     filters = [
@@ -3930,8 +3996,7 @@ async def _evidence_rows(
 
 @router.get("/evidence/export")
 async def export_agent_evidence(
-    request: Request,
-    current_user: CurrentUser = None,
+    current_user: AgentAdminUser = None,
     db: DatabaseSession = None,
     export_format: str = Query("json", alias="format", pattern="^(csv|json)$"),
     date_from: Optional[datetime] = Query(None, alias="from"),
@@ -3961,9 +4026,7 @@ async def export_agent_evidence(
     against, so the control mapping is documented here rather than invented
     in the schema; the compliance module can read this endpoint directly.
     """
-    ctx = _agent_context(current_user, Mode.INTERACTIVE, request=request)
-    _require_admin(ctx)
-    scope_org = _scope_organization(current_user, ctx, organization_id, False)
+    scope_org = _scope_organization(current_user, organization_id, False)
 
     end = date_to or datetime.now(timezone.utc)
     start = date_from or (end - timedelta(days=30))
@@ -3981,7 +4044,7 @@ async def export_agent_evidence(
     logger.info(
         "agent_evidence_exported",
         organization_id=scope_org,
-        actor_id=ctx.actor_user_id,
+        actor_id=str(current_user.id),
         rows=len(rows),
         export_format=export_format,
         truncated=truncated,

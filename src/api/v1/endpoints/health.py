@@ -11,7 +11,7 @@ from fastapi import APIRouter
 from sqlalchemy import text
 
 from src import __version__
-from src.api.deps import AdminUser, CurrentUser, DatabaseSession, RedisClient
+from src.api.deps import AdminUser, CurrentUser, DatabaseSession, PlatformSuperUser, RedisClient
 from src.core import metrics as agentic_metrics
 from src.core.config import settings
 from src.core.database import async_session_factory
@@ -214,8 +214,11 @@ async def health_llm(
 
 
 @router.get("/metrics/agentic")
-async def agentic_metrics_snapshot(admin: AdminUser = None) -> Dict[str, Any]:
-    """The agentic counters for THIS process as JSON (admin).
+async def agentic_metrics_snapshot(admin: PlatformSuperUser = None) -> Dict[str, Any]:
+    """The agentic counters for THIS process as JSON (platform superuser only).
+
+    The counters are process-wide and span every tenant, so a tenant admin
+    (``AdminUser``) must not read them.
 
     ``prometheus_client`` is not a dependency and there is no scrape endpoint,
     so ``src/core/metrics.py`` keeps the three counters the design names in a

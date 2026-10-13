@@ -12,7 +12,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.api.deps import CurrentUser, DatabaseSession, RedisClient
 from src.models.user import User
 from src.core.account_lockout import AccountLockoutManager
-from src.core.config import settings
 from src.core.password_policy import PasswordValidator
 from src.core.security import (
     create_access_token,
@@ -30,6 +29,7 @@ from src.schemas.auth import (
     TokenResponse,
 )
 from src.schemas.user import UserResponse
+from src.services.tenant_settings import session_timeout_minutes_for
 from src.services.user_service import UserService
 
 logger = logging.getLogger(__name__)
@@ -109,8 +109,12 @@ async def login(
     await user_service.update_last_login(user.id)
 
     # Create tokens
+    # Token lifetime is the organisation's session timeout (Settings >
+    # Security / General), else the platform default.
+    session_minutes = await session_timeout_minutes_for(db, user.organization_id)
     access_token = create_access_token(
         subject=user.id,
+        expires_delta=timedelta(minutes=session_minutes),
         extra_claims={"role": user.role},
     )
     refresh_token = create_refresh_token(subject=user.id)
@@ -120,7 +124,7 @@ async def login(
     return TokenResponse(
         access_token=access_token,
         refresh_token=refresh_token,
-        expires_in=settings.access_token_expire_minutes * 60,
+        expires_in=session_minutes * 60,
     )
 
 
@@ -150,8 +154,12 @@ async def refresh_token_endpoint(
         )
 
     # Create new tokens
+    # Token lifetime is the organisation's session timeout (Settings >
+    # Security / General), else the platform default.
+    session_minutes = await session_timeout_minutes_for(db, user.organization_id)
     access_token = create_access_token(
         subject=user.id,
+        expires_delta=timedelta(minutes=session_minutes),
         extra_claims={"role": user.role},
     )
     refresh_token = create_refresh_token(subject=user.id)
@@ -161,7 +169,7 @@ async def refresh_token_endpoint(
     return TokenResponse(
         access_token=access_token,
         refresh_token=refresh_token,
-        expires_in=settings.access_token_expire_minutes * 60,
+        expires_in=session_minutes * 60,
     )
 
 

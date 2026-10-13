@@ -163,6 +163,9 @@ class HoneyTokenGenerateRequest(BaseModel):
         ...,
         description="aws_key, api_key, database_cred, jwt_token, ssh_key, dns_canary, url_canary, email_canary, document_beacon",
     )
+    name: str | None = Field(
+        default=None, max_length=255, description="Display name; defaults to '<type>-<hash8>'",
+    )
     service: str | None = None
     db_type: str | None = None
     domain: str | None = None
@@ -176,6 +179,14 @@ class HoneyTokenGenerateResponse(DBModel):
     """Response schema for generated honey token."""
 
     id: UUID
+    name: str = ""
+    token_type: str = ""
+    status: str = ""
+    deployment_location: str | None = None
+    deployment_context: str | None = None
+    expires_at: datetime | None = None
+    alert_severity: str | None = None
+    deployed_by: str | None = None
     token_hash: str = ""
     triggered_count: int = 0
     last_triggered_at: datetime | None

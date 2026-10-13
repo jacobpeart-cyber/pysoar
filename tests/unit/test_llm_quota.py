@@ -416,9 +416,13 @@ async def test_record_budget_event_writes_audit_row(db_session: Any, monkeypatch
     from src.llm.quota import record_budget_event
 
     broadcasts: list[tuple[str, str, dict[str, Any]]] = []
+    published_to: list[str | None] = []
 
-    async def fake_notify(event_type: str, message: str, data: dict[str, Any] | None = None) -> None:
+    async def fake_notify(
+        event_type: str, message: str, data: dict[str, Any] | None = None, *, organization_id: str | None,
+    ) -> None:
         broadcasts.append((event_type, message, data or {}))
+        published_to.append(organization_id)
 
     monkeypatch.setattr("src.services.websocket_manager.notify_system_event", fake_notify)
     await record_budget_event(db_session, org_id="org-a", bucket="autonomous", pct=100, used=600, cap=600, run_id="run-1")
@@ -430,3 +434,5 @@ async def test_record_budget_event_writes_audit_row(db_session: Any, monkeypatch
     assert row.result == "denied" and row.risk_level == "high" and row.run_id == "run-1"
     assert row.new_value["control"] == "SC-5"
     assert broadcasts and broadcasts[0][0] == "llm_budget" and broadcasts[0][2]["pct"] == 100
+    # Published to the tenant's own system channel only (system:org-a).
+    assert published_to == ["org-a"]

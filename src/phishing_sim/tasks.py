@@ -162,7 +162,10 @@ def send_phishing_email(self, target_id: str, organization_id: str):
             template_subject = "Action Required"
             if campaign.template_id:
                 tmpl = (await session.execute(
-                    select(PhishingTemplate).where(PhishingTemplate.id == campaign.template_id)
+                    select(PhishingTemplate).where(
+                        PhishingTemplate.id == campaign.template_id,
+                        PhishingTemplate.organization_id == campaign.organization_id,
+                    ),
                 )).scalar_one_or_none()
                 if tmpl:
                     template_html = tmpl.html_body
@@ -178,7 +181,9 @@ def send_phishing_email(self, target_id: str, organization_id: str):
                         .replace("{{tracking_id}}", target.tracking_id)
                 )
 
-            email = EmailService()
+            # Tenant SMTP: the campaign's organisation settings, falling back
+            # to the platform relay (EmailService.for_organization).
+            email = await EmailService.for_organization(session, campaign.organization_id)
             if not email.is_configured:
                 target.status = "awaiting_smtp_config"
                 target.error_message = "SMTP not configured at send time"
@@ -262,7 +267,10 @@ def send_campaign_batch(
             template_subject = "Action Required"
             if campaign.template_id:
                 tmpl_result = await session.execute(
-                    select(PhishingTemplate).where(PhishingTemplate.id == campaign.template_id)
+                    select(PhishingTemplate).where(
+                        PhishingTemplate.id == campaign.template_id,
+                        PhishingTemplate.organization_id == campaign.organization_id,
+                    ),
                 )
                 tmpl = tmpl_result.scalar_one_or_none()
                 if tmpl:
@@ -290,7 +298,9 @@ def send_campaign_batch(
 
             try:
                 from src.services.email_service import EmailService
-                email_service = EmailService()
+                email_service = await EmailService.for_organization(
+                    session, campaign.organization_id,
+                )
                 can_send = email_service.is_configured
             except Exception:
                 can_send = False

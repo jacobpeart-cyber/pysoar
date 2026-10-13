@@ -5,14 +5,22 @@ Provides endpoints for simulation management, technique discovery,
 adversary emulation, and security posture assessment.
 """
 
-from typing import Optional, List
+from typing import Annotated, Optional, List
 from fastapi import APIRouter, Depends, HTTPException, Query, Body
+from sqlalchemy import or_, select as sa_select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.core.database import get_db as get_async_session
 from src.core.logging import get_logger
 from src.services.automation import AutomationService
-from src.api.deps import get_current_active_user as get_current_user, CurrentUser, DatabaseSession
+from src.api.deps import (
+    get_current_active_user as get_current_user,
+    CurrentUser,
+    DatabaseSession,
+    OrganizationId,
+    require_role,
+)
+from src.models.user import User, UserRole
 from src.simulation.engine import (
     SimulationOrchestrator,
     AtomicTestLibrary,
@@ -55,12 +63,42 @@ from src.simulation.tasks import (
 logger = get_logger(__name__)
 router = APIRouter(prefix="/simulation", tags=["simulation"])
 
+# Role gates. Viewers are read-only. Analysts create and steer simulations;
+# anything that executes atomic tests on live endpoints is admin-only.
+AnalystUser = Annotated[User, Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
+AdminOnlyUser = Annotated[User, Depends(require_role([UserRole.ADMIN]))]
+
+
+async def _get_org_simulation(
+    session: AsyncSession, simulation_id: str, org_id: str,
+) -> AttackSimulation:
+    """The caller's simulation, or 404 (also for another tenant's id)."""
+    simulation = (
+        await session.execute(
+            sa_select(AttackSimulation).where(
+                AttackSimulation.id == simulation_id,
+                AttackSimulation.organization_id == org_id,
+            ),
+        )
+    ).scalar_one_or_none()
+    if simulation is None:
+        raise HTTPException(status_code=404, detail="Simulation not found")
+    return simulation
+
+
+def _visible_adversary(org_id: str):
+    """Adversary profiles a tenant may see: global built-ins plus its own."""
+    return or_(
+        AdversaryProfile.organization_id == org_id,
+        AdversaryProfile.organization_id.is_(None),
+    )
+
 
 # ==================== TARGETS (real enrolled BAS agents) ====================
 
 @router.get("/targets")
 async def list_bas_targets(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     session: DatabaseSession = None,
 ) -> list[dict]:
     """List active, BAS-capable endpoint agents enrolled in this org.
@@ -75,10 +113,10 @@ async def list_bas_targets(
     from src.agents.capabilities import AgentCapability
     from src.agents.models import EndpointAgent
 
-    org_id = getattr(current_user, "organization_id", None)
-    stmt = _sel(EndpointAgent).where(EndpointAgent.status == "active")
-    if org_id:
-        stmt = stmt.where(EndpointAgent.organization_id == org_id)
+    stmt = _sel(EndpointAgent).where(
+        EndpointAgent.status == "active",
+        EndpointAgent.organization_id == org_id,
+    )
     rows = list((await session.execute(stmt)).scalars().all())
 
     targets = []
@@ -101,12 +139,12 @@ async def list_bas_targets(
 @router.post("/simulations")
 async def create_simulation(
     request: SimulationCreateRequest,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    current_user: AnalystUser = None,
     session: DatabaseSession = None,
 ):
     """Create a new attack simulation."""
     try:
-        org_id = getattr(current_user, "organization_id", None)
         orchestrator = SimulationOrchestrator(session)
         simulation = await orchestrator.create_simulation(
             name=request.name,
@@ -141,7 +179,7 @@ async def create_simulation(
 
 @router.get("/simulations", response_model=SimulationListResponse)
 async def list_simulations(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
     status: Optional[str] = None,
@@ -165,21 +203,16 @@ async def list_simulations(
     try:
         from sqlalchemy import select, and_, func
 
-        org_id = getattr(current_user, "organization_id", None)
-
         stmt = select(AttackSimulation)
 
         # Add filters
-        filters = []
-        if org_id is not None:
-            filters.append(AttackSimulation.organization_id == org_id)
+        filters = [AttackSimulation.organization_id == org_id]
         if status:
             filters.append(AttackSimulation.status == status)
         if environment:
             filters.append(AttackSimulation.target_environment == environment)
 
-        if filters:
-            stmt = stmt.where(and_(*filters))
+        stmt = stmt.where(and_(*filters))
 
         # Get total count with proper query
         count_stmt = select(func.count()).select_from(stmt.subquery())
@@ -204,7 +237,7 @@ async def list_simulations(
 @router.get("/simulations/{simulation_id}", response_model=SimulationDetailResponse)
 async def get_simulation_detail(
     simulation_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     session: DatabaseSession = None,
 ) -> SimulationDetailResponse:
     """
@@ -222,12 +255,7 @@ async def get_simulation_detail(
         from sqlalchemy import select
 
         # Get simulation
-        stmt = select(AttackSimulation).where(AttackSimulation.id == simulation_id)
-        result = await session.execute(stmt)
-        simulation = result.scalar_one_or_none()
-
-        if not simulation:
-            raise HTTPException(status_code=404, detail="Simulation not found")
+        simulation = await _get_org_simulation(session, simulation_id, org_id)
 
         # Get tests
         from src.simulation.models import SimulationTest
@@ -265,7 +293,8 @@ async def get_simulation_detail(
 @router.post("/simulations/{simulation_id}/start")
 async def start_simulation(
     simulation_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    current_user: AdminOnlyUser = None,
     session: DatabaseSession = None,
 ) -> dict:
     """
@@ -279,8 +308,8 @@ async def start_simulation(
     Returns:
         Execution start status
     """
+    await _get_org_simulation(session, simulation_id, org_id)
     try:
-        org_id = getattr(current_user, "organization_id", None)
         orchestrator = SimulationOrchestrator(session)
         result = await orchestrator.start_simulation(simulation_id)
 
@@ -297,7 +326,8 @@ async def start_simulation(
 @router.post("/simulations/{simulation_id}/pause")
 async def pause_simulation(
     simulation_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    current_user: AnalystUser = None,
     session: DatabaseSession = None,
 ) -> dict:
     """
@@ -311,6 +341,7 @@ async def pause_simulation(
     Returns:
         Success message
     """
+    await _get_org_simulation(session, simulation_id, org_id)
     try:
         orchestrator = SimulationOrchestrator(session)
         await orchestrator.pause_simulation(simulation_id)
@@ -324,7 +355,8 @@ async def pause_simulation(
 @router.post("/simulations/{simulation_id}/cancel")
 async def cancel_simulation(
     simulation_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    current_user: AnalystUser = None,
     session: DatabaseSession = None,
 ) -> dict:
     """
@@ -338,6 +370,7 @@ async def cancel_simulation(
     Returns:
         Success message
     """
+    await _get_org_simulation(session, simulation_id, org_id)
     try:
         orchestrator = SimulationOrchestrator(session)
         await orchestrator.cancel_simulation(simulation_id)
@@ -351,7 +384,7 @@ async def cancel_simulation(
 @router.get("/simulations/{simulation_id}/progress", response_model=SimulationProgressResponse)
 async def get_simulation_progress(
     simulation_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     session: DatabaseSession = None,
 ) -> SimulationProgressResponse:
     """
@@ -365,6 +398,7 @@ async def get_simulation_progress(
     Returns:
         Progress information
     """
+    await _get_org_simulation(session, simulation_id, org_id)
     try:
         orchestrator = SimulationOrchestrator(session)
         progress = await orchestrator.get_simulation_progress(simulation_id)
@@ -378,7 +412,7 @@ async def get_simulation_progress(
 @router.get("/simulations/{simulation_id}/report", response_model=SimulationReportResponse)
 async def get_simulation_report(
     simulation_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     session: DatabaseSession = None,
 ) -> SimulationReportResponse:
     """
@@ -392,6 +426,7 @@ async def get_simulation_report(
     Returns:
         Executive report
     """
+    await _get_org_simulation(session, simulation_id, org_id)
     try:
         scorer = PostureScorer(session)
         report = await scorer.generate_executive_report(simulation_id)
@@ -406,7 +441,7 @@ async def get_simulation_report(
 
 @router.get("/techniques", response_model=TechniqueListResponse)
 async def list_techniques(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     tactic: Optional[str] = None,
     platform: Optional[str] = None,
     risk_level: Optional[str] = None,
@@ -436,6 +471,10 @@ async def list_techniques(
 
         if safe_only:
             techniques = await library.get_safe_techniques()
+            # get_safe_techniques ignores tactic; apply it here so the two
+            # filters combine instead of safe_only silently dropping tactic.
+            if tactic:
+                techniques = [t for t in techniques if t.tactic == tactic]
         elif tactic:
             techniques = await library.get_techniques_by_tactic(tactic)
         else:
@@ -470,7 +509,7 @@ async def list_techniques(
 
 @router.get("/techniques/coverage")
 async def get_coverage_map(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     session: DatabaseSession = None,
 ) -> dict:
     """
@@ -485,37 +524,23 @@ async def get_coverage_map(
     Returns:
         Coverage map by tactic and technique
     """
-    try:
-        library = AtomicTestLibrary(session)
-        techniques = await library.get_safe_techniques()
-
-        coverage = {}
-        for technique in techniques:
-            if technique.tactic not in coverage:
-                coverage[technique.tactic] = {"total": 0, "detected": 0, "techniques": []}
-
-            coverage[technique.tactic]["total"] += 1
-            detected = bool(technique.detection_sources)
-            if detected:
-                coverage[technique.tactic]["detected"] += 1
-
-            coverage[technique.tactic]["techniques"].append({
-                "mitre_id": technique.mitre_id,
-                "name": technique.name,
-                "detection_sources": technique.detection_sources,
-            })
-
-        return coverage
-
-    except Exception as e:
-        logger.error(f"Error getting coverage: {str(e)}")
-        raise HTTPException(status_code=400, detail="Operation failed. Please try again or contact support.")
+    # Previously "detected" meant the hardcoded catalogue row lists any
+    # detection_sources, a static field that says nothing about this
+    # tenant's detection rules, so every technique looked covered.
+    raise HTTPException(
+        status_code=501,
+        detail={
+            "error": "not_implemented",
+            "detail": "technique coverage is not computed against the organisation's "
+            "detection rules; run a simulation and use /posture/gaps instead",
+        },
+    )
 
 
 @router.get("/techniques/{mitre_id}", response_model=AttackTechniqueSchema)
 async def get_technique(
     mitre_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     session: DatabaseSession = None,
 ) -> AttackTechniqueSchema:
     """
@@ -548,7 +573,8 @@ async def get_technique(
 @router.post("/techniques/{mitre_id}/test")
 async def test_technique(
     mitre_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    current_user: AdminOnlyUser = None,
     payload: Optional[dict] = Body(default=None),
     session: DatabaseSession = None,
 ) -> dict:
@@ -576,7 +602,6 @@ async def test_technique(
         if isinstance(payload, dict) and payload.get("target_host"):
             target_host = str(payload["target_host"])
 
-        org_id = getattr(current_user, "organization_id", None)
         orchestrator = SimulationOrchestrator(session)
         scope: dict = {}
         if target_host:
@@ -669,7 +694,7 @@ async def test_technique(
 
 @router.get("/adversaries", response_model=AdversaryListResponse)
 async def list_adversaries(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     builtin_only: bool = False,
     session: DatabaseSession = None,
 ) -> AdversaryListResponse:
@@ -690,7 +715,7 @@ async def list_adversaries(
         emulator = AdversaryEmulator(session)
         await emulator.load_builtin_profiles()
 
-        stmt = select(AdversaryProfile)
+        stmt = select(AdversaryProfile).where(_visible_adversary(org_id))
         if builtin_only:
             stmt = stmt.where(AdversaryProfile.is_builtin == True)
 
@@ -710,7 +735,7 @@ async def list_adversaries(
 @router.get("/adversaries/{adversary_id}", response_model=AdversaryProfileSchema)
 async def get_adversary(
     adversary_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     session: DatabaseSession = None,
 ) -> AdversaryProfileSchema:
     """
@@ -727,7 +752,9 @@ async def get_adversary(
     try:
         from sqlalchemy import select
 
-        stmt = select(AdversaryProfile).where(AdversaryProfile.id == adversary_id)
+        stmt = select(AdversaryProfile).where(
+            AdversaryProfile.id == adversary_id, _visible_adversary(org_id),
+        )
         result = await session.execute(stmt)
         adversary = result.scalar_one_or_none()
 
@@ -746,7 +773,8 @@ async def get_adversary(
 @router.post("/adversaries/{adversary_id}/emulate", response_model=SimulationDetailResponse)
 async def create_emulation_plan(
     adversary_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    current_user: AdminOnlyUser = None,
     session: DatabaseSession = None,
 ) -> SimulationDetailResponse:
     """
@@ -760,8 +788,16 @@ async def create_emulation_plan(
     Returns:
         Created simulation
     """
+    visible = (
+        await session.execute(
+            sa_select(AdversaryProfile.id).where(
+                AdversaryProfile.id == adversary_id, _visible_adversary(org_id),
+            ),
+        )
+    ).scalar_one_or_none()
+    if visible is None:
+        raise HTTPException(status_code=404, detail="Adversary not found")
     try:
-        org_id = getattr(current_user, "organization_id", None)
         emulator = AdversaryEmulator(session)
         simulation = await emulator.create_emulation_plan(
             adversary_id,
@@ -824,7 +860,7 @@ async def create_emulation_plan(
 
 @router.get("/posture", response_model=PostureScoreResponse)
 async def get_current_posture(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     session: DatabaseSession = None,
 ) -> PostureScoreResponse:
     """
@@ -840,17 +876,22 @@ async def get_current_posture(
     try:
         from sqlalchemy import select, desc
 
-        stmt = select(SecurityPostureScore).order_by(desc(SecurityPostureScore.assessed_at)).limit(1)
+        # Scoped to the caller's org so another tenant's score never shows here.
+        stmt = (
+            select(SecurityPostureScore)
+            .where(SecurityPostureScore.organization_id == org_id)
+            .order_by(desc(SecurityPostureScore.assessed_at))
+            .limit(1)
+        )
         result = await session.execute(stmt)
         score = result.scalar_one_or_none()
 
         if not score:
-            # No assessment has run yet. Return an empty/zero posture (200) so
-            # the dashboard renders a "no posture yet" state instead of erroring
-            # on a fresh environment.
+            # No assessment has run yet. score=None (not 0) so the page says
+            # "not available" instead of presenting an invented 0/100.
             return PostureScoreResponse(
                 score_type="overall",
-                score=0.0,
+                score=None,
                 max_score=100.0,
                 breakdown={},
                 recommendations=[],
@@ -874,7 +915,7 @@ async def get_current_posture(
 
 @router.get("/posture/gaps", response_model=GapAnalysisResponse)
 async def get_gap_analysis(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     simulation_id: Optional[str] = None,
     session: DatabaseSession = None,
 ) -> GapAnalysisResponse:
@@ -893,12 +934,19 @@ async def get_gap_analysis(
         from sqlalchemy import select, desc
 
         if not simulation_id:
-            stmt = select(AttackSimulation).order_by(desc(AttackSimulation.completed_at)).limit(1)
+            stmt = (
+                select(AttackSimulation)
+                .where(AttackSimulation.organization_id == org_id)
+                .order_by(desc(AttackSimulation.completed_at).nullslast())
+                .limit(1)
+            )
             result = await session.execute(stmt)
             simulation = result.scalar_one_or_none()
             if not simulation:
                 raise HTTPException(status_code=404, detail="No simulations found")
             simulation_id = simulation.id
+        else:
+            await _get_org_simulation(session, simulation_id, org_id)
 
         scorer = PostureScorer(session)
         gaps = await scorer.generate_gap_analysis(simulation_id)
@@ -930,7 +978,7 @@ async def get_gap_analysis(
 
 @router.get("/dashboard", response_model=DashboardStatsResponse)
 async def get_dashboard_stats(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     session: DatabaseSession = None,
 ) -> DashboardStatsResponse:
     """
@@ -947,8 +995,6 @@ async def get_dashboard_stats(
         from sqlalchemy import select, func, desc, and_
         from src.simulation.models import SimulationTest
 
-        org_id = getattr(current_user, "organization_id", None)
-
         # Make sure the built-in technique catalog AND adversary profiles
         # are loaded so the dashboard counts aren't 0 on a cold database.
         # Both loaders are idempotent (skip rows that already exist).
@@ -959,8 +1005,6 @@ async def get_dashboard_stats(
             logger.warning(f"Builtin BAS loader failed on dashboard: {load_exc}")
 
         def _org(q):
-            if org_id is None:
-                return q
             return q.where(AttackSimulation.organization_id == org_id)
 
         # Count simulations by status (scoped to org)
@@ -972,21 +1016,26 @@ async def get_dashboard_stats(
             _org(select(func.count(AttackSimulation.id))).where(AttackSimulation.status == "running")
         )).scalar() or 0
 
-        # Library-level counts (techniques and adversary profiles are global)
+        # Library-level counts: techniques are a global catalogue; adversary
+        # profiles are the global built-ins plus this org's own.
         technique_count = (await session.execute(select(func.count(AttackTechnique.id)))).scalar() or 0
-        adversary_count = (await session.execute(select(func.count(AdversaryProfile.id)))).scalar() or 0
+        adversary_count = (await session.execute(
+            select(func.count(AdversaryProfile.id)).where(_visible_adversary(org_id)),
+        )).scalar() or 0
 
         # Averages over completed simulations for this org
+        # None (not 0) when no completed run has a value, so the page can
+        # say "not available" rather than report a 0% detection rate.
         avg_detection = (await session.execute(
             _org(select(func.avg(AttackSimulation.detection_rate))).where(
                 AttackSimulation.status == "completed"
             )
-        )).scalar() or 0.0
+        )).scalar()
         avg_posture = (await session.execute(
             _org(select(func.avg(AttackSimulation.overall_score))).where(
                 AttackSimulation.status == "completed"
             )
-        )).scalar() or 0.0
+        )).scalar()
 
         # --- Real top_tactics (detection rate per MITRE tactic) ---
         # Join SimulationTest -> AttackTechnique -> group by tactic, compute
@@ -1003,11 +1052,12 @@ async def get_dashboard_stats(
             .select_from(SimulationTest)
             .join(AttackTechnique, SimulationTest.technique_id == AttackTechnique.id)
             .join(AttackSimulation, SimulationTest.simulation_id == AttackSimulation.id)
-            .where(AttackSimulation.status == "completed")
+            .where(
+                AttackSimulation.status == "completed",
+                AttackSimulation.organization_id == org_id,
+            )
             .group_by(AttackTechnique.tactic)
         )
-        if org_id is not None:
-            tactic_stmt = tactic_stmt.where(AttackSimulation.organization_id == org_id)
 
         top_tactics: list[dict] = []
         tactic_result = await session.execute(tactic_stmt)
@@ -1035,18 +1085,10 @@ async def get_dashboard_stats(
         # --- Real security_trends from SecurityPostureScore history ---
         trends_stmt = (
             select(SecurityPostureScore.score)
+            .where(SecurityPostureScore.organization_id == org_id)
             .order_by(desc(SecurityPostureScore.assessed_at))
             .limit(12)
         )
-        if org_id is not None:
-            # Posture scores belong to simulations; join through to filter by org
-            trends_stmt = (
-                select(SecurityPostureScore.score)
-                .join(AttackSimulation, SecurityPostureScore.simulation_id == AttackSimulation.id)
-                .where(AttackSimulation.organization_id == org_id)
-                .order_by(desc(SecurityPostureScore.assessed_at))
-                .limit(12)
-            )
         trend_scores = [float(s) for s in (await session.execute(trends_stmt)).scalars().all()]
         trend_scores.reverse()  # oldest -> newest for chart consumption
 
@@ -1063,8 +1105,8 @@ async def get_dashboard_stats(
             total_simulations=total_sims,
             completed_simulations=completed,
             running_simulations=running,
-            average_detection_rate=round(float(avg_detection), 1),
-            average_posture_score=round(float(avg_posture), 1),
+            average_detection_rate=round(float(avg_detection), 1) if avg_detection is not None else None,
+            average_posture_score=round(float(avg_posture), 1) if avg_posture is not None else None,
             techniques_in_library=technique_count,
             adversary_profiles=adversary_count,
             top_tactics=top_tactics,

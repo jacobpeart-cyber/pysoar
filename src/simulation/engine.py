@@ -433,9 +433,10 @@ class SimulationOrchestrator:
             target_host = scope.get("target_host") if isinstance(scope, dict) else None
             org_id = simulation.organization_id
 
-            base_query = select(EndpointAgent).where(EndpointAgent.status == "active")
-            if org_id:
-                base_query = base_query.where(EndpointAgent.organization_id == org_id)
+            base_query = select(EndpointAgent).where(
+                EndpointAgent.status == "active",
+                EndpointAgent.organization_id == org_id,
+            )
 
             # Pool of active BAS-capable agents in the org (no hostname
             # filter) — used as the fallback when target_host misses.
@@ -535,10 +536,14 @@ class SimulationOrchestrator:
         mitre_id: str,
         rule_ids: list[str],
         window_start: datetime,
+        organization_id: str,
     ) -> Optional[dict]:
         """Find the earliest evidence that detection actually FIRED in the
         execution window: a rule match recorded on an ingested log entry,
         or a correlation event carrying this technique.
+
+        Only the simulation's own organisation's logs and correlation events
+        count, so another tenant's telemetry can never mark this test detected.
 
         Returns ``{"fired_at", "source", "ref_id"}`` or None.
         """
@@ -554,7 +559,11 @@ class SimulationOrchestrator:
             like_clauses = [LogEntry.rule_matches.like(f'%{rid}%') for rid in rule_ids]
             stmt = (
                 select(LogEntry)
-                .where(LogEntry.rule_matches.is_not(None), or_(*like_clauses))
+                .where(
+                    LogEntry.organization_id == organization_id,
+                    LogEntry.rule_matches.is_not(None),
+                    or_(*like_clauses),
+                )
                 .order_by(LogEntry.received_at.desc())
                 .limit(500)
             )
@@ -567,6 +576,7 @@ class SimulationOrchestrator:
         stmt = (
             select(CorrelationEvent)
             .where(
+                CorrelationEvent.organization_id == organization_id,
                 CorrelationEvent.mitre_techniques.is_not(None),
                 CorrelationEvent.mitre_techniques.like(f"%{mitre_id}%"),
                 CorrelationEvent.created_at >= search_start.replace(tzinfo=None),
@@ -618,12 +628,20 @@ class SimulationOrchestrator:
         if not mitre_id:
             return False
 
+        # Detection is judged only against the simulation's own tenant:
+        # another organisation's rules or telemetry must never credit it.
+        simulation = await self._get_simulation(test.simulation_id)
+        if simulation is None:
+            return False
+        org_id = simulation.organization_id
+
         # Active detection rules whose mitre_techniques contains this id.
         # ``mitre_techniques`` is a Text column holding a JSON array, so we
         # use SQL LIKE to pre-filter and then confirm in Python against a
         # parsed list to avoid false positives (e.g. "T1059" matching "T10591").
         stmt = select(DetectionRule).where(
             and_(
+                DetectionRule.organization_id == org_id,
                 DetectionRule.status == RuleStatus.ACTIVE.value,
                 DetectionRule.mitre_techniques.is_not(None),
                 DetectionRule.mitre_techniques.like(f"%{mitre_id}%"),
@@ -646,7 +664,7 @@ class SimulationOrchestrator:
         if execution_mode == "real":
             window_start = self._parse_ts(test.started_at) or utc_now()
             evidence = await self._find_fired_evidence(
-                mitre_id, [r.id for r in matching_rules], window_start
+                mitre_id, [r.id for r in matching_rules], window_start, org_id,
             )
             if evidence:
                 latency = max(0, int((evidence["fired_at"] - window_start).total_seconds()))
@@ -1577,13 +1595,26 @@ class PostureScorer:
             total_count = len(tests)
             detection_score = (detected_count / total_count * 100) if total_count > 0 else 0
 
-            # Calculate tactic-based scores
-            tactic_scores = {}
-            for tactic in simulation.mitre_tactics:
-                tactic_tests = [t for t in tests if hasattr(t, 'technique_id')]
-                if tactic_tests:
-                    tactic_detected = sum(1 for t in tactic_tests if t.was_detected)
-                    tactic_scores[tactic] = (tactic_detected / len(tactic_tests) * 100)
+            # Per-tactic detection rate from each test's own technique. The
+            # old loop put every test under every tactic, so each tactic just
+            # repeated the overall rate.
+            technique_tactic: Dict[str, Optional[str]] = {}
+            tactic_counts: Dict[str, List[int]] = {}
+            for t in tests:
+                if t.technique_id not in technique_tactic:
+                    tech = await self._get_technique(t.technique_id)
+                    technique_tactic[t.technique_id] = tech.tactic if tech else None
+                tactic = technique_tactic[t.technique_id]
+                if not tactic:
+                    continue
+                counts = tactic_counts.setdefault(tactic, [0, 0])
+                counts[0] += 1
+                if t.was_detected:
+                    counts[1] += 1
+            tactic_scores = {
+                tactic: (detected / total * 100)
+                for tactic, (total, detected) in tactic_counts.items()
+            }
 
             score = detection_score
             breakdown = {
@@ -1668,14 +1699,17 @@ class PostureScorer:
 
         posture_score = await self.calculate_posture_score(simulation_id)
         gaps = await self.generate_gap_analysis(simulation_id)
+        # Detected tests come from was_detected; blocked_tests counts the
+        # tests that were NOT detected, so it must not be reported here.
+        tests_detected = int((posture_score.breakdown or {}).get("tests_detected", 0))
 
         return {
             "simulation_name": simulation.name,
             "simulation_id": simulation.id,
             "overall_score": posture_score.score,
             "total_tests": simulation.total_tests,
-            "tests_detected": simulation.blocked_tests,
-            "detection_rate_percent": ((simulation.blocked_tests / max(simulation.total_tests, 1)) * 100),
+            "tests_detected": tests_detected,
+            "detection_rate_percent": ((tests_detected / max(simulation.total_tests, 1)) * 100),
             "techniques_assessed": len(simulation.mitre_techniques),
             "tactics_covered": simulation.mitre_tactics,
             "undetected_gaps": len(gaps),

@@ -80,8 +80,16 @@ def send_notification_task(
     subject: str,
     message: str,
     html_message: str = None,
+    organization_id: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Send a notification via email, Slack, or Teams."""
+    """Send a notification via email, Slack, or Teams.
+
+    With ``organization_id`` the organisation's own SMTP settings and
+    Slack / Teams webhooks are used (Settings page, per tenant); a tenant with
+    no webhook configured is not notified on any other channel. Without it
+    (platform events such as backups) the platform configuration from the
+    environment applies.
+    """
     import asyncio
 
     logger.info(
@@ -92,10 +100,37 @@ def send_notification_task(
 
     sent = False
 
+    tenant_webhook: Optional[str] = None
+    tenant_email = None
+    if organization_id:
+        async def _tenant_config() -> tuple[Optional[str], Any]:
+            from src.core.database import async_session_factory
+            from src.services.email_service import EmailService
+            from src.services.tenant_settings import notification_webhook_for
+
+            async with async_session_factory() as session:
+                webhook = (
+                    await notification_webhook_for(session, organization_id, channel)
+                    if channel in ("slack", "teams")
+                    else None
+                )
+                email = (
+                    await EmailService.for_organization(session, organization_id)
+                    if channel == "email"
+                    else None
+                )
+                return webhook, email
+
+        config_loop = asyncio.new_event_loop()
+        try:
+            tenant_webhook, tenant_email = config_loop.run_until_complete(_tenant_config())
+        finally:
+            config_loop.close()
+
     if channel == "email" and recipients:
         try:
             from src.services.email_service import EmailService
-            email_service = EmailService()
+            email_service = tenant_email or EmailService()
             if email_service.is_configured:
                 loop = asyncio.new_event_loop()
                 sent = loop.run_until_complete(
@@ -117,7 +152,7 @@ def send_notification_task(
         try:
             import httpx
             from src.core.config import settings
-            webhook_url = settings.slack_webhook_url
+            webhook_url = tenant_webhook if organization_id else settings.slack_webhook_url
             if webhook_url:
                 resp = httpx.post(webhook_url, json={"text": f"*{subject}*\n{message}"}, timeout=10)
                 sent = resp.status_code == 200
@@ -129,7 +164,7 @@ def send_notification_task(
         try:
             import httpx
             from src.core.config import settings
-            webhook_url = settings.teams_webhook_url
+            webhook_url = tenant_webhook if organization_id else settings.teams_webhook_url
             if webhook_url:
                 resp = httpx.post(webhook_url, json={"text": f"**{subject}**\n\n{message}"}, timeout=10)
                 sent = resp.status_code == 200

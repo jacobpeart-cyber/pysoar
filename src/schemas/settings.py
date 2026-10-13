@@ -36,6 +36,8 @@ class NotificationConfig(BaseModel):
     teams_enabled: bool = False
     slack_webhook_url: Optional[str] = None
     teams_webhook_url: Optional[str] = None
+    #: Response only: stored keys no server-side code enforces yet.
+    stored_not_enforced: List[str] = Field(default_factory=list)
 
 
 class AlertCorrelationConfig(BaseModel):
@@ -56,6 +58,8 @@ class GeneralSettings(BaseModel):
     session_timeout_minutes: int = 30
     max_login_attempts: int = 5
     lockout_duration_minutes: int = 15
+    #: Response only: stored keys no server-side code enforces yet.
+    stored_not_enforced: List[str] = Field(default_factory=list)
 
 
 class SettingsResponse(BaseModel):

@@ -345,7 +345,7 @@ class LegalHoldBase(BaseModel):
 
     hold_type: str = ""
     custodians: list[str]
-    data_sources: list[str]
+    data_sources: list[str] = Field(default_factory=list)
     issued_by: str = ""
     issued_date: Optional[str] = None
     expiry_date: Optional[str] = None

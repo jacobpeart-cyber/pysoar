@@ -39,7 +39,13 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.agentic.policy import AGENTIC_POLICY_SECTION, org_policy_settings_from_section
-from src.api.deps import AdminUser, DatabaseSession, get_current_superuser
+from src.api.deps import (
+    AdminUser,
+    DatabaseSession,
+    OrganizationId,
+    PlatformSuperUser,
+    require_role,
+)
 from src.audit_evidence.engine import AuditLogger
 from src.core.config import settings as app_settings
 from src.core.logging import get_logger
@@ -62,7 +68,7 @@ from src.llm.factory import (
     resolve_llm_config,
 )
 from src.models.settings import AppSetting
-from src.models.user import User
+from src.models.user import User, UserRole
 from src.schemas.settings import (
     AgenticPolicySettingsResponse,
     AgenticPolicySettingsUpdate,
@@ -89,9 +95,33 @@ class SecurityConfig(BaseModel):
     session_timeout_minutes: Optional[int] = None
     password_min_length: Optional[int] = None
     require_mfa: Optional[bool] = None
+    stored_not_enforced: List[str] = []
 
 
 router = APIRouter(prefix="/settings", tags=["settings"])
+
+#: Settings writes are tenant configuration: admins of the organisation only.
+_ADMIN = require_role([UserRole.ADMIN])
+
+# Keys each section stores per organisation that no server-side code reads
+# yet. Responses list them in ``stored_not_enforced`` so the page can say
+# "saved, not yet enforced" instead of implying the platform applies them.
+# Everything else is read per organisation where it is used: SMTP
+# (EmailService.for_organization), Slack/Teams webhooks
+# (src.services.notifications, playbook Slack action, notification task),
+# session timeout (token lifetime at login / refresh / MFA), integration keys
+# (Test buttons and the installed-integration credential store).
+_STORED_NOT_ENFORCED: Dict[str, List[str]] = {
+    "general": ["max_login_attempts", "lockout_duration_minutes"],
+    "security": ["max_login_attempts", "lockout_duration_minutes", "password_min_length", "require_mfa"],
+    "notifications": ["email_enabled", "slack_enabled", "teams_enabled"],
+}
+
+#: Integration keys whose per-organisation value is not yet used by the
+#: automatic IOC enrichment path (src/intel/enrichment.py and the
+#: src/integrations/<provider>.py clients read the platform key). The
+#: per-organisation key is used by Test and by marketplace integration actions.
+_ENRICHMENT_PLATFORM_KEY_ONLY = frozenset({"virustotal", "abuseipdb", "shodan", "greynoise"})
 
 
 # ---------------------------------------------------------------------------
@@ -248,16 +278,15 @@ def _utc_now_iso() -> str:
 # GET /settings
 # ---------------------------------------------------------------------------
 
-@router.get("", response_model=SettingsResponse)
+@router.get("", response_model=SettingsResponse, dependencies=[Depends(_ADMIN)])
 async def get_settings(
     db: DatabaseSession = None,
-    current_user: User = Depends(get_current_superuser),
+    org_id: OrganizationId = None,
 ) -> SettingsResponse:
     """Get current application settings (admin only).
 
     Union of env-derived defaults with any stored per-org overrides.
     """
-    org_id = _user_org(current_user)
 
     general_override = await _load_section(db, org_id, "general")
     smtp_override = await _load_section(db, org_id, "smtp")
@@ -304,12 +333,7 @@ async def get_settings(
     stmt = select(AppSetting.section, AppSetting.value).where(
         AppSetting.section.like("integration:%"),
     )
-    stmt = (
-        stmt.where(AppSetting.organization_id == org_id)
-        if org_id is not None
-        else stmt.where(AppSetting.organization_id.is_(None))
-    )
-    rows = await db.execute(stmt)
+    rows = await db.execute(stmt.where(AppSetting.organization_id == org_id))
     for section, value in rows.all():
         integ_id = section.split(":", 1)[1] if ":" in section else section
         ovr = value if isinstance(value, dict) else {}
@@ -348,6 +372,7 @@ async def get_settings(
                 "lockout_duration_minutes",
                 pick(general_override, "lockout_duration_minutes", 15),
             ),
+            stored_not_enforced=_STORED_NOT_ENFORCED["general"],
         ),
         smtp=SMTPConfig(
             host=pick(smtp_override, "host", app_settings.smtp_host),
@@ -382,6 +407,7 @@ async def get_settings(
                     notif_override, "teams_webhook_url", app_settings.teams_webhook_url,
                 ),
             ),
+            stored_not_enforced=_STORED_NOT_ENFORCED["notifications"],
         ),
         alert_correlation=AlertCorrelationConfig(
             enabled=True,
@@ -402,47 +428,33 @@ async def get_settings(
 async def update_settings(
     settings_update: SettingsUpdate,
     db: DatabaseSession = None,
-    current_user: User = Depends(get_current_superuser),
+    current_user: User = Depends(_ADMIN),
+    org_id: OrganizationId = None,
 ) -> SettingsResponse:
     """Update application settings (admin only) — persists to DB."""
-    org_id = _user_org(current_user)
     uid = getattr(current_user, "id", None)
 
     if settings_update.smtp:
         smtp = settings_update.smtp
         value = smtp.model_dump(exclude_unset=True, exclude_none=True)
+        # Per organisation only; EmailService.for_organization reads it.
         await _upsert_section(db, org_id, "smtp", value, uid)
-        # Mirror to runtime so the rest of this process sees the change
-        for k, attr in (
-            ("host", "smtp_host"),
-            ("port", "smtp_port"),
-            ("username", "smtp_user"),
-            ("password", "smtp_password"),
-            ("from_address", "smtp_from"),
-            ("use_tls", "smtp_tls"),
-        ):
-            if k in value and value[k] is not None:
-                setattr(app_settings, attr, value[k])
 
     if settings_update.notifications:
         notif = settings_update.notifications
-        value = notif.model_dump(exclude_unset=True, exclude_none=True)
+        value = notif.model_dump(
+            exclude_unset=True, exclude_none=True, exclude={"stored_not_enforced"},
+        )
         await _upsert_section(db, org_id, "notifications", value, uid)
-        if "slack_webhook_url" in value:
-            app_settings.slack_webhook_url = value["slack_webhook_url"] or ""
-        if "teams_webhook_url" in value:
-            app_settings.teams_webhook_url = value["teams_webhook_url"] or ""
 
     if settings_update.general:
         gen = settings_update.general
-        value = gen.model_dump(exclude_unset=True, exclude_none=True)
+        value = gen.model_dump(
+            exclude_unset=True, exclude_none=True, exclude={"stored_not_enforced"},
+        )
         await _upsert_section(db, org_id, "general", value, uid)
-        if "app_name" in value and value["app_name"] is not None:
-            app_settings.app_name = value["app_name"]
-        if "session_timeout_minutes" in value and value["session_timeout_minutes"] is not None:
-            app_settings.access_token_expire_minutes = int(value["session_timeout_minutes"])
 
-    return await get_settings(db, current_user)
+    return await get_settings(db, org_id)
 
 
 # ---------------------------------------------------------------------------
@@ -453,10 +465,10 @@ async def update_settings(
 async def update_general_settings(
     updates: Dict[str, Any] = Body(...),
     db: DatabaseSession = None,
-    current_user: User = Depends(get_current_superuser),
+    current_user: User = Depends(_ADMIN),
+    org_id: OrganizationId = None,
 ) -> GeneralSettings:
     """Update general settings. Accepts a dict of fields to update."""
-    org_id = _user_org(current_user)
     uid = getattr(current_user, "id", None)
 
     if "session_timeout_minutes" in updates and updates["session_timeout_minutes"] is not None:
@@ -465,13 +477,10 @@ async def update_general_settings(
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="session_timeout_minutes must be int")
 
+    updates.pop("stored_not_enforced", None)
+    # Per organisation only: the session timeout is read at token issue
+    # (src.services.tenant_settings.session_timeout_minutes_for).
     merged = await _upsert_section(db, org_id, "general", updates, uid)
-
-    # Mirror to runtime for in-process effect
-    if "app_name" in merged and merged["app_name"] is not None:
-        app_settings.app_name = str(merged["app_name"])
-    if "session_timeout_minutes" in merged and merged["session_timeout_minutes"] is not None:
-        app_settings.access_token_expire_minutes = int(merged["session_timeout_minutes"])
 
     return GeneralSettings(
         app_name=merged.get("app_name", app_settings.app_name),
@@ -483,6 +492,7 @@ async def update_general_settings(
         ),
         max_login_attempts=int(merged.get("max_login_attempts", 5)),
         lockout_duration_minutes=int(merged.get("lockout_duration_minutes", 15)),
+        stored_not_enforced=_STORED_NOT_ENFORCED["general"],
     )
 
 
@@ -494,10 +504,10 @@ async def update_general_settings(
 async def update_smtp_settings(
     updates: Dict[str, Any] = Body(...),
     db: DatabaseSession = None,
-    current_user: User = Depends(get_current_superuser),
+    current_user: User = Depends(_ADMIN),
+    org_id: OrganizationId = None,
 ) -> SMTPConfig:
     """Update SMTP settings. Accepts a dict of fields to update."""
-    org_id = _user_org(current_user)
     uid = getattr(current_user, "id", None)
 
     clean: Dict[str, Any] = {}
@@ -509,7 +519,7 @@ async def update_smtp_settings(
         "from_address": "smtp_from",
         "use_tls": "smtp_tls",
     }
-    for in_key, attr in mapping.items():
+    for in_key in mapping:
         if in_key in updates and updates[in_key] is not None:
             value = updates[in_key]
             if in_key == "port":
@@ -520,7 +530,6 @@ async def update_smtp_settings(
             if in_key == "use_tls":
                 value = bool(value)
             clean[in_key] = value
-            setattr(app_settings, attr, value)
 
     merged = await _upsert_section(db, org_id, "smtp", clean, uid)
 
@@ -541,19 +550,17 @@ async def update_smtp_settings(
 async def update_notification_settings(
     updates: Dict[str, Any] = Body(...),
     db: DatabaseSession = None,
-    current_user: User = Depends(get_current_superuser),
+    current_user: User = Depends(_ADMIN),
+    org_id: OrganizationId = None,
 ) -> NotificationConfig:
     """Update notification settings. Accepts a dict of fields to update."""
-    org_id = _user_org(current_user)
     uid = getattr(current_user, "id", None)
 
     clean: Dict[str, Any] = {}
     if "slack_webhook_url" in updates:
         clean["slack_webhook_url"] = updates["slack_webhook_url"] or ""
-        app_settings.slack_webhook_url = clean["slack_webhook_url"]
     if "teams_webhook_url" in updates:
         clean["teams_webhook_url"] = updates["teams_webhook_url"] or ""
-        app_settings.teams_webhook_url = clean["teams_webhook_url"]
     for key in ("email_enabled", "slack_enabled", "teams_enabled"):
         if key in updates and updates[key] is not None:
             clean[key] = bool(updates[key])
@@ -574,6 +581,7 @@ async def update_notification_settings(
         teams_webhook_url=_mask_secret(
             merged.get("teams_webhook_url", app_settings.teams_webhook_url),
         ),
+        stored_not_enforced=_STORED_NOT_ENFORCED["notifications"],
     )
 
 
@@ -585,17 +593,16 @@ async def update_notification_settings(
 async def update_security_settings(
     updates: Dict[str, Any] = Body(...),
     db: DatabaseSession = None,
-    current_user: User = Depends(get_current_superuser),
+    current_user: User = Depends(_ADMIN),
+    org_id: OrganizationId = None,
 ) -> SecurityConfig:
     """Update security settings. Accepts a dict of fields to update."""
-    org_id = _user_org(current_user)
     uid = getattr(current_user, "id", None)
 
     clean: Dict[str, Any] = {}
     if "session_timeout_minutes" in updates and updates["session_timeout_minutes"] is not None:
         try:
             clean["session_timeout_minutes"] = int(updates["session_timeout_minutes"])
-            app_settings.access_token_expire_minutes = clean["session_timeout_minutes"]
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="session_timeout_minutes must be int")
     for key in ("max_login_attempts", "lockout_duration_minutes",
@@ -613,6 +620,7 @@ async def update_security_settings(
         ),
         password_min_length=int(merged.get("password_min_length", 8)),
         require_mfa=bool(merged.get("require_mfa", False)),
+        stored_not_enforced=_STORED_NOT_ENFORCED["security"],
     )
 
 
@@ -736,7 +744,8 @@ async def save_integration_config(
     integration_id: str,
     config: Dict[str, Any] = Body(...),
     db: DatabaseSession = None,
-    current_user: User = Depends(get_current_superuser),
+    current_user: User = Depends(_ADMIN),
+    org_id: OrganizationId = None,
 ) -> dict:
     """Save configuration for a specific integration (persisted)."""
     if integration_id not in _INTEGRATION_KEY_ATTR:
@@ -747,29 +756,11 @@ async def save_integration_config(
 
     _reject_tenant_url(integration_id, config)
 
-    org_id = _user_org(current_user)
     uid = getattr(current_user, "id", None)
     attr = _INTEGRATION_KEY_ATTR[integration_id]
 
-    primary_value = (
-        config.get("api_key")
-        or config.get("url")
-        or config.get("host")
-        or config.get("token")
-        or config.get("webhook_url")
-    )
-    # Only mutate app_settings when the target attribute actually
-    # exists on the BaseSettings object (pydantic v2 rejects unknown
-    # attrs). Notification/ticketing integrations like Slack, Teams,
-    # PagerDuty, Jira don't have corresponding app_settings attrs —
-    # they're read exclusively from the DB-saved `integration:<name>`
-    # row, which is what `_upsert_section` below persists.
-    if primary_value is not None and hasattr(app_settings, attr):
-        try:
-            setattr(app_settings, attr, str(primary_value))
-        except Exception:  # pydantic validation — non-fatal
-            pass
-
+    # Stored per organisation only (the process-wide config is never
+    # written: it used to make one tenant's key every tenant's key).
     merged = await _upsert_section(
         db, org_id, f"integration:{integration_id}", config, uid,
     )
@@ -808,11 +799,18 @@ async def save_integration_config(
             error=type(exc).__name__,
         )
 
-    return {
+    response: Dict[str, Any] = {
         "integration_id": integration_id,
         "enabled": enabled,
         "configured": configured,
     }
+    if integration_id in _ENRICHMENT_PLATFORM_KEY_ONLY:
+        response["stored_not_enforced"] = ["automatic_ioc_enrichment"]
+        response["note"] = (
+            "Saved for this organisation and used by Test and by integration actions; "
+            "automatic IOC enrichment still uses the platform key."
+        )
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -823,7 +821,8 @@ async def save_integration_config(
 @router.post("/test-email")
 async def test_email_settings(
     db: DatabaseSession = None,
-    current_user: User = Depends(get_current_superuser),
+    current_user: User = Depends(_ADMIN),
+    org_id: OrganizationId = None,
 ) -> dict:
     """Test email configuration by sending a test email.
 
@@ -832,17 +831,16 @@ async def test_email_settings(
     through the UI got "Email is not configured" on Test until the
     container was restarted — save+test was broken within a session.
     """
-    org_id = _user_org(current_user)
-    saved_smtp = await _load_section(db, org_id, "smtp") if db is not None else {}
-    configured_user = (saved_smtp or {}).get("smtp_user") or (saved_smtp or {}).get("user") or app_settings.smtp_user
-    if not configured_user:
+    from src.services.email_service import EmailService
+
+    # The organisation's SMTP section (Settings > SMTP), else the platform
+    # relay from the environment; never another tenant's values.
+    email_service = await EmailService.for_organization(db, org_id)
+    if not email_service.username:
         raise HTTPException(
             status_code=400,
             detail="Email is not configured",
         )
-
-    from src.services.email_service import EmailService
-    email_service = EmailService()
 
     if not email_service.is_configured:
         raise HTTPException(
@@ -865,11 +863,11 @@ async def test_email_settings(
     return {"message": "Test email sent successfully", "to": current_user.email}
 
 
-@router.post("/test-integration/{integration_name}")
+@router.post("/test-integration/{integration_name}", dependencies=[Depends(_ADMIN)])
 async def test_integration(
     integration_name: str,
     db: DatabaseSession = None,
-    current_user: User = Depends(get_current_superuser),
+    org_id: OrganizationId = None,
 ) -> dict:
     """Test an integration connection.
 
@@ -902,7 +900,6 @@ async def test_integration(
             detail=f"Unknown integration: {integration_name}",
         )
 
-    org_id = _user_org(current_user)
     saved = await _load_section(db, org_id, f"integration:{integration_name}") if db is not None else {}
 
     def _pick(keys: list[str], fallback: str = "") -> str:
@@ -1668,7 +1665,7 @@ async def list_ai_models(
 @router.get("/ai/tenants", response_model=AITenantsResponse)
 async def list_ai_tenants(
     db: DatabaseSession = None,
-    current_user: User = Depends(get_current_superuser),
+    current_user: PlatformSuperUser = None,
 ) -> AITenantsResponse:
     """One row per organization with an ``ai`` section (superuser, cross-org).
 

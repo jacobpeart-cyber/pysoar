@@ -3,16 +3,30 @@
 import math
 from typing import Any, Optional
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import select, func, desc
+from sqlalchemy import desc, func, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from src.api.deps import DatabaseSession, get_current_superuser, get_db
+from src.api.deps import DatabaseSession, get_current_superuser, get_db, resolve_organization_scope
 from src.models.audit import AuditLog
 from src.models.user import User
 from src.schemas.audit import AuditLogResponse, AuditLogListResponse
 
 router = APIRouter(prefix="/audit", tags=["audit"])
+
+
+def _audit_scope(current_user: User, organization_id: Optional[str]) -> Optional[str]:
+    """The tenant whose audit rows the caller may read.
+
+    Tenant admins (``get_current_superuser`` admits them) only ever see rows
+    stamped with their own organisation; an explicit ``organization_id`` must
+    match it (403 ``organization_mismatch``). A platform superuser sees every
+    tenant (``None``: no filter, including historic rows written before
+    migration 023 with no organisation) unless they name one tenant.
+    """
+    if current_user.is_superuser and not organization_id:
+        return None
+    return resolve_organization_scope(current_user, organization_id)
 
 
 @router.get("", response_model=AuditLogListResponse)
@@ -28,6 +42,7 @@ async def list_audit_logs(
     days: Optional[int] = Query(None, ge=1, le=3650),
     search: Optional[str] = None,
     ip_address: Optional[str] = None,
+    organization_id: Optional[str] = Query(None),
 ) -> AuditLogListResponse:
     """List audit logs with filtering (admin only).
 
@@ -39,9 +54,13 @@ async def list_audit_logs(
     from datetime import datetime, timedelta, timezone
     from sqlalchemy import or_
 
-    # Build query
+    # Build query (tenant admins: their organisation only)
     query = select(AuditLog).options(selectinload(AuditLog.user))
     count_query = select(func.count(AuditLog.id))
+    scope = _audit_scope(current_user, organization_id)
+    if scope is not None:
+        query = query.where(AuditLog.organization_id == scope)
+        count_query = count_query.where(AuditLog.organization_id == scope)
 
     # Apply filters
     if action:
@@ -138,9 +157,13 @@ async def list_audit_actions(
 async def list_resource_types(
     db: DatabaseSession = None,
     current_user: User = Depends(get_current_superuser),
+    organization_id: Optional[str] = Query(None),
 ) -> dict:
-    """List all resource types that have audit logs"""
+    """List all resource types that have audit logs (in the caller's scope)"""
     query = select(AuditLog.resource_type).distinct()
+    scope = _audit_scope(current_user, organization_id)
+    if scope is not None:
+        query = query.where(AuditLog.organization_id == scope)
     result = await db.execute(query)
     types = result.scalars().all()
 
@@ -153,26 +176,30 @@ async def list_resource_types(
 async def get_audit_stats(
     db: DatabaseSession = None,
     current_user: User = Depends(get_current_superuser),
+    organization_id: Optional[str] = Query(None),
 ) -> dict:
-    """Get audit log statistics"""
+    """Get audit log statistics (in the caller's scope)"""
+    scope = _audit_scope(current_user, organization_id)
+    in_scope = (AuditLog.organization_id == scope) if scope is not None else true()
 
     # Total logs
-    total_query = select(func.count(AuditLog.id))
+    total_query = select(func.count(AuditLog.id)).where(in_scope)
     total_result = await db.execute(total_query)
     total = total_result.scalar() or 0
 
     # Success vs failure
-    success_query = select(func.count(AuditLog.id)).where(AuditLog.success == True)
+    success_query = select(func.count(AuditLog.id)).where(in_scope, AuditLog.success == True)
     success_result = await db.execute(success_query)
     successful = success_result.scalar() or 0
 
-    failed_query = select(func.count(AuditLog.id)).where(AuditLog.success == False)
+    failed_query = select(func.count(AuditLog.id)).where(in_scope, AuditLog.success == False)
     failed_result = await db.execute(failed_query)
     failed = failed_result.scalar() or 0
 
     # By action type
     action_query = (
         select(AuditLog.action, func.count(AuditLog.id))
+        .where(in_scope)
         .group_by(AuditLog.action)
         .order_by(desc(func.count(AuditLog.id)))
         .limit(10)
@@ -183,6 +210,7 @@ async def get_audit_stats(
     # By resource type
     resource_query = (
         select(AuditLog.resource_type, func.count(AuditLog.id))
+        .where(in_scope)
         .group_by(AuditLog.resource_type)
         .order_by(desc(func.count(AuditLog.id)))
     )
@@ -206,6 +234,7 @@ async def export_audit_logs(
     days: int = Query(30, ge=1, le=365),
     action: Optional[str] = None,
     resource_type: Optional[str] = None,
+    organization_id: Optional[str] = Query(None),
 ) -> Any:
     """
     Export audit logs as CSV, JSON, or XML file download.
@@ -220,6 +249,9 @@ async def export_audit_logs(
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     query = select(AuditLog).where(AuditLog.created_at >= cutoff)
+    scope = _audit_scope(current_user, organization_id)
+    if scope is not None:
+        query = query.where(AuditLog.organization_id == scope)
     if action:
         query = query.where(AuditLog.action == action)
     if resource_type:

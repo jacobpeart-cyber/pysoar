@@ -106,6 +106,28 @@ class Settings(BaseSettings):
                 return [origin.strip() for origin in v.split(",")]
         return v
 
+    # OT active discovery (TCP sweep from the API host). Platform-level
+    # allowlist: every discovery target must be a subnet of one of these
+    # CIDRs AND of a tenant OT zone. Empty (default) disables discovery
+    # entirely (fail closed). Env: OT_DISCOVERY_ALLOWED_CIDRS as a JSON list
+    # or a comma-separated string.
+    ot_discovery_allowed_cidrs: Annotated[List[str], NoDecode] = []
+
+    @field_validator("ot_discovery_allowed_cidrs", mode="before")
+    @classmethod
+    def parse_ot_discovery_allowed_cidrs(cls, v):
+        if isinstance(v, str):
+            import json
+
+            raw = v.strip()
+            if not raw:
+                return []
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                return [cidr.strip() for cidr in raw.split(",") if cidr.strip()]
+        return v
+
     @field_validator("database_ssl_mode")
     @classmethod
     def validate_database_ssl_mode(cls, v, info):

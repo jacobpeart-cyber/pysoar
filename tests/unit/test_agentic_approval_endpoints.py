@@ -147,7 +147,7 @@ def _approval_body(action: AgentAction, **extra: Any) -> dict[str, Any]:
 @pytest.mark.asyncio
 async def test_approve_executes_through_the_registry_and_audits(client, db_session):
     await _orgs(db_session)
-    analyst = await _user(db_session, email="approver@org-c.test", role="analyst")
+    analyst = await _user(db_session, email="approver@org-c.test", role="admin")
     action = await _proposal(db_session)
     await db_session.commit()
 
@@ -165,7 +165,7 @@ async def test_approve_executes_through_the_registry_and_audits(client, db_sessi
     await db_session.refresh(action)
     assert action.execution_status == ActionExecutionStatus.COMPLETED.value
     assert action.approved_by == analyst.id
-    assert action.approver_role == "analyst"
+    assert action.approver_role == "admin"
     assert action.rollback_available is True
 
     # The forward effect really happened: an active blocked indicator.
@@ -187,7 +187,7 @@ async def test_approve_executes_through_the_registry_and_audits(client, db_sessi
 @pytest.mark.asyncio
 async def test_approve_with_stale_hash_is_409(client, db_session):
     await _orgs(db_session)
-    analyst = await _user(db_session, email="approver2@org-c.test", role="analyst")
+    analyst = await _user(db_session, email="approver2@org-c.test", role="admin")
     action = await _proposal(db_session)
     await db_session.commit()
 
@@ -204,7 +204,7 @@ async def test_approve_with_stale_hash_is_409(client, db_session):
 @pytest.mark.asyncio
 async def test_approve_without_hashes_is_rejected_by_validation(client, db_session):
     await _orgs(db_session)
-    analyst = await _user(db_session, email="approver3@org-c.test", role="analyst")
+    analyst = await _user(db_session, email="approver3@org-c.test", role="admin")
     action = await _proposal(db_session)
     await db_session.commit()
 
@@ -219,7 +219,7 @@ async def test_approve_without_hashes_is_rejected_by_validation(client, db_sessi
 @pytest.mark.asyncio
 async def test_expired_proposal_is_409(client, db_session):
     await _orgs(db_session)
-    analyst = await _user(db_session, email="approver4@org-c.test", role="analyst")
+    analyst = await _user(db_session, email="approver4@org-c.test", role="admin")
     action = await _proposal(db_session, expires_in_hours=-1)
     await db_session.commit()
 
@@ -235,7 +235,7 @@ async def test_expired_proposal_is_409(client, db_session):
 @pytest.mark.asyncio
 async def test_suspect_proposal_needs_an_admin_acknowledgement(client, db_session):
     await _orgs(db_session)
-    analyst = await _user(db_session, email="approver5@org-c.test", role="analyst")
+    analyst = await _user(db_session, email="approver5@org-c.test", role="admin")
     action = await _proposal(db_session, suspect=True, injection_tier="flagged")
     await db_session.commit()
 
@@ -294,7 +294,7 @@ async def test_viewer_cannot_approve(client, db_session):
 @pytest.mark.asyncio
 async def test_cross_tenant_action_is_not_found(client, db_session):
     await _orgs(db_session)
-    analyst = await _user(db_session, email="approver6@org-c.test", role="analyst")
+    analyst = await _user(db_session, email="approver6@org-c.test", role="admin")
     action = await _proposal(db_session, org_id=ORG_B)
     await db_session.commit()
 
@@ -309,7 +309,7 @@ async def test_cross_tenant_action_is_not_found(client, db_session):
 @pytest.mark.asyncio
 async def test_denial_records_the_decision_without_executing(client, db_session):
     await _orgs(db_session)
-    analyst = await _user(db_session, email="approver7@org-c.test", role="analyst")
+    analyst = await _user(db_session, email="approver7@org-c.test", role="admin")
     action = await _proposal(db_session)
     await db_session.commit()
 
@@ -375,14 +375,26 @@ async def test_direct_destructive_execute_without_propose_is_denied(client, db_s
 
 
 @pytest.mark.asyncio
-async def test_viewer_can_execute_a_read_tool_directly(client, db_session):
+async def test_viewer_cannot_execute_tools_directly(client, db_session):
+    # Wave 1: direct tool execution is an operational write (analyst+), even
+    # for read-tier tools; viewers read through the GET surfaces.
     await _orgs(db_session)
     viewer = await _user(db_session, email="viewer2@org-c.test", role="viewer")
+    analyst = await _user(db_session, email="direct5@org-c.test", role="analyst")
     await db_session.commit()
+    viewer_auth, analyst_auth = _token(viewer), _token(analyst)
 
     resp = await client.post(
         "/api/v1/agentic/tools/list_alerts/execute",
-        headers=_token(viewer),
+        headers=viewer_auth,
+        json={"limit": 5},
+    )
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["detail"]["error"] == "role_not_permitted"
+
+    resp = await client.post(
+        "/api/v1/agentic/tools/list_alerts/execute",
+        headers=analyst_auth,
         json={"limit": 5},
     )
     assert resp.status_code == 200, resp.text
@@ -433,7 +445,7 @@ async def test_rollback_deactivates_the_recorded_indicator(client, db_session):
     import json
 
     await _orgs(db_session)
-    analyst = await _user(db_session, email="rollback@org-c.test", role="analyst")
+    analyst = await _user(db_session, email="rollback@org-c.test", role="admin")
     action = await _proposal(db_session)
     ioc = ThreatIndicator(
         value="198.51.100.24", indicator_type="ipv4", severity="high", is_active=True,
@@ -468,7 +480,7 @@ async def test_rollback_without_recorded_effects_is_refused(client, db_session):
     import json
 
     await _orgs(db_session)
-    analyst = await _user(db_session, email="rollback2@org-c.test", role="analyst")
+    analyst = await _user(db_session, email="rollback2@org-c.test", role="admin")
     action = await _proposal(db_session)
     action.execution_status = ActionExecutionStatus.COMPLETED.value
     action.result = json.dumps({"status": "recorded", "note": "nothing with an id"})

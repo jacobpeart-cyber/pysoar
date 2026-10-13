@@ -1,14 +1,22 @@
 """Organization and Team management endpoints"""
 
-from typing import Any, Optional
+from typing import Annotated, Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select, func
+from sqlalchemy import delete as sa_delete
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from src.api.deps import CurrentUser, DatabaseSession, get_current_admin_user
+from src.api.deps import (
+    CurrentUser,
+    DatabaseSession,
+    PlatformSuperUser,
+    require_role,
+    resolve_organization_scope,
+)
+from src.core.logging import get_logger
 from src.models.organization import (
     Organization,
     OrganizationMember,
@@ -17,9 +25,24 @@ from src.models.organization import (
     TeamMember,
     TeamRole,
 )
-from src.models.user import User
+from src.models.user import User, UserRole
+
+logger = get_logger(__name__)
 
 router = APIRouter()
+
+#: Organisation configuration (PATCH, membership): tenant admin (of that
+#: organisation, checked by ``_get_organization``) or platform superuser.
+OrgAdminUser = Annotated[User, Depends(require_role([UserRole.ADMIN]))]
+#: Team writes (create, update, delete, membership): analyst or admin of the
+#: team's organisation. Viewers read only.
+TeamWriter = Annotated[User, Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
+
+#: Roles a tenant admin may grant through organisation membership. ``owner``
+#: is reserved for the organisation's creator.
+_ASSIGNABLE_MEMBER_ROLES: frozenset[str] = frozenset(
+    {OrganizationRole.ADMIN.value, OrganizationRole.MEMBER.value, OrganizationRole.VIEWER.value},
+)
 
 
 # Schemas
@@ -105,24 +128,17 @@ async def list_organizations(
 ):
     """List organizations visible to the caller.
 
-    Platform superusers see every organization. Every other role — including
-    per-tenant ``admin`` role — only sees organizations they are members of
-    (via OrganizationMember) or the one matching their primary
-    ``users.organization_id``. This stops a tenant admin from enumerating
-    every other customer's organization via this endpoint.
+    Listing every organisation is a platform-superuser action. Everyone else,
+    tenant admins included, sees only their own organisation
+    (``users.organization_id``); an org-less non-superuser gets 403
+    ``organization_required``. ``OrganizationMember`` rows grant no
+    visibility into other tenants.
     """
-    if getattr(current_user, "is_superuser", False):
+    if current_user.is_superuser:
         query = select(Organization)
     else:
-        member_subquery = select(OrganizationMember.organization_id).where(
-            OrganizationMember.user_id == current_user.id
-        )
-        filters = [Organization.id.in_(member_subquery)]
-        primary_org = getattr(current_user, "organization_id", None)
-        if primary_org:
-            filters.append(Organization.id == primary_org)
-        from sqlalchemy import or_ as _or
-        query = select(Organization).where(_or(*filters))
+        own_org = resolve_organization_scope(current_user, None)
+        query = select(Organization).where(Organization.id == own_org)
 
     query = query.offset(skip).limit(limit).order_by(Organization.created_at.desc())
     result = await db.execute(query)
@@ -133,8 +149,8 @@ async def list_organizations(
     for org in organizations:
         count_result = await db.execute(
             select(func.count(OrganizationMember.id)).where(
-                OrganizationMember.organization_id == org.id
-            )
+                OrganizationMember.organization_id == org.id,
+            ),
         )
         member_count = count_result.scalar() or 0
         response.append({
@@ -149,12 +165,16 @@ async def list_organizations(
 async def create_organization(
     data: OrganizationCreate,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    current_user: PlatformSuperUser = None,
 ):
-    """Create a new organization"""
+    """Create a new organization (platform superuser only).
+
+    Creating a tenant is a platform-level action: tenant admins (and every
+    other tenant role) get 403 ``platform_superuser_required``.
+    """
     # Check if slug is unique
     existing = await db.execute(
-        select(Organization).where(Organization.slug == data.slug)
+        select(Organization).where(Organization.slug == data.slug),
     )
     if existing.scalar_one_or_none():
         raise HTTPException(
@@ -184,6 +204,7 @@ async def create_organization(
     await db.commit()
     await db.refresh(org)
 
+    logger.info("organization_created", organization_id=org.id, actor_id=current_user.id)
     return {**_format_organization(org), "member_count": 1}
 
 
@@ -193,13 +214,14 @@ async def get_organization(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
 ):
-    """Get an organization by ID"""
+    """Get an organization by ID: the caller's own (any role), or any for a
+    platform superuser. Another tenant's organisation is reported as missing."""
     org = await _get_organization(org_id, current_user, db)
 
     count_result = await db.execute(
         select(func.count(OrganizationMember.id)).where(
-            OrganizationMember.organization_id == org.id
-        )
+            OrganizationMember.organization_id == org.id,
+        ),
     )
     member_count = count_result.scalar() or 0
 
@@ -211,10 +233,21 @@ async def update_organization(
     org_id: str,
     data: OrganizationUpdate,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    current_user: OrgAdminUser = None,
 ):
-    """Update an organization"""
+    """Update an organization: a tenant admin may update only their own
+    organisation's name and description; ``plan`` and ``is_active`` are
+    platform-superuser only."""
     org = await _get_organization(org_id, current_user, db, require_admin=True)
+
+    if (data.plan is not None or data.is_active is not None) and not current_user.is_superuser:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "platform_superuser_required",
+                "detail": "plan and is_active are managed by platform superusers",
+            },
+        )
 
     if data.name is not None:
         org.name = data.name
@@ -235,15 +268,9 @@ async def update_organization(
 async def delete_organization(
     org_id: str,
     db: DatabaseSession = None,
-    admin_user: User = Depends(get_current_admin_user),
+    admin_user: PlatformSuperUser = None,
 ):
     """Delete an organization (platform superuser only)"""
-    if not getattr(admin_user, "is_superuser", False):
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only platform superusers can delete organizations",
-        )
-
     result = await db.execute(select(Organization).where(Organization.id == org_id))
     org = result.scalar_one_or_none()
 
@@ -255,6 +282,7 @@ async def delete_organization(
 
     await db.delete(org)
     await db.commit()
+    logger.info("organization_deleted", organization_id=org_id, actor_id=admin_user.id)
 
 
 # Organization members
@@ -270,7 +298,7 @@ async def list_organization_members(
     result = await db.execute(
         select(OrganizationMember)
         .options(selectinload(OrganizationMember.user))
-        .where(OrganizationMember.organization_id == org_id)
+        .where(OrganizationMember.organization_id == org_id),
     )
     members = result.scalars().all()
 
@@ -295,44 +323,49 @@ async def add_organization_member(
     org_id: str,
     data: AddMemberRequest,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    current_user: OrgAdminUser = None,
 ):
-    """Add a member to an organization"""
+    """Add a member to an organization.
+
+    Admin of that organisation (or a platform superuser) only. The user must
+    already belong to the organisation (``users.organization_id``): lookups by
+    id or email never see other tenants' users, so this is neither an
+    enumeration oracle nor a way to attach a foreign user. ``owner`` cannot be
+    granted.
+    """
     await _get_organization(org_id, current_user, db, require_admin=True)
 
-    # Resolve user_id from email if not provided directly
-    target_user_id = data.user_id
-    if not target_user_id and data.email:
-        by_email = await db.execute(
-            select(User).where(User.email == data.email.lower().strip())
+    if data.role not in _ASSIGNABLE_MEMBER_ROLES:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"role must be one of {sorted(_ASSIGNABLE_MEMBER_ROLES)}",
         )
-        user_row = by_email.scalar_one_or_none()
-        if not user_row:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"No user found with email {data.email}",
-            )
-        target_user_id = user_row.id
-    if not target_user_id:
+
+    if not data.user_id and not data.email:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Either user_id or email must be provided",
         )
 
-    # Check if user exists
-    user_result = await db.execute(select(User).where(User.id == target_user_id))
-    if not user_result.scalar_one_or_none():
+    user_query = select(User).where(User.organization_id == org_id)
+    if data.user_id:
+        user_query = user_query.where(User.id == data.user_id)
+    else:
+        user_query = user_query.where(User.email == (data.email or "").lower().strip())
+    user_row = (await db.execute(user_query)).scalar_one_or_none()
+    if user_row is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found",
+            detail="User not found in this organization",
         )
+    target_user_id = user_row.id
 
     # Check if already a member
     existing = await db.execute(
         select(OrganizationMember).where(
             OrganizationMember.organization_id == org_id,
             OrganizationMember.user_id == target_user_id,
-        )
+        ),
     )
     if existing.scalar_one_or_none():
         raise HTTPException(
@@ -348,6 +381,13 @@ async def add_organization_member(
     db.add(member)
     await db.commit()
 
+    logger.info(
+        "organization_member_added",
+        organization_id=org_id,
+        user_id=target_user_id,
+        role=data.role,
+        actor_id=current_user.id,
+    )
     return {"status": "success", "message": "Member added", "user_id": target_user_id}
 
 
@@ -356,16 +396,17 @@ async def remove_organization_member(
     org_id: str,
     user_id: str,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    current_user: OrgAdminUser = None,
 ):
-    """Remove a member from an organization"""
+    """Remove a member from an organization (admin of that organisation or a
+    platform superuser)."""
     await _get_organization(org_id, current_user, db, require_admin=True)
 
     result = await db.execute(
         select(OrganizationMember).where(
             OrganizationMember.organization_id == org_id,
             OrganizationMember.user_id == user_id,
-        )
+        ),
     )
     member = result.scalar_one_or_none()
 
@@ -396,28 +437,17 @@ async def list_teams(
     """List teams in the caller's organization.
 
     Only platform superusers may list another organization's teams (by
-    passing ``organization_id``); everyone else is scoped to their own.
+    passing ``organization_id``); everyone else is scoped to their own
+    (403 ``organization_mismatch`` for another, ``organization_required``
+    without one).
     """
-    query = select(Team)
-
-    if getattr(current_user, "is_superuser", False):
-        if organization_id:
-            query = query.where(Team.organization_id == organization_id)
-    else:
-        own_org = getattr(current_user, "organization_id", None)
-        if not own_org:
-            return []
-        if organization_id and organization_id != own_org:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Not a member of this organization",
-            )
-        query = query.where(Team.organization_id == own_org)
+    scope_org = resolve_organization_scope(current_user, organization_id)
+    query = select(Team).where(Team.organization_id == scope_org)
 
     if not current_user.is_admin:
         # Get teams the user is a member of
         member_subquery = select(TeamMember.team_id).where(
-            TeamMember.user_id == current_user.id
+            TeamMember.user_id == current_user.id,
         )
         query = query.where(Team.id.in_(member_subquery))
 
@@ -427,7 +457,7 @@ async def list_teams(
     response = []
     for team in teams:
         count_result = await db.execute(
-            select(func.count(TeamMember.id)).where(TeamMember.team_id == team.id)
+            select(func.count(TeamMember.id)).where(TeamMember.team_id == team.id),
         )
         member_count = count_result.scalar() or 0
         response.append({
@@ -442,22 +472,21 @@ async def list_teams(
 async def create_team(
     data: TeamCreate,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    current_user: TeamWriter = None,
 ):
-    """Create a new team"""
-    if not data.organization_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Organization ID is required",
-        )
+    """Create a team in the caller's organisation (analyst or admin).
 
-    # Verify organization access
-    await _get_organization(data.organization_id, current_user, db, require_admin=True)
+    ``organization_id`` defaults to the caller's own; a different one is
+    refused (403 ``organization_mismatch``) unless the caller is a platform
+    superuser naming an existing organisation.
+    """
+    team_org = resolve_organization_scope(current_user, data.organization_id)
+    await _get_organization(team_org, current_user, db)
 
     team = Team(
         name=data.name,
         description=data.description,
-        organization_id=data.organization_id,
+        organization_id=team_org,
         is_default=data.is_default,
     )
     db.add(team)
@@ -487,7 +516,7 @@ async def get_team(
     team = await _get_team(db, team_id, current_user)
 
     count_result = await db.execute(
-        select(func.count(TeamMember.id)).where(TeamMember.team_id == team.id)
+        select(func.count(TeamMember.id)).where(TeamMember.team_id == team.id),
     )
     member_count = count_result.scalar() or 0
 
@@ -499,7 +528,7 @@ async def update_team(
     team_id: str,
     data: TeamUpdate,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    current_user: TeamWriter = None,
 ):
     """Update a team"""
     team = await _get_team(db, team_id, current_user)
@@ -519,7 +548,7 @@ async def update_team(
 async def delete_team(
     team_id: str,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    current_user: TeamWriter = None,
 ):
     """Delete a team"""
     team = await _get_team(db, team_id, current_user)
@@ -530,6 +559,10 @@ async def delete_team(
             detail="Cannot delete default team",
         )
 
+    # TeamMember.team_id is NOT NULL and the relationship has no delete
+    # cascade: without removing the memberships first the ORM nulls their
+    # team_id and the delete fails (every team has at least its creator).
+    await db.execute(sa_delete(TeamMember).where(TeamMember.team_id == team.id))
     await db.delete(team)
     await db.commit()
 
@@ -547,7 +580,7 @@ async def list_team_members(
     result = await db.execute(
         select(TeamMember)
         .options(selectinload(TeamMember.user))
-        .where(TeamMember.team_id == team_id)
+        .where(TeamMember.team_id == team_id),
     )
     members = result.scalars().all()
 
@@ -571,48 +604,38 @@ async def add_team_member(
     team_id: str,
     data: AddMemberRequest,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    current_user: TeamWriter = None,
 ):
     """Add a member to a team"""
     team = await _get_team(db, team_id, current_user)
 
-    # Resolve user_id from email if not provided
-    target_user_id = data.user_id
-    if not target_user_id and data.email:
-        email_query = select(User).where(User.email == data.email.lower().strip())
-        if not getattr(current_user, "is_superuser", False):
-            email_query = email_query.where(User.organization_id == team.organization_id)
-        by_email = await db.execute(email_query)
-        user_row = by_email.scalar_one_or_none()
-        if not user_row:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"No user found with email {data.email}",
-            )
-        target_user_id = user_row.id
-    if not target_user_id:
+    if not data.user_id and not data.email:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Either user_id or email must be provided",
         )
 
-    # The new member must belong to the team's organization (superusers excepted).
-    if not getattr(current_user, "is_superuser", False):
-        target_org = (
-            await db.execute(select(User.organization_id).where(User.id == target_user_id))
-        ).scalar_one_or_none()
-        if target_org != team.organization_id:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="User not found in this organization",
-            )
+    # The new member must belong to the team's organization, for every
+    # caller (platform superusers included): a team never spans tenants.
+    user_query = select(User).where(User.organization_id == team.organization_id)
+    if data.user_id:
+        user_query = user_query.where(User.id == data.user_id)
+    else:
+        user_query = user_query.where(User.email == (data.email or "").lower().strip())
+    user_row = (await db.execute(user_query)).scalar_one_or_none()
+    if user_row is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found in this organization",
+        )
+    target_user_id = user_row.id
 
     # Check if already a member
     existing = await db.execute(
         select(TeamMember).where(
             TeamMember.team_id == team_id,
             TeamMember.user_id == target_user_id,
-        )
+        ),
     )
     if existing.scalar_one_or_none():
         raise HTTPException(
@@ -636,7 +659,7 @@ async def remove_team_member(
     team_id: str,
     user_id: str,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    current_user: TeamWriter = None,
 ):
     """Remove a member from a team"""
     await _get_team(db, team_id, current_user)
@@ -645,7 +668,7 @@ async def remove_team_member(
         select(TeamMember).where(
             TeamMember.team_id == team_id,
             TeamMember.user_id == user_id,
-        )
+        ),
     )
     member = result.scalar_one_or_none()
 
@@ -666,11 +689,13 @@ async def _get_organization(
     db: AsyncSession,
     require_admin: bool = False,
 ) -> Organization:
-    """Get an organization with a real access check.
+    """Get an organization with a tenant access check.
 
-    Only platform superusers bypass the membership check. Per-tenant admin
-    role no longer grants cross-tenant access — they must be members of the
-    specific organization they're trying to touch.
+    Platform superusers reach any organisation. Everyone else reaches only
+    their own (``users.organization_id``, the tenancy key used everywhere);
+    another tenant's organisation is reported as missing (404) so its
+    existence does not leak. ``OrganizationMember`` rows grant no access.
+    ``require_admin`` additionally needs the tenant ``admin`` role.
     """
     result = await db.execute(select(Organization).where(Organization.id == org_id))
     org = result.scalar_one_or_none()
@@ -681,35 +706,21 @@ async def _get_organization(
             detail="Organization not found",
         )
 
-    if getattr(user, "is_superuser", False):
+    if user.is_superuser:
         return org
 
-    # Must be a member (or primary org) to access.
-    member_result = await db.execute(
-        select(OrganizationMember).where(
-            OrganizationMember.organization_id == org_id,
-            OrganizationMember.user_id == user.id,
+    own_org = getattr(user, "organization_id", None)
+    if not own_org or str(own_org) != str(org.id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Organization not found",
         )
-    )
-    member = member_result.scalar_one_or_none()
 
-    primary_org = getattr(user, "organization_id", None)
-    if not member and primary_org != org_id:
+    if require_admin and user.role != UserRole.ADMIN.value:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not a member of this organization",
+            detail="Admin access required",
         )
-
-    if require_admin:
-        is_org_admin = member and member.role in [
-            OrganizationRole.OWNER.value,
-            OrganizationRole.ADMIN.value,
-        ]
-        if not is_org_admin:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Admin access required",
-            )
 
     return org
 
@@ -751,7 +762,7 @@ async def _get_team(
             select(TeamMember).where(
                 TeamMember.team_id == team_id,
                 TeamMember.user_id == user.id,
-            )
+            ),
         )
         if not member_result.scalar_one_or_none():
             raise HTTPException(
