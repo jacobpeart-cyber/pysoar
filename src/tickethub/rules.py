@@ -52,9 +52,10 @@ shorthand ``{"set_status": "acknowledged", "notify": {}}``.
     as ``awaiting_integration``, not success.
 ``block_ip`` / ``isolate_host``
     Alerts only; the alert's source_ip / hostname goes to
-    ``src.services.containment`` (endpoint-agent commands, high-blast ones
-    through the agent approval queue as ``queued_for_approval``;
-    ``detection_only`` when no agent or integration covers the target).
+    ``src.services.containment`` with ``unattended=True``: agent commands
+    always land in the approval queue (``queued_for_approval``), integration
+    containment is never executed by a rule (``manual_required``), and
+    ``detection_only`` when no agent or integration covers the target.
 
 Rule actions write ``automation_*`` activity types, never ``status_change``,
 so a rule can never re-trigger itself (loop guard).
@@ -105,6 +106,7 @@ RESULT_FAILED = "failed"
 RESULT_AWAITING_INTEGRATION = "awaiting_integration"
 RESULT_DETECTION_ONLY = "detection_only"
 RESULT_QUEUED_FOR_APPROVAL = "queued_for_approval"
+RESULT_MANUAL_REQUIRED = "manual_required"
 
 TRIGGER_ALIASES: dict[str, str] = {
     "alert_created": "alert_created",
@@ -573,6 +575,10 @@ def _containment_outcome(result: Any) -> ActionOutcome:
         return ActionOutcome(RESULT_SUCCESS, None, data)
     if result.status == "queued_for_approval":
         return ActionOutcome(RESULT_QUEUED_FOR_APPROVAL, None, data)
+    if result.status == RESULT_MANUAL_REQUIRED:
+        # Unattended callers never actuate an integration directly; an
+        # operator has to trigger it from the alert.
+        return ActionOutcome(RESULT_MANUAL_REQUIRED, result.detail, data)
     if result.status == RESULT_AWAITING_INTEGRATION:
         return ActionOutcome(RESULT_AWAITING_INTEGRATION, result.missing_dependency or result.detail, data)
     return ActionOutcome(RESULT_DETECTION_ONLY, result.detail, data)
@@ -593,6 +599,11 @@ async def _act_containment(db: AsyncSession, ctx: RuleContext, event: RuleEvent,
         "actor": ctx.actor,
         "reason": f"automation rule '{ctx.rule_name}' on alert {event.target_id}",
         "execution_ref": f"automation_rule:{ctx.rule_id}:{event.event_id}",
+        # A rule fires with no human in the loop: agent commands must land in
+        # the approval queue and integration containment is refused
+        # (``manual_required``) instead of executing on attacker-shaped alert
+        # fields.
+        "unattended": True,
     }
     if kind == "block_ip":
         result = await containment.block_ip(db, ctx.organization_id, ip=target_value, **common)

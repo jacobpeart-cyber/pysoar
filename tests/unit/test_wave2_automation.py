@@ -355,6 +355,38 @@ async def test_containment_goes_through_the_shared_service(
     assert f"automation_rule:{rule_id}" in containment_audit[0].new_value
 
 
+async def test_rule_containment_is_unattended_and_never_actuates_an_integration(
+    db_session: AsyncSession, org_a: Organization,
+) -> None:
+    """A rule fires with no human in the loop: the service is called with
+    ``unattended=True`` and a ``manual_required`` answer is recorded as such,
+    never upgraded to success."""
+    from types import SimpleNamespace
+
+    org_a_id = org_a.id
+    rule_id = await _rule(db_session, org_a_id, actions=[{"type": "isolate_host"}])
+    await _alert(db_session, org_a_id, hostname="ws-042.corp.example")
+    seen: dict[str, Any] = {}
+
+    async def fake_isolate(db, org_id, **kwargs):
+        seen.update(kwargs)
+        return SimpleNamespace(
+            status="manual_required", failed=False, error=None, missing_dependency=None,
+            detail="CrowdStrike contain_host must be triggered by an operator",
+            to_dict=lambda: {"status": "manual_required", "integration": "crowdstrike"},
+        )
+
+    with patch("src.services.containment.isolate_host", fake_isolate):
+        await evaluate_rules(db_session)
+
+    assert seen["unattended"] is True
+    assert seen["execution_ref"].startswith(f"automation_rule:{rule_id}:")
+    [firing] = await _firings(db_session, rule_id)
+    assert firing.result == "manual_required"
+    assert firing.detail["target"] == "ws-042.corp.example"
+    assert firing.detail["integration"] == "crowdstrike"
+
+
 async def test_ticket_status_change_rule_and_cross_tenant_assignee(
     db_session: AsyncSession,
     org_a: Organization,
