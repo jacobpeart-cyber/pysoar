@@ -577,3 +577,30 @@ async def test_crowdstrike_revert_refuses_invalid_hostname(db_session, org_a):
     outcome = await revert_step(db_session, org_a.id, step, actor="system:test", execution_ref=None)
     assert outcome["rolled_back"] is False
     assert "invalid_hostname" in outcome["reason"]
+
+
+async def test_integration_base_url_cannot_point_at_internal_networks(
+    client: AsyncClient, db_session: AsyncSession, org_a_admin_headers: dict[str, str],
+) -> None:
+    """Stored base URLs go through the same outbound-target guard the engine applies
+    before any call, so a tenant admin cannot aim the API host at metadata or loopback."""
+    await _connector(db_session, "virustotal", "threat_intel")
+    metadata = await client.post(
+        f"{API}/integrations",
+        json={"connector_id": "virustotal", "name": "VT", "config": {"base_url": "http://169.254.169.254/latest"}},
+        headers=org_a_admin_headers,
+    )
+    assert metadata.status_code == 400, metadata.text
+    assert metadata.json()["detail"]["error"] == "outbound_target_refused"
+
+    ok = await client.post(
+        f"{API}/integrations", json={"connector_id": "virustotal", "name": "VT"}, headers=org_a_admin_headers,
+    )
+    assert ok.status_code in (200, 201), ok.text
+    integration_id = ok.json()["id"]
+
+    loopback = await client.put(
+        f"{API}/integrations/{integration_id}", json={"endpoint_url": "http://127.0.0.1:8500/v1"}, headers=org_a_admin_headers,
+    )
+    assert loopback.status_code == 400, loopback.text
+    assert loopback.json()["detail"]["error"] == "outbound_target_refused"

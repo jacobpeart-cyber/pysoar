@@ -25,8 +25,20 @@ from src.services.playbook_engine import RUN_PARTIAL, PlaybookEngine
 from tests.helpers.tenancy import assert_tenant_isolated
 
 
-async def _playbook(db, org_id: str, steps: list[dict[str, Any]], *, status: str = "active") -> Playbook:
-    pb = Playbook(name="W2 playbook", status=status, is_enabled=True, organization_id=org_id, steps=json.dumps(steps))
+async def _playbook(
+    db, org_id: str, steps: list[dict[str, Any]], *, status: str = "active", created_by: str | None = None,
+) -> Playbook:
+    # Classic playbooks are admin-authored (the create route is admin-only) and
+    # the engine refuses privileged steps in unattended runs unless the author
+    # is an admin, so seed one unless the test chooses the author itself.
+    if created_by is None:
+        from tests.helpers.tenancy import make_user
+
+        created_by = (await make_user(db, role="admin", organization_id=org_id, label="pb-author")).id
+    pb = Playbook(
+        name="W2 playbook", status=status, is_enabled=True, organization_id=org_id, steps=json.dumps(steps),
+        created_by=created_by,
+    )
     db.add(pb)
     await db.flush()
     return pb
@@ -263,3 +275,34 @@ async def test_analyst_cannot_run_integration_containment_step(client, db_sessio
     # Read-only lookups stay analyst-level (the step then fails: no such integration in the org).
     resp = await client.post(f"/api/v1/playbooks/{lookup_id}/execute", headers=org_a_headers, json={})
     assert resp.status_code == 200
+
+
+async def test_unattended_privileged_run_requires_an_admin_author(
+    db_session: AsyncSession, org_a: Organization, org_a_user: User, org_a_admin: User,
+) -> None:
+    """Parity with the visual-builder runner: a privileged step only runs when the
+    attending user, or for auto/scheduled runs the playbook's author, is an
+    admin right now. Analyst-authored playbooks fail closed before any step."""
+    org_a_id, analyst_id, admin_id = org_a.id, org_a_user.id, org_a_admin.id
+    steps = [{"action": "block_ip", "parameters": {"ip": "203.0.113.9"}}]
+
+    pb = await _playbook(db_session, org_a_id, steps)
+    pb.created_by = analyst_id
+    await db_session.commit()
+    refused = await _run(db_session, pb, org_a_id, None)
+    assert refused.status == "failed", refused.error_message
+    assert refused.error_message.startswith("forbidden_privileged_step")
+    assert [s["status"] for s in _steps(refused)] == ["forbidden_privileged_step"]
+    assert (await db_session.execute(
+        select(AuditLog).where(AuditLog.action == "containment_block_ip")
+    )).scalars().all() == []
+
+    # An analyst attending the run is refused the same way (the route 403s first).
+    attended = await _run(db_session, pb, org_a_id, analyst_id)
+    assert attended.status == "failed" and attended.error_message.startswith("forbidden_privileged_step")
+
+    pb.created_by = admin_id
+    await db_session.commit()
+    allowed = await _run(db_session, pb, org_a_id, None)
+    assert not (allowed.error_message or "").startswith("forbidden_privileged_step"), allowed.error_message
+    assert _steps(allowed)[0]["status"] in ("detection_only", "queued_for_approval", "awaiting_integration")

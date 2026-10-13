@@ -1490,6 +1490,24 @@ async def list_integrations(
     return items
 
 
+async def _refuse_private_base_url(config: dict) -> None:
+    """400 when the client-supplied base URL resolves to a private, loopback,
+    link-local or metadata address (same guard the engine applies before any
+    outbound call), so a stored integration can never point the API host at
+    its own network."""
+    base_url = config.get("base_url") or config.get("url")
+    if not base_url:
+        return
+    from src.integrations.engine import ActionExecutor, OutboundTargetRefused
+
+    try:
+        await ActionExecutor()._resolve_generic_target("/", {**config, "base_url": base_url})
+    except OutboundTargetRefused as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "outbound_target_refused", "field": "base_url", "detail": str(exc)},
+        ) from None
+
 @router.post("/integrations", response_model=RemediationIntegrationResponse, status_code=status.HTTP_201_CREATED, dependencies=_ADMIN_WRITE)
 async def create_integration(
     request: RemediationIntegrationCreate,
@@ -1530,6 +1548,7 @@ async def create_integration(
     config = dict(request.config or {})
     if request.endpoint_url and not config.get("base_url"):
         config["base_url"] = request.endpoint_url
+    await _refuse_private_base_url(config)
     credentials = dict(request.credentials or request.auth_config or {})
     integ = InstalledIntegration(
         organization_id=org_id,
@@ -1578,6 +1597,7 @@ async def update_integration(
             config = dict(request.config)
         if request.endpoint_url:
             config["base_url"] = request.endpoint_url
+        await _refuse_private_base_url(config)
         integ.config_encrypted = json.dumps(config)
     credentials = request.credentials if request.credentials is not None else request.auth_config
     if credentials:

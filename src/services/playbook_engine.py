@@ -816,6 +816,19 @@ class PlaybookEngine:
     def __init__(self, db: AsyncSession):
         self.db = db
 
+    async def _is_current_admin(self, user_id: Optional[str], org_id: str) -> bool:
+        """True when ``user_id`` is, right now, an admin of ``org_id`` or a platform superuser."""
+        if not user_id:
+            return False
+        from src.models.user import User
+
+        row = (await self.db.execute(
+            select(User.role, User.is_superuser, User.is_active).where(User.id == user_id, User.organization_id == org_id)
+        )).first()
+        if row is None or not row.is_active:
+            return False
+        return bool(row.is_superuser) or row.role == "admin"
+
     async def _actor(self, execution: PlaybookExecution, org_id: str) -> tuple[str, Optional[str]]:
         from src.models.user import User
 
@@ -893,6 +906,41 @@ class PlaybookEngine:
             return execution
 
         actor, actor_user_id = await self._actor(execution, scoped_org)
+
+        # Run-time privilege re-check (parity with the visual-builder runner):
+        # the dispatch route refuses analysts for privileged steps, but
+        # auto-triggered and scheduled runs never pass through it, and a
+        # playbook can be edited between dispatch and execution. Privileged
+        # steps run only when the attending user, or for unattended runs the
+        # playbook's author, is an admin right now.
+        privileged_steps = [
+            (idx + 1, str(step.get("action") or ""))
+            for idx, step in enumerate(steps)
+            if isinstance(step, dict) and is_privileged_step(str(step.get("action") or ""), step.get("parameters") or {})
+        ]
+        if privileged_steps:
+            authoriser = actor_user_id or playbook.created_by
+            if not await self._is_current_admin(authoriser, scoped_org):
+                execution.status = ExecutionStatus.FAILED.value
+                execution.completed_at = _now()
+                execution.error_message = (
+                    "forbidden_privileged_step: step(s) "
+                    + ", ".join(f"{n} ({action})" for n, action in privileged_steps)
+                    + f" need an admin; run attended by {actor}"
+                    + ("" if actor_user_id else f", playbook authored by {playbook.created_by or 'unknown'}")
+                )
+                execution.step_results = json.dumps([
+                    {"step": n, "action": action, "status": "forbidden_privileged_step",
+                     "error": "privileged step requires an admin", "started_at": None, "finished_at": None}
+                    for n, action in privileged_steps
+                ])
+                await self.db.flush()
+                logger.warning(
+                    "playbook_privileged_steps_refused", execution_id=execution.id, playbook_id=playbook.id,
+                    organization_id=scoped_org, actor=actor, steps=[n for n, _ in privileged_steps],
+                )
+                return execution
+
         runtime = StepRuntime(db=self.db, organization_id=scoped_org, execution_id=execution.id,
                               actor=actor, actor_user_id=actor_user_id)
         token = _RUNTIME.set(runtime)
