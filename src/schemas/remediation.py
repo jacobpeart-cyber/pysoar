@@ -182,7 +182,11 @@ class RemediationExecutionResponse(RemediationExecutionBase):
 # ============================================================================
 
 class ApprovalRequest(BaseModel):
-    """Approve a pending execution."""
+    """Approve a pending execution.
+
+    ``approver_id`` is accepted for backward compatibility but ignored: the
+    endpoint binds the approver to the authenticated user.
+    """
     execution_id: str = ""
     approver_id: str = ""
 
@@ -195,7 +199,7 @@ class ApprovalResponse(BaseModel):
 
 
 class RejectionRequest(BaseModel):
-    """Reject a pending execution."""
+    """Reject a pending execution (``approver_id`` ignored; bound to the caller)."""
     execution_id: str = ""
     approver_id: str = ""
     reason: Optional[str] = None

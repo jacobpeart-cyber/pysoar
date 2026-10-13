@@ -273,6 +273,29 @@ class PlaybookExecutionListResponse(BaseModel):
     pages: int = 0
 
 
+class PlaybookExecutionSummary(PlaybookExecutionResponse):
+    """An execution row for the org-wide history list.
+
+    ``total_nodes`` is the playbook's current node count and
+    ``nodes_executed`` the number of node executions that completed; both
+    come from the database, never from a default.
+    """
+
+    playbook_name: Optional[str] = None
+    total_nodes: int = 0
+    nodes_executed: int = 0
+
+
+class PlaybookExecutionSummaryListResponse(BaseModel):
+    """Paginated org-wide execution history"""
+
+    items: list[PlaybookExecutionSummary]
+    total: int = 0
+    page: int = 0
+    size: int = 0
+    pages: int = 0
+
+
 class PlaybookExecutionStatusResponse(BaseModel):
     """Schema for execution status"""
 

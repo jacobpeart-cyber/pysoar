@@ -135,7 +135,7 @@ async def sweep_scheduled_playbooks(db: AsyncSession) -> dict[str, Any]:
 
     while checked < MAX_SCHEDULED_PLAYBOOKS_PER_SWEEP:
         window = min(SCHEDULE_SWEEP_BATCH_SIZE, MAX_SCHEDULED_PLAYBOOKS_PER_SWEEP - checked)
-        stmt = select(Playbook.id, Playbook.trigger_conditions).where(
+        stmt = select(Playbook.id, Playbook.trigger_conditions, Playbook.organization_id).where(
             Playbook.trigger_type == PlaybookTrigger.SCHEDULED.value,
             Playbook.is_enabled == True,  # noqa: E712
         )
@@ -163,7 +163,7 @@ async def sweep_scheduled_playbooks(db: AsyncSession) -> dict[str, Any]:
             ).all(),
         )
 
-        for pb_id, trigger_conditions in rows:
+        for pb_id, trigger_conditions, pb_org_id in rows:
             try:
                 try:
                     conditions = json.loads(trigger_conditions) if trigger_conditions else None
@@ -176,6 +176,8 @@ async def sweep_scheduled_playbooks(db: AsyncSession) -> dict[str, Any]:
 
                 execution = PlaybookExecution(
                     playbook_id=pb_id,
+                    # A scheduled run belongs to the playbook's tenant.
+                    organization_id=pb_org_id,
                     status=ExecutionStatus.PENDING.value,
                     trigger_source="schedule",
                     input_data=json.dumps({"scheduled_at": now.isoformat()}),

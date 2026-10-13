@@ -5,14 +5,20 @@ import json
 from datetime import datetime, timezone
 from typing import Optional, List
 
-from fastapi import APIRouter, Body, HTTPException, Query, status
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from sqlalchemy import select, func, desc
 
-from src.api.deps import CurrentUser, DatabaseSession
+from src.api.deps import CurrentUser, DatabaseSession, OrganizationId, require_role
+from src.models.user import UserRole
 from src.tickethub.models import TicketComment, TicketActivity, AutomationRule, TicketLink
 from src.tickethub.engine import TicketAggregator
 
 router = APIRouter(prefix="/tickethub", tags=["ticket-hub"])
+
+#: Ticket work (status, kanban, comments, links): analysts and admins.
+_ANALYST_WRITE = [Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
+#: Automation rules are configuration: admins only.
+_ADMIN_WRITE = [Depends(require_role([UserRole.ADMIN]))]
 
 
 # ============================================================================
@@ -22,6 +28,7 @@ router = APIRouter(prefix="/tickethub", tags=["ticket-hub"])
 
 @router.get("/tickets")
 async def list_unified_tickets(
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
@@ -33,7 +40,6 @@ async def list_unified_tickets(
     priority: Optional[str] = None,
 ):
     """Get paginated list of all tickets across all modules."""
-    org_id = getattr(current_user, "organization_id", None)
     aggregator = TicketAggregator(db)
 
     source_types = [source_type] if source_type else None
@@ -54,11 +60,11 @@ async def list_unified_tickets(
 async def get_ticket_detail(
     source_type: str,
     source_id: str,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Get detailed view of a specific ticket with comments and activity."""
-    org_id = getattr(current_user, "organization_id", None)
     aggregator = TicketAggregator(db)
 
     # Get the ticket from aggregation
@@ -143,10 +149,11 @@ async def get_ticket_detail(
     }
 
 
-@router.patch("/tickets/{source_type}/{source_id}/status")
+@router.patch("/tickets/{source_type}/{source_id}/status", dependencies=_ANALYST_WRITE)
 async def update_ticket_status(
     source_type: str,
     source_id: str,
+    org_id: OrganizationId,
     data: dict = Body(...),
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
@@ -161,12 +168,7 @@ async def update_ticket_status(
     if not model:
         raise HTTPException(status_code=400, detail=f"Unknown source type: {source_type}")
 
-    org_id = getattr(current_user, "organization_id", None)
-    stmt = select(model).where(model.id == source_id)
-    if hasattr(model, "organization_id"):
-        stmt = stmt.where(model.organization_id == org_id)
-    result = await db.execute(stmt)
-    record = result.scalars().first()
+    record = await _get_scoped_record(db, model, source_id, org_id)
     if not record:
         raise HTTPException(status_code=404, detail="Ticket not found")
 
@@ -198,7 +200,7 @@ async def update_ticket_status(
         description=f"Status changed from {old_status} to {translated_status}",
         old_value=old_status,
         new_value=translated_status,
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
     )
     db.add(activity)
     await db.flush()
@@ -218,17 +220,18 @@ async def update_ticket_status(
 
 @router.get("/kanban")
 async def get_kanban_board(
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Get kanban board with tickets grouped into 4 columns."""
-    org_id = getattr(current_user, "organization_id", None)
     aggregator = TicketAggregator(db)
     return await aggregator.get_kanban_board(organization_id=org_id)
 
 
-@router.post("/kanban/move")
+@router.post("/kanban/move", dependencies=_ANALYST_WRITE)
 async def move_kanban_card(
+    org_id: OrganizationId,
     data: dict = Body(...),
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
@@ -255,12 +258,7 @@ async def move_kanban_card(
     if not model:
         raise HTTPException(status_code=400, detail=f"Unknown source type: {source_type}")
 
-    org_id = getattr(current_user, "organization_id", None)
-    stmt = select(model).where(model.id == source_id)
-    if hasattr(model, "organization_id"):
-        stmt = stmt.where(model.organization_id == org_id)
-    result = await db.execute(stmt)
-    record = result.scalars().first()
+    record = await _get_scoped_record(db, model, source_id, org_id)
     if not record:
         raise HTTPException(status_code=404, detail="Ticket not found")
 
@@ -278,7 +276,7 @@ async def move_kanban_card(
         description=f"Moved to {target_column}: {old_status} → {new_status}",
         old_value=old_status,
         new_value=new_status,
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
     )
     db.add(activity)
     await db.flush()
@@ -295,11 +293,11 @@ async def move_kanban_card(
 async def list_comments(
     source_type: str,
     source_id: str,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """List comments on a ticket."""
-    org_id = getattr(current_user, "organization_id", None)
     result = await db.execute(
         select(TicketComment)
         .where(
@@ -312,15 +310,21 @@ async def list_comments(
     return list(result.scalars().all())
 
 
-@router.post("/tickets/{source_type}/{source_id}/comments", status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/tickets/{source_type}/{source_id}/comments",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=_ANALYST_WRITE,
+)
 async def add_comment(
     source_type: str,
     source_id: str,
+    org_id: OrganizationId,
     data: dict = Body(...),
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Add a comment to a ticket."""
+    """Add a comment to one of the caller's tickets."""
+    await _require_ticket(db, source_type, source_id, org_id)
     comment = TicketComment(
         id=str(uuid.uuid4()),
         source_type=source_type,
@@ -329,7 +333,7 @@ async def add_comment(
         author_id=str(current_user.id),
         parent_comment_id=data.get("parent_comment_id"),
         mentioned_users=json.dumps(data.get("mentioned_users", [])),
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
     )
     db.add(comment)
 
@@ -341,7 +345,7 @@ async def add_comment(
         activity_type="comment_added",
         actor_id=str(current_user.id),
         description=f"Comment added",
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
     )
     db.add(activity)
     await db.flush()
@@ -350,14 +354,14 @@ async def add_comment(
     return comment
 
 
-@router.delete("/comments/{comment_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/comments/{comment_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=_ANALYST_WRITE)
 async def delete_comment(
     comment_id: str,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Delete a comment (tenant-scoped)."""
-    org_id = getattr(current_user, "organization_id", None)
     result = await db.execute(
         select(TicketComment).where(
             TicketComment.id == comment_id,
@@ -367,6 +371,11 @@ async def delete_comment(
     comment = result.scalars().first()
     if not comment:
         raise HTTPException(status_code=404, detail="Comment not found")
+    if comment.author_id != str(current_user.id) and not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "not_comment_author", "detail": "only the author or an admin can delete a comment"},
+        )
     await db.delete(comment)
     await db.flush()
 
@@ -380,11 +389,11 @@ async def delete_comment(
 async def get_activity_log(
     source_type: str,
     source_id: str,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Get activity timeline for a ticket (tenant-scoped)."""
-    org_id = getattr(current_user, "organization_id", None)
     result = await db.execute(
         select(TicketActivity)
         .where(
@@ -405,21 +414,20 @@ async def get_activity_log(
 
 @router.get("/automation/rules")
 async def list_automation_rules(
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """List automation rules."""
-    org_id = getattr(current_user, "organization_id", None)
-    query = select(AutomationRule)
-    if org_id:
-        query = query.where(AutomationRule.organization_id == org_id)
+    query = select(AutomationRule).where(AutomationRule.organization_id == org_id)
     query = query.order_by(AutomationRule.priority.desc())
     result = await db.execute(query)
     return list(result.scalars().all())
 
 
-@router.post("/automation/rules", status_code=status.HTTP_201_CREATED)
+@router.post("/automation/rules", status_code=status.HTTP_201_CREATED, dependencies=_ADMIN_WRITE)
 async def create_automation_rule(
+    org_id: OrganizationId,
     data: dict = Body(...),
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
@@ -436,7 +444,7 @@ async def create_automation_rule(
         priority=data.get("priority", 0),
         cooldown_minutes=data.get("cooldown_minutes", 0),
         created_by=str(current_user.id),
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
     )
     db.add(rule)
     await db.flush()
@@ -444,15 +452,15 @@ async def create_automation_rule(
     return rule
 
 
-@router.put("/automation/rules/{rule_id}")
+@router.put("/automation/rules/{rule_id}", dependencies=_ADMIN_WRITE)
 async def update_automation_rule(
     rule_id: str,
+    org_id: OrganizationId,
     data: dict = Body(...),
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Update an automation rule (tenant-scoped)."""
-    org_id = getattr(current_user, "organization_id", None)
     result = await db.execute(
         select(AutomationRule).where(
             AutomationRule.id == rule_id,
@@ -476,14 +484,14 @@ async def update_automation_rule(
     return rule
 
 
-@router.delete("/automation/rules/{rule_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/automation/rules/{rule_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=_ADMIN_WRITE)
 async def delete_automation_rule(
     rule_id: str,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Delete an automation rule (tenant-scoped)."""
-    org_id = getattr(current_user, "organization_id", None)
     result = await db.execute(
         select(AutomationRule).where(
             AutomationRule.id == rule_id,
@@ -502,15 +510,26 @@ async def delete_automation_rule(
 # ============================================================================
 
 
-@router.post("/tickets/{source_type}/{source_id}/links", status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/tickets/{source_type}/{source_id}/links",
+    status_code=status.HTTP_201_CREATED,
+    dependencies=_ANALYST_WRITE,
+)
 async def create_ticket_link(
     source_type: str,
     source_id: str,
+    org_id: OrganizationId,
     data: dict = Body(...),
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Link two tickets together."""
+    """Link two of the caller's tickets together (both must exist in the tenant)."""
+    target_type = data.get("target_source_type")
+    target_id = data.get("target_source_id")
+    if not target_type or not target_id:
+        raise HTTPException(status_code=400, detail="target_source_type and target_source_id are required")
+    await _require_ticket(db, source_type, source_id, org_id)
+    await _require_ticket(db, target_type, target_id, org_id)
     link = TicketLink(
         id=str(uuid.uuid4()),
         source_type_a=source_type,
@@ -519,7 +538,7 @@ async def create_ticket_link(
         source_id_b=data.get("target_source_id"),
         link_type=data.get("link_type", "related"),
         created_by=str(current_user.id),
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
     )
     db.add(link)
     await db.flush()
@@ -531,11 +550,11 @@ async def create_ticket_link(
 async def get_ticket_links(
     source_type: str,
     source_id: str,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Get linked tickets (tenant-scoped)."""
-    org_id = getattr(current_user, "organization_id", None)
     result = await db.execute(
         select(TicketLink).where(
             TicketLink.organization_id == org_id,
@@ -553,11 +572,11 @@ async def get_ticket_links(
 
 @router.get("/dashboard")
 async def get_dashboard(
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Get aggregated ticket hub statistics."""
-    org_id = getattr(current_user, "organization_id", None)
     aggregator = TicketAggregator(db)
     return await aggregator.get_dashboard_stats(organization_id=org_id)
 
@@ -565,6 +584,35 @@ async def get_dashboard(
 # ============================================================================
 # HELPER
 # ============================================================================
+
+
+async def _get_scoped_record(db, model, source_id: str, org_id: str):
+    """Load a source record only if it belongs to ``org_id``.
+
+    Case tasks carry no organization_id; they are scoped through the owning
+    incident. Every other source model has its own organization_id.
+    """
+    from src.models.case import Task
+    from src.models.incident import Incident
+
+    stmt = select(model).where(model.id == source_id)
+    if model is Task:
+        stmt = stmt.where(
+            Task.incident_id.in_(select(Incident.id).where(Incident.organization_id == org_id))
+        )
+    else:
+        stmt = stmt.where(model.organization_id == org_id)
+    result = await db.execute(stmt)
+    return result.scalars().first()
+
+
+async def _require_ticket(db, source_type: str, source_id: str, org_id: str) -> None:
+    """404 unless ``source_type``/``source_id`` names a ticket in the caller's tenant."""
+    model = _get_source_model(source_type)
+    if not model:
+        raise HTTPException(status_code=400, detail=f"Unknown source type: {source_type}")
+    if await _get_scoped_record(db, model, source_id, org_id) is None:
+        raise HTTPException(status_code=404, detail="Ticket not found")
 
 
 def _get_source_model(source_type: str):

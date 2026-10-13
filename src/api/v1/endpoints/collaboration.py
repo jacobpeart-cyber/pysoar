@@ -5,11 +5,11 @@ import math
 from datetime import datetime
 from typing import Optional
 
-from fastapi import APIRouter, Path, HTTPException, Query, status, BackgroundTasks
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Path, Query, status
 from sqlalchemy import func, select, and_, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import CurrentUser, DatabaseSession
+from src.api.deps import CurrentUser, DatabaseSession, OrganizationId, require_role
 from src.collaboration.models import (
     WarRoom,
     WarRoomMessage,
@@ -63,10 +63,15 @@ from src.schemas.collaboration import (
 )
 from src.core.logging import get_logger
 from src.core.utils import safe_json_loads
+from src.models.user import User, UserRole
 
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/collaboration", tags=["Collaboration"])
+
+#: War-room work (rooms, messages, actions, timeline, artifacts): analysts and
+#: admins. Viewers are read-only.
+_ANALYST_WRITE = [Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
 
 
 # ============================================================================
@@ -74,11 +79,9 @@ router = APIRouter(prefix="/collaboration", tags=["Collaboration"])
 # ============================================================================
 
 
-async def get_war_room_or_404(db: AsyncSession, room_id: str, org_id: Optional[str] = None) -> WarRoom:
-    """Get war room by ID or raise 404 (tenant-scoped when org_id provided)"""
-    stmt = select(WarRoom).where(WarRoom.id == room_id)
-    if org_id is not None:
-        stmt = stmt.where(WarRoom.organization_id == org_id)
+async def get_war_room_or_404(db: AsyncSession, room_id: str, org_id: str) -> WarRoom:
+    """Get war room by ID or raise 404 (always tenant-scoped)"""
+    stmt = select(WarRoom).where(WarRoom.id == room_id, WarRoom.organization_id == org_id)
     result = await db.execute(stmt)
     room = result.scalar_one_or_none()
     if not room:
@@ -86,11 +89,9 @@ async def get_war_room_or_404(db: AsyncSession, room_id: str, org_id: Optional[s
     return room
 
 
-async def get_message_or_404(db: AsyncSession, message_id: str, org_id: Optional[str] = None) -> WarRoomMessage:
-    """Get message by ID or raise 404 (tenant-scoped when org_id provided)"""
-    stmt = select(WarRoomMessage).where(WarRoomMessage.id == message_id)
-    if org_id is not None:
-        stmt = stmt.where(WarRoomMessage.organization_id == org_id)
+async def get_message_or_404(db: AsyncSession, message_id: str, org_id: str) -> WarRoomMessage:
+    """Get message by ID or raise 404 (always tenant-scoped)"""
+    stmt = select(WarRoomMessage).where(WarRoomMessage.id == message_id, WarRoomMessage.organization_id == org_id)
     result = await db.execute(stmt)
     message = result.scalar_one_or_none()
     if not message:
@@ -98,11 +99,9 @@ async def get_message_or_404(db: AsyncSession, message_id: str, org_id: Optional
     return message
 
 
-async def get_artifact_or_404(db: AsyncSession, artifact_id: str, org_id: Optional[str] = None) -> SharedArtifact:
-    """Get artifact by ID or raise 404 (tenant-scoped when org_id provided)"""
-    stmt = select(SharedArtifact).where(SharedArtifact.id == artifact_id)
-    if org_id is not None:
-        stmt = stmt.where(SharedArtifact.organization_id == org_id)
+async def get_artifact_or_404(db: AsyncSession, artifact_id: str, org_id: str) -> SharedArtifact:
+    """Get artifact by ID or raise 404 (always tenant-scoped)"""
+    stmt = select(SharedArtifact).where(SharedArtifact.id == artifact_id, SharedArtifact.organization_id == org_id)
     result = await db.execute(stmt)
     artifact = result.scalar_one_or_none()
     if not artifact:
@@ -110,11 +109,9 @@ async def get_artifact_or_404(db: AsyncSession, artifact_id: str, org_id: Option
     return artifact
 
 
-async def get_action_or_404(db: AsyncSession, action_id: str, org_id: Optional[str] = None) -> ActionItem:
-    """Get action item by ID or raise 404 (tenant-scoped when org_id provided)"""
-    stmt = select(ActionItem).where(ActionItem.id == action_id)
-    if org_id is not None:
-        stmt = stmt.where(ActionItem.organization_id == org_id)
+async def get_action_or_404(db: AsyncSession, action_id: str, org_id: str) -> ActionItem:
+    """Get action item by ID or raise 404 (always tenant-scoped)"""
+    stmt = select(ActionItem).where(ActionItem.id == action_id, ActionItem.organization_id == org_id)
     result = await db.execute(stmt)
     action = result.scalar_one_or_none()
     if not action:
@@ -127,16 +124,17 @@ async def get_action_or_404(db: AsyncSession, action_id: str, org_id: Optional[s
 # ============================================================================
 
 
-@router.post("/rooms", response_model=WarRoomResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/rooms", response_model=WarRoomResponse, status_code=status.HTTP_201_CREATED, dependencies=_ANALYST_WRITE)
 async def create_war_room(
     room_data: WarRoomCreate,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Create a new war room"""
     manager = WarRoomManager(db)
     room = await manager.create_room(
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         name=room_data.name,
         room_type=room_data.room_type,
         severity_level=room_data.severity_level,
@@ -155,6 +153,7 @@ async def create_war_room(
 
 @router.get("/rooms", response_model=WarRoomListResponse)
 async def list_war_rooms(
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
@@ -164,7 +163,7 @@ async def list_war_rooms(
     search: Optional[str] = None,
 ):
     """List war rooms with filtering"""
-    query = select(WarRoom).where(WarRoom.organization_id == getattr(current_user, "organization_id", None))
+    query = select(WarRoom).where(WarRoom.organization_id == org_id)
 
     if status:
         query = query.where(WarRoom.status == status)
@@ -199,24 +198,26 @@ async def list_war_rooms(
 
 @router.get("/rooms/{room_id}", response_model=WarRoomResponse)
 async def get_war_room(
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     room_id: str = Path(...),
 ):
     """Get war room details"""
-    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
+    room = await get_war_room_or_404(db, room_id, org_id)
     return room
 
 
-@router.patch("/rooms/{room_id}", response_model=WarRoomResponse)
+@router.patch("/rooms/{room_id}", response_model=WarRoomResponse, dependencies=_ANALYST_WRITE)
 async def update_war_room(
     room_data: WarRoomUpdate,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     room_id: str = Path(...),
 ):
     """Update war room"""
-    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
+    room = await get_war_room_or_404(db, room_id, org_id)
 
     if room_data.name:
         room.name = room_data.name
@@ -236,14 +237,15 @@ async def update_war_room(
     return room
 
 
-@router.post("/rooms/{room_id}/archive")
+@router.post("/rooms/{room_id}/archive", dependencies=_ANALYST_WRITE)
 async def archive_war_room(
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     room_id: str = Path(...),
 ):
     """Archive war room"""
-    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
+    room = await get_war_room_or_404(db, room_id, org_id)
     manager = WarRoomManager(db)
     await manager.archive_room(room_id)
     await db.commit()
@@ -252,25 +254,27 @@ async def archive_war_room(
 
 @router.get("/rooms/{room_id}/summary", response_model=WarRoomSummary)
 async def get_room_summary(
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     room_id: str = Path(...),
 ):
     """Get war room summary with metrics"""
-    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
+    room = await get_war_room_or_404(db, room_id, org_id)
     manager = WarRoomManager(db)
     summary = await manager.get_room_summary(room_id)
     return WarRoomSummary(**summary)
 
 
-@router.post("/rooms/{room_id}/join")
+@router.post("/rooms/{room_id}/join", dependencies=_ANALYST_WRITE)
 async def join_war_room(
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     room_id: str = Path(...),
 ):
     """Join a war room"""
-    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
+    room = await get_war_room_or_404(db, room_id, org_id)
     manager = WarRoomManager(db)
     success = await manager.join_room(room_id, current_user.id)
 
@@ -284,29 +288,36 @@ async def join_war_room(
     return {"status": "joined", "room_id": room_id}
 
 
-@router.post("/rooms/{room_id}/leave")
+@router.post("/rooms/{room_id}/leave", dependencies=_ANALYST_WRITE)
 async def leave_war_room(
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     room_id: str = Path(...),
 ):
     """Leave a war room"""
-    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
+    room = await get_war_room_or_404(db, room_id, org_id)
     manager = WarRoomManager(db)
     await manager.leave_room(room_id, current_user.id)
     await db.commit()
     return {"status": "left", "room_id": room_id}
 
 
-@router.post("/rooms/{room_id}/commander/{user_id}")
+@router.post("/rooms/{room_id}/commander/{user_id}", dependencies=_ANALYST_WRITE)
 async def set_war_room_commander(
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     room_id: str = Path(...),
     user_id: str = Path(...),
 ):
-    """Set incident commander for war room"""
-    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
+    """Set incident commander for war room (the commander must be in the caller's organisation)"""
+    room = await get_war_room_or_404(db, room_id, org_id)
+    member = await db.execute(
+        select(User.id).where(User.id == user_id, User.organization_id == org_id)
+    )
+    if member.scalar_one_or_none() is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
     manager = WarRoomManager(db)
     success = await manager.set_commander(room_id, user_id)
 
@@ -322,20 +333,21 @@ async def set_war_room_commander(
 # ============================================================================
 
 
-@router.post("/rooms/{room_id}/messages", response_model=WarRoomMessageResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/rooms/{room_id}/messages", response_model=WarRoomMessageResponse, status_code=status.HTTP_201_CREATED, dependencies=_ANALYST_WRITE)
 async def send_message(
     msg_data: WarRoomMessageCreate,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     room_id: str = Path(...),
 ):
     """Send message to war room"""
-    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
+    room = await get_war_room_or_404(db, room_id, org_id)
     engine = MessageEngine(db)
 
     message = await engine.send_message(
         room_id=room_id,
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         sender_id=str(current_user.id),
         sender_name=getattr(current_user, "full_name", None) or getattr(current_user, "email", "Unknown"),
         content=msg_data.content,
@@ -350,6 +362,7 @@ async def send_message(
 
 @router.get("/rooms/{room_id}/messages", response_model=WarRoomMessageListResponse)
 async def get_room_messages(
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     room_id: str = Path(...),
@@ -357,7 +370,7 @@ async def get_room_messages(
     size: int = Query(50, ge=1, le=200),
 ):
     """Get room message history"""
-    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
+    room = await get_war_room_or_404(db, room_id, org_id)
     engine = MessageEngine(db)
     messages, total = await engine.get_message_history(room_id, page=page, size=size)
 
@@ -369,15 +382,21 @@ async def get_room_messages(
     )
 
 
-@router.patch("/messages/{message_id}", response_model=WarRoomMessageResponse)
+@router.patch("/messages/{message_id}", response_model=WarRoomMessageResponse, dependencies=_ANALYST_WRITE)
 async def edit_message(
     msg_data: WarRoomMessageUpdate,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     message_id: str = Path(...),
 ):
-    """Edit message"""
-    message = await get_message_or_404(db, message_id, getattr(current_user, "organization_id", None))
+    """Edit message (only its sender may edit it)"""
+    message = await get_message_or_404(db, message_id, org_id)
+    if str(message.sender_id) != str(current_user.id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "not_message_sender", "detail": "only the sender can edit a message"},
+        )
     engine = MessageEngine(db)
     success = await engine.edit_message(message_id, msg_data.content)
 
@@ -389,14 +408,15 @@ async def edit_message(
     return message
 
 
-@router.post("/messages/{message_id}/pin")
+@router.post("/messages/{message_id}/pin", dependencies=_ANALYST_WRITE)
 async def pin_message(
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     message_id: str = Path(...),
 ):
     """Pin message in room"""
-    message = await get_message_or_404(db, message_id, getattr(current_user, "organization_id", None))
+    message = await get_message_or_404(db, message_id, org_id)
     engine = MessageEngine(db)
     success = await engine.pin_message(message.room_id, message_id)
 
@@ -409,6 +429,7 @@ async def pin_message(
 
 @router.get("/rooms/{room_id}/messages/search", response_model=list[WarRoomMessageResponse])
 async def search_messages(
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     room_id: str = Path(...),
@@ -416,7 +437,7 @@ async def search_messages(
     limit: int = Query(50, ge=1, le=200),
 ):
     """Search messages in room"""
-    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
+    room = await get_war_room_or_404(db, room_id, org_id)
     engine = MessageEngine(db)
     messages = await engine.search_messages(room_id, q, limit=limit)
     return messages
@@ -424,14 +445,15 @@ async def search_messages(
 
 @router.get("/rooms/{room_id}/messages/{message_id}/thread", response_model=MessageThreadResponse)
 async def get_message_thread(
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     room_id: str = Path(...),
     message_id: str = Path(...),
 ):
     """Get message thread"""
-    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
-    parent = await get_message_or_404(db, message_id, getattr(current_user, "organization_id", None))
+    room = await get_war_room_or_404(db, room_id, org_id)
+    parent = await get_message_or_404(db, message_id, org_id)
 
     # Get replies
     result = await db.execute(
@@ -449,20 +471,21 @@ async def get_message_thread(
 # ============================================================================
 
 
-@router.post("/rooms/{room_id}/artifacts", response_model=SharedArtifactResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/rooms/{room_id}/artifacts", response_model=SharedArtifactResponse, status_code=status.HTTP_201_CREATED, dependencies=_ANALYST_WRITE)
 async def upload_artifact(
     artifact_data: SharedArtifactCreate,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     room_id: str = Path(...),
 ):
     """Upload artifact to war room"""
-    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
+    room = await get_war_room_or_404(db, room_id, org_id)
     manager = ArtifactManager(db)
 
     artifact = await manager.upload_artifact(
         room_id=room_id,
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         uploaded_by=current_user.id,
         file_name=artifact_data.file_name,
         file_hash=artifact_data.file_hash,
@@ -478,6 +501,7 @@ async def upload_artifact(
 
 @router.get("/rooms/{room_id}/artifacts", response_model=SharedArtifactListResponse)
 async def list_room_artifacts(
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     room_id: str = Path(...),
@@ -486,7 +510,7 @@ async def list_room_artifacts(
     artifact_type: Optional[str] = None,
 ):
     """List artifacts in room"""
-    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
+    room = await get_war_room_or_404(db, room_id, org_id)
 
     query = select(SharedArtifact).where(SharedArtifact.room_id == room_id)
 
@@ -516,23 +540,25 @@ async def list_room_artifacts(
 
 @router.get("/artifacts/{artifact_id}", response_model=SharedArtifactResponse)
 async def get_artifact(
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     artifact_id: str = Path(...),
 ):
     """Get artifact details"""
-    artifact = await get_artifact_or_404(db, artifact_id, getattr(current_user, "organization_id", None))
+    artifact = await get_artifact_or_404(db, artifact_id, org_id)
     return artifact
 
 
 @router.post("/artifacts/{artifact_id}/download")
 async def download_artifact(
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     artifact_id: str = Path(...),
 ):
     """Track artifact download"""
-    artifact = await get_artifact_or_404(db, artifact_id, getattr(current_user, "organization_id", None))
+    artifact = await get_artifact_or_404(db, artifact_id, org_id)
     manager = ArtifactManager(db)
     await manager.track_downloads(artifact_id)
     await db.commit()
@@ -541,12 +567,13 @@ async def download_artifact(
 
 @router.get("/rooms/{room_id}/artifacts/index")
 async def get_artifact_index(
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     room_id: str = Path(...),
 ):
     """Get artifact index for room"""
-    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
+    room = await get_war_room_or_404(db, room_id, org_id)
     manager = ArtifactManager(db)
     index = await manager.generate_artifact_index(room_id)
     return index
@@ -557,20 +584,21 @@ async def get_artifact_index(
 # ============================================================================
 
 
-@router.post("/rooms/{room_id}/actions", response_model=ActionItemResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/rooms/{room_id}/actions", response_model=ActionItemResponse, status_code=status.HTTP_201_CREATED, dependencies=_ANALYST_WRITE)
 async def create_action_item(
     action_data: ActionItemCreate,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     room_id: str = Path(...),
 ):
     """Create action item"""
-    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
+    room = await get_war_room_or_404(db, room_id, org_id)
     tracker = ActionTracker(db)
 
     action = await tracker.create_action_item(
         room_id=room_id,
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         title=action_data.title,
         description=action_data.description,
         assigned_by=str(current_user.id),
@@ -584,6 +612,7 @@ async def create_action_item(
 
 @router.get("/rooms/{room_id}/actions", response_model=ActionItemListResponse)
 async def list_room_actions(
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     room_id: str = Path(...),
@@ -593,7 +622,7 @@ async def list_room_actions(
     assigned_to: Optional[str] = None,
 ):
     """List action items in room"""
-    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
+    room = await get_war_room_or_404(db, room_id, org_id)
 
     query = select(ActionItem).where(ActionItem.room_id == room_id)
 
@@ -624,15 +653,16 @@ async def list_room_actions(
     )
 
 
-@router.patch("/actions/{action_id}", response_model=ActionItemResponse)
+@router.patch("/actions/{action_id}", response_model=ActionItemResponse, dependencies=_ANALYST_WRITE)
 async def update_action_item(
     action_data: ActionItemUpdate,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     action_id: str = Path(...),
 ):
     """Update action item"""
-    action = await get_action_or_404(db, action_id, getattr(current_user, "organization_id", None))
+    action = await get_action_or_404(db, action_id, org_id)
 
     if action_data.title:
         action.title = action_data.title
@@ -657,12 +687,13 @@ async def update_action_item(
 
 @router.get("/rooms/{room_id}/actions/report", response_model=ActionReport)
 async def get_action_report(
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     room_id: str = Path(...),
 ):
     """Get action items report"""
-    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
+    room = await get_war_room_or_404(db, room_id, org_id)
     tracker = ActionTracker(db)
     report = await tracker.generate_action_report(room_id)
     return ActionReport(**report)
@@ -673,20 +704,21 @@ async def get_action_report(
 # ============================================================================
 
 
-@router.post("/rooms/{room_id}/timeline", response_model=IncidentTimelineResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/rooms/{room_id}/timeline", response_model=IncidentTimelineResponse, status_code=status.HTTP_201_CREATED, dependencies=_ANALYST_WRITE)
 async def add_timeline_event(
     event_data: IncidentTimelineCreate,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     room_id: str = Path(...),
 ):
     """Add event to timeline"""
-    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
+    room = await get_war_room_or_404(db, room_id, org_id)
     manager = TimelineManager(db)
 
     event = await manager.add_event(
         room_id=room_id,
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         event_type=event_data.event_type,
         description=event_data.description,
         created_by=str(current_user.id),
@@ -701,6 +733,7 @@ async def add_timeline_event(
 
 @router.get("/rooms/{room_id}/timeline", response_model=IncidentTimelineListResponse)
 async def get_timeline(
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     room_id: str = Path(...),
@@ -710,7 +743,7 @@ async def get_timeline(
     key_only: bool = False,
 ):
     """Get timeline events"""
-    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
+    room = await get_war_room_or_404(db, room_id, org_id)
     manager = TimelineManager(db)
 
     event_types = [event_type] if event_type else None
@@ -731,12 +764,13 @@ async def get_timeline(
 
 @router.get("/rooms/{room_id}/timeline/report")
 async def get_timeline_report(
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     room_id: str = Path(...),
 ):
     """Get timeline report"""
-    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
+    room = await get_war_room_or_404(db, room_id, org_id)
     manager = TimelineManager(db)
     report = await manager.generate_timeline_report(room_id)
     return {"report": report}
@@ -744,13 +778,14 @@ async def get_timeline_report(
 
 @router.get("/rooms/{room_id}/timeline/export")
 async def export_timeline(
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     room_id: str = Path(...),
     format: str = Query("json", pattern="^(json|text)$"),
 ):
     """Export timeline"""
-    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
+    room = await get_war_room_or_404(db, room_id, org_id)
     manager = TimelineManager(db)
     export_data = await manager.export_timeline(room_id, format=format)
     return {"data": export_data, "format": format}
@@ -761,14 +796,15 @@ async def export_timeline(
 # ============================================================================
 
 
-@router.post("/rooms/{room_id}/postmortem", response_model=PostMortemReport)
+@router.post("/rooms/{room_id}/postmortem", response_model=PostMortemReport, dependencies=_ANALYST_WRITE)
 async def generate_post_mortem(
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     room_id: str = Path(...),
 ):
     """Generate post-mortem report"""
-    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
+    room = await get_war_room_or_404(db, room_id, org_id)
     generator = PostMortemGenerator(db)
     report = await generator.generate_post_mortem(room_id)
     return PostMortemReport(**report)
@@ -776,12 +812,13 @@ async def generate_post_mortem(
 
 @router.get("/rooms/{room_id}/postmortem/analysis", response_model=PostMortemAnalysis)
 async def get_postmortem_analysis(
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     room_id: str = Path(...),
 ):
     """Get complete post-mortem analysis"""
-    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
+    room = await get_war_room_or_404(db, room_id, org_id)
     generator = PostMortemGenerator(db)
 
     report = await generator.generate_post_mortem(room_id)
@@ -812,11 +849,11 @@ async def get_postmortem_analysis(
 
 @router.get("/dashboard", response_model=CollaborationDashboard)
 async def get_collaboration_dashboard(
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Get collaboration dashboard"""
-    org_id = getattr(current_user, "organization_id", None)
     manager = WarRoomManager(db)
 
     # Get active rooms
@@ -883,12 +920,13 @@ async def get_collaboration_dashboard(
 
 @router.get("/rooms/{room_id}/activity-metrics", response_model=RoomActivityMetrics)
 async def get_room_activity_metrics(
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     room_id: str = Path(...),
 ):
     """Get activity metrics for room"""
-    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
+    room = await get_war_room_or_404(db, room_id, org_id)
     from datetime import timedelta
     from src.models.base import utc_now
 
@@ -964,13 +1002,18 @@ async def get_room_activity_metrics(
 
 @router.get("/search", response_model=SearchResultsResponse)
 async def search_collaboration(
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
-    room_id: str = Path(...),
+    room_id: str = Query(..., min_length=1),
     q: str = Query(..., min_length=1),
 ):
-    """Search across messages and artifacts"""
-    room = await get_war_room_or_404(db, room_id, getattr(current_user, "organization_id", None))
+    """Search one of the caller's rooms across messages and artifacts.
+
+    ``room_id`` is a query parameter: it used to be declared as a path
+    parameter on a path without one, so every call failed with 422.
+    """
+    room = await get_war_room_or_404(db, room_id, org_id)
     msg_engine = MessageEngine(db)
 
     messages = await msg_engine.search_messages(room_id, q, limit=50)
@@ -980,6 +1023,7 @@ async def search_collaboration(
         select(SharedArtifact).where(
             and_(
                 SharedArtifact.room_id == room_id,
+                SharedArtifact.organization_id == org_id,
                 SharedArtifact.file_name.ilike(f"%{q}%"),
             )
         )

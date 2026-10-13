@@ -151,6 +151,8 @@ class SendNotificationAction(PlaybookAction):
                 recipients=recipients,
                 subject=subject,
                 message=message,
+                # The execution's tenant: its SMTP / webhooks, nobody else's.
+                organization_id=context.get("organization_id"),
             )
             logger.info(f"Notification queued via {channel} to {recipients}")
         except Exception as e:

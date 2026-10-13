@@ -61,8 +61,14 @@ class PlaybookAction:
         recipients = [to] if isinstance(to, str) else to
         sent = False
         try:
+            from src.core.database import async_session_factory
             from src.services.email_service import EmailService
-            email_service = EmailService()
+
+            # The execution's organisation SMTP (Settings), else the platform relay.
+            async with async_session_factory() as session:
+                email_service = await EmailService.for_organization(
+                    session, context.get("organization_id"),
+                )
             if email_service.is_configured:
                 sent = await email_service.send_email(
                     to=recipients,
@@ -100,8 +106,16 @@ class PlaybookAction:
         sent = False
         try:
             import httpx
-            from src.core.config import settings
-            webhook_url = params.get("webhook_url") or settings.slack_webhook_url
+            # The execution's own organisation webhook (Settings, per tenant);
+            # never the process-wide value another tenant may have saved.
+            webhook_url = params.get("webhook_url")
+            org_id = context.get("organization_id")
+            if not webhook_url and org_id:
+                from src.core.database import async_session_factory
+                from src.services.tenant_settings import notification_webhook_for
+
+                async with async_session_factory() as session:
+                    webhook_url = await notification_webhook_for(session, org_id, "slack")
             if webhook_url:
                 payload = {"text": message}
                 if channel:

@@ -5,14 +5,16 @@ import math
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, status
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import CurrentUser, DatabaseSession
+from src.api.deps import CurrentUser, DatabaseSession, OrganizationId, require_role
 from src.core.database import async_session_factory
+from src.core.logging import get_logger
 from src.models.alert import Alert, AlertSeverity, AlertStatus
 from src.models.audit import AuditLog
+from src.models.user import UserRole
 from src.schemas.alert import (
     AlertBulkAction,
     AlertCreate,
@@ -26,6 +28,10 @@ from src.services.automation import AutomationService
 from src.services.websocket_manager import notify_new_alert, create_notification_callback
 
 router = APIRouter(prefix="/alerts", tags=["Alerts"])
+logger = get_logger(__name__)
+
+#: Operational writes: analysts and admins. Viewers are read-only.
+_ANALYST_WRITE = [Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
 
 
 async def process_alert_correlation(alert_id: str):
@@ -35,18 +41,17 @@ async def process_alert_correlation(alert_id: str):
             result = await db.execute(select(Alert).where(Alert.id == alert_id))
             alert = result.scalar_one_or_none()
             if alert:
-                notify_callback = create_notification_callback("incidents")
+                notify_callback = create_notification_callback("incidents", alert.organization_id)
                 await process_new_alert(db, alert, notify_callback)
                 await db.commit()
-        except Exception:
+        except Exception as exc:  # background task: log, never swallow silently
+            logger.error("alert_correlation_failed", alert_id=alert_id, error=str(exc), exc_info=True)
             await db.rollback()
 
 
-async def get_alert_or_404(db: AsyncSession, alert_id: str, org_id: Optional[str] = None) -> Alert:
-    """Get alert by ID or raise 404 (tenant-scoped)"""
-    stmt = select(Alert).where(Alert.id == alert_id)
-    if org_id is not None:
-        stmt = stmt.where(Alert.organization_id == org_id)
+async def get_alert_or_404(db: AsyncSession, alert_id: str, org_id: str) -> Alert:
+    """Get the caller's alert by ID or raise 404 (always tenant-scoped)"""
+    stmt = select(Alert).where(Alert.id == alert_id, Alert.organization_id == org_id)
     result = await db.execute(stmt)
     alert = result.scalar_one_or_none()
     if not alert:
@@ -59,6 +64,7 @@ async def get_alert_or_404(db: AsyncSession, alert_id: str, org_id: Optional[str
 
 @router.get("", response_model=AlertListResponse)
 async def list_alerts(
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
@@ -74,7 +80,6 @@ async def list_alerts(
     sort_order: str = "desc",
 ):
     """List alerts with filtering and pagination"""
-    org_id = getattr(current_user, "organization_id", None)
     query = select(Alert).where(Alert.organization_id == org_id)
 
     # Apply filters
@@ -135,9 +140,12 @@ async def list_alerts(
     )
 
 
-@router.post("", response_model=AlertResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "", response_model=AlertResponse, status_code=status.HTTP_201_CREATED, dependencies=_ANALYST_WRITE
+)
 async def create_alert(
     alert_data: AlertCreate,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     background_tasks: BackgroundTasks = None,
@@ -145,7 +153,7 @@ async def create_alert(
 ):
     """Create a new alert"""
     alert = Alert(
-        organization_id=getattr(current_user, "organization_id", None) if current_user else None,
+        organization_id=org_id,
         title=alert_data.title,
         description=alert_data.description,
         severity=alert_data.severity,
@@ -192,11 +200,10 @@ async def create_alert(
     response = AlertResponse.model_validate(alert)
 
     # Send WebSocket notification
-    background_tasks.add_task(notify_new_alert, response.model_dump())
+    background_tasks.add_task(notify_new_alert, response.model_dump(), org_id)
 
     # Run central automation service (includes correlation, incident creation, playbooks)
     try:
-        org_id = getattr(current_user, "organization_id", None) if current_user else None
         automation = AutomationService(db)
         await automation.on_alert_created(
             alert,
@@ -214,11 +221,11 @@ async def create_alert(
 
 @router.get("/stats", response_model=AlertStats)
 async def get_alert_stats(
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Get alert statistics with real date-filtered counts (tenant-scoped)."""
-    org_id = getattr(current_user, "organization_id", None)
     now = datetime.now(timezone.utc)
     today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     week_start = now - timedelta(days=7)
@@ -296,24 +303,26 @@ async def get_alert_stats(
 @router.get("/{alert_id}", response_model=AlertResponse)
 async def get_alert(
     alert_id: str,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Get an alert by ID"""
-    alert = await get_alert_or_404(db, alert_id, getattr(current_user, "organization_id", None))
+    alert = await get_alert_or_404(db, alert_id, org_id)
     return AlertResponse.model_validate(alert)
 
 
-@router.patch("/{alert_id}", response_model=AlertResponse)
+@router.patch("/{alert_id}", response_model=AlertResponse, dependencies=_ANALYST_WRITE)
 async def update_alert(
     alert_id: str,
     alert_data: AlertUpdate,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     request: Request = None,
 ):
     """Update an alert"""
-    alert = await get_alert_or_404(db, alert_id, getattr(current_user, "organization_id", None))
+    alert = await get_alert_or_404(db, alert_id, org_id)
 
     update_data = alert_data.model_dump(exclude_unset=True, exclude_none=True)
 
@@ -359,24 +368,41 @@ async def update_alert(
     return AlertResponse.model_validate(alert)
 
 
-@router.delete("/{alert_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{alert_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=_ANALYST_WRITE
+)
 async def delete_alert(
     alert_id: str,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
+    request: Request = None,
 ):
-    """Delete an alert"""
-    alert = await get_alert_or_404(db, alert_id, getattr(current_user, "organization_id", None))
+    """Delete an alert (audited)"""
+    alert = await get_alert_or_404(db, alert_id, org_id)
+    title = alert.title
     await db.delete(alert)
+    db.add(AuditLog(
+        user_id=str(current_user.id),
+        organization_id=org_id,
+        action="alert_delete",
+        resource_type="alert",
+        resource_id=str(alert_id),
+        description=f"Deleted alert: {title}",
+        ip_address=(request.client.host if request and request.client else None),
+        user_agent=(request.headers.get("user-agent") if request else None),
+        success=True,
+    ))
     await db.flush()
 
 
 _VALID_BULK_ACTIONS = {"acknowledge", "close", "assign", "resolve", "delete", "in_progress"}
 
 
-@router.post("/bulk", response_model=None)
+@router.post("/bulk", response_model=None, dependencies=_ANALYST_WRITE)
 async def bulk_action(
     action_data: AlertBulkAction,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     request: Request = None,
@@ -384,8 +410,13 @@ async def bulk_action(
     """Perform bulk action on alerts.
 
     Supported actions: acknowledge, in_progress, resolve, close, assign, delete.
-    `assign` requires `value` to be set to a user ID.
+    `assign` requires `value` to be set to a user ID. Bulk delete is admin-only.
     """
+    if action_data.action == "delete" and not current_user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "admin_required", "detail": "bulk delete requires the admin role"},
+        )
     if action_data.action not in _VALID_BULK_ACTIONS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -411,7 +442,6 @@ async def bulk_action(
     failures: list[dict] = []
     now_iso = datetime.now(timezone.utc).isoformat()
 
-    org_id = getattr(current_user, "organization_id", None)
     for alert_id in action_data.alert_ids:
         try:
             result = await db.execute(

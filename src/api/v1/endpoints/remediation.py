@@ -20,11 +20,12 @@ from pydantic import BaseModel as PydanticBaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, desc
 
-from src.api.deps import CurrentUser, DatabaseSession, get_current_active_user
+from src.api.deps import CurrentUser, DatabaseSession, OrganizationId, require_role
 from src.core.database import get_db
 from src.core.logging import get_logger
 from src.models.audit import AuditLog
 from src.models.base import utc_now
+from src.models.user import UserRole
 from src.remediation.models import (
     RemediationPolicy,
     RemediationAction,
@@ -62,16 +63,23 @@ from src.schemas.remediation import (
 logger = get_logger(__name__)
 router = APIRouter(prefix="/remediation", tags=["remediation"])
 
+#: Operational writes (testing, manual lifecycle, cancel): analysts and admins.
+_ANALYST_WRITE = [Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
+#: Configuration (policies, actions, playbooks, integrations), containment
+#: (quick actions, playbook runs, rollback) and approvals: admins only.
+_ADMIN_WRITE = [Depends(require_role([UserRole.ADMIN]))]
+
 
 # ============================================================================
 # Policies
 # ============================================================================
 
-@router.post("/policies", response_model=RemediationPolicyResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/policies", response_model=RemediationPolicyResponse, status_code=status.HTTP_201_CREATED, dependencies=_ADMIN_WRITE)
 async def create_policy(
     request: RemediationPolicyCreate,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user = Depends(get_current_active_user),
+    current_user: CurrentUser = None,
 ):
     """Create a new remediation policy."""
     logger.info("Creating remediation policy", extra={
@@ -101,7 +109,7 @@ async def create_policy(
         rollback_actions=request.rollback_actions,
         tags=request.tags,
         created_by=str(current_user.id) if current_user else None,
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
     )
     db.add(policy)
     await db.commit()
@@ -111,6 +119,7 @@ async def create_policy(
 
 @router.get("/policies", response_model=List[RemediationPolicyResponse])
 async def list_policies(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     policy_type: Optional[str] = Query(None),
     trigger_type: Optional[str] = Query(None),
@@ -120,10 +129,8 @@ async def list_policies(
     current_user: CurrentUser = None,
 ):
     """List remediation policies with optional filtering."""
-    org_id = getattr(current_user, "organization_id", None)
     query = select(RemediationPolicy)
-    if org_id:
-        query = query.where(RemediationPolicy.organization_id == org_id)
+    query = query.where(RemediationPolicy.organization_id == org_id)
 
     if policy_type:
         query = query.where(RemediationPolicy.policy_type == policy_type)
@@ -167,26 +174,28 @@ async def list_builtin_policies(
 @router.get("/policies/{policy_id}", response_model=RemediationPolicyResponse)
 async def get_policy(
     policy_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user = Depends(get_current_active_user),
+    current_user: CurrentUser = None,
 ):
     """Get a specific policy with execution history."""
     policy = await db.get(RemediationPolicy, policy_id)
-    if not policy or policy.organization_id != getattr(current_user, "organization_id", None):
+    if not policy or policy.organization_id != org_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     return policy
 
 
-@router.put("/policies/{policy_id}", response_model=RemediationPolicyResponse)
+@router.put("/policies/{policy_id}", response_model=RemediationPolicyResponse, dependencies=_ADMIN_WRITE)
 async def update_policy(
     policy_id: str,
     request: RemediationPolicyUpdate,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user = Depends(get_current_active_user),
+    current_user: CurrentUser = None,
 ):
     """Update a policy."""
     policy = await db.get(RemediationPolicy, policy_id)
-    if not policy or policy.organization_id != getattr(current_user, "organization_id", None):
+    if not policy or policy.organization_id != org_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
     update_data = request.model_dump(exclude_unset=True)
@@ -199,15 +208,16 @@ async def update_policy(
     return policy
 
 
-@router.delete("/policies/{policy_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/policies/{policy_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=_ADMIN_WRITE)
 async def delete_policy(
     policy_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user = Depends(get_current_active_user),
+    current_user: CurrentUser = None,
 ):
     """Disable a policy (soft delete)."""
     policy = await db.get(RemediationPolicy, policy_id)
-    if not policy or policy.organization_id != getattr(current_user, "organization_id", None):
+    if not policy or policy.organization_id != org_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
     policy.is_enabled = False
@@ -215,23 +225,24 @@ async def delete_policy(
     await db.commit()
 
 
-@router.post("/policies/{policy_id}/test")
+@router.post("/policies/{policy_id}/test", dependencies=_ANALYST_WRITE)
 async def test_policy(
     policy_id: str,
     trigger_data: dict,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user = Depends(get_current_active_user),
+    current_user: CurrentUser = None,
 ):
     """Test a policy against sample data."""
     policy = await db.get(RemediationPolicy, policy_id)
-    if not policy or policy.organization_id != getattr(current_user, "organization_id", None):
+    if not policy or policy.organization_id != org_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
     engine = RemediationEngine(db)
     matched = await engine.evaluate_trigger(
         policy.trigger_type,
         trigger_data,
-        getattr(current_user, "organization_id", None),
+        org_id,
     )
 
     return {
@@ -247,15 +258,16 @@ async def test_policy(
 
 @router.get("/actions", response_model=List[RemediationActionResponse])
 async def list_actions(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     action_type: Optional[str] = Query(None),
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, ge=1, le=500),
-    current_user = Depends(get_current_active_user),
+    current_user: CurrentUser = None,
 ):
     """List available remediation actions."""
     query = select(RemediationAction).where(
-        RemediationAction.organization_id == getattr(current_user, "organization_id", None)
+        RemediationAction.organization_id == org_id
     )
 
     if action_type:
@@ -266,11 +278,12 @@ async def list_actions(
     return result.scalars().all()
 
 
-@router.post("/actions", response_model=RemediationActionResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/actions", response_model=RemediationActionResponse, status_code=status.HTTP_201_CREATED, dependencies=_ADMIN_WRITE)
 async def create_action(
     request: RemediationActionCreate,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user = Depends(get_current_active_user),
+    current_user: CurrentUser = None,
 ):
     """Create a custom remediation action."""
     action = RemediationAction(
@@ -289,7 +302,7 @@ async def create_action(
         risk_level=request.risk_level,
         requires_confirmation=request.requires_confirmation,
         tags=request.tags,
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
     )
     db.add(action)
     await db.commit()
@@ -300,34 +313,37 @@ async def create_action(
 @router.get("/actions/{action_id}", response_model=RemediationActionResponse)
 async def get_action(
     action_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user = Depends(get_current_active_user),
+    current_user: CurrentUser = None,
 ):
     """Get a specific action."""
     action = await db.get(RemediationAction, action_id)
-    if not action or action.organization_id != getattr(current_user, "organization_id", None):
+    if not action or action.organization_id != org_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     return action
 
 
-@router.post("/actions/{action_id}/test")
+@router.post("/actions/{action_id}/test", dependencies=_ANALYST_WRITE)
 async def test_action(
     action_id: str,
     target: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user = Depends(get_current_active_user),
+    current_user: CurrentUser = None,
 ):
-    """Test an action."""
+    """Test an action: not implemented (it used to report success without doing anything)."""
     action = await db.get(RemediationAction, action_id)
-    if not action or action.organization_id != getattr(current_user, "organization_id", None):
+    if not action or action.organization_id != org_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
-    return {
-        "action_id": action_id,
-        "target": target,
-        "test_result": "success",
-        "tested_at": utc_now().isoformat(),
-    }
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail={
+            "error": "not_implemented",
+            "detail": "remediation actions cannot be dry-run yet; nothing was executed",
+        },
+    )
 
 
 # ============================================================================
@@ -336,6 +352,7 @@ async def test_action(
 
 @router.get("/executions", response_model=List[RemediationExecutionResponse])
 async def list_executions(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     status: Optional[str] = Query(None),
     trigger_source: Optional[str] = Query(None),
@@ -345,10 +362,8 @@ async def list_executions(
     current_user: CurrentUser = None,
 ):
     """List remediation executions."""
-    org_id = getattr(current_user, "organization_id", None)
     query = select(RemediationExecution)
-    if org_id:
-        query = query.where(RemediationExecution.organization_id == org_id)
+    query = query.where(RemediationExecution.organization_id == org_id)
 
     cutoff = utc_now() - timedelta(days=days)
     query = query.where(RemediationExecution.created_at >= cutoff)
@@ -365,16 +380,15 @@ async def list_executions(
 
 @router.get("/executions/pending")
 async def get_pending_approvals(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
 ):
     """Get pending approvals for current organization."""
-    org_id = getattr(current_user, "organization_id", None)
     query = select(RemediationExecution).where(
         RemediationExecution.approval_status == "pending",
     )
-    if org_id:
-        query = query.where(RemediationExecution.organization_id == org_id)
+    query = query.where(RemediationExecution.organization_id == org_id)
     result = await db.execute(query)
     pending = result.scalars().all()
 
@@ -386,16 +400,16 @@ async def get_pending_approvals(
 
 @router.get("/quick-actions")
 async def list_quick_actions(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
 ):
     """List recent quick actions (block IP, isolate host, etc.)."""
-    org_id = getattr(current_user, "organization_id", None)
     query = select(RemediationExecution).where(
-        RemediationExecution.trigger_source.in_(["manual", "quick_action"])
+        # Quick actions are written with trigger_source="manual_quick_action".
+        RemediationExecution.trigger_source.in_(["manual", "quick_action", "manual_quick_action"])
     ).order_by(desc(RemediationExecution.created_at)).limit(20)
-    if org_id:
-        query = query.where(RemediationExecution.organization_id == org_id)
+    query = query.where(RemediationExecution.organization_id == org_id)
     result = await db.execute(query)
     return list(result.scalars().all())
 
@@ -403,12 +417,13 @@ async def list_quick_actions(
 @router.get("/executions/{execution_id}", response_model=RemediationExecutionResponse)
 async def get_execution(
     execution_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user = Depends(get_current_active_user),
+    current_user: CurrentUser = None,
 ):
     """Get execution detail with action results."""
     execution = await db.get(RemediationExecution, execution_id)
-    if not execution or execution.organization_id != getattr(current_user, "organization_id", None):
+    if not execution or execution.organization_id != org_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     return execution
 
@@ -416,12 +431,13 @@ async def get_execution(
 @router.get("/executions/{execution_id}/progress", response_model=ExecutionProgressResponse)
 async def get_execution_progress(
     execution_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user = Depends(get_current_active_user),
+    current_user: CurrentUser = None,
 ):
     """Get real-time execution progress."""
     execution = await db.get(RemediationExecution, execution_id)
-    if not execution or execution.organization_id != getattr(current_user, "organization_id", None):
+    if not execution or execution.organization_id != org_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
     percent = 0.0
@@ -444,16 +460,29 @@ async def get_execution_progress(
     )
 
 
-@router.post("/executions/{execution_id}/approve", response_model=ApprovalResponse)
+def _require_separate_approver(execution: RemediationExecution, current_user: CurrentUser) -> None:
+    """Separation of duties: whoever started an execution cannot approve or reject it."""
+    if execution.created_by and str(execution.created_by) == str(current_user.id):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={
+                "error": "separation_of_duties",
+                "detail": "the user who initiated this execution cannot approve or reject it",
+            },
+        )
+
+
+@router.post("/executions/{execution_id}/approve", response_model=ApprovalResponse, dependencies=_ADMIN_WRITE)
 async def approve_execution(
     execution_id: str,
-    request: ApprovalRequest,
+    _request: ApprovalRequest,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user = Depends(get_current_active_user),
+    current_user: CurrentUser = None,
 ):
     """Approve a pending remediation execution."""
     execution = await db.get(RemediationExecution, execution_id)
-    if not execution or execution.organization_id != getattr(current_user, "organization_id", None):
+    if not execution or execution.organization_id != org_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
     if execution.approval_status != "pending":
@@ -461,9 +490,12 @@ async def approve_execution(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Execution not in pending approval state"
         )
+    _require_separate_approver(execution, current_user)
 
+    # The approver is the authenticated caller, never a client-supplied id
+    # (the page used to send approver_id: "" against an FK to users.id).
     engine = RemediationEngine(db)
-    await engine.approve_execution(execution_id, request.approver_id)
+    await engine.approve_execution(execution_id, str(current_user.id))
 
     return ApprovalResponse(
         execution_id=execution_id,
@@ -472,16 +504,17 @@ async def approve_execution(
     )
 
 
-@router.post("/executions/{execution_id}/reject")
+@router.post("/executions/{execution_id}/reject", dependencies=_ADMIN_WRITE)
 async def reject_execution(
     execution_id: str,
     request: RejectionRequest,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user = Depends(get_current_active_user),
+    current_user: CurrentUser = None,
 ):
     """Reject a pending remediation execution."""
     execution = await db.get(RemediationExecution, execution_id)
-    if not execution or execution.organization_id != getattr(current_user, "organization_id", None):
+    if not execution or execution.organization_id != org_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
     if execution.approval_status != "pending":
@@ -489,9 +522,10 @@ async def reject_execution(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Execution not in pending approval state"
         )
+    _require_separate_approver(execution, current_user)
 
     engine = RemediationEngine(db)
-    await engine.reject_execution(execution_id, request.approver_id, request.reason)
+    await engine.reject_execution(execution_id, str(current_user.id), request.reason)
 
     return {
         "execution_id": execution_id,
@@ -533,17 +567,18 @@ class _MarkFailedBody(PydanticBaseModel):
     reason: str
 
 
-@router.post("/executions/{execution_id}/mark-complete")
+@router.post("/executions/{execution_id}/mark-complete", dependencies=_ANALYST_WRITE)
 async def mark_execution_complete(
     execution_id: str,
+    org_id: OrganizationId,
     body: _MarkCompleteBody = Body(...),
     db: DatabaseSession = None,
-    current_user = Depends(get_current_active_user),
+    current_user: CurrentUser = None,
 ):
     """Operator confirms an awaiting_manual / awaiting_integration
     execution actually got done out of band. Transitions to completed."""
     execution = await db.get(RemediationExecution, execution_id)
-    if not execution or execution.organization_id != getattr(current_user, "organization_id", None):
+    if not execution or execution.organization_id != org_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
     if execution.status in _MANUAL_LIFECYCLE_FORBIDDEN:
@@ -620,17 +655,18 @@ async def mark_execution_complete(
     }
 
 
-@router.post("/executions/{execution_id}/mark-failed")
+@router.post("/executions/{execution_id}/mark-failed", dependencies=_ANALYST_WRITE)
 async def mark_execution_failed(
     execution_id: str,
+    org_id: OrganizationId,
     body: _MarkFailedBody = Body(...),
     db: DatabaseSession = None,
-    current_user = Depends(get_current_active_user),
+    current_user: CurrentUser = None,
 ):
     """Operator confirms an awaiting_manual / awaiting_integration
     execution won't happen. Transitions to failed with reason."""
     execution = await db.get(RemediationExecution, execution_id)
-    if not execution or execution.organization_id != getattr(current_user, "organization_id", None):
+    if not execution or execution.organization_id != org_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
     if not body.reason or not body.reason.strip():
@@ -708,15 +744,16 @@ async def mark_execution_failed(
     }
 
 
-@router.post("/executions/{execution_id}/rollback")
+@router.post("/executions/{execution_id}/rollback", dependencies=_ADMIN_WRITE)
 async def rollback_execution(
     execution_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user = Depends(get_current_active_user),
+    current_user: CurrentUser = None,
 ):
     """Rollback a completed execution."""
     execution = await db.get(RemediationExecution, execution_id)
-    if not execution or execution.organization_id != getattr(current_user, "organization_id", None):
+    if not execution or execution.organization_id != org_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
     engine = RemediationEngine(db)
@@ -729,15 +766,16 @@ async def rollback_execution(
     }
 
 
-@router.post("/executions/{execution_id}/cancel")
+@router.post("/executions/{execution_id}/cancel", dependencies=_ANALYST_WRITE)
 async def cancel_execution(
     execution_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user = Depends(get_current_active_user),
+    current_user: CurrentUser = None,
 ):
     """Cancel a running execution."""
     execution = await db.get(RemediationExecution, execution_id)
-    if not execution or execution.organization_id != getattr(current_user, "organization_id", None):
+    if not execution or execution.organization_id != org_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
     execution.status = "cancelled"
@@ -751,31 +789,26 @@ async def cancel_execution(
 # Manual Remediation
 # ============================================================================
 
-@router.post("/execute")
+@router.post("/execute", dependencies=_ADMIN_WRITE)
 async def execute_manual_remediation(
     request: ManualRemediationRequest,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user = Depends(get_current_active_user),
+    current_user: CurrentUser = None,
 ):
-    """Trigger manual remediation."""
-    engine = RemediationEngine(db)
+    """Trigger manual remediation without a policy: not implemented.
 
-    execution = await engine.execute_remediation(
-        policy_id=None,  # Manual execution
-        trigger_data={
-            "target_entity": request.target_entity,
-            "target_type": request.target_type,
-            "action_type": request.action_type,
+    The engine only runs policy-backed executions (``policy_id=None`` used to
+    raise a ValueError and 500). Use the quick actions or a policy instead.
+    """
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail={
+            "error": "not_implemented",
+            "detail": "policy-less manual remediation is not supported; use a quick action "
+            "(/remediation/block-ip, /isolate-host, /disable-account, /quarantine-file) or a policy",
         },
-        trigger_source="manual",
-        initiated_by=current_user.id,
-        organization_id=getattr(current_user, "organization_id", None),
     )
-
-    return {
-        "execution_id": execution.id,
-        "status": execution.status,
-    }
 
 
 # ============================================================================
@@ -825,7 +858,7 @@ _IDENTITY_CONNECTORS = (
 async def _find_active_integration(
     db,
     connector_ids: tuple,
-    org_id: Optional[str],
+    org_id: str,
 ):
     """Look up the first active ``InstalledIntegration`` whose
     ``connector_id`` matches any of ``connector_ids`` (case-insensitive)
@@ -837,8 +870,7 @@ async def _find_active_integration(
     q = select(InstalledIntegration).where(
         InstalledIntegration.status == IntegrationStatus.ACTIVE.value
     )
-    if org_id:
-        q = q.where(InstalledIntegration.organization_id == org_id)
+    q = q.where(InstalledIntegration.organization_id == org_id)
 
     rows = list((await db.execute(q)).scalars().all())
     for row in rows:
@@ -950,18 +982,21 @@ async def _dispatch_via_integration(
     return False, f"{connector}: dispatch failed (HTTP {resp.status_code})", body
 
 
-async def _find_ir_agent(db, hostname: Optional[str], org_id: Optional[str]):
-    """Find an active IR-capable agent for ``hostname`` (or any IR agent
-    in the org if no hostname is provided). Returns None if nothing
-    matches so callers can fall back to a manual execution path."""
+async def _find_ir_agent(db, hostname: Optional[str], org_id: str):
+    """Find the caller's active IR-capable agent on ``hostname``.
+
+    Returns None when no hostname is given (never an arbitrary agent in the
+    org) or nothing matches, so callers fall back to a manual path."""
     from src.agents.models import EndpointAgent
     from src.agents.capabilities import AgentCapability
 
-    q = select(EndpointAgent).where(EndpointAgent.status == "active")
-    if hostname:
-        q = q.where(EndpointAgent.hostname == hostname)
-    if org_id:
-        q = q.where(EndpointAgent.organization_id == org_id)
+    if not (hostname or "").strip():
+        return None
+    q = select(EndpointAgent).where(
+        EndpointAgent.status == "active",
+        EndpointAgent.hostname == hostname,
+        EndpointAgent.organization_id == org_id,
+    )
 
     rows = list((await db.execute(q)).scalars().all())
     for a in rows:
@@ -974,6 +1009,7 @@ async def _write_execution(
     *,
     db,
     current_user,
+    org_id: str,
     target_entity: str,
     target_type: str,
     action_type: str,
@@ -993,7 +1029,7 @@ async def _write_execution(
         actions_completed=[],
         started_at=utc_now() if status_value == "running" else None,
         created_by=str(current_user.id) if current_user else None,
-        organization_id=getattr(current_user, "organization_id", None) or "",
+        organization_id=org_id,
         metrics={"agent_command_id": agent_command_id} if agent_command_id else {},
     )
     db.add(execution)
@@ -1002,11 +1038,12 @@ async def _write_execution(
     return execution
 
 
-@router.post("/block-ip")
+@router.post("/block-ip", dependencies=_ADMIN_WRITE)
 async def quick_block_ip(
     request: QuickBlockIPRequest,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user = Depends(get_current_active_user),
+    current_user: CurrentUser = None,
 ):
     """Quick action: block an attacker IP.
 
@@ -1018,7 +1055,6 @@ async def quick_block_ip(
       * If no firewall is installed, mark ``awaiting_integration`` so
         the UI can tell the operator this was staged, not dispatched.
     """
-    org_id = getattr(current_user, "organization_id", None)
     logger.info("Quick block IP", extra={"ip": request.ip, "duration_hours": request.duration_hours})
 
     # Write ThreatIndicator IOC — that's what a firewall block really is
@@ -1032,7 +1068,7 @@ async def quick_block_ip(
             source="remediation_quick_action",
             tags=["auto_block", f"ttl_hours_{request.duration_hours}"],
             is_active=True,
-            organization_id=org_id or "",
+            organization_id=org_id,
         )
         db.add(ioc)
         await db.flush()
@@ -1080,6 +1116,7 @@ async def quick_block_ip(
     execution = await _write_execution(
         db=db,
         current_user=current_user,
+        org_id=org_id,
         target_entity=request.ip,
         target_type="ip",
         action_type="firewall_block",
@@ -1136,11 +1173,12 @@ async def quick_block_ip(
     }
 
 
-@router.post("/isolate-host")
+@router.post("/isolate-host", dependencies=_ADMIN_WRITE)
 async def quick_isolate_host(
     request: QuickIsolateHostRequest,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user = Depends(get_current_active_user),
+    current_user: CurrentUser = None,
 ):
     """Quick action: isolate a host.
 
@@ -1152,7 +1190,6 @@ async def quick_isolate_host(
     from src.agents.capabilities import AgentAction
     from src.agents.service import AgentService
 
-    org_id = getattr(current_user, "organization_id", None)
     logger.info("Quick isolate host", extra={"hostname": request.hostname})
 
     integration = await _find_active_integration(db, _EDR_CONNECTORS, org_id)
@@ -1218,6 +1255,7 @@ async def quick_isolate_host(
     execution = await _write_execution(
         db=db,
         current_user=current_user,
+        org_id=org_id,
         target_entity=request.hostname,
         target_type="host",
         action_type="host_isolate",
@@ -1259,11 +1297,12 @@ async def quick_isolate_host(
     }
 
 
-@router.post("/disable-account")
+@router.post("/disable-account", dependencies=_ADMIN_WRITE)
 async def quick_disable_account(
     request: QuickDisableAccountRequest,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user = Depends(get_current_active_user),
+    current_user: CurrentUser = None,
 ):
     """Quick action: disable a user account.
 
@@ -1276,7 +1315,6 @@ async def quick_disable_account(
     from src.agents.capabilities import AgentAction
     from src.agents.service import AgentService
 
-    org_id = getattr(current_user, "organization_id", None)
     logger.info("Quick disable account", extra={"username": request.username})
 
     integration = await _find_active_integration(db, _IDENTITY_CONNECTORS, org_id)
@@ -1344,6 +1382,7 @@ async def quick_disable_account(
     execution = await _write_execution(
         db=db,
         current_user=current_user,
+        org_id=org_id,
         target_entity=request.username,
         target_type="user",
         action_type="account_disable",
@@ -1385,11 +1424,12 @@ async def quick_disable_account(
     }
 
 
-@router.post("/quarantine-file")
+@router.post("/quarantine-file", dependencies=_ADMIN_WRITE)
 async def quick_quarantine_file(
     request: QuickQuarantineFileRequest,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user = Depends(get_current_active_user),
+    current_user: CurrentUser = None,
 ):
     """Quick action: quarantine a file on a specific host.
 
@@ -1399,7 +1439,14 @@ async def quick_quarantine_file(
     from src.agents.capabilities import AgentAction
     from src.agents.service import AgentService
 
-    org_id = getattr(current_user, "organization_id", None)
+    if not (request.hostname or "").strip() or not (request.file_path or "").strip():
+        # Without a hostname _find_ir_agent skips its host filter and would
+        # route the quarantine to an arbitrary agent in the org.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="hostname and file_path are required",
+        )
+
     logger.info("Quick quarantine file", extra={
         "file_path": request.file_path,
         "hostname": request.hostname,
@@ -1426,6 +1473,7 @@ async def quick_quarantine_file(
     execution = await _write_execution(
         db=db,
         current_user=current_user,
+        org_id=org_id,
         target_entity=request.file_path,
         target_type="file",
         action_type="file_quarantine",
@@ -1455,15 +1503,16 @@ async def quick_quarantine_file(
 
 @router.get("/playbooks", response_model=List[RemediationPlaybookResponse])
 async def list_playbooks(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     playbook_type: Optional[str] = Query(None),
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, ge=1, le=500),
-    current_user = Depends(get_current_active_user),
+    current_user: CurrentUser = None,
 ):
     """List remediation playbooks."""
     query = select(RemediationPlaybook).where(
-        RemediationPlaybook.organization_id == getattr(current_user, "organization_id", None)
+        RemediationPlaybook.organization_id == org_id
     )
 
     if playbook_type:
@@ -1474,11 +1523,12 @@ async def list_playbooks(
     return result.scalars().all()
 
 
-@router.post("/playbooks", response_model=RemediationPlaybookResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/playbooks", response_model=RemediationPlaybookResponse, status_code=status.HTTP_201_CREATED, dependencies=_ADMIN_WRITE)
 async def create_playbook(
     request: RemediationPlaybookCreate,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user = Depends(get_current_active_user),
+    current_user: CurrentUser = None,
 ):
     """Create a remediation playbook."""
     playbook = RemediationPlaybook(
@@ -1493,8 +1543,8 @@ async def create_playbook(
         is_template=request.is_template,
         is_enabled=request.is_enabled,
         tags=request.tags,
-        created_by=request.created_by,
-        organization_id=getattr(current_user, "organization_id", None),
+        created_by=str(current_user.id),
+        organization_id=org_id,
     )
     db.add(playbook)
     await db.commit()
@@ -1505,26 +1555,28 @@ async def create_playbook(
 @router.get("/playbooks/{playbook_id}", response_model=RemediationPlaybookResponse)
 async def get_playbook(
     playbook_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user = Depends(get_current_active_user),
+    current_user: CurrentUser = None,
 ):
     """Get a specific playbook."""
     playbook = await db.get(RemediationPlaybook, playbook_id)
-    if not playbook or playbook.organization_id != getattr(current_user, "organization_id", None):
+    if not playbook or playbook.organization_id != org_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     return playbook
 
 
-@router.put("/playbooks/{playbook_id}", response_model=RemediationPlaybookResponse)
+@router.put("/playbooks/{playbook_id}", response_model=RemediationPlaybookResponse, dependencies=_ADMIN_WRITE)
 async def update_playbook(
     playbook_id: str,
     request: RemediationPlaybookCreate,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user = Depends(get_current_active_user),
+    current_user: CurrentUser = None,
 ):
     """Update a playbook."""
     playbook = await db.get(RemediationPlaybook, playbook_id)
-    if not playbook or playbook.organization_id != getattr(current_user, "organization_id", None):
+    if not playbook or playbook.organization_id != org_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
     playbook.name = request.name
@@ -1538,12 +1590,13 @@ async def update_playbook(
     return playbook
 
 
-@router.post("/playbooks/{playbook_id}/execute")
+@router.post("/playbooks/{playbook_id}/execute", dependencies=_ADMIN_WRITE)
 async def execute_playbook(
     playbook_id: str,
     trigger_data: dict,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user = Depends(get_current_active_user),
+    current_user: CurrentUser = None,
 ):
     """Execute a playbook against a real target and persist the run.
 
@@ -1555,7 +1608,7 @@ async def execute_playbook(
     ``actions_completed`` / ``actions_failed`` on the row.
     """
     playbook = await db.get(RemediationPlaybook, playbook_id)
-    if not playbook or playbook.organization_id != getattr(current_user, "organization_id", None):
+    if not playbook or playbook.organization_id != org_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
     if not playbook.is_enabled:
         raise HTTPException(
@@ -1586,7 +1639,7 @@ async def execute_playbook(
         current_action_index=0,
         metrics={},
         created_by=str(current_user.id),
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
     )
     db.add(execution)
     await db.flush()
@@ -1618,13 +1671,14 @@ async def execute_playbook(
             select(RemediationIntegration).where(
                 RemediationIntegration.integration_type == int_type,
                 RemediationIntegration.is_enabled == True,
-                RemediationIntegration.organization_id == getattr(current_user, "organization_id", None),
+                RemediationIntegration.organization_id == org_id,
             ).limit(1)
         )
         return res.scalars().first()
 
     actions_completed: list[dict] = []
     actions_failed: list[dict] = []
+    actions_awaiting: list[dict] = []
     for idx, step in enumerate(playbook.steps or []):
         if not isinstance(step, dict):
             actions_failed.append({"index": idx, "error": "malformed step", "step": step})
@@ -1634,7 +1688,7 @@ async def execute_playbook(
         try:
             integration = await _pick_integration(step_type)
             if integration is None:
-                actions_completed.append({
+                actions_awaiting.append({
                     "index": idx,
                     "action": step_type,
                     "status": "awaiting_integration",
@@ -1664,12 +1718,29 @@ async def execute_playbook(
         execution.current_action_index = idx + 1
 
     execution.actions_completed = actions_completed
+    metrics: dict = {}
     if actions_failed:
-        execution.metrics = {"actions_failed": actions_failed}
+        metrics["actions_failed"] = actions_failed
+    if actions_awaiting:
+        metrics["actions_awaiting_integration"] = actions_awaiting
+    execution.metrics = metrics
     execution.completed_at = utc_now()
     if actions_failed and actions_completed:
         execution.status = "completed"
         execution.overall_result = "partial_success"
+    elif actions_awaiting and actions_completed and not actions_failed:
+        # Some steps ran, the rest have nothing to dispatch through.
+        execution.status = "completed"
+        execution.overall_result = "partial_success"
+    elif actions_awaiting and not actions_failed:
+        # Nothing ran: every step lacks an enabled integration. Never "success".
+        execution.status = "awaiting_integration"
+        execution.overall_result = "pending"
+        execution.completed_at = None
+    elif not actions_completed and not actions_failed:
+        execution.status = "failed"
+        execution.overall_result = "failure"
+        execution.error_message = "playbook has no executable steps"
     elif actions_failed:
         execution.status = "failed"
         execution.overall_result = "failure"
@@ -1700,6 +1771,8 @@ async def execute_playbook(
         "overall_result": execution.overall_result,
         "actions_completed": len(actions_completed),
         "actions_failed": len(actions_failed),
+        "actions_awaiting_integration": len(actions_awaiting),
+        "error": "awaiting_integration" if execution.status == "awaiting_integration" else None,
         "started_at": execution.started_at.isoformat() if execution.started_at else None,
         "completed_at": execution.completed_at.isoformat() if execution.completed_at else None,
     }
@@ -1711,15 +1784,14 @@ async def execute_playbook(
 
 @router.get("/integrations", response_model=List[RemediationIntegrationResponse])
 async def list_integrations(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     integration_type: Optional[str] = Query(None),
     current_user: CurrentUser = None,
 ):
     """List remediation integrations."""
-    org_id = getattr(current_user, "organization_id", None)
     query = select(RemediationIntegration)
-    if org_id:
-        query = query.where(RemediationIntegration.organization_id == org_id)
+    query = query.where(RemediationIntegration.organization_id == org_id)
 
     if integration_type:
         query = query.where(RemediationIntegration.integration_type == integration_type)
@@ -1728,11 +1800,12 @@ async def list_integrations(
     return result.scalars().all()
 
 
-@router.post("/integrations", response_model=RemediationIntegrationResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/integrations", response_model=RemediationIntegrationResponse, status_code=status.HTTP_201_CREATED, dependencies=_ADMIN_WRITE)
 async def create_integration(
     request: RemediationIntegrationCreate,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user = Depends(get_current_active_user),
+    current_user: CurrentUser = None,
 ):
     """Add a remediation integration."""
     integration = RemediationIntegration(
@@ -1745,7 +1818,7 @@ async def create_integration(
         capabilities=request.capabilities,
         rate_limit=request.rate_limit,
         tags=request.tags,
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
     )
     db.add(integration)
     await db.commit()
@@ -1753,16 +1826,17 @@ async def create_integration(
     return integration
 
 
-@router.put("/integrations/{integration_id}", response_model=RemediationIntegrationResponse)
+@router.put("/integrations/{integration_id}", response_model=RemediationIntegrationResponse, dependencies=_ADMIN_WRITE)
 async def update_integration(
     integration_id: str,
     request: RemediationIntegrationCreate,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user = Depends(get_current_active_user),
+    current_user: CurrentUser = None,
 ):
     """Update an integration."""
     integration = await db.get(RemediationIntegration, integration_id)
-    if not integration or integration.organization_id != getattr(current_user, "organization_id", None):
+    if not integration or integration.organization_id != org_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
     for key, value in request.model_dump(exclude_unset=True).items():
@@ -1774,34 +1848,40 @@ async def update_integration(
     return integration
 
 
-@router.post("/integrations/{integration_id}/test", response_model=IntegrationTestResult)
+@router.post("/integrations/{integration_id}/test", response_model=IntegrationTestResult, dependencies=_ANALYST_WRITE)
 async def test_integration(
     integration_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user = Depends(get_current_active_user),
+    current_user: CurrentUser = None,
 ):
-    """Test integration connectivity."""
+    """Test integration connectivity: not implemented.
+
+    It used to report success without making any network call.
+    """
     integration = await db.get(RemediationIntegration, integration_id)
-    if not integration or integration.organization_id != getattr(current_user, "organization_id", None):
+    if not integration or integration.organization_id != org_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
-    return IntegrationTestResult(
-        integration_id=integration_id,
-        success=True,
-        message="Integration test successful",
-        tested_at=utc_now(),
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail={
+            "error": "not_implemented",
+            "detail": "remediation integration connectivity tests are not implemented; no call was made",
+        },
     )
 
 
 @router.get("/integrations/{integration_id}/health")
 async def get_integration_health(
     integration_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user = Depends(get_current_active_user),
+    current_user: CurrentUser = None,
 ):
     """Check integration health status."""
     integration = await db.get(RemediationIntegration, integration_id)
-    if not integration or integration.organization_id != getattr(current_user, "organization_id", None):
+    if not integration or integration.organization_id != org_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
     return {
@@ -1818,19 +1898,18 @@ async def get_integration_health(
 
 @router.get("/dashboard", response_model=RemediationDashboardStats)
 async def get_dashboard_stats(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     days: int = Query(default=7, ge=1, le=90),
     current_user: CurrentUser = None,
 ):
     """Get remediation dashboard statistics."""
-    org_id = getattr(current_user, "organization_id", None)
     cutoff = utc_now() - timedelta(days=days)
 
     query = select(RemediationExecution).where(
         RemediationExecution.created_at >= cutoff,
     )
-    if org_id:
-        query = query.where(RemediationExecution.organization_id == org_id)
+    query = query.where(RemediationExecution.organization_id == org_id)
     result = await db.execute(query)
     executions = result.scalars().all()
 
@@ -1899,10 +1978,9 @@ async def get_dashboard_stats(
         name_stmt = select(RemediationPolicy).where(
             RemediationPolicy.id.in_(top_policy_ids)
         )
-        if org_id:
-            name_stmt = name_stmt.where(
-                RemediationPolicy.organization_id == org_id
-            )
+        name_stmt = name_stmt.where(
+            RemediationPolicy.organization_id == org_id
+        )
         name_map = {
             p.id: p.name
             for p in (await db.execute(name_stmt)).scalars().all()
@@ -1949,7 +2027,7 @@ async def get_dashboard_stats(
     return RemediationDashboardStats(
         period_start=cutoff,
         period_end=utc_now(),
-        organization_id=org_id or "",
+        organization_id=org_id,
         total_executions=total,
         successful_executions=successful,
         failed_executions=failed,
@@ -1966,45 +2044,74 @@ async def get_dashboard_stats(
 
 @router.get("/timeline", response_model=RemediationTimelineResponse)
 async def get_remediation_timeline(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     days: int = Query(default=7, ge=1, le=90),
     current_user: CurrentUser = None,
 ):
     """Get recent remediation timeline."""
-    org_id = getattr(current_user, "organization_id", None)
     cutoff = utc_now() - timedelta(days=days)
 
     query = select(RemediationExecution).where(
         RemediationExecution.created_at >= cutoff,
     ).order_by(desc(RemediationExecution.completed_at))
-    if org_id:
-        query = query.where(RemediationExecution.organization_id == org_id)
+    query = query.where(RemediationExecution.organization_id == org_id)
 
     result = await db.execute(query)
     executions = result.scalars().all()
 
+    from src.schemas.remediation import TimelineEvent
+
+    policy_ids = {e.policy_id for e in executions if e.policy_id}
+    policy_names: dict[str, str] = {}
+    if policy_ids:
+        rows = await db.execute(
+            select(RemediationPolicy.id, RemediationPolicy.name).where(
+                RemediationPolicy.id.in_(policy_ids),
+                RemediationPolicy.organization_id == org_id,
+            )
+        )
+        policy_names = {pid: name for pid, name in rows.all()}
+
+    # Only finished executions have a completion time to place on the timeline.
+    events = [
+        TimelineEvent(
+            execution_id=e.id,
+            policy_name=policy_names.get(e.policy_id) if e.policy_id else None,
+            target=e.target_entity or "",
+            action_count=len(e.actions_planned or []),
+            status=e.status or "",
+            overall_result=e.overall_result,
+            completed_at=e.completed_at,
+        )
+        for e in executions
+        if e.completed_at is not None
+    ]
+
     return RemediationTimelineResponse(
-        organization_id=org_id or "",
+        organization_id=org_id,
         period=f"last_{days}_days",
-        events=[],
+        events=events,
         total_count=len(executions),
     )
 
 
 @router.get("/effectiveness", response_model=EffectivenessMetrics)
 async def get_effectiveness_metrics(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     days: int = Query(default=7, ge=1, le=90),
-    current_user = Depends(get_current_active_user),
+    current_user: CurrentUser = None,
 ):
-    """Get remediation effectiveness metrics."""
-    return EffectivenessMetrics(
-        organization_id=getattr(current_user, "organization_id", None),
-        period=f"last_{days}_days",
-        executions_verified=0,
-        effective_count=0,
-        ineffective_count=0,
-        effectiveness_rate=0.0,
-        rollbacks_recommended=0,
-        rollbacks_executed=0,
+    """Remediation effectiveness: not implemented.
+
+    It used to return hardcoded zeros. No verification of remediation
+    outcomes is recorded yet, so there is nothing honest to report.
+    """
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail={
+            "error": "not_implemented",
+            "detail": "remediation effectiveness verification is not recorded yet",
+        },
     )

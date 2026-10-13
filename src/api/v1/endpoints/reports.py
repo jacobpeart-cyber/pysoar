@@ -3,10 +3,11 @@
 from datetime import datetime, timezone
 from enum import Enum
 
-from fastapi import APIRouter, Query, Response
+from fastapi import APIRouter, Query, Request, Response
 
-from src.api.deps import CurrentUser, DatabaseSession
+from src.api.deps import CurrentUser, DatabaseSession, OrganizationId
 from src.core.logging import get_logger
+from src.models.audit import AuditLog
 from src.services.report_generator import ReportGenerator
 
 logger = get_logger(__name__)
@@ -28,16 +29,30 @@ class ExportFormat(str, Enum):
 @router.get("/reports/{report_type}/export")
 async def export_report(
     report_type: ReportType,
+    org_id: OrganizationId,
     format: ExportFormat = Query(...),
     days: int = Query(30, ge=1, le=365),
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
+    request: Request = None,
 ):
-    """Download a report as a real CSV or PDF file."""
-    org_id = getattr(current_user, "organization_id", None)
+    """Download one of the caller's tenant reports as a real CSV or PDF file (audited)."""
     gen = ReportGenerator(db)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
     filename = f"pysoar-{report_type.value}-{stamp}"
+    # Exports carry tenant data out of the platform: record who took what.
+    db.add(AuditLog(
+        user_id=str(current_user.id),
+        organization_id=org_id,
+        action="report_export",
+        resource_type="report",
+        resource_id=report_type.value,
+        description=f"Exported {report_type.value} report as {format.value} (last {days} days)",
+        ip_address=(request.client.host if request and request.client else None),
+        user_agent=(request.headers.get("user-agent") if request else None),
+        success=True,
+    ))
+    await db.flush()
 
     if format is ExportFormat.CSV:
         if report_type is ReportType.ALERTS:

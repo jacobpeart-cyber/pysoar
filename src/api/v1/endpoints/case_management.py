@@ -6,15 +6,17 @@ import os
 import shutil
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Annotated, Optional
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
 from pydantic import BaseModel, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from src.api.deps import CurrentUser, DatabaseSession
+from src.api.deps import DatabaseSession, OrganizationId, require_role
+from src.core.logging import get_logger
+from src.core.utils import safe_json_loads
 from src.models.case import (
     AttachmentType,
     CaseAttachment,
@@ -25,10 +27,15 @@ from src.models.case import (
     TimelineEventType,
 )
 from src.models.incident import Incident
-from src.models.user import User
-from src.core.utils import safe_json_loads
+from src.models.user import User, UserRole
+
+logger = get_logger(__name__)
 
 router = APIRouter()
+
+#: Case writes (notes, tasks, attachments, timeline entries) are operational
+#: work: analyst or admin. Viewers read only.
+CaseWriter = Annotated[User, Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
 
 # Configure upload directory
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads/attachments")
@@ -176,12 +183,17 @@ class TimelineCreate(BaseModel):
 
 
 async def get_incident_or_404(
-    db: AsyncSession, incident_id: str, org_id: Optional[str] = None
+    db: AsyncSession, incident_id: str, org_id: str,
 ) -> Incident:
-    """Get incident by ID or raise 404"""
-    stmt = select(Incident).where(Incident.id == incident_id)
-    if org_id is not None:
-        stmt = stmt.where(Incident.organization_id == org_id)
+    """The incident inside the caller's organisation, or 404.
+
+    Every case route loads the parent incident through this before touching
+    child rows (notes, tasks, attachments, timeline), so another tenant's
+    incident and everything hanging off it is reported as missing.
+    """
+    stmt = select(Incident).where(
+        Incident.id == incident_id, Incident.organization_id == org_id,
+    )
     result = await db.execute(stmt)
     incident = result.scalar_one_or_none()
     if not incident:
@@ -190,6 +202,37 @@ async def get_incident_or_404(
             detail="Incident not found",
         )
     return incident
+
+
+def _attachment_path(location: Optional[str]) -> str:
+    """Resolve a stored attachment path and refuse anything outside UPLOAD_DIR.
+
+    Raises 404 (not 403) so a tampered row does not reveal anything about the
+    host's filesystem; the refusal is logged for the operator.
+    """
+    root = os.path.realpath(UPLOAD_DIR)
+    real = os.path.realpath(location or "")
+    if not location or (real != root and not real.startswith(root + os.sep)):
+        logger.warning("case_attachment_path_outside_root", location=str(location)[:300])
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Attachment file missing on disk",
+        )
+    return real
+
+
+async def _get_org_user_or_400(db: AsyncSession, user_id: str, org_id: str) -> User:
+    """An assignee must be a user of the same organisation."""
+    result = await db.execute(
+        select(User).where(User.id == user_id, User.organization_id == org_id),
+    )
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Assigned user not found",
+        )
+    return user
 
 
 async def add_timeline_event(
@@ -226,12 +269,12 @@ async def add_timeline_event(
 @router.get("/incidents/{incident_id}/notes", response_model=list[NoteResponse])
 async def list_notes(
     incident_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
     include_internal: bool = Query(default=True),
 ):
     """List all notes for an incident"""
-    await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
+    await get_incident_or_404(db, incident_id, org_id)
 
     query = (
         select(CaseNote)
@@ -272,11 +315,12 @@ async def list_notes(
 async def create_note(
     incident_id: str,
     data: NoteCreate,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    current_user: CaseWriter = None,
 ):
     """Create a new note for an incident"""
-    await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
+    await get_incident_or_404(db, incident_id, org_id)
 
     # Validate note type
     valid_types = [t.value for t in NoteType]
@@ -328,16 +372,17 @@ async def update_note(
     incident_id: str,
     note_id: str,
     data: NoteUpdate,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    current_user: CaseWriter = None,
 ):
     """Update a note"""
-    await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
+    await get_incident_or_404(db, incident_id, org_id)
 
     result = await db.execute(
         select(CaseNote)
         .options(selectinload(CaseNote.author))
-        .where(CaseNote.id == note_id, CaseNote.incident_id == incident_id)
+        .where(CaseNote.id == note_id, CaseNote.incident_id == incident_id),
     )
     note = result.scalar_one_or_none()
 
@@ -387,16 +432,17 @@ async def update_note(
 async def delete_note(
     incident_id: str,
     note_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    current_user: CaseWriter = None,
 ):
     """Delete a note"""
-    await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
+    await get_incident_or_404(db, incident_id, org_id)
 
     result = await db.execute(
         select(CaseNote).where(
-            CaseNote.id == note_id, CaseNote.incident_id == incident_id
-        )
+            CaseNote.id == note_id, CaseNote.incident_id == incident_id,
+        ),
     )
     note = result.scalar_one_or_none()
 
@@ -425,13 +471,13 @@ async def delete_note(
 @router.get("/incidents/{incident_id}/tasks", response_model=list[TaskResponse])
 async def list_tasks(
     incident_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
     status_filter: Optional[str] = Query(None, alias="status"),
     assigned_to: Optional[str] = None,
 ):
     """List all tasks for an incident"""
-    await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
+    await get_incident_or_404(db, incident_id, org_id)
 
     query = (
         select(Task)
@@ -478,24 +524,17 @@ async def list_tasks(
 async def create_task(
     incident_id: str,
     data: TaskCreate,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    current_user: CaseWriter = None,
 ):
     """Create a new task for an incident"""
-    await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
+    await get_incident_or_404(db, incident_id, org_id)
 
     # Validate assignee if provided
     assignee = None
     if data.assigned_to:
-        result = await db.execute(
-            select(User).where(User.id == data.assigned_to)
-        )
-        assignee = result.scalar_one_or_none()
-        if not assignee:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Assigned user not found",
-            )
+        assignee = await _get_org_user_or_400(db, data.assigned_to, org_id)
 
     task = Task(
         title=data.title,
@@ -545,16 +584,17 @@ async def update_task(
     incident_id: str,
     task_id: str,
     data: TaskUpdate,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _current_user: CaseWriter = None,
 ):
     """Update a task"""
-    await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
+    await get_incident_or_404(db, incident_id, org_id)
 
     result = await db.execute(
         select(Task)
         .options(selectinload(Task.assignee), selectinload(Task.creator))
-        .where(Task.id == task_id, Task.incident_id == incident_id)
+        .where(Task.id == task_id, Task.incident_id == incident_id),
     )
     task = result.scalar_one_or_none()
 
@@ -575,7 +615,9 @@ async def update_task(
     if data.due_date is not None:
         task.due_date = data.due_date
     if data.assigned_to is not None:
-        task.assigned_to = data.assigned_to
+        if data.assigned_to:
+            await _get_org_user_or_400(db, data.assigned_to, org_id)
+        task.assigned_to = data.assigned_to or None
     if data.status is not None:
         task.status = data.status
         if data.status == "completed" and old_status != "completed":
@@ -588,7 +630,7 @@ async def update_task(
     result = await db.execute(
         select(Task)
         .options(selectinload(Task.assignee), selectinload(Task.creator))
-        .where(Task.id == task_id)
+        .where(Task.id == task_id),
     )
     task = result.scalar_one()
 
@@ -617,14 +659,15 @@ async def update_task(
 async def delete_task(
     incident_id: str,
     task_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _current_user: CaseWriter = None,
 ):
     """Delete a task"""
-    await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
+    await get_incident_or_404(db, incident_id, org_id)
 
     result = await db.execute(
-        select(Task).where(Task.id == task_id, Task.incident_id == incident_id)
+        select(Task).where(Task.id == task_id, Task.incident_id == incident_id),
     )
     task = result.scalar_one_or_none()
 
@@ -644,21 +687,21 @@ async def delete_task(
 
 
 @router.get(
-    "/incidents/{incident_id}/attachments", response_model=list[AttachmentResponse]
+    "/incidents/{incident_id}/attachments", response_model=list[AttachmentResponse],
 )
 async def list_attachments(
     incident_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
     """List all attachments for an incident"""
-    await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
+    await get_incident_or_404(db, incident_id, org_id)
 
     result = await db.execute(
         select(CaseAttachment)
         .options(selectinload(CaseAttachment.uploader))
         .where(CaseAttachment.incident_id == incident_id)
-        .order_by(CaseAttachment.created_at.desc())
+        .order_by(CaseAttachment.created_at.desc()),
     )
     attachments = result.scalars().all()
 
@@ -690,14 +733,15 @@ async def list_attachments(
 )
 async def upload_attachment(
     incident_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    current_user: CaseWriter = None,
     file: UploadFile = File(...),
     attachment_type: str = Form(default=AttachmentType.OTHER.value),
     description: Optional[str] = Form(default=None),
 ):
     """Upload an attachment for an incident"""
-    await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
+    await get_incident_or_404(db, incident_id, org_id)
 
     # Validate attachment type
     valid_types = [t.value for t in AttachmentType]
@@ -734,7 +778,8 @@ async def upload_attachment(
     file_hash = hashlib.sha256(content).hexdigest()
 
     # Create upload directory if needed
-    incident_dir = os.path.join(UPLOAD_DIR, incident_id)
+    incident_dir = os.path.join(os.path.realpath(UPLOAD_DIR), incident_id)
+    _attachment_path(incident_dir)
     os.makedirs(incident_dir, exist_ok=True)
 
     # Save file
@@ -795,8 +840,8 @@ async def upload_attachment(
 async def download_attachment(
     incident_id: str,
     attachment_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
     """Stream an incident attachment back to the caller as a real file download.
 
@@ -806,13 +851,13 @@ async def download_attachment(
     """
     from fastapi.responses import FileResponse
 
-    await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
+    await get_incident_or_404(db, incident_id, org_id)
 
     result = await db.execute(
         select(CaseAttachment).where(
             CaseAttachment.id == attachment_id,
             CaseAttachment.incident_id == incident_id,
-        )
+        ),
     )
     attachment = result.scalar_one_or_none()
 
@@ -822,14 +867,15 @@ async def download_attachment(
             detail="Attachment not found",
         )
 
-    if not attachment.file_path or not os.path.exists(attachment.file_path):
+    file_path = _attachment_path(attachment.file_path)
+    if not os.path.isfile(file_path):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Attachment file missing on disk",
         )
 
     return FileResponse(
-        path=attachment.file_path,
+        path=file_path,
         media_type=attachment.mime_type or "application/octet-stream",
         filename=attachment.original_filename or "attachment",
     )
@@ -842,17 +888,18 @@ async def download_attachment(
 async def delete_attachment(
     incident_id: str,
     attachment_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    current_user: CaseWriter = None,
 ):
     """Delete an attachment"""
-    await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
+    await get_incident_or_404(db, incident_id, org_id)
 
     result = await db.execute(
         select(CaseAttachment).where(
             CaseAttachment.id == attachment_id,
             CaseAttachment.incident_id == incident_id,
-        )
+        ),
     )
     attachment = result.scalar_one_or_none()
 
@@ -869,9 +916,13 @@ async def delete_attachment(
             detail="Not authorized to delete this attachment",
         )
 
-    # Delete file from disk
-    if os.path.exists(attachment.file_path):
-        os.remove(attachment.file_path)
+    # Delete file from disk, but only ever inside the upload root.
+    try:
+        file_path = _attachment_path(attachment.file_path)
+    except HTTPException:
+        file_path = None
+    if file_path and os.path.isfile(file_path):
+        os.remove(file_path)
 
     await db.delete(attachment)
     await db.commit()
@@ -885,13 +936,13 @@ async def delete_attachment(
 @router.get("/incidents/{incident_id}/timeline", response_model=list[TimelineResponse])
 async def get_timeline(
     incident_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
     event_type: Optional[str] = None,
     limit: int = Query(default=50, ge=1, le=200),
 ):
     """Get timeline events for an incident"""
-    await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
+    await get_incident_or_404(db, incident_id, org_id)
 
     query = (
         select(CaseTimeline)
@@ -933,11 +984,12 @@ async def get_timeline(
 async def create_timeline_event(
     incident_id: str,
     data: TimelineCreate,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    current_user: CaseWriter = None,
 ):
     """Create a custom timeline event"""
-    await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
+    await get_incident_or_404(db, incident_id, org_id)
 
     event = await add_timeline_event(
         db=db,

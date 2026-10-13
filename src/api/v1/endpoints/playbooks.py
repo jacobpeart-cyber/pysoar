@@ -4,12 +4,15 @@ import json
 import math
 from typing import Optional
 
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import AdminUser, CurrentUser, DatabaseSession
+from src.api.deps import AdminUser, CurrentUser, DatabaseSession, OrganizationId, require_role
 from src.core.database import async_session_factory
+from src.models.alert import Alert
+from src.models.incident import Incident
+from src.models.user import UserRole
 from src.core.utils import safe_json_loads
 from src.models.playbook import (
     ExecutionStatus,
@@ -31,13 +34,25 @@ from src.services.websocket_manager import create_notification_callback
 
 router = APIRouter(prefix="/playbooks", tags=["Playbooks"])
 
+#: Operational writes (running a playbook): analysts and admins. Authoring,
+#: editing and deleting playbooks stay admin-only (AdminUser).
+_ANALYST_WRITE = [Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
+
 
 async def run_playbook_execution(execution_id: str):
     """Background task to run playbook execution"""
     async with async_session_factory() as db:
         try:
             engine = PlaybookEngine(db)
-            notify_callback = create_notification_callback("playbooks")
+            # Publish only to the execution's tenant channel (playbooks:<org>).
+            execution_org = (
+                await db.execute(
+                    select(PlaybookExecution.organization_id).where(
+                        PlaybookExecution.id == execution_id,
+                    ),
+                )
+            ).scalar_one_or_none()
+            notify_callback = create_notification_callback("playbooks", execution_org)
             await engine.execute(execution_id, notify_callback)
             await db.commit()
         except Exception as e:
@@ -45,9 +60,11 @@ async def run_playbook_execution(execution_id: str):
             raise e
 
 
-async def get_playbook_or_404(db: AsyncSession, playbook_id: str) -> Playbook:
-    """Get playbook by ID or raise 404"""
-    result = await db.execute(select(Playbook).where(Playbook.id == playbook_id))
+async def get_playbook_or_404(db: AsyncSession, playbook_id: str, org_id: str) -> Playbook:
+    """Get the caller's playbook by ID or raise 404 (always tenant-scoped)"""
+    result = await db.execute(
+        select(Playbook).where(Playbook.id == playbook_id, Playbook.organization_id == org_id)
+    )
     playbook = result.scalar_one_or_none()
     if not playbook:
         raise HTTPException(
@@ -87,6 +104,7 @@ def playbook_to_response(playbook: Playbook) -> PlaybookResponse:
 
 @router.get("", response_model=PlaybookListResponse)
 async def list_playbooks(
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
@@ -96,8 +114,8 @@ async def list_playbooks(
     category: Optional[str] = None,
     trigger_type: Optional[str] = None,
 ):
-    """List playbooks with filtering and pagination"""
-    query = select(Playbook)
+    """List the caller's playbooks with filtering and pagination"""
+    query = select(Playbook).where(Playbook.organization_id == org_id)
 
     # Apply filters
     if search:
@@ -139,9 +157,15 @@ async def list_playbooks(
 
 
 @router.post("", response_model=PlaybookResponse, status_code=status.HTTP_201_CREATED)
-async def create_playbook(playbook_data: PlaybookCreate, current_user: AdminUser = None, db: DatabaseSession = None):
-    """Create a new playbook (admin only)"""
+async def create_playbook(
+    playbook_data: PlaybookCreate,
+    org_id: OrganizationId,
+    current_user: AdminUser = None,
+    db: DatabaseSession = None,
+):
+    """Create a new playbook in the caller's organisation (admin only)"""
     playbook = Playbook(
+        organization_id=org_id,
         name=playbook_data.name,
         description=playbook_data.description,
         trigger_type=playbook_data.trigger_type,
@@ -166,18 +190,25 @@ async def create_playbook(playbook_data: PlaybookCreate, current_user: AdminUser
 @router.get("/{playbook_id}", response_model=PlaybookResponse)
 async def get_playbook(
     playbook_id: str,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Get a playbook by ID"""
-    playbook = await get_playbook_or_404(db, playbook_id)
+    playbook = await get_playbook_or_404(db, playbook_id, org_id)
     return playbook_to_response(playbook)
 
 
 @router.patch("/{playbook_id}", response_model=PlaybookResponse)
-async def update_playbook(playbook_id: str, playbook_data: PlaybookUpdate, current_user: AdminUser = None, db: DatabaseSession = None):
+async def update_playbook(
+    playbook_id: str,
+    playbook_data: PlaybookUpdate,
+    org_id: OrganizationId,
+    current_user: AdminUser = None,
+    db: DatabaseSession = None,
+):
     """Update a playbook (admin only)"""
-    playbook = await get_playbook_or_404(db, playbook_id)
+    playbook = await get_playbook_or_404(db, playbook_id, org_id)
 
     update_data = playbook_data.model_dump(exclude_unset=True, exclude_none=True)
 
@@ -205,17 +236,48 @@ async def update_playbook(playbook_id: str, playbook_data: PlaybookUpdate, curre
 
 
 @router.delete("/{playbook_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_playbook(playbook_id: str, current_user: AdminUser = None, db: DatabaseSession = None):
+async def delete_playbook(
+    playbook_id: str,
+    org_id: OrganizationId,
+    current_user: AdminUser = None,
+    db: DatabaseSession = None,
+):
     """Delete a playbook (admin only)"""
-    playbook = await get_playbook_or_404(db, playbook_id)
+    playbook = await get_playbook_or_404(db, playbook_id, org_id)
     await db.delete(playbook)
     await db.flush()
 
 
-@router.post("/{playbook_id}/execute", response_model=PlaybookExecutionResponse)
-async def execute_playbook(playbook_id: str, execute_data: PlaybookExecuteRequest, current_user: CurrentUser = None, db: DatabaseSession = None, background_tasks: BackgroundTasks = None):
-    """Execute a playbook"""
-    playbook = await get_playbook_or_404(db, playbook_id)
+@router.post(
+    "/{playbook_id}/execute", response_model=PlaybookExecutionResponse, dependencies=_ANALYST_WRITE
+)
+async def execute_playbook(
+    playbook_id: str,
+    execute_data: PlaybookExecuteRequest,
+    org_id: OrganizationId,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+    background_tasks: BackgroundTasks = None,
+):
+    """Execute a playbook against the caller's own alert/incident"""
+    playbook = await get_playbook_or_404(db, playbook_id, org_id)
+
+    # The engine mutates the target alert/incident, so both must belong to
+    # the caller's organisation (404 otherwise, never another tenant's row).
+    if execute_data.alert_id:
+        found = await db.execute(
+            select(Alert.id).where(Alert.id == execute_data.alert_id, Alert.organization_id == org_id)
+        )
+        if found.scalar_one_or_none() is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Alert not found")
+    if execute_data.incident_id:
+        found = await db.execute(
+            select(Incident.id).where(
+                Incident.id == execute_data.incident_id, Incident.organization_id == org_id
+            )
+        )
+        if found.scalar_one_or_none() is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Incident not found")
 
     if not playbook.is_enabled:
         raise HTTPException(
@@ -247,6 +309,7 @@ async def execute_playbook(playbook_id: str, execute_data: PlaybookExecuteReques
         input_data["target_id"] = input_data.get("target_id") or execute_data.incident_id
 
     execution = PlaybookExecution(
+        organization_id=org_id,
         playbook_id=playbook.id,
         incident_id=execute_data.incident_id,
         status=ExecutionStatus.PENDING.value,
@@ -288,31 +351,24 @@ async def execute_playbook(playbook_id: str, execute_data: PlaybookExecuteReques
 @router.get("/{playbook_id}/executions", response_model=PlaybookExecutionListResponse)
 async def list_playbook_executions(
     playbook_id: str,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     execution_status: Optional[str] = Query(None, alias="status"),
 ):
-    """List executions for a playbook.
+    """List the caller's executions of one of the caller's playbooks.
 
-    Playbook and PlaybookExecution models have no organization_id column
-    (SOAR playbooks are system-level admin resources). To prevent cross-tenant
-    visibility of execution history we scope by joining to the users table
-    and filtering triggered_by to users in the caller's organization. Manual
-    executions with no user context are filtered out conservatively.
+    Executions carry the organisation (stamped at creation; migration 014
+    backfilled historic rows from the triggering user).
     """
-    await get_playbook_or_404(db, playbook_id)
-
-    from src.models.user import User as _User
-    org_id = getattr(current_user, "organization_id", None)
+    await get_playbook_or_404(db, playbook_id, org_id)
 
     query = select(PlaybookExecution).where(
-        PlaybookExecution.playbook_id == playbook_id
+        PlaybookExecution.playbook_id == playbook_id,
+        PlaybookExecution.organization_id == org_id,
     )
-    if org_id is not None:
-        org_user_ids = select(_User.id).where(_User.organization_id == org_id)
-        query = query.where(PlaybookExecution.triggered_by.in_(org_user_ids))
 
     if execution_status:
         query = query.where(PlaybookExecution.status == execution_status)

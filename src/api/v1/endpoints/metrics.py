@@ -1,4 +1,8 @@
-"""Metrics and Analytics API endpoints"""
+"""Metrics and Analytics API endpoints.
+
+Every metric is tenant-scoped to the caller's organisation (OrganizationId:
+403 organization_required for accounts without one).
+"""
 
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -7,7 +11,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import CurrentUser, DatabaseSession
+from src.api.deps import CurrentUser, DatabaseSession, OrganizationId
 from src.models.alert import Alert
 from src.models.incident import Incident
 from src.intel.models import ThreatIndicator as IOC
@@ -18,6 +22,7 @@ router = APIRouter()
 
 @router.get("/overview")
 async def get_metrics_overview(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
     days: int = Query(default=30, ge=1, le=365),
@@ -26,39 +31,43 @@ async def get_metrics_overview(
     start_date = datetime.now(timezone.utc) - timedelta(days=days)
 
     # Total counts
-    alerts_total = await db.scalar(select(func.count(Alert.id)))
-    incidents_total = await db.scalar(select(func.count(Incident.id)))
-    iocs_total = await db.scalar(select(func.count(IOC.id)))
+    alerts_total = await db.scalar(select(func.count(Alert.id)).where(Alert.organization_id == org_id))
+    incidents_total = await db.scalar(select(func.count(Incident.id)).where(Incident.organization_id == org_id))
+    iocs_total = await db.scalar(select(func.count(IOC.id)).where(IOC.organization_id == org_id))
 
     # Active counts
     alerts_active = await db.scalar(
         select(func.count(Alert.id)).where(
+            Alert.organization_id == org_id,
             Alert.status.in_(["new", "acknowledged", "in_progress"])
         )
     )
     incidents_active = await db.scalar(
         select(func.count(Incident.id)).where(
+            Incident.organization_id == org_id,
             Incident.status.in_(["open", "investigating", "containment"])
         )
     )
 
     # Period counts
     alerts_period = await db.scalar(
-        select(func.count(Alert.id)).where(Alert.created_at >= start_date)
+        select(func.count(Alert.id)).where(Alert.organization_id == org_id, Alert.created_at >= start_date)
     )
     incidents_period = await db.scalar(
-        select(func.count(Incident.id)).where(Incident.created_at >= start_date)
+        select(func.count(Incident.id)).where(Incident.organization_id == org_id, Incident.created_at >= start_date)
     )
 
     # Resolved counts
     alerts_resolved = await db.scalar(
         select(func.count(Alert.id)).where(
+            Alert.organization_id == org_id,
             Alert.status.in_(["resolved", "closed"]),
             Alert.created_at >= start_date,
         )
     )
     incidents_resolved = await db.scalar(
         select(func.count(Incident.id)).where(
+            Incident.organization_id == org_id,
             Incident.status == "closed",
             Incident.created_at >= start_date,
         )
@@ -86,6 +95,7 @@ async def get_metrics_overview(
 
 @router.get("/alerts/by-severity")
 async def get_alerts_by_severity(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
     days: int = Query(default=30, ge=1, le=365),
@@ -95,7 +105,7 @@ async def get_alerts_by_severity(
 
     result = await db.execute(
         select(Alert.severity, func.count(Alert.id))
-        .where(Alert.created_at >= start_date)
+        .where(Alert.organization_id == org_id, Alert.created_at >= start_date)
         .group_by(Alert.severity)
     )
 
@@ -115,6 +125,7 @@ async def get_alerts_by_severity(
 
 @router.get("/alerts/by-source")
 async def get_alerts_by_source(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
     days: int = Query(default=30, ge=1, le=365),
@@ -124,7 +135,7 @@ async def get_alerts_by_source(
 
     result = await db.execute(
         select(Alert.source, func.count(Alert.id))
-        .where(Alert.created_at >= start_date)
+        .where(Alert.organization_id == org_id, Alert.created_at >= start_date)
         .group_by(Alert.source)
         .order_by(func.count(Alert.id).desc())
         .limit(10)
@@ -138,6 +149,7 @@ async def get_alerts_by_source(
 
 @router.get("/alerts/by-status")
 async def get_alerts_by_status(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
     days: int = Query(default=30, ge=1, le=365),
@@ -147,7 +159,7 @@ async def get_alerts_by_status(
 
     result = await db.execute(
         select(Alert.status, func.count(Alert.id))
-        .where(Alert.created_at >= start_date)
+        .where(Alert.organization_id == org_id, Alert.created_at >= start_date)
         .group_by(Alert.status)
     )
 
@@ -159,6 +171,7 @@ async def get_alerts_by_status(
 
 @router.get("/alerts/trend")
 async def get_alerts_trend(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
     days: int = Query(default=30, ge=1, le=365),
@@ -178,7 +191,7 @@ async def get_alerts_trend(
             func.date(Alert.created_at).label("date"),
             func.count(Alert.id).label("count"),
         )
-        .where(Alert.created_at >= start_date)
+        .where(Alert.organization_id == org_id, Alert.created_at >= start_date)
         .group_by(func.date(Alert.created_at))
         .order_by(func.date(Alert.created_at))
     )
@@ -198,6 +211,7 @@ async def get_alerts_trend(
 
 @router.get("/incidents/by-type")
 async def get_incidents_by_type(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
     days: int = Query(default=30, ge=1, le=365),
@@ -207,7 +221,7 @@ async def get_incidents_by_type(
 
     result = await db.execute(
         select(Incident.incident_type, func.count(Incident.id))
-        .where(Incident.created_at >= start_date)
+        .where(Incident.organization_id == org_id, Incident.created_at >= start_date)
         .group_by(Incident.incident_type)
         .order_by(func.count(Incident.id).desc())
     )
@@ -220,6 +234,7 @@ async def get_incidents_by_type(
 
 @router.get("/incidents/mttr")
 async def get_mean_time_to_resolve(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
     days: int = Query(default=30, ge=1, le=365),
@@ -231,6 +246,7 @@ async def get_mean_time_to_resolve(
     result = await db.execute(
         select(Incident)
         .where(
+            Incident.organization_id == org_id,
             Incident.status == "closed",
             Incident.created_at >= start_date,
             Incident.resolved_at.isnot(None),
@@ -252,9 +268,18 @@ async def get_mean_time_to_resolve(
 
     for incident in incidents:
         try:
-            created = datetime.fromisoformat(incident.created_at)
-            resolved = datetime.fromisoformat(incident.resolved_at)
+            # created_at is a DateTime column and resolved_at an ISO string
+            # column; fromisoformat() on the datetime raised TypeError for
+            # every row, so MTTR was always None.
+            created = incident.created_at
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            resolved = datetime.fromisoformat(str(incident.resolved_at).replace("Z", "+00:00"))
+            if resolved.tzinfo is None:
+                resolved = resolved.replace(tzinfo=timezone.utc)
             duration = (resolved - created).total_seconds() / 3600
+            if duration < 0:
+                continue
             total_hours += duration
             count += 1
         except (ValueError, TypeError):
@@ -280,6 +305,7 @@ async def get_mean_time_to_resolve(
 
 @router.get("/playbooks/executions")
 async def get_playbook_execution_stats(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
     days: int = Query(default=30, ge=1, le=365),
@@ -290,6 +316,7 @@ async def get_playbook_execution_stats(
     # Total executions
     total = await db.scalar(
         select(func.count(PlaybookExecution.id)).where(
+            PlaybookExecution.organization_id == org_id,
             PlaybookExecution.created_at >= start_date
         )
     )
@@ -297,7 +324,7 @@ async def get_playbook_execution_stats(
     # By status
     status_result = await db.execute(
         select(PlaybookExecution.status, func.count(PlaybookExecution.id))
-        .where(PlaybookExecution.created_at >= start_date)
+        .where(PlaybookExecution.organization_id == org_id, PlaybookExecution.created_at >= start_date)
         .group_by(PlaybookExecution.status)
     )
 
@@ -318,13 +345,14 @@ async def get_playbook_execution_stats(
 
 @router.get("/iocs/by-type")
 async def get_iocs_by_type(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
 ):
     """Get IOC counts grouped by type"""
     result = await db.execute(
         select(IOC.indicator_type, func.count(IOC.id))
-        .where(IOC.is_active == True)  # noqa: E712
+        .where(IOC.organization_id == org_id, IOC.is_active == True)  # noqa: E712
         .group_by(IOC.indicator_type)
         .order_by(func.count(IOC.id).desc())
     )
@@ -336,13 +364,14 @@ async def get_iocs_by_type(
 
 @router.get("/iocs/by-threat-level")
 async def get_iocs_by_threat_level(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
 ):
     """Get IOC counts grouped by threat level"""
     result = await db.execute(
         select(IOC.severity, func.count(IOC.id))
-        .where(IOC.is_active == True)  # noqa: E712
+        .where(IOC.organization_id == org_id, IOC.is_active == True)  # noqa: E712
         .group_by(IOC.severity)
     )
 
@@ -353,6 +382,7 @@ async def get_iocs_by_threat_level(
 
 @router.get("/top-attackers")
 async def get_top_attackers(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
     days: int = Query(default=30, ge=1, le=365),
@@ -364,6 +394,7 @@ async def get_top_attackers(
     result = await db.execute(
         select(Alert.source_ip, func.count(Alert.id))
         .where(
+            Alert.organization_id == org_id,
             Alert.created_at >= start_date,
             Alert.source_ip.isnot(None),
         )

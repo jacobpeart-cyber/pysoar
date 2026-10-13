@@ -4,14 +4,15 @@ import json
 import math
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from src.api.deps import AdminUser, CurrentUser, DatabaseSession
+from src.api.deps import AdminUser, CurrentUser, DatabaseSession, OrganizationId, require_role
 from src.core.logging import get_logger
 from src.core.utils import safe_json_loads
+from src.models.user import UserRole
 from src.playbook_builder.engine import (
     PlaybookDesigner,
     PlaybookExecutionEngine,
@@ -35,6 +36,8 @@ from src.schemas.playbook_builder import (
     PlaybookExecutionListResponse,
     PlaybookExecutionResponse,
     PlaybookExecutionStatusResponse,
+    PlaybookExecutionSummary,
+    PlaybookExecutionSummaryListResponse,
     PlaybookExecutionTrigger,
     PlaybookExportResponse,
     PlaybookImportRequest,
@@ -53,12 +56,18 @@ from src.schemas.playbook_builder import (
 from src.playbook_builder.tasks import async_playbook_execution
 
 router = APIRouter(prefix="/playbook-builder", tags=["Playbook Builder"])
+
+#: Authoring and running visual playbooks: analysts and admins (viewers are
+#: read-only). Deleting a playbook is admin-only.
+_ANALYST_WRITE = [Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
+_ADMIN_WRITE = [Depends(require_role([UserRole.ADMIN]))]
 logger = get_logger(__name__)
 
 
 # Playbook CRUD endpoints
 @router.get("", response_model=PlaybookListResponse)
 async def list_playbooks(
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
@@ -69,12 +78,11 @@ async def list_playbooks(
     is_template: Optional[bool] = None,
 ):
     """List playbooks with filtering and pagination"""
-    org_id = getattr(current_user, "organization_id", None)
     query = select(VisualPlaybook).options(
         selectinload(VisualPlaybook.nodes),
         selectinload(VisualPlaybook.edges),
     ).where(
-        VisualPlaybook.organization_id == org_id
+        VisualPlaybook.organization_id == org_id,
     )
 
     if search:
@@ -92,8 +100,8 @@ async def list_playbooks(
     # Get total count
     count_result = await db.execute(
         select(func.count(VisualPlaybook.id)).where(
-            VisualPlaybook.organization_id == org_id
-        )
+            VisualPlaybook.organization_id == org_id,
+        ),
     )
     total = count_result.scalar() or 0
 
@@ -116,14 +124,14 @@ async def list_playbooks(
     )
 
 
-@router.post("", response_model=PlaybookResponse, status_code=status.HTTP_201_CREATED)
+@router.post("", response_model=PlaybookResponse, status_code=status.HTTP_201_CREATED, dependencies=_ANALYST_WRITE)
 async def create_playbook(
     request: PlaybookCreate,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Create a new playbook"""
-    org_id = getattr(current_user, "organization_id", None)
     designer = PlaybookDesigner()
     playbook = designer.create_playbook(
         organization_id=org_id,
@@ -144,7 +152,7 @@ async def create_playbook(
         select(VisualPlaybook).options(
             selectinload(VisualPlaybook.nodes),
             selectinload(VisualPlaybook.edges),
-        ).where(VisualPlaybook.id == playbook.id)
+        ).where(VisualPlaybook.id == playbook.id),
     )
     playbook = result.scalar_one()
 
@@ -214,6 +222,7 @@ async def list_templates_early(
 
 @router.get("/dashboard", response_model=PlaybookDashboardResponse)
 async def get_dashboard_early(
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
@@ -225,13 +234,12 @@ async def get_dashboard_early(
     ``success_rate=0.0`` regardless of the real execution history.
     Now computes all four from VisualPlaybookExecution rows.
     """
-    org_id = getattr(current_user, "organization_id", None)
 
     # Count playbooks (org-scoped)
     total_result = await db.execute(
         select(func.count(VisualPlaybook.id)).where(
-            VisualPlaybook.organization_id == org_id
-        )
+            VisualPlaybook.organization_id == org_id,
+        ),
     )
     total_playbooks = total_result.scalar() or 0
 
@@ -239,7 +247,7 @@ async def get_dashboard_early(
         select(func.count(VisualPlaybook.id)).where(
             VisualPlaybook.organization_id == org_id,
             VisualPlaybook.status == "active",
-        )
+        ),
     )
     active_playbooks = active_result.scalar() or 0
 
@@ -247,7 +255,7 @@ async def get_dashboard_early(
         select(func.count(VisualPlaybook.id)).where(
             VisualPlaybook.organization_id == org_id,
             VisualPlaybook.status == "draft",
-        )
+        ),
     )
     draft_playbooks = draft_result.scalar() or 0
 
@@ -256,8 +264,8 @@ async def get_dashboard_early(
     # Real execution aggregates
     exec_result = await db.execute(
         select(VisualPlaybookExecution).where(
-            VisualPlaybookExecution.organization_id == org_id
-        )
+            VisualPlaybookExecution.organization_id == org_id,
+        ),
     )
     executions = list(exec_result.scalars().all())
     total_executions = len(executions)
@@ -298,26 +306,113 @@ async def get_dashboard_early(
     )
 
 
+@router.get("/executions", response_model=PlaybookExecutionSummaryListResponse)
+async def list_org_executions(
+    org_id: OrganizationId,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+    page: int = Query(1, ge=1),
+    size: int = Query(20, ge=1, le=100),
+    status_filter: Optional[str] = Query(None, alias="status"),
+):
+    """Recent visual-playbook executions across the caller's organisation.
+
+    Registered before ``/{playbook_id}`` so the literal path is not captured
+    by the playbook lookup (which used to 404 this call silently).
+    """
+
+    conditions = [VisualPlaybookExecution.organization_id == org_id]
+    if status_filter:
+        conditions.append(VisualPlaybookExecution.status == status_filter)
+
+    total = (
+        await db.execute(
+            select(func.count(VisualPlaybookExecution.id)).where(*conditions),
+        )
+    ).scalar() or 0
+
+    rows = (
+        await db.execute(
+            select(VisualPlaybookExecution, VisualPlaybook.name)
+            .join(VisualPlaybook, VisualPlaybook.id == VisualPlaybookExecution.playbook_id)
+            .where(*conditions, VisualPlaybook.organization_id == org_id)
+            .order_by(VisualPlaybookExecution.created_at.desc())
+            .offset((page - 1) * size)
+            .limit(size),
+        )
+    ).all()
+
+    playbook_ids = {ex.playbook_id for ex, _ in rows}
+    execution_ids = [ex.id for ex, _ in rows]
+
+    node_counts: dict[str, int] = {}
+    if playbook_ids:
+        node_counts = dict(
+            (
+                await db.execute(
+                    select(PlaybookNode.playbook_id, func.count(PlaybookNode.id))
+                    .where(PlaybookNode.playbook_id.in_(playbook_ids))
+                    .group_by(PlaybookNode.playbook_id),
+                )
+            ).all(),
+        )
+
+    completed_counts: dict[str, int] = {}
+    if execution_ids:
+        completed_counts = dict(
+            (
+                await db.execute(
+                    select(PlaybookNodeExecution.execution_id, func.count(PlaybookNodeExecution.id))
+                    .where(
+                        PlaybookNodeExecution.execution_id.in_(execution_ids),
+                        PlaybookNodeExecution.status == "completed",
+                    )
+                    .group_by(PlaybookNodeExecution.execution_id),
+                )
+            ).all(),
+        )
+
+    items = [
+        PlaybookExecutionSummary(
+            **_execution_to_response(ex).model_dump(),
+            playbook_name=name,
+            total_nodes=node_counts.get(ex.playbook_id, 0),
+            nodes_executed=completed_counts.get(ex.id, 0),
+        )
+        for ex, name in rows
+    ]
+
+    return PlaybookExecutionSummaryListResponse(
+        items=items,
+        total=total,
+        page=page,
+        size=size,
+        pages=math.ceil(total / size) if size > 0 else 0,
+    )
+
+
 @router.get("/{playbook_id}", response_model=PlaybookResponse)
 async def get_playbook(
     playbook_id: str,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Get a specific playbook"""
-    playbook = await _get_playbook_or_404(db, playbook_id, getattr(current_user, "organization_id", None))
+    playbook = await _get_playbook_or_404(db, playbook_id, org_id)
     return _playbook_to_response(playbook)
 
 
-@router.put("/{playbook_id}", response_model=PlaybookResponse)
+@router.put("/{playbook_id}", response_model=PlaybookResponse, dependencies=_ANALYST_WRITE)
 async def update_playbook(
     playbook_id: str,
     request: PlaybookUpdate,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Update a playbook"""
-    playbook = await _get_playbook_or_404(db, playbook_id, getattr(current_user, "organization_id", None))
+    playbook = await _get_playbook_or_404(db, playbook_id, org_id)
 
     if request.name is not None:
         playbook.name = request.name
@@ -343,14 +438,15 @@ async def update_playbook(
     return _playbook_to_response(playbook)
 
 
-@router.delete("/{playbook_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{playbook_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=_ADMIN_WRITE)
 async def delete_playbook(
     playbook_id: str,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Delete a playbook"""
-    playbook = await _get_playbook_or_404(db, playbook_id, getattr(current_user, "organization_id", None))
+    playbook = await _get_playbook_or_404(db, playbook_id, org_id)
     await db.delete(playbook)
     await db.commit()
     logger.info(f"Deleted playbook: {playbook_id}")
@@ -361,11 +457,12 @@ async def delete_playbook(
 async def validate_playbook(
     playbook_id: str,
     request: PlaybookValidateRequest,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Validate playbook structure"""
-    playbook = await _get_playbook_or_404(db, playbook_id, getattr(current_user, "organization_id", None))
+    playbook = await _get_playbook_or_404(db, playbook_id, org_id)
 
     designer = PlaybookDesigner()
     is_valid, errors = designer.validate_playbook(playbook)
@@ -374,21 +471,22 @@ async def validate_playbook(
 
 
 # Clone endpoint
-@router.post("/{playbook_id}/clone", response_model=PlaybookResponse)
+@router.post("/{playbook_id}/clone", response_model=PlaybookResponse, dependencies=_ANALYST_WRITE)
 async def clone_playbook(
     playbook_id: str,
     request: PlaybookCloneRequest,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Clone a playbook"""
-    playbook = await _get_playbook_or_404(db, playbook_id, getattr(current_user, "organization_id", None))
+    playbook = await _get_playbook_or_404(db, playbook_id, org_id)
 
     designer = PlaybookDesigner()
     cloned = designer.clone_playbook(
         playbook,
         request.new_name,
-        getattr(request, "organization_id", None) or getattr(current_user, "organization_id", None),
+        org_id,
     )
 
     db.add(cloned)
@@ -399,7 +497,7 @@ async def clone_playbook(
         select(VisualPlaybook).options(
             selectinload(VisualPlaybook.nodes),
             selectinload(VisualPlaybook.edges),
-        ).where(VisualPlaybook.id == cloned.id)
+        ).where(VisualPlaybook.id == cloned.id),
     )
     cloned = result.scalar_one()
 
@@ -411,11 +509,12 @@ async def clone_playbook(
 @router.post("/{playbook_id}/export", response_model=PlaybookExportResponse)
 async def export_playbook(
     playbook_id: str,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Export playbook as JSON"""
-    playbook = await _get_playbook_or_404(db, playbook_id, getattr(current_user, "organization_id", None))
+    playbook = await _get_playbook_or_404(db, playbook_id, org_id)
 
     designer = PlaybookDesigner()
     export_data = designer.export_playbook_json(playbook)
@@ -423,16 +522,17 @@ async def export_playbook(
     return PlaybookExportResponse(**export_data)
 
 
-@router.post("/import", response_model=PlaybookResponse, status_code=status.HTTP_201_CREATED)
+@router.post("/import", response_model=PlaybookResponse, status_code=status.HTTP_201_CREATED, dependencies=_ANALYST_WRITE)
 async def import_playbook(
     request: PlaybookImportRequest,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Import a playbook from JSON"""
     designer = PlaybookDesigner()
     playbook = designer.import_playbook_json(
-        getattr(current_user, "organization_id", None),
+        org_id,
         request.playbook_data,
     )
 
@@ -445,15 +545,16 @@ async def import_playbook(
 
 
 # Node management endpoints
-@router.post("/{playbook_id}/nodes", response_model=PlaybookNodeResponse)
+@router.post("/{playbook_id}/nodes", response_model=PlaybookNodeResponse, dependencies=_ANALYST_WRITE)
 async def add_node(
     playbook_id: str,
     request: PlaybookNodeCreate,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Add a node to a playbook"""
-    playbook = await _get_playbook_or_404(db, playbook_id, getattr(current_user, "organization_id", None))
+    playbook = await _get_playbook_or_404(db, playbook_id, org_id)
 
     designer = PlaybookDesigner()
     node = designer.add_node(
@@ -477,16 +578,17 @@ async def add_node(
     return _node_to_response(node)
 
 
-@router.put("/{playbook_id}/nodes/{node_id}", response_model=PlaybookNodeResponse)
+@router.put("/{playbook_id}/nodes/{node_id}", response_model=PlaybookNodeResponse, dependencies=_ANALYST_WRITE)
 async def update_node(
     playbook_id: str,
     node_id: str,
     request: PlaybookNodeUpdate,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Update a node"""
-    playbook = await _get_playbook_or_404(db, playbook_id, getattr(current_user, "organization_id", None))
+    playbook = await _get_playbook_or_404(db, playbook_id, org_id)
     node = await _get_node_or_404(playbook, node_id)
 
     if request.display_name is not None:
@@ -514,15 +616,16 @@ async def update_node(
     return _node_to_response(node)
 
 
-@router.delete("/{playbook_id}/nodes/{node_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{playbook_id}/nodes/{node_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=_ANALYST_WRITE)
 async def remove_node(
     playbook_id: str,
     node_id: str,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Remove a node from a playbook"""
-    playbook = await _get_playbook_or_404(db, playbook_id, getattr(current_user, "organization_id", None))
+    playbook = await _get_playbook_or_404(db, playbook_id, org_id)
 
     designer = PlaybookDesigner()
     if not designer.remove_node(playbook, node_id):
@@ -534,15 +637,16 @@ async def remove_node(
 
 
 # Edge management endpoints
-@router.post("/{playbook_id}/edges", response_model=PlaybookEdgeResponse)
+@router.post("/{playbook_id}/edges", response_model=PlaybookEdgeResponse, dependencies=_ANALYST_WRITE)
 async def connect_nodes(
     playbook_id: str,
     request: PlaybookEdgeCreate,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Connect two nodes"""
-    playbook = await _get_playbook_or_404(db, playbook_id, getattr(current_user, "organization_id", None))
+    playbook = await _get_playbook_or_404(db, playbook_id, org_id)
 
     designer = PlaybookDesigner()
     edge = designer.connect_nodes(
@@ -563,16 +667,17 @@ async def connect_nodes(
     return _edge_to_response(edge)
 
 
-@router.put("/{playbook_id}/edges/{edge_id}", response_model=PlaybookEdgeResponse)
+@router.put("/{playbook_id}/edges/{edge_id}", response_model=PlaybookEdgeResponse, dependencies=_ANALYST_WRITE)
 async def update_edge(
     playbook_id: str,
     edge_id: str,
     request: PlaybookEdgeUpdate,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Update an edge"""
-    playbook = await _get_playbook_or_404(db, playbook_id, getattr(current_user, "organization_id", None))
+    playbook = await _get_playbook_or_404(db, playbook_id, org_id)
     edge = await _get_edge_or_404(playbook, edge_id)
 
     if request.edge_type is not None:
@@ -592,15 +697,16 @@ async def update_edge(
     return _edge_to_response(edge)
 
 
-@router.delete("/{playbook_id}/edges/{edge_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{playbook_id}/edges/{edge_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=_ANALYST_WRITE)
 async def disconnect_nodes(
     playbook_id: str,
     edge_id: str,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Remove an edge"""
-    playbook = await _get_playbook_or_404(db, playbook_id, getattr(current_user, "organization_id", None))
+    playbook = await _get_playbook_or_404(db, playbook_id, org_id)
     edge = await _get_edge_or_404(playbook, edge_id)
 
     await db.delete(edge)
@@ -609,15 +715,16 @@ async def disconnect_nodes(
 
 
 # Execution endpoints
-@router.post("/{playbook_id}/execute", response_model=PlaybookExecutionResponse)
+@router.post("/{playbook_id}/execute", response_model=PlaybookExecutionResponse, dependencies=_ANALYST_WRITE)
 async def execute_playbook(
     playbook_id: str,
     request: PlaybookExecutionTrigger,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Trigger playbook execution"""
-    playbook = await _get_playbook_or_404(db, playbook_id, getattr(current_user, "organization_id", None))
+    playbook = await _get_playbook_or_404(db, playbook_id, org_id)
 
     execution = VisualPlaybookExecution(
         playbook_id=playbook.id,
@@ -646,21 +753,22 @@ async def execute_playbook(
 @router.get("/{playbook_id}/executions", response_model=PlaybookExecutionListResponse)
 async def list_executions(
     playbook_id: str,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
 ):
     """List playbook executions"""
-    playbook = await _get_playbook_or_404(db, playbook_id, getattr(current_user, "organization_id", None))
+    playbook = await _get_playbook_or_404(db, playbook_id, org_id)
 
     query = select(VisualPlaybookExecution).where(VisualPlaybookExecution.playbook_id == playbook.id)
 
     # Get total count
     count_result = await db.execute(
         select(func.count(VisualPlaybookExecution.id)).where(
-            VisualPlaybookExecution.playbook_id == playbook.id
-        )
+            VisualPlaybookExecution.playbook_id == playbook.id,
+        ),
     )
     total = count_result.scalar() or 0
 
@@ -686,31 +794,32 @@ async def list_executions(
 @router.get("/executions/{execution_id}", response_model=PlaybookExecutionStatusResponse)
 async def get_execution_status(
     execution_id: str,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Get execution status"""
     result = await db.execute(
-        select(VisualPlaybookExecution).where(VisualPlaybookExecution.id == execution_id)
+        select(VisualPlaybookExecution).where(VisualPlaybookExecution.id == execution_id),
     )
     execution = result.scalar_one_or_none()
 
-    if not execution or execution.organization_id != getattr(current_user, "organization_id", None):
+    if not execution or execution.organization_id != org_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Execution not found")
 
     # Get node executions
     result = await db.execute(
         select(PlaybookNodeExecution).where(
-            PlaybookNodeExecution.execution_id == execution_id
-        )
+            PlaybookNodeExecution.execution_id == execution_id,
+        ),
     )
     node_executions = result.scalars().all()
 
     # Get total node count from the playbook to calculate real progress
     playbook_result = await db.execute(
         select(func.count(PlaybookNode.id)).where(
-            PlaybookNode.playbook_id == execution.playbook_id
-        )
+            PlaybookNode.playbook_id == execution.playbook_id,
+        ),
     )
     total_nodes = playbook_result.scalar() or 0
     completed_nodes = len([ne for ne in node_executions if ne.status == "completed"])
@@ -736,10 +845,11 @@ async def get_execution_status(
 # placeholder so the import structure stays intact.
 
 
-@router.post("/templates/{template_id}/create", response_model=PlaybookResponse)
+@router.post("/templates/{template_id}/create", response_model=PlaybookResponse, dependencies=_ANALYST_WRITE)
 async def create_from_template(
     template_id: str,
     request: CreateFromTemplateRequest,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
@@ -748,14 +858,14 @@ async def create_from_template(
 
     if template_id not in templates:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Template not found"
+            status_code=status.HTTP_404_NOT_FOUND, detail="Template not found",
         )
 
     template_data = templates[template_id]
 
     designer = PlaybookDesigner()
     playbook = designer.import_playbook_json(
-        getattr(request, "organization_id", None) or getattr(current_user, "organization_id", None),
+        org_id,
         {**template_data, "name": request.playbook_name},
     )
 
@@ -767,7 +877,7 @@ async def create_from_template(
         select(VisualPlaybook).options(
             selectinload(VisualPlaybook.nodes),
             selectinload(VisualPlaybook.edges),
-        ).where(VisualPlaybook.id == playbook.id)
+        ).where(VisualPlaybook.id == playbook.id),
     )
     playbook = result.scalar_one()
 
@@ -794,13 +904,13 @@ async def _get_playbook_or_404(
         ).where(
             VisualPlaybook.id == playbook_id,
             VisualPlaybook.organization_id == organization_id,
-        )
+        ),
     )
     playbook = result.scalar_one_or_none()
 
     if not playbook:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, detail="Playbook not found"
+            status_code=status.HTTP_404_NOT_FOUND, detail="Playbook not found",
         )
 
     return playbook

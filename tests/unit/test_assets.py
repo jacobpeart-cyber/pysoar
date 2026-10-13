@@ -31,14 +31,16 @@ class TestAssetEndpoints:
         assert data["hostname"] == "web-srv-01"
         assert data["asset_type"] == "server"
 
-    async def test_list_assets(self, client: AsyncClient, auth_headers, db_session: AsyncSession):
+    async def test_list_assets(self, client: AsyncClient, auth_headers, db_session: AsyncSession, test_organization):
         """Test listing assets"""
         asset1 = Asset(
+            organization_id=test_organization.id,
             name="Server 1",
             asset_type="server",
             criticality="high",
         )
         asset2 = Asset(
+            organization_id=test_organization.id,
             name="Workstation 1",
             asset_type="workstation",
             criticality="medium",
@@ -57,9 +59,10 @@ class TestAssetEndpoints:
         assert "items" in data
         assert len(data["items"]) >= 2
 
-    async def test_get_asset(self, client: AsyncClient, auth_headers, db_session: AsyncSession):
+    async def test_get_asset(self, client: AsyncClient, auth_headers, db_session: AsyncSession, test_organization):
         """Test getting a specific asset"""
         asset = Asset(
+            organization_id=test_organization.id,
             name="Test Server",
             hostname="test-srv",
             asset_type="server",
@@ -80,9 +83,10 @@ class TestAssetEndpoints:
         assert data["name"] == "Test Server"
         assert data["hostname"] == "test-srv"
 
-    async def test_update_asset(self, client: AsyncClient, auth_headers, db_session: AsyncSession):
+    async def test_update_asset(self, client: AsyncClient, auth_headers, db_session: AsyncSession, test_organization):
         """Test updating an asset"""
         asset = Asset(
+            organization_id=test_organization.id,
             name="Old Name",
             asset_type="server",
             criticality="low",
@@ -105,9 +109,10 @@ class TestAssetEndpoints:
         assert data["name"] == "New Name"
         assert data["criticality"] == "high"
 
-    async def test_delete_asset(self, client: AsyncClient, admin_auth_headers, db_session: AsyncSession):
+    async def test_delete_asset(self, client: AsyncClient, admin_auth_headers, db_session: AsyncSession, test_organization):
         """Test deleting an asset"""
         asset = Asset(
+            organization_id=test_organization.id,
             name="Delete Me",
             asset_type="workstation",
             criticality="low",
@@ -123,10 +128,10 @@ class TestAssetEndpoints:
 
         assert response.status_code == 204
 
-    async def test_filter_by_type(self, client: AsyncClient, auth_headers, db_session: AsyncSession):
+    async def test_filter_by_type(self, client: AsyncClient, auth_headers, db_session: AsyncSession, test_organization):
         """Test filtering assets by type"""
-        server = Asset(name="Server", asset_type="server", criticality="high")
-        workstation = Asset(name="Workstation", asset_type="workstation", criticality="medium")
+        server = Asset(organization_id=test_organization.id, name="Server", asset_type="server", criticality="high")
+        workstation = Asset(organization_id=test_organization.id, name="Workstation", asset_type="workstation", criticality="medium")
         db_session.add(server)
         db_session.add(workstation)
         await db_session.commit()
@@ -141,10 +146,10 @@ class TestAssetEndpoints:
         for item in data["items"]:
             assert item["asset_type"] == "server"
 
-    async def test_filter_by_criticality(self, client: AsyncClient, auth_headers, db_session: AsyncSession):
+    async def test_filter_by_criticality(self, client: AsyncClient, auth_headers, db_session: AsyncSession, test_organization):
         """Test filtering assets by criticality"""
-        critical = Asset(name="Critical Asset", asset_type="server", criticality="critical")
-        low = Asset(name="Low Asset", asset_type="workstation", criticality="low")
+        critical = Asset(organization_id=test_organization.id, name="Critical Asset", asset_type="server", criticality="critical")
+        low = Asset(organization_id=test_organization.id, name="Low Asset", asset_type="workstation", criticality="low")
         db_session.add(critical)
         db_session.add(low)
         await db_session.commit()

@@ -4,12 +4,13 @@ import json
 import math
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import CurrentUser, DatabaseSession
+from src.api.deps import CurrentUser, DatabaseSession, OrganizationId, require_role
 from src.models.asset import Asset, AssetStatus
+from src.models.user import UserRole
 from src.core.utils import safe_json_loads
 from src.schemas.asset import (
     AssetCreate,
@@ -20,12 +21,13 @@ from src.schemas.asset import (
 
 router = APIRouter(prefix="/assets", tags=["Assets"])
 
+#: Inventory writes: analysts and admins. Viewers are read-only.
+_ANALYST_WRITE = [Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
 
-async def get_asset_or_404(db: AsyncSession, asset_id: str, org_id: Optional[str] = None) -> Asset:
-    """Get Asset by ID or raise 404 (tenant-scoped)"""
-    stmt = select(Asset).where(Asset.id == asset_id)
-    if org_id is not None:
-        stmt = stmt.where(Asset.organization_id == org_id)
+
+async def get_asset_or_404(db: AsyncSession, asset_id: str, org_id: str) -> Asset:
+    """Get the caller's asset by ID or raise 404 (always tenant-scoped)"""
+    stmt = select(Asset).where(Asset.id == asset_id, Asset.organization_id == org_id)
     result = await db.execute(stmt)
     asset = result.scalar_one_or_none()
     if not asset:
@@ -73,6 +75,7 @@ def asset_to_response(asset: Asset) -> AssetResponse:
 
 @router.get("", response_model=AssetListResponse)
 async def list_assets(
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
@@ -83,7 +86,6 @@ async def list_assets(
     criticality: Optional[str] = None,
 ):
     """List assets with filtering and pagination"""
-    org_id = getattr(current_user, "organization_id", None)
     query = select(Asset).where(Asset.organization_id == org_id)
 
     # Apply filters
@@ -127,15 +129,16 @@ async def list_assets(
     )
 
 
-@router.post("", response_model=AssetResponse, status_code=status.HTTP_201_CREATED)
+@router.post("", response_model=AssetResponse, status_code=status.HTTP_201_CREATED, dependencies=_ANALYST_WRITE)
 async def create_asset(
     asset_data: AssetCreate,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Create a new asset"""
     asset = Asset(
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         name=asset_data.name,
         hostname=asset_data.hostname,
         asset_type=asset_data.asset_type,
@@ -169,23 +172,25 @@ async def create_asset(
 @router.get("/{asset_id}", response_model=AssetResponse)
 async def get_asset(
     asset_id: str,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Get an asset by ID"""
-    asset = await get_asset_or_404(db, asset_id, getattr(current_user, "organization_id", None))
+    asset = await get_asset_or_404(db, asset_id, org_id)
     return asset_to_response(asset)
 
 
-@router.patch("/{asset_id}", response_model=AssetResponse)
+@router.patch("/{asset_id}", response_model=AssetResponse, dependencies=_ANALYST_WRITE)
 async def update_asset(
     asset_id: str,
     asset_data: AssetUpdate,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Update an asset"""
-    asset = await get_asset_or_404(db, asset_id, getattr(current_user, "organization_id", None))
+    asset = await get_asset_or_404(db, asset_id, org_id)
 
     update_data = asset_data.model_dump(exclude_unset=True, exclude_none=True)
 
@@ -202,13 +207,14 @@ async def update_asset(
     return asset_to_response(asset)
 
 
-@router.delete("/{asset_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{asset_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=_ANALYST_WRITE)
 async def delete_asset(
     asset_id: str,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Delete an asset"""
-    asset = await get_asset_or_404(db, asset_id, getattr(current_user, "organization_id", None))
+    asset = await get_asset_or_404(db, asset_id, org_id)
     await db.delete(asset)
     await db.flush()

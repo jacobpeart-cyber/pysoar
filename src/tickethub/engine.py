@@ -5,7 +5,6 @@ Queries all 8 source ticket systems, normalizes to a common shape,
 and provides kanban board grouping with status mapping.
 """
 
-import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -107,35 +106,33 @@ class TicketAggregator:
         page: int = 1,
         size: int = 50,
     ) -> Dict[str, Any]:
-        """Query all source tables and return normalized tickets."""
+        """Query all source tables of one tenant and return normalized tickets.
 
-        # Run all queries in parallel
-        tasks = []
+        ``organization_id`` is mandatory: there is no cross-tenant view. The
+        sources are fetched one after another (an AsyncSession does not allow
+        concurrent queries) and a failing source raises instead of silently
+        vanishing from the board.
+        """
+        if not organization_id:
+            raise ValueError("organization_id is required for the ticket hub")
+
         requested_types = source_types or [
             "incident", "case_task", "remediation_ticket",
             "action_item", "poam",
         ]
+        fetchers = {
+            "incident": self._fetch_incidents,
+            "case_task": self._fetch_case_tasks,
+            "remediation_ticket": self._fetch_remediation_tickets,
+            "action_item": self._fetch_action_items,
+            "poam": self._fetch_poams,
+        }
 
-        if "incident" in requested_types:
-            tasks.append(self._fetch_incidents(organization_id))
-        if "case_task" in requested_types:
-            tasks.append(self._fetch_case_tasks(organization_id))
-        if "remediation_ticket" in requested_types:
-            tasks.append(self._fetch_remediation_tickets(organization_id))
-        if "action_item" in requested_types:
-            tasks.append(self._fetch_action_items(organization_id))
-        if "poam" in requested_types:
-            tasks.append(self._fetch_poams(organization_id))
-
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Flatten and filter
         all_tickets = []
-        for result in results:
-            if isinstance(result, Exception):
-                logger.error(f"Ticket fetch failed: {result}")
-                continue
-            all_tickets.extend(result)
+        for source in requested_types:
+            fetch = fetchers.get(source)
+            if fetch is not None:
+                all_tickets.extend(await fetch(organization_id))
 
         # Apply filters
         if kanban_column:
@@ -220,53 +217,41 @@ class TicketAggregator:
 
     # --- Source fetchers ---
 
-    async def _fetch_incidents(self, org_id: Optional[str]) -> List[Dict]:
+    async def _fetch_incidents(self, org_id: str) -> List[Dict]:
         from src.models.incident import Incident
-        query = select(Incident)
-        if org_id:
-            query = query.where(Incident.organization_id == org_id) if hasattr(Incident, "organization_id") else query
+        query = select(Incident).where(Incident.organization_id == org_id)
         query = query.order_by(Incident.created_at.desc()).limit(200)
         result = await self.db.execute(query)
         return [self._normalize_incident(r) for r in result.scalars().all()]
 
-    async def _fetch_case_tasks(self, org_id: Optional[str]) -> List[Dict]:
+    async def _fetch_case_tasks(self, org_id: str) -> List[Dict]:
         from src.models.case import Task
         from src.models.incident import Incident
-        query = select(Task)
-        if org_id:
-            # Task has no organization_id; scope through the owning incident.
-            query = query.where(
-                Task.incident_id.in_(select(Incident.id).where(Incident.organization_id == org_id))
-            )
+        # Task has no organization_id; scope through the owning incident.
+        query = select(Task).where(
+            Task.incident_id.in_(select(Incident.id).where(Incident.organization_id == org_id))
+        )
         query = query.order_by(Task.created_at.desc()).limit(200)
         result = await self.db.execute(query)
         return [self._normalize_case_task(r) for r in result.scalars().all()]
 
-    async def _fetch_remediation_tickets(self, org_id: Optional[str]) -> List[Dict]:
+    async def _fetch_remediation_tickets(self, org_id: str) -> List[Dict]:
         from src.exposure.models import RemediationTicket
-        query = select(RemediationTicket)
-        if org_id:
-            query = query.where(RemediationTicket.organization_id == org_id)
+        query = select(RemediationTicket).where(RemediationTicket.organization_id == org_id)
         query = query.order_by(RemediationTicket.created_at.desc()).limit(200)
         result = await self.db.execute(query)
         return [self._normalize_remediation_ticket(r) for r in result.scalars().all()]
 
-    async def _fetch_action_items(self, org_id: Optional[str]) -> List[Dict]:
+    async def _fetch_action_items(self, org_id: str) -> List[Dict]:
         from src.collaboration.models import ActionItem
-        query = select(ActionItem)
-        if org_id:
-            # Was unscoped: every tenant's war-room action items landed in every
-            # tenant's unified ticket feed (and in the agent's list_tickets tool).
-            query = query.where(ActionItem.organization_id == org_id)
+        query = select(ActionItem).where(ActionItem.organization_id == org_id)
         query = query.order_by(ActionItem.created_at.desc()).limit(200)
         result = await self.db.execute(query)
         return [self._normalize_action_item(r) for r in result.scalars().all()]
 
-    async def _fetch_poams(self, org_id: Optional[str]) -> List[Dict]:
+    async def _fetch_poams(self, org_id: str) -> List[Dict]:
         from src.compliance.models import POAM
-        query = select(POAM)
-        if org_id:
-            query = query.where(POAM.organization_id == org_id)
+        query = select(POAM).where(POAM.organization_id == org_id)
         query = query.order_by(POAM.created_at.desc()).limit(200)
         result = await self.db.execute(query)
         return [self._normalize_poam(r) for r in result.scalars().all()]

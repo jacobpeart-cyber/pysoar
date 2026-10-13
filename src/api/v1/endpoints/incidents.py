@@ -5,15 +5,17 @@ import math
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from src.api.deps import CurrentUser, DatabaseSession
+from src.api.deps import CurrentUser, DatabaseSession, OrganizationId, require_role
 from src.models.alert import Alert
 from src.models.audit import AuditLog
 from src.models.incident import Incident, IncidentStatus
+from src.models.user import UserRole
+from src.schemas.alert import AlertResponse
 from src.schemas.incident import (
     IncidentCreate,
     IncidentListResponse,
@@ -24,16 +26,17 @@ from src.schemas.incident import (
 
 router = APIRouter(prefix="/incidents", tags=["Incidents"])
 
+#: Operational writes: analysts and admins. Viewers are read-only.
+_ANALYST_WRITE = [Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
 
-async def get_incident_or_404(db: AsyncSession, incident_id: str, org_id: Optional[str] = None) -> Incident:
-    """Get incident by ID or raise 404 (tenant-scoped)"""
+
+async def get_incident_or_404(db: AsyncSession, incident_id: str, org_id: str) -> Incident:
+    """Get the caller's incident by ID or raise 404 (always tenant-scoped)"""
     stmt = (
         select(Incident)
         .options(selectinload(Incident.alerts))
-        .where(Incident.id == incident_id)
+        .where(Incident.id == incident_id, Incident.organization_id == org_id)
     )
-    if org_id is not None:
-        stmt = stmt.where(Incident.organization_id == org_id)
     result = await db.execute(stmt)
     incident = result.scalar_one_or_none()
     if not incident:
@@ -46,6 +49,7 @@ async def get_incident_or_404(db: AsyncSession, incident_id: str, org_id: Option
 
 @router.get("", response_model=IncidentListResponse)
 async def list_incidents(
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
@@ -59,7 +63,6 @@ async def list_incidents(
     sort_order: str = "desc",
 ):
     """List incidents with filtering and pagination"""
-    org_id = getattr(current_user, "organization_id", None)
     query = (
         select(Incident)
         .options(selectinload(Incident.alerts))
@@ -127,9 +130,12 @@ async def list_incidents(
     )
 
 
-@router.post("", response_model=IncidentResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "", response_model=IncidentResponse, status_code=status.HTTP_201_CREATED, dependencies=_ANALYST_WRITE
+)
 async def create_incident(
     incident_data: IncidentCreate,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     request: Request = None,
@@ -144,7 +150,7 @@ async def create_incident(
     from src.services.automation import AutomationService
 
     incident = Incident(
-        organization_id=getattr(current_user, "organization_id", None) if current_user else None,
+        organization_id=org_id,
         title=incident_data.title,
         description=incident_data.description,
         severity=incident_data.severity,
@@ -166,12 +172,11 @@ async def create_incident(
     # Link alerts if provided (tenant-scoped so a tenant can't pull alerts
     # from another tenant into their own incident).
     linked_alerts = 0
-    _org = getattr(current_user, "organization_id", None) if current_user else None
     if incident_data.alert_ids:
         for alert_id in incident_data.alert_ids:
             result = await db.execute(
                 select(Alert).where(
-                    and_(Alert.id == alert_id, Alert.organization_id == _org)
+                    and_(Alert.id == alert_id, Alert.organization_id == org_id)
                 )
             )
             alert = result.scalar_one_or_none()
@@ -205,7 +210,7 @@ async def create_incident(
         automation = AutomationService(db)
         await automation.on_incident_created(
             incident,
-            organization_id=getattr(current_user, "organization_id", None) if current_user else None,
+            organization_id=org_id,
             created_by=str(current_user.id) if current_user else None,
         )
     except Exception as e:
@@ -222,6 +227,7 @@ async def create_incident(
 
 @router.get("/stats", response_model=IncidentStats)
 async def get_incident_stats(
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
@@ -230,7 +236,6 @@ async def get_incident_stats(
     MTTR = average(resolved_at - created_at) over all closed incidents
     that have a resolved_at timestamp.
     """
-    org_id = getattr(current_user, "organization_id", None)
     org_filter = Incident.organization_id == org_id
 
     # Total count
@@ -308,26 +313,28 @@ async def get_incident_stats(
 @router.get("/{incident_id}", response_model=IncidentResponse)
 async def get_incident(
     incident_id: str,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Get an incident by ID"""
-    incident = await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
+    incident = await get_incident_or_404(db, incident_id, org_id)
     response = IncidentResponse.model_validate(incident)
     response.alert_count = len(incident.alerts)
     return response
 
 
-@router.patch("/{incident_id}", response_model=IncidentResponse)
+@router.patch("/{incident_id}", response_model=IncidentResponse, dependencies=_ANALYST_WRITE)
 async def update_incident(
     incident_id: str,
     incident_data: IncidentUpdate,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     request: Request = None,
 ):
     """Update an incident"""
-    incident = await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
+    incident = await get_incident_or_404(db, incident_id, org_id)
 
     update_data = incident_data.model_dump(exclude_unset=True, exclude_none=True)
 
@@ -376,9 +383,12 @@ async def update_incident(
     return response
 
 
-@router.delete("/{incident_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{incident_id}", status_code=status.HTTP_204_NO_CONTENT, dependencies=_ANALYST_WRITE
+)
 async def delete_incident(
     incident_id: str,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
     request: Request = None,
@@ -396,7 +406,7 @@ async def delete_incident(
     """
     from src.collaboration.models import WarRoom
 
-    incident = await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
+    incident = await get_incident_or_404(db, incident_id, org_id)
 
     # Unlink alerts
     for alert in incident.alerts:
@@ -433,20 +443,47 @@ async def delete_incident(
         _logging.getLogger(__name__).warning(f"Failed to write audit_log for incident_delete {incident_id}: {_e}")
 
 
-@router.post("/{incident_id}/alerts/{alert_id}")
+@router.get("/{incident_id}/alerts", response_model=list[AlertResponse])
+async def list_incident_alerts(
+    incident_id: str,
+    org_id: OrganizationId,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+):
+    """List the alerts linked to an incident (tenant-scoped).
+
+    IncidentResponse carries only ``alert_count``, so this is the route the
+    incident page reads to show and unlink the related alerts.
+    """
+    await get_incident_or_404(db, incident_id, org_id)
+
+    result = await db.execute(
+        select(Alert)
+        .where(
+            and_(
+                Alert.incident_id == incident_id,
+                Alert.organization_id == org_id,
+            )
+        )
+        .order_by(Alert.created_at.desc())
+    )
+    return [AlertResponse.model_validate(a) for a in result.scalars().all()]
+
+
+@router.post("/{incident_id}/alerts/{alert_id}", dependencies=_ANALYST_WRITE)
 async def link_alert_to_incident(
     incident_id: str,
     alert_id: str,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Link an alert to an incident (both must belong to the same tenant)"""
-    _org = getattr(current_user, "organization_id", None)
-    incident = await get_incident_or_404(db, incident_id, _org)
+    incident = await get_incident_or_404(db, incident_id, org_id)
 
     result = await db.execute(
         select(Alert).where(
-            and_(Alert.id == alert_id, Alert.organization_id == _org)
+            and_(Alert.id == alert_id, Alert.organization_id == org_id)
         )
     )
     alert = result.scalar_one_or_none()
@@ -463,23 +500,23 @@ async def link_alert_to_incident(
     return {"message": "Alert linked to incident"}
 
 
-@router.delete("/{incident_id}/alerts/{alert_id}")
+@router.delete("/{incident_id}/alerts/{alert_id}", dependencies=_ANALYST_WRITE)
 async def unlink_alert_from_incident(
     incident_id: str,
     alert_id: str,
+    org_id: OrganizationId,
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Unlink an alert from an incident (tenant-scoped)"""
-    _org = getattr(current_user, "organization_id", None)
-    await get_incident_or_404(db, incident_id, _org)
+    await get_incident_or_404(db, incident_id, org_id)
 
     result = await db.execute(
         select(Alert).where(
             and_(
                 Alert.id == alert_id,
                 Alert.incident_id == incident_id,
-                Alert.organization_id == _org,
+                Alert.organization_id == org_id,
             )
         )
     )

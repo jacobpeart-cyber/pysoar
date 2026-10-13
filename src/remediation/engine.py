@@ -1975,9 +1975,12 @@ class NotificationExecutor(ActionExecutor):
         email_error: str | None = None
         if recipients:
             try:
+                from src.core.database import async_session_factory
                 from src.services.email_service import EmailService
 
-                email = EmailService()
+                # The execution's organisation SMTP (Settings), else the platform relay.
+                async with async_session_factory() as session:
+                    email = await EmailService.for_organization(session, org_id)
                 if email.is_configured:
                     email_sent = await email.send_email(
                         to=list(recipients),
