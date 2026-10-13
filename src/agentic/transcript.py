@@ -159,9 +159,15 @@ class AgentRunTranscript(BaseModel):
 
 # ``"api_key": "value"`` / ``password=value`` inside free text (a truncated
 # JSON preview no longer parses, so key redaction cannot reach it).
+#
+# The key must start at an identifier boundary and its prefix is bounded:
+# an unbounded ``[a-z0-9_-]*`` before the keyword alternation backtracked
+# once per character of every long identifier-like run, which made a 4 KB
+# preview take seconds (quadratic in length) and timed the writer out in CI.
 _INLINE_SECRET_RE = re.compile(
-    r"(?i)(\"?[a-z0-9_\-]*(?:api[_-]?key|token|secret|passw(?:or)?d|private[_-]?key|authorization|cookie|credential)s?\"?"
-    r"\s*[:=]\s*)(\"(?:[^\"\\]|\\.)*\"?|'[^']*'?|[^\s,;}\]]+)",
+    r"(?i)(?<![a-z0-9_\-])"
+    r"(\"?[a-z0-9_\-]{0,128}?(?:api[_-]?key|token|secret|passw(?:or)?d|private[_-]?key|authorization|cookie|credential)s?\"?"
+    r"\s*[:=]\s*)(Bearer\s+[^\s,;}\]]+|\"(?:[^\"\\]|\\.)*\"?|'[^']*'?|[^\s,;}\]]+)",
 )
 _NUMERIC_RE = re.compile(r"^\d+(?:\.\d+)?$")
 
