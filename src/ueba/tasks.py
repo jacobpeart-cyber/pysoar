@@ -145,16 +145,20 @@ def _row_to_baseline_event(row) -> dict:
 
 
 async def _process_behavior_events_async(
-    organization_id: Optional[str], event_batch: list[dict]
+    organization_id: str, event_batch: list[dict]
 ) -> dict[str, Any]:
     """Persist + score a batch of behavior events via the shared ingest helper.
 
     Identical semantics to POST /ueba/events/batch: entity lookup by
-    ``entity_id`` (org-filtered), ``score_event_anomaly`` scoring, entity
-    risk bump, and ``on_ueba_anomaly`` automation fanout on anomalies.
+    ``entity_id`` inside ``organization_id`` (mandatory: events are never
+    matched against another tenant's entities), ``score_event_anomaly``
+    scoring, entity risk bump, and ``on_ueba_anomaly`` automation fanout.
     """
     from src.core.database import async_session_factory
     from src.ueba.ingest import ingest_behavior_event
+
+    if not organization_id:
+        raise ValueError("process_behavior_events requires an organization_id")
 
     processed = 0
     failed = 0
@@ -895,7 +899,7 @@ async def _cleanup_old_behavior_events_async(
 
 
 @shared_task(bind=True, max_retries=3)
-def process_behavior_events(self, organization_id: Optional[str], event_batch: list[dict]) -> dict:
+def process_behavior_events(self, organization_id: str, event_batch: list[dict]) -> dict:
     """
     Ingest and analyze new behavior events.
 

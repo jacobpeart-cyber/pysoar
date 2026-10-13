@@ -1,4 +1,10 @@
-"""Tests for IOC functionality"""
+"""Tests for IOC functionality
+
+Wave 1: /iocs is tenant-scoped, so these run as members of org A (the old
+org-less ``auth_headers`` user now gets 403 organization_required). Rows the
+tests modify belong to org A; rows with no organisation are platform feed
+intel, readable but not writable through /iocs.
+"""
 
 import pytest
 from httpx import AsyncClient
@@ -11,11 +17,11 @@ from src.models.ioc import IOC
 class TestIOCEndpoints:
     """Tests for IOC API endpoints"""
 
-    async def test_create_ioc(self, client: AsyncClient, auth_headers):
+    async def test_create_ioc(self, client: AsyncClient, org_a_headers):
         """Test creating an IOC"""
         response = await client.post(
             "/api/v1/iocs",
-            headers=auth_headers,
+            headers=org_a_headers,
             json={
                 "value": "192.168.1.100",
                 "ioc_type": "ip_address",
@@ -42,7 +48,7 @@ class TestIOCEndpoints:
 
         assert response.status_code == 401
 
-    async def test_list_iocs(self, client: AsyncClient, auth_headers, db_session: AsyncSession):
+    async def test_list_iocs(self, client: AsyncClient, org_a_headers, db_session: AsyncSession):
         """Test listing IOCs"""
         # Create test IOCs
         ioc1 = IOC(
@@ -61,7 +67,7 @@ class TestIOCEndpoints:
 
         response = await client.get(
             "/api/v1/iocs",
-            headers=auth_headers,
+            headers=org_a_headers,
         )
 
         assert response.status_code == 200
@@ -69,7 +75,7 @@ class TestIOCEndpoints:
         assert "items" in data
         assert len(data["items"]) >= 2
 
-    async def test_get_ioc(self, client: AsyncClient, auth_headers, db_session: AsyncSession):
+    async def test_get_ioc(self, client: AsyncClient, org_a_headers, db_session: AsyncSession):
         """Test getting a specific IOC"""
         ioc = IOC(
             value="evil.com",
@@ -82,7 +88,7 @@ class TestIOCEndpoints:
 
         response = await client.get(
             f"/api/v1/iocs/{ioc.id}",
-            headers=auth_headers,
+            headers=org_a_headers,
         )
 
         assert response.status_code == 200
@@ -90,10 +96,11 @@ class TestIOCEndpoints:
         assert data["value"] == "evil.com"
         assert data["ioc_type"] == "domain"
 
-    async def test_update_ioc(self, client: AsyncClient, auth_headers, db_session: AsyncSession):
+    async def test_update_ioc(self, client: AsyncClient, org_a_headers, org_a, db_session: AsyncSession):
         """Test updating an IOC"""
         ioc = IOC(
             value="suspicious.com",
+            organization_id=org_a.id,
             indicator_type="domain",
             severity="low",
         )
@@ -103,7 +110,7 @@ class TestIOCEndpoints:
 
         response = await client.patch(
             f"/api/v1/iocs/{ioc.id}",
-            headers=auth_headers,
+            headers=org_a_headers,
             json={"threat_level": "high"},
         )
 
@@ -111,10 +118,11 @@ class TestIOCEndpoints:
         data = response.json()
         assert data["threat_level"] == "high"
 
-    async def test_delete_ioc(self, client: AsyncClient, admin_auth_headers, db_session: AsyncSession):
+    async def test_delete_ioc(self, client: AsyncClient, org_a_admin_headers, org_a, db_session: AsyncSession):
         """Test deleting an IOC"""
         ioc = IOC(
             value="delete-me.com",
+            organization_id=org_a.id,
             indicator_type="domain",
             severity="low",
         )
@@ -124,12 +132,12 @@ class TestIOCEndpoints:
 
         response = await client.delete(
             f"/api/v1/iocs/{ioc.id}",
-            headers=admin_auth_headers,
+            headers=org_a_admin_headers,
         )
 
         assert response.status_code == 204
 
-    async def test_search_iocs(self, client: AsyncClient, auth_headers, db_session: AsyncSession):
+    async def test_search_iocs(self, client: AsyncClient, org_a_headers, db_session: AsyncSession):
         """Test searching IOCs"""
         ioc = IOC(
             value="searchme.evil.com",
@@ -141,7 +149,7 @@ class TestIOCEndpoints:
 
         response = await client.get(
             "/api/v1/iocs?search=searchme",
-            headers=auth_headers,
+            headers=org_a_headers,
         )
 
         assert response.status_code == 200
@@ -153,11 +161,11 @@ class TestIOCValidation:
     """Tests for IOC validation"""
 
     @pytest.mark.asyncio
-    async def test_invalid_ioc_type(self, client: AsyncClient, auth_headers):
+    async def test_invalid_ioc_type(self, client: AsyncClient, org_a_headers):
         """Test creating IOC with invalid type"""
         response = await client.post(
             "/api/v1/iocs",
-            headers=auth_headers,
+            headers=org_a_headers,
             json={
                 "value": "test",
                 "ioc_type": "invalid_type",
@@ -168,11 +176,11 @@ class TestIOCValidation:
         assert response.status_code in (201, 422)
 
     @pytest.mark.asyncio
-    async def test_empty_value(self, client: AsyncClient, auth_headers):
+    async def test_empty_value(self, client: AsyncClient, org_a_headers):
         """Test creating IOC with empty value"""
         response = await client.post(
             "/api/v1/iocs",
-            headers=auth_headers,
+            headers=org_a_headers,
             json={
                 "value": "",
                 "ioc_type": "ip_address",

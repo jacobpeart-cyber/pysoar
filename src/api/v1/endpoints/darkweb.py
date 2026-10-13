@@ -7,16 +7,17 @@ credential leak handling, and brand threat tracking.
 import json
 import math
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Annotated, Optional
 
-from fastapi import APIRouter, Path, BackgroundTasks, HTTPException, Query, status
+from fastapi import APIRouter, Depends, Path, BackgroundTasks, HTTPException, Query, status
 from fastapi.responses import StreamingResponse
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import CurrentUser, DatabaseSession
+from src.api.deps import CurrentUser, DatabaseSession, OrganizationId, require_role
 from src.core.database import async_session_factory
 from src.core.logging import get_logger
+from src.models.user import User, UserRole
 from src.services.automation import AutomationService
 from src.darkweb.models import (
     BrandThreat,
@@ -63,14 +64,23 @@ from src.schemas.darkweb import (
 router = APIRouter(prefix="/darkweb", tags=["Dark Web Monitoring"])
 logger = get_logger(__name__)
 
+# Tenancy and roles (wave 1, docs/audit/2026-10-08/PLAN.md): every monitor,
+# finding, credential leak and brand threat belongs to one organisation; every
+# query filters on the caller's OrganizationId, every created row is stamped
+# with it and lookups by id outside the tenant 404. Monitor configuration and
+# scans require admin; finding / credential / brand-threat triage (update,
+# escalate, notify, bulk actions, takedown requests) requires analyst or admin;
+# viewers are read-only.
+AnalystUser = Annotated[User, Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
+AdminRoleUser = Annotated[User, Depends(require_role([UserRole.ADMIN]))]
+
 
 async def get_monitor_or_404(
-    db: AsyncSession, monitor_id: str, org_id: Optional[str] = None
+    db: AsyncSession, monitor_id: str, org_id: str
 ) -> DarkWebMonitor:
     """Get monitor by ID or raise 404"""
     stmt = select(DarkWebMonitor).where(DarkWebMonitor.id == monitor_id)
-    if org_id is not None:
-        stmt = stmt.where(DarkWebMonitor.organization_id == org_id)
+    stmt = stmt.where(DarkWebMonitor.organization_id == org_id)
     result = await db.execute(stmt)
     monitor = result.scalar_one_or_none()
     if not monitor:
@@ -82,12 +92,11 @@ async def get_monitor_or_404(
 
 
 async def get_finding_or_404(
-    db: AsyncSession, finding_id: str, org_id: Optional[str] = None
+    db: AsyncSession, finding_id: str, org_id: str
 ) -> DarkWebFinding:
     """Get finding by ID or raise 404"""
     stmt = select(DarkWebFinding).where(DarkWebFinding.id == finding_id)
-    if org_id is not None:
-        stmt = stmt.where(DarkWebFinding.organization_id == org_id)
+    stmt = stmt.where(DarkWebFinding.organization_id == org_id)
     result = await db.execute(stmt)
     finding = result.scalar_one_or_none()
     if not finding:
@@ -99,12 +108,11 @@ async def get_finding_or_404(
 
 
 async def get_credential_or_404(
-    db: AsyncSession, credential_id: str, org_id: Optional[str] = None
+    db: AsyncSession, credential_id: str, org_id: str
 ) -> CredentialLeak:
     """Get credential leak by ID or raise 404"""
     stmt = select(CredentialLeak).where(CredentialLeak.id == credential_id)
-    if org_id is not None:
-        stmt = stmt.where(CredentialLeak.organization_id == org_id)
+    stmt = stmt.where(CredentialLeak.organization_id == org_id)
     result = await db.execute(stmt)
     credential = result.scalar_one_or_none()
     if not credential:
@@ -121,6 +129,7 @@ async def get_credential_or_404(
 @router.get("/monitors", response_model=DarkWebMonitorListResponse)
 async def list_monitors(
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -130,7 +139,7 @@ async def list_monitors(
 ):
     """List dark web monitors with filtering and pagination"""
     query = select(DarkWebMonitor).where(
-        DarkWebMonitor.organization_id == getattr(current_user, "organization_id", None)
+        DarkWebMonitor.organization_id == org_id
     )
 
     if enabled is not None:
@@ -175,12 +184,13 @@ async def list_monitors(
 @router.post("/monitors", response_model=DarkWebMonitorResponse, status_code=201)
 async def create_monitor(
     monitor: DarkWebMonitorCreate,
-    current_user: CurrentUser = None,
+    current_user: AdminRoleUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Create a new dark web monitor"""
     db_monitor = DarkWebMonitor(
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         name=monitor.name,
         description=monitor.description,
         monitor_type=monitor.monitor_type,
@@ -207,12 +217,13 @@ async def create_monitor(
 @router.get("/monitors/{monitor_id}", response_model=DarkWebMonitorResponse)
 async def get_monitor(
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     monitor_id: str = Path(...),
 ):
     """Get monitor by ID"""
     monitor = await get_monitor_or_404(
-        db, monitor_id, getattr(current_user, "organization_id", None)
+        db, monitor_id, org_id
     )
 
     return DarkWebMonitorResponse.model_validate(monitor)
@@ -221,13 +232,14 @@ async def get_monitor(
 @router.patch("/monitors/{monitor_id}", response_model=DarkWebMonitorResponse)
 async def update_monitor(
     update: DarkWebMonitorUpdate,
-    current_user: CurrentUser = None,
+    current_user: AdminRoleUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     monitor_id: str = Path(...),
 ):
     """Update monitor configuration"""
     monitor = await get_monitor_or_404(
-        db, monitor_id, getattr(current_user, "organization_id", None)
+        db, monitor_id, org_id
     )
 
     # Update fields
@@ -258,13 +270,14 @@ async def update_monitor(
 
 @router.delete("/monitors/{monitor_id}", status_code=204)
 async def delete_monitor(
-    current_user: CurrentUser = None,
+    current_user: AdminRoleUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     monitor_id: str = Path(...),
 ):
     """Delete monitor"""
     monitor = await get_monitor_or_404(
-        db, monitor_id, getattr(current_user, "organization_id", None)
+        db, monitor_id, org_id
     )
 
     await db.delete(monitor)
@@ -279,7 +292,8 @@ async def delete_monitor(
 )
 async def trigger_monitor_scan(
     scan_request: ScanTriggerRequest,
-    current_user: CurrentUser = None,
+    current_user: AdminRoleUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     monitor_id: str = Path(...),
 ):
@@ -305,7 +319,6 @@ async def trigger_monitor_scan(
     from src.darkweb.engine import DarkWebScanner
     import hashlib as _hashlib
 
-    org_id = getattr(current_user, "organization_id", None)
     monitor = await get_monitor_or_404(db, monitor_id, org_id)
 
     start_time = datetime.now(timezone.utc)
@@ -326,9 +339,15 @@ async def trigger_monitor_scan(
             forums = await scanner.search_forums()
             channels = await scanner.search_telegram_channels()
             marketplaces = await scanner.search_marketplaces()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(f"Dark web scan engine call failed: {exc}")
-        pastes, breaches, forums, channels, marketplaces = [], [], [], [], []
+    except Exception as exc:
+        # Previously swallowed into a "completed" scan with zero findings.
+        logger.warning(
+            "Dark web scan engine call failed", monitor_id=monitor_id, error=str(exc)
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={"error": "darkweb_scan_failed", "detail": str(exc)[:300]},
+        ) from exc
 
     persisted_findings: list[DarkWebFinding] = []
 
@@ -416,31 +435,29 @@ async def trigger_monitor_scan(
     await db.flush()
 
     # Fire automation on critical/high findings
+    # The findings are already persisted; a failing automation rule for one
+    # finding is logged and does not undo the scan.
     critical_count = 0
-    try:
-        automation = AutomationService(db)
-        for f in persisted_findings:
-            if f.severity in ("critical", "high"):
-                critical_count += 1
-                try:
-                    await automation.on_darkweb_finding(
-                        finding_type=f.finding_type or "unknown",
-                        description=f.description or "",
-                        severity=f.severity,
-                        organization_id=org_id,
-                    )
-                except Exception as inner_exc:  # noqa: BLE001
-                    logger.warning(f"on_darkweb_finding failed: {inner_exc}")
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(f"Automation fan-out failed during dark web scan: {exc}")
+    automation = AutomationService(db)
+    for f in persisted_findings:
+        if f.severity in ("critical", "high"):
+            critical_count += 1
+            try:
+                await automation.on_darkweb_finding(
+                    finding_type=f.finding_type or "unknown",
+                    description=f.description or "",
+                    severity=f.severity,
+                    organization_id=org_id,
+                )
+            except Exception as inner_exc:  # noqa: BLE001
+                logger.warning(
+                    "on_darkweb_finding failed", finding_id=f.id, error=str(inner_exc)
+                )
 
-    # Update monitor last_scan timestamp if the column exists
-    try:
-        if hasattr(monitor, "last_scan_date"):
-            monitor.last_scan_date = start_time
-        await db.flush()
-    except Exception:  # noqa: BLE001
-        pass
+    # Record the scan on the monitor (``last_check``; the old code wrote a
+    # non-existent ``last_scan_date`` attribute inside a swallowed try).
+    monitor.last_check = start_time.isoformat()
+    await db.flush()
 
     scan_id = f"scan_{monitor_id}_{int(start_time.timestamp())}"
     logger.info(
@@ -464,6 +481,7 @@ async def trigger_monitor_scan(
 @router.get("/findings", response_model=DarkWebFindingListResponse)
 async def list_findings(
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -475,7 +493,7 @@ async def list_findings(
 ):
     """List dark web findings with filtering"""
     query = select(DarkWebFinding).where(
-        DarkWebFinding.organization_id == getattr(current_user, "organization_id", None)
+        DarkWebFinding.organization_id == org_id
     )
 
     if monitor_id:
@@ -526,11 +544,12 @@ async def list_findings(
 @router.post("/findings", response_model=DarkWebFindingResponse, status_code=201)
 async def create_finding(
     finding_data: DarkWebFindingCreate,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
-    """Create a new dark web finding"""
-    org_id = getattr(current_user, "organization_id", None)
+    """Create a new dark web finding on one of the caller's monitors"""
+    await get_monitor_or_404(db, finding_data.monitor_id, org_id)
     finding = DarkWebFinding(
         organization_id=org_id,
         monitor_id=finding_data.monitor_id,
@@ -559,7 +578,9 @@ async def create_finding(
             organization_id=org_id,
         )
     except Exception as e:
-        logger.error(f"Automation failed for dark web finding {finding.id}: {e}")
+        # The finding is committed; a failing automation rule is logged and
+        # does not turn the create into an error.
+        logger.error("Automation failed for dark web finding", finding_id=finding.id, error=str(e))
 
     logger.info(f"Created dark web finding: {finding.id}")
 
@@ -569,12 +590,13 @@ async def create_finding(
 @router.get("/findings/{finding_id}", response_model=DarkWebFindingDetailResponse)
 async def get_finding(
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     finding_id: str = Path(...),
 ):
     """Get finding details with related data"""
     finding = await get_finding_or_404(
-        db, finding_id, getattr(current_user, "organization_id", None)
+        db, finding_id, org_id
     )
 
     return DarkWebFindingDetailResponse.model_validate(finding)
@@ -583,13 +605,14 @@ async def get_finding(
 @router.patch("/findings/{finding_id}", response_model=DarkWebFindingResponse)
 async def update_finding(
     update: DarkWebFindingUpdate,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     finding_id: str = Path(...),
 ):
     """Update finding status and notes"""
     finding = await get_finding_or_404(
-        db, finding_id, getattr(current_user, "organization_id", None)
+        db, finding_id, org_id
     )
 
     if update.status is not None:
@@ -609,7 +632,8 @@ async def update_finding(
 
 @router.post("/findings/{finding_id}/escalate")
 async def escalate_finding(
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     finding_id: str = Path(...),
 ):
@@ -624,7 +648,6 @@ async def escalate_finding(
     """
     from src.models.incident import Incident
     from src.models.base import generate_uuid, utc_now
-    org_id = getattr(current_user, "organization_id", None)
     finding = await get_finding_or_404(db, finding_id, org_id)
 
     # Idempotency: if already escalated and an Incident exists for this
@@ -680,7 +703,8 @@ async def escalate_finding(
 
 @router.post("/findings/{finding_id}/notify")
 async def notify_stakeholders(
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     finding_id: str = Path(...),
 ):
@@ -694,7 +718,7 @@ async def notify_stakeholders(
     from src.services.notifications import send_incident_notifications
 
     finding = await get_finding_or_404(
-        db, finding_id, getattr(current_user, "organization_id", None)
+        db, finding_id, org_id
     )
 
     event = {
@@ -733,14 +757,19 @@ async def notify_stakeholders(
 
 
 @router.post("/findings/bulk-action")
-async def bulk_finding_action(action: BulkFindingAction, current_user: CurrentUser = None, db: DatabaseSession = None, background_tasks: BackgroundTasks = None):
+async def bulk_finding_action(
+    action: BulkFindingAction,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
+    db: DatabaseSession = None,
+):
     """Perform bulk actions on findings"""
     # Verify ownership
     result = await db.execute(
         select(DarkWebFinding).where(
             and_(
                 DarkWebFinding.id.in_(action.finding_ids),
-                DarkWebFinding.organization_id == getattr(current_user, "organization_id", None),
+                DarkWebFinding.organization_id == org_id,
             )
         )
     )
@@ -778,6 +807,7 @@ async def bulk_finding_action(action: BulkFindingAction, current_user: CurrentUs
 @router.get("/credentials", response_model=CredentialLeakListResponse)
 async def list_credentials(
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -787,7 +817,7 @@ async def list_credentials(
 ):
     """List credential leaks"""
     query = select(CredentialLeak).where(
-        CredentialLeak.organization_id == getattr(current_user, "organization_id", None)
+        CredentialLeak.organization_id == org_id
     )
 
     if remediated is not None:
@@ -817,7 +847,7 @@ async def list_credentials(
             select(CredentialLeak)
             .where(
                 and_(
-                    CredentialLeak.organization_id == getattr(current_user, "organization_id", None),
+                    CredentialLeak.organization_id == org_id,
                     CredentialLeak.is_remediated == False,
                 )
             )
@@ -848,13 +878,14 @@ async def list_credentials(
 @router.patch("/credentials/{credential_id}", response_model=CredentialLeakResponse)
 async def update_credential(
     update: CredentialLeakUpdate,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     credential_id: str = Path(...),
 ):
     """Update credential leak remediation status"""
     credential = await get_credential_or_404(
-        db, credential_id, getattr(current_user, "organization_id", None)
+        db, credential_id, org_id
     )
 
     if update.is_valid is not None:
@@ -873,7 +904,8 @@ async def update_credential(
 @router.post("/credentials/bulk-remediate", response_model=CredentialRemediationReport)
 async def bulk_remediate_credentials(
     action: BulkCredentialRemediateAction,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Bulk remediate credentials"""
@@ -882,7 +914,7 @@ async def bulk_remediate_credentials(
         select(CredentialLeak).where(
             and_(
                 CredentialLeak.id.in_(action.credential_ids),
-                CredentialLeak.organization_id == getattr(current_user, "organization_id", None),
+                CredentialLeak.organization_id == org_id,
             )
         )
     )
@@ -897,20 +929,19 @@ async def bulk_remediate_credentials(
     mfa_enforced = 0
     failed_actions = 0
 
+    # Records the remediation decision on each leak (no external action is
+    # executed here); nothing in this loop can fail per credential, so a
+    # database error surfaces as an error response instead of a count.
     for credential in credentials:
-        try:
-            credential.remediation_action = action.action
-            credential.is_remediated = True
+        credential.remediation_action = action.action
+        credential.is_remediated = True
 
-            if action.action == "password_reset":
-                password_reset_sent += 1
-            elif action.action == "account_disabled":
-                account_disabled += 1
-            elif action.action == "mfa_enforced":
-                mfa_enforced += 1
-        except Exception as e:
-            logger.error(f"Remediation failed for credential {credential.id}: {e}")
-            failed_actions += 1
+        if action.action == "password_reset":
+            password_reset_sent += 1
+        elif action.action == "account_disabled":
+            account_disabled += 1
+        elif action.action == "mfa_enforced":
+            mfa_enforced += 1
 
     await db.commit()
 
@@ -932,6 +963,7 @@ async def bulk_remediate_credentials(
 @router.get("/brand-threats", response_model=BrandThreatListResponse)
 async def list_brand_threats(
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -941,7 +973,7 @@ async def list_brand_threats(
 ):
     """List brand threats"""
     query = select(BrandThreat).where(
-        BrandThreat.organization_id == getattr(current_user, "organization_id", None)
+        BrandThreat.organization_id == org_id
     )
 
     if status:
@@ -980,7 +1012,8 @@ async def list_brand_threats(
 @router.patch("/brand-threats/{threat_id}", response_model=BrandThreatResponse)
 async def update_brand_threat(
     update: BrandThreatUpdate,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     threat_id: str = Path(...),
 ):
@@ -989,7 +1022,7 @@ async def update_brand_threat(
         select(BrandThreat).where(
             and_(
                 BrandThreat.id == threat_id,
-                BrandThreat.organization_id == getattr(current_user, "organization_id", None),
+                BrandThreat.organization_id == org_id,
             )
         )
     )
@@ -1011,7 +1044,8 @@ async def update_brand_threat(
 
 @router.post("/brand-threats/{threat_id}/initiate-takedown")
 async def initiate_takedown(
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     background_tasks: BackgroundTasks = None,
     threat_id: str = Path(...),
@@ -1021,7 +1055,7 @@ async def initiate_takedown(
         select(BrandThreat).where(
             and_(
                 BrandThreat.id == threat_id,
-                BrandThreat.organization_id == getattr(current_user, "organization_id", None),
+                BrandThreat.organization_id == org_id,
             )
         )
     )
@@ -1064,6 +1098,7 @@ async def initiate_takedown(
 @router.get("/dashboard", response_model=DarkWebDashboard)
 async def get_dashboard(
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Get dark web monitoring dashboard.
@@ -1083,7 +1118,6 @@ async def get_dashboard(
     from datetime import timedelta
     from src.darkweb.models import PasswordType
 
-    org_id = getattr(current_user, "organization_id", None)
 
     # --- Finding counts ---
     findings_result = await db.execute(
@@ -1117,19 +1151,24 @@ async def get_dashboard(
     # Unique domains = unique "after @" portion of the email column
     # (Postgres supports split_part; the fallback is a Python pass
     # over a small row set)
-    exposed_domains = 0
-    try:
-        dom_rows = await db.execute(
-            select(func.distinct(func.split_part(CredentialLeak.email, "@", 2))).where(
-                and_(
-                    CredentialLeak.organization_id == org_id,
-                    CredentialLeak.email.is_not(None),
-                )
+    # Computed from the distinct emails in Python: portable across database
+    # dialects. The old split_part() query sat in an `except: pass`, which
+    # on Postgres also left the transaction aborted for every later query.
+    email_rows = await db.execute(
+        select(func.distinct(CredentialLeak.email)).where(
+            and_(
+                CredentialLeak.organization_id == org_id,
+                CredentialLeak.email.is_not(None),
             )
         )
-        exposed_domains = len([r for (r,) in dom_rows.all() if r])
-    except Exception:  # noqa: BLE001
-        pass
+    )
+    exposed_domains = len(
+        {
+            email.rsplit("@", 1)[1].lower()
+            for (email,) in email_rows.all()
+            if email and "@" in email and email.rsplit("@", 1)[1]
+        }
+    )
 
     # --- Credential stats ---
     creds_result = await db.execute(
@@ -1177,12 +1216,9 @@ async def get_dashboard(
         by_source[src or "unknown"] = int(count)
 
     # Real crackable / plaintext counts
-    try:
-        plain_str = PasswordType.PLAINTEXT.value
-        md5_str = PasswordType.MD5.value if hasattr(PasswordType, "MD5") else "md5"
-        sha1_str = PasswordType.SHA1.value if hasattr(PasswordType, "SHA1") else "sha1"
-    except Exception:  # noqa: BLE001
-        plain_str, md5_str, sha1_str = "plaintext", "md5", "sha1"
+    plain_str = PasswordType.PLAINTEXT.value
+    md5_str = PasswordType.MD5.value
+    sha1_str = PasswordType.SHA1.value
 
     plaintext_result = await db.execute(
         select(func.count(CredentialLeak.id)).where(
@@ -1262,70 +1298,64 @@ async def get_dashboard(
     # --- Real trending_threats (last 7d vs last 30d by finding_type) ---
     now = datetime.now(timezone.utc)
     trending: list[TrendingThreats] = []
-    try:
-        type_rows_30d = await db.execute(
-            select(DarkWebFinding.finding_type, func.count(DarkWebFinding.id))
-            .where(
-                and_(
-                    DarkWebFinding.organization_id == org_id,
-                    DarkWebFinding.created_at >= now - timedelta(days=30),
-                )
+    type_rows_30d = await db.execute(
+        select(DarkWebFinding.finding_type, func.count(DarkWebFinding.id))
+        .where(
+            and_(
+                DarkWebFinding.organization_id == org_id,
+                DarkWebFinding.created_at >= now - timedelta(days=30),
             )
-            .group_by(DarkWebFinding.finding_type)
         )
-        counts_30d = {t: int(c) for t, c in type_rows_30d.all() if t}
+        .group_by(DarkWebFinding.finding_type)
+    )
+    counts_30d = {t: int(c) for t, c in type_rows_30d.all() if t}
 
-        type_rows_7d = await db.execute(
-            select(DarkWebFinding.finding_type, func.count(DarkWebFinding.id))
-            .where(
-                and_(
-                    DarkWebFinding.organization_id == org_id,
-                    DarkWebFinding.created_at >= now - timedelta(days=7),
-                )
+    type_rows_7d = await db.execute(
+        select(DarkWebFinding.finding_type, func.count(DarkWebFinding.id))
+        .where(
+            and_(
+                DarkWebFinding.organization_id == org_id,
+                DarkWebFinding.created_at >= now - timedelta(days=7),
             )
-            .group_by(DarkWebFinding.finding_type)
         )
-        counts_7d = {t: int(c) for t, c in type_rows_7d.all() if t}
+        .group_by(DarkWebFinding.finding_type)
+    )
+    counts_7d = {t: int(c) for t, c in type_rows_7d.all() if t}
 
-        for ftype, c30 in counts_30d.items():
-            c7 = counts_7d.get(ftype, 0)
-            # Rising if the 7d count is more than 1/4 of the 30d
-            # count (rough threshold — recent share > linear share)
-            expected_7 = c30 / 30 * 7 if c30 else 0
-            if c7 > expected_7 * 1.2:
-                trend = "rising"
-            elif c7 < expected_7 * 0.8:
-                trend = "declining"
-            else:
-                trend = "stable"
-            trending.append(
-                TrendingThreats(
-                    threat_type=ftype,
-                    occurrences_last_7_days=c7,
-                    occurrences_last_30_days=c30,
-                    trend=trend,
-                    affected_industries=[],
-                )
+    for ftype, c30 in counts_30d.items():
+        c7 = counts_7d.get(ftype, 0)
+        # Rising if the 7d count is more than 1/4 of the 30d
+        # count (rough threshold — recent share > linear share)
+        expected_7 = c30 / 30 * 7 if c30 else 0
+        if c7 > expected_7 * 1.2:
+            trend = "rising"
+        elif c7 < expected_7 * 0.8:
+            trend = "declining"
+        else:
+            trend = "stable"
+        trending.append(
+            TrendingThreats(
+                threat_type=ftype,
+                occurrences_last_7_days=c7,
+                occurrences_last_30_days=c30,
+                trend=trend,
+                affected_industries=[],
             )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(f"trending threats aggregation failed: {exc}")
+        )
 
     # Last scan + inferred frequency (based on monitors)
     last_scan_iso: Optional[str] = None
     scan_frequency = "manual"
-    try:
-        last_scan_rows = await db.execute(
-            select(func.max(DarkWebFinding.discovered_date)).where(
-                DarkWebFinding.organization_id == org_id
-            )
+    last_scan_rows = await db.execute(
+        select(func.max(DarkWebFinding.discovered_date)).where(
+            DarkWebFinding.organization_id == org_id
         )
-        lv = last_scan_rows.scalar()
-        if lv:
-            last_scan_iso = lv.isoformat() if hasattr(lv, "isoformat") else str(lv)
-        if active_monitors > 0:
-            scan_frequency = "daily"
-    except Exception:  # noqa: BLE001
-        pass
+    )
+    lv = last_scan_rows.scalar()
+    if lv:
+        last_scan_iso = lv.isoformat() if hasattr(lv, "isoformat") else str(lv)
+    if active_monitors > 0:
+        scan_frequency = "daily"
 
     return DarkWebDashboard(
         exposure_summary=DarkWebExposureSummary(
@@ -1371,6 +1401,7 @@ async def get_dashboard(
 @router.get("/report/export")
 async def export_darkweb_report(
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     format: str = Query("csv", pattern="^(csv|pdf)$"),
 ):
@@ -1387,7 +1418,6 @@ async def export_darkweb_report(
     import io
     from datetime import datetime as _dt
 
-    org_id = getattr(current_user, "organization_id", None)
 
     # Pull findings + their matched monitor name in a single query.
     stmt = (

@@ -1,7 +1,24 @@
-"""Threat Intelligence Platform API endpoints"""
+"""Threat Intelligence Platform API endpoints
+
+Tenancy (wave 1, docs/audit/2026-10-08/PLAN.md):
+
+* Feeds, indicators, sightings, actors, campaigns and reports are owned by an
+  organisation: every query filters on the caller's ``OrganizationId`` and
+  every created row is stamped with it. Lookups by id outside the tenant 404.
+* NULL-organisation convention: ``organization_id IS NULL`` marks PLATFORM
+  intel, i.e. the built-in feeds registered at startup and the indicators the
+  system-wide feed poll ingests for them (see ``src/intel/feeds.py``). Reads
+  of feeds and indicators (list / get / search / lookup / export / stats)
+  return the caller's rows PLUS platform rows. Platform rows are read-only to
+  tenants: update / delete / enrich / whitelist / poll answer 403
+  ``platform_intel_read_only``. Only a platform superuser manages them
+  (``POST /feeds/register-builtins``, ``POST /feeds/poll-all``).
+* Roles: feed configuration and polling require ``admin``; indicator,
+  sighting, actor, campaign and report writes require ``analyst`` or
+  ``admin``; viewers are read-only.
+"""
 
 import asyncio
-import json
 import logging
 import math
 import re
@@ -11,11 +28,20 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 
 import httpx
-from fastapi import APIRouter, BackgroundTasks, Path, HTTPException, Query, status
+from typing import Annotated
+
+from fastapi import APIRouter, BackgroundTasks, Depends, Path, HTTPException, Query, status
 from sqlalchemy import and_, desc, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import CurrentUser, DatabaseSession, get_current_admin_user
+from src.api.deps import (
+    CurrentUser,
+    DatabaseSession,
+    OrganizationId,
+    PlatformSuperUser,
+    require_role,
+)
+from src.core.secrets import _decrypt_secret_json
 from src.intel.models import (
     IndicatorSighting,
     IntelReport,
@@ -25,8 +51,13 @@ from src.intel.models import (
     ThreatIndicator,
 )
 from src.integrations.models import InstalledIntegration, IntegrationConnector
+from src.models.user import User, UserRole
 
 logger = logging.getLogger(__name__)
+
+# Role gates (viewers are read-only on every route below).
+AnalystUser = Annotated[User, Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
+AdminRoleUser = Annotated[User, Depends(require_role([UserRole.ADMIN]))]
 
 # ---------------------------------------------------------------------------
 # In-process TTL cache for external IOC enrichment
@@ -35,11 +66,13 @@ logger = logging.getLogger(__name__)
 # rate-limit us aggressively, so we cache lookups for 1 hour per
 # (provider, indicator_type, value) tuple. This keeps the UI snappy on repeat
 # lookups and avoids burning quota on the same indicator.
+# The key also carries the organisation id: each tenant enriches with its own
+# installed API keys, so one tenant's lookups never serve another tenant.
 _IOC_CACHE_TTL_SECONDS = 3600
-_ioc_lookup_cache: dict[tuple[str, str, str], tuple[float, dict[str, Any]]] = {}
+_ioc_lookup_cache: dict[tuple[str, ...], tuple[float, dict[str, Any]]] = {}
 
 
-def _cache_get(key: tuple[str, str, str]) -> Optional[dict[str, Any]]:
+def _cache_get(key: tuple[str, ...]) -> Optional[dict[str, Any]]:
     entry = _ioc_lookup_cache.get(key)
     if not entry:
         return None
@@ -50,7 +83,7 @@ def _cache_get(key: tuple[str, str, str]) -> Optional[dict[str, Any]]:
     return value
 
 
-def _cache_set(key: tuple[str, str, str], value: dict[str, Any]) -> None:
+def _cache_set(key: tuple[str, ...], value: dict[str, Any]) -> None:
     _ioc_lookup_cache[key] = (time.time() + _IOC_CACHE_TTL_SECONDS, value)
 
 
@@ -95,13 +128,16 @@ def _normalize_type(t: str) -> str:
 
 async def _load_intel_integrations(
     db: AsyncSession,
-) -> dict[str, dict[str, Any]]:
-    """Load installed VirusTotal / AbuseIPDB integration credentials.
+    org_id: str,
+) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    """Load the caller organisation's VirusTotal / AbuseIPDB credentials.
 
-    Returns a mapping ``{connector_name: credentials_dict}`` for any active
-    installation. Credentials for these connectors are stored as plaintext
-    JSON in ``auth_credentials_encrypted`` (name is historical — see
-    ``src/integrations/engine.py`` ``test_connection``).
+    Returns ``({connector_name: credentials_dict}, errors)``. Only the
+    caller's own installations are considered (one tenant's API key never
+    serves another tenant). Credentials are stored as an ``enc:v1:``
+    envelope in ``auth_credentials_encrypted``; an installation whose
+    credentials cannot be read is reported in ``errors`` instead of being
+    silently treated as "not configured".
     """
     q = (
         select(InstalledIntegration, IntegrationConnector)
@@ -109,23 +145,25 @@ async def _load_intel_integrations(
             IntegrationConnector,
             IntegrationConnector.id == InstalledIntegration.connector_id,
         )
-        .where(IntegrationConnector.name.in_(("virustotal", "abuseipdb")))
+        .where(
+            IntegrationConnector.name.in_(("virustotal", "abuseipdb")),
+            InstalledIntegration.organization_id == org_id,
+        )
     )
     result = await db.execute(q)
     integrations: dict[str, dict[str, Any]] = {}
+    errors: list[str] = []
     for inst, conn in result.all():
-        try:
-            creds = json.loads(inst.auth_credentials_encrypted or "{}")
-        except (json.JSONDecodeError, TypeError):
-            creds = {}
-        if not isinstance(creds, dict):
+        creds = _decrypt_secret_json(inst.auth_credentials_encrypted)
+        if not creds and inst.auth_credentials_encrypted:
+            errors.append(f"{conn.name.lower()}: credentials_unreadable")
             continue
         # Only surface integrations that have a usable key.
         if conn.name.lower() in ("virustotal", "abuseipdb") and (
             creds.get("api_key") or creds.get("apikey") or creds.get("key")
         ):
             integrations[conn.name.lower()] = creds
-    return integrations
+    return integrations, errors
 
 
 def _vt_verdict(stats: dict[str, Any]) -> tuple[str, int]:
@@ -346,6 +384,71 @@ router = APIRouter(prefix="/threat-intel", tags=["Threat Intelligence"])
 
 
 # ============================================================================
+# TENANCY HELPERS
+# ============================================================================
+# NULL-organisation convention: a feed or indicator with organization_id NULL
+# is platform intel (built-in feeds and what the system-wide poll ingests for
+# them). Tenants read it alongside their own rows but can never modify it.
+
+
+def _visible_to(model: Any, org_id: str) -> Any:
+    """Rows of ``model`` the tenant may read: its own plus platform (NULL) rows."""
+    return or_(model.organization_id == org_id, model.organization_id.is_(None))
+
+
+def _platform_read_only(kind: str) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail={
+            "error": "platform_intel_read_only",
+            "detail": f"this {kind} is platform-wide threat intel and is read-only to tenants",
+        },
+    )
+
+
+async def _get_visible_feed_or_404(db: AsyncSession, feed_id: str, org_id: str) -> ThreatFeed:
+    result = await db.execute(
+        select(ThreatFeed).where(ThreatFeed.id == feed_id, _visible_to(ThreatFeed, org_id))
+    )
+    feed = result.scalars().first()
+    if not feed:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Feed not found")
+    return feed
+
+
+async def _get_owned_feed(db: AsyncSession, feed_id: str, org_id: str) -> ThreatFeed:
+    """The caller's own feed: 404 outside the tenant, 403 for a platform feed."""
+    feed = await _get_visible_feed_or_404(db, feed_id, org_id)
+    if feed.organization_id is None:
+        raise _platform_read_only("feed")
+    return feed
+
+
+async def _get_visible_indicator_or_404(
+    db: AsyncSession, indicator_id: str, org_id: str
+) -> ThreatIndicator:
+    result = await db.execute(
+        select(ThreatIndicator).where(
+            ThreatIndicator.id == indicator_id, _visible_to(ThreatIndicator, org_id)
+        )
+    )
+    indicator = result.scalars().first()
+    if not indicator:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Indicator not found")
+    return indicator
+
+
+async def _get_owned_indicator(
+    db: AsyncSession, indicator_id: str, org_id: str
+) -> ThreatIndicator:
+    """The caller's own indicator: 404 outside the tenant, 403 for platform intel."""
+    indicator = await _get_visible_indicator_or_404(db, indicator_id, org_id)
+    if indicator.organization_id is None:
+        raise _platform_read_only("indicator")
+    return indicator
+
+
+# ============================================================================
 # STATS AND LOOKUP ENDPOINTS (consumed by frontend ThreatIntel.tsx)
 # ============================================================================
 
@@ -353,18 +456,17 @@ router = APIRouter(prefix="/threat-intel", tags=["Threat Intelligence"])
 @router.get("/stats", response_model=None, operation_id="get_threat_intel_stats")
 async def get_threat_intel_stats(
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ) -> dict:
     """
     Get threat intelligence stats for the frontend dashboard cards.
-    """
-    org_id = getattr(current_user, "organization_id", None)
 
-    # Build org filter - scope to the caller's organization when present.
+    Counts the caller's own feeds/indicators plus platform (NULL-org) intel.
+    """
+
     def org_filter(model):
-        if org_id is None:
-            return True
-        return model.organization_id == org_id
+        return _visible_to(model, org_id)
 
     total_indicators = (
         await db.execute(
@@ -441,6 +543,7 @@ async def get_threat_intel_stats(
 async def lookup_ioc(
     payload: dict,
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ) -> dict:
     """Look up an IOC and enrich with external feeds.
@@ -470,14 +573,10 @@ async def lookup_ioc(
             detail="indicator is required",
         )
 
-    # Query matching indicators in the local DB
-    org_id = getattr(current_user, "organization_id", None)
-    org_clause = (
-        ThreatIndicator.organization_id == org_id if org_id is not None else True
-    )
+    # Query matching indicators in the local DB: own plus platform intel.
     query = select(ThreatIndicator).where(
         and_(
-            org_clause,
+            _visible_to(ThreatIndicator, org_id),
             ThreatIndicator.value == indicator_value,
         )
     )
@@ -505,11 +604,7 @@ async def lookup_ioc(
             {
                 "name": ind.source or "Internal",
                 "verdict": severity_to_reputation.get(ind.severity or "", "unknown"),
-                "last_seen": (
-                    ind.last_seen.isoformat()
-                    if ind.last_seen
-                    else datetime.now(timezone.utc).isoformat()
-                ),
+                "last_seen": ind.last_seen.isoformat() if ind.last_seen else None,
             }
             for ind in indicators
         ]
@@ -546,13 +641,12 @@ async def lookup_ioc(
     external_errors: list[str] = []
     external_status = "ok"
 
-    try:
-        integrations = await _load_intel_integrations(db)
-    except Exception as e:
-        logger.warning("Failed to load intel integrations: %s", e)
-        integrations = {}
+    integrations, credential_errors = await _load_intel_integrations(db, org_id)
+    external_errors.extend(credential_errors)
 
-    if not integrations:
+    if not integrations and credential_errors:
+        external_status = "integration_credentials_unreadable"
+    elif not integrations:
         external_status = "no_integrations_configured"
     elif dispatch_type not in ("ip", "domain", "url", "hash"):
         external_status = "unsupported_indicator_type"
@@ -570,7 +664,7 @@ async def lookup_ioc(
         cached_hits: list[dict[str, Any]] = []
         missing: list[str] = []
         for provider in providers_to_call:
-            cache_key = (provider, dispatch_type, indicator_value)
+            cache_key = (org_id, provider, dispatch_type, indicator_value)
             cached = _cache_get(cache_key)
             if cached is not None:
                 cached_hits.append(cached)
@@ -582,9 +676,10 @@ async def lookup_ioc(
         if missing:
             sub_integrations = {k: v for k, v in integrations.items() if k in missing}
             try:
-                fresh_sources, external_errors = await _enrich_external(
+                fresh_sources, provider_errors = await _enrich_external(
                     dispatch_type, indicator_value, sub_integrations
                 )
+                external_errors.extend(provider_errors)
             except Exception as e:
                 logger.exception("External IOC enrichment crashed: %s", e)
                 external_errors.append(f"enrichment_crashed: {e}")
@@ -593,7 +688,7 @@ async def lookup_ioc(
             # Populate cache for successful results only
             for src in fresh_sources:
                 if src.get("verdict") not in ("error",):
-                    _cache_set((src["name"], dispatch_type, indicator_value), src)
+                    _cache_set((org_id, src["name"], dispatch_type, indicator_value), src)
 
         external_sources = cached_hits + fresh_sources
         if not external_sources and external_status == "ok":
@@ -640,20 +735,19 @@ async def lookup_ioc(
 @router.post("/feeds", response_model=ThreatFeedResponse, status_code=status.HTTP_201_CREATED)
 async def create_threat_feed(
     feed_data: ThreatFeedCreate,
-    current_user: CurrentUser = None,
+    current_user: AdminRoleUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ) -> ThreatFeedResponse:
     """
-    Create a new threat feed.
-
-    Requires admin privileges.
+    Create a new threat feed owned by the caller's organisation (admin only).
     """
-    # Use current_user directly (admin check handled by dependency injection)
+    await _ensure_feed_name_free(db, feed_data.name)
 
     feed = ThreatFeed(
         id=str(uuid.uuid4()),
         **feed_data.model_dump(),
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
     )
     db.add(feed)
     await db.flush()
@@ -661,9 +755,21 @@ async def create_threat_feed(
     return feed
 
 
+async def _ensure_feed_name_free(db: AsyncSession, name: str) -> None:
+    """``threat_feeds.name`` is globally unique in the schema; answer 409
+    instead of letting the insert fail with an IntegrityError (500)."""
+    existing = await db.execute(select(ThreatFeed.id).where(ThreatFeed.name == name))
+    if existing.first() is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"error": "feed_name_taken", "detail": "a threat feed with this name already exists"},
+        )
+
+
 @router.get("/feeds", response_model=ThreatFeedListResponse, operation_id="list_threat_feeds")
 async def list_threat_feeds(
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=200),
@@ -672,13 +778,9 @@ async def list_threat_feeds(
     search: Optional[str] = None,
 ) -> ThreatFeedListResponse:
     """
-    List threat feeds with filtering and pagination.
+    List the caller's threat feeds plus the platform (NULL-org) built-in feeds.
     """
-    query = select(ThreatFeed)
-
-    org_id = getattr(current_user, "organization_id", None)
-    if org_id is not None:
-        query = query.where(ThreatFeed.organization_id == org_id)
+    query = select(ThreatFeed).where(_visible_to(ThreatFeed, org_id))
 
     if is_enabled is not None:
         query = query.where(ThreatFeed.is_enabled == is_enabled)
@@ -709,7 +811,10 @@ async def list_threat_feeds(
         feed_ids = [f.id for f in items]
         live_counts_res = await db.execute(
             select(ThreatIndicator.feed_id, func.count(ThreatIndicator.id))
-            .where(ThreatIndicator.feed_id.in_(feed_ids))
+            .where(
+                ThreatIndicator.feed_id.in_(feed_ids),
+                _visible_to(ThreatIndicator, org_id),
+            )
             .group_by(ThreatIndicator.feed_id)
         )
         live_counts = {row[0]: row[1] for row in live_counts_res.all()}
@@ -725,47 +830,33 @@ async def list_threat_feeds(
 @router.get("/feeds/{feed_id}", response_model=ThreatFeedResponse, operation_id="get_threat_feed")
 async def get_threat_feed(
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     feed_id: str = Path(...),
 ) -> ThreatFeedResponse:
     """
-    Get threat feed details.
+    Get threat feed details (own or platform feed).
     """
-    org_id = getattr(current_user, "organization_id", None)
-    stmt = select(ThreatFeed).where(ThreatFeed.id == feed_id)
-    if org_id is not None:
-        stmt = stmt.where(ThreatFeed.organization_id == org_id)
-    result = await db.execute(stmt)
-    feed = result.scalars().first()
-    if not feed:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Feed not found")
-    return feed
+    return await _get_visible_feed_or_404(db, feed_id, org_id)
 
 
 @router.put("/feeds/{feed_id}", response_model=ThreatFeedResponse, operation_id="update_threat_feed")
 async def update_threat_feed(
     feed_update: ThreatFeedUpdate,
-    current_user: CurrentUser = None,
+    current_user: AdminRoleUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     feed_id: str = Path(...),
 ) -> ThreatFeedResponse:
     """
-    Update a threat feed.
-
-    Requires admin privileges.
+    Update one of the caller's threat feeds (admin only; platform feeds 403).
     """
-    # Use current_user directly (admin check handled by dependency injection)
+    feed = await _get_owned_feed(db, feed_id, org_id)
 
-    org_id = getattr(current_user, "organization_id", None)
-    stmt = select(ThreatFeed).where(ThreatFeed.id == feed_id)
-    if org_id is not None:
-        stmt = stmt.where(ThreatFeed.organization_id == org_id)
-    result = await db.execute(stmt)
-    feed = result.scalars().first()
-    if not feed:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Feed not found")
-
-    for field, value in feed_update.model_dump(exclude_unset=True).items():
+    changes = feed_update.model_dump(exclude_unset=True)
+    if changes.get("name") and changes["name"] != feed.name:
+        await _ensure_feed_name_free(db, changes["name"])
+    for field, value in changes.items():
         setattr(feed, field, value)
 
     await db.flush()
@@ -775,25 +866,15 @@ async def update_threat_feed(
 
 @router.delete("/feeds/{feed_id}", status_code=status.HTTP_204_NO_CONTENT, operation_id="delete_threat_feed")
 async def delete_threat_feed(
-    current_user: CurrentUser = None,
+    current_user: AdminRoleUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     feed_id: str = Path(...),
 ) -> None:
     """
-    Delete a threat feed.
-
-    Requires admin privileges.
+    Delete one of the caller's threat feeds (admin only; platform feeds 403).
     """
-    # Use current_user directly (admin check handled by dependency injection)
-
-    org_id = getattr(current_user, "organization_id", None)
-    stmt = select(ThreatFeed).where(ThreatFeed.id == feed_id)
-    if org_id is not None:
-        stmt = stmt.where(ThreatFeed.organization_id == org_id)
-    result = await db.execute(stmt)
-    feed = result.scalars().first()
-    if not feed:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Feed not found")
+    feed = await _get_owned_feed(db, feed_id, org_id)
 
     await db.delete(feed)
     await db.flush()
@@ -802,7 +883,8 @@ async def delete_threat_feed(
 @router.post("/feeds/{feed_id}/poll", response_model=None, operation_id="poll_threat_feed")
 async def poll_threat_feed(
     background_tasks: BackgroundTasks,
-    current_user: CurrentUser = None,
+    current_user: AdminRoleUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     feed_id: str = Path(...),
 ) -> dict:
@@ -813,16 +895,12 @@ async def poll_threat_feed(
     never grew. This now dispatches ``FeedManager.poll_feed(feed_id)``
     as a background task so the HTTP response returns immediately while
     the ingestion runs against its own session and writes real rows
-    into ``threat_indicators``.
+    into ``threat_indicators``, stamped with the feed's organisation.
+
+    Admin only. Platform (NULL-org) feeds answer 403: polling them affects
+    every tenant, so only a platform superuser may (``POST /feeds/poll-all``).
     """
-    org_id = getattr(current_user, "organization_id", None)
-    stmt = select(ThreatFeed).where(ThreatFeed.id == feed_id)
-    if org_id is not None:
-        stmt = stmt.where(ThreatFeed.organization_id == org_id)
-    result = await db.execute(stmt)
-    feed = result.scalars().first()
-    if not feed:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Feed not found")
+    feed = await _get_owned_feed(db, feed_id, org_id)
     if not feed.is_enabled:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -834,21 +912,7 @@ async def poll_threat_feed(
     feed.last_poll_at = datetime.now(timezone.utc)
     await db.flush()
 
-    async def _run_poll(fid: str) -> None:
-        try:
-            from src.intel.feeds import FeedManager
-            count = await FeedManager().poll_feed(fid)
-            import logging
-            logging.getLogger(__name__).info(
-                "Threat feed poll completed", extra={"feed_id": fid, "new_indicators": count}
-            )
-        except Exception as exc:  # noqa: BLE001
-            import logging
-            logging.getLogger(__name__).error(
-                "Threat feed poll failed: %s", exc, extra={"feed_id": fid}, exc_info=True
-            )
-
-    background_tasks.add_task(_run_poll, feed_id)
+    background_tasks.add_task(_run_feed_poll, feed_id)
 
     return {
         "status": "poll_started",
@@ -862,10 +926,27 @@ async def poll_threat_feed(
     }
 
 
+async def _run_feed_poll(feed_id: str) -> None:
+    """Background poll of one feed. ``FeedManager.poll_feed`` records
+    fetch/parse problems on ``feed.last_error`` (shown on the Feeds tab); an
+    unexpected crash is logged with its traceback and re-raised."""
+    from src.intel.feeds import FeedManager
+
+    try:
+        count = await FeedManager().poll_feed(feed_id)
+    except Exception:
+        logger.exception("Threat feed poll failed", extra={"feed_id": feed_id})
+        raise
+    logger.info(
+        "Threat feed poll completed", extra={"feed_id": feed_id, "new_indicators": count}
+    )
+
+
 @router.post("/feeds/{feed_id}/sync", response_model=None, operation_id="sync_threat_feed")
 async def sync_threat_feed(
     background_tasks: BackgroundTasks,
-    current_user: CurrentUser = None,
+    current_user: AdminRoleUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     feed_id: str = Path(...),
 ) -> dict:
@@ -873,6 +954,7 @@ async def sync_threat_feed(
     return await poll_threat_feed(
         background_tasks=background_tasks,
         current_user=current_user,
+        org_id=org_id,
         db=db,
         feed_id=feed_id,
     )
@@ -880,97 +962,73 @@ async def sync_threat_feed(
 
 @router.post("/feeds/register-builtins", response_model=None, operation_id="register_builtin_feeds")
 async def register_builtin_feeds(
-    current_user: CurrentUser = None,
-    db: DatabaseSession = None,
+    current_user: PlatformSuperUser = None,
 ) -> dict:
     """
-    Register built-in threat feeds.
+    (Re-)register the platform built-in feeds (platform superuser only).
 
-    Requires admin privileges.
+    Built-in feeds are platform intel (organization_id NULL) that every
+    tenant reads, so registering them is a platform action. This runs the
+    same idempotent registration as application startup
+    (``FeedManager.register_builtin_feeds``). Previously any user could call
+    it, and it inserted per-tenant copies of three feeds whose names collide
+    with the global ``threat_feeds.name`` unique constraint (500).
     """
-    # Use current_user directly (admin check handled by dependency injection)
+    from src.intel.feeds import FeedManager
 
-    builtin_feeds = [
-        {
-            "name": "AlienVault OTX",
-            "feed_type": "json",
-            "url": "https://otx.alienvault.com/api/v1/pulses/subscribed",
-            "provider": "AlienVault",
-            "description": "Open Threat Exchange community threat intelligence",
-            "is_builtin": True,
-            "poll_interval_minutes": 60,
-        },
-        {
-            "name": "Abuse.ch URLhaus",
-            "feed_type": "csv",
-            "url": "https://urlhaus.abuse.ch/downloads/csv_recent/",
-            "provider": "abuse.ch",
-            "description": "URLhaus malicious URL feed",
-            "is_builtin": True,
-            "poll_interval_minutes": 30,
-        },
-        {
-            "name": "Abuse.ch ThreatFox",
-            "feed_type": "json",
-            "url": "https://threatfox-api.abuse.ch/api/v1/",
-            "provider": "abuse.ch",
-            "description": "ThreatFox IOC feed",
-            "is_builtin": True,
-            "poll_interval_minutes": 60,
-        },
-    ]
+    created = await FeedManager().register_builtin_feeds()
+    return {"status": "feeds_registered", "count": created}
 
-    org_id = getattr(current_user, "organization_id", None)
-    registered_count = 0
-    for feed_def in builtin_feeds:
-        # Check if already registered
-        existing_stmt = select(ThreatFeed).where(ThreatFeed.name == feed_def["name"])
-        if org_id is not None:
-            existing_stmt = existing_stmt.where(ThreatFeed.organization_id == org_id)
-        existing = await db.execute(existing_stmt)
-        if existing.scalars().first():
-            continue
 
-        feed = ThreatFeed(
-            id=str(uuid.uuid4()),
-            organization_id=getattr(current_user, "organization_id", None),
-            **feed_def,
-        )
-        db.add(feed)
-        registered_count += 1
+@router.post("/feeds/poll-all", response_model=None, operation_id="poll_all_threat_feeds")
+async def poll_all_threat_feeds(
+    background_tasks: BackgroundTasks,
+    current_user: PlatformSuperUser = None,
+) -> dict:
+    """Poll every enabled feed of every tenant plus the platform feeds now
+    (platform superuser only). Same work as the scheduled
+    ``intel.poll_threat_feeds`` task; each feed's indicators are stamped with
+    that feed's organisation (NULL for platform feeds)."""
+    background_tasks.add_task(_run_all_feed_polls)
+    return {"status": "poll_started", "scope": "all_feeds"}
 
-    await db.flush()
-    return {"status": "feeds_registered", "count": registered_count}
+
+async def _run_all_feed_polls() -> None:
+    from src.intel.feeds import FeedManager
+
+    results = await FeedManager().poll_all_feeds()
+    logger.info("Platform-wide feed poll completed", extra={"feeds": len(results)})
 
 
 @router.get("/feeds/{feed_id}/stats", response_model=None, operation_id="get_feed_stats")
 async def get_feed_stats(
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     feed_id: str = Path(...),
 ) -> dict:
     """
-    Get statistics for a threat feed.
+    Get statistics for a threat feed (own or platform feed).
     """
-    org_id = getattr(current_user, "organization_id", None)
-    stmt = select(ThreatFeed).where(ThreatFeed.id == feed_id)
-    if org_id is not None:
-        stmt = stmt.where(ThreatFeed.organization_id == org_id)
-    result = await db.execute(stmt)
-    feed = result.scalars().first()
-    if not feed:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Feed not found")
+    feed = await _get_visible_feed_or_404(db, feed_id, org_id)
 
     total_indicators = (
         await db.execute(
-            select(func.count(ThreatIndicator.id)).where(ThreatIndicator.feed_id == feed_id)
+            select(func.count(ThreatIndicator.id)).where(
+                ThreatIndicator.feed_id == feed_id,
+                _visible_to(ThreatIndicator, org_id),
+            )
         )
     ).scalar() or 0
 
     active_indicators = (
         await db.execute(
             select(func.count(ThreatIndicator.id)).where(
-                and_(ThreatIndicator.feed_id == feed_id, ThreatIndicator.is_active == True)
+                and_(
+                    ThreatIndicator.feed_id == feed_id,
+                    _visible_to(ThreatIndicator, org_id),
+                    ThreatIndicator.is_active == True,
+                )
             )
         )
     ).scalar() or 0
@@ -992,7 +1050,8 @@ async def get_feed_stats(
 @router.post("/indicators", response_model=ThreatIndicatorResponse, status_code=status.HTTP_201_CREATED)
 async def create_indicator(
     indicator_data: ThreatIndicatorCreate,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ) -> ThreatIndicatorResponse:
     """
@@ -1003,7 +1062,7 @@ async def create_indicator(
         **indicator_data.model_dump(),
         first_seen=datetime.now(timezone.utc),
         last_seen=datetime.now(timezone.utc),
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
     )
     db.add(indicator)
     await db.flush()
@@ -1014,12 +1073,17 @@ async def create_indicator(
 @router.post("/indicators/bulk", response_model=None, status_code=status.HTTP_201_CREATED, operation_id="bulk_import_indicators")
 async def bulk_import_indicators(
     import_data: BulkIndicatorImport,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ) -> dict:
     """
-    Bulk import threat indicators.
+    Bulk import threat indicators into the caller's organisation.
+
+    ``feed_id``, when given, must be one of the caller's own feeds.
     """
+    if import_data.feed_id:
+        await _get_owned_feed(db, import_data.feed_id, org_id)
     now = datetime.now(timezone.utc)
     created_count = 0
     errors = []
@@ -1032,14 +1096,14 @@ async def bulk_import_indicators(
                 feed_id=import_data.feed_id,
                 first_seen=now,
                 last_seen=now,
-                organization_id=getattr(current_user, "organization_id", None),
+                organization_id=org_id,
             )
             # Override source with the bulk import source if not set on individual indicator
             if not indicator.source:
                 indicator.source = import_data.source
             db.add(indicator)
             created_count += 1
-        except Exception as e:
+        except (TypeError, ValueError) as e:
             errors.append({"index": idx, "error": str(e)})
 
     await db.flush()
@@ -1055,6 +1119,7 @@ async def bulk_import_indicators(
 @router.get("/indicators", response_model=ThreatIndicatorListResponse, operation_id="list_indicators")
 async def list_indicators(
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=200),
@@ -1081,9 +1146,7 @@ async def list_indicators(
     """
     query = select(ThreatIndicator)
 
-    org_id = getattr(current_user, "organization_id", None)
-    if org_id is not None:
-        query = query.where(ThreatIndicator.organization_id == org_id)
+    query = query.where(_visible_to(ThreatIndicator, org_id))
 
     if indicator_type:
         type_values = [t.strip() for t in indicator_type.split(",") if t.strip()]
@@ -1145,41 +1208,29 @@ async def list_indicators(
 @router.get("/indicators/{indicator_id}", response_model=ThreatIndicatorResponse, operation_id="get_indicator")
 async def get_indicator(
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     indicator_id: str = Path(...),
 ) -> ThreatIndicatorResponse:
     """
     Get a specific threat indicator.
     """
-    org_id = getattr(current_user, "organization_id", None)
-    stmt = select(ThreatIndicator).where(ThreatIndicator.id == indicator_id)
-    if org_id is not None:
-        stmt = stmt.where(ThreatIndicator.organization_id == org_id)
-    result = await db.execute(stmt)
-    indicator = result.scalars().first()
-    if not indicator:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Indicator not found")
+    indicator = await _get_visible_indicator_or_404(db, indicator_id, org_id)
     return indicator
 
 
 @router.put("/indicators/{indicator_id}", response_model=ThreatIndicatorResponse, operation_id="update_indicator")
 async def update_indicator(
     indicator_update: ThreatIndicatorUpdate,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     indicator_id: str = Path(...),
 ) -> ThreatIndicatorResponse:
     """
     Update a threat indicator.
     """
-    org_id = getattr(current_user, "organization_id", None)
-    stmt = select(ThreatIndicator).where(ThreatIndicator.id == indicator_id)
-    if org_id is not None:
-        stmt = stmt.where(ThreatIndicator.organization_id == org_id)
-    result = await db.execute(stmt)
-    indicator = result.scalars().first()
-    if not indicator:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Indicator not found")
+    indicator = await _get_owned_indicator(db, indicator_id, org_id)
 
     for field, value in indicator_update.model_dump(exclude_unset=True).items():
         setattr(indicator, field, value)
@@ -1191,21 +1242,15 @@ async def update_indicator(
 
 @router.delete("/indicators/{indicator_id}", status_code=status.HTTP_204_NO_CONTENT, operation_id="delete_indicator")
 async def delete_indicator(
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     indicator_id: str = Path(...),
 ) -> None:
     """
     Delete a threat indicator.
     """
-    org_id = getattr(current_user, "organization_id", None)
-    stmt = select(ThreatIndicator).where(ThreatIndicator.id == indicator_id)
-    if org_id is not None:
-        stmt = stmt.where(ThreatIndicator.organization_id == org_id)
-    result = await db.execute(stmt)
-    indicator = result.scalars().first()
-    if not indicator:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Indicator not found")
+    indicator = await _get_owned_indicator(db, indicator_id, org_id)
 
     await db.delete(indicator)
     await db.flush()
@@ -1213,21 +1258,15 @@ async def delete_indicator(
 
 @router.post("/indicators/{indicator_id}/enrich", response_model=None, operation_id="enrich_indicator")
 async def enrich_indicator(
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     indicator_id: str = Path(...),
 ) -> dict:
     """
     Trigger enrichment for a threat indicator.
     """
-    org_id = getattr(current_user, "organization_id", None)
-    stmt = select(ThreatIndicator).where(ThreatIndicator.id == indicator_id)
-    if org_id is not None:
-        stmt = stmt.where(ThreatIndicator.organization_id == org_id)
-    result = await db.execute(stmt)
-    indicator = result.scalars().first()
-    if not indicator:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Indicator not found")
+    indicator = await _get_owned_indicator(db, indicator_id, org_id)
 
     # Mark as enrichment pending in context
     enrichment_data = indicator.context or {}
@@ -1246,21 +1285,15 @@ async def enrich_indicator(
 
 @router.post("/indicators/{indicator_id}/whitelist", response_model=ThreatIndicatorResponse, operation_id="whitelist_indicator")
 async def whitelist_indicator(
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     indicator_id: str = Path(...),
 ) -> ThreatIndicatorResponse:
     """
     Whitelist a threat indicator.
     """
-    org_id = getattr(current_user, "organization_id", None)
-    stmt = select(ThreatIndicator).where(ThreatIndicator.id == indicator_id)
-    if org_id is not None:
-        stmt = stmt.where(ThreatIndicator.organization_id == org_id)
-    result = await db.execute(stmt)
-    indicator = result.scalars().first()
-    if not indicator:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Indicator not found")
+    indicator = await _get_owned_indicator(db, indicator_id, org_id)
 
     indicator.is_whitelisted = True
     indicator.is_active = False
@@ -1273,32 +1306,25 @@ async def whitelist_indicator(
 @router.get("/indicators/{indicator_id}/timeline", response_model=None, operation_id="get_indicator_timeline")
 async def get_indicator_timeline(
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     indicator_id: str = Path(...),
 ) -> list:
     """
     Get the timeline/history for a threat indicator.
     """
-    # Verify indicator exists and belongs to user's org
-    org_id = getattr(current_user, "organization_id", None)
-    stmt = select(ThreatIndicator).where(ThreatIndicator.id == indicator_id)
-    if org_id is not None:
-        stmt = stmt.where(ThreatIndicator.organization_id == org_id)
-    result = await db.execute(stmt)
-    indicator = result.scalars().first()
-    if not indicator:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Indicator not found")
+    # The indicator must be the caller's own or platform intel.
+    indicator = await _get_visible_indicator_or_404(db, indicator_id, org_id)
 
-    # Get sightings as timeline events
+    # Get this tenant's sightings as timeline events
     sightings_query = (
         select(IndicatorSighting)
-        .where(IndicatorSighting.indicator_id == indicator_id)
+        .where(
+            IndicatorSighting.indicator_id == indicator_id,
+            IndicatorSighting.organization_id == org_id,
+        )
         .order_by(desc(IndicatorSighting.created_at))
     )
-    if org_id is not None:
-        sightings_query = sightings_query.where(
-            IndicatorSighting.organization_id == org_id
-        )
     sightings_result = await db.execute(sightings_query)
     sightings = sightings_result.scalars().all()
 
@@ -1331,6 +1357,7 @@ async def get_indicator_timeline(
 async def advanced_search_indicators(
     search_request: IntelSearchRequest,
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=200),
@@ -1340,9 +1367,7 @@ async def advanced_search_indicators(
     """
     query = select(ThreatIndicator)
 
-    org_id = getattr(current_user, "organization_id", None)
-    if org_id is not None:
-        query = query.where(ThreatIndicator.organization_id == org_id)
+    query = query.where(_visible_to(ThreatIndicator, org_id))
 
     if search_request.query:
         query = query.where(
@@ -1385,35 +1410,31 @@ async def advanced_search_indicators(
 @router.post("/sightings", response_model=IndicatorSightingResponse, status_code=status.HTTP_201_CREATED, operation_id="record_sighting")
 async def record_sighting(
     sighting_data: IndicatorSightingCreate,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ) -> IndicatorSightingResponse:
     """
-    Record a new sighting for a threat indicator.
+    Record a sighting (stamped with the caller's organisation) of one of the
+    caller's indicators or of a platform indicator.
     """
-    # Verify the indicator exists
-    org_id = getattr(current_user, "organization_id", None)
-    stmt = select(ThreatIndicator).where(
-        ThreatIndicator.id == sighting_data.indicator_id
-    )
-    if org_id is not None:
-        stmt = stmt.where(ThreatIndicator.organization_id == org_id)
-    result = await db.execute(stmt)
-    indicator = result.scalars().first()
-    if not indicator:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Indicator not found")
+    indicator = await _get_visible_indicator_or_404(db, sighting_data.indicator_id, org_id)
 
     sighting = IndicatorSighting(
         id=str(uuid.uuid4()),
         **sighting_data.model_dump(),
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
     )
     db.add(sighting)
 
-    # Update indicator sighting tracking
-    indicator.sighting_count = (indicator.sighting_count or 0) + 1
-    indicator.last_sighting_at = datetime.now(timezone.utc)
-    indicator.last_seen = datetime.now(timezone.utc)
+    # Sighting counters live on the indicator row. Platform (NULL-org)
+    # indicators are shared by every tenant and read-only to them, so only
+    # the caller's own indicators are bumped; the sighting row itself always
+    # records the event for this tenant.
+    if indicator.organization_id is not None:
+        indicator.sighting_count = (indicator.sighting_count or 0) + 1
+        indicator.last_sighting_at = datetime.now(timezone.utc)
+        indicator.last_seen = datetime.now(timezone.utc)
 
     await db.flush()
     await db.refresh(sighting)
@@ -1423,6 +1444,7 @@ async def record_sighting(
 @router.get("/indicators/{indicator_id}/sightings", response_model=list[IndicatorSightingResponse], operation_id="get_indicator_sightings")
 async def get_indicator_sightings(
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     indicator_id: str = Path(...),
     page: int = Query(1, ge=1),
@@ -1431,14 +1453,8 @@ async def get_indicator_sightings(
     """
     Get sightings for a specific threat indicator.
     """
-    # Verify the indicator exists and belongs to user's org
-    org_id = getattr(current_user, "organization_id", None)
-    ind_stmt = select(ThreatIndicator).where(ThreatIndicator.id == indicator_id)
-    if org_id is not None:
-        ind_stmt = ind_stmt.where(ThreatIndicator.organization_id == org_id)
-    ind_result = await db.execute(ind_stmt)
-    if not ind_result.scalars().first():
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Indicator not found")
+    # The indicator must be the caller's own or platform intel.
+    await _get_visible_indicator_or_404(db, indicator_id, org_id)
 
     query = (
         select(IndicatorSighting)
@@ -1447,8 +1463,7 @@ async def get_indicator_sightings(
         .offset((page - 1) * size)
         .limit(size)
     )
-    if org_id is not None:
-        query = query.where(IndicatorSighting.organization_id == org_id)
+    query = query.where(IndicatorSighting.organization_id == org_id)
     result = await db.execute(query)
     sightings = result.scalars().all()
     return sightings
@@ -1462,16 +1477,18 @@ async def get_indicator_sightings(
 @router.post("/actors", response_model=ThreatActorResponse, status_code=status.HTTP_201_CREATED, operation_id="create_actor")
 async def create_actor(
     actor_data: ThreatActorCreate,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ) -> ThreatActorResponse:
     """
-    Create a new threat actor.
+    Create a new threat actor in the caller's organisation.
     """
+    await _ensure_actor_name_free(db, actor_data.name)
     actor = ThreatActor(
         id=str(uuid.uuid4()),
         **actor_data.model_dump(),
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
     )
     db.add(actor)
     await db.flush()
@@ -1479,9 +1496,21 @@ async def create_actor(
     return actor
 
 
+async def _ensure_actor_name_free(db: AsyncSession, name: str) -> None:
+    """``threat_actors.name`` is globally unique in the schema; answer 409
+    instead of letting the insert fail with an IntegrityError (500)."""
+    existing = await db.execute(select(ThreatActor.id).where(ThreatActor.name == name))
+    if existing.first() is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"error": "actor_name_taken", "detail": "a threat actor with this name already exists"},
+        )
+
+
 @router.get("/actors", response_model=ThreatActorListResponse, operation_id="list_actors")
 async def list_actors(
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=200),
@@ -1495,9 +1524,7 @@ async def list_actors(
     """
     query = select(ThreatActor)
 
-    org_id = getattr(current_user, "organization_id", None)
-    if org_id is not None:
-        query = query.where(ThreatActor.organization_id == org_id)
+    query = query.where(ThreatActor.organization_id == org_id)
 
     if search:
         query = query.where(
@@ -1525,16 +1552,15 @@ async def list_actors(
 @router.get("/actors/{actor_id}", response_model=ThreatActorResponse, operation_id="get_actor")
 async def get_actor(
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     actor_id: str = Path(...),
 ) -> ThreatActorResponse:
     """
     Get threat actor details with associated campaigns and indicators.
     """
-    org_id = getattr(current_user, "organization_id", None)
     stmt = select(ThreatActor).where(ThreatActor.id == actor_id)
-    if org_id is not None:
-        stmt = stmt.where(ThreatActor.organization_id == org_id)
+    stmt = stmt.where(ThreatActor.organization_id == org_id)
     result = await db.execute(stmt)
     actor = result.scalars().first()
     if not actor:
@@ -1545,23 +1571,25 @@ async def get_actor(
 @router.put("/actors/{actor_id}", response_model=ThreatActorResponse, operation_id="update_actor")
 async def update_actor(
     actor_update: ThreatActorUpdate,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     actor_id: str = Path(...),
 ) -> ThreatActorResponse:
     """
     Update a threat actor.
     """
-    org_id = getattr(current_user, "organization_id", None)
     stmt = select(ThreatActor).where(ThreatActor.id == actor_id)
-    if org_id is not None:
-        stmt = stmt.where(ThreatActor.organization_id == org_id)
+    stmt = stmt.where(ThreatActor.organization_id == org_id)
     result = await db.execute(stmt)
     actor = result.scalars().first()
     if not actor:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Actor not found")
 
-    for field, value in actor_update.model_dump(exclude_unset=True).items():
+    changes = actor_update.model_dump(exclude_unset=True)
+    if changes.get("name") and changes["name"] != actor.name:
+        await _ensure_actor_name_free(db, changes["name"])
+    for field, value in changes.items():
         setattr(actor, field, value)
 
     await db.flush()
@@ -1571,17 +1599,16 @@ async def update_actor(
 
 @router.delete("/actors/{actor_id}", status_code=status.HTTP_204_NO_CONTENT, operation_id="delete_actor")
 async def delete_actor(
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     actor_id: str = Path(...),
 ) -> None:
     """
     Delete a threat actor.
     """
-    org_id = getattr(current_user, "organization_id", None)
     stmt = select(ThreatActor).where(ThreatActor.id == actor_id)
-    if org_id is not None:
-        stmt = stmt.where(ThreatActor.organization_id == org_id)
+    stmt = stmt.where(ThreatActor.organization_id == org_id)
     result = await db.execute(stmt)
     actor = result.scalars().first()
     if not actor:
@@ -1599,16 +1626,20 @@ async def delete_actor(
 @router.post("/campaigns", response_model=ThreatCampaignResponse, status_code=status.HTTP_201_CREATED, operation_id="create_campaign")
 async def create_campaign(
     campaign_data: ThreatCampaignCreate,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ) -> ThreatCampaignResponse:
     """
-    Create a new threat campaign.
+    Create a new threat campaign in the caller's organisation. ``actor_id``,
+    when given, must be one of the caller's actors.
     """
+    if campaign_data.actor_id:
+        await _ensure_own_actor(db, campaign_data.actor_id, org_id)
     campaign = ThreatCampaign(
         id=str(uuid.uuid4()),
         **campaign_data.model_dump(),
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
     )
     db.add(campaign)
     await db.flush()
@@ -1616,9 +1647,21 @@ async def create_campaign(
     return campaign
 
 
+async def _ensure_own_actor(db: AsyncSession, actor_id: str, org_id: str) -> None:
+    """A campaign may only link to an actor of the same organisation (404 otherwise)."""
+    result = await db.execute(
+        select(ThreatActor.id).where(
+            ThreatActor.id == actor_id, ThreatActor.organization_id == org_id
+        )
+    )
+    if result.first() is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Actor not found")
+
+
 @router.get("/campaigns", response_model=ThreatCampaignListResponse, operation_id="list_campaigns")
 async def list_campaigns(
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=200),
@@ -1631,9 +1674,7 @@ async def list_campaigns(
     """
     query = select(ThreatCampaign)
 
-    org_id = getattr(current_user, "organization_id", None)
-    if org_id is not None:
-        query = query.where(ThreatCampaign.organization_id == org_id)
+    query = query.where(ThreatCampaign.organization_id == org_id)
 
     if status:
         query = query.where(ThreatCampaign.status == status)
@@ -1659,16 +1700,15 @@ async def list_campaigns(
 @router.get("/campaigns/{campaign_id}", response_model=ThreatCampaignResponse, operation_id="get_campaign")
 async def get_campaign(
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     campaign_id: str = Path(...),
 ) -> ThreatCampaignResponse:
     """
     Get threat campaign details.
     """
-    org_id = getattr(current_user, "organization_id", None)
     stmt = select(ThreatCampaign).where(ThreatCampaign.id == campaign_id)
-    if org_id is not None:
-        stmt = stmt.where(ThreatCampaign.organization_id == org_id)
+    stmt = stmt.where(ThreatCampaign.organization_id == org_id)
     result = await db.execute(stmt)
     campaign = result.scalars().first()
     if not campaign:
@@ -1679,23 +1719,25 @@ async def get_campaign(
 @router.put("/campaigns/{campaign_id}", response_model=ThreatCampaignResponse, operation_id="update_campaign")
 async def update_campaign(
     campaign_update: ThreatCampaignUpdate,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     campaign_id: str = Path(...),
 ) -> ThreatCampaignResponse:
     """
     Update a threat campaign.
     """
-    org_id = getattr(current_user, "organization_id", None)
     stmt = select(ThreatCampaign).where(ThreatCampaign.id == campaign_id)
-    if org_id is not None:
-        stmt = stmt.where(ThreatCampaign.organization_id == org_id)
+    stmt = stmt.where(ThreatCampaign.organization_id == org_id)
     result = await db.execute(stmt)
     campaign = result.scalars().first()
     if not campaign:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Campaign not found")
 
-    for field, value in campaign_update.model_dump(exclude_unset=True).items():
+    changes = campaign_update.model_dump(exclude_unset=True)
+    if changes.get("actor_id"):
+        await _ensure_own_actor(db, changes["actor_id"], org_id)
+    for field, value in changes.items():
         setattr(campaign, field, value)
 
     await db.flush()
@@ -1705,17 +1747,16 @@ async def update_campaign(
 
 @router.delete("/campaigns/{campaign_id}", status_code=status.HTTP_204_NO_CONTENT, operation_id="delete_campaign")
 async def delete_campaign(
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     campaign_id: str = Path(...),
 ) -> None:
     """
     Delete a threat campaign.
     """
-    org_id = getattr(current_user, "organization_id", None)
     stmt = select(ThreatCampaign).where(ThreatCampaign.id == campaign_id)
-    if org_id is not None:
-        stmt = stmt.where(ThreatCampaign.organization_id == org_id)
+    stmt = stmt.where(ThreatCampaign.organization_id == org_id)
     result = await db.execute(stmt)
     campaign = result.scalars().first()
     if not campaign:
@@ -1733,7 +1774,8 @@ async def delete_campaign(
 @router.post("/reports", response_model=IntelReportResponse, status_code=status.HTTP_201_CREATED, operation_id="create_report")
 async def create_report(
     report_data: IntelReportCreate,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ) -> IntelReportResponse:
     """
@@ -1744,7 +1786,7 @@ async def create_report(
         **report_data.model_dump(),
         author_id=current_user.id,
         status="draft",
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
     )
     db.add(report)
     await db.flush()
@@ -1755,6 +1797,7 @@ async def create_report(
 @router.get("/reports", response_model=IntelReportListResponse, operation_id="list_reports")
 async def list_reports(
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=200),
@@ -1768,9 +1811,7 @@ async def list_reports(
     """
     query = select(IntelReport)
 
-    org_id = getattr(current_user, "organization_id", None)
-    if org_id is not None:
-        query = query.where(IntelReport.organization_id == org_id)
+    query = query.where(IntelReport.organization_id == org_id)
 
     if report_type:
         query = query.where(IntelReport.report_type == report_type)
@@ -1798,16 +1839,15 @@ async def list_reports(
 @router.get("/reports/{report_id}", response_model=IntelReportResponse, operation_id="get_report")
 async def get_report(
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     report_id: str = Path(...),
 ) -> IntelReportResponse:
     """
     Get a specific intel report.
     """
-    org_id = getattr(current_user, "organization_id", None)
     stmt = select(IntelReport).where(IntelReport.id == report_id)
-    if org_id is not None:
-        stmt = stmt.where(IntelReport.organization_id == org_id)
+    stmt = stmt.where(IntelReport.organization_id == org_id)
     result = await db.execute(stmt)
     report = result.scalars().first()
     if not report:
@@ -1818,17 +1858,16 @@ async def get_report(
 @router.put("/reports/{report_id}", response_model=IntelReportResponse, operation_id="update_report")
 async def update_report(
     report_update: IntelReportUpdate,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     report_id: str = Path(...),
 ) -> IntelReportResponse:
     """
     Update an intel report.
     """
-    org_id = getattr(current_user, "organization_id", None)
     stmt = select(IntelReport).where(IntelReport.id == report_id)
-    if org_id is not None:
-        stmt = stmt.where(IntelReport.organization_id == org_id)
+    stmt = stmt.where(IntelReport.organization_id == org_id)
     result = await db.execute(stmt)
     report = result.scalars().first()
     if not report:
@@ -1844,17 +1883,16 @@ async def update_report(
 
 @router.post("/reports/{report_id}/publish", response_model=IntelReportResponse, operation_id="publish_report")
 async def publish_report(
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     report_id: str = Path(...),
 ) -> IntelReportResponse:
     """
     Publish an intel report.
     """
-    org_id = getattr(current_user, "organization_id", None)
     stmt = select(IntelReport).where(IntelReport.id == report_id)
-    if org_id is not None:
-        stmt = stmt.where(IntelReport.organization_id == org_id)
+    stmt = stmt.where(IntelReport.organization_id == org_id)
     result = await db.execute(stmt)
     report = result.scalars().first()
     if not report:
@@ -1870,17 +1908,16 @@ async def publish_report(
 
 @router.delete("/reports/{report_id}", status_code=status.HTTP_204_NO_CONTENT, operation_id="delete_report")
 async def delete_report(
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     report_id: str = Path(...),
 ) -> None:
     """
     Delete an intel report.
     """
-    org_id = getattr(current_user, "organization_id", None)
     stmt = select(IntelReport).where(IntelReport.id == report_id)
-    if org_id is not None:
-        stmt = stmt.where(IntelReport.organization_id == org_id)
+    stmt = stmt.where(IntelReport.organization_id == org_id)
     result = await db.execute(stmt)
     report = result.scalars().first()
     if not report:
@@ -1898,20 +1935,21 @@ async def delete_report(
 @router.get("/dashboard", response_model=IntelDashboardStats, operation_id="get_dashboard_stats")
 async def get_dashboard_stats(
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ) -> IntelDashboardStats:
     """
     Get threat intelligence dashboard statistics.
 
-    Scoped to the caller's organization so each tenant only sees its
-    own intel posture.
+    Scoped to the caller's organization so each tenant only sees its own
+    intel posture; feed and indicator counts also include platform
+    (NULL-org) intel, which every tenant reads.
     """
-    org_id = getattr(current_user, "organization_id", None)
 
     def _scope(stmt, model):
-        if org_id is not None:
-            return stmt.where(model.organization_id == org_id)
-        return stmt
+        if model in (ThreatIndicator, ThreatFeed):
+            return stmt.where(_visible_to(model, org_id))
+        return stmt.where(model.organization_id == org_id)
 
     total_indicators = (
         await db.execute(_scope(select(func.count(ThreatIndicator.id)), ThreatIndicator))
@@ -2011,6 +2049,7 @@ async def get_dashboard_stats(
 @router.get("/export", response_model=None, operation_id="export_indicators")
 async def export_indicators(
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     format: str = Query("json", description="json, csv, stix"),
     indicator_types: Optional[list[str]] = Query(None),
@@ -2028,9 +2067,7 @@ async def export_indicators(
 
     query = select(ThreatIndicator)
 
-    org_id = getattr(current_user, "organization_id", None)
-    if org_id is not None:
-        query = query.where(ThreatIndicator.organization_id == org_id)
+    query = query.where(_visible_to(ThreatIndicator, org_id))
 
     if indicator_types:
         query = query.where(ThreatIndicator.indicator_type.in_(indicator_types))

@@ -268,6 +268,9 @@ class EntityRiskResponse(BaseModel):
     risk_level: str = ""
     risk_factors: list[RiskFactorResponse]
     risk_trend: list[RiskTrendPoint]
+    alert_count: int = 0
+    anomaly_count: int = 0
+    period_days: int = 0
     updated_at: Optional[datetime] = None
 
 
@@ -281,10 +284,14 @@ class BehaviorTimelineEvent(BaseModel):
     id: str = ""
     event_type: str = ""
     timestamp: datetime
+    created_at: Optional[datetime] = None
     description: str = ""
     is_anomalous: bool = False
-    anomaly_reasons: list
+    anomaly_reasons: list = Field(default_factory=list)
     risk_contribution: float = 0.0
+    source_ip: Optional[str] = None
+    destination: Optional[str] = None
+    event_data: dict = Field(default_factory=dict)
 
 
 class BehaviorTimelineResponse(BaseModel):
@@ -294,6 +301,9 @@ class BehaviorTimelineResponse(BaseModel):
     event_count: int = 0
     anomaly_count: int = 0
     events: list[BehaviorTimelineEvent]
+    total_events: int = 0
+    period_days: int = 0
+    anomalies_only: bool = False
 
 
 # ============================================================================

@@ -554,7 +554,21 @@ class TAXIIFeedClient:
 
 
 class FeedManager:
-    """Manager for threat feeds: polling, parsing, and indicator ingestion"""
+    """Manager for threat feeds: polling, parsing, and indicator ingestion
+
+    Tenancy / NULL-organisation convention (wave 1):
+
+    * A feed row that belongs to an organisation (``feed.organization_id``
+      set) ingests indicators stamped with that organisation.
+    * A feed with ``organization_id`` NULL is a PLATFORM feed (the built-ins
+      registered at startup by ``register_builtin_feeds``); the system-wide
+      poll stamps its indicators with ``organization_id`` NULL, i.e. platform
+      intel. Tenants read platform rows alongside their own but never modify
+      them (``src/api/v1/endpoints/intel.py``).
+    * Deduplication is per (organisation, type, value): an indicator that one
+      organisation (or the platform) already holds is never touched or claimed
+      by another organisation's ingestion.
+    """
 
     def __init__(self):
         """Initialize feed manager"""
@@ -782,9 +796,17 @@ class FeedManager:
                 # scalar_one_or_none() blew up with "Multiple rows".
                 # Touch all duplicates so sighting_count reflects reality
                 # and last_seen advances on every surviving copy.
+                # Scoped to the feed AND its organisation (NULL for platform
+                # feeds) so dedup never reaches another tenant's rows.
+                org_clause = (
+                    ThreatIndicator.organization_id.is_(None)
+                    if feed.organization_id is None
+                    else ThreatIndicator.organization_id == feed.organization_id
+                )
                 existing = await session.execute(
                     select(ThreatIndicator).where(
                         ThreatIndicator.feed_id == feed.id,
+                        org_clause,
                         ThreatIndicator.value.in_([v for _, v in wanted]),
                     )
                 )
@@ -814,6 +836,8 @@ class FeedManager:
                             indicator_type=ind_type,
                             value=ind_value,
                             feed_id=feed.id,
+                            # The feed's organisation; NULL = platform intel.
+                            organization_id=feed.organization_id,
                             source=feed.name,
                             confidence=indicator_dict.get("confidence", 50),
                             severity=indicator_dict.get("severity", "medium"),
@@ -987,6 +1011,7 @@ class FeedManager:
                     indicator_dict.get("indicator_type"),
                     indicator_dict.get("value"),
                     feed.id,
+                    organization_id=feed.organization_id,
                 )
 
                 if indicator:
@@ -1001,18 +1026,25 @@ class FeedManager:
         return new_count
 
     async def _deduplicate_indicator(
-        self, indicator_type: str, value: str, feed_id: str
+        self,
+        indicator_type: str,
+        value: str,
+        feed_id: str,
+        organization_id: Optional[str] = None,
     ) -> Optional[ThreatIndicator]:
         """Check for existing indicator or create new one
 
         Queries the database for an existing indicator with the same type and
-        value. If found, updates its last_seen timestamp. If not found, creates
-        a new ThreatIndicator record.
+        value in the same organisation (``organization_id`` NULL = platform
+        intel). If found, updates its last_seen timestamp. If not found,
+        creates a new ThreatIndicator record stamped with that organisation.
+        Another organisation's row with the same value is never touched.
 
         Args:
             indicator_type: Type of indicator
             value: Indicator value
             feed_id: Source feed ID
+            organization_id: Owning organisation of the feed (None = platform)
 
         Returns:
             ThreatIndicator instance if new, None if already exists
@@ -1025,9 +1057,13 @@ class FeedManager:
             query = select(ThreatIndicator).where(
                 ThreatIndicator.indicator_type == indicator_type,
                 ThreatIndicator.value == value,
+                ThreatIndicator.organization_id.is_(None)
+                if organization_id is None
+                else ThreatIndicator.organization_id == organization_id,
             )
             result = await db.execute(query)
-            existing = result.scalar_one_or_none()
+            # Duplicates can exist (no unique constraint); touch the first.
+            existing = result.scalars().first()
 
             if existing:
                 # Update last_seen on existing indicator
@@ -1040,6 +1076,7 @@ class FeedManager:
                 indicator_type=indicator_type,
                 value=value,
                 feed_id=feed_id,
+                organization_id=organization_id,
                 source=f"feed:{feed_id}",
                 is_active=True,
                 first_seen=datetime.now(timezone.utc),
@@ -1088,9 +1125,11 @@ class FeedManager:
     async def register_builtin_feeds(self) -> int:
         """Register built-in threat feeds in the database.
 
-        Idempotent — existing builtin feeds (matched by name) are updated
-        in place, not duplicated. Deprecated built-ins are removed.
-        Returns the number of NEW feeds created this call.
+        Built-in feeds are PLATFORM feeds (``organization_id`` NULL). Only
+        platform rows are matched, updated or purged here; a tenant's own feed
+        is never modified. Idempotent — existing builtin feeds (matched by
+        name) are updated in place, not duplicated. Deprecated built-ins are
+        removed. Returns the number of NEW feeds created this call.
         """
         from src.core.database import async_session_factory
         from sqlalchemy import select, delete
@@ -1106,9 +1145,10 @@ class FeedManager:
                     select(ThreatFeed).where(
                         ThreatFeed.name == dead_name,
                         ThreatFeed.is_builtin == True,  # noqa: E712
+                        ThreatFeed.organization_id.is_(None),
                     )
                 )
-                dead = result.scalar_one_or_none()
+                dead = result.scalars().first()
                 if dead:
                     self.logger.info("Removing deprecated builtin feed", name=dead_name)
                     await session.delete(dead)
@@ -1117,7 +1157,17 @@ class FeedManager:
                 existing = await session.execute(
                     select(ThreatFeed).where(ThreatFeed.name == feed_def["name"])
                 )
-                row = existing.scalar_one_or_none()
+                row = existing.scalars().first()
+
+                if row is not None and row.organization_id is not None:
+                    # threat_feeds.name is globally unique: a tenant already
+                    # owns a feed with this name. Leave it alone (never adopt
+                    # a tenant's row as platform intel) and skip the built-in.
+                    self.logger.warning(
+                        "Builtin feed name is taken by a tenant feed; skipping",
+                        name=feed_def["name"],
+                    )
+                    continue
 
                 if row:
                     # Update mutable config on every call so URL/description
@@ -1163,9 +1213,12 @@ class FeedManager:
                 if not target_severity:
                     continue
                 feed_row_result = await session.execute(
-                    select(ThreatFeed).where(ThreatFeed.name == feed_def["name"])
+                    select(ThreatFeed).where(
+                        ThreatFeed.name == feed_def["name"],
+                        ThreatFeed.organization_id.is_(None),
+                    )
                 )
-                feed_row = feed_row_result.scalar_one_or_none()
+                feed_row = feed_row_result.scalars().first()
                 if not feed_row:
                     continue
                 await session.execute(

@@ -15,6 +15,19 @@ mirrored log it can actually match.
 ``seed_builtin_detection_rules()`` is idempotent: it UPSERTs by name,
 filling in empty detection_logic on existing rows so we don't lose
 history, and adding any rule that's missing entirely.
+
+Platform scope convention (wave 1 tenancy):
+    Built-in rules are seeded ONCE with ``organization_id IS NULL``. A NULL
+    organisation on ``detection_rules`` means "platform rule": every
+    organisation sees it in ``GET /siem/rules`` (read-only), the per-org
+    rule engine (``src.siem.engine_manager``) evaluates it against every
+    organisation's logs, and the alert or correlation it produces carries
+    the organisation of the log that matched. Organisation users cannot
+    update or delete platform rows (the SIEM router answers 403
+    ``platform_rule_read_only``); only a platform superuser can. Rules an
+    organisation creates or imports are stamped with that organisation and
+    apply to its logs only. Rules are not seeded per organisation because
+    ``detection_rules.name`` is globally unique.
 """
 
 from __future__ import annotations
@@ -370,7 +383,8 @@ async def seed_builtin_detection_rules(db: AsyncSession) -> dict[str, int]:
     (the previous decorative state), INSERTs rows that are missing.
     Never downgrades a user-customized rule.
     """
-    existing_res = await db.execute(select(DetectionRule))
+    names = [spec["name"] for spec in BUILTIN_RULES]
+    existing_res = await db.execute(select(DetectionRule).where(DetectionRule.name.in_(names)))
     existing: dict[str, DetectionRule] = {r.name: r for r in existing_res.scalars().all()}
 
     inserted = 0
@@ -401,9 +415,18 @@ async def seed_builtin_detection_rules(db: AsyncSession) -> dict[str, int]:
                 tags=json.dumps(spec.get("tags", [])) if spec.get("tags") else None,
                 rule_yaml=yaml_doc,
                 enabled=True,
+                # Platform rule: see "Platform scope convention" above.
+                organization_id=None,
             )
             db.add(new_rule)
             inserted += 1
+        elif row.organization_id is not None:
+            # An organisation owns a rule with a built-in's name (names are
+            # globally unique). Leave the tenant's row alone.
+            logger.warning(
+                "SIEM rule seeder: built-in %s shadowed by an organisation rule; skipped",
+                spec["name"],
+            )
         else:
             # Refill only when empty — don't overwrite user customizations.
             if not row.detection_logic:

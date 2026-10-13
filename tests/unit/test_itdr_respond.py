@@ -5,7 +5,9 @@ directly, which bypassed the policy gate entirely (F14). It now shares one
 implementation with ``POST /agentic/tools/{tool_name}/execute``
 (``guarded_tool_call``), so a destructive response is *proposed* for
 approval instead of executed, viewers are refused, a policy denial carries
-its reason code, and another tenant's threat is a 404.
+its reason code, and another tenant's threat is a 404. Wave 1 (tenancy/RBAC):
+response actions are admin-only, so the responders here are admins and an
+analyst is refused with ``role_not_permitted``.
 """
 from __future__ import annotations
 
@@ -113,14 +115,14 @@ def _body(action: str, **details: Any) -> dict[str, Any]:
 @pytest.mark.asyncio
 async def test_block_ip_is_proposed_not_executed(client, db_session):
     await _orgs(db_session)
-    analyst = await _user(db_session, email="responder@org-a.test", role="analyst")
+    responder = await _user(db_session, email="responder@org-a.test", role="admin")
     await _soc_agent(db_session)
     threat = await _threat(db_session)
     await db_session.commit()
 
     resp = await client.post(
         f"/api/v1/itdr/threats/{threat.id}/respond",
-        headers=_token(analyst),
+        headers=_token(responder),
         json=_body("block_ip", ip="198.51.100.77", propose_actions=True),
     )
     assert resp.status_code == 200, resp.text
@@ -150,14 +152,14 @@ async def test_block_ip_is_proposed_not_executed(client, db_session):
 @pytest.mark.asyncio
 async def test_block_ip_without_propose_actions_is_denied_with_reason_code(client, db_session):
     await _orgs(db_session)
-    analyst = await _user(db_session, email="responder2@org-a.test", role="analyst")
+    responder = await _user(db_session, email="responder2@org-a.test", role="admin")
     await _soc_agent(db_session)
     threat = await _threat(db_session)
     await db_session.commit()
 
     resp = await client.post(
         f"/api/v1/itdr/threats/{threat.id}/respond",
-        headers=_token(analyst),
+        headers=_token(responder),
         json=_body("block_ip", ip="198.51.100.77"),
     )
     assert resp.status_code == 403, resp.text
@@ -172,7 +174,7 @@ async def test_block_ip_without_propose_actions_is_denied_with_reason_code(clien
 @pytest.mark.asyncio
 async def test_quarantine_proposes_every_destructive_tool(client, db_session):
     await _orgs(db_session)
-    analyst = await _user(db_session, email="responder3@org-a.test", role="analyst")
+    responder = await _user(db_session, email="responder3@org-a.test", role="admin")
     # Both tools resolve their target inside the organization: ``disable_user``
     # by user email, ``isolate_host`` by asset hostname.
     await _user(db_session, email="svc-backup@org-a.test", role="viewer")
@@ -184,7 +186,7 @@ async def test_quarantine_proposes_every_destructive_tool(client, db_session):
 
     resp = await client.post(
         f"/api/v1/itdr/threats/{threat.id}/respond",
-        headers=_token(analyst),
+        headers=_token(responder),
         json=_body("quarantine", hostname="dc-01", propose_actions=True),
     )
     assert resp.status_code == 200, resp.text
@@ -221,6 +223,24 @@ async def test_viewer_cannot_respond(client, db_session):
     assert (await db_session.execute(select(func.count()).select_from(AgentAction))).scalar() == 0
 
 
+@pytest.mark.asyncio
+async def test_analyst_cannot_respond(client, db_session):
+    await _orgs(db_session)
+    analyst = await _user(db_session, email="analyst-responder@org-a.test", role="analyst")
+    await _soc_agent(db_session)
+    threat = await _threat(db_session)
+    await db_session.commit()
+
+    resp = await client.post(
+        f"/api/v1/itdr/threats/{threat.id}/respond",
+        headers=_token(analyst),
+        json=_body("block_ip", ip="198.51.100.77", propose_actions=True),
+    )
+    assert resp.status_code == 403, resp.text
+    assert resp.json()["detail"]["error"] == "role_not_permitted"
+    assert (await db_session.execute(select(func.count()).select_from(AgentAction))).scalar() == 0
+
+
 # ---------------------------------------------------------------------------
 # Non-destructive path still works
 # ---------------------------------------------------------------------------
@@ -229,13 +249,13 @@ async def test_viewer_cannot_respond(client, db_session):
 @pytest.mark.asyncio
 async def test_open_incident_executes_through_the_policy_gate(client, db_session):
     await _orgs(db_session)
-    analyst = await _user(db_session, email="responder4@org-a.test", role="analyst")
+    responder = await _user(db_session, email="responder4@org-a.test", role="admin")
     threat = await _threat(db_session)
     await db_session.commit()
 
     resp = await client.post(
         f"/api/v1/itdr/threats/{threat.id}/respond",
-        headers=_token(analyst),
+        headers=_token(responder),
         json=_body("open_incident"),
     )
     assert resp.status_code == 200, resp.text
@@ -253,13 +273,13 @@ async def test_open_incident_executes_through_the_policy_gate(client, db_session
 @pytest.mark.asyncio
 async def test_contain_marks_the_threat_without_claiming_a_tool_ran(client, db_session):
     await _orgs(db_session)
-    analyst = await _user(db_session, email="responder5@org-a.test", role="analyst")
+    responder = await _user(db_session, email="responder5@org-a.test", role="admin")
     threat = await _threat(db_session)
     await db_session.commit()
 
     resp = await client.post(
         f"/api/v1/itdr/threats/{threat.id}/respond",
-        headers=_token(analyst),
+        headers=_token(responder),
         json=_body("contain"),
     )
     assert resp.status_code == 200, resp.text
@@ -272,13 +292,13 @@ async def test_contain_marks_the_threat_without_claiming_a_tool_ran(client, db_s
 @pytest.mark.asyncio
 async def test_missing_required_argument_is_a_400(client, db_session):
     await _orgs(db_session)
-    analyst = await _user(db_session, email="responder6@org-a.test", role="analyst")
+    responder = await _user(db_session, email="responder6@org-a.test", role="admin")
     threat = await _threat(db_session)
     await db_session.commit()
 
     resp = await client.post(
         f"/api/v1/itdr/threats/{threat.id}/respond",
-        headers=_token(analyst),
+        headers=_token(responder),
         json=_body("isolate_host", propose_actions=True),
     )
     assert resp.status_code == 400, resp.text
@@ -293,14 +313,14 @@ async def test_missing_required_argument_is_a_400(client, db_session):
 @pytest.mark.asyncio
 async def test_other_organizations_threat_is_a_404(client, db_session):
     await _orgs(db_session)
-    analyst = await _user(db_session, email="responder7@org-a.test", role="analyst")
+    responder = await _user(db_session, email="responder7@org-a.test", role="admin")
     await _soc_agent(db_session)
     other = await _threat(db_session, org_id=ORG_B, with_identity=False)
     await db_session.commit()
 
     resp = await client.post(
         f"/api/v1/itdr/threats/{other.id}/respond",
-        headers=_token(analyst),
+        headers=_token(responder),
         json=_body("block_ip", ip="198.51.100.77", propose_actions=True),
     )
     assert resp.status_code == 404, resp.text

@@ -1,18 +1,20 @@
 """Threat hunting endpoints"""
 
+import asyncio
 import json
 import math
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Annotated, Any, Optional
 
-from fastapi import APIRouter, BackgroundTasks, Body, HTTPException, Query, status
-from sqlalchemy import and_, func, or_, select
+from fastapi import APIRouter, BackgroundTasks, Body, Depends, HTTPException, Query, status
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import CurrentUser, DatabaseSession, OrganizationId
+from src.api.deps import CurrentUser, DatabaseSession, OrganizationId, require_role
 from src.core.database import async_session_factory
 from src.core.logging import get_logger
 from src.core.utils import safe_json_loads
+from src.models.user import User, UserRole
 from src.services.automation import AutomationService
 
 logger = get_logger(__name__)
@@ -46,14 +48,19 @@ from src.schemas.hunting import (
 
 router = APIRouter(prefix="/hunting", tags=["hunting"])
 
+#: Hunting writes (hypotheses, sessions, findings, escalation, notebooks):
+#: analysts and admins. Viewers are read-only. Hunt templates have no
+#: organisation column: they are platform scope and read-only here (there
+#: is no create/update/delete route for them).
+AnalystUser = Annotated[User, Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
 
-async def get_hypothesis_or_404(
-    db: AsyncSession, hypothesis_id: str, org_id: Optional[str] = None
-) -> HuntHypothesis:
-    """Get hypothesis by ID or raise 404 (org-scoped when org_id given)"""
-    stmt = select(HuntHypothesis).where(HuntHypothesis.id == hypothesis_id)
-    if org_id is not None:
-        stmt = stmt.where(HuntHypothesis.organization_id == org_id)
+
+async def get_hypothesis_or_404(db: AsyncSession, hypothesis_id: str, org_id: str) -> HuntHypothesis:
+    """The caller's hunt hypothesis by ID or 404 (always tenant-scoped)"""
+    stmt = select(HuntHypothesis).where(
+        HuntHypothesis.id == hypothesis_id,
+        HuntHypothesis.organization_id == org_id,
+    )
     result = await db.execute(stmt)
     hypothesis = result.scalar_one_or_none()
     if not hypothesis:
@@ -64,13 +71,12 @@ async def get_hypothesis_or_404(
     return hypothesis
 
 
-async def get_session_or_404(
-    db: AsyncSession, session_id: str, org_id: Optional[str] = None
-) -> HuntSession:
-    """Get hunt session by ID or raise 404 (org-scoped when org_id given)"""
-    stmt = select(HuntSession).where(HuntSession.id == session_id)
-    if org_id is not None:
-        stmt = stmt.where(HuntSession.organization_id == org_id)
+async def get_session_or_404(db: AsyncSession, session_id: str, org_id: str) -> HuntSession:
+    """The caller's hunt session by ID or 404 (always tenant-scoped)"""
+    stmt = select(HuntSession).where(
+        HuntSession.id == session_id,
+        HuntSession.organization_id == org_id,
+    )
     result = await db.execute(stmt)
     session = result.scalar_one_or_none()
     if not session:
@@ -81,13 +87,12 @@ async def get_session_or_404(
     return session
 
 
-async def get_finding_or_404(
-    db: AsyncSession, finding_id: str, org_id: Optional[str] = None
-) -> HuntFinding:
-    """Get finding by ID or raise 404 (org-scoped when org_id given)"""
-    stmt = select(HuntFinding).where(HuntFinding.id == finding_id)
-    if org_id is not None:
-        stmt = stmt.where(HuntFinding.organization_id == org_id)
+async def get_finding_or_404(db: AsyncSession, finding_id: str, org_id: str) -> HuntFinding:
+    """The caller's hunt finding by ID or 404 (always tenant-scoped)"""
+    stmt = select(HuntFinding).where(
+        HuntFinding.id == finding_id,
+        HuntFinding.organization_id == org_id,
+    )
     result = await db.execute(stmt)
     finding = result.scalar_one_or_none()
     if not finding:
@@ -115,284 +120,386 @@ async def get_notebook_or_404(db: AsyncSession, notebook_id: str, org_id: str) -
     return notebook
 
 
-async def get_sessions_count(db: AsyncSession, hypothesis_id: str) -> int:
-    """Get the number of sessions for a hypothesis"""
+async def get_sessions_count(db: AsyncSession, hypothesis_id: str, org_id: Optional[str]) -> int:
+    """Get the number of the organisation's sessions for a hypothesis"""
     result = await db.execute(
-        select(func.count(HuntSession.id)).where(HuntSession.hypothesis_id == hypothesis_id)
+        select(func.count(HuntSession.id)).where(
+            HuntSession.hypothesis_id == hypothesis_id,
+            HuntSession.organization_id == org_id,
+        ),
     )
     return result.scalar() or 0
 
 
 async def hypothesis_to_response(db: AsyncSession, hypothesis: HuntHypothesis) -> HuntHypothesisResponse:
     """Convert hypothesis model to response with sessions_count"""
-    sessions_count = await get_sessions_count(db, hypothesis.id)
+    sessions_count = await get_sessions_count(db, hypothesis.id, hypothesis.organization_id)
     data = HuntHypothesisResponse.model_validate(hypothesis)
     data.sessions_count = sessions_count
     return data
 
 
-async def execute_hunt_session(session_id: str):  # noqa: C901
-    """Background task to run a real hunt against the SIEM logs + IOC DB.
+_TERMINAL_SESSION_STATES = frozenset({"COMPLETED", "FAILED", "CANCELLED"})
+#: How often a paused hunt re-checks its status, and how long it may stay
+#: paused before the executor gives up and cancels it (so a later resume can
+#: never leave a RUNNING session with no executor behind it).
+HUNT_PAUSE_POLL_SECONDS = 2.0
+HUNT_PAUSE_MAX_SECONDS = 3600.0
 
-    The hunt engine:
-      1. Marks the session RUNNING
-      2. Loads the hypothesis (data_sources, mitre_techniques, description)
-      3. For each indicator mentioned in the hypothesis description, checks
-         against the unified threat_indicators table
-      4. Queries the SIEM LogEntry table for keywords / techniques in the
-         last 24 hours and creates HuntFinding rows for matches
-      5. Counts and writes back the aggregate counts
-      6. Marks the session COMPLETED with duration
 
-    Best-effort: any exception marks the session FAILED (not silently
-    rolled back and left dangling as it was before).
+class _HuntStopped(Exception):
+    """The session was cancelled (or deleted) while the hunt ran."""
+
+
+async def _hunt_checkpoint(db: AsyncSession, session_id: str) -> None:
+    """Commit progress so far, then honour pause / cancel.
+
+    * CANCELLED / FAILED / COMPLETED / deleted: raise ``_HuntStopped``.
+    * PAUSED: wait (without holding a transaction) until the analyst resumes
+      or cancels; after ``HUNT_PAUSE_MAX_SECONDS`` the hunt is cancelled.
+    * RUNNING: return and keep hunting.
     """
-    logger.info(f"execute_hunt_session START session_id={session_id}")
-    async with async_session_factory() as db:
-        session = None
-        try:
-            # Fetch session directly (can't use the request-bound
-            # get_session_or_404 helper from a background task).
-            session_result = await db.execute(
-                select(HuntSession).where(HuntSession.id == session_id)
+    await db.commit()
+    waited = 0.0
+    while True:
+        current = (
+            await db.execute(select(HuntSession.status).where(HuntSession.id == session_id))
+        ).scalar_one_or_none()
+        await db.commit()  # end the read transaction before sleeping
+        if current is None or current in _TERMINAL_SESSION_STATES:
+            raise _HuntStopped(current or "DELETED")
+        if current != "PAUSED":
+            return
+        if waited >= HUNT_PAUSE_MAX_SECONDS:
+            await db.execute(
+                update(HuntSession)
+                .where(HuntSession.id == session_id, HuntSession.status == "PAUSED")
+                .values(
+                    status="CANCELLED",
+                    completed_at=datetime.now(timezone.utc),
+                    error_message=(
+                        f"paused for more than {int(HUNT_PAUSE_MAX_SECONDS)}s; "
+                        "hunt stopped, start a new session to continue"
+                    ),
+                ),
             )
-            session = session_result.scalar_one_or_none()
+            await db.commit()
+            logger.warning("hunt_pause_timeout", session_id=session_id)
+            raise _HuntStopped("CANCELLED")
+        await asyncio.sleep(HUNT_PAUSE_POLL_SECONDS)
+        waited += HUNT_PAUSE_POLL_SECONDS
+
+
+async def execute_hunt_session(session_id: str) -> None:  # noqa: C901
+    """Background task to run a real hunt against the organisation's SIEM
+    logs, threat indicators, alerts and audit log.
+
+    Every query is scoped to the session's organisation (threat indicators
+    also include platform-wide feed intel, organisation NULL); a session with
+    no organisation is refused. Findings are stamped with the organisation.
+
+    The hunt:
+      1. Marks the session RUNNING (committed, so pause/cancel can see it)
+      2. Loads the organisation's hypothesis (data_sources, mitre_techniques)
+      3. Scans the organisation's SIEM LogEntry rows of the last 24 hours
+      4. Checks hypothesis data sources against threat_indicators
+      5. Scans the organisation's alerts and audit log (last 14 days)
+      6. Writes back the aggregate counts and marks the session COMPLETED
+
+    Between phases the hunt commits its progress and honours pause / resume /
+    cancel (see ``_hunt_checkpoint``); a cancelled hunt keeps CANCELLED and
+    the counts gathered so far. Any other exception marks the session FAILED.
+    """
+    import re as _re
+
+    from src.intel.models import ThreatIndicator
+    from src.models.alert import Alert
+    from src.models.audit import AuditLog
+    from src.siem.models import LogEntry
+
+    logger.info("execute_hunt_session_start", session_id=session_id)
+    async with async_session_factory() as db:
+        findings_created = 0
+        iocs_checked = 0
+        logs_scanned = 0
+        alerts_scanned = 0
+        audit_scanned = 0
+        keywords: set[str] = set()
+        mitre_ids: list = []
+        stopped: Optional[str] = None
+        try:
+            session = (
+                await db.execute(select(HuntSession).where(HuntSession.id == session_id))
+            ).scalar_one_or_none()
             if not session:
-                logger.warning(f"execute_hunt_session: session {session_id} not found")
+                logger.warning("execute_hunt_session_not_found", session_id=session_id)
+                return
+            if session.status != "PENDING":
+                # cancelled (or otherwise moved on) before the task started
+                logger.info(
+                    "execute_hunt_session_skipped", session_id=session_id, status=session.status,
+                )
+                return
+            org_id = session.organization_id
+            if not org_id:
+                session.status = "FAILED"
+                session.completed_at = datetime.now(timezone.utc)
+                session.error_message = (
+                    "hunt session has no organisation; refusing to hunt across tenants"
+                )
+                await db.commit()
                 return
 
-            hyp_result = await db.execute(
-                select(HuntHypothesis).where(HuntHypothesis.id == session.hypothesis_id)
-            )
-            hypothesis = hyp_result.scalar_one_or_none()
+            hypothesis = (
+                await db.execute(
+                    select(HuntHypothesis).where(
+                        HuntHypothesis.id == session.hypothesis_id,
+                        HuntHypothesis.organization_id == org_id,
+                    ),
+                )
+            ).scalar_one_or_none()
 
             session.status = "RUNNING"
             session.started_at = datetime.now(timezone.utc)
-            await db.flush()
+            await db.commit()
 
-            findings_created = 0
-            iocs_checked = 0
-            logs_scanned = 0
+            try:
+                if hypothesis:
+                    # Step 1: derive search keywords. Title + description
+                    # words longer than 3 chars, plus MITRE technique IDs.
+                    text = f"{hypothesis.title or ''} {hypothesis.description or ''}"
+                    keywords = {
+                        w.lower() for w in _re.findall(r"[A-Za-z][A-Za-z0-9_-]{3,}", text)
+                        if w.lower() not in {"the", "and", "for", "with", "this", "that", "from", "user", "data"}
+                    }
+                    mitre_ids = safe_json_loads(hypothesis.mitre_techniques, []) or []
 
-            if hypothesis:
-                # Step 1 — derive search keywords. Title + description words
-                # longer than 3 chars, plus MITRE technique IDs.
-                import re as _re
-                text = f"{hypothesis.title or ''} {hypothesis.description or ''}"
-                keywords = {
-                    w.lower() for w in _re.findall(r"[A-Za-z][A-Za-z0-9_-]{3,}", text)
-                    if w.lower() not in {"the", "and", "for", "with", "this", "that", "from", "user", "data"}
-                }
-                mitre_ids = safe_json_loads(hypothesis.mitre_techniques, []) or []
-
-                # Step 2 — scan recent SIEM logs (last 24h) for any keyword match
-                from src.siem.models import LogEntry
-                since = datetime.now(timezone.utc) - timedelta(days=1)
-                log_query = select(LogEntry).where(
-                    LogEntry.timestamp >= since.isoformat()
-                ).limit(500)
-                log_result = await db.execute(log_query)
-                candidate_logs = list(log_result.scalars().all())
-                logs_scanned = len(candidate_logs)
-
-                for log in candidate_logs:
-                    haystack = " ".join(filter(None, [
-                        log.message, log.raw_log, log.hostname, log.username,
-                        log.process_name, log.action,
-                    ])).lower()
-                    matched_keywords = [k for k in keywords if k in haystack]
-                    if matched_keywords:
-                        finding = HuntFinding(
-                            session_id=session_id,
-                            title=f"Log match: {log.message[:120] if log.message else log.raw_log[:120]}",
-                            description=(
-                                f"Log matched {len(matched_keywords)} hypothesis keywords: "
-                                + ", ".join(matched_keywords[:5])
-                            ),
-                            severity=log.severity or "medium",
-                            evidence=json.dumps({
-                                "log_id": log.id,
-                                "timestamp": log.timestamp,
-                                "source_type": log.source_type,
-                                "matched_keywords": matched_keywords[:10],
-                            }),
-                            mitre_techniques=json.dumps(mitre_ids) if mitre_ids else None,
+                    # Step 2: scan the organisation's SIEM logs (last 24h,
+                    # newest first) for any keyword match.
+                    since = datetime.now(timezone.utc) - timedelta(days=1)
+                    log_query = (
+                        select(LogEntry)
+                        .where(
+                            LogEntry.organization_id == org_id,
+                            LogEntry.timestamp >= since.isoformat(),
                         )
-                        db.add(finding)
-                        findings_created += 1
-
-                # Step 3 — check active threat indicators. Two modes:
-                #   (a) explicit data_sources list on the hypothesis
-                #       (analyst says "investigate these IPs/domains")
-                #   (b) broad scan — any active IOC whose value or source
-                #       mentions a hypothesis keyword.
-                from src.intel.models import ThreatIndicator
-                data_sources = safe_json_loads(hypothesis.data_sources, []) or []
-                for src_value in data_sources[:50]:
-                    if not isinstance(src_value, str):
-                        continue
-                    ioc_result = await db.execute(
-                        select(ThreatIndicator).where(
-                            ThreatIndicator.value == src_value,
-                            ThreatIndicator.is_active == True,  # noqa: E712
-                        )
+                        .order_by(LogEntry.timestamp.desc())
+                        .limit(500)
                     )
-                    matches = ioc_result.scalars().all()
-                    iocs_checked += 1
-                    for ioc in matches:
-                        finding = HuntFinding(
-                            session_id=session_id,
-                            title=f"IOC match: {ioc.indicator_type}:{ioc.value}",
-                            description=(
-                                f"Hypothesis data source matched a known threat indicator "
-                                f"from feed '{ioc.source or 'unknown'}'"
-                            ),
-                            severity=ioc.severity or "high",
-                            evidence=json.dumps({
-                                "indicator_id": ioc.id,
-                                "type": ioc.indicator_type,
-                                "value": ioc.value,
-                                "source": ioc.source,
-                                "tags": ioc.tags or [],
-                            }),
-                        )
-                        db.add(finding)
-                        findings_created += 1
+                    candidate_logs = list((await db.execute(log_query)).scalars().all())
+                    logs_scanned = len(candidate_logs)
 
-                # Step 4 — hunt the alerts table (last 14 days) for any
-                # matching keyword. This surfaces prior detections the
-                # hypothesis may have been written to find. Alerts are
-                # usually present even when raw logs are not, so this is
-                # the most valuable hunt source on most deployments.
-                from src.models.alert import Alert
-                alerts_scanned = 0
-                if keywords:
-                    alert_since = datetime.now(timezone.utc) - timedelta(days=14)
-                    alert_q = select(Alert).where(Alert.created_at >= alert_since).limit(2000)
-                    alert_res = await db.execute(alert_q)
-                    for a in alert_res.scalars().all():
-                        alerts_scanned += 1
-                        hay = " ".join(filter(None, [
-                            a.title, a.description, a.hostname, a.username,
-                            a.source, a.category, a.source_ip, a.destination_ip,
-                            a.domain, a.url, a.file_hash,
+                    for log in candidate_logs:
+                        haystack = " ".join(filter(None, [
+                            log.message, log.raw_log, log.hostname, log.username,
+                            log.process_name, log.action,
                         ])).lower()
-                        matched = [k for k in keywords if k in hay]
-                        if matched:
+                        matched_keywords = [k for k in keywords if k in haystack]
+                        if matched_keywords:
                             db.add(HuntFinding(
+                                organization_id=org_id,
                                 session_id=session_id,
-                                title=f"Alert match: {a.title}",
+                                title=f"Log match: {log.message[:120] if log.message else log.raw_log[:120]}",
                                 description=(
-                                    f"Historical alert from {a.source or 'unknown source'} "
-                                    f"matched {len(matched)} hypothesis keywords."
+                                    f"Log matched {len(matched_keywords)} hypothesis keywords: "
+                                    + ", ".join(matched_keywords[:5])
                                 ),
-                                severity=a.severity or "medium",
+                                severity=log.severity or "medium",
                                 evidence=json.dumps({
-                                    "alert_id": a.id,
-                                    "alert_status": a.status,
-                                    "created_at": a.created_at.isoformat() if a.created_at else None,
-                                    "matched_keywords": matched[:10],
-                                    "source_ip": a.source_ip,
-                                    "hostname": a.hostname,
+                                    "log_id": log.id,
+                                    "timestamp": log.timestamp,
+                                    "source_type": log.source_type,
+                                    "matched_keywords": matched_keywords[:10],
                                 }),
                                 mitre_techniques=json.dumps(mitre_ids) if mitre_ids else None,
                             ))
                             findings_created += 1
+                    await _hunt_checkpoint(db, session_id)
 
-                # Step 5 — hunt audit_logs for keyword matches on actions.
-                # This catches abuse of platform actions (e.g. "playbook
-                # execution on critical host" matching "lateral movement"
-                # keywords).
-                from src.models.audit import AuditLog
-                audit_scanned = 0
-                if keywords:
-                    audit_since = datetime.now(timezone.utc) - timedelta(days=14)
-                    audit_q = select(AuditLog).where(AuditLog.created_at >= audit_since).limit(2000)
-                    audit_res = await db.execute(audit_q)
-                    for al in audit_res.scalars().all():
-                        audit_scanned += 1
-                        hay = " ".join(filter(None, [
-                            al.action, al.resource_type, al.resource_id,
-                            al.description, al.ip_address,
-                        ])).lower()
-                        matched = [k for k in keywords if k in hay]
-                        if matched:
-                            db.add(HuntFinding(
-                                session_id=session_id,
-                                title=f"Audit log match: {al.action} on {al.resource_type}",
-                                description=(
-                                    f"Audit event matched {len(matched)} hypothesis keywords."
+                    # Step 3: check the hypothesis data sources against the
+                    # organisation's threat indicators plus platform-wide
+                    # feed intel (organisation NULL).
+                    data_sources = safe_json_loads(hypothesis.data_sources, []) or []
+                    for src_value in data_sources[:50]:
+                        if not isinstance(src_value, str):
+                            continue
+                        ioc_result = await db.execute(
+                            select(ThreatIndicator).where(
+                                ThreatIndicator.value == src_value,
+                                ThreatIndicator.is_active == True,  # noqa: E712
+                                or_(
+                                    ThreatIndicator.organization_id == org_id,
+                                    ThreatIndicator.organization_id.is_(None),
                                 ),
-                                severity="medium" if al.success else "high",
+                            ),
+                        )
+                        matches = ioc_result.scalars().all()
+                        iocs_checked += 1
+                        for ioc in matches:
+                            db.add(HuntFinding(
+                                organization_id=org_id,
+                                session_id=session_id,
+                                title=f"IOC match: {ioc.indicator_type}:{ioc.value}",
+                                description=(
+                                    f"Hypothesis data source matched a known threat indicator "
+                                    f"from feed '{ioc.source or 'unknown'}'"
+                                ),
+                                severity=ioc.severity or "high",
                                 evidence=json.dumps({
-                                    "audit_id": al.id,
-                                    "action": al.action,
-                                    "resource_type": al.resource_type,
-                                    "resource_id": al.resource_id,
-                                    "user_id": al.user_id,
-                                    "success": al.success,
-                                    "matched_keywords": matched[:10],
+                                    "indicator_id": ioc.id,
+                                    "type": ioc.indicator_type,
+                                    "value": ioc.value,
+                                    "source": ioc.source,
+                                    "tags": ioc.tags or [],
                                 }),
                             ))
                             findings_created += 1
+                    await _hunt_checkpoint(db, session_id)
+
+                    # Step 4: hunt the organisation's alerts (last 14 days)
+                    # for any matching keyword.
+                    if keywords:
+                        alert_since = datetime.now(timezone.utc) - timedelta(days=14)
+                        alert_q = (
+                            select(Alert)
+                            .where(Alert.organization_id == org_id, Alert.created_at >= alert_since)
+                            .order_by(Alert.created_at.desc())
+                            .limit(2000)
+                        )
+                        for a in (await db.execute(alert_q)).scalars().all():
+                            alerts_scanned += 1
+                            hay = " ".join(filter(None, [
+                                a.title, a.description, a.hostname, a.username,
+                                a.source, a.category, a.source_ip, a.destination_ip,
+                                a.domain, a.url, a.file_hash,
+                            ])).lower()
+                            matched = [k for k in keywords if k in hay]
+                            if matched:
+                                db.add(HuntFinding(
+                                    organization_id=org_id,
+                                    session_id=session_id,
+                                    title=f"Alert match: {a.title}",
+                                    description=(
+                                        f"Historical alert from {a.source or 'unknown source'} "
+                                        f"matched {len(matched)} hypothesis keywords."
+                                    ),
+                                    severity=a.severity or "medium",
+                                    evidence=json.dumps({
+                                        "alert_id": a.id,
+                                        "alert_status": a.status,
+                                        "created_at": a.created_at.isoformat() if a.created_at else None,
+                                        "matched_keywords": matched[:10],
+                                        "source_ip": a.source_ip,
+                                        "hostname": a.hostname,
+                                    }),
+                                    mitre_techniques=json.dumps(mitre_ids) if mitre_ids else None,
+                                ))
+                                findings_created += 1
+                    await _hunt_checkpoint(db, session_id)
+
+                    # Step 5: hunt the organisation's audit log for keyword
+                    # matches on actions (abuse of platform actions).
+                    if keywords:
+                        audit_since = datetime.now(timezone.utc) - timedelta(days=14)
+                        audit_q = (
+                            select(AuditLog)
+                            .where(AuditLog.organization_id == org_id, AuditLog.created_at >= audit_since)
+                            .order_by(AuditLog.created_at.desc())
+                            .limit(2000)
+                        )
+                        for al in (await db.execute(audit_q)).scalars().all():
+                            audit_scanned += 1
+                            hay = " ".join(filter(None, [
+                                al.action, al.resource_type, al.resource_id,
+                                al.description, al.ip_address,
+                            ])).lower()
+                            matched = [k for k in keywords if k in hay]
+                            if matched:
+                                db.add(HuntFinding(
+                                    organization_id=org_id,
+                                    session_id=session_id,
+                                    title=f"Audit log match: {al.action} on {al.resource_type}",
+                                    description=(
+                                        f"Audit event matched {len(matched)} hypothesis keywords."
+                                    ),
+                                    severity="medium" if al.success else "high",
+                                    evidence=json.dumps({
+                                        "audit_id": al.id,
+                                        "action": al.action,
+                                        "resource_type": al.resource_type,
+                                        "resource_id": al.resource_id,
+                                        "user_id": al.user_id,
+                                        "success": al.success,
+                                        "matched_keywords": matched[:10],
+                                    }),
+                                ))
+                                findings_created += 1
+                    await _hunt_checkpoint(db, session_id)
+            except _HuntStopped as stop:
+                stopped = str(stop)
 
             # Flush the new findings before counting so the count query
             # can see them in this session's transaction.
             await db.flush()
             findings_count_result = await db.execute(
-                select(func.count(HuntFinding.id)).where(HuntFinding.session_id == session_id)
+                select(func.count(HuntFinding.id)).where(
+                    HuntFinding.session_id == session_id,
+                    HuntFinding.organization_id == org_id,
+                ),
             )
+            # Counters only: the status column is never written here, so a
+            # cancel that landed meanwhile is not overwritten.
             session.findings_count = findings_count_result.scalar() or 0
-            # events_analyzed is the sum of rows actually inspected across
-            # every hunt source, so the UI's "analyzed N events" number
-            # reflects real work.
             session.events_analyzed = logs_scanned + alerts_scanned + audit_scanned
-            # query_count is the number of distinct queries we ran: one
-            # SIEM log scan, one alerts scan, one audit scan, plus one
+            # one SIEM log scan, one alerts scan, one audit scan, plus one
             # per IOC lookup against the threat_indicators table.
             session.query_count = 3 + iocs_checked
-
-            # Store per-run hunt telemetry for the UI to display.
             session.queries_executed = json.dumps({
                 "logs_scanned": logs_scanned,
                 "alerts_scanned": alerts_scanned,
                 "audit_logs_scanned": audit_scanned,
                 "iocs_checked": iocs_checked,
                 "findings_created_this_run": findings_created,
-                "keywords_used": sorted(list(keywords))[:30],
+                "keywords_used": sorted(keywords)[:30],
                 "mitre_techniques": mitre_ids,
+                "stopped": stopped,
             })
-
-            completed_at = datetime.now(timezone.utc)
-            session.status = "COMPLETED"
-            session.completed_at = completed_at
-            if session.started_at:
-                session.duration_seconds = int(
-                    (completed_at - session.started_at).total_seconds()
-                )
             await db.commit()
+
+            if stopped is None:
+                completed_at = datetime.now(timezone.utc)
+                duration = (
+                    int((completed_at - session.started_at).total_seconds())
+                    if session.started_at else None
+                )
+                # Conditional: only a still-RUNNING session becomes COMPLETED.
+                await db.execute(
+                    update(HuntSession)
+                    .where(HuntSession.id == session_id, HuntSession.status == "RUNNING")
+                    .values(status="COMPLETED", completed_at=completed_at, duration_seconds=duration),
+                )
+                await db.commit()
             logger.info(
-                f"execute_hunt_session DONE session_id={session_id} "
-                f"findings_created={findings_created} logs_scanned={logs_scanned} "
-                f"iocs_checked={iocs_checked}"
+                "execute_hunt_session_done",
+                session_id=session_id,
+                organization_id=org_id,
+                findings_created=findings_created,
+                logs_scanned=logs_scanned,
+                iocs_checked=iocs_checked,
+                stopped=stopped,
             )
         except Exception as e:
-            logger.error(f"execute_hunt_session FAILED session_id={session_id}: {e}", exc_info=True)
-            try:
-                await db.rollback()
-                # Re-fetch the session in a clean state and mark it failed
-                fail_result = await db.execute(
-                    select(HuntSession).where(HuntSession.id == session_id)
-                )
-                fail_session = fail_result.scalar_one_or_none()
-                if fail_session:
-                    fail_session.status = "FAILED"
-                    fail_session.completed_at = datetime.now(timezone.utc)
-                    fail_session.error_message = str(e)[:500]
-                    await db.commit()
-            except Exception as inner:
-                logger.error(f"Could not mark session {session_id} as FAILED: {inner}")
-                await db.rollback()
+            logger.error("execute_hunt_session_failed", session_id=session_id, error=str(e), exc_info=True)
+            await db.rollback()
+            # Re-fetch the session in a clean state and mark it failed
+            fail_session = (
+                await db.execute(select(HuntSession).where(HuntSession.id == session_id))
+            ).scalar_one_or_none()
+            if fail_session and fail_session.status not in _TERMINAL_SESSION_STATES:
+                fail_session.status = "FAILED"
+                fail_session.completed_at = datetime.now(timezone.utc)
+                fail_session.error_message = str(e)[:500]
+                await db.commit()
 
 
 # ============================================================================
@@ -403,6 +510,7 @@ async def execute_hunt_session(session_id: str):  # noqa: C901
 @router.get("/hypotheses", response_model=HuntHypothesisListResponse)
 async def list_hypotheses(
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -413,8 +521,8 @@ async def list_hypotheses(
     sort_by: str = "created_at",
     sort_order: str = "desc",
 ):
-    """List hunt hypotheses with filtering and pagination"""
-    query = select(HuntHypothesis)
+    """List the organisation's hunt hypotheses with filtering and pagination"""
+    query = select(HuntHypothesis).where(HuntHypothesis.organization_id == org_id)
 
     # Apply filters
     if search:
@@ -428,7 +536,8 @@ async def list_hypotheses(
         query = query.where(HuntHypothesis.status == status)
 
     if priority:
-        query = query.where(HuntHypothesis.priority == priority)
+        # priority is a VARCHAR column; binding the int failed on Postgres
+        query = query.where(HuntHypothesis.priority == str(priority))
 
     if hunt_type:
         query = query.where(HuntHypothesis.hunt_type == hunt_type)
@@ -471,11 +580,13 @@ async def list_hypotheses(
 @router.post("/hypotheses", response_model=HuntHypothesisResponse, status_code=status.HTTP_201_CREATED)
 async def create_hypothesis(
     hypothesis_data: HuntHypothesisCreate,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Create a new hunt hypothesis"""
     hypothesis = HuntHypothesis(
+        organization_id=org_id,
         title=hypothesis_data.title,
         description=hypothesis_data.description,
         priority=str(hypothesis_data.priority),
@@ -500,11 +611,12 @@ async def create_hypothesis(
 async def get_hypothesis(
     hypothesis_id: str,
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Get a hypothesis by ID"""
     hypothesis = await get_hypothesis_or_404(
-        db, hypothesis_id, getattr(current_user, "organization_id", None)
+        db, hypothesis_id, org_id
     )
     return await hypothesis_to_response(db, hypothesis)
 
@@ -513,12 +625,13 @@ async def get_hypothesis(
 async def update_hypothesis(
     hypothesis_id: str,
     hypothesis_data: HuntHypothesisUpdate,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Update a hypothesis"""
     hypothesis = await get_hypothesis_or_404(
-        db, hypothesis_id, getattr(current_user, "organization_id", None)
+        db, hypothesis_id, org_id
     )
 
     update_data = hypothesis_data.model_dump(exclude_unset=True, exclude_none=True)
@@ -552,12 +665,13 @@ async def update_hypothesis(
 @router.delete("/hypotheses/{hypothesis_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_hypothesis(
     hypothesis_id: str,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Delete a hypothesis (only if DRAFT)"""
     hypothesis = await get_hypothesis_or_404(
-        db, hypothesis_id, getattr(current_user, "organization_id", None)
+        db, hypothesis_id, org_id
     )
 
     if hypothesis.status != "DRAFT":
@@ -573,12 +687,13 @@ async def delete_hypothesis(
 @router.post("/hypotheses/{hypothesis_id}/activate", response_model=HuntHypothesisResponse)
 async def activate_hypothesis(
     hypothesis_id: str,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Activate a hypothesis (set status to ACTIVE)"""
     hypothesis = await get_hypothesis_or_404(
-        db, hypothesis_id, getattr(current_user, "organization_id", None)
+        db, hypothesis_id, org_id
     )
 
     if hypothesis.status != "DRAFT":
@@ -601,13 +716,20 @@ async def activate_hypothesis(
 
 
 @router.post("/sessions", response_model=HuntSessionResponse, status_code=status.HTTP_201_CREATED)
-async def create_session(session_data: HuntSessionCreate, current_user: CurrentUser = None, db: DatabaseSession = None, background_tasks: BackgroundTasks = None):
+async def create_session(
+    session_data: HuntSessionCreate,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
+    db: DatabaseSession = None,
+    background_tasks: BackgroundTasks = None,
+):
     """Create and start a hunt session"""
     hypothesis = await get_hypothesis_or_404(
-        db, session_data.hypothesis_id, getattr(current_user, "organization_id", None)
+        db, session_data.hypothesis_id, org_id
     )
 
     hunt_session = HuntSession(
+        organization_id=org_id,
         hypothesis_id=session_data.hypothesis_id,
         status="PENDING",
         parameters=json.dumps(session_data.parameters) if session_data.parameters else None,
@@ -633,6 +755,7 @@ async def create_session(session_data: HuntSessionCreate, current_user: CurrentU
 @router.get("/sessions", response_model=HuntSessionListResponse)
 async def list_sessions(
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -641,10 +764,11 @@ async def list_sessions(
     sort_by: str = "created_at",
     sort_order: str = "desc",
 ):
-    """List hunt sessions with filtering and pagination"""
-    query = select(HuntSession)
+    """List the organisation's hunt sessions with filtering and pagination"""
+    query = select(HuntSession).where(HuntSession.organization_id == org_id)
 
     if hypothesis_id:
+        await get_hypothesis_or_404(db, hypothesis_id, org_id)
         query = query.where(HuntSession.hypothesis_id == hypothesis_id)
 
     if session_status:
@@ -688,11 +812,12 @@ async def list_sessions(
 async def get_session(
     session_id: str,
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Get a hunt session by ID"""
     session = await get_session_or_404(
-        db, session_id, getattr(current_user, "organization_id", None)
+        db, session_id, org_id
     )
     return HuntSessionResponse.model_validate(session)
 
@@ -700,12 +825,13 @@ async def get_session(
 @router.post("/sessions/{session_id}/pause", response_model=HuntSessionResponse)
 async def pause_session(
     session_id: str,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Pause a hunt session"""
     session = await get_session_or_404(
-        db, session_id, getattr(current_user, "organization_id", None)
+        db, session_id, org_id
     )
 
     if session.status != "RUNNING":
@@ -724,12 +850,13 @@ async def pause_session(
 @router.post("/sessions/{session_id}/resume", response_model=HuntSessionResponse)
 async def resume_session(
     session_id: str,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Resume a paused hunt session"""
     session = await get_session_or_404(
-        db, session_id, getattr(current_user, "organization_id", None)
+        db, session_id, org_id
     )
 
     if session.status != "PAUSED":
@@ -748,12 +875,13 @@ async def resume_session(
 @router.post("/sessions/{session_id}/cancel", response_model=HuntSessionResponse)
 async def cancel_session(
     session_id: str,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Cancel a hunt session"""
     session = await get_session_or_404(
-        db, session_id, getattr(current_user, "organization_id", None)
+        db, session_id, org_id
     )
 
     if session.status in ["COMPLETED", "FAILED", "CANCELLED"]:
@@ -778,6 +906,7 @@ async def cancel_session(
 @router.get("/findings", response_model=HuntFindingListResponse)
 async def list_findings(
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -787,10 +916,11 @@ async def list_findings(
     sort_by: str = "created_at",
     sort_order: str = "desc",
 ):
-    """List hunt findings with filtering and pagination"""
-    query = select(HuntFinding)
+    """List the organisation's hunt findings with filtering and pagination"""
+    query = select(HuntFinding).where(HuntFinding.organization_id == org_id)
 
     if session_id:
+        await get_session_or_404(db, session_id, org_id)
         query = query.where(HuntFinding.session_id == session_id)
 
     if severity:
@@ -835,16 +965,18 @@ async def list_findings(
 @router.post("/findings", response_model=HuntFindingResponse, status_code=status.HTTP_201_CREATED)
 async def create_finding(
     finding_data: HuntFindingCreate,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Create a new hunt finding"""
     # Verify session exists
     session = await get_session_or_404(
-        db, finding_data.session_id, getattr(current_user, "organization_id", None)
+        db, finding_data.session_id, org_id
     )
 
     finding = HuntFinding(
+        organization_id=org_id,
         session_id=finding_data.session_id,
         title=finding_data.title,
         description=finding_data.description,
@@ -861,7 +993,6 @@ async def create_finding(
     await db.refresh(finding)
 
     try:
-        org_id = getattr(current_user, "organization_id", None)
         automation = AutomationService(db)
         await automation.on_threat_hunt_finding(
             hunt_name="hunt",
@@ -870,7 +1001,7 @@ async def create_finding(
             organization_id=org_id,
         )
     except Exception as automation_exc:
-        logger.warning(f"Automation on_threat_hunt_finding failed: {automation_exc}")
+        logger.warning("automation_on_threat_hunt_finding_failed", error=str(automation_exc))
 
     return HuntFindingResponse.model_validate(finding)
 
@@ -879,11 +1010,12 @@ async def create_finding(
 async def get_finding(
     finding_id: str,
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Get a finding by ID"""
     finding = await get_finding_or_404(
-        db, finding_id, getattr(current_user, "organization_id", None)
+        db, finding_id, org_id
     )
     return HuntFindingResponse.model_validate(finding)
 
@@ -892,12 +1024,13 @@ async def get_finding(
 async def update_finding(
     finding_id: str,
     finding_data: HuntFindingUpdate,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Update a finding"""
     finding = await get_finding_or_404(
-        db, finding_id, getattr(current_user, "organization_id", None)
+        db, finding_id, org_id
     )
 
     update_data = finding_data.model_dump(exclude_unset=True, exclude_none=True)
@@ -914,7 +1047,8 @@ async def update_finding(
 @router.post("/findings/{finding_id}/escalate", response_model=None)
 async def escalate_finding(
     finding_id: str,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Escalate a hunt finding to a real Incident.
@@ -928,7 +1062,7 @@ async def escalate_finding(
     from src.models.incident import Incident, IncidentStatus
 
     finding = await get_finding_or_404(
-        db, finding_id, getattr(current_user, "organization_id", None)
+        db, finding_id, org_id
     )
 
     if finding.escalated_to_case and finding.case_id:
@@ -949,6 +1083,7 @@ async def escalate_finding(
     incident_severity = sev_map.get((finding.severity or "").lower(), "medium")
 
     incident = Incident(
+        organization_id=org_id,
         title=f"Hunt escalation: {finding.title}",
         description=(
             (finding.description or "") + "\n\n---\n"
@@ -972,11 +1107,11 @@ async def escalate_finding(
         automation = AutomationService(db)
         await automation.on_incident_created(
             incident,
-            organization_id=getattr(current_user, "organization_id", None) if current_user else None,
-            created_by=str(current_user.id) if current_user else None,
+            organization_id=org_id,
+            created_by=str(current_user.id),
         )
     except Exception as automation_exc:
-        logger.warning(f"Automation on_incident_created failed after escalation: {automation_exc}")
+        logger.warning("automation_on_incident_created_failed", error=str(automation_exc))
 
     await db.flush()
     await db.refresh(finding)
@@ -994,6 +1129,45 @@ async def escalate_finding(
 # ============================================================================
 # HUNT TEMPLATES ENDPOINTS
 # ============================================================================
+# Hunt templates are platform scope: the table has no organisation column,
+# every tenant reads the same rows, and there is no route that creates,
+# updates or deletes one. Instantiating a template creates a hypothesis in the
+# caller's organisation.
+
+
+def _template_list(value: Any) -> Optional[list]:
+    """JSON list column that may hold a native list or a JSON string."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = safe_json_loads(value, [])
+    return value if isinstance(value, list) else None
+
+
+def template_to_response(template: HuntTemplate) -> HuntTemplateResponse:
+    """Build the response without tripping on nullable columns.
+
+    The schema declares category/description/hypothesis_template as ``str``
+    and estimated_duration_minutes as ``int`` while the table allows NULL, so
+    ``model_validate`` raised (a 500 for the whole list) on any template
+    with one of those unset.
+    """
+    return HuntTemplateResponse(
+        id=template.id,
+        name=template.name,
+        description=template.description or "",
+        category=template.category or "",
+        hunt_type=template.hunt_type or "",
+        hypothesis_template=template.hypothesis_template or "",
+        default_queries=_template_list(template.default_queries),
+        mitre_tactics=_template_list(template.mitre_tactics),
+        mitre_techniques=_template_list(template.mitre_techniques),
+        difficulty=template.difficulty or "",
+        estimated_duration_minutes=template.estimated_duration_minutes or 0,
+        tags=_template_list(template.tags),
+        is_builtin=bool(template.is_builtin),
+        enabled=bool(template.enabled),
+    )
 
 
 @router.get("/templates", response_model=list[HuntTemplateResponse])
@@ -1019,7 +1193,7 @@ async def list_templates(
     result = await db.execute(query)
     templates = list(result.scalars().all())
 
-    return [HuntTemplateResponse.model_validate(t) for t in templates]
+    return [template_to_response(t) for t in templates]
 
 
 @router.get("/templates/{template_id}", response_model=HuntTemplateResponse)
@@ -1040,14 +1214,15 @@ async def get_template(
             detail="Template not found",
         )
 
-    return HuntTemplateResponse.model_validate(template)
+    return template_to_response(template)
 
 
 @router.post("/templates/{template_id}/instantiate", response_model=HuntHypothesisResponse, status_code=status.HTTP_201_CREATED)
 async def instantiate_template(
     template_id: str,
     parameters: dict = Body(default={}),
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Create a hypothesis from a template"""
@@ -1064,6 +1239,7 @@ async def instantiate_template(
 
     # Create hypothesis from template
     hypothesis = HuntHypothesis(
+        organization_id=org_id,
         title=parameters.get("title", template.name),
         description=template.hypothesis_template,
         hunt_type=template.hunt_type,
@@ -1148,7 +1324,7 @@ async def list_notebooks(
 @router.post("/notebooks", response_model=HuntNotebookResponse, status_code=status.HTTP_201_CREATED)
 async def create_notebook(
     notebook_data: HuntNotebookCreate,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
     org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
@@ -1188,7 +1364,7 @@ async def get_notebook(
 async def update_notebook(
     notebook_id: str,
     notebook_data: HuntNotebookUpdate,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
     org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
@@ -1218,7 +1394,7 @@ async def update_notebook(
 async def execute_notebook_cell(
     notebook_id: str,
     cell_data: HuntNotebookCellExecute,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
     org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
@@ -1312,7 +1488,10 @@ async def execute_notebook_cell(
     elif query_lower.startswith("session"):
         # Session stats
         session_result = await db.execute(
-            select(HuntSession).where(HuntSession.id == notebook.session_id)
+            select(HuntSession).where(
+                HuntSession.id == notebook.session_id,
+                HuntSession.organization_id == org_id,
+            ),
         )
         s = session_result.scalar_one_or_none()
         if s:
@@ -1330,7 +1509,10 @@ async def execute_notebook_cell(
 
     else:
         # Default: findings for this session, optionally filtered
-        f_query = select(HuntFinding).where(HuntFinding.session_id == notebook.session_id)
+        f_query = select(HuntFinding).where(
+            HuntFinding.session_id == notebook.session_id,
+            HuntFinding.organization_id == org_id,
+        )
         if "severity:" in query_lower:
             sev = query_lower.split("severity:", 1)[1].split()[0]
             f_query = f_query.where(HuntFinding.severity == sev)
@@ -1369,7 +1551,7 @@ async def execute_notebook_cell(
 @router.post("/notebooks/{notebook_id}/publish", response_model=HuntNotebookResponse)
 async def publish_notebook(
     notebook_id: str,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
     org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
@@ -1499,32 +1681,42 @@ def _coerce_notebook_cells(raw) -> list[dict]:
 @router.get("/stats", response_model=HuntStatsResponse)
 async def get_hunting_stats(
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
-    """Get hunting statistics"""
+    """Hunting statistics of the caller's organisation"""
     # Total hypotheses
-    total_hyp_result = await db.execute(select(func.count(HuntHypothesis.id)))
+    total_hyp_result = await db.execute(
+        select(func.count(HuntHypothesis.id)).where(HuntHypothesis.organization_id == org_id),
+    )
     total_hypotheses = total_hyp_result.scalar() or 0
 
     # Active hunts
     active_result = await db.execute(
-        select(func.count(HuntSession.id)).where(HuntSession.status == "RUNNING")
+        select(func.count(HuntSession.id)).where(
+            HuntSession.organization_id == org_id, HuntSession.status == "RUNNING",
+        )
     )
     active_hunts = active_result.scalar() or 0
 
     # Completed hunts
     completed_result = await db.execute(
-        select(func.count(HuntSession.id)).where(HuntSession.status == "COMPLETED")
+        select(func.count(HuntSession.id)).where(
+            HuntSession.organization_id == org_id, HuntSession.status == "COMPLETED",
+        )
     )
     completed_hunts = completed_result.scalar() or 0
 
     # Total findings
-    total_find_result = await db.execute(select(func.count(HuntFinding.id)))
+    total_find_result = await db.execute(
+        select(func.count(HuntFinding.id)).where(HuntFinding.organization_id == org_id),
+    )
     total_findings = total_find_result.scalar() or 0
 
     # Findings by classification
     class_result = await db.execute(
         select(HuntFinding.classification, func.count(HuntFinding.id))
+        .where(HuntFinding.organization_id == org_id)
         .group_by(HuntFinding.classification)
     )
     findings_by_classification = dict(class_result.all()) or {}
@@ -1532,6 +1724,7 @@ async def get_hunting_stats(
     # Findings by severity
     sev_result = await db.execute(
         select(HuntFinding.severity, func.count(HuntFinding.id))
+        .where(HuntFinding.organization_id == org_id)
         .group_by(HuntFinding.severity)
     )
     findings_by_severity = dict(sev_result.all()) or {}
@@ -1539,7 +1732,8 @@ async def get_hunting_stats(
     # Average hunt duration
     avg_dur_result = await db.execute(
         select(func.avg(HuntSession.duration_seconds)).where(
-            HuntSession.status == "COMPLETED"
+            HuntSession.organization_id == org_id,
+            HuntSession.status == "COMPLETED",
         )
     )
     avg_duration_seconds = avg_dur_result.scalar() or 0
@@ -1549,7 +1743,10 @@ async def get_hunting_stats(
     from sqlalchemy import cast, String
     top_mitre_result = await db.execute(
         select(cast(HuntFinding.mitre_techniques, String), func.count(HuntFinding.id))
-        .where(HuntFinding.mitre_techniques.isnot(None))
+        .where(
+            HuntFinding.organization_id == org_id,
+            HuntFinding.mitre_techniques.isnot(None),
+        )
         .group_by(cast(HuntFinding.mitre_techniques, String))
         .order_by(func.count(HuntFinding.id).desc())
         .limit(10)

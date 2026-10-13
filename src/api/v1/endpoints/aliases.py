@@ -22,9 +22,15 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, desc, func, select
+from sqlalchemy import and_, desc, func, or_, select
 
-from src.api.deps import CurrentUser, DatabaseSession, require_role
+from src.api.deps import (
+    CurrentUser,
+    DatabaseSession,
+    OrganizationId,
+    _organization_required,
+    require_role,
+)
 from src.core.logging import get_logger
 from src.models.user import User, UserRole
 
@@ -51,50 +57,57 @@ async def _safe_list(
     size: int = 20,
     order_by=None,
     filters: Optional[List] = None,
+    include_platform_rows: bool = False,
 ) -> Dict[str, Any]:
-    """Generic paginated list query filtered by organization_id when present."""
-    try:
-        where_clauses = []
-        if org_id is not None and hasattr(model, "organization_id"):
+    """Generic paginated list query, scoped to ``org_id``.
+
+    Tenant scoping is mandatory for tenant-owned models: a caller with no
+    organisation gets 403 ``organization_required`` (wave 1). With
+    ``include_platform_rows`` the platform-scope rows (``organization_id IS
+    NULL``, e.g. indicators from global feeds) are listed too, read-only.
+
+    Query failures propagate (the global handler returns a 500 with an error
+    key) instead of being disguised as an empty list.
+    """
+    where_clauses = []
+    if hasattr(model, "organization_id"):
+        if not org_id:
+            raise _organization_required()
+        if include_platform_rows:
+            where_clauses.append(
+                or_(model.organization_id == org_id, model.organization_id.is_(None)),
+            )
+        else:
             where_clauses.append(model.organization_id == org_id)
-        if filters:
-            where_clauses.extend(filters)
+    if filters:
+        where_clauses.extend(filters)
 
-        stmt = select(model)
-        if where_clauses:
-            stmt = stmt.where(and_(*where_clauses))
+    stmt = select(model)
+    if where_clauses:
+        stmt = stmt.where(and_(*where_clauses))
 
-        count_stmt = select(func.count()).select_from(model)
-        if where_clauses:
-            count_stmt = count_stmt.where(and_(*where_clauses))
-        total = (await db.execute(count_stmt)).scalar() or 0
+    count_stmt = select(func.count()).select_from(model)
+    if where_clauses:
+        count_stmt = count_stmt.where(and_(*where_clauses))
+    total = (await db.execute(count_stmt)).scalar() or 0
 
-        if order_by is None and hasattr(model, "created_at"):
-            order_by = desc(model.created_at)
-        if order_by is not None:
-            stmt = stmt.order_by(order_by)
+    if order_by is None and hasattr(model, "created_at"):
+        order_by = desc(model.created_at)
+    if order_by is not None:
+        stmt = stmt.order_by(order_by)
 
-        stmt = stmt.offset((page - 1) * size).limit(size)
-        result = await db.execute(stmt)
-        rows = list(result.scalars().all())
+    stmt = stmt.offset((page - 1) * size).limit(size)
+    result = await db.execute(stmt)
+    rows = list(result.scalars().all())
 
-        # Serialize rows to dicts using SQLAlchemy inspection, so we never
-        # crash on response-model mismatches during the demo.
-        items = [_row_to_dict(r) for r in rows]
-        return {
-            "items": items,
-            "total": total,
-            "page": page,
-            "size": size,
-            "pages": (total + size - 1) // size if size else 1,
-        }
-    except Exception as exc:
-        logger.warning(
-            "alias list query failed",
-            model=getattr(model, "__name__", str(model)),
-            error=str(exc),
-        )
-        return {"items": [], "total": 0, "page": page, "size": size, "pages": 0}
+    items = [_row_to_dict(r) for r in rows]
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "size": size,
+        "pages": (total + size - 1) // size if size else 1,
+    }
 
 
 def _row_to_dict(row: Any) -> Dict[str, Any]:
@@ -306,36 +319,40 @@ async def risk_quant_analysis_flat(
 
 @router.get("/intel/iocs")
 async def intel_iocs_flat(
-    db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    db: DatabaseSession,
+    org_id: OrganizationId,
     limit: int = Query(20, ge=1, le=500),
-):
-    """Recent threat indicators, capped by `limit`."""
+) -> Dict[str, Any]:
+    """Recent threat indicators, capped by `limit`.
+
+    The caller's indicators plus platform-scope ones (``organization_id IS
+    NULL``, polled from global feeds), matching the intel router.
+    """
     from src.intel.models import ThreatIndicator
 
-    result = await _safe_list(
+    return await _safe_list(
         db,
         ThreatIndicator,
-        org_id=_org_id(current_user),
+        org_id=org_id,
         page=1,
         size=limit,
+        include_platform_rows=True,
     )
-    return result
 
 
 @router.get("/intel/feeds")
 async def intel_feeds_flat(
-    db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    db: DatabaseSession,
+    org_id: OrganizationId,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=500),
-):
+) -> Dict[str, Any]:
     from src.intel.models import ThreatFeed
 
     return await _safe_list(
         db,
         ThreatFeed,
-        org_id=_org_id(current_user),
+        org_id=org_id,
         page=page,
         size=size,
     )
@@ -451,24 +468,26 @@ async def simulation_posture_trend(
 
 @router.get("/playbooks/executions/recent")
 async def playbooks_executions_recent(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
     limit: int = Query(20, ge=1, le=200),
 ):
-    """Most recent playbook executions across all playbooks."""
+    """The caller's most recent playbook executions across all their playbooks.
+
+    Always tenant-scoped (executions are stamped with the organisation when
+    created); query failures propagate instead of returning an empty list.
+    """
     from src.models.playbook import PlaybookExecution
 
-    try:
-        org_id = _org_id(current_user)
-        stmt = select(PlaybookExecution)
-        if org_id and hasattr(PlaybookExecution, "organization_id"):
-            stmt = stmt.where(PlaybookExecution.organization_id == org_id)
-        stmt = stmt.order_by(desc(PlaybookExecution.created_at)).limit(limit)
-        rows = list((await db.execute(stmt)).scalars().all())
-        return {"items": [_row_to_dict(r) for r in rows], "total": len(rows)}
-    except Exception as exc:
-        logger.warning("playbooks_executions_recent failed", error=str(exc))
-        return {"items": [], "total": 0}
+    stmt = (
+        select(PlaybookExecution)
+        .where(PlaybookExecution.organization_id == org_id)
+        .order_by(desc(PlaybookExecution.created_at))
+        .limit(limit)
+    )
+    rows = list((await db.execute(stmt)).scalars().all())
+    return {"items": [_row_to_dict(r) for r in rows], "total": len(rows)}
 
 
 # --------------------------------------------------------------------------
@@ -666,62 +685,47 @@ async def agents_commands_pending(
 
 @router.get("/siem/dashboard")
 async def siem_dashboard(
-    db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    db: DatabaseSession,
+    org_id: OrganizationId,
 ) -> Dict[str, Any]:
-    """Aggregated SIEM dashboard stats.
+    """Aggregated SIEM dashboard stats for the caller's organisation.
 
     Computes log counts, rule counts, and recent correlation counts
-    directly from the SIEM tables.
+    directly from the SIEM tables. Detection rules include the platform
+    built-ins (``organization_id IS NULL``), which apply to every tenant.
+    Query failures propagate rather than reporting zeros.
     """
-    try:
-        from src.siem.models import (
-            CorrelationEvent,
-            DetectionRule,
-            LogEntry,
-        )
+    from src.siem.models import (
+        CorrelationEvent,
+        DetectionRule,
+        LogEntry,
+    )
 
-        org_id = _org_id(current_user)
+    async def _count(model: Any, *extra: Any) -> int:
+        stmt = select(func.count()).select_from(model).where(*extra)
+        return int((await db.execute(stmt)).scalar() or 0)
 
-        async def _count(model):
-            stmt = select(func.count()).select_from(model)
-            if org_id and hasattr(model, "organization_id"):
-                stmt = stmt.where(model.organization_id == org_id)
-            return (await db.execute(stmt)).scalar() or 0
+    total_logs = await _count(LogEntry, LogEntry.organization_id == org_id)
+    total_rules = await _count(
+        DetectionRule,
+        or_(DetectionRule.organization_id == org_id, DetectionRule.organization_id.is_(None)),
+    )
+    total_correlations = await _count(
+        CorrelationEvent, CorrelationEvent.organization_id == org_id,
+    )
 
-        total_logs = await _count(LogEntry)
-        total_rules = await _count(DetectionRule)
-        total_correlations = await _count(CorrelationEvent)
+    since = datetime.utcnow() - timedelta(hours=24)
+    logs_last_24h = await _count(
+        LogEntry, LogEntry.organization_id == org_id, LogEntry.created_at >= since,
+    )
 
-        # Last 24h logs
-        since = datetime.utcnow() - timedelta(hours=24)
-        stmt = (
-            select(func.count())
-            .select_from(LogEntry)
-            .where(
-                LogEntry.created_at >= since,
-            )
-        )
-        if org_id and hasattr(LogEntry, "organization_id"):
-            stmt = stmt.where(LogEntry.organization_id == org_id)
-        logs_last_24h = (await db.execute(stmt)).scalar() or 0
-
-        return {
-            "total_logs": total_logs,
-            "logs_last_24h": logs_last_24h,
-            "total_rules": total_rules,
-            "total_correlations": total_correlations,
-            "generated_at": datetime.utcnow().isoformat() + "Z",
-        }
-    except Exception as exc:
-        logger.warning("siem_dashboard failed", error=str(exc))
-        return {
-            "total_logs": 0,
-            "logs_last_24h": 0,
-            "total_rules": 0,
-            "total_correlations": 0,
-            "generated_at": datetime.utcnow().isoformat() + "Z",
-        }
+    return {
+        "total_logs": total_logs,
+        "logs_last_24h": logs_last_24h,
+        "total_rules": total_rules,
+        "total_correlations": total_correlations,
+        "generated_at": datetime.utcnow().isoformat() + "Z",
+    }
 
 
 # --------------------------------------------------------------------------
@@ -731,18 +735,18 @@ async def siem_dashboard(
 
 @router.get("/itdr/access-anomalies")
 async def itdr_access_anomalies_alias(
-    db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    db: DatabaseSession,
+    org_id: OrganizationId,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
-):
+) -> Dict[str, Any]:
     """Alias for `/itdr/anomalies` (AccessAnomaly)."""
     from src.itdr.models import AccessAnomaly
 
     return await _safe_list(
         db,
         AccessAnomaly,
-        org_id=_org_id(current_user),
+        org_id=org_id,
         page=page,
         size=size,
     )
@@ -837,24 +841,19 @@ async def ot_security_zones_dash(
 
 @router.get("/ot-security/purdue-map")
 async def ot_security_purdue_map_dash(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
     """Purdue model map: zones + assets grouped by purdue level."""
     from src.ot_security.models import OTAsset, OTZone
 
     try:
-        org_id = _org_id(current_user)
         # Zones
-        zone_stmt = select(OTZone)
-        if org_id and hasattr(OTZone, "organization_id"):
-            zone_stmt = zone_stmt.where(OTZone.organization_id == org_id)
+        zone_stmt = select(OTZone).where(OTZone.organization_id == org_id)
         zones = list((await db.execute(zone_stmt)).scalars().all())
 
         # Assets
-        asset_stmt = select(OTAsset)
-        if org_id and hasattr(OTAsset, "organization_id"):
-            asset_stmt = asset_stmt.where(OTAsset.organization_id == org_id)
+        asset_stmt = select(OTAsset).where(OTAsset.organization_id == org_id)
         assets = list((await db.execute(asset_stmt)).scalars().all())
 
         # Group by purdue_level
@@ -975,6 +974,7 @@ class OTDiscoverRequest(BaseModel):
 
 @router.post("/ot-security/discover")
 async def ot_security_bulk_discover(
+    org_id: OrganizationId,
     payload: OTDiscoverRequest = Body(...),
     db: DatabaseSession = None,
     current_user: User = Depends(require_role([UserRole.ADMIN])),
@@ -989,8 +989,10 @@ async def ot_security_bulk_discover(
 
     Safety gates:
       * Admin role only: the sweep runs from the API host's network.
-      * When the organization has OT zones configured, the CIDR must lie
-        inside one of their ``network_cidr`` ranges.
+      * The CIDR must lie inside the platform allowlist
+        ``OT_DISCOVERY_ALLOWED_CIDRS`` (empty = discovery disabled) AND inside
+        one of the organization's OT zone ``network_cidr`` ranges; loopback,
+        link-local and cloud-metadata ranges are always refused.
       * CIDRs larger than /22 are refused (same cap the engine enforces).
       * If ``PYSOAR_DISABLE_NETWORK_SCAN=1`` is set, no sockets are opened
         and the endpoint returns a skipped-result payload.
@@ -1001,10 +1003,6 @@ async def ot_security_bulk_discover(
         OTMonitor,
     )
     from src.ot_security.models import OTAsset
-
-    org_id = _org_id(current_user)
-    if not org_id:
-        raise HTTPException(status_code=401, detail="organization_id required")
 
     # Early safety check so we return a clean 400 instead of relying on
     # the engine to log and silently return an empty list.
@@ -1022,42 +1020,19 @@ async def ot_security_bulk_discover(
             ),
         )
 
-    # Confine the sweep to the organization's configured OT subnets.
-    from src.ot_security.models import OTZone
+    # Confine the sweep: platform allowlist (OT_DISCOVERY_ALLOWED_CIDRS) AND the
+    # organization's OT zones; loopback/link-local/metadata ranges are always
+    # refused. Fails closed when either list is empty.
+    from src.api.v1.endpoints.ot_security import enforce_discovery_targets
 
-    zone_cidrs = (
-        await db.execute(select(OTZone.network_cidr).where(OTZone.organization_id == org_id))
-    ).scalars().all()
-    configured = []
-    for raw in zone_cidrs:
-        try:
-            configured.append(ip_network(str(raw).strip(), strict=False))
-        except ValueError:
-            continue
-    if configured and not any(
-        net.version == zone.version and net.subnet_of(zone)  # type: ignore[arg-type]
-        for zone in configured
-    ):
-        logger.warning(
-            "ot_discover_refused_outside_zones",
-            user_id=str(getattr(current_user, "id", "")),
-            organization_id=org_id,
-            cidr=str(net),
-        )
-        raise HTTPException(
-            status_code=403,
-            detail={
-                "error": "cidr_outside_ot_zones",
-                "detail": "the CIDR must lie inside one of the organization's OT zone networks",
-            },
-        )
+    await enforce_discovery_targets(db, org_id, [net])
 
     logger.info(
         "ot_discover_requested",
         user_id=str(getattr(current_user, "id", "")),
         organization_id=org_id,
         cidr=str(net),
-        zone_restricted=bool(configured),
+        zone_restricted=True,
     )
 
     if os.environ.get("PYSOAR_DISABLE_NETWORK_SCAN") == "1":
@@ -1145,9 +1120,9 @@ def _asset_last_seen_iso(asset: Any) -> str:
 
 @router.get("/ot-security/export")
 async def ot_security_export(
+    org_id: OrganizationId,
     export_format: str = Query("json", alias="format", pattern="^(json|csv)$"),
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
     """
     Server-side OT security report download.
@@ -1162,22 +1137,17 @@ async def ot_security_export(
     """
     from src.ot_security.models import OTAlert, OTAsset, OTZone
 
-    org_id = _org_id(current_user)
     now = datetime.now(timezone.utc)
     generated_at = now.isoformat()
 
-    assets_res = await db.execute(
-        select(OTAsset).where(OTAsset.organization_id == org_id) if org_id else select(OTAsset),
-    )
+    assets_res = await db.execute(select(OTAsset).where(OTAsset.organization_id == org_id))
     assets = list(assets_res.scalars().all())
 
-    alerts_res = await db.execute(
-        select(OTAlert).where(OTAlert.organization_id == org_id) if org_id else select(OTAlert),
-    )
+    alerts_res = await db.execute(select(OTAlert).where(OTAlert.organization_id == org_id))
     alerts = list(alerts_res.scalars().all())
 
     zones_res = await db.execute(
-        select(OTZone).where(OTZone.organization_id == org_id) if org_id else select(OTZone),
+        select(OTZone).where(OTZone.organization_id == org_id),
     )
     zones = list(zones_res.scalars().all())
 

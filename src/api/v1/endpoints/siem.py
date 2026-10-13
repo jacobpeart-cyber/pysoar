@@ -1,23 +1,50 @@
-"""SIEM management endpoints"""
+"""SIEM management endpoints.
+
+Tenancy and roles (wave 1, docs/audit/2026-10-08/PLAN.md):
+
+* Every tenant route takes ``OrganizationId``: queries filter on it, created
+  rows (logs, rules, imports, data sources, saved searches) are stamped with
+  it, and ids from another organisation answer 404.
+* Detection rules with ``organization_id IS NULL`` are platform (built-in)
+  rules (see ``src.siem.rule_seeder``): every organisation can read and
+  export them and the engine evaluates them on every organisation's logs,
+  but only a platform superuser may update or delete them (organisation
+  users get 403 ``platform_rule_read_only``).
+* Roles: viewers read (searches, aggregations, dry-run tests and saved
+  search runs are reads even though they are POSTs); analysts perform
+  operational writes (log ingestion, correlation triage, saved searches);
+  admins change configuration (rules, imports, data sources, cloud poll of
+  their organisation's integrations); platform superusers run host-level or
+  every-tenant actions (syslog listener start/stop, history backfill, ingest
+  queue status).
+"""
 
 import json
-import logging
 import math
-from datetime import datetime, timezone
-from typing import Optional
+from datetime import datetime, timedelta, timezone
+from typing import Annotated, Optional
 
-logger = logging.getLogger(__name__)
-
-from fastapi import APIRouter, BackgroundTasks, Body, HTTPException, Query, Request, status
-from sqlalchemy import asc, desc, func, select
+from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
+from sqlalchemy import func, or_, select
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import CurrentUser, DatabaseSession
+from src.api.deps import (
+    CurrentUser,
+    DatabaseSession,
+    OrganizationId,
+    PlatformSuperUser,
+    require_role,
+    resolve_organization_scope,
+)
 from src.core.database import async_session_factory
+from src.core.logging import get_logger
+from src.models.user import User, UserRole
 from src.schemas.siem import (
     AggregationRequest,
     CorrelationEventResponse,
     DataSourceCreate,
+    DataSourceUpdate,
     DataSourceResponse,
     DetectionRuleCreate,
     DetectionRuleListResponse,
@@ -33,35 +60,48 @@ from src.schemas.siem import (
 )
 from src.siem.models import (
     CorrelationEvent,
+    CorrelationStatus,
     DetectionRule,
     LogEntry,
     SIEMDataSource,
 )
+from src.models.alert import Alert
 from src.services.automation import AutomationService
 from src.core.utils import safe_json_loads
 
+logger = get_logger(__name__)
+
 router = APIRouter(prefix="/siem", tags=["SIEM"])
+
+#: Operational writes (ingest, correlation triage, saved searches).
+AnalystUser = Annotated[User, Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
+#: Configuration writes (rules, imports, data sources, cloud polling).
+SIEMAdminUser = Annotated[User, Depends(require_role([UserRole.ADMIN]))]
+
+
+def _error(status_code: int, error: str, detail: str) -> HTTPException:
+    return HTTPException(status_code=status_code, detail={"error": error, "detail": detail})
 
 
 @router.get("/ingest/status")
 async def ingest_status(
-    request: Request = None,
+    current_user: PlatformSuperUser = None,
 ):
-    """Return ingest queue status for monitoring and autoscaling."""
+    """Return ingest queue status (host-wide queue; platform superusers only)."""
+    from src.siem.ingest_queue import get_status
+
     try:
-        from src.siem.ingest_queue import get_status
-        status_info = await get_status()
-    except Exception as exc:  # noqa: BLE001
-        logger.debug(f"ingest status check failed: {exc}")
-        status_info = {"mode": "unknown", "queue_length": -1, "redis_connected": False}
-    return status_info
+        return await get_status()
+    except Exception as exc:  # noqa: BLE001 - any backend failure is reported, not hidden
+        logger.warning("ingest status check failed", error=str(exc))
+        raise _error(
+            status.HTTP_503_SERVICE_UNAVAILABLE, "ingest_status_unavailable", str(exc)
+        ) from exc
 
 
-async def get_log_or_404(db: AsyncSession, log_id: str, org_id: Optional[str] = None) -> LogEntry:
-    """Get log entry by ID or raise 404"""
-    stmt = select(LogEntry).where(LogEntry.id == log_id)
-    if org_id is not None:
-        stmt = stmt.where(LogEntry.organization_id == org_id)
+async def get_log_or_404(db: AsyncSession, log_id: str, org_id: str) -> LogEntry:
+    """Get log entry by ID within the organisation or raise 404"""
+    stmt = select(LogEntry).where(LogEntry.id == log_id, LogEntry.organization_id == org_id)
     result = await db.execute(stmt)
     log_entry = result.scalar_one_or_none()
     if not log_entry:
@@ -72,11 +112,14 @@ async def get_log_or_404(db: AsyncSession, log_id: str, org_id: Optional[str] = 
     return log_entry
 
 
-async def get_rule_or_404(db: AsyncSession, rule_id: str, org_id: Optional[str] = None) -> DetectionRule:
-    """Get detection rule by ID or raise 404"""
-    stmt = select(DetectionRule).where(DetectionRule.id == rule_id)
-    if org_id is not None:
-        stmt = stmt.where(DetectionRule.organization_id == org_id)
+def _visible_rules(org_id: str):
+    """Rules an organisation can see: its own plus platform (NULL-org) rules."""
+    return or_(DetectionRule.organization_id == org_id, DetectionRule.organization_id.is_(None))
+
+
+async def get_rule_or_404(db: AsyncSession, rule_id: str, org_id: str) -> DetectionRule:
+    """Get a detection rule visible to the organisation (own or platform) or raise 404"""
+    stmt = select(DetectionRule).where(DetectionRule.id == rule_id, _visible_rules(org_id))
     result = await db.execute(stmt)
     rule = result.scalar_one_or_none()
     if not rule:
@@ -87,11 +130,21 @@ async def get_rule_or_404(db: AsyncSession, rule_id: str, org_id: Optional[str] 
     return rule
 
 
-async def get_correlation_or_404(db: AsyncSession, correlation_id: str, org_id: Optional[str] = None) -> CorrelationEvent:
-    """Get correlation event by ID or raise 404"""
-    stmt = select(CorrelationEvent).where(CorrelationEvent.id == correlation_id)
-    if org_id is not None:
-        stmt = stmt.where(CorrelationEvent.organization_id == org_id)
+def _ensure_rule_writable(rule: DetectionRule, current_user: User) -> None:
+    """Platform (NULL-org) rules are read-only for organisation users."""
+    if rule.organization_id is None and not current_user.is_superuser:
+        raise _error(
+            status.HTTP_403_FORBIDDEN,
+            "platform_rule_read_only",
+            "built-in platform rules apply to every organisation and cannot be changed by one",
+        )
+
+
+async def get_correlation_or_404(db: AsyncSession, correlation_id: str, org_id: str) -> CorrelationEvent:
+    """Get correlation event by ID within the organisation or raise 404"""
+    stmt = select(CorrelationEvent).where(
+        CorrelationEvent.id == correlation_id, CorrelationEvent.organization_id == org_id
+    )
     result = await db.execute(stmt)
     correlation = result.scalar_one_or_none()
     if not correlation:
@@ -102,11 +155,11 @@ async def get_correlation_or_404(db: AsyncSession, correlation_id: str, org_id: 
     return correlation
 
 
-async def get_source_or_404(db: AsyncSession, source_id: str, org_id: Optional[str] = None) -> SIEMDataSource:
-    """Get data source by ID or raise 404"""
-    stmt = select(SIEMDataSource).where(SIEMDataSource.id == source_id)
-    if org_id is not None:
-        stmt = stmt.where(SIEMDataSource.organization_id == org_id)
+async def get_source_or_404(db: AsyncSession, source_id: str, org_id: str) -> SIEMDataSource:
+    """Get data source by ID within the organisation or raise 404"""
+    stmt = select(SIEMDataSource).where(
+        SIEMDataSource.id == source_id, SIEMDataSource.organization_id == org_id
+    )
     result = await db.execute(stmt)
     source = result.scalar_one_or_none()
     if not source:
@@ -212,11 +265,17 @@ async def bulk_ingest_logs_apikey(
             detail="Invalid or expired API key (or missing siem:write permission)",
         )
 
-    # Resolve the owner's organization_id so mirrored rows are scoped.
-    from src.models.user import User
+    # The key owner's organisation scopes every ingested row. A key whose
+    # owner has no organisation cannot ingest (rows would be tenant-less).
     owner_res = await db.execute(select(User).where(User.id == owner_id))
     owner = owner_res.scalar_one_or_none()
     org_id = getattr(owner, "organization_id", None) if owner else None
+    if not org_id:
+        raise _error(
+            status.HTTP_403_FORBIDDEN,
+            "organization_required",
+            "the API key's owner belongs to no organisation; ingested logs must belong to one",
+        )
 
     raw_body = await request.body()
     if not raw_body:
@@ -308,7 +367,8 @@ async def bulk_ingest_logs_apikey(
 @router.post("/logs/ingest", response_model=None, status_code=status.HTTP_201_CREATED)
 async def ingest_log(
     log_data: LogIngestRequest,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """
@@ -322,8 +382,6 @@ async def ingest_log(
     5. Alerts created for rule matches
     """
     from src.siem.pipeline import process_log
-
-    org_id = getattr(current_user, "organization_id", None)
 
     log_entry, alerts, correlations = await process_log(
         raw_log=log_data.raw_log,
@@ -348,9 +406,8 @@ async def ingest_log(
                     matched_events=[],
                     organization_id=org_id,
                 )
-        except Exception as e:
-            import logging
-            logging.getLogger(__name__).error(f"Automation failed for SIEM correlation: {e}")
+        except Exception as e:  # noqa: BLE001 - the log is stored; automation failure is logged
+            logger.error("Automation failed for SIEM correlation", error=str(e), organization_id=org_id)
 
     return {
         "id": log_entry.id,
@@ -370,17 +427,21 @@ async def ingest_log(
 @router.post("/logs/batch", response_model=None)
 async def batch_ingest_logs(
     batch_data: LogBatchIngestRequest,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """
     Batch ingest multiple log entries through the full SIEM pipeline.
 
     Each log is parsed, normalized, and evaluated against detection rules.
+    The body's ``organization_id`` selects the tenant only for platform
+    superusers; anyone else must leave it empty or name their own
+    organisation. Each log is written in its own SAVEPOINT, so one failing
+    log is reported in ``errors`` without losing the others.
     """
     from src.siem.pipeline import process_log
 
-    org_id = getattr(current_user, "organization_id", None) or batch_data.organization_id
+    org_id = resolve_organization_scope(current_user, batch_data.organization_id)
 
     processed = 0
     total_alerts = 0
@@ -428,13 +489,14 @@ _LOG_SEARCHABLE_FIELDS = {
 async def search_logs(
     search_data: LogSearchRequest,
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
-    """Search logs with complex filtering."""
+    """Search the organisation's logs with complex filtering (a read; viewers allowed)."""
     import time as _time
     started = _time.monotonic()
 
-    query = select(LogEntry)
+    query = select(LogEntry).where(LogEntry.organization_id == org_id)
 
     # Apply filters
     if search_data.query:
@@ -509,6 +571,7 @@ async def search_logs(
 async def aggregate_logs(
     agg_data: AggregationRequest,
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Run aggregation query on logs.
@@ -527,7 +590,7 @@ async def aggregate_logs(
         )
 
     field_column = getattr(LogEntry, agg_data.field)
-    query = select(field_column, func.count(LogEntry.id))
+    query = select(field_column, func.count(LogEntry.id)).where(LogEntry.organization_id == org_id)
 
     if agg_data.time_start:
         query = query.where(LogEntry.timestamp >= agg_data.time_start.isoformat())
@@ -555,16 +618,19 @@ async def aggregate_logs(
 @router.get("/logs/stats", response_model=SIEMStatsResponse)
 async def get_siem_stats(
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
-    """Get SIEM statistics"""
-    total_result = await db.execute(select(func.count(LogEntry.id)))
+    """Get the organisation's SIEM statistics"""
+    own_logs = LogEntry.organization_id == org_id
+    total_result = await db.execute(select(func.count(LogEntry.id)).where(own_logs))
     total_logs = total_result.scalar() or 0
 
     # Filter logs_today by today's date
-    today_start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    now = datetime.now(timezone.utc)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     logs_today_result = await db.execute(
-        select(func.count(LogEntry.id)).where(LogEntry.timestamp >= today_start.isoformat())
+        select(func.count(LogEntry.id)).where(own_logs, LogEntry.timestamp >= today_start.isoformat())
     )
     logs_today = logs_today_result.scalar() or 0
 
@@ -573,54 +639,69 @@ async def get_siem_stats(
 
     type_result = await db.execute(
         select(LogEntry.log_type, func.count(LogEntry.id))
+        .where(own_logs)
         .group_by(LogEntry.log_type)
     )
     logs_by_type = [{"name": row[0] or "unknown", "value": row[1]} for row in type_result.all()]
 
     severity_result = await db.execute(
         select(LogEntry.severity, func.count(LogEntry.id))
+        .where(own_logs)
         .group_by(LogEntry.severity)
     )
     logs_by_severity = [{"name": row[0] or "unknown", "value": row[1]} for row in severity_result.all()]
 
     source_result = await db.execute(
         select(LogEntry.source_name, func.count(LogEntry.id))
+        .where(own_logs)
         .group_by(LogEntry.source_name)
     )
     logs_by_source = [{"name": row[0] or "unknown", "value": row[1]} for row in source_result.all()]
 
+    # Enabled rules that apply to this organisation (its own + platform).
     rules_result = await db.execute(
-        select(func.count(DetectionRule.id)).where(DetectionRule.enabled == True)
+        select(func.count(DetectionRule.id)).where(
+            DetectionRule.enabled == True,  # noqa: E712
+            _visible_rules(org_id),
+        )
     )
     active_rules = rules_result.scalar() or 0
 
-    matches_result = await db.execute(select(func.sum(DetectionRule.match_count)))
+    # Rule matches today and SIEM alerts in the last 24 hours, both counted
+    # from this organisation's SIEM alerts. Rule match_count columns are not
+    # used: platform rules are shared, so their counters are not per tenant.
+    siem_alerts = (Alert.organization_id == org_id, Alert.source == "siem")
+    matches_result = await db.execute(
+        select(func.count(Alert.id)).where(
+            *siem_alerts,
+            Alert.alert_type == "detection_rule",
+            Alert.created_at >= today_start,
+        )
+    )
     rule_matches_today = matches_result.scalar() or 0
 
-    # Alerts triggered in last 24 hours (correlation events with alert_generated=True)
-    twenty_four_hours_ago = datetime.now(timezone.utc).replace(microsecond=0)
-    twenty_four_hours_ago = twenty_four_hours_ago.replace(
-        hour=twenty_four_hours_ago.hour,
-    )
     alerts_result = await db.execute(
-        select(func.count(CorrelationEvent.id)).where(
-            CorrelationEvent.alert_generated == True
-        )
+        select(func.count(Alert.id)).where(*siem_alerts, Alert.created_at >= now - timedelta(hours=24))
     )
     alerts_triggered_24h = alerts_result.scalar() or 0
 
     # Active data sources count
     sources_result = await db.execute(
-        select(func.count(SIEMDataSource.id)).where(SIEMDataSource.enabled == True)
+        select(func.count(SIEMDataSource.id)).where(
+            SIEMDataSource.enabled == True,  # noqa: E712
+            SIEMDataSource.organization_id == org_id,
+        )
     )
     active_data_sources = sources_result.scalar() or 0
 
-    corr_result = await db.execute(select(func.count(CorrelationEvent.id)))
+    own_correlations = CorrelationEvent.organization_id == org_id
+    corr_result = await db.execute(select(func.count(CorrelationEvent.id)).where(own_correlations))
     active_correlations = corr_result.scalar() or 0
 
     # Recent detections - last 5 correlation events
     recent_corr_result = await db.execute(
         select(CorrelationEvent)
+        .where(own_correlations)
         .order_by(CorrelationEvent.created_at.desc())
         .limit(5)
     )
@@ -659,10 +740,10 @@ async def get_siem_stats(
 async def get_log(
     log_id: str,
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Get a log entry by ID"""
-    org_id = getattr(current_user, "organization_id", None)
     log_entry = await get_log_or_404(db, log_id, org_id)
     return LogEntryResponse.model_validate(log_entry)
 
@@ -675,6 +756,7 @@ async def get_log(
 @router.get("/rules", response_model=DetectionRuleListResponse)
 async def list_rules(
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -684,8 +766,8 @@ async def list_rules(
     sort_by: str = "created_at",
     sort_order: str = "desc",
 ):
-    """List detection rules with filtering and pagination"""
-    query = select(DetectionRule)
+    """List the organisation's detection rules plus the platform (built-in) rules"""
+    query = select(DetectionRule).where(_visible_rules(org_id))
 
     # Apply filters
     if search:
@@ -733,10 +815,11 @@ async def list_rules(
 @router.post("/rules", response_model=DetectionRuleResponse, status_code=status.HTTP_201_CREATED)
 async def create_rule(
     rule_data: DetectionRuleCreate,
-    current_user: CurrentUser = None,
+    current_user: SIEMAdminUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
-    """Create a new detection rule"""
+    """Create a new detection rule owned by the organisation"""
     rule = DetectionRule(
         name=rule_data.name,
         title=rule_data.title,
@@ -754,15 +837,23 @@ async def create_rule(
         false_positive_notes=rule_data.false_positive_notes,
         references=json.dumps(rule_data.references) if rule_data.references else None,
         rule_yaml=rule_data.rule_yaml,
+        organization_id=org_id,
     )
 
-    db.add(rule)
-    await db.flush()
+    try:
+        async with db.begin_nested():
+            db.add(rule)
+            await db.flush()
+    except IntegrityError as exc:
+        # detection_rules.name is unique across the platform.
+        raise _error(
+            status.HTTP_409_CONFLICT, "rule_name_conflict", "a detection rule with this name already exists"
+        ) from exc
     await db.refresh(rule)
 
-    # Reload rules in the engine
+    # Reload this organisation's rules in the engine
     from src.siem.engine_manager import reload_rules
-    await reload_rules(db)
+    await reload_rules(db, org_id)
 
     return DetectionRuleResponse.model_validate(rule)
 
@@ -771,10 +862,10 @@ async def create_rule(
 async def get_rule(
     rule_id: str,
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Get a detection rule by ID"""
-    org_id = getattr(current_user, "organization_id", None)
     rule = await get_rule_or_404(db, rule_id, org_id)
     return DetectionRuleResponse.model_validate(rule)
 
@@ -783,12 +874,13 @@ async def get_rule(
 async def update_rule(
     rule_id: str,
     rule_data: DetectionRuleUpdate,
-    current_user: CurrentUser = None,
+    current_user: SIEMAdminUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
-    """Update a detection rule"""
-    org_id = getattr(current_user, "organization_id", None)
+    """Update a detection rule (platform rules: platform superusers only)"""
     rule = await get_rule_or_404(db, rule_id, org_id)
+    _ensure_rule_writable(rule, current_user)
 
     update_data = rule_data.model_dump(exclude_unset=True, exclude_none=True)
 
@@ -805,7 +897,7 @@ async def update_rule(
     await db.refresh(rule)
 
     from src.siem.engine_manager import reload_rules
-    await reload_rules(db)
+    await reload_rules(db, rule.organization_id)
 
     return DetectionRuleResponse.model_validate(rule)
 
@@ -813,17 +905,19 @@ async def update_rule(
 @router.delete("/rules/{rule_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_rule(
     rule_id: str,
-    current_user: CurrentUser = None,
+    current_user: SIEMAdminUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
-    """Delete a detection rule"""
-    org_id = getattr(current_user, "organization_id", None)
+    """Delete a detection rule (platform rules: platform superusers only)"""
     rule = await get_rule_or_404(db, rule_id, org_id)
+    _ensure_rule_writable(rule, current_user)
+    rule_org = rule.organization_id
     await db.delete(rule)
     await db.flush()
 
     from src.siem.engine_manager import reload_rules
-    await reload_rules(db)
+    await reload_rules(db, rule_org)
 
 
 @router.post("/rules/{rule_id}/test", response_model=None)
@@ -831,9 +925,10 @@ async def test_rule(
     rule_id: str,
     test_data: dict = Body(...),
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
-    """Dry-run a detection rule against sample logs.
+    """Dry-run a detection rule against sample logs (a read; viewers allowed).
 
     Uses the real Sigma-style rule engine — same one that runs in prod
     on every ingested log — so the test result is identical to what
@@ -850,7 +945,6 @@ async def test_rule(
     from src.siem.engine_manager import _build_yaml_from_logic
     from src.core.utils import safe_json_loads
 
-    org_id = getattr(current_user, "organization_id", None)
     rule = await get_rule_or_404(db, rule_id, org_id)
     sample_logs = test_data.get("sample_logs", []) or []
 
@@ -868,7 +962,8 @@ async def test_rule(
                     else detection_logic
                 )
                 yaml_content = _build_yaml_from_logic(rule, logic)
-            except Exception:
+            except (ValueError, TypeError) as exc:
+                logger.warning("detection_logic could not be converted", rule_id=rule.id, error=str(exc))
                 yaml_content = None
 
     if not yaml_content:
@@ -953,14 +1048,15 @@ async def validate_rule(
 @router.get("/correlations", response_model=list[CorrelationEventResponse])
 async def list_correlations(
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     severity: Optional[str] = None,
     status: Optional[str] = None,
 ):
-    """List correlation events"""
-    query = select(CorrelationEvent)
+    """List the organisation's correlation events"""
+    query = select(CorrelationEvent).where(CorrelationEvent.organization_id == org_id)
 
     if severity:
         query = query.where(CorrelationEvent.severity == severity)
@@ -982,10 +1078,10 @@ async def list_correlations(
 async def get_correlation(
     correlation_id: str,
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Get a correlation event by ID"""
-    org_id = getattr(current_user, "organization_id", None)
     correlation = await get_correlation_or_404(db, correlation_id, org_id)
     return CorrelationEventResponse.model_validate(correlation)
 
@@ -994,15 +1090,23 @@ async def get_correlation(
 async def update_correlation_status(
     correlation_id: str,
     status_update: dict = Body(...),
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
-    """Update correlation event status"""
-    org_id = getattr(current_user, "organization_id", None)
+    """Update correlation event status (triage; analysts and admins)"""
     correlation = await get_correlation_or_404(db, correlation_id, org_id)
 
     if "status" in status_update:
-        correlation.status = status_update["status"]
+        allowed = {s.value for s in CorrelationStatus}
+        new_status = status_update["status"]
+        if new_status not in allowed:
+            raise _error(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "invalid_status",
+                f"status must be one of {sorted(allowed)}",
+            )
+        correlation.status = new_status
 
     await db.flush()
     await db.refresh(correlation)
@@ -1018,12 +1122,17 @@ async def update_correlation_status(
 @router.get("/sources", response_model=list[DataSourceResponse])
 async def list_sources(
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
 ):
-    """List data sources"""
-    query = select(SIEMDataSource).order_by(SIEMDataSource.created_at.desc())
+    """List the organisation's data sources"""
+    query = (
+        select(SIEMDataSource)
+        .where(SIEMDataSource.organization_id == org_id)
+        .order_by(SIEMDataSource.created_at.desc())
+    )
     query = query.offset((page - 1) * size).limit(size)
 
     result = await db.execute(query)
@@ -1035,10 +1144,11 @@ async def list_sources(
 @router.post("/sources", response_model=DataSourceResponse, status_code=status.HTTP_201_CREATED)
 async def create_source(
     source_data: DataSourceCreate,
-    current_user: CurrentUser = None,
+    current_user: SIEMAdminUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
-    """Create a new data source"""
+    """Create a new data source owned by the organisation"""
     source = SIEMDataSource(
         name=source_data.name,
         description=source_data.description,
@@ -1046,10 +1156,18 @@ async def create_source(
         connection_config=json.dumps(source_data.connection_config),
         parser_config=json.dumps(source_data.parser_config) if source_data.parser_config else None,
         enabled=source_data.enabled,
+        organization_id=org_id,
     )
 
-    db.add(source)
-    await db.flush()
+    try:
+        async with db.begin_nested():
+            db.add(source)
+            await db.flush()
+    except IntegrityError as exc:
+        # siem_data_sources.name is unique across the platform.
+        raise _error(
+            status.HTTP_409_CONFLICT, "source_name_conflict", "a data source with this name already exists"
+        ) from exc
     await db.refresh(source)
 
     return DataSourceResponse.model_validate(source)
@@ -1058,20 +1176,32 @@ async def create_source(
 @router.put("/sources/{source_id}", response_model=DataSourceResponse)
 async def update_source(
     source_id: str,
-    source_data: DataSourceCreate,
-    current_user: CurrentUser = None,
+    source_data: DataSourceUpdate,
+    current_user: SIEMAdminUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
-    """Update a data source"""
-    org_id = getattr(current_user, "organization_id", None)
+    """Update a data source.
+
+    Partial update: only fields present in the body change. The old full
+    replace required ``name`` (so the enable toggle 422'd) and reset
+    ``connection_config`` to {} whenever a client omitted it.
+    """
     source = await get_source_or_404(db, source_id, org_id)
 
-    source.name = source_data.name
-    source.description = source_data.description
-    source.source_type = source_data.source_type
-    source.connection_config = json.dumps(source_data.connection_config)
-    source.parser_config = json.dumps(source_data.parser_config) if source_data.parser_config else None
-    source.enabled = source_data.enabled
+    changes = source_data.model_dump(exclude_unset=True)
+    if changes.get("name"):
+        source.name = changes["name"]
+    if "description" in changes:
+        source.description = changes["description"]
+    if "source_type" in changes:
+        source.source_type = changes["source_type"]
+    if "connection_config" in changes:
+        source.connection_config = json.dumps(changes["connection_config"] or {})
+    if "parser_config" in changes:
+        source.parser_config = json.dumps(changes["parser_config"]) if changes["parser_config"] else None
+    if "enabled" in changes and changes["enabled"] is not None:
+        source.enabled = changes["enabled"]
 
     await db.flush()
     await db.refresh(source)
@@ -1082,11 +1212,11 @@ async def update_source(
 @router.delete("/sources/{source_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_source(
     source_id: str,
-    current_user: CurrentUser = None,
+    current_user: SIEMAdminUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Delete a data source"""
-    org_id = getattr(current_user, "organization_id", None)
     source = await get_source_or_404(db, source_id, org_id)
     await db.delete(source)
     await db.flush()
@@ -1100,14 +1230,12 @@ async def delete_source(
 @router.get("/saved-searches", response_model=None)
 async def list_saved_searches(
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
-    """List saved searches"""
+    """List the organisation's saved searches"""
     from src.siem.models import SavedSearch
-    org_id = getattr(current_user, "organization_id", None)
-    query = select(SavedSearch)
-    if org_id:
-        query = query.where(SavedSearch.organization_id == org_id)
+    query = select(SavedSearch).where(SavedSearch.organization_id == org_id)
     query = query.order_by(SavedSearch.created_at.desc())
     result = await db.execute(query)
     return list(result.scalars().all())
@@ -1116,7 +1244,8 @@ async def list_saved_searches(
 @router.post("/saved-searches", response_model=None, status_code=status.HTTP_201_CREATED)
 async def create_saved_search(
     data: dict = Body(...),
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Create a saved search"""
@@ -1132,7 +1261,7 @@ async def create_saved_search(
         is_alert=data.get("is_alert", False),
         alert_threshold=data.get("alert_threshold"),
         schedule_cron=data.get("schedule_cron"),
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         created_by=str(current_user.id),
     )
     db.add(search)
@@ -1144,15 +1273,15 @@ async def create_saved_search(
 @router.delete("/saved-searches/{search_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_saved_search(
     search_id: str,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Delete a saved search"""
     from src.siem.models import SavedSearch
-    org_id = getattr(current_user, "organization_id", None)
-    stmt = select(SavedSearch).where(SavedSearch.id == search_id)
-    if org_id is not None:
-        stmt = stmt.where(SavedSearch.organization_id == org_id)
+    stmt = select(SavedSearch).where(
+        SavedSearch.id == search_id, SavedSearch.organization_id == org_id
+    )
     result = await db.execute(stmt)
     search = result.scalar_one_or_none()
     if not search:
@@ -1165,23 +1294,21 @@ async def delete_saved_search(
 async def run_saved_search(
     search_id: str,
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
-    """Execute a saved search and return results"""
+    """Execute a saved search and return results (a read; viewers allowed)"""
     from src.siem.models import SavedSearch
-    org_id = getattr(current_user, "organization_id", None)
-    stmt = select(SavedSearch).where(SavedSearch.id == search_id)
-    if org_id is not None:
-        stmt = stmt.where(SavedSearch.organization_id == org_id)
+    stmt = select(SavedSearch).where(
+        SavedSearch.id == search_id, SavedSearch.organization_id == org_id
+    )
     result = await db.execute(stmt)
     search = result.scalar_one_or_none()
     if not search:
         raise HTTPException(status_code=404, detail="Saved search not found")
 
     # Execute the search query
-    query = select(LogEntry)
-    if org_id is not None:
-        query = query.where(LogEntry.organization_id == org_id)
+    query = select(LogEntry).where(LogEntry.organization_id == org_id)
     if search.query:
         search_filter = f"%{search.query}%"
         query = query.where(
@@ -1213,7 +1340,8 @@ async def run_saved_search(
 @router.post("/rules/import", response_model=None, status_code=status.HTTP_201_CREATED)
 async def import_rule_yaml(
     data: dict = Body(...),
-    current_user: CurrentUser = None,
+    current_user: SIEMAdminUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Import a detection rule from Sigma YAML.
@@ -1231,7 +1359,6 @@ async def import_rule_yaml(
     """
     import uuid
     import yaml
-    from sqlalchemy.exc import IntegrityError
 
     yaml_content = data.get("yaml", "")
     if not yaml_content:
@@ -1318,22 +1445,31 @@ async def import_rule_yaml(
         references=json.dumps(parsed.get("references", []) or []) if parsed.get("references") else None,
         rule_yaml=yaml_content,
         enabled=True,
+        organization_id=org_id,
     )
-    db.add(rule)
     try:
-        await db.flush()
+        async with db.begin_nested():
+            db.add(rule)
+            await db.flush()
     except IntegrityError:
-        # Name collision on the unique index — fall back to title + short
-        # sigma-id suffix (still title-based, never a bare UUID).
-        await db.rollback()
+        # Name collision on the unique index: fall back to title + short
+        # sigma-id suffix (still title-based, never a bare UUID). Only the
+        # SAVEPOINT is rolled back; the old full rollback discarded the
+        # request's whole transaction.
         suffix = (sigma_id[:8] if sigma_id else uuid.uuid4().hex[:8])
         rule.name = f"{title} ({suffix})"
-        db.add(rule)
-        await db.flush()
+        try:
+            async with db.begin_nested():
+                db.add(rule)
+                await db.flush()
+        except IntegrityError as exc:
+            raise _error(
+                status.HTTP_409_CONFLICT, "rule_name_conflict", "a detection rule with this name already exists"
+            ) from exc
     await db.refresh(rule)
 
     from src.siem.engine_manager import reload_rules
-    await reload_rules(db)
+    await reload_rules(db, org_id)
 
     return {
         "id": rule.id,
@@ -1348,10 +1484,10 @@ async def import_rule_yaml(
 async def export_rule_yaml(
     rule_id: str,
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
-    """Export a detection rule as YAML"""
-    org_id = getattr(current_user, "organization_id", None)
+    """Export a detection rule (own or platform) as YAML"""
     rule = await get_rule_or_404(db, rule_id, org_id)
 
     if rule.rule_yaml:
@@ -1377,19 +1513,21 @@ async def export_rule_yaml(
 
 @router.post("/cloud/poll-all", response_model=None)
 async def trigger_cloud_poll(
-    current_user: CurrentUser = None,
+    current_user: SIEMAdminUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ) -> dict:
-    """Manually trigger every installed cloud-log integration to poll.
+    """Manually poll the organisation's installed cloud-log integrations.
 
-    Iterates installed AWS CloudTrail / Azure Activity / GCP Cloud
-    Logging integrations, fetches new events since each one's last
-    poll, and dispatches them through the SIEM pipeline. Celery beat
-    runs the same code on a 5-minute schedule; this endpoint is for
-    on-demand 'fetch latest now' use during demos and triage.
+    Iterates the caller's organisation's AWS CloudTrail / Azure Activity /
+    GCP Cloud Logging (and Splunk / Elastic / QRadar) integrations, fetches
+    new events since each one's last poll, and dispatches them through the
+    SIEM pipeline. Celery beat polls every tenant's integrations on a
+    5-minute schedule; this endpoint is the on-demand 'fetch latest now'
+    for one organisation and never touches another tenant's integrations.
     """
     from src.siem.cloud_poller import poll_all_cloud_integrations
-    results = await poll_all_cloud_integrations(db)
+    results = await poll_all_cloud_integrations(db, organization_id=org_id)
     return {
         "polled": len(results),
         "results": results,
@@ -1404,10 +1542,13 @@ async def trigger_cloud_poll(
 @router.post("/logs/backfill", response_model=None)
 async def backfill_log_entries(
     limit_per_source: int = Query(5000, ge=1, le=50000),
-    current_user: CurrentUser = None,
+    current_user: PlatformSuperUser = None,
     db: DatabaseSession = None,
 ):
     """Copy existing Alert + AuditLog rows into ``log_entries``.
+
+    Platform superusers only: the backfill reads every tenant's alerts and
+    audit logs, so it is a platform-wide operation.
 
     Run once after deploy to populate the SIEM search surface with the
     platform's historical security events. Idempotent — rows already
@@ -1471,7 +1612,7 @@ async def _resolve_default_siem_org() -> Optional[str]:
             orgs = {u.organization_id for u in supers if u.organization_id}
             if len(orgs) == 1:
                 return orgs.pop()
-    except Exception as exc:  # noqa: BLE001
+    except SQLAlchemyError as exc:
         logger.warning("Default SIEM org resolution failed", error=str(exc))
     return None
 
@@ -1518,8 +1659,10 @@ async def _syslog_batch_handler(messages: list):
                     db=db,
                     organization_id=org_id,
                 )
-            except Exception as e:
-                logger.error(f"Syslog pipeline error: {e}")
+            except Exception as e:  # noqa: BLE001 - one bad message must not drop the batch
+                # process_log wraps each message in a SAVEPOINT, so the
+                # failure is rolled back alone and the session stays usable.
+                logger.error("Syslog pipeline error", error=str(e), organization_id=org_id)
         await db.commit()
 
 
@@ -1528,16 +1671,18 @@ async def get_collector_status(current_user: CurrentUser = None):
     """Get syslog collector status"""
     global _collector_instance
     if _collector_instance:
-        health = _collector_instance.get_health()
+        # get_stats() carries the processed/errors/uptime/rate counters;
+        # get_health() does not, so those always read 0 before.
+        stats = _collector_instance.get_stats()
         return {
             "running": _collector_instance._running,
             "listen_port": _collector_instance.udp_port,
             "protocol": "udp+tcp",
-            "messages_received": health.get("messages_received", 0),
-            "messages_processed": health.get("messages_processed", 0),
-            "errors": health.get("errors", 0),
-            "uptime_seconds": health.get("uptime_seconds", 0),
-            "messages_per_second": health.get("messages_per_second", 0),
+            "messages_received": stats.get("messages_received", 0),
+            "messages_processed": stats.get("messages_processed", 0),
+            "errors": stats.get("errors", 0),
+            "uptime_seconds": stats.get("uptime_seconds", 0),
+            "messages_per_second": stats.get("messages_per_second", 0),
         }
     return {
         "running": False,
@@ -1553,10 +1698,15 @@ async def get_collector_status(current_user: CurrentUser = None):
 
 @router.post("/collector/start", response_model=None)
 async def start_collector(
-    current_user: CurrentUser = None,
+    current_user: PlatformSuperUser = None,
     port: int = 5514,
 ):
-    """Start the syslog collector on specified port."""
+    """Start the syslog collector on specified port.
+
+    The listener is host-global (one socket for the whole deployment, logs
+    stamped with ``SIEM_DEFAULT_ORG_ID``), so only platform superusers may
+    start or stop it.
+    """
     import asyncio
     global _collector_instance, _collector_task
 
@@ -1582,17 +1732,14 @@ async def start_collector(
             "message": f"Syslog collector started on UDP+TCP port {port}",
             "port": port,
         }
-    except Exception as e:
-        logger.error(f"Failed to start collector: {e}")
-        return {
-            "status": "error",
-            "message": f"Failed to start: {str(e)}",
-        }
+    except (OSError, RuntimeError, ValueError) as e:
+        logger.error("Failed to start collector", error=str(e))
+        raise _error(status.HTTP_500_INTERNAL_SERVER_ERROR, "collector_start_failed", str(e)) from e
 
 
 @router.post("/collector/stop", response_model=None)
-async def stop_collector(current_user: CurrentUser = None):
-    """Stop the syslog collector"""
+async def stop_collector(current_user: PlatformSuperUser = None):
+    """Stop the syslog collector (host-global; platform superusers only)"""
     global _collector_instance, _collector_task
 
     if not _collector_instance or not _collector_instance._running:
@@ -1616,6 +1763,6 @@ async def stop_collector(current_user: CurrentUser = None):
                 "errors": stats.get("errors", 0),
             },
         }
-    except Exception as e:
-        logger.error(f"Failed to stop collector: {e}")
-        return {"status": "error", "message": f"Failed to stop: {str(e)}"}
+    except (OSError, RuntimeError) as e:
+        logger.error("Failed to stop collector", error=str(e))
+        raise _error(status.HTTP_500_INTERNAL_SERVER_ERROR, "collector_stop_failed", str(e)) from e

@@ -614,11 +614,25 @@ class EventAggregator:
             }
 
 
+#: Upper bound on events kept per correlation group (per strategy key).
+MAX_EVENTS_PER_GROUP = 500
+
+
 class CorrelationEngine:
     """
     Main SIEM correlation engine.
 
     Manages multiple correlation strategies and processes events through them.
+
+    One instance holds the buffers of exactly one organisation:
+    ``src.siem.engine_manager.get_correlation_engine(organization_id)`` keeps
+    an engine per tenant so events from different organisations never share
+    a buffer and never correlate together.
+
+    Buffers are bounded: each group keeps at most ``MAX_EVENTS_PER_GROUP``
+    events, each strategy keeps at most ``max_buffer_size`` groups (oldest
+    evicted first), and a group is cleared once it produces a correlation so
+    one pattern is reported once instead of on every later event.
     """
 
     def __init__(
@@ -687,6 +701,13 @@ class CorrelationEngine:
                 # Get correlation key
                 corr_key = strategy.get_correlation_key(event)
                 buffer[corr_key].append(event)
+                if len(buffer[corr_key]) > MAX_EVENTS_PER_GROUP:
+                    del buffer[corr_key][: len(buffer[corr_key]) - MAX_EVENTS_PER_GROUP]
+                while len(buffer) > self.max_buffer_size:
+                    oldest_key = next(iter(buffer))
+                    if oldest_key == corr_key:
+                        break
+                    del buffer[oldest_key]
 
                 # Try to correlate events in this group
                 correlated_events = buffer[corr_key]
@@ -702,8 +723,14 @@ class CorrelationEngine:
                             )
                             if result:
                                 self._correlations[result.correlation_id] = result
+                                while len(self._correlations) > self.max_buffer_size:
+                                    del self._correlations[next(iter(self._correlations))]
                                 results.append(result)
                                 self._stats["total_correlations_found"] += 1
+                                # Reported: start the group afresh so the
+                                # same pattern does not re-fire on every
+                                # subsequent event from this key.
+                                buffer.pop(corr_key, None)
                                 break
 
             return results

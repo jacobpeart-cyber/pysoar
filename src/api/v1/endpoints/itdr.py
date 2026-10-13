@@ -7,16 +7,23 @@ access anomaly analysis, and privileged access management.
 
 import math
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional
+from typing import Annotated, Any, Optional
 
-from fastapi import APIRouter, HTTPException, Query, Request, status, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status, BackgroundTasks
 import json
 
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.agentic.context import Mode
-from src.api.deps import CurrentUser, DatabaseSession, RedisClient
+from src.api.deps import (
+    CurrentUser,
+    DatabaseSession,
+    OrganizationId,
+    RedisClient,
+    require_role,
+)
+from src.models.user import User, UserRole
 from src.core.database import async_session_factory
 from src.core.logging import get_logger
 from src.services.automation import AutomationService
@@ -67,14 +74,18 @@ from src.schemas.itdr import (
 logger = get_logger(__name__)
 router = APIRouter(prefix="/itdr", tags=["ITDR"])
 
+#: Operational writes: identities, threats, triage, exposure checks, reviews.
+AnalystUser = Annotated[User, Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
+#: Access decisions and response actions: approve/revoke elevation.
+AdminRoleUser = Annotated[User, Depends(require_role([UserRole.ADMIN]))]
+
 
 async def get_identity_or_404(
-    db: AsyncSession, identity_id: str, org_id: Optional[str] = None
+    db: AsyncSession, identity_id: str, org_id: str
 ) -> IdentityProfile:
-    """Get identity profile by ID or raise 404"""
+    """Get the caller's identity profile by ID or raise 404 (always tenant-scoped)"""
     stmt = select(IdentityProfile).where(IdentityProfile.id == identity_id)
-    if org_id is not None:
-        stmt = stmt.where(IdentityProfile.organization_id == org_id)
+    stmt = stmt.where(IdentityProfile.organization_id == org_id)
     result = await db.execute(stmt)
     identity = result.scalar_one_or_none()
     if not identity:
@@ -86,12 +97,11 @@ async def get_identity_or_404(
 
 
 async def get_threat_or_404(
-    db: AsyncSession, threat_id: str, org_id: Optional[str] = None
+    db: AsyncSession, threat_id: str, org_id: str
 ) -> IdentityThreat:
-    """Get identity threat by ID or raise 404"""
+    """Get the caller's identity threat by ID or raise 404 (always tenant-scoped)"""
     stmt = select(IdentityThreat).where(IdentityThreat.id == threat_id)
-    if org_id is not None:
-        stmt = stmt.where(IdentityThreat.organization_id == org_id)
+    stmt = stmt.where(IdentityThreat.organization_id == org_id)
     result = await db.execute(stmt)
     threat = result.scalar_one_or_none()
     if not threat:
@@ -109,7 +119,7 @@ async def get_threat_or_404(
 
 @router.get("/identities", response_model=IdentityProfileListResponse)
 async def list_identities(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -125,9 +135,7 @@ async def list_identities(
     query = select(IdentityProfile)
 
     # Filter by organization
-    org_id = getattr(current_user, "organization_id", None)
-    if org_id:
-        query = query.where(IdentityProfile.organization_id == org_id)
+    query = query.where(IdentityProfile.organization_id == org_id)
 
     # Apply filters
     if search:
@@ -180,12 +188,12 @@ async def list_identities(
 @router.get("/identities/{identity_id}", response_model=IdentityProfileResponse)
 async def get_identity(
     identity_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Get identity profile details"""
     identity = await get_identity_or_404(
-        db, identity_id, getattr(current_user, "organization_id", None)
+        db, identity_id, org_id
     )
     return IdentityProfileResponse.model_validate(identity)
 
@@ -193,12 +201,13 @@ async def get_identity(
 @router.post("/identities", response_model=IdentityProfileResponse, status_code=status.HTTP_201_CREATED)
 async def create_identity(
     data: IdentityProfileCreate,
-    current_user: CurrentUser = None,
+    _caller: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Create new identity profile"""
     identity = IdentityProfile(
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         **data.dict()
     )
     db.add(identity)
@@ -212,12 +221,13 @@ async def create_identity(
 async def update_identity(
     identity_id: str,
     data: IdentityProfileUpdate,
-    current_user: CurrentUser = None,
+    _caller: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Update identity profile"""
     identity = await get_identity_or_404(
-        db, identity_id, getattr(current_user, "organization_id", None)
+        db, identity_id, org_id
     )
     update_data = data.dict(exclude_unset=True)
     for field, value in update_data.items():
@@ -231,17 +241,20 @@ async def update_identity(
 @router.get("/identities/{identity_id}/risk-score")
 async def get_identity_risk_score(
     identity_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Get identity risk score breakdown"""
     identity = await get_identity_or_404(
-        db, identity_id, getattr(current_user, "organization_id", None)
+        db, identity_id, org_id
     )
 
     # Count threats
     threat_result = await db.execute(
-        select(func.count()).where(IdentityThreat.identity_id == identity_id)
+        select(func.count()).where(
+            IdentityThreat.identity_id == identity_id,
+            IdentityThreat.organization_id == org_id,
+        )
     )
     threat_count = threat_result.scalar() or 0
 
@@ -249,6 +262,7 @@ async def get_identity_risk_score(
     critical_result = await db.execute(
         select(func.count()).where(
             (IdentityThreat.identity_id == identity_id)
+            & (IdentityThreat.organization_id == org_id)
             & (IdentityThreat.severity == "critical")
         )
     )
@@ -256,13 +270,19 @@ async def get_identity_risk_score(
 
     # Count anomalies
     anomaly_result = await db.execute(
-        select(func.count()).where(AccessAnomaly.identity_id == identity_id)
+        select(func.count()).where(
+            AccessAnomaly.identity_id == identity_id,
+            AccessAnomaly.organization_id == org_id,
+        )
     )
     anomaly_count = anomaly_result.scalar() or 0
 
     # Count exposures
     exposure_result = await db.execute(
-        select(func.count()).where(CredentialExposure.identity_id == identity_id)
+        select(func.count()).where(
+            CredentialExposure.identity_id == identity_id,
+            CredentialExposure.organization_id == org_id,
+        )
     )
     exposure_count = exposure_result.scalar() or 0
 
@@ -289,7 +309,7 @@ async def get_identity_risk_score(
 
 @router.get("/threats", response_model=IdentityThreatListResponse)
 async def list_threats(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -305,9 +325,7 @@ async def list_threats(
     query = select(IdentityThreat)
 
     # Filter by organization
-    org_id = getattr(current_user, "organization_id", None)
-    if org_id:
-        query = query.where(IdentityThreat.organization_id == org_id)
+    query = query.where(IdentityThreat.organization_id == org_id)
 
     if threat_type:
         query = query.where(IdentityThreat.threat_type == threat_type)
@@ -354,12 +372,12 @@ async def list_threats(
 @router.get("/threats/{threat_id}", response_model=IdentityThreatResponse)
 async def get_threat(
     threat_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Get identity threat details"""
     threat = await get_threat_or_404(
-        db, threat_id, getattr(current_user, "organization_id", None)
+        db, threat_id, org_id
     )
     return IdentityThreatResponse.model_validate(threat)
 
@@ -367,7 +385,8 @@ async def get_threat(
 @router.post("/threats", response_model=IdentityThreatResponse, status_code=status.HTTP_201_CREATED)
 async def create_threat(
     data: IdentityThreatCreate,
-    current_user: CurrentUser = None,
+    _caller: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Create new identity threat"""
@@ -375,8 +394,12 @@ async def create_threat(
     # Convert empty identity_id to None to avoid FK violation
     if not threat_data.get("identity_id"):
         threat_data["identity_id"] = None
+    else:
+        # Never link a threat to another tenant's identity (or a missing one,
+        # which used to surface as a foreign-key 500).
+        await get_identity_or_404(db, threat_data["identity_id"], org_id)
     threat = IdentityThreat(
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         **threat_data
     )
     db.add(threat)
@@ -385,7 +408,6 @@ async def create_threat(
 
     # Trigger automation rules
     try:
-        org_id = getattr(current_user, "organization_id", None)
         automation = AutomationService(db)
         await automation.on_itdr_threat(
             threat_type=threat.threat_type,
@@ -404,12 +426,13 @@ async def create_threat(
 async def update_threat(
     threat_id: str,
     data: IdentityThreatUpdate,
-    current_user: CurrentUser = None,
+    _caller: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Update identity threat status and details"""
     threat = await get_threat_or_404(
-        db, threat_id, getattr(current_user, "organization_id", None)
+        db, threat_id, org_id
     )
     update_data = data.dict(exclude_unset=True)
     for field, value in update_data.items():
@@ -424,12 +447,13 @@ async def update_threat(
 async def investigate_threat(
     threat_id: str,
     data: ThreatInvestigationRequest,
-    current_user: CurrentUser = None,
+    _caller: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Start threat investigation"""
     threat = await get_threat_or_404(
-        db, threat_id, getattr(current_user, "organization_id", None)
+        db, threat_id, org_id
     )
     threat.status = "investigating"
     await db.commit()
@@ -551,6 +575,7 @@ async def respond_to_threat(
     data: ThreatResponseAction,
     request: Request,
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     redis: RedisClient = None,
 ):
@@ -567,7 +592,8 @@ async def respond_to_threat(
     of its own.
 
     Identity comes from the JWT: the caller's organization, user id, agent
-    role and client IP. Viewers are refused; the threat is looked up inside
+    role and client IP. Only admins may respond (viewers and analysts get
+    403 ``role_not_permitted``); the threat is looked up inside
     the caller's organization, so another tenant's threat is a 404.
 
     ``action_details`` carries the tool arguments for the action
@@ -600,7 +626,7 @@ async def respond_to_threat(
     """
     from src.api.v1.endpoints.agentic import (
         _agent_context,
-        _require_analyst,
+        _require_admin,
         guarded_tool_call,
     )
 
@@ -610,9 +636,11 @@ async def respond_to_threat(
         propose_actions=_propose_actions(data),
         request=request,
     )
-    _require_analyst(ctx)
+    # Response actions (disable account, block, isolate, quarantine) are
+    # admin-only; analysts triage via PUT /threats/{id} and /investigate.
+    _require_admin(ctx)
 
-    threat = await get_threat_or_404(db, threat_id, ctx.org_id)
+    threat = await get_threat_or_404(db, threat_id, org_id)
     action = (data.action_type or "contain").strip().lower()
     details = data.action_details if isinstance(data.action_details, dict) else {}
 
@@ -694,7 +722,8 @@ async def respond_to_threat(
 
 @router.post("/threats/scan")
 async def run_threat_scan(
-    current_user: CurrentUser = None,
+    _caller: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Run identity threat detection scan synchronously.
@@ -712,19 +741,18 @@ async def run_threat_scan(
     Already-open threats of the same type on the same identity are
     skipped so re-running the scan is idempotent within its cooldown
     window. The dropped ``organization_id`` query parameter was a
-    cross-tenant vector — we now always use current_user.organization_id.
+    cross-tenant vector — the scan always runs in the caller's organisation
+    (``OrganizationId``; an org-less caller is refused).
     """
     from src.itdr.models import ThreatStatus, PrivilegeLevel
 
-    org_id = getattr(current_user, "organization_id", None)
     logger.info(f"Running identity threat scan for org={org_id}")
 
     now = datetime.now(timezone.utc)
     cutoff_180d = now - timedelta(days=180)
 
     id_query = select(IdentityProfile)
-    if org_id:
-        id_query = id_query.where(IdentityProfile.organization_id == org_id)
+    id_query = id_query.where(IdentityProfile.organization_id == org_id)
     identities = list((await db.execute(id_query)).scalars().all())
 
     # Preload open threats so we can dedupe
@@ -734,8 +762,7 @@ async def run_threat_scan(
             ThreatStatus.INVESTIGATING.value,
         ])
     )
-    if org_id:
-        existing_q = existing_q.where(IdentityThreat.organization_id == org_id)
+    existing_q = existing_q.where(IdentityThreat.organization_id == org_id)
     existing_rows = list((await db.execute(existing_q)).scalars().all())
     existing_by_identity: dict[str, set[str]] = {}
     for t in existing_rows:
@@ -754,7 +781,7 @@ async def run_threat_scan(
             identity_id=identity_id,
             threat_type=threat_type,
             severity=severity,
-            confidence_score=0.9,
+            confidence_score=90.0,  # 0-100 scale (schemas/itdr.py)
             evidence=evidence,
             status=ThreatStatus.DETECTED.value,
         )
@@ -901,7 +928,7 @@ async def run_threat_scan(
 
 @router.get("/credential-exposures", response_model=CredentialExposureListResponse)
 async def list_exposures(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -916,9 +943,7 @@ async def list_exposures(
     query = select(CredentialExposure)
 
     # Filter by organization
-    org_id = getattr(current_user, "organization_id", None)
-    if org_id:
-        query = query.where(CredentialExposure.organization_id == org_id)
+    query = query.where(CredentialExposure.organization_id == org_id)
 
     if credential_type:
         query = query.where(CredentialExposure.credential_type == credential_type)
@@ -962,14 +987,12 @@ async def list_exposures(
 @router.get("/credential-exposures/{exposure_id}", response_model=CredentialExposureResponse)
 async def get_exposure(
     exposure_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Get credential exposure details"""
-    org_id = getattr(current_user, "organization_id", None)
     stmt = select(CredentialExposure).where(CredentialExposure.id == exposure_id)
-    if org_id is not None:
-        stmt = stmt.where(CredentialExposure.organization_id == org_id)
+    stmt = stmt.where(CredentialExposure.organization_id == org_id)
     result = await db.execute(stmt)
     exposure = result.scalar_one_or_none()
     if not exposure:
@@ -983,7 +1006,8 @@ async def get_exposure(
 @router.post("/credential-exposures/check")
 async def check_credential_exposure(
     identity_id: str,
-    current_user: CurrentUser = None,
+    _caller: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Check an identity's credentials against known exposure sources.
@@ -999,7 +1023,6 @@ async def check_credential_exposure(
     """
     from src.darkweb.models import CredentialLeak
 
-    org_id = getattr(current_user, "organization_id", None)
     identity = await get_identity_or_404(db, identity_id, org_id)
 
     # Match leaks by email OR username (case-insensitive)
@@ -1097,7 +1120,8 @@ async def check_credential_exposure(
 @router.post("/credential-exposures/remediate")
 async def remediate_exposures(
     data: CredentialRemediationRequest,
-    current_user: CurrentUser = None,
+    _caller: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Mark credential exposures as remediated and record the action.
@@ -1109,7 +1133,6 @@ async def remediate_exposures(
     Only exposures belonging to the caller's org are touched, so one
     tenant can't remediate another tenant's exposures.
     """
-    org_id = getattr(current_user, "organization_id", None)
     now_iso = datetime.now(timezone.utc).isoformat()
 
     updated_count = 0
@@ -1167,7 +1190,7 @@ async def remediate_exposures(
 
 @router.get("/anomalies", response_model=AccessAnomalyListResponse)
 async def list_anomalies(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -1182,9 +1205,7 @@ async def list_anomalies(
     query = select(AccessAnomaly)
 
     # Filter by organization
-    org_id = getattr(current_user, "organization_id", None)
-    if org_id:
-        query = query.where(AccessAnomaly.organization_id == org_id)
+    query = query.where(AccessAnomaly.organization_id == org_id)
 
     if anomaly_type:
         query = query.where(AccessAnomaly.anomaly_type == anomaly_type)
@@ -1228,14 +1249,12 @@ async def list_anomalies(
 @router.get("/anomalies/{anomaly_id}", response_model=AccessAnomalyResponse)
 async def get_anomaly(
     anomaly_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Get access anomaly details"""
-    org_id = getattr(current_user, "organization_id", None)
     stmt = select(AccessAnomaly).where(AccessAnomaly.id == anomaly_id)
-    if org_id is not None:
-        stmt = stmt.where(AccessAnomaly.organization_id == org_id)
+    stmt = stmt.where(AccessAnomaly.organization_id == org_id)
     result = await db.execute(stmt)
     anomaly = result.scalar_one_or_none()
     if not anomaly:
@@ -1250,14 +1269,13 @@ async def get_anomaly(
 async def review_anomaly(
     anomaly_id: str,
     data: AnomalyReviewRequest,
-    current_user: CurrentUser = None,
+    _caller: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Review anomaly as legitimate or suspicious"""
-    org_id = getattr(current_user, "organization_id", None)
     stmt = select(AccessAnomaly).where(AccessAnomaly.id == anomaly_id)
-    if org_id is not None:
-        stmt = stmt.where(AccessAnomaly.organization_id == org_id)
+    stmt = stmt.where(AccessAnomaly.organization_id == org_id)
     result = await db.execute(stmt)
     anomaly = result.scalar_one_or_none()
     if not anomaly:
@@ -1287,7 +1305,7 @@ async def review_anomaly(
 
 @router.get("/privileged-access", response_model=PrivilegedAccessEventListResponse)
 async def list_privileged_events(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -1301,9 +1319,7 @@ async def list_privileged_events(
     query = select(PrivilegedAccessEvent)
 
     # Filter by organization
-    org_id = getattr(current_user, "organization_id", None)
-    if org_id:
-        query = query.where(PrivilegedAccessEvent.organization_id == org_id)
+    query = query.where(PrivilegedAccessEvent.organization_id == org_id)
 
     if event_type:
         query = query.where(PrivilegedAccessEvent.event_type == event_type)
@@ -1344,16 +1360,17 @@ async def list_privileged_events(
 @router.post("/privileged-access/request")
 async def request_elevation(
     data: ElevationRequest,
-    current_user: CurrentUser = None,
+    _caller: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Request privilege elevation"""
     identity = await get_identity_or_404(
-        db, data.identity_id, getattr(current_user, "organization_id", None)
+        db, data.identity_id, org_id
     )
 
     event = PrivilegedAccessEvent(
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         identity_id=data.identity_id,
         event_type="elevation_request",
         target_resource=data.target_resource,
@@ -1377,14 +1394,13 @@ async def request_elevation(
 async def approve_elevation(
     event_id: str,
     data: ElevationApprovalRequest,
-    current_user: CurrentUser = None,
+    current_user: AdminRoleUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Approve privilege elevation request"""
-    org_id = getattr(current_user, "organization_id", None)
     stmt = select(PrivilegedAccessEvent).where(PrivilegedAccessEvent.id == event_id)
-    if org_id is not None:
-        stmt = stmt.where(PrivilegedAccessEvent.organization_id == org_id)
+    stmt = stmt.where(PrivilegedAccessEvent.organization_id == org_id)
     result = await db.execute(stmt)
     event = result.scalar_one_or_none()
     if not event:
@@ -1414,14 +1430,13 @@ async def approve_elevation(
 async def revoke_access(
     event_id: str,
     revocation_reason: str,
-    current_user: CurrentUser = None,
+    _caller: AdminRoleUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Revoke privileged access"""
-    org_id = getattr(current_user, "organization_id", None)
     stmt = select(PrivilegedAccessEvent).where(PrivilegedAccessEvent.id == event_id)
-    if org_id is not None:
-        stmt = stmt.where(PrivilegedAccessEvent.organization_id == org_id)
+    stmt = stmt.where(PrivilegedAccessEvent.organization_id == org_id)
     result = await db.execute(stmt)
     event = result.scalar_one_or_none()
     if not event:
@@ -1451,11 +1466,10 @@ async def revoke_access(
 
 @router.get("/dashboard/metrics", response_model=ITDRDashboardMetrics)
 async def get_dashboard_metrics(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Get ITDR dashboard metrics"""
-    org_id = getattr(current_user, "organization_id", None)
 
     identity_base = select(func.count()).select_from(IdentityProfile)
     threat_base = select(func.count()).select_from(IdentityThreat)
@@ -1463,12 +1477,11 @@ async def get_dashboard_metrics(
     anomaly_base = select(func.count()).select_from(AccessAnomaly)
     priv_base = select(func.count()).select_from(PrivilegedAccessEvent)
 
-    if org_id:
-        identity_base = identity_base.where(IdentityProfile.organization_id == org_id)
-        threat_base = threat_base.where(IdentityThreat.organization_id == org_id)
-        exposure_base = exposure_base.where(CredentialExposure.organization_id == org_id)
-        anomaly_base = anomaly_base.where(AccessAnomaly.organization_id == org_id)
-        priv_base = priv_base.where(PrivilegedAccessEvent.organization_id == org_id)
+    identity_base = identity_base.where(IdentityProfile.organization_id == org_id)
+    threat_base = threat_base.where(IdentityThreat.organization_id == org_id)
+    exposure_base = exposure_base.where(CredentialExposure.organization_id == org_id)
+    anomaly_base = anomaly_base.where(AccessAnomaly.organization_id == org_id)
+    priv_base = priv_base.where(PrivilegedAccessEvent.organization_id == org_id)
 
     identities_result = await db.execute(identity_base)
     total_identities = identities_result.scalar() or 0
@@ -1532,7 +1545,7 @@ async def get_dashboard_metrics(
 
 @router.get("/dashboard/risk-overview")
 async def get_risk_overview(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Get ITDR risk overview with real trend + compliance data.
@@ -1552,11 +1565,9 @@ async def get_risk_overview(
         column value. If no framework is loaded, the key is absent
         rather than falsely claiming compliant.
     """
-    org_id = getattr(current_user, "organization_id", None)
 
     threat_base = select(func.count()).select_from(IdentityThreat)
-    if org_id:
-        threat_base = threat_base.where(IdentityThreat.organization_id == org_id)
+    threat_base = threat_base.where(IdentityThreat.organization_id == org_id)
 
     critical_threats_result = await db.execute(
         threat_base.where(IdentityThreat.severity == "critical")
@@ -1609,17 +1620,13 @@ async def get_risk_overview(
             trend_label = "stable"
 
     # --- Real compliance_status ---
+    from src.compliance.models import ComplianceFramework
+
     compliance_status: dict[str, str] = {}
-    try:
-        from src.compliance.models import ComplianceFramework
-        fw_q = select(ComplianceFramework)
-        if org_id:
-            fw_q = fw_q.where(ComplianceFramework.organization_id == org_id)
-        for fw in (await db.execute(fw_q)).scalars().all():
-            if fw.short_name:
-                compliance_status[fw.short_name] = fw.status or "unknown"
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(f"compliance_status lookup failed: {exc}")
+    fw_q = select(ComplianceFramework).where(ComplianceFramework.organization_id == org_id)
+    for fw in (await db.execute(fw_q)).scalars().all():
+        if fw.short_name:
+            compliance_status[fw.short_name] = fw.status or "unknown"
 
     return ITDRRiskOverview(
         summary=(
@@ -1657,7 +1664,8 @@ async def get_risk_overview(
 async def update_credential_exposure(
     exposure_id: str,
     data: CredentialExposureUpdate,
-    current_user: CurrentUser = None,
+    _caller: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Update a single credential exposure record (tenant-scoped).
@@ -1667,7 +1675,6 @@ async def update_credential_exposure(
     the ``remediation_date`` without going through the bulk
     remediate endpoint.
     """
-    org_id = getattr(current_user, "organization_id", None)
     result = await db.execute(
         select(CredentialExposure).where(
             and_(
@@ -1694,11 +1701,11 @@ async def update_credential_exposure(
 async def update_access_anomaly(
     anomaly_id: str,
     data: AccessAnomalyUpdate,
-    current_user: CurrentUser = None,
+    _caller: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Update an access anomaly record (tenant-scoped)."""
-    org_id = getattr(current_user, "organization_id", None)
     result = await db.execute(
         select(AccessAnomaly).where(
             and_(
@@ -1728,11 +1735,11 @@ async def update_access_anomaly(
 async def update_privileged_access_event(
     event_id: str,
     data: PrivilegedAccessEventUpdate,
-    current_user: CurrentUser = None,
+    _caller: AdminRoleUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Update a privileged access event (tenant-scoped)."""
-    org_id = getattr(current_user, "organization_id", None)
     result = await db.execute(
         select(PrivilegedAccessEvent).where(
             and_(

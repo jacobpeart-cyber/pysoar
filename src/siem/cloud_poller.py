@@ -560,19 +560,27 @@ _CLOUD_CONNECTOR_DISPATCH = {
 }
 
 
-async def poll_all_cloud_integrations(db: AsyncSession) -> list[dict[str, Any]]:
-    """Iterate every enabled cloud integration and run its poller.
+async def poll_all_cloud_integrations(
+    db: AsyncSession, organization_id: Optional[str] = None
+) -> list[dict[str, Any]]:
+    """Run the poller of every enabled cloud integration.
 
-    Returns a list of per-integration result dicts so the caller (a
-    Celery beat task or the manual /siem/cloud/poll-all endpoint) can
-    log the outcomes.
+    ``organization_id`` limits the sweep to one organisation's
+    integrations; the manual ``/siem/cloud/poll-all`` endpoint always
+    passes the caller's organisation. ``None`` (every tenant) is reserved
+    for the Celery beat task. Each integration's events are ingested with
+    that integration's own organisation either way.
+
+    Returns a list of per-integration result dicts so the caller can log
+    the outcomes.
     """
-    res = await db.execute(
-        select(InstalledIntegration).where(
-            InstalledIntegration.connector_id.in_(list(_CLOUD_CONNECTOR_DISPATCH.keys())),
-            InstalledIntegration.status == "active",
-        )
+    stmt = select(InstalledIntegration).where(
+        InstalledIntegration.connector_id.in_(list(_CLOUD_CONNECTOR_DISPATCH.keys())),
+        InstalledIntegration.status == "active",
     )
+    if organization_id is not None:
+        stmt = stmt.where(InstalledIntegration.organization_id == organization_id)
+    res = await db.execute(stmt)
     results: list[dict[str, Any]] = []
     for integration in res.scalars().all():
         poller = _CLOUD_CONNECTOR_DISPATCH.get(integration.connector_id)

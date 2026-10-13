@@ -1,52 +1,110 @@
 """
-Singleton managers for SIEM Rule Engine and Correlation Engine.
+Per-organisation managers for the SIEM Rule Engine and Correlation Engine.
 
-Holds module-level instances that persist across requests.
-Rules are loaded from DB on first access and can be reloaded after CRUD operations.
+Tenancy model (wave 1, docs/audit/2026-10-08/PLAN.md):
+
+* Every organisation gets its own ``RuleEngine`` and ``CorrelationEngine``.
+  A log from org A is only ever evaluated against org A's engine, so it can
+  never trigger org B's custom rules or correlate with org B's events.
+* An organisation's rule engine holds that organisation's enabled rules PLUS
+  the enabled platform rules (``DetectionRule.organization_id IS NULL``, the
+  built-ins installed by ``src.siem.rule_seeder``). Platform rules therefore
+  apply to every organisation's logs, and the alert / correlation they
+  produce carries the log's organisation (see ``src.siem.pipeline``).
+* Logs with no organisation (for example syslog when no default org is
+  configured) use the ``None`` key: platform rules only, and a correlation
+  buffer that is never shared with any tenant.
+
+Engines live in-process and are rebuilt lazily after rule CRUD through
+``reload_rules``. They are bounded by an LRU so a long-running worker that
+has seen many organisations does not grow without limit; an evicted engine
+is simply rebuilt from the database on next use (correlation state for that
+organisation starts afresh).
 """
 
-import logging
-from typing import Optional
+from __future__ import annotations
 
-from src.siem.rules.engine import RuleEngine
+import json
+import threading
+from collections import OrderedDict
+from typing import Any, Optional
+
+import yaml
+from sqlalchemy import or_, select
+
+from src.core.logging import get_logger
 from src.siem.correlation import CorrelationEngine
+from src.siem.rules.engine import RuleEngine
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
-# Module-level singletons
-_rule_engine: Optional[RuleEngine] = None
-_correlation_engine: Optional[CorrelationEngine] = None
-_rules_loaded: bool = False
+#: Maximum number of organisations whose engines are kept in memory.
+MAX_CACHED_ORGANIZATIONS = 1024
 
-
-def get_rule_engine() -> RuleEngine:
-    """Get or create the singleton RuleEngine instance."""
-    global _rule_engine
-    if _rule_engine is None:
-        _rule_engine = RuleEngine()
-        logger.info("RuleEngine singleton created")
-    return _rule_engine
+_lock = threading.RLock()
+_rule_engines: "OrderedDict[Optional[str], RuleEngine]" = OrderedDict()
+_loaded_orgs: set[Optional[str]] = set()
+_correlation_engines: "OrderedDict[Optional[str], CorrelationEngine]" = OrderedDict()
 
 
-def get_correlation_engine() -> CorrelationEngine:
-    """Get or create the singleton CorrelationEngine instance."""
-    global _correlation_engine
-    if _correlation_engine is None:
-        _correlation_engine = CorrelationEngine()
-        logger.info("CorrelationEngine singleton created")
-    return _correlation_engine
+def _touch(cache: "OrderedDict[Optional[str], Any]", key: Optional[str]) -> None:
+    cache.move_to_end(key)
+    while len(cache) > MAX_CACHED_ORGANIZATIONS:
+        evicted, _ = cache.popitem(last=False)
+        if cache is _rule_engines:
+            _loaded_orgs.discard(evicted)
 
 
-async def load_rules_from_db(db) -> int:
-    """Load all enabled detection rules from database into the engine."""
-    global _rules_loaded
-    from sqlalchemy import select
+def get_rule_engine(organization_id: Optional[str] = None) -> RuleEngine:
+    """Return the RuleEngine for ``organization_id`` (``None`` = platform rules only)."""
+    with _lock:
+        engine = _rule_engines.get(organization_id)
+        if engine is None:
+            engine = RuleEngine()
+            _rule_engines[organization_id] = engine
+            logger.info("RuleEngine created", organization_id=organization_id)
+        _touch(_rule_engines, organization_id)
+        return engine
+
+
+def get_correlation_engine(organization_id: Optional[str] = None) -> CorrelationEngine:
+    """Return the CorrelationEngine (and its event buffers) for ``organization_id``."""
+    with _lock:
+        engine = _correlation_engines.get(organization_id)
+        if engine is None:
+            engine = CorrelationEngine()
+            _correlation_engines[organization_id] = engine
+            logger.info("CorrelationEngine created", organization_id=organization_id)
+        _touch(_correlation_engines, organization_id)
+        return engine
+
+
+def _rule_scope(organization_id: Optional[str]):
+    """Rules that apply to an organisation: its own plus platform (NULL-org) rules."""
     from src.siem.models import DetectionRule
 
-    engine = get_rule_engine()
+    if organization_id is None:
+        return DetectionRule.organization_id.is_(None)
+    return or_(
+        DetectionRule.organization_id == organization_id,
+        DetectionRule.organization_id.is_(None),
+    )
+
+
+async def load_rules_from_db(db, organization_id: Optional[str] = None) -> int:
+    """Load the enabled rules that apply to ``organization_id`` into its engine.
+
+    ``organization_id=None`` loads the platform (built-in) rules only.
+    """
+    from src.siem.models import DetectionRule
+
+    engine = get_rule_engine(organization_id)
 
     result = await db.execute(
-        select(DetectionRule).where(DetectionRule.enabled == True)
+        select(DetectionRule).where(
+            DetectionRule.enabled == True,  # noqa: E712
+            _rule_scope(organization_id),
+        )
     )
     rules = result.scalars().all()
 
@@ -58,38 +116,65 @@ async def load_rules_from_db(db) -> int:
                 if instance:
                     loaded += 1
             elif rule.detection_logic:
-                import json
-                logic = json.loads(rule.detection_logic) if isinstance(rule.detection_logic, str) else rule.detection_logic
+                logic = (
+                    json.loads(rule.detection_logic)
+                    if isinstance(rule.detection_logic, str)
+                    else rule.detection_logic
+                )
                 yaml_content = _build_yaml_from_logic(rule, logic)
                 instance = engine.load_rule_from_yaml(yaml_content)
                 if instance:
                     loaded += 1
-        except Exception as e:
-            logger.warning(f"Failed to load rule {rule.id}: {e}")
+        except (ValueError, TypeError, KeyError, yaml.YAMLError) as e:
+            logger.warning("Failed to load detection rule", rule_id=rule.id, error=str(e))
 
-    _rules_loaded = True
-    logger.info(f"Loaded {loaded}/{len(rules)} detection rules from database")
+    with _lock:
+        _loaded_orgs.add(organization_id)
+    logger.info(
+        "Loaded detection rules",
+        organization_id=organization_id,
+        loaded=loaded,
+        total=len(rules),
+    )
     return loaded
 
 
-async def ensure_rules_loaded(db) -> None:
-    """Ensure rules are loaded (lazy initialization)."""
-    global _rules_loaded
-    if not _rules_loaded:
-        await load_rules_from_db(db)
+async def ensure_rules_loaded(db, organization_id: Optional[str] = None) -> None:
+    """Load ``organization_id``'s rules on first use (lazy initialisation)."""
+    with _lock:
+        loaded = organization_id in _loaded_orgs and organization_id in _rule_engines
+    if not loaded:
+        await load_rules_from_db(db, organization_id)
 
 
-async def reload_rules(db) -> int:
-    """Force reload all rules from database."""
-    global _rule_engine, _rules_loaded
-    _rule_engine = RuleEngine()
-    _rules_loaded = False
-    return await load_rules_from_db(db)
+async def reload_rules(db, organization_id: Optional[str] = None) -> int:
+    """Rebuild rule engines after rule CRUD.
+
+    A change to an organisation's own rule only invalidates that
+    organisation's engine. A change to a platform rule (``organization_id``
+    None) invalidates every engine, because platform rules are part of every
+    organisation's rule set; the others are rebuilt lazily on next use.
+    """
+    with _lock:
+        if organization_id is None:
+            _rule_engines.clear()
+            _loaded_orgs.clear()
+        else:
+            _rule_engines.pop(organization_id, None)
+            _loaded_orgs.discard(organization_id)
+    return await load_rules_from_db(db, organization_id)
+
+
+def reset_engines() -> None:
+    """Drop every cached rule and correlation engine (tests / admin reset)."""
+    with _lock:
+        _rule_engines.clear()
+        _loaded_orgs.clear()
+        _correlation_engines.clear()
 
 
 def _build_yaml_from_logic(rule, logic: dict) -> str:
     """Build YAML rule definition from detection_logic JSON."""
-    import json
     condition = getattr(rule, "condition", None) or "selection"
 
     yaml_dict = {
@@ -108,5 +193,4 @@ def _build_yaml_from_logic(rule, logic: dict) -> str:
         tactics = json.loads(rule.mitre_tactics) if isinstance(rule.mitre_tactics, str) else rule.mitre_tactics
         yaml_dict["tags"] = tactics
 
-    import yaml
     return yaml.dump(yaml_dict, default_flow_style=False)

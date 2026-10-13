@@ -9,11 +9,14 @@ import statistics
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
+from sqlalchemy import select
+
 from src.core.logging import get_logger
 from src.hunting.models import (
     FindingClassification,
     FindingSeverity,
     HuntFinding,
+    HuntHypothesis,
     HuntSession,
     SessionStatus,
     HuntTemplate,
@@ -224,53 +227,114 @@ class HuntQueryBuilder:
 
 
 class HuntExecutor:
-    """Executes hunt investigations and collects results"""
+    """Executes hunt investigations for ONE organisation.
 
-    def __init__(self, db_session=None, search_service: Optional[LogSearchService] = None):
-        """Initialize executor with database and search service
+    Every query the executor runs is scoped to ``organization_id`` (the SIEM
+    log search gets an ``organization_id`` field filter that callers cannot
+    drop), the session and findings it creates are stamped with it, and
+    pause / resume / cancel / status only act on that organisation's
+    sessions. A hunt cancelled while it runs keeps its CANCELLED status.
+    """
+
+    _TERMINAL = frozenset({
+        SessionStatus.COMPLETED.value,
+        SessionStatus.FAILED.value,
+        SessionStatus.CANCELLED.value,
+    })
+
+    def __init__(
+        self,
+        db_session,
+        organization_id: str,
+        search_service: Optional[LogSearchService] = None,
+    ):
+        """Initialize executor with database, tenant and search service
 
         Args:
             db_session: SQLAlchemy async session
+            organization_id: tenant every query and created row is scoped to
             search_service: LogSearchService instance for querying logs
         """
+        if db_session is None:
+            raise ValueError("HuntExecutor requires a database session")
+        if not organization_id:
+            raise ValueError("HuntExecutor requires organization_id")
         self.db = db_session
+        self.organization_id = str(organization_id)
         self.search_service = search_service or LogSearchService()
         self.query_builder = HuntQueryBuilder()
 
+    async def _get_session(self, session_id: str) -> HuntSession:
+        """The organisation's session, or LookupError."""
+        result = await self.db.execute(
+            select(HuntSession).where(
+                HuntSession.id == session_id,
+                HuntSession.organization_id == self.organization_id,
+            ),
+        )
+        session = result.scalar_one_or_none()
+        if session is None:
+            raise LookupError(f"hunt session {session_id} not found")
+        return session
+
+    async def _current_status(self, session_id: str) -> Optional[str]:
+        """Stored status of a session (sees a cancel issued meanwhile)."""
+        result = await self.db.execute(
+            select(HuntSession.status).where(
+                HuntSession.id == session_id,
+                HuntSession.organization_id == self.organization_id,
+            ),
+        )
+        return result.scalar_one_or_none()
+
     async def execute_hunt(
-        self, hypothesis_id: str, parameters: dict, hypothesis_data: dict
+        self, hypothesis_id: str, parameters: dict, hypothesis_data: dict,
     ) -> str:
         """Execute a hunt and create a session
 
         Args:
-            hypothesis_id: ID of the hunt hypothesis
+            hypothesis_id: ID of the organisation's hunt hypothesis
             parameters: Runtime parameters (time_range_hours, target_hosts, etc.)
             hypothesis_data: Hypothesis details (title, description, mitre_techniques)
 
         Returns:
             Session ID of the created hunt session
-        """
-        logger.info(f"Starting hunt execution for hypothesis {hypothesis_id}")
 
-        # Create session record
-        session = HuntSession(
+        Raises:
+            LookupError: the hypothesis does not belong to the organisation
+        """
+        hyp_result = await self.db.execute(
+            select(HuntHypothesis.id).where(
+                HuntHypothesis.id == hypothesis_id,
+                HuntHypothesis.organization_id == self.organization_id,
+            ),
+        )
+        if hyp_result.scalar_one_or_none() is None:
+            raise LookupError(f"hunt hypothesis {hypothesis_id} not found")
+
+        logger.info(
+            "hunt_execution_start",
             hypothesis_id=hypothesis_id,
-            status=SessionStatus.PENDING.value,
+            organization_id=self.organization_id,
+        )
+
+        session = HuntSession(
+            organization_id=self.organization_id,
+            hypothesis_id=hypothesis_id,
+            status=SessionStatus.RUNNING.value,
             parameters=json.dumps(parameters),
             created_by=parameters.get("created_by"),
+            started_at=datetime.now(timezone.utc),
         )
-        # Note: In a real implementation, would add/flush to db
+        self.db.add(session)
+        await self.db.flush()
         session_id = session.id
-
-        # Update status to RUNNING
-        session.status = SessionStatus.RUNNING.value
-        session.started_at = datetime.now(timezone.utc)
 
         try:
             # Resolve technique ids → authoritative ATT&CK names from the
             # KB so the search uses real technique names, not guesses.
             technique_terms = []
-            if hypothesis_data.get("mitre_techniques") and getattr(self, "db", None) is not None:
+            if hypothesis_data.get("mitre_techniques"):
                 try:
                     from src.attack.service import AttackService
                     svc = AttackService(self.db)
@@ -279,11 +343,11 @@ class HuntExecutor:
                         if tech and tech.get("name"):
                             technique_terms.append(tech["name"])
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning(f"ATT&CK term resolution failed: {exc}")
+                    logger.warning("attack_term_resolution_failed", error=str(exc))
 
             # Build and execute queries
             query = self.query_builder.build_log_query(
-                hypothesis_data, parameters, technique_terms=technique_terms or None
+                hypothesis_data, parameters, technique_terms=technique_terms or None,
             )
             results = await self._run_queries(session, [query])
 
@@ -296,38 +360,47 @@ class HuntExecutor:
                 self.db.add(finding)
             await self.db.flush()
 
-            # Update session with results
             session.findings_count = len(findings)
             session.events_analyzed = sum(
                 r.get("event_count", 1) for r in results
             )
             session.query_count = 1
-            session.status = SessionStatus.COMPLETED.value
-            session.completed_at = datetime.now(timezone.utc)
 
-            if session.started_at and session.completed_at:
-                session.duration_seconds = int(
-                    (session.completed_at - session.started_at).total_seconds()
-                )
+            # Honour a cancel issued while the hunt ran: keep CANCELLED.
+            if await self._current_status(session_id) not in self._TERMINAL:
+                session.status = SessionStatus.COMPLETED.value
+                session.completed_at = datetime.now(timezone.utc)
+                if session.started_at and session.completed_at:
+                    session.duration_seconds = int(
+                        (session.completed_at - session.started_at).total_seconds(),
+                    )
+            await self.db.flush()
 
             logger.info(
-                f"Hunt session {session_id} completed with {len(findings)} findings"
+                "hunt_execution_done",
+                session_id=session_id,
+                findings=len(findings),
+                organization_id=self.organization_id,
             )
 
         except Exception as e:
-            logger.error(f"Hunt execution failed: {str(e)}")
+            logger.error("hunt_execution_failed", session_id=session_id, error=str(e))
             session.status = SessionStatus.FAILED.value
-            session.error_message = str(e)
+            session.error_message = str(e)[:500]
             session.completed_at = datetime.now(timezone.utc)
+            await self.db.flush()
 
         return session_id
 
-    async def _run_queries(self, session: HuntSession, queries: list[dict]) -> list[dict]:
-        """Execute queries against SIEM log store
+    async def _run_queries(self, session: HuntSession, queries: list) -> list[dict]:
+        """Execute queries against the organisation's SIEM log store
+
+        Search failures propagate (the caller marks the session FAILED)
+        instead of being reported as "0 results".
 
         Args:
             session: HuntSession instance
-            queries: List of query dicts
+            queries: List of SearchQuery objects or query dicts
 
         Returns:
             List of result dicts with timing information
@@ -337,30 +410,18 @@ class HuntExecutor:
         for query_dict in queries:
             start_time = datetime.now(timezone.utc)
 
-            # Execute search
             if isinstance(query_dict, SearchQuery):
                 search_query = query_dict
             else:
-                # Convert dict to SearchQuery if needed
                 search_query = SearchQuery(**query_dict)
+            # Tenant scope is not optional: always overwrite whatever the
+            # query carried.
+            search_query.field_filters = {
+                **(search_query.field_filters or {}),
+                "organization_id": self.organization_id,
+            }
 
-            # Execute the query against the real SIEM log search service
-            search_service = LogSearchService()
-            try:
-                result_obj = await search_service.search(self.db, search_query)
-                search_result = {
-                    "items": result_obj.items if result_obj else [],
-                    "total": result_obj.total if result_obj else 0,
-                    "query_text": getattr(search_query, "query_text", ""),
-                }
-            except Exception as search_err:
-                logger.warning(f"Search query failed: {search_err}")
-                search_result = {
-                    "items": [],
-                    "total": 0,
-                    "query_text": getattr(search_query, "query_text", ""),
-                    "error": str(search_err),
-                }
+            result_obj = await self.search_service.search(self.db, search_query)
 
             end_time = datetime.now(timezone.utc)
             execution_ms = int((end_time - start_time).total_seconds() * 1000)
@@ -368,15 +429,15 @@ class HuntExecutor:
             results.append(
                 {
                     "query_text": search_query.query_text or "",
-                    "results_count": search_result["total"],
+                    "results_count": result_obj.total,
                     "execution_time_ms": execution_ms,
-                    "items": search_result["items"],
-                    "event_count": search_result["total"],
-                }
+                    "items": result_obj.items,
+                    "event_count": result_obj.total,
+                },
             )
 
         # Store queries executed
-        session.queries_executed = json.dumps(results)
+        session.queries_executed = json.dumps(results, default=str)
 
         return results
 
@@ -412,9 +473,9 @@ class HuntExecutor:
         return analyzed_findings
 
     async def _create_findings(
-        self, session_id: str, analyzed: list[dict]
+        self, session_id: str, analyzed: list[dict],
     ) -> list[HuntFinding]:
-        """Convert analyzed results to finding records
+        """Convert analyzed results to finding records of the organisation
 
         Args:
             session_id: Session ID to link findings to
@@ -440,14 +501,15 @@ class HuntExecutor:
                 severity = FindingSeverity.LOW.value
 
             finding = HuntFinding(
+                organization_id=self.organization_id,
                 session_id=session_id,
                 title=finding_data.get("title", "Unnamed Finding"),
                 description=finding_data.get("description", ""),
                 severity=severity,
                 classification=FindingClassification.NEEDS_REVIEW.value,
-                evidence=json.dumps(finding_data.get("evidence", [])),
-                affected_assets=json.dumps(finding_data.get("affected_assets", [])),
-                iocs_found=json.dumps(finding_data.get("iocs", [])),
+                evidence=json.dumps(finding_data.get("evidence", []), default=str),
+                affected_assets=json.dumps(finding_data.get("affected_assets", []), default=str),
+                iocs_found=json.dumps(finding_data.get("iocs", []), default=str),
             )
 
             findings.append(finding)
@@ -455,61 +517,52 @@ class HuntExecutor:
         return findings
 
     async def pause_hunt(self, session_id: str) -> bool:
-        """Pause a running hunt session
+        """Pause a RUNNING session of the organisation.
 
-        Args:
-            session_id: ID of session to pause
-
-        Returns:
-            True if successful
+        Returns False when the session is not RUNNING; LookupError when it
+        is not the organisation's.
         """
-        logger.info(f"Pausing hunt session {session_id}")
-        # In real implementation, would update session status in db
+        session = await self._get_session(session_id)
+        if session.status != SessionStatus.RUNNING.value:
+            return False
+        session.status = SessionStatus.PAUSED.value
+        await self.db.flush()
+        logger.info("hunt_paused", session_id=session_id, organization_id=self.organization_id)
         return True
 
     async def resume_hunt(self, session_id: str) -> bool:
-        """Resume a paused hunt session
-
-        Args:
-            session_id: ID of session to resume
-
-        Returns:
-            True if successful
-        """
-        logger.info(f"Resuming hunt session {session_id}")
-        # In real implementation, would update session status in db
+        """Resume a PAUSED session of the organisation (False otherwise)."""
+        session = await self._get_session(session_id)
+        if session.status != SessionStatus.PAUSED.value:
+            return False
+        session.status = SessionStatus.RUNNING.value
+        await self.db.flush()
+        logger.info("hunt_resumed", session_id=session_id, organization_id=self.organization_id)
         return True
 
     async def cancel_hunt(self, session_id: str) -> bool:
-        """Cancel a hunt session
-
-        Args:
-            session_id: ID of session to cancel
-
-        Returns:
-            True if successful
-        """
-        logger.info(f"Cancelling hunt session {session_id}")
-        # In real implementation, would update session status in db
+        """Cancel a non-terminal session of the organisation (False otherwise)."""
+        session = await self._get_session(session_id)
+        if session.status in self._TERMINAL:
+            return False
+        session.status = SessionStatus.CANCELLED.value
+        session.completed_at = datetime.now(timezone.utc)
+        await self.db.flush()
+        logger.info("hunt_cancelled", session_id=session_id, organization_id=self.organization_id)
         return True
 
     async def get_hunt_status(self, session_id: str) -> dict:
-        """Get current status of a hunt session
-
-        Args:
-            session_id: ID of session
-
-        Returns:
-            Dict with status, progress, and statistics
-        """
-        # In real implementation, would fetch from db
+        """Stored status and counters of the organisation's session."""
+        session = await self._get_session(session_id)
         return {
-            "session_id": session_id,
-            "status": SessionStatus.RUNNING.value,
-            "progress_percent": 50,
-            "queries_executed": 1,
-            "events_analyzed": 0,
-            "findings_found": 0,
+            "session_id": session.id,
+            "status": session.status,
+            "started_at": session.started_at.isoformat() if session.started_at else None,
+            "completed_at": session.completed_at.isoformat() if session.completed_at else None,
+            "query_count": session.query_count,
+            "events_analyzed": session.events_analyzed,
+            "findings_found": session.findings_count,
+            "error_message": session.error_message,
         }
 
 

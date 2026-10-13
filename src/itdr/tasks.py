@@ -112,7 +112,7 @@ async def _run_identity_scan_for_org(session, organization_id: str) -> dict:
             identity_id=identity_id,
             threat_type=threat_type,
             severity=severity,
-            confidence_score=0.9,
+            confidence_score=90.0,  # 0-100 scale (schemas/itdr.py)
             evidence=evidence,
             status=ThreatStatus.DETECTED.value,
         ))
@@ -305,8 +305,12 @@ def credential_exposure_check(
             )
             org_emails = {r[0].lower() for r in org_emails_result.all() if r[0]}
 
+            # Only this organisation's leak records: matching against every
+            # tenant's leaks disclosed whether another tenant's monitoring
+            # had seen an address.
             leaked_result = await session.execute(
                 select(CredentialLeak.email).where(
+                    CredentialLeak.organization_id == organization_id,
                     CredentialLeak.is_remediated == False,
                 )
             )
@@ -449,20 +453,19 @@ def dormant_account_detection(
                 )
             )).scalar() or 0
 
-            dormant_count = 0
-            try:
-                if hasattr(User, "last_login"):
-                    dormant_count = (await session.execute(
-                        select(func.count(User.id)).where(
-                            and_(
-                                User.organization_id == organization_id,
-                                User.is_active == True,
-                                User.last_login < cutoff,
-                            )
-                        )
-                    )).scalar() or 0
-            except Exception:
-                pass
+            # A failing query used to be swallowed into "0 dormant accounts"
+            # (and comparing the string column to a datetime always failed);
+            # errors now fail the task and its retry instead.
+            dormant_count = (await session.execute(
+                select(func.count(User.id)).where(
+                    and_(
+                        User.organization_id == organization_id,
+                        User.is_active == True,
+                        # last_login is an ISO-8601 UTC string column
+                        User.last_login < cutoff.isoformat(),
+                    )
+                )
+            )).scalar() or 0
 
             return {
                 "status": "success",

@@ -22,13 +22,6 @@ from src.ueba.models import BehaviorBaseline, BehaviorEvent, EntityProfile
 logger = get_logger(__name__)
 
 
-def _org_filter(model, org_id):
-    """Return an org_id filter clause, or True if org_id is None (skip filtering)."""
-    if org_id:
-        return model.organization_id == org_id
-    return True
-
-
 def risk_level_for_score(risk_score: float) -> str:
     """Ingest-path risk bucketing (matches the /ueba/events endpoints)."""
     if risk_score >= 80:
@@ -150,13 +143,14 @@ async def score_event_anomaly(
 
 async def ingest_behavior_event(
     db: AsyncSession,
-    organization_id: Optional[str],
+    organization_id: str,
     event: dict,
 ) -> tuple[Optional[BehaviorEvent], bool]:
     """Persist and score one behavior event for the entity it belongs to.
 
-    Looks up the EntityProfile by its ``entity_id`` field (org-scoped when
-    ``organization_id`` is given), scores the event with
+    Looks up the EntityProfile by its ``entity_id`` field inside
+    ``organization_id`` (mandatory: there is no cross-tenant lookup; a
+    missing organisation raises ``ValueError``), scores the event with
     ``score_event_anomaly``, bumps the entity's rolling risk counters on
     anomaly, and fires the ``on_ueba_anomaly`` automation fanout.
 
@@ -169,11 +163,14 @@ async def ingest_behavior_event(
     """
     from src.services.automation import AutomationService
 
+    if not organization_id:
+        raise ValueError("ingest_behavior_event requires an organization_id")
+
     entity_result = await db.execute(
         select(EntityProfile).where(
             and_(
                 EntityProfile.entity_id == event.get("entity_id"),
-                _org_filter(EntityProfile, organization_id),
+                EntityProfile.organization_id == organization_id,
             )
         )
     )

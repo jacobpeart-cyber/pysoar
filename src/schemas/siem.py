@@ -62,6 +62,8 @@ class LogBatchIngestRequest(BaseModel):
     """Schema for batch log ingestion"""
 
     logs: list[LogIngestRequest]
+    # Honoured only for platform superusers (explicit tenant choice); for
+    # anyone else it must equal their own organisation (403 otherwise).
     organization_id: Optional[str] = None
 
 
@@ -223,6 +225,9 @@ class DetectionRuleResponse(DetectionRuleBase, DBModel):
     false_positive_notes: Optional[str] = None
     references: Optional[list[str]] = None
     rule_yaml: Optional[str] = None
+    # None = platform (built-in) rule: visible to every organisation,
+    # read-only for organisation users.
+    organization_id: Optional[str] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 
@@ -317,6 +322,17 @@ class DataSourceCreate(BaseModel):
     connection_config: dict[str, Any] = {}
     parser_config: Optional[dict[str, Any]] = None
     enabled: bool = True
+
+
+class DataSourceUpdate(BaseModel):
+    """Schema for partially updating a data source (only sent fields change)"""
+
+    name: Optional[str] = Field(None, min_length=1, max_length=255)
+    description: Optional[str] = None
+    source_type: Optional[str] = None
+    connection_config: Optional[dict[str, Any]] = None
+    parser_config: Optional[dict[str, Any]] = None
+    enabled: Optional[bool] = None
 
 
 class DataSourceResponse(DBModel):

@@ -5,18 +5,26 @@ Backed by the unified `threat_indicators` table. Legacy IOC-specific fields
 source_reference, enrichment_data, is_internal) are stored inside the
 ThreatIndicator.context JSON dict to preserve the wire contract for the
 existing frontend IOCs page.
+
+Tenancy (wave 1): every route is scoped to the caller's organisation. Reads
+(list, get, search, enrichment siblings) see the organisation's own indicators
+plus platform-wide feed intel (``organization_id`` NULL), which is read-only
+here: update, delete and enrich only act on the organisation's own rows, and
+create/bulk de-duplicate against the organisation's own rows only. Writes
+need the analyst or admin role; viewers are read-only.
 """
 
 import math
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Annotated, Optional
 
-from fastapi import APIRouter, HTTPException, Query, status
-from sqlalchemy import func, select
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import CurrentUser, DatabaseSession
+from src.api.deps import CurrentUser, DatabaseSession, OrganizationId, require_role
 from src.intel.models import ThreatIndicator
+from src.models.user import User, UserRole
 from src.schemas.ioc import (
     IOCBulkCreate,
     IOCCreate,
@@ -28,6 +36,8 @@ from src.schemas.ioc import (
 )
 
 router = APIRouter(prefix="/iocs", tags=["IOCs"])
+
+AnalystUser = Annotated[User, Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
 
 
 # --------------------------------------------------------------------------- #
@@ -87,12 +97,26 @@ def ioc_to_response(ioc: ThreatIndicator) -> IOCResponse:
     )
 
 
+def _visible_to(org_id: str):
+    """The organisation's own indicators plus platform-wide feed intel."""
+    return or_(
+        ThreatIndicator.organization_id == org_id,
+        ThreatIndicator.organization_id.is_(None),
+    )
+
+
 async def get_ioc_or_404(
-    db: AsyncSession, ioc_id: str, org_id: Optional[str] = None
+    db: AsyncSession, ioc_id: str, org_id: str, *, include_platform: bool = False,
 ) -> ThreatIndicator:
-    """Get IOC by ID or raise 404."""
+    """The organisation's IOC by ID or 404.
+
+    ``include_platform`` also admits platform-wide feed intel (read paths
+    only; those rows are never modified through this router).
+    """
     stmt = select(ThreatIndicator).where(ThreatIndicator.id == ioc_id)
-    if org_id is not None:
+    if include_platform:
+        stmt = stmt.where(_visible_to(org_id))
+    else:
         stmt = stmt.where(ThreatIndicator.organization_id == org_id)
     result = await db.execute(stmt)
     ioc = result.scalar_one_or_none()
@@ -124,6 +148,27 @@ def _build_context_from_create(ioc_data: IOCCreate) -> dict:
     return ctx
 
 
+async def _find_own_duplicate(
+    db: AsyncSession, org_id: str, value: str, ioc_type: str,
+) -> Optional[ThreatIndicator]:
+    """The organisation's existing row for value + type, if any.
+
+    ``first()`` rather than ``scalar_one_or_none()``: legacy data can hold
+    duplicates, which used to raise MultipleResultsFound (a 500).
+    """
+    result = await db.execute(
+        select(ThreatIndicator)
+        .where(
+            ThreatIndicator.organization_id == org_id,
+            ThreatIndicator.value == value,
+            ThreatIndicator.indicator_type == ioc_type,
+        )
+        .order_by(ThreatIndicator.created_at.asc())
+        .limit(1),
+    )
+    return result.scalars().first()
+
+
 # --------------------------------------------------------------------------- #
 # Endpoints
 # --------------------------------------------------------------------------- #
@@ -131,6 +176,7 @@ def _build_context_from_create(ioc_data: IOCCreate) -> dict:
 @router.get("", response_model=IOCListResponse)
 async def list_iocs(
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -140,8 +186,8 @@ async def list_iocs(
     threat_level: Optional[str] = None,
     is_whitelisted: Optional[bool] = None,
 ):
-    """List IOCs (unified threat indicators) with filtering and pagination."""
-    query = select(ThreatIndicator)
+    """List the organisation's IOCs plus platform feed intel, filtered and paginated."""
+    query = select(ThreatIndicator).where(_visible_to(org_id))
 
     if search:
         search_filter = f"%{search}%"
@@ -183,20 +229,15 @@ async def list_iocs(
 @router.post("", response_model=IOCResponse, status_code=status.HTTP_201_CREATED)
 async def create_ioc(
     ioc_data: IOCCreate,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Create a new IOC in the unified threat_indicators table."""
     now = datetime.now(timezone.utc)
 
-    # Check for duplicate (same value + type)
-    result = await db.execute(
-        select(ThreatIndicator).where(
-            (ThreatIndicator.value == ioc_data.value)
-            & (ThreatIndicator.indicator_type == ioc_data.ioc_type)
-        )
-    )
-    existing = result.scalar_one_or_none()
+    # Check for a duplicate (same value + type) in the organisation
+    existing = await _find_own_duplicate(db, org_id, ioc_data.value, ioc_data.ioc_type)
 
     if existing:
         existing.sighting_count = (existing.sighting_count or 0) + 1
@@ -207,7 +248,6 @@ async def create_ioc(
         return ioc_to_response(existing)
 
     ctx = _build_context_from_create(ioc_data)
-    org_id = getattr(current_user, "organization_id", None)
 
     ioc = ThreatIndicator(
         value=ioc_data.value,
@@ -238,7 +278,8 @@ async def create_ioc(
 @router.post("/bulk", response_model=None)
 async def bulk_create_iocs(
     bulk_data: IOCBulkCreate,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Bulk create IOCs."""
@@ -246,44 +287,36 @@ async def bulk_create_iocs(
     updated_count = 0
     failures: list[dict] = []
     now = datetime.now(timezone.utc)
-    org_id = getattr(current_user, "organization_id", None)
 
+    # A database error aborts the whole import (the transaction is rolled
+    # back) instead of being reported per row while the session is broken.
     for ioc_data in bulk_data.iocs:
-        try:
-            result = await db.execute(
-                select(ThreatIndicator).where(
-                    (ThreatIndicator.value == ioc_data.value)
-                    & (ThreatIndicator.indicator_type == ioc_data.ioc_type)
-                )
+        existing = await _find_own_duplicate(db, org_id, ioc_data.value, ioc_data.ioc_type)
+
+        if existing:
+            existing.sighting_count = (existing.sighting_count or 0) + 1
+            existing.last_sighting_at = now
+            existing.last_seen = now
+            updated_count += 1
+        else:
+            ioc = ThreatIndicator(
+                value=ioc_data.value,
+                indicator_type=ioc_data.ioc_type,
+                is_active=True,
+                is_whitelisted=False,
+                severity=ioc_data.threat_level or "informational",
+                confidence=ioc_data.confidence,
+                source=ioc_data.source,
+                tags=ioc_data.tags or [],
+                context=_build_context_from_create(ioc_data),
+                first_seen=now,
+                last_seen=now,
+                sighting_count=1,
+                organization_id=org_id,
             )
-            existing = result.scalar_one_or_none()
-
-            if existing:
-                existing.sighting_count = (existing.sighting_count or 0) + 1
-                existing.last_sighting_at = now
-                existing.last_seen = now
-                updated_count += 1
-            else:
-                ioc = ThreatIndicator(
-                    value=ioc_data.value,
-                    indicator_type=ioc_data.ioc_type,
-                    is_active=True,
-                    is_whitelisted=False,
-                    severity=ioc_data.threat_level or "informational",
-                    confidence=ioc_data.confidence,
-                    source=ioc_data.source,
-                    tags=ioc_data.tags or [],
-                    context=_build_context_from_create(ioc_data),
-                    first_seen=now,
-                    last_seen=now,
-                    sighting_count=1,
-                    organization_id=org_id,
-                )
-                db.add(ioc)
-                created_count += 1
-
-        except Exception as e:
-            failures.append({"value": ioc_data.value, "error": str(e)})
+            db.add(ioc)
+            await db.flush()
+            created_count += 1
 
     await db.flush()
 
@@ -299,10 +332,11 @@ async def bulk_create_iocs(
 async def get_ioc(
     ioc_id: str,
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
-    """Get an IOC by ID."""
-    ioc = await get_ioc_or_404(db, ioc_id, getattr(current_user, "organization_id", None))
+    """Get an IOC by ID (own or platform feed intel)."""
+    ioc = await get_ioc_or_404(db, ioc_id, org_id, include_platform=True)
     return ioc_to_response(ioc)
 
 
@@ -310,11 +344,12 @@ async def get_ioc(
 async def update_ioc(
     ioc_id: str,
     ioc_data: IOCUpdate,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Update an IOC."""
-    ioc = await get_ioc_or_404(db, ioc_id, getattr(current_user, "organization_id", None))
+    ioc = await get_ioc_or_404(db, ioc_id, org_id)
 
     update_data = ioc_data.model_dump(exclude_unset=True, exclude_none=True)
     ctx = dict(ioc.context) if isinstance(ioc.context, dict) else {}
@@ -352,11 +387,12 @@ async def update_ioc(
 @router.delete("/{ioc_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_ioc(
     ioc_id: str,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Delete an IOC."""
-    ioc = await get_ioc_or_404(db, ioc_id, getattr(current_user, "organization_id", None))
+    ioc = await get_ioc_or_404(db, ioc_id, org_id)
     await db.delete(ioc)
     await db.flush()
 
@@ -365,22 +401,23 @@ async def delete_ioc(
 async def search_ioc(
     search_data: IOCSearchRequest,
     current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
-    """Search for an IOC by value."""
-    query = select(ThreatIndicator).where(ThreatIndicator.value == search_data.value)
+    """Search the organisation's IOCs and platform feed intel by value.
+
+    A read: it no longer bumps last_seen / sighting_count (a lookup is not a
+    sighting, and it used to mutate other tenants' rows).
+    """
+    query = select(ThreatIndicator).where(
+        ThreatIndicator.value == search_data.value,
+        _visible_to(org_id),
+    )
     if search_data.ioc_type:
         query = query.where(ThreatIndicator.indicator_type == search_data.ioc_type)
 
     result = await db.execute(query)
     iocs = list(result.scalars().all())
-
-    now = datetime.now(timezone.utc)
-    for ioc in iocs:
-        ioc.last_seen = now
-        ioc.sighting_count = (ioc.sighting_count or 0) + 1
-
-    await db.flush()
 
     return [ioc_to_response(ioc) for ioc in iocs]
 
@@ -388,7 +425,8 @@ async def search_ioc(
 @router.post("/{ioc_id}/enrich", response_model=IOCResponse)
 async def enrich_ioc(
     ioc_id: str,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ):
     """Enrich an IOC by aggregating all matching threat indicators by value.
@@ -397,14 +435,17 @@ async def enrich_ioc(
     means "look for other rows with the same value across different feeds
     and fold their context together."
     """
-    ioc = await get_ioc_or_404(db, ioc_id, getattr(current_user, "organization_id", None))
+    ioc = await get_ioc_or_404(db, ioc_id, org_id)
 
+    # Siblings: the organisation's own rows and platform feed intel only;
+    # other tenants' context never leaks into this IOC.
     sibling_result = await db.execute(
         select(ThreatIndicator).where(
             ThreatIndicator.value == ioc.value,
             ThreatIndicator.id != ioc.id,
             ThreatIndicator.is_active == True,  # noqa: E712
-        )
+            _visible_to(org_id),
+        ),
     )
     siblings = list(sibling_result.scalars().all())
 

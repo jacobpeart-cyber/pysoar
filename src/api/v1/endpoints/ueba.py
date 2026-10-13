@@ -5,7 +5,7 @@ FastAPI router for User & Entity Behavior Analytics operations.
 
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Annotated, Optional
 from fastapi import APIRouter, HTTPException, Query, Depends
 from sqlalchemy import select, func, and_, or_, desc
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -13,14 +13,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.core.logging import get_logger
 from src.core.config import settings
 
-
-def _org_filter(model, org_id):
-    """Return an org_id filter clause, or True if org_id is None (skip filtering)."""
-    if org_id:
-        return model.organization_id == org_id
-    return True
 from src.services.automation import AutomationService
-from src.api.deps import CurrentUser, DatabaseSession, get_current_active_user, get_db
+from src.api.deps import (
+    CurrentUser,
+    DatabaseSession,
+    OrganizationId,
+    get_current_active_user,
+    get_db,
+    require_role,
+)
+from src.models.user import User, UserRole
+from src.ueba.engine import PeerGroupAnalyzer, RiskScorer
 from src.ueba.models import (
     EntityProfile,
     BehaviorBaseline,
@@ -54,6 +57,11 @@ from src.schemas.ueba import (
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/ueba", tags=["ueba"])
+
+#: Operational writes (alert triage, escalation, watchlist, event ingest).
+AnalystUser = Annotated[User, Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
+#: Configuration and whole-org recomputation (peer groups, baselines).
+AdminRoleUser = Annotated[User, Depends(require_role([UserRole.ADMIN]))]
 
 
 # ============================================================================
@@ -93,6 +101,52 @@ async def get_alert_or_404(db: AsyncSession, alert_id: str, organization_id: str
     return alert
 
 
+def _timeline_event(event: BehaviorEvent) -> dict:
+    """One BehaviorEvent row in the BehaviorTimelineEvent shape."""
+    data = event.event_data if isinstance(event.event_data, dict) else {}
+    reasons = list(event.anomaly_reasons or [])
+    description = data.get("description")
+    if not description:
+        description = ", ".join(str(r) for r in reasons) if reasons else event.event_type
+    return {
+        "id": event.id,
+        "event_type": event.event_type,
+        "timestamp": event.created_at,
+        "created_at": event.created_at,
+        "description": str(description or ""),
+        "is_anomalous": bool(event.is_anomalous),
+        "anomaly_reasons": reasons,
+        "risk_contribution": event.risk_contribution or 0.0,
+        "source_ip": event.source_ip,
+        "destination": event.destination,
+        "event_data": data,
+    }
+
+
+#: Preference when an entity belongs to several groups.
+_PEER_GROUP_TYPE_ORDER = ("custom", "auto_clustered", "role", "department")
+
+
+def _pick_peer_group(entity: EntityProfile, groups: list[PeerGroup]) -> Optional[PeerGroup]:
+    """The peer group ``entity`` is a member of (its labelled group first)."""
+    containing = [g for g in groups if entity.id in (g.members or [])]
+    if not containing:
+        return None
+    if entity.peer_group:
+        for g in containing:
+            if entity.peer_group in (g.name, g.id):
+                return g
+
+    def _rank(g: PeerGroup) -> tuple[int, int]:
+        try:
+            type_rank = _PEER_GROUP_TYPE_ORDER.index(g.group_type)
+        except ValueError:
+            type_rank = len(_PEER_GROUP_TYPE_ORDER)
+        return (type_rank, -(g.member_count or 0))
+
+    return sorted(containing, key=_rank)[0]
+
+
 # Event scoring + persist logic lives in src.ueba.ingest so the REST
 # ingest endpoints and the `ueba.process_behavior_events` Celery task
 # share one implementation and cannot drift.
@@ -129,7 +183,7 @@ async def get_peer_group_or_404(db: AsyncSession, group_id: str, organization_id
     description="List user and entity profiles with filtering"
 )
 async def list_entities(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     entity_type: Optional[str] = Query(None),
     risk_level: Optional[str] = Query(None),
@@ -156,11 +210,8 @@ async def list_entities(
         f"watched={is_watched}, limit={limit}, offset={offset}"
     )
 
-    org_id = getattr(current_user, "organization_id", None)
-    # org_id may be None for users without organization
-
     query = select(EntityProfile).where(
-        _org_filter(EntityProfile, org_id)
+        EntityProfile.organization_id == org_id
     )
 
     if entity_type:
@@ -201,7 +252,7 @@ async def list_entities(
 )
 async def get_entity(
     entity_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ) -> EntityProfile:
     """
@@ -211,9 +262,6 @@ async def get_entity(
     - entity_id: Unique entity identifier
     """
     logger.info(f"Getting entity profile: {entity_id}")
-
-    org_id = getattr(current_user, "organization_id", None)
-    # org_id may be None for users without organization
 
     entity = await get_entity_or_404(db, entity_id, org_id)
     return entity
@@ -228,7 +276,8 @@ async def get_entity(
 async def update_watchlist(
     entity_id: str,
     is_watched: bool,
-    current_user: CurrentUser = None,
+    _caller: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     reason: Optional[str] = None,
 ) -> EntityProfile:
@@ -243,9 +292,6 @@ async def update_watchlist(
     - reason: Reason for watchlist status
     """
     logger.info(f"Updating watchlist for {entity_id}: watched={is_watched}")
-
-    org_id = getattr(current_user, "organization_id", None)
-    # org_id may be None for users without organization
 
     entity = await get_entity_or_404(db, entity_id, org_id)
 
@@ -266,7 +312,7 @@ async def update_watchlist(
 )
 async def get_entity_timeline(
     entity_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     days: int = Query(7, ge=1, le=365),
     anomalies_only: bool = Query(False),
@@ -285,9 +331,6 @@ async def get_entity_timeline(
     """
     logger.info(f"Getting timeline for {entity_id}: days={days}, anomalies_only={anomalies_only}")
 
-    org_id = getattr(current_user, "organization_id", None)
-    # org_id may be None for users without organization
-
     entity = await get_entity_or_404(db, entity_id, org_id)
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
@@ -295,7 +338,7 @@ async def get_entity_timeline(
     query = select(BehaviorEvent).where(
         and_(
             BehaviorEvent.entity_profile_id == entity.id,
-            _org_filter(BehaviorEvent, org_id),
+            BehaviorEvent.organization_id == org_id,
             BehaviorEvent.created_at >= cutoff,
         )
     )
@@ -308,10 +351,17 @@ async def get_entity_timeline(
     result = await db.execute(query)
     events = list(result.scalars().all())
 
+    # BehaviorEvent has no ``timestamp`` / ``description`` columns; returning
+    # the ORM rows straight into BehaviorTimelineEvent was a 500 whenever the
+    # entity had an event. Map them explicitly.
+    timeline_events = [_timeline_event(ev) for ev in events]
+
     return {
         "entity_id": entity_id,
-        "events": events,
-        "total_events": len(events),
+        "event_count": len(timeline_events),
+        "anomaly_count": sum(1 for ev in events if ev.is_anomalous),
+        "events": timeline_events,
+        "total_events": len(timeline_events),
         "period_days": days,
         "anomalies_only": anomalies_only,
     }
@@ -325,7 +375,7 @@ async def get_entity_timeline(
 )
 async def get_entity_risk(
     entity_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     days: int = Query(30, ge=1, le=365),
 ) -> dict:
@@ -340,46 +390,62 @@ async def get_entity_risk(
     """
     logger.info(f"Getting risk for {entity_id}: days={days}")
 
-    org_id = getattr(current_user, "organization_id", None)
-    # org_id may be None for users without organization
-
     entity = await get_entity_or_404(db, entity_id, org_id)
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
 
-    # Count alerts in period
-    alert_count_result = await db.execute(
-        select(func.count(UEBARiskAlert.id)).where(
-            and_(
-                UEBARiskAlert.entity_profile_id == entity.id,
-                _org_filter(UEBARiskAlert, org_id),
-                UEBARiskAlert.created_at >= cutoff,
+    # Alerts in period (severity + time feed the factor breakdown and trend)
+    alert_rows = (
+        await db.execute(
+            select(UEBARiskAlert.severity, UEBARiskAlert.created_at).where(
+                and_(
+                    UEBARiskAlert.entity_profile_id == entity.id,
+                    UEBARiskAlert.organization_id == org_id,
+                    UEBARiskAlert.created_at >= cutoff,
+                )
             )
         )
-    )
-    alert_count = alert_count_result.scalar() or 0
+    ).all()
+    alerts = [{"severity": sev, "created_at": created} for sev, created in alert_rows]
 
-    # Count anomalous events in period
-    anomaly_count_result = await db.execute(
-        select(func.count(BehaviorEvent.id)).where(
-            and_(
-                BehaviorEvent.entity_profile_id == entity.id,
-                _org_filter(BehaviorEvent, org_id),
-                BehaviorEvent.is_anomalous == True,
-                BehaviorEvent.created_at >= cutoff,
+    # Anomalous events in period, with their summed risk contribution
+    anomaly_count, anomaly_contribution = (
+        await db.execute(
+            select(
+                func.count(BehaviorEvent.id),
+                func.coalesce(func.sum(BehaviorEvent.risk_contribution), 0.0),
+            ).where(
+                and_(
+                    BehaviorEvent.entity_profile_id == entity.id,
+                    BehaviorEvent.organization_id == org_id,
+                    BehaviorEvent.is_anomalous == True,
+                    BehaviorEvent.created_at >= cutoff,
+                )
             )
         )
-    )
-    anomaly_count = anomaly_count_result.scalar() or 0
+    ).one()
+
+    # The response previously handed ``current_behavior`` (a dict) to a list
+    # field and omitted the required ``risk_trend``: always a 500.
+    scorer = RiskScorer()
+    risk_factors = scorer.get_risk_factors(entity.id, alerts)
+    if anomaly_count:
+        risk_factors.append({
+            "factor": "anomalous_events",
+            "count": int(anomaly_count),
+            "contribution": round(float(anomaly_contribution or 0.0), 2),
+        })
 
     return {
         "entity_id": entity_id,
         "risk_score": entity.risk_score,
         "risk_level": entity.risk_level,
-        "alert_count": alert_count,
-        "anomaly_count": anomaly_count,
+        "risk_factors": risk_factors,
+        "risk_trend": scorer.get_risk_trend(entity.id, alerts, days=days),
+        "alert_count": len(alerts),
+        "anomaly_count": int(anomaly_count or 0),
         "period_days": days,
-        "risk_factors": entity.current_behavior,
+        "updated_at": entity.updated_at,
     }
 
 
@@ -391,7 +457,7 @@ async def get_entity_risk(
 )
 async def get_peer_comparison(
     entity_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ) -> dict:
     """
@@ -402,35 +468,78 @@ async def get_peer_comparison(
     """
     logger.info(f"Getting peer comparison for {entity_id}")
 
-    org_id = getattr(current_user, "organization_id", None)
-    # org_id may be None for users without organization
-
     entity = await get_entity_or_404(db, entity_id, org_id)
 
-    # Find peer group members
-    peer_entities = []
-    if entity.peer_group:
-        peer_result = await db.execute(
-            select(EntityProfile).where(
-                and_(
-                    _org_filter(EntityProfile, org_id),
-                    EntityProfile.peer_group == entity.peer_group,
-                    EntityProfile.id != entity.id,
-                )
-            ).limit(50)
-        )
-        peer_entities = list(peer_result.scalars().all())
+    # Peer groups record their members by EntityProfile id (auto-cluster
+    # and the update_peer_groups task); ``EntityProfile.peer_group`` is only
+    # a label, so membership is resolved from the groups themselves. The old
+    # response omitted the required comparisons/deviations: always a 500.
+    groups = list(
+        (
+            await db.execute(
+                select(PeerGroup).where(PeerGroup.organization_id == org_id)
+            )
+        ).scalars().all()
+    )
+    group = _pick_peer_group(entity, groups)
 
-    peer_risk_scores = [p.risk_score for p in peer_entities]
-    avg_peer_risk = sum(peer_risk_scores) / len(peer_risk_scores) if peer_risk_scores else 0.0
+    if group is None:
+        return {
+            "entity_id": entity_id,
+            "peer_group_id": "",
+            "peer_group_name": "",
+            "member_count": 0,
+            "comparisons": [],
+            "deviations": [],
+        }
+
+    peer_ids = [m for m in (group.members or []) if m != entity.id][:500]
+    peer_entities: list[EntityProfile] = []
+    if peer_ids:
+        peer_entities = list(
+            (
+                await db.execute(
+                    select(EntityProfile).where(
+                        and_(
+                            EntityProfile.organization_id == org_id,
+                            EntityProfile.id.in_(peer_ids),
+                        )
+                    )
+                )
+            ).scalars().all()
+        )
+
+    entity_data = {
+        "risk_score": entity.risk_score or 0.0,
+        "activity_count": entity.anomaly_count_30d or 0,
+    }
+    peer_data = [
+        {"risk_score": p.risk_score or 0.0, "activity_count": p.anomaly_count_30d or 0}
+        for p in peer_entities
+    ]
+
+    comparisons = []
+    for metric, key in (("risk_score", "risk_score"), ("anomaly_count_30d", "activity_count")):
+        values = [float(d[key]) for d in peer_data]
+        if not values:
+            continue
+        own = float(entity_data[key])
+        comparisons.append({
+            "metric": metric,
+            "entity_value": own,
+            "peer_average": round(sum(values) / len(values), 2),
+            "percentile": round(sum(1 for v in values if v < own) / len(values) * 100.0, 1),
+        })
+
+    deviations = PeerGroupAnalyzer().detect_peer_deviation(entity.id, entity_data, peer_data)
 
     return {
         "entity_id": entity_id,
-        "entity_risk_score": entity.risk_score,
-        "peer_group": entity.peer_group,
-        "peer_count": len(peer_entities),
-        "avg_peer_risk_score": avg_peer_risk,
-        "peers": peer_entities,
+        "peer_group_id": group.id,
+        "peer_group_name": group.name,
+        "member_count": len(peer_entities) + 1,
+        "comparisons": comparisons,
+        "deviations": deviations,
     }
 
 
@@ -445,7 +554,7 @@ async def get_peer_comparison(
     description="List risk alerts with filtering"
 )
 async def list_alerts(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     alert_type: Optional[str] = Query(None),
     severity: Optional[str] = Query(None),
@@ -472,11 +581,8 @@ async def list_alerts(
         f"status={status}, limit={limit}, offset={offset}"
     )
 
-    org_id = getattr(current_user, "organization_id", None)
-    # org_id may be None for users without organization
-
     query = select(UEBARiskAlert).where(
-        _org_filter(UEBARiskAlert, org_id)
+        UEBARiskAlert.organization_id == org_id
     )
 
     if alert_type:
@@ -512,7 +618,7 @@ async def list_alerts(
 )
 async def get_alert(
     alert_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ) -> UEBARiskAlert:
     """
@@ -522,9 +628,6 @@ async def get_alert(
     - alert_id: Unique alert identifier
     """
     logger.info(f"Getting alert: {alert_id}")
-
-    org_id = getattr(current_user, "organization_id", None)
-    # org_id may be None for users without organization
 
     alert = await get_alert_or_404(db, alert_id, org_id)
     return alert
@@ -539,7 +642,8 @@ async def get_alert(
 async def update_alert_status(
     alert_id: str,
     update: UEBARiskAlertUpdate,
-    current_user: CurrentUser = None,
+    _caller: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ) -> UEBARiskAlert:
     """
@@ -554,9 +658,6 @@ async def update_alert_status(
     - escalated_to_incident: Incident ID if escalated
     """
     logger.info(f"Updating alert {alert_id}: status={update.status}")
-
-    org_id = getattr(current_user, "organization_id", None)
-    # org_id may be None for users without organization
 
     alert = await get_alert_or_404(db, alert_id, org_id)
 
@@ -578,7 +679,8 @@ async def update_alert_status(
 )
 async def escalate_alert(
     alert_id: str,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     incident_id: Optional[str] = Query(None),
     notes: Optional[str] = Query(None),
@@ -600,7 +702,6 @@ async def escalate_alert(
 
     logger.info(f"Escalating alert {alert_id} (target incident={incident_id})")
 
-    org_id = getattr(current_user, "organization_id", None)
     alert = await get_alert_or_404(db, alert_id, org_id)
 
     # Idempotent: if already escalated, return as-is
@@ -613,7 +714,10 @@ async def escalate_alert(
 
     # Load the entity so we can populate the incident w/ meaningful context
     entity_result = await db.execute(
-        select(EntityProfile).where(EntityProfile.id == alert.entity_profile_id)
+        select(EntityProfile).where(
+            EntityProfile.id == alert.entity_profile_id,
+            EntityProfile.organization_id == org_id,
+        )
     )
     entity = entity_result.scalar_one_or_none()
 
@@ -623,9 +727,10 @@ async def escalate_alert(
     if incident_id:
         # Link to an existing incident — verify it exists and belongs
         # to the caller's organization (cross-tenant IDOR guard).
-        inc_stmt = select(Incident).where(Incident.id == incident_id)
-        if org_id is not None:
-            inc_stmt = inc_stmt.where(Incident.organization_id == org_id)
+        inc_stmt = select(Incident).where(
+            Incident.id == incident_id,
+            Incident.organization_id == org_id,
+        )
         inc_result = await db.execute(inc_stmt)
         target_incident = inc_result.scalar_one_or_none()
         if not target_incident:
@@ -656,6 +761,7 @@ async def escalate_alert(
             status=IncidentStatus.OPEN.value,
             incident_type="ueba_anomaly",
             detected_at=datetime.now(timezone.utc).isoformat(),
+            organization_id=org_id,
         )
         db.add(target_incident)
         await db.flush()
@@ -675,8 +781,13 @@ async def escalate_alert(
                 created_by=str(current_user.id) if current_user else None,
             )
         except Exception as automation_exc:  # noqa: BLE001
+            # The incident and the alert link are real and committed with the
+            # request; the war-room/action-item fanout is best effort.
             logger.warning(
-                f"Automation on_incident_created failed after UEBA escalation: {automation_exc}"
+                "ueba_escalation_automation_failed",
+                incident_id=target_incident.id,
+                organization_id=org_id,
+                error=str(automation_exc),
             )
 
     await db.flush()
@@ -697,7 +808,8 @@ async def escalate_alert(
 )
 async def ingest_event(
     event: BehaviorEventCreate,
-    current_user: CurrentUser = None,
+    _caller: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ) -> BehaviorEvent:
     """
@@ -713,9 +825,6 @@ async def ingest_event(
     - device_info: Device information if available
     """
     logger.info(f"Ingesting event for entity {event.entity_id}: type={event.event_type}")
-
-    org_id = getattr(current_user, "organization_id", None)
-    # org_id may be None for users without organization
 
     # Shared with the batch endpoint and the process_behavior_events
     # Celery task: entity lookup, anomaly scoring against the baseline,
@@ -740,7 +849,8 @@ async def ingest_event(
 )
 async def ingest_batch(
     batch: BehaviorEventBatch,
-    current_user: CurrentUser = None,
+    _caller: AnalystUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ) -> dict:
     """
@@ -751,9 +861,6 @@ async def ingest_batch(
     """
     logger.info(f"Ingesting batch of {len(batch.events)} events")
 
-    org_id = getattr(current_user, "organization_id", None)
-    # org_id may be None for users without organization
-
     import time as _t
     _started = _t.monotonic()
 
@@ -763,25 +870,23 @@ async def ingest_batch(
     alerts_created = 0
 
     for event in batch.events:
-        try:
-            # Shared per-event ingest: entity lookup, baseline scoring,
-            # risk bump, and on_ueba_anomaly fanout — identical logic to
-            # single-event ingest and the process_behavior_events task.
-            behavior_event, alert_created = await ingest_behavior_event(
-                db, org_id, event.model_dump()
-            )
-            if behavior_event is None:
-                failed += 1
-                continue
-
-            processed += 1
-            if behavior_event.is_anomalous:
-                anomalies += 1
-            if alert_created:
-                alerts_created += 1
-        except Exception as exc:
-            logger.error(f"Batch event ingest failed: {exc}", exc_info=True)
+        # Shared per-event ingest: entity lookup, baseline scoring,
+        # risk bump, and on_ueba_anomaly fanout — identical logic to
+        # single-event ingest and the process_behavior_events task.
+        # An unknown entity counts as failed; any other error (database,
+        # scoring) fails the request instead of being folded into the count.
+        behavior_event, alert_created = await ingest_behavior_event(
+            db, org_id, event.model_dump()
+        )
+        if behavior_event is None:
             failed += 1
+            continue
+
+        processed += 1
+        if behavior_event.is_anomalous:
+            anomalies += 1
+        if alert_created:
+            alerts_created += 1
 
     if processed > 0:
         await db.flush()
@@ -805,7 +910,7 @@ async def ingest_batch(
     description="Search and filter behavior events"
 )
 async def search_events(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     entity_id: Optional[str] = Query(None),
     event_type: Optional[str] = Query(None),
@@ -831,14 +936,11 @@ async def search_events(
     """
     logger.info(f"Searching events: entity={entity_id}, type={event_type}, days={days}")
 
-    org_id = getattr(current_user, "organization_id", None)
-    # org_id may be None for users without organization
-
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
 
     query = select(BehaviorEvent).where(
         and_(
-            _org_filter(BehaviorEvent, org_id),
+            BehaviorEvent.organization_id == org_id,
             BehaviorEvent.created_at >= cutoff,
         )
     )
@@ -878,7 +980,7 @@ async def search_events(
     description="List all peer groups"
 )
 async def list_peer_groups(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     group_type: Optional[str] = Query(None),
 ) -> list:
@@ -890,11 +992,8 @@ async def list_peer_groups(
     """
     logger.info(f"Listing peer groups: type={group_type}")
 
-    org_id = getattr(current_user, "organization_id", None)
-    # org_id may be None for users without organization
-
     query = select(PeerGroup).where(
-        _org_filter(PeerGroup, org_id)
+        PeerGroup.organization_id == org_id
     )
 
     if group_type:
@@ -916,7 +1015,8 @@ async def list_peer_groups(
 )
 async def create_peer_group(
     group: PeerGroupCreate,
-    current_user: CurrentUser = None,
+    _caller: AdminRoleUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ) -> PeerGroup:
     """
@@ -929,9 +1029,6 @@ async def create_peer_group(
     - risk_threshold: Risk threshold for members
     """
     logger.info(f"Creating peer group: {group.name}")
-
-    org_id = getattr(current_user, "organization_id", None)
-    # org_id may be None for users without organization
 
     peer_group = PeerGroup(
         id=str(uuid.uuid4()),
@@ -957,7 +1054,7 @@ async def create_peer_group(
 )
 async def get_peer_group(
     group_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ) -> PeerGroup:
     """
@@ -967,9 +1064,6 @@ async def get_peer_group(
     - group_id: Unique group identifier
     """
     logger.info(f"Getting peer group: {group_id}")
-
-    org_id = getattr(current_user, "organization_id", None)
-    # org_id may be None for users without organization
 
     group = await get_peer_group_or_404(db, group_id, org_id)
     return group
@@ -982,7 +1076,8 @@ async def get_peer_group(
     description="Trigger automatic peer clustering"
 )
 async def trigger_auto_cluster(
-    current_user: CurrentUser = None,
+    _caller: AdminRoleUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ) -> list:
     """
@@ -998,11 +1093,10 @@ async def trigger_auto_cluster(
 
     logger.info("Triggering auto-cluster for peer groups")
 
-    org_id = getattr(current_user, "organization_id", None)
 
     # Load all entities for this org
     entity_result = await db.execute(
-        select(EntityProfile).where(_org_filter(EntityProfile, org_id))
+        select(EntityProfile).where(EntityProfile.organization_id == org_id)
     )
     entities = list(entity_result.scalars().all())
 
@@ -1027,7 +1121,7 @@ async def trigger_auto_cluster(
     await db.execute(
         sql_delete(PeerGroup).where(
             and_(
-                _org_filter(PeerGroup, org_id),
+                PeerGroup.organization_id == org_id,
                 PeerGroup.group_type == "auto_clustered",
             )
         )
@@ -1090,7 +1184,7 @@ async def trigger_auto_cluster(
 )
 async def get_baselines(
     entity_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     behavior_type: Optional[str] = Query(None),
 ) -> list:
@@ -1105,16 +1199,19 @@ async def get_baselines(
     """
     logger.info(f"Getting baselines for {entity_id}: type={behavior_type}")
 
-    org_id = getattr(current_user, "organization_id", None)
-    # org_id may be None for users without organization
-
     # Verify entity exists and belongs to org
     await get_entity_or_404(db, entity_id, org_id)
 
-    query = select(BehaviorBaseline).where(
-        and_(
-            BehaviorBaseline.entity_profile_id == entity_id,
-            _org_filter(BehaviorBaseline, org_id),
+    # BehaviorBaseline has no organization_id column (filtering on one was a
+    # 500 for every caller); the tenant boundary is the owning entity.
+    query = (
+        select(BehaviorBaseline)
+        .join(EntityProfile, EntityProfile.id == BehaviorBaseline.entity_profile_id)
+        .where(
+            and_(
+                BehaviorBaseline.entity_profile_id == entity_id,
+                EntityProfile.organization_id == org_id,
+            )
         )
     )
 
@@ -1133,7 +1230,8 @@ async def get_baselines(
     description="Trigger baseline recalculation"
 )
 async def rebuild_baselines(
-    current_user: CurrentUser = None,
+    _caller: AdminRoleUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
     entity_ids: Optional[list[str]] = Query(None),
     baseline_days: int = Query(30, ge=1, le=365),
@@ -1154,18 +1252,17 @@ async def rebuild_baselines(
     """
     from sqlalchemy import delete as sql_delete
 
-    org_id = getattr(current_user, "organization_id", None)
 
     # Load target entities
     if entity_ids:
         ent_query = select(EntityProfile).where(
             and_(
                 EntityProfile.id.in_(entity_ids),
-                _org_filter(EntityProfile, org_id),
+                EntityProfile.organization_id == org_id,
             )
         )
     else:
-        ent_query = select(EntityProfile).where(_org_filter(EntityProfile, org_id))
+        ent_query = select(EntityProfile).where(EntityProfile.organization_id == org_id)
 
     ent_result = await db.execute(ent_query)
     entities = list(ent_result.scalars().all())
@@ -1182,6 +1279,7 @@ async def rebuild_baselines(
             select(BehaviorEvent).where(
                 and_(
                     BehaviorEvent.entity_profile_id == entity.id,
+                    BehaviorEvent.organization_id == org_id,
                     BehaviorEvent.created_at >= cutoff,
                 )
             )
@@ -1279,7 +1377,7 @@ async def rebuild_baselines(
     description="Retrieve UEBA dashboard statistics"
 )
 async def get_dashboard_stats(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ) -> dict:
     """
@@ -1287,19 +1385,16 @@ async def get_dashboard_stats(
     """
     logger.info("Getting UEBA dashboard statistics")
 
-    org_id = getattr(current_user, "organization_id", None)
-    # org_id may be None for users without organization
-
     # Total entities
     total_result = await db.execute(
-        select(func.count(EntityProfile.id)).where(_org_filter(EntityProfile, org_id))
+        select(func.count(EntityProfile.id)).where(EntityProfile.organization_id == org_id)
     )
     total_entities = total_result.scalar() or 0
 
     # Watched entities
     watched_result = await db.execute(
         select(func.count(EntityProfile.id)).where(
-            and_(_org_filter(EntityProfile, org_id), EntityProfile.is_watched == True)
+            and_(EntityProfile.organization_id == org_id, EntityProfile.is_watched == True)
         )
     )
     watched_entities = watched_result.scalar() or 0
@@ -1308,7 +1403,7 @@ async def get_dashboard_stats(
     high_risk_result = await db.execute(
         select(EntityProfile).where(
             and_(
-                _org_filter(EntityProfile, org_id),
+                EntityProfile.organization_id == org_id,
                 EntityProfile.risk_score >= 70.0,
             )
         ).order_by(desc(EntityProfile.risk_score)).limit(10)
@@ -1318,7 +1413,7 @@ async def get_dashboard_stats(
     # Risk distribution
     risk_dist_result = await db.execute(
         select(EntityProfile.risk_level, func.count(EntityProfile.id))
-        .where(_org_filter(EntityProfile, org_id))
+        .where(EntityProfile.organization_id == org_id)
         .group_by(EntityProfile.risk_level)
     )
     risk_distribution = [{"level": level, "count": count} for level, count in risk_dist_result.all()]
@@ -1326,7 +1421,7 @@ async def get_dashboard_stats(
     # Alert distribution by severity
     alert_dist_result = await db.execute(
         select(UEBARiskAlert.severity, func.count(UEBARiskAlert.id))
-        .where(_org_filter(UEBARiskAlert, org_id))
+        .where(UEBARiskAlert.organization_id == org_id)
         .group_by(UEBARiskAlert.severity)
     )
     alert_distribution = [{"severity": sev, "count": count} for sev, count in alert_dist_result.all()]
@@ -1336,7 +1431,7 @@ async def get_dashboard_stats(
     alerts_7d_result = await db.execute(
         select(func.count(UEBARiskAlert.id)).where(
             and_(
-                _org_filter(UEBARiskAlert, org_id),
+                UEBARiskAlert.organization_id == org_id,
                 UEBARiskAlert.created_at >= now - timedelta(days=7),
             )
         )
@@ -1346,7 +1441,7 @@ async def get_dashboard_stats(
     alerts_30d_result = await db.execute(
         select(func.count(UEBARiskAlert.id)).where(
             and_(
-                _org_filter(UEBARiskAlert, org_id),
+                UEBARiskAlert.organization_id == org_id,
                 UEBARiskAlert.created_at >= now - timedelta(days=30),
             )
         )
@@ -1357,7 +1452,7 @@ async def get_dashboard_stats(
     anomalies_7d_result = await db.execute(
         select(func.count(BehaviorEvent.id)).where(
             and_(
-                _org_filter(BehaviorEvent, org_id),
+                BehaviorEvent.organization_id == org_id,
                 BehaviorEvent.is_anomalous == True,
                 BehaviorEvent.created_at >= now - timedelta(days=7),
             )
@@ -1368,7 +1463,7 @@ async def get_dashboard_stats(
     anomalies_30d_result = await db.execute(
         select(func.count(BehaviorEvent.id)).where(
             and_(
-                _org_filter(BehaviorEvent, org_id),
+                BehaviorEvent.organization_id == org_id,
                 BehaviorEvent.is_anomalous == True,
                 BehaviorEvent.created_at >= now - timedelta(days=30),
             )
@@ -1397,16 +1492,13 @@ async def get_dashboard_stats(
     description="Retrieve risk heatmap data by entity type and risk level"
 )
 async def get_risk_heatmap(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId = None,
     db: DatabaseSession = None,
 ) -> dict:
     """
     Get risk heatmap data for visualization.
     """
     logger.info("Getting risk heatmap data")
-
-    org_id = getattr(current_user, "organization_id", None)
-    # org_id may be None for users without organization
 
     # Aggregate by entity_type and risk_level
     heatmap_result = await db.execute(
@@ -1415,7 +1507,7 @@ async def get_risk_heatmap(
             EntityProfile.risk_level,
             func.count(EntityProfile.id),
         )
-        .where(_org_filter(EntityProfile, org_id))
+        .where(EntityProfile.organization_id == org_id)
         .group_by(EntityProfile.entity_type, EntityProfile.risk_level)
     )
     heatmap_data = [
@@ -1424,7 +1516,7 @@ async def get_risk_heatmap(
     ]
 
     total_result = await db.execute(
-        select(func.count(EntityProfile.id)).where(_org_filter(EntityProfile, org_id))
+        select(func.count(EntityProfile.id)).where(EntityProfile.organization_id == org_id)
     )
     total_entities = total_result.scalar() or 0
 
