@@ -109,6 +109,9 @@ class PlaybookExecutionResponse(DBModel):
     input_data: Optional[dict[str, Any]] = None
     output_data: Optional[dict[str, Any]] = None
     step_results: Optional[list[dict[str, Any]]] = None
+    # Count of steps per status (completed / failed / awaiting_integration /
+    # queued_for_approval). A run is "completed" only when every step completed.
+    step_summary: Optional[dict[str, int]] = None
     error_message: Optional[str] = None
     error_step: Optional[int] = None
     triggered_by: Optional[str] = None

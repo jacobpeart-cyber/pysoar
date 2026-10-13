@@ -161,10 +161,14 @@ async def _seed_execution(db_session, *, steps=None, status=ExecutionStatus.PEND
         steps=steps if steps is not None else json.dumps(
             [{"name": "wait", "action": "wait", "parameters": {"seconds": 0}}]
         ),
+        # Steps only run inside a tenant: the engine refuses an execution with no organisation.
+        organization_id="loop-test-org",
     )
     db_session.add(pb)
     await db_session.flush()
-    execution = PlaybookExecution(playbook_id=pb.id, status=status, trigger_source="test")
+    execution = PlaybookExecution(
+        playbook_id=pb.id, organization_id="loop-test-org", status=status, trigger_source="test",
+    )
     db_session.add(execution)
     await db_session.commit()
     return execution

@@ -1,4 +1,11 @@
-"""Playbook management endpoints"""
+"""Playbook management endpoints
+
+Steps run through ``src.services.playbook_engine`` (see its docstring for what
+each step type really does). Create/update reject unknown step types and the
+removed ``run_script``; running a playbook that contains a privileged step
+(containment, outbound HTTP, or a non-read-only integration action; see
+``playbook_engine.is_privileged_step``) is admin-only.
+"""
 
 import json
 import math
@@ -29,7 +36,13 @@ from src.schemas.playbook import (
     PlaybookResponse,
     PlaybookUpdate,
 )
-from src.services.playbook_engine import PlaybookEngine
+from src.services.playbook_engine import (
+    REMOVED_ACTIONS,
+    SUPPORTED_ACTIONS,
+    PlaybookEngine,
+    is_privileged_step,
+    summarize_steps,
+)
 from src.services.websocket_manager import create_notification_callback
 
 router = APIRouter(prefix="/playbooks", tags=["Playbooks"])
@@ -37,6 +50,51 @@ router = APIRouter(prefix="/playbooks", tags=["Playbooks"])
 #: Operational writes (running a playbook): analysts and admins. Authoring,
 #: editing and deleting playbooks stay admin-only (AdminUser).
 _ANALYST_WRITE = [Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
+
+
+#: The UI's "schedule" trigger is stored as the enum value "scheduled".
+_TRIGGER_ALIASES = {"schedule": "scheduled"}
+
+
+def _validate_steps(steps: list) -> None:
+    """422 for removed or unknown step types (nothing unknown is ever stored)."""
+    problems = []
+    for idx, step in enumerate(steps):
+        action = step.action
+        if action in REMOVED_ACTIONS:
+            problems.append({"step": idx + 1, "action": action, "error": REMOVED_ACTIONS[action]})
+        elif action not in SUPPORTED_ACTIONS:
+            problems.append({"step": idx + 1, "action": action, "error": "unknown step type"})
+    if problems:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"error": "invalid_steps", "steps": problems, "supported_actions": sorted(SUPPORTED_ACTIONS)},
+        )
+
+
+def execution_to_response(execution: PlaybookExecution) -> PlaybookExecutionResponse:
+    """PlaybookExecution row -> response, with per-step results and a status summary."""
+    step_results = safe_json_loads(execution.step_results, None)
+    return PlaybookExecutionResponse(
+        id=execution.id,
+        playbook_id=execution.playbook_id,
+        incident_id=execution.incident_id,
+        status=execution.status,
+        current_step=execution.current_step,
+        total_steps=execution.total_steps,
+        started_at=execution.started_at,
+        completed_at=execution.completed_at,
+        input_data=safe_json_loads(execution.input_data, None),
+        output_data=safe_json_loads(execution.output_data, None),
+        step_results=step_results,
+        step_summary=summarize_steps(step_results) if isinstance(step_results, list) else None,
+        error_message=execution.error_message,
+        error_step=execution.error_step,
+        triggered_by=execution.triggered_by,
+        trigger_source=execution.trigger_source,
+        created_at=execution.created_at,
+        updated_at=execution.updated_at,
+    )
 
 
 async def run_playbook_execution(execution_id: str):
@@ -63,7 +121,7 @@ async def run_playbook_execution(execution_id: str):
 async def get_playbook_or_404(db: AsyncSession, playbook_id: str, org_id: str) -> Playbook:
     """Get the caller's playbook by ID or raise 404 (always tenant-scoped)"""
     result = await db.execute(
-        select(Playbook).where(Playbook.id == playbook_id, Playbook.organization_id == org_id)
+        select(Playbook).where(Playbook.id == playbook_id, Playbook.organization_id == org_id),
     )
     playbook = result.scalar_one_or_none()
     if not playbook:
@@ -164,11 +222,12 @@ async def create_playbook(
     db: DatabaseSession = None,
 ):
     """Create a new playbook in the caller's organisation (admin only)"""
+    _validate_steps(playbook_data.steps)
     playbook = Playbook(
         organization_id=org_id,
         name=playbook_data.name,
         description=playbook_data.description,
-        trigger_type=playbook_data.trigger_type,
+        trigger_type=_TRIGGER_ALIASES.get(playbook_data.trigger_type, playbook_data.trigger_type),
         trigger_conditions=json.dumps(playbook_data.trigger_conditions) if playbook_data.trigger_conditions else None,
         steps=json.dumps([s.model_dump() for s in playbook_data.steps]),
         variables=json.dumps(playbook_data.variables) if playbook_data.variables else None,
@@ -210,7 +269,11 @@ async def update_playbook(
     """Update a playbook (admin only)"""
     playbook = await get_playbook_or_404(db, playbook_id, org_id)
 
+    if playbook_data.steps is not None:
+        _validate_steps(playbook_data.steps)
     update_data = playbook_data.model_dump(exclude_unset=True, exclude_none=True)
+    if "trigger_type" in update_data:
+        update_data["trigger_type"] = _TRIGGER_ALIASES.get(update_data["trigger_type"], update_data["trigger_type"])
 
     # Handle JSON fields
     if "steps" in update_data:
@@ -293,6 +356,18 @@ async def execute_playbook(
 
     steps = safe_json_loads(playbook.steps, [])
 
+    # Privileged by capability (containment, outbound HTTP, non-read-only
+    # integration actions), not by a name allowlist.
+    containment_steps = sorted({
+        s.get("action") for s in steps
+        if isinstance(s, dict) and is_privileged_step(str(s.get("action") or ""), s.get("parameters") or {})
+    })
+    if containment_steps and not (current_user.is_superuser or current_user.role == UserRole.ADMIN.value):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "containment_requires_admin", "containment_steps": containment_steps},
+        )
+
     # Fold alert_id / incident_id from the request into input_data so
     # step executors (update_alert, add_comment, isolate_host, etc.) can
     # resolve the target entity without needing a separate lookup. The
@@ -316,6 +391,7 @@ async def execute_playbook(
         total_steps=len(steps),
         input_data=json.dumps(input_data) if input_data else None,
         triggered_by=current_user.id,
+        triggered_by_user_id=current_user.id,
         trigger_source="manual",
     )
 
@@ -327,25 +403,7 @@ async def execute_playbook(
     # visible to the new session that run_playbook_execution creates.
     background_tasks.add_task(run_playbook_execution, execution.id)
 
-    return PlaybookExecutionResponse(
-        id=execution.id,
-        playbook_id=execution.playbook_id,
-        incident_id=execution.incident_id,
-        status=execution.status,
-        current_step=execution.current_step,
-        total_steps=execution.total_steps,
-        started_at=execution.started_at,
-        completed_at=execution.completed_at,
-        input_data=safe_json_loads(execution.input_data, None),
-        output_data=None,
-        step_results=None,
-        error_message=execution.error_message,
-        error_step=execution.error_step,
-        triggered_by=execution.triggered_by,
-        trigger_source=execution.trigger_source,
-        created_at=execution.created_at,
-        updated_at=execution.updated_at,
-    )
+    return execution_to_response(execution)
 
 
 @router.get("/{playbook_id}/executions", response_model=PlaybookExecutionListResponse)
@@ -386,27 +444,7 @@ async def list_playbook_executions(
     result = await db.execute(query)
     executions = list(result.scalars().all())
 
-    items = []
-    for execution in executions:
-        items.append(PlaybookExecutionResponse(
-            id=execution.id,
-            playbook_id=execution.playbook_id,
-            incident_id=execution.incident_id,
-            status=execution.status,
-            current_step=execution.current_step,
-            total_steps=execution.total_steps,
-            started_at=execution.started_at,
-            completed_at=execution.completed_at,
-            input_data=safe_json_loads(execution.input_data, None),
-            output_data=safe_json_loads(execution.output_data, None),
-            step_results=safe_json_loads(execution.step_results, None),
-            error_message=execution.error_message,
-            error_step=execution.error_step,
-            triggered_by=execution.triggered_by,
-            trigger_source=execution.trigger_source,
-            created_at=execution.created_at,
-            updated_at=execution.updated_at,
-        ))
+    items = [execution_to_response(execution) for execution in executions]
 
     return PlaybookExecutionListResponse(
         items=items,
@@ -415,3 +453,31 @@ async def list_playbook_executions(
         size=size,
         pages=math.ceil(total / size) if total > 0 else 0,
     )
+
+
+@router.get("/{playbook_id}/executions/{execution_id}", response_model=PlaybookExecutionResponse)
+async def get_playbook_execution(
+    playbook_id: str,
+    execution_id: str,
+    org_id: OrganizationId,
+    _current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+):
+    """One execution of one of the caller's playbooks, for polling a run.
+
+    Carries per-step ``status`` / ``started_at`` / ``finished_at`` / ``result`` /
+    ``error`` in ``step_results`` and a per-status ``step_summary``.
+    """
+    await get_playbook_or_404(db, playbook_id, org_id)
+    execution = (
+        await db.execute(
+            select(PlaybookExecution).where(
+                PlaybookExecution.id == execution_id,
+                PlaybookExecution.playbook_id == playbook_id,
+                PlaybookExecution.organization_id == org_id,
+            ),
+        )
+    ).scalar_one_or_none()
+    if execution is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Execution not found")
+    return execution_to_response(execution)

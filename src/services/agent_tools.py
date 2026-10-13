@@ -2280,16 +2280,16 @@ class AgentToolRegistry:
 
     async def _dispatchable_agents(self) -> list[EndpointAgent]:
         """Enrolled endpoint agents in this org that may receive a command."""
-        q = self._scoped(select(EndpointAgent), EndpointAgent).where(EndpointAgent.status.in_(_DISPATCHABLE_AGENT_STATES))
-        return list((await self.db.execute(q)).scalars().all())
+        from src.services import containment
+
+        return await containment.dispatchable_agents(self.db, self.ctx.org_id)
 
     async def _block_ip(self, ip: str, reason: str) -> dict[str, Any]:
         """Detection layer (active blocked IOC) + enforcement layer (host-firewall
-        ``block_ip`` command on every enrolled IR-capable endpoint agent, the
-        same dispatch the remediation engine's FirewallBlockExecutor uses).
+        ``block_ip`` command on every enrolled IR-capable endpoint agent, through
+        the shared containment service ``src.services.containment.block_ip``).
         ``mode`` states honestly which layers took effect."""
-        from src.agents.capabilities import capability_allows
-        from src.agents.service import AgentService, AgentServiceError
+        from src.services import containment
 
         ioc = ThreatIndicator(
             value=ip, indicator_type="ipv4", severity="high", is_active=True, is_whitelisted=False,
@@ -2299,21 +2299,12 @@ class AgentToolRegistry:
         self.db.add(ioc)
         await self.db.flush()
 
-        commands: list[dict[str, Any]] = []
-        rejected: list[dict[str, Any]] = []
-        svc = AgentService(self.db)
-        for agent in await self._dispatchable_agents():
-            if not capability_allows(list(agent.capabilities or []), "block_ip"):
-                continue  # not IR-enrolled: ineligible, not a failure
-            try:
-                # approval_override: the policy/approval flow already authorized this destructive call.
-                cmd = await svc.issue_command(
-                    agent=agent, action="block_ip", payload={"ip": ip, "reason": reason},
-                    issued_by=self.ctx.actor_user_id, approval_override=True,
-                )
-                commands.append({"agent_id": agent.id, "hostname": agent.hostname, "command_id": cmd.id, "command_status": cmd.status})
-            except AgentServiceError as exc:
-                rejected.append({"agent_id": agent.id, "hostname": agent.hostname, "error": str(exc)})
+        # approval_override: the policy/approval flow already authorized this destructive call.
+        res = await containment.block_ip(
+            self.db, self.ctx.org_id, ip=ip, actor=self._actor_id(), reason=reason,
+            execution_ref=f"agent_run:{self.ctx.run_id}", issued_by=self.ctx.actor_user_id, approval_override=True,
+        )
+        commands, rejected = res.commands, res.rejected
 
         if commands:
             mode = "enforced_via_agents"
@@ -2338,64 +2329,60 @@ class AgentToolRegistry:
 
     async def _agent_for_host(self, asset: Optional[Asset], hostname: str) -> Optional[EndpointAgent]:
         """The enrolled endpoint agent for ``asset`` (or the raw hostname), if any."""
-        names = {n.lower() for n in (hostname, getattr(asset, "hostname", None), getattr(asset, "name", None), getattr(asset, "fqdn", None)) if n}
-        if not names:
-            return None
-        q = self._scoped(select(EndpointAgent), EndpointAgent).where(
-            EndpointAgent.status.in_(_DISPATCHABLE_AGENT_STATES), func.lower(EndpointAgent.hostname).in_(sorted(names)),
-        ).order_by(EndpointAgent.last_heartbeat_at.desc().nullslast())
-        return (await self.db.execute(q)).scalars().first()
+        from src.services import containment
+
+        return await containment.agent_for_host(self.db, self.ctx.org_id, asset, hostname)
 
     async def _isolate_host(self, hostname: str, reason: str) -> dict[str, Any]:
-        """Network isolation through the host's enrolled endpoint agent. With no
-        agent the request is recorded only (``mode=detection_only``) - nothing is
+        """Network isolation through the shared containment service (the host's
+        enrolled endpoint agent, else a capable EDR integration). With neither
+        the request is recorded only (``mode=detection_only``) - nothing is
         simulated."""
-        from src.agents.service import AgentService, AgentServiceError
+        from src.services import containment
 
         # The policy resolves ``hostname`` to an in-org Asset id; accept either.
-        asset = await self._find_asset(str(hostname))
-        label = (asset.hostname or asset.name) if asset else str(hostname)
-        agent = await self._agent_for_host(asset, str(hostname))
+        # approval_override: the policy/approval flow already authorized this destructive call.
+        res = await containment.isolate_host(
+            self.db, self.ctx.org_id, hostname=str(hostname), actor=self._actor_id(), reason=reason,
+            execution_ref=f"agent_run:{self.ctx.run_id}", issued_by=self.ctx.actor_user_id, approval_override=True,
+        )
+        label = res.target
+        command_id = res.command_id
+        command_status = res.command_status
+        agent_id = res.agent_id
+        error = res.error
 
-        command_id: Optional[str] = None
-        command_status: Optional[str] = None
-        error: Optional[str] = None
-        if agent is not None:
-            try:
-                # approval_override: the policy/approval flow already authorized this destructive call.
-                cmd = await AgentService(self.db).issue_command(
-                    agent=agent, action="isolate_host", payload={"hostname": label, "reason": reason},
-                    issued_by=self.ctx.actor_user_id, approval_override=True,
-                )
-                command_id, command_status = cmd.id, cmd.status
-            except AgentServiceError as exc:
-                error = str(exc)
-
-        if command_id:
+        if res.actuated and command_id:
             mode, status = "enforced_via_agent", "isolation_queued"
-            note = f"isolate_host command {command_id} queued to endpoint agent {agent.id} ({agent.hostname})"  # type: ignore[union-attr]
-        elif agent is not None:
+            note = f"isolate_host command {command_id} queued to endpoint agent {agent_id} ({res.agent_hostname})"
+        elif res.actuated:
+            mode, status = "enforced_via_integration", "isolation_requested"
+            note = res.detail
+        elif agent_id is not None:
             mode, status = "detection_only", "recorded"
-            note = f"Endpoint agent {agent.hostname} rejected isolate_host: {error}. Isolation request recorded only; isolate manually."
+            note = f"Endpoint agent {res.agent_hostname} rejected isolate_host: {error}. Isolation request recorded only; isolate manually."
         else:
             mode, status = "detection_only", "recorded"
             note = (
                 f"No enrolled endpoint agent for host {label}: isolation request recorded as a remediation activity only. "
                 "Enroll the PySOAR agent with the isolate_host capability or isolate the host manually."
             )
+            if error:
+                note = f"{note} ({error})"
         self.db.add(TicketActivity(
-            source_type="remediation", source_id=asset.id if asset else label, activity_type="isolate_host",
+            source_type="remediation", source_id=res.asset_id or label, activity_type="isolate_host",
             description=f"Host {label} isolation ({mode}) by agent. Reason: {reason}",
             actor_id=self._actor_id(), organization_id=self.ctx.org_id,
             extra_metadata={
-                "asset_id": asset.id if asset else None, "mode": mode, "agent_id": agent.id if agent else None,
+                "asset_id": res.asset_id, "mode": mode, "agent_id": agent_id,
                 "command_id": command_id, "command_status": command_status, "error": error,
+                "integration": res.integration, "integration_execution_id": res.integration_execution_id,
             },
         ))
         await self.db.flush()
         return {
-            "hostname": label, "asset_id": asset.id if asset else None, "status": status, "mode": mode,
-            "agent_id": agent.id if agent else None, "command_id": command_id, "command_status": command_status,
+            "hostname": label, "asset_id": res.asset_id, "status": status, "mode": mode,
+            "agent_id": agent_id, "command_id": command_id, "command_status": command_status,
             "note": note, "reason": reason,
         }
 

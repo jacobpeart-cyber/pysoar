@@ -1,4 +1,14 @@
-"""Visual Playbook Builder API endpoints"""
+"""Visual Playbook Builder API endpoints
+
+``POST /playbook-builder/{id}/run`` (and the older ``/execute``) creates a real
+pending ``VisualPlaybookExecution`` and dispatches it to the worker; poll
+``GET /playbook-builder/executions`` or ``/executions/{execution_id}``. A
+playbook with a node the engine cannot execute is refused with 501
+``not_implemented`` before any run starts. Privileged nodes (containment,
+agent_command, api_call, and integration actions not on the read-only
+allowlist) are admin-only at dispatch and re-checked by the runner against
+the role recorded on the execution (``forbidden_privileged_node``).
+"""
 
 import json
 import math
@@ -62,6 +72,68 @@ router = APIRouter(prefix="/playbook-builder", tags=["Playbook Builder"])
 _ANALYST_WRITE = [Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
 _ADMIN_WRITE = [Depends(require_role([UserRole.ADMIN]))]
 logger = get_logger(__name__)
+
+
+
+def _effective_role(user) -> str:
+    """Role recorded on the execution: platform superusers count as admin."""
+    return "admin" if user.is_superuser else str(user.role)
+
+
+async def _start_execution(
+    playbook: VisualPlaybook,
+    request: PlaybookExecutionTrigger,
+    current_user,
+    db: AsyncSession,
+) -> VisualPlaybookExecution:
+    """Create a pending execution for ``playbook`` and dispatch it, or refuse honestly."""
+    if not any(n.node_type == "trigger" for n in playbook.nodes):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"error": "no_trigger_node", "message": "The playbook needs a trigger node to run"},
+        )
+    problems = PlaybookExecutionEngine().unsupported_nodes(playbook)
+    if problems:
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail={"error": "not_implemented", "message": "Some nodes cannot execute", "nodes": problems},
+        )
+    # Privileged by capability (PlaybookExecutionEngine.node_is_privileged),
+    # fail closed; the runner re-checks against the role recorded below.
+    privileged = PlaybookExecutionEngine().privileged_nodes(playbook)
+    role = _effective_role(current_user)
+    if privileged and role != UserRole.ADMIN.value:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail={"error": "containment_requires_admin", "nodes": privileged},
+        )
+
+    execution = VisualPlaybookExecution(
+        playbook_id=playbook.id,
+        organization_id=playbook.organization_id,
+        status="pending",
+        triggered_by=current_user.id,
+        triggered_by_role=role,
+        trigger_event=json.dumps(request.trigger_event) if request.trigger_event else None,
+        variables=json.dumps(request.variables) if request.variables else None,
+    )
+    db.add(execution)
+    await db.commit()
+    await db.refresh(execution)
+
+    try:
+        async_playbook_execution.delay(playbook_id=playbook.id, execution_id=execution.id)
+    except Exception as exc:  # broker down: the run did not start, say so on the row and to the caller
+        logger.error("visual_playbook_dispatch_failed", execution_id=execution.id, error=str(exc))
+        execution.status = "failed"
+        execution.error_message = f"dispatch to the worker failed: {exc}"
+        await db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error": "dispatch_failed", "execution_id": execution.id},
+        ) from exc
+    logger.info("visual_playbook_execution_queued", execution_id=execution.id, playbook_id=playbook.id)
+    return execution
 
 
 # Playbook CRUD endpoints
@@ -205,6 +277,8 @@ async def list_templates_early(
             category=templates[tid].get("category"),
             nodes=templates[tid].get("nodes", []),
             edges=templates[tid].get("edges", []),
+            node_count=len(templates[tid].get("nodes", [])),
+            edge_count=len(templates[tid].get("edges", [])),
             created_at=None,
             updated_at=None,
         )
@@ -273,15 +347,7 @@ async def get_dashboard_early(
     failed = sum(1 for e in executions if e.status in ("failed", "error"))
 
     # Pull duration from started_at/completed_at timestamps
-    durations_ms: list[float] = []
-    for e in executions:
-        if e.started_at and e.completed_at:
-            try:
-                delta = (e.completed_at - e.started_at).total_seconds() * 1000.0
-                if delta > 0:
-                    durations_ms.append(delta)
-            except Exception:  # noqa: BLE001
-                continue
+    durations_ms: list[float] = [float(e.duration_ms) for e in executions if e.duration_ms is not None]
     avg_execution_time_ms = (
         round(sum(durations_ms) / len(durations_ms), 1) if durations_ms else 0.0
     )
@@ -466,6 +532,9 @@ async def validate_playbook(
 
     designer = PlaybookDesigner()
     is_valid, errors = designer.validate_playbook(playbook)
+    for problem in PlaybookExecutionEngine().unsupported_nodes(playbook):
+        errors.append(f"Node {problem['node_id']} cannot execute: {problem['reason']}")
+        is_valid = False
 
     return PlaybookValidateResponse(is_valid=is_valid, errors=errors)
 
@@ -723,30 +792,32 @@ async def execute_playbook(
     current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
-    """Trigger playbook execution"""
+    """Trigger playbook execution (same as ``/run``)."""
     playbook = await _get_playbook_or_404(db, playbook_id, org_id)
+    execution = await _start_execution(playbook, request, current_user, db)
+    return _execution_to_response(execution)
 
-    execution = VisualPlaybookExecution(
-        playbook_id=playbook.id,
-        organization_id=playbook.organization_id,
-        triggered_by=current_user.id,
-        trigger_event=json.dumps(request.trigger_event) if request.trigger_event else None,
-        variables=json.dumps(request.variables) if request.variables else None,
-    )
 
-    db.add(execution)
-    await db.commit()
-    await db.refresh(execution)
+@router.post(
+    "/{playbook_id}/run",
+    response_model=PlaybookExecutionResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=_ANALYST_WRITE,
+)
+async def run_playbook(
+    playbook_id: str,
+    org_id: OrganizationId,
+    current_user: CurrentUser = None,
+    db: DatabaseSession = None,
+    request: Optional[PlaybookExecutionTrigger] = None,
+):
+    """Start a real execution; poll ``/executions/{id}`` for node-by-node status.
 
-    # Queue async execution
-    async_playbook_execution.delay(
-        playbook_id=playbook.id,
-        execution_id=execution.id,
-        trigger_event=request.trigger_event,
-        variables=request.variables,
-    )
-
-    logger.info(f"Started execution: {execution.id}")
+    501 ``not_implemented`` when a node cannot execute (listed in ``nodes``),
+    422 without a trigger node, 403 for containment nodes unless admin.
+    """
+    playbook = await _get_playbook_or_404(db, playbook_id, org_id)
+    execution = await _start_execution(playbook, request or PlaybookExecutionTrigger(), current_user, db)
     return _execution_to_response(execution)
 
 
@@ -762,7 +833,11 @@ async def list_executions(
     """List playbook executions"""
     playbook = await _get_playbook_or_404(db, playbook_id, org_id)
 
-    query = select(VisualPlaybookExecution).where(VisualPlaybookExecution.playbook_id == playbook.id)
+    query = (
+        select(VisualPlaybookExecution)
+        .where(VisualPlaybookExecution.playbook_id == playbook.id, VisualPlaybookExecution.organization_id == org_id)
+        .order_by(VisualPlaybookExecution.created_at.desc())
+    )
 
     # Get total count
     count_result = await db.execute(
@@ -811,9 +886,13 @@ async def get_execution_status(
     result = await db.execute(
         select(PlaybookNodeExecution).where(
             PlaybookNodeExecution.execution_id == execution_id,
-        ),
+            PlaybookNodeExecution.organization_id == org_id,
+        ).order_by(PlaybookNodeExecution.started_at),
     )
     node_executions = result.scalars().all()
+    node_summary: dict[str, int] = {}
+    for ne in node_executions:
+        node_summary[ne.status] = node_summary.get(ne.status, 0) + 1
 
     # Get total node count from the playbook to calculate real progress
     playbook_result = await db.execute(
@@ -824,9 +903,9 @@ async def get_execution_status(
     total_nodes = playbook_result.scalar() or 0
     completed_nodes = len([ne for ne in node_executions if ne.status == "completed"])
     progress = (completed_nodes / max(1, total_nodes)) * 100
-    if execution.status == "completed":
+    if execution.status in ("completed", "partial", "failed"):
         progress = 100.0
-    elif execution.status != "completed":
+    else:
         progress = min(progress, 99.0)
 
     return PlaybookExecutionStatusResponse(
@@ -837,6 +916,11 @@ async def get_execution_status(
         progress_percent=progress,
         node_executions=[_node_execution_to_response(ne) for ne in node_executions],
         error_message=execution.error_message,
+        started_at=execution.started_at,
+        completed_at=execution.completed_at,
+        duration_ms=execution.duration_ms,
+        execution_path=safe_json_loads(execution.execution_path, []) or [],
+        node_summary=node_summary,
     )
 
 

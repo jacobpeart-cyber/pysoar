@@ -306,6 +306,14 @@ class PlaybookExecutionStatusResponse(BaseModel):
     progress_percent: float = 0.0
     node_executions: list[PlaybookNodeExecutionResponse] = []
     error_message: Optional[str] = None
+    started_at: Optional[str] = None
+    completed_at: Optional[str] = None
+    duration_ms: Optional[int] = None
+    execution_path: list[str] = []
+    # Node executions per status (completed / failed / awaiting_integration /
+    # queued_for_approval / not_implemented). Run status "partial" means it
+    # finished but some node did not complete.
+    node_summary: dict[str, int] = {}
 
 
 # Template-related schemas
@@ -323,6 +331,8 @@ class PlaybookTemplateResponse(PlaybookTemplateBase, DBModel):
     id: str = ""
     nodes: list[dict[str, Any]]
     edges: list[dict[str, Any]]
+    node_count: int = 0
+    edge_count: int = 0
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
 

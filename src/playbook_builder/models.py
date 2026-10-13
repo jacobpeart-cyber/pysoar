@@ -305,6 +305,9 @@ class VisualPlaybookExecution(BaseModel):
 
     # Metadata
     triggered_by: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    # Role of the triggering user recorded at dispatch ("admin" for platform
+    # superusers). The runner re-checks privileged nodes against it (migration 025).
+    triggered_by_role: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
 
     # Relationships
     playbook: Mapped["VisualPlaybook"] = relationship(

@@ -1,221 +1,166 @@
-"""Celery tasks for Visual Playbook Builder"""
+"""Celery tasks for Visual Playbook Builder.
 
+``async_playbook_execution`` drives a persisted ``VisualPlaybookExecution``
+through ``src.playbook_builder.engine.run_visual_execution``; node results are
+written as ``PlaybookNodeExecution`` rows and the run status is whatever the
+engine concluded (``completed`` / ``partial`` / ``failed``). Runs are never
+retried automatically: a step may already have contained a host.
+"""
+
+import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from typing import Any, Optional
 
 from celery import shared_task
 
-from src.core.config import settings
 from src.core.logging import get_logger
 
 logger = get_logger(__name__)
 
 
-@shared_task(bind=True, max_retries=3)
-def async_playbook_execution(
-    self,
-    playbook_id: str,
-    execution_id: str,
-    trigger_event: dict | None = None,
-    variables: dict | None = None,
-):
-    """
-    Execute a playbook asynchronously.
+async def _run(execution_id: str) -> dict[str, Any]:
+    from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import NullPool
 
-    Args:
-        playbook_id: ID of playbook to execute
-        execution_id: ID of execution record
-        trigger_event: Event that triggered execution
-        variables: Runtime variables
+    from src.core.config import settings
+    from src.playbook_builder.engine import run_visual_execution
+    from src.playbook_builder.models import VisualPlaybookExecution
 
-    Returns:
-        Execution result
-    """
+    # NullPool: each task runs in its own asyncio.run() loop.
+    engine = create_async_engine(settings.database_url, echo=False, poolclass=NullPool)
+    session_factory = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     try:
-        logger.info(f"Starting async playbook execution: {execution_id}")
-
-        from src.core.database import async_session_factory
-        from src.playbook_builder.engine import PlaybookExecutionEngine
-        from src.playbook_builder.models import VisualPlaybook, VisualPlaybookExecution
-        from sqlalchemy import select
-
-        import asyncio
-
-        async def _execute():
-            async with async_session_factory() as db:
-                # Look up the playbook and execution record
-                playbook_query = select(VisualPlaybook).where(VisualPlaybook.id == playbook_id)
-                pb_result = await db.execute(playbook_query)
-                playbook = pb_result.scalar_one_or_none()
-
-                exec_query = select(VisualPlaybookExecution).where(VisualPlaybookExecution.id == execution_id)
-                exec_result = await db.execute(exec_query)
-                execution = exec_result.scalar_one_or_none()
-
-                if not playbook or not execution:
-                    return {
-                        "execution_id": execution_id,
-                        "playbook_id": playbook_id,
-                        "status": "failed",
-                        "error": "playbook or execution record not found",
-                    }
-
-                started_at = datetime.now(timezone.utc)
-                execution.status = "running"
-                execution.started_at = started_at.isoformat()
+        async with session_factory() as db:
+            execution = await db.get(VisualPlaybookExecution, execution_id)
+            if execution is None:
+                return {"execution_id": execution_id, "status": "failed", "error": "execution not found"}
+            if execution.status != "pending":
+                return {"execution_id": execution_id, "skipped": True, "status": execution.status}
+            try:
+                result = await run_visual_execution(db, execution_id)
                 await db.commit()
-
-                try:
-                    # Run the playbook through the execution engine
-                    engine = PlaybookExecutionEngine(db)
-                    result = await engine.execute_playbook(
-                        playbook=playbook,
-                        trigger_event=trigger_event,
-                        variables=variables or {},
-                    )
-
-                    completed_at = datetime.now(timezone.utc)
-                    duration_ms = int((completed_at - started_at).total_seconds() * 1000)
-
-                    execution.status = "completed"
-                    execution.completed_at = completed_at.isoformat()
-                    execution.duration_ms = duration_ms
-                    await db.commit()
-
-                    return {
-                        "execution_id": execution_id,
-                        "playbook_id": playbook_id,
-                        "status": "completed",
-                        "started_at": started_at.isoformat(),
-                        "completed_at": completed_at.isoformat(),
-                        "duration_ms": duration_ms,
-                    }
-
-                except Exception as exec_err:
+                return {"execution_id": execution_id, "status": result.status, "duration_ms": result.duration_ms}
+            except Exception as exc:  # record the truth on the row, then report it
+                logger.error("visual_playbook_execution_crashed", execution_id=execution_id, error=str(exc))
+                await db.rollback()
+                execution = await db.get(VisualPlaybookExecution, execution_id)
+                if execution is not None:
                     execution.status = "failed"
-                    execution.error_message = str(exec_err)
+                    execution.error_message = str(exc)
                     execution.completed_at = datetime.now(timezone.utc).isoformat()
                     await db.commit()
-                    raise
-
-        logger.info(f"Executing playbook {playbook_id}")
-        execution_result = asyncio.run(_execute())
-        logger.info(f"Playbook execution completed: {execution_id}")
-        return execution_result
-
-    except Exception as exc:
-        logger.error(f"Playbook execution failed: {exc}")
-        # Retry with exponential backoff
-        raise self.retry(exc=exc, countdown=2**self.request.retries)
+                return {"execution_id": execution_id, "status": "failed", "error": str(exc)}
+    finally:
+        await engine.dispose()
 
 
-@shared_task(bind=True, max_retries=3)
-def scheduled_playbook_trigger(
-    self,
+@shared_task
+def async_playbook_execution(
     playbook_id: str,
-    schedule_name: str,
-):
-    """
-    Trigger scheduled playbook execution.
+    execution_id: str,
+    trigger_event: Optional[dict] = None,
+    variables: Optional[dict] = None,
+) -> dict[str, Any]:
+    """Execute a pending visual playbook execution.
 
-    Args:
-        playbook_id: ID of playbook to trigger
-        schedule_name: Name of the schedule
-
-    Returns:
-        Execution ID
+    ``trigger_event`` / ``variables`` are read from the execution row; the
+    arguments are accepted for backwards compatibility with queued messages.
     """
+    logger.info("visual_playbook_execution_start", playbook_id=playbook_id, execution_id=execution_id)
+    return asyncio.run(_run(execution_id))
+
+
+async def _create_scheduled_execution(playbook_id: str, schedule_name: str) -> Optional[str]:
+    from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import NullPool
+
+    from src.core.config import settings
+    from src.playbook_builder.models import VisualPlaybook, VisualPlaybookExecution
+
+    engine = create_async_engine(settings.database_url, echo=False, poolclass=NullPool)
+    session_factory = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     try:
-        logger.info(f"Triggered scheduled playbook: {playbook_id}")
+        async with session_factory() as db:
+            playbook = await db.get(VisualPlaybook, playbook_id)
+            if playbook is None or playbook.status != "active":
+                return None
+            trigger = {"trigger_type": "schedule", "schedule_name": schedule_name}
+            execution = VisualPlaybookExecution(
+                playbook_id=playbook.id,
+                organization_id=playbook.organization_id,
+                status="pending",
+                trigger_event=json.dumps(trigger),
+            )
+            db.add(execution)
+            await db.commit()
+            return execution.id
+    finally:
+        await engine.dispose()
 
-        execution_id = f"exec_{playbook_id[:8]}_{datetime.now().timestamp()}"
 
-        # Queue async execution
-        async_playbook_execution.delay(
-            playbook_id=playbook_id,
-            execution_id=execution_id,
-            trigger_event={"trigger_type": "schedule", "schedule_name": schedule_name},
-        )
-
-        return {"execution_id": execution_id, "playbook_id": playbook_id}
-
-    except Exception as exc:
-        logger.error(f"Scheduled trigger failed: {exc}")
-        raise self.retry(exc=exc, countdown=2**self.request.retries)
+@shared_task
+def scheduled_playbook_trigger(playbook_id: str, schedule_name: str) -> dict[str, Any]:
+    """Create a real pending execution for an active playbook and dispatch it."""
+    execution_id = asyncio.run(_create_scheduled_execution(playbook_id, schedule_name))
+    if execution_id is None:
+        return {"playbook_id": playbook_id, "status": "skipped", "reason": "playbook missing or not active"}
+    async_playbook_execution.delay(playbook_id=playbook_id, execution_id=execution_id)
+    return {"execution_id": execution_id, "playbook_id": playbook_id, "status": "pending"}
 
 
-@shared_task(bind=True, max_retries=2)
-def execution_cleanup(
-    self,
-    max_age_hours: int = 7 * 24,  # 7 days by default
-    batch_size: int = 100,
-):
-    """
-    Clean up old execution records.
+async def _cleanup(cutoff: datetime, batch_size: int) -> int:
+    from sqlalchemy import delete, select
+    from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+    from sqlalchemy.orm import sessionmaker
+    from sqlalchemy.pool import NullPool
 
-    Args:
-        max_age_hours: Delete executions older than this many hours
-        batch_size: Number of records to delete per batch
+    from src.core.config import settings
+    from src.playbook_builder.models import PlaybookNodeExecution, VisualPlaybookExecution
 
-    Returns:
-        Cleanup statistics
-    """
+    engine = create_async_engine(settings.database_url, echo=False, poolclass=NullPool)
+    session_factory = sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    deleted = 0
     try:
-        logger.info(f"Starting execution cleanup (max_age_hours={max_age_hours})")
-
-        from datetime import timedelta
-        from src.core.database import async_session_factory
-        from src.playbook_builder.models import VisualPlaybookExecution
-        from sqlalchemy import select, delete
-        from sqlalchemy.orm import Session
-
-        # This is a simplified version - would need proper async context in real implementation
-        cutoff_time = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
-
-        deleted_count = 0
-        logger.info(f"Cleanup completed. Deleted {deleted_count} old executions")
-
-        return {
-            "deleted_count": deleted_count,
-            "cutoff_time": cutoff_time.isoformat(),
-        }
-
-    except Exception as exc:
-        logger.error(f"Cleanup failed: {exc}")
-        raise self.retry(exc=exc, countdown=2**self.request.retries)
+        async with session_factory() as db:
+            while True:
+                ids = list((await db.execute(
+                    select(VisualPlaybookExecution.id)
+                    .where(VisualPlaybookExecution.created_at < cutoff)
+                    .limit(batch_size)
+                )).scalars().all())
+                if not ids:
+                    break
+                await db.execute(delete(PlaybookNodeExecution).where(PlaybookNodeExecution.execution_id.in_(ids)))
+                await db.execute(delete(VisualPlaybookExecution).where(VisualPlaybookExecution.id.in_(ids)))
+                await db.commit()
+                deleted += len(ids)
+    finally:
+        await engine.dispose()
+    return deleted
 
 
-@shared_task(bind=True, max_retries=3)
-def template_sync(
-    self,
-    template_source: str = "builtin",
-):
-    """
-    Sync template library with external source.
+@shared_task
+def execution_cleanup(max_age_hours: int = 7 * 24, batch_size: int = 100) -> dict[str, Any]:
+    """Delete visual playbook executions (and their node executions) older than ``max_age_hours``."""
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+    deleted = asyncio.run(_cleanup(cutoff, batch_size))
+    logger.info("visual_playbook_execution_cleanup", deleted=deleted, cutoff=cutoff.isoformat())
+    return {"deleted_count": deleted, "cutoff_time": cutoff.isoformat()}
 
-    Args:
-        template_source: Source for templates (builtin, repository, marketplace)
 
-    Returns:
-        Sync results
-    """
-    try:
-        logger.info(f"Starting template sync from {template_source}")
+@shared_task
+def template_sync(template_source: str = "builtin") -> dict[str, Any]:
+    """Report the built-in template library (there is no external template source)."""
+    from src.playbook_builder.engine import TemplateLibrary
 
-        from src.playbook_builder.engine import TemplateLibrary
-
-        # Get built-in templates
-        templates = TemplateLibrary.get_templates()
-        template_count = len(templates)
-
-        logger.info(f"Synced {template_count} templates")
-
-        return {
-            "source": template_source,
-            "synced_count": template_count,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-
-    except Exception as exc:
-        logger.error(f"Template sync failed: {exc}")
-        raise self.retry(exc=exc, countdown=2**self.request.retries)
+    if template_source != "builtin":
+        return {"source": template_source, "synced_count": 0, "error": "only the builtin template library exists"}
+    templates = TemplateLibrary.get_templates()
+    return {
+        "source": template_source,
+        "synced_count": len(templates),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }

@@ -1,9 +1,71 @@
-"""Playbook Execution Engine - Executes playbook steps"""
+"""Classic playbook execution engine.
+
+Every step runs inside the execution's tenant (``PlaybookExecution.organization_id``)
+on the engine's own database session, and records ``status``, ``started_at``,
+``finished_at``, ``result`` and ``error``. A step whose status is ``failed``
+fails the run unless the step sets ``continue_on_error``.
+
+Step types and what they really do
+----------------------------------
+Containment (``src.services.containment``; agent command queue or an installed
+integration via ``src.integrations.engine``; one AuditLog row per call):
+
+* ``block_ip``, ``isolate_host``, ``disable_user``, ``quarantine_file``. The
+  step status is the containment status: ``completed`` (command queued /
+  integration call succeeded), ``queued_for_approval`` (high-blast agent
+  command waiting in the agent approval queue), ``awaiting_integration``
+  (no enrolled agent or capable integration; ``missing_dependency`` names it,
+  including the ``detection_only`` case), ``manual_required`` (a run with no
+  human behind it, e.g. scheduled or auto-triggered, whose only path would
+  execute immediately: containment is called with ``unattended=True``). A
+  failed integration call fails the step.
+
+Notifications (tenant Settings only, ``src.services.tenant_settings``):
+
+* ``notify`` / ``send_notification`` (``channel`` = email | slack | teams),
+  ``send_email``, ``send_slack``. With no SMTP / webhook configured for the
+  organisation the step is ``awaiting_integration``; a delivery error fails it.
+
+Tickets and integrations (``src.integrations.engine.ActionExecutor``):
+
+* ``create_ticket``: Jira ``create_issue`` or ServiceNow ``create_incident``
+  through the organisation's installed integration; none installed is
+  ``awaiting_integration``. No local placeholder ticket is written.
+* ``integration_action`` / ``execute_integration_action`` and
+  ``http_request``: an installed integration of this organisation;
+  ``http_request`` is confined to that integration's base URL by the engine's
+  SSRF guard. Arbitrary URLs are refused.
+
+Enrichment:
+
+* ``enrich`` / ``enrich_ioc`` / ``enrich_ip`` / ``enrich_domain`` /
+  ``enrich_hash``: the organisation's threat indicators plus the configured
+  threat-intel providers. No provider configured and no local match is
+  ``awaiting_integration``; no default score is invented.
+
+Case work (scoped to the organisation): ``update_alert``, ``update_incident``,
+``create_incident``, ``add_comment``, ``assign_to``.
+
+Flow: ``wait`` (capped at 60 s), ``condition`` (``on_success`` /
+``on_failure`` = ``"skip"`` or a 0-based step index).
+
+``run_script`` is REMOVED. It executed bash / PowerShell / Python on the
+shared API host for any tenant admin. Playbook create/update rejects it and a
+stored ``run_script`` step fails with an explanatory error. Host-side work
+belongs on an enrolled endpoint agent (bounded, allowlisted actions).
+
+Unknown step types fail the step (and therefore the run).
+"""
+
+from __future__ import annotations
 
 import asyncio
 import json
+import re
+from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -13,9 +75,123 @@ from src.models.playbook import ExecutionStatus, Playbook, PlaybookExecution
 
 logger = get_logger(__name__)
 
+#: Step statuses.
+STEP_COMPLETED = "completed"
+STEP_FAILED = "failed"
+STEP_AWAITING_INTEGRATION = "awaiting_integration"
+STEP_QUEUED_FOR_APPROVAL = "queued_for_approval"
+#: Containment for a run with no human behind it (scheduled / auto-triggered)
+#: whose only path would execute immediately: an operator must act.
+STEP_MANUAL_REQUIRED = "manual_required"
+STEP_SKIPPED = "skipped"
+
+#: Run status when every step ran but at least one did not complete
+#: (awaiting an integration, waiting for approval, or failed with
+#: ``continue_on_error``). Never reported as ``completed``.
+RUN_PARTIAL = "partial"
+
+#: Steps that a playbook may contain. ``run_script`` is deliberately absent.
+SUPPORTED_ACTIONS: frozenset[str] = frozenset({
+    "block_ip", "isolate_host", "disable_user", "quarantine_file",
+    "notify", "send_notification", "send_email", "send_slack",
+    "create_ticket", "integration_action", "execute_integration_action", "http_request",
+    "enrich", "enrich_ioc", "enrich_ip", "enrich_domain", "enrich_hash",
+    "update_alert", "update_incident", "create_incident", "add_comment", "assign_to",
+    "wait", "condition",
+})
+
+REMOVED_ACTIONS: dict[str, str] = {
+    "run_script": (
+        "run_script was removed: it executed code on the shared API host. Use an endpoint-agent "
+        "action (isolate_host, quarantine_file, ...) or an integration_action instead."
+    ),
+}
+
+
+#: Steps that actuate containment directly.
+CONTAINMENT_ACTIONS: frozenset[str] = frozenset({"block_ip", "isolate_host", "disable_user", "quarantine_file"})
+
+#: Integration actions an analyst may run: lookups only. Anything else an
+#: integration can do (contain_host, create/delete rules, ...) is privileged.
+READ_ONLY_INTEGRATION_PREFIXES: tuple[str, ...] = ("get_", "list_", "search_", "lookup_")
+READ_ONLY_INTEGRATION_ACTIONS: frozenset[str] = frozenset({"query", "enrich"})
+
+
+def is_read_only_integration_action(action_name: Any) -> bool:
+    name = str(action_name or "").lower()
+    return name in READ_ONLY_INTEGRATION_ACTIONS or name.startswith(READ_ONLY_INTEGRATION_PREFIXES)
+
+
+def is_privileged_step(action: str, parameters: Optional[dict[str, Any]] = None) -> bool:
+    """True when a step can change something outside PySOAR's case data.
+
+    Classified by capability, fail closed: containment, raw endpoint-agent
+    commands, outbound HTTP, and any integration action that is not on the
+    read-only allowlist. notify / condition / wait / enrich* / create_ticket
+    and case updates are analyst-level.
+    """
+    params = parameters or {}
+    if action in CONTAINMENT_ACTIONS or action in ("agent_command", "http_request", "api_call"):
+        return True
+    if action in ("integration_action", "execute_integration_action"):
+        return not is_read_only_integration_action(params.get("action_name"))
+    return False
+
+
+@dataclass
+class StepRuntime:
+    """What a step handler needs besides its parameters: the session and the principal."""
+
+    db: AsyncSession
+    organization_id: str
+    execution_id: str
+    actor: str  # user id, or ``system:playbook:<execution_id>``
+    actor_user_id: Optional[str]
+
+
+_RUNTIME: ContextVar[Optional[StepRuntime]] = ContextVar("playbook_step_runtime", default=None)
+
+
+def current_runtime() -> Optional[StepRuntime]:
+    """The runtime of the step being executed (``None`` outside the engine)."""
+    return _RUNTIME.get()
+
+
+async def run_step_in_runtime(
+    runtime: StepRuntime, action: str, parameters: dict[str, Any], context: dict[str, Any],
+) -> dict[str, Any]:
+    """Run one step handler under ``runtime`` (used by the visual builder's action nodes)."""
+    token = _RUNTIME.set(runtime)
+    try:
+        return await PlaybookAction.execute(action, parameters, context)
+    finally:
+        _RUNTIME.reset(token)
+
+
+def _ok(action: str, details: dict[str, Any], **extra: Any) -> dict[str, Any]:
+    return {"success": True, "status": STEP_COMPLETED, "action": action, "details": details, **extra}
+
+
+def _fail(action: str, error: str, details: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    return {"success": False, "status": STEP_FAILED, "action": action, "error": error, "details": details or {}}
+
+
+def _awaiting(action: str, missing: str, details: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    return {
+        "success": False, "status": STEP_AWAITING_INTEGRATION, "action": action,
+        "missing_dependency": missing, "details": details or {},
+    }
+
+
+def _no_runtime(action: str) -> dict[str, Any]:
+    return _fail(action, "step must run inside a playbook execution (no tenant runtime)")
+
+
+Handler = Callable[[dict, dict], Awaitable[dict]]
+
 
 class PlaybookAction:
-    """Base class for playbook actions"""
+    """Step handlers. ``execute(action, parameters, context)`` dispatches one step."""
 
     @staticmethod
     async def execute(
@@ -23,862 +199,615 @@ class PlaybookAction:
         parameters: dict[str, Any],
         context: dict[str, Any],
     ) -> dict[str, Any]:
-        """Execute an action and return results"""
-        action_handlers = {
-            "send_email": PlaybookAction._send_email,
-            "send_slack": PlaybookAction._send_slack,
+        """Execute an action and return its result dict (``success``, ``status``, ...)."""
+        if action in REMOVED_ACTIONS:
+            return _fail(action, REMOVED_ACTIONS[action])
+        handlers: dict[str, Handler] = {
             "block_ip": PlaybookAction._block_ip,
             "isolate_host": PlaybookAction._isolate_host,
             "disable_user": PlaybookAction._disable_user,
+            "quarantine_file": PlaybookAction._quarantine_file,
+            "notify": PlaybookAction._notify,
+            "send_notification": PlaybookAction._notify,
+            "send_email": PlaybookAction._send_email,
+            "send_slack": PlaybookAction._send_slack,
             "create_ticket": PlaybookAction._create_ticket,
-            "enrich_ioc": PlaybookAction._enrich_ioc,
-            "run_script": PlaybookAction._run_script,
+            "integration_action": PlaybookAction._integration_action,
+            "execute_integration_action": PlaybookAction._integration_action,
             "http_request": PlaybookAction._http_request,
+            "enrich": PlaybookAction._enrich,
+            "enrich_ioc": PlaybookAction._enrich,
+            "enrich_ip": PlaybookAction._enrich_ip,
+            "enrich_domain": PlaybookAction._enrich_domain,
+            "enrich_hash": PlaybookAction._enrich_hash,
             "update_alert": PlaybookAction._update_alert,
             "update_incident": PlaybookAction._update_incident,
+            "create_incident": PlaybookAction._create_incident,
             "add_comment": PlaybookAction._add_comment,
             "assign_to": PlaybookAction._assign_to,
             "wait": PlaybookAction._wait,
             "condition": PlaybookAction._condition,
         }
+        handler = handlers.get(action)
+        if handler is None:
+            return _fail(action or "unknown", f"Unknown action type: {action!r}")
+        return await handler(parameters or {}, context)
 
-        handler = action_handlers.get(action, PlaybookAction._unknown_action)
-        return await handler(parameters, context)
-
-    @staticmethod
-    async def _send_email(params: dict, context: dict) -> dict:
-        """Send email notification"""
-        to = params.get("to", "")
-        subject = params.get("subject", "PySOAR Notification")
-        body = params.get("body", "")
-
-        # Substitute variables from context
-        subject = PlaybookAction._substitute_vars(subject, context)
-        body = PlaybookAction._substitute_vars(body, context)
-
-        logger.info(f"Sending email to {to}: {subject}")
-
-        recipients = [to] if isinstance(to, str) else to
-        sent = False
-        try:
-            from src.core.database import async_session_factory
-            from src.services.email_service import EmailService
-
-            # The execution's organisation SMTP (Settings), else the platform relay.
-            async with async_session_factory() as session:
-                email_service = await EmailService.for_organization(
-                    session, context.get("organization_id"),
-                )
-            if email_service.is_configured:
-                sent = await email_service.send_email(
-                    to=recipients,
-                    subject=subject,
-                    body=body,
-                    html_body=params.get("html_body"),
-                )
-            else:
-                logger.warning("Email service not configured, cannot send email")
-        except Exception as e:
-            logger.error(f"Failed to send email: {e}")
-            return {
-                "success": False,
-                "action": "send_email",
-                "error": str(e),
-                "details": {"to": to, "subject": subject},
-            }
-
-        return {
-            "success": sent,
-            "action": "send_email",
-            "details": {"to": to, "subject": subject, "sent": sent},
-        }
+    # ------------------------------------------------------------------
+    # Containment
+    # ------------------------------------------------------------------
 
     @staticmethod
-    async def _send_slack(params: dict, context: dict) -> dict:
-        """Send Slack notification"""
-        channel = params.get("channel", "#security-alerts")
-        message = params.get("message", "")
+    def _containment_step(action: str, res: Any) -> dict[str, Any]:
+        details = res.to_dict()
+        if res.failed:
+            return _fail(action, res.error or res.detail, details)
+        if res.status == "executed":
+            return _ok(action, details)
+        if res.status == "queued_for_approval":
+            return {"success": False, "status": STEP_QUEUED_FOR_APPROVAL, "action": action, "details": details}
+        if res.status == "manual_required":
+            return {"success": False, "status": STEP_MANUAL_REQUIRED, "action": action,
+                    "missing_dependency": res.detail, "details": details}
+        return _awaiting(action, res.missing_dependency or res.detail, details)
 
-        message = PlaybookAction._substitute_vars(message, context)
-
-        logger.info(f"Sending Slack message to {channel}")
-
-        sent = False
-        try:
-            import httpx
-            # The execution's own organisation webhook (Settings, per tenant);
-            # never the process-wide value another tenant may have saved.
-            webhook_url = params.get("webhook_url")
-            org_id = context.get("organization_id")
-            if not webhook_url and org_id:
-                from src.core.database import async_session_factory
-                from src.services.tenant_settings import notification_webhook_for
-
-                async with async_session_factory() as session:
-                    webhook_url = await notification_webhook_for(session, org_id, "slack")
-            if webhook_url:
-                payload = {"text": message}
-                if channel:
-                    payload["channel"] = channel
-                async with httpx.AsyncClient() as client:
-                    resp = await client.post(webhook_url, json=payload, timeout=10)
-                    sent = resp.status_code == 200
-            else:
-                logger.warning("No Slack webhook URL configured")
-        except Exception as e:
-            logger.error(f"Failed to send Slack message: {e}")
-            return {
-                "success": False,
-                "action": "send_slack",
-                "error": str(e),
-                "details": {"channel": channel, "message_preview": message[:100]},
-            }
-
-        return {
-            "success": sent,
-            "action": "send_slack",
-            "details": {"channel": channel, "message_preview": message[:100], "sent": sent},
-        }
+    @staticmethod
+    def _reason(params: dict, context: dict, action: str) -> str:
+        return str(params.get("reason") or f"playbook step {action} (execution {context.get('playbook_execution_id', '')})")
 
     @staticmethod
     async def _block_ip(params: dict, context: dict) -> dict:
-        """Block IP address at firewall"""
-        ip = params.get("ip", context.get("source_ip", ""))
-        duration = params.get("duration_hours", 24)
-        firewall = params.get("firewall", "default")
+        from src.services import containment
 
-        logger.info(f"Blocking IP {ip} for {duration} hours on {firewall}")
-
-        try:
-            from src.core.database import async_session_factory
-            from src.tickethub.models import TicketActivity
-
-            async with async_session_factory() as session:
-                activity = TicketActivity(
-                    source_type="remediation",
-                    source_id=context.get("alert_id", context.get("incident_id", "unknown")),
-                    activity_type="block_ip",
-                    actor_id=context.get("user_id"),
-                    description=f"Blocked IP {ip} for {duration} hours on firewall '{firewall}'",
-                    extra_metadata=json.dumps({
-                        "ip": ip,
-                        "duration_hours": duration,
-                        "firewall": firewall,
-                    }),
-                )
-                session.add(activity)
-                await session.commit()
-
-            logger.info(f"Recorded IP block action for {ip}")
-        except Exception as e:
-            logger.error(f"Failed to record IP block action: {e}")
-            return {
-                "success": False,
-                "action": "block_ip",
-                "error": str(e),
-                "details": {"ip": ip, "duration_hours": duration, "firewall": firewall},
-            }
-
-        return {
-            "success": True,
-            "action": "block_ip",
-            "details": {"ip": ip, "duration_hours": duration, "firewall": firewall},
-        }
+        rt = current_runtime()
+        if rt is None:
+            return _no_runtime("block_ip")
+        ip = PlaybookAction._substitute_vars(str(params.get("ip") or context.get("source_ip") or ""), context)
+        if not ip:
+            return _fail("block_ip", "No IP address provided (parameter 'ip' or context 'source_ip')")
+        res = await containment.block_ip(
+            rt.db, rt.organization_id, ip=ip, actor=rt.actor, reason=PlaybookAction._reason(params, context, "block_ip"),
+            execution_ref=f"playbook_execution:{rt.execution_id}", unattended=rt.actor_user_id is None,
+        )
+        return PlaybookAction._containment_step("block_ip", res)
 
     @staticmethod
     async def _isolate_host(params: dict, context: dict) -> dict:
-        """Isolate host from network"""
-        hostname = params.get("hostname", context.get("hostname", ""))
-        method = params.get("method", "edr")  # edr, switch, firewall
+        from src.services import containment
 
-        logger.info(f"Isolating host {hostname} via {method}")
-
-        try:
-            from src.core.database import async_session_factory
-            from src.tickethub.models import TicketActivity
-
-            async with async_session_factory() as session:
-                activity = TicketActivity(
-                    source_type="remediation",
-                    source_id=context.get("alert_id", context.get("incident_id", "unknown")),
-                    activity_type="isolate_host",
-                    actor_id=context.get("user_id"),
-                    description=f"Isolated host {hostname} via {method}",
-                    extra_metadata=json.dumps({
-                        "hostname": hostname,
-                        "method": method,
-                    }),
-                )
-                session.add(activity)
-                await session.commit()
-
-            logger.info(f"Recorded host isolation action for {hostname}")
-        except Exception as e:
-            logger.error(f"Failed to record host isolation action: {e}")
-            return {
-                "success": False,
-                "action": "isolate_host",
-                "error": str(e),
-                "details": {"hostname": hostname, "method": method},
-            }
-
-        return {
-            "success": True,
-            "action": "isolate_host",
-            "details": {"hostname": hostname, "method": method},
-        }
+        rt = current_runtime()
+        if rt is None:
+            return _no_runtime("isolate_host")
+        hostname = PlaybookAction._substitute_vars(str(params.get("hostname") or context.get("hostname") or ""), context)
+        if not hostname:
+            return _fail("isolate_host", "No hostname provided (parameter or context 'hostname')")
+        res = await containment.isolate_host(
+            rt.db, rt.organization_id, hostname=hostname, actor=rt.actor,
+            reason=PlaybookAction._reason(params, context, "isolate_host"),
+            execution_ref=f"playbook_execution:{rt.execution_id}", unattended=rt.actor_user_id is None,
+        )
+        return PlaybookAction._containment_step("isolate_host", res)
 
     @staticmethod
     async def _disable_user(params: dict, context: dict) -> dict:
-        """Disable user account"""
-        username = params.get("username", context.get("username", ""))
-        directory = params.get("directory", "active_directory")
+        from src.services import containment
 
-        logger.info(f"Disabling user {username} in {directory}")
-
-        disabled = False
-        try:
-            from src.core.database import async_session_factory
-            from src.models.user import User
-            from src.tickethub.models import TicketActivity
-
-            async with async_session_factory() as session:
-                # Find the user by email (username)
-                result = await session.execute(
-                    select(User).where(User.email == username)
-                )
-                user = result.scalar_one_or_none()
-
-                if user:
-                    user.is_active = False
-                    disabled = True
-                    logger.info(f"Disabled user account: {username}")
-
-                    # Record the action for audit trail
-                    activity = TicketActivity(
-                        source_type="remediation",
-                        source_id=context.get("alert_id", context.get("incident_id", "unknown")),
-                        activity_type="disable_user",
-                        actor_id=context.get("user_id"),
-                        description=f"Disabled user {username} in {directory}",
-                        old_value="active",
-                        new_value="disabled",
-                        extra_metadata=json.dumps({
-                            "username": username,
-                            "directory": directory,
-                            "user_id": user.id,
-                        }),
-                    )
-                    session.add(activity)
-                    await session.commit()
-                else:
-                    logger.warning(f"User not found in local database: {username}")
-        except Exception as e:
-            logger.error(f"Failed to disable user: {e}")
-            return {
-                "success": False,
-                "action": "disable_user",
-                "error": str(e),
-                "details": {"username": username, "directory": directory},
-            }
-
-        return {
-            "success": True,
-            "action": "disable_user",
-            "details": {"username": username, "directory": directory, "disabled": disabled},
-        }
+        rt = current_runtime()
+        if rt is None:
+            return _no_runtime("disable_user")
+        username = PlaybookAction._substitute_vars(str(params.get("username") or context.get("username") or ""), context)
+        if not username:
+            return _fail("disable_user", "No username provided (parameter or context 'username')")
+        hostname = params.get("hostname") or context.get("hostname")
+        res = await containment.disable_user(
+            rt.db, rt.organization_id, username=username,
+            hostname=PlaybookAction._substitute_vars(str(hostname), context) if hostname else None,
+            actor=rt.actor, reason=PlaybookAction._reason(params, context, "disable_user"),
+            execution_ref=f"playbook_execution:{rt.execution_id}", unattended=rt.actor_user_id is None,
+        )
+        return PlaybookAction._containment_step("disable_user", res)
 
     @staticmethod
-    async def _create_ticket(params: dict, context: dict) -> dict:
-        """Create ticket in ticketing system"""
-        system = params.get("system", "jira")
-        title = params.get("title", "Security Incident")
-        description = params.get("description", "")
-        priority = params.get("priority", "high")
+    async def _quarantine_file(params: dict, context: dict) -> dict:
+        from src.services import containment
 
-        title = PlaybookAction._substitute_vars(title, context)
-        description = PlaybookAction._substitute_vars(description, context)
+        rt = current_runtime()
+        if rt is None:
+            return _no_runtime("quarantine_file")
+        hostname = PlaybookAction._substitute_vars(str(params.get("hostname") or context.get("hostname") or ""), context)
+        file_path = PlaybookAction._substitute_vars(str(params.get("file_path") or context.get("file_path") or ""), context)
+        if not hostname or not file_path:
+            return _fail("quarantine_file", "hostname and file_path are required")
+        res = await containment.quarantine_file(
+            rt.db, rt.organization_id, hostname=hostname, file_path=file_path, actor=rt.actor,
+            reason=PlaybookAction._reason(params, context, "quarantine_file"),
+            execution_ref=f"playbook_execution:{rt.execution_id}", unattended=rt.actor_user_id is None,
+        )
+        return PlaybookAction._containment_step("quarantine_file", res)
 
-        logger.info(f"Creating {system} ticket: {title}")
-
-        ticket_id = None
-        try:
-            from src.core.database import async_session_factory
-            from src.tickethub.models import TicketActivity, TicketComment
-
-            source_id = context.get("alert_id", context.get("incident_id", "unknown"))
-            source_type = "incident" if context.get("incident_id") else "alert"
-
-            async with async_session_factory() as session:
-                # Create a ticket activity to record ticket creation
-                activity = TicketActivity(
-                    source_type=source_type,
-                    source_id=source_id,
-                    activity_type="create_ticket",
-                    actor_id=context.get("user_id"),
-                    description=f"Created {system} ticket: {title} (priority: {priority})",
-                    extra_metadata=json.dumps({
-                        "system": system,
-                        "title": title,
-                        "priority": priority,
-                    }),
-                )
-                session.add(activity)
-
-                # Add description as a comment on the ticket
-                comment = TicketComment(
-                    source_type=source_type,
-                    source_id=source_id,
-                    content=f"[{system} Ticket] {title}\n\nPriority: {priority}\n\n{description}",
-                    author_id=context.get("user_id", "system"),
-                )
-                session.add(comment)
-                await session.commit()
-
-                ticket_id = activity.id
-                logger.info(f"Created ticket record {ticket_id} for {system}")
-        except Exception as e:
-            logger.error(f"Failed to create ticket: {e}")
-            return {
-                "success": False,
-                "action": "create_ticket",
-                "error": str(e),
-                "details": {"system": system, "title": title},
-            }
-
-        return {
-            "success": True,
-            "action": "create_ticket",
-            "details": {
-                "system": system,
-                "title": title,
-                "ticket_id": ticket_id or f"TICKET-{datetime.now().strftime('%Y%m%d%H%M%S')}",
-            },
-        }
+    # ------------------------------------------------------------------
+    # Notifications (tenant settings only)
+    # ------------------------------------------------------------------
 
     @staticmethod
-    async def _enrich_ioc(params: dict, context: dict) -> dict:
-        """Enrich IOC with threat intelligence"""
-        ioc_value = params.get("value", "")
-        ioc_type = params.get("type", "ip")
-        sources = params.get("sources", ["virustotal", "abuseipdb"])
-
-        logger.info(f"Enriching {ioc_type} {ioc_value} from {sources}")
-
-        enrichment_results = {}
-        try:
-            from src.core.database import async_session_factory
-            from src.intel.models import ThreatIndicator
-
-            async with async_session_factory() as session:
-                # Query the unified threat_indicators table
-                ti_result = await session.execute(
-                    select(ThreatIndicator).where(
-                        ThreatIndicator.value == ioc_value,
-                        ThreatIndicator.is_active == True,
-                    )
-                )
-                indicators = list(ti_result.scalars().all())
-
-                for indicator in indicators:
-                    enrichment_results[f"threat_intel_{indicator.feed_id or indicator.id[:8]}"] = {
-                        "confidence": indicator.confidence,
-                        "severity": indicator.severity,
-                        "tags": indicator.tags,
-                        "context": indicator.context,
-                        "source": indicator.source,
-                        "first_seen": indicator.first_seen.isoformat() if indicator.first_seen else None,
-                        "last_seen": indicator.last_seen.isoformat() if indicator.last_seen else None,
-                    }
-
-                # Stash aggregated enrichment into the first match's context
-                if indicators:
-                    primary = indicators[0]
-                    ctx = dict(primary.context) if isinstance(primary.context, dict) else {}
-                    existing_enr = dict(ctx.get("enrichment_data") or {})
-                    existing_enr.update(enrichment_results)
-                    ctx["enrichment_data"] = existing_enr
-                    ctx["last_enriched"] = datetime.now(timezone.utc).isoformat()
-                    primary.context = ctx
-                    await session.commit()
-
-        except Exception as e:
-            logger.error(f"Failed to enrich IOC: {e}")
-            return {
-                "success": False,
-                "action": "enrich_ioc",
-                "error": str(e),
-                "details": {"value": ioc_value, "type": ioc_type},
-            }
-
-        confidence = 50
-        reputation = "unknown"
-        if enrichment_results:
-            scores = [r.get("confidence", 50) for r in enrichment_results.values() if r.get("confidence")]
-            confidence = int(sum(scores) / len(scores)) if scores else 50
-            reputation = "malicious" if confidence >= 70 else "suspicious" if confidence >= 40 else "benign"
-
-        return {
-            "success": True,
-            "action": "enrich_ioc",
-            "details": {
-                "value": ioc_value,
-                "type": ioc_type,
-                "reputation": reputation,
-                "confidence": confidence,
-                "enrichment_sources": list(enrichment_results.keys()),
-            },
-        }
-
-    @staticmethod
-    async def _run_script(params: dict, context: dict) -> dict:
-        """Run a script/command"""
-        import subprocess
-        import shlex
-
-        script_type = params.get("type", "powershell")
-        script = params.get("script", "")
-        target = params.get("target", "local")
-        timeout = min(params.get("timeout_seconds", 30), 60)  # Cap at 60s
-
-        logger.info(f"Running {script_type} script on {target}")
-
-        if target != "local":
-            return {
-                "success": False,
-                "action": "run_script",
-                "error": "Only local script execution is supported",
-                "details": {"type": script_type, "target": target},
-            }
-
-        if not script:
-            return {
-                "success": False,
-                "action": "run_script",
-                "error": "No script provided",
-                "details": {"type": script_type, "target": target},
-            }
-
-        try:
-            # Build command based on script type
-            if script_type == "powershell":
-                command = ["powershell", "-NoProfile", "-NonInteractive", "-Command", script]
-            elif script_type == "bash":
-                command = ["bash", "-c", script]
-            elif script_type == "python":
-                command = ["python", "-c", script]
-            else:
-                command = shlex.split(script)
-
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                timeout=timeout,
-                text=True,
-                shell=False,
+    async def _notify(params: dict, context: dict) -> dict:
+        channel = str(params.get("channel") or "email").lower()
+        if channel == "email":
+            recipients = params.get("recipients") or params.get("to") or []
+            return await PlaybookAction._send_email(
+                {**params, "to": recipients, "body": params.get("body") or params.get("message", "")}, context,
             )
+        if channel in ("slack", "teams"):
+            return await PlaybookAction._send_webhook(channel, params, context, action="notify")
+        return _fail("notify", f"Unsupported notification channel {channel!r} (email, slack or teams)")
 
-            output = result.stdout[:4096] if result.stdout else ""
-            stderr = result.stderr[:2048] if result.stderr else ""
+    @staticmethod
+    async def _send_email(params: dict, context: dict) -> dict:
+        from src.services.email_service import EmailService
 
-            return {
-                "success": result.returncode == 0,
-                "action": "run_script",
-                "details": {
-                    "type": script_type,
-                    "target": target,
-                    "return_code": result.returncode,
-                    "output": output,
-                    "stderr": stderr,
-                },
-            }
-        except subprocess.TimeoutExpired:
-            logger.error(f"Script execution timed out after {timeout}s")
-            return {
-                "success": False,
-                "action": "run_script",
-                "error": f"Script timed out after {timeout} seconds",
-                "details": {"type": script_type, "target": target},
-            }
-        except Exception as e:
-            logger.error(f"Script execution failed: {e}")
-            return {
-                "success": False,
-                "action": "run_script",
-                "error": str(e),
-                "details": {"type": script_type, "target": target},
-            }
+        rt = current_runtime()
+        if rt is None:
+            return _no_runtime("send_email")
+        to = params.get("to") or []
+        recipients = [to] if isinstance(to, str) else [str(r) for r in to]
+        recipients = [r for r in recipients if r]
+        subject = PlaybookAction._substitute_vars(str(params.get("subject") or "PySOAR Notification"), context)
+        body = PlaybookAction._substitute_vars(str(params.get("body") or ""), context)
+        if not recipients:
+            return _fail("send_email", "No recipients provided")
+        email_service = await EmailService.for_organization(rt.db, rt.organization_id)
+        if not email_service.is_configured:
+            return _awaiting("send_email", "SMTP settings for this organisation (Settings > Notifications)",
+                             {"to": recipients, "subject": subject})
+        try:
+            sent = await email_service.send_email(to=recipients, subject=subject, body=body, html_body=params.get("html_body"))
+        except Exception as exc:  # SMTP / network errors surface as a failed step
+            return _fail("send_email", f"email delivery failed: {exc}", {"to": recipients, "subject": subject})
+        if not sent:
+            return _fail("send_email", "email delivery failed", {"to": recipients, "subject": subject})
+        return _ok("send_email", {"to": recipients, "subject": subject, "sent": True})
+
+    @staticmethod
+    async def _send_slack(params: dict, context: dict) -> dict:
+        return await PlaybookAction._send_webhook("slack", params, context, action="send_slack")
+
+    @staticmethod
+    async def _send_webhook(channel: str, params: dict, context: dict, *, action: str) -> dict:
+        from src.services.notifications import _post_json
+        from src.services.tenant_settings import notification_webhook_for
+
+        rt = current_runtime()
+        if rt is None:
+            return _no_runtime(action)
+        message = PlaybookAction._substitute_vars(str(params.get("message") or params.get("body") or ""), context)
+        if not message:
+            return _fail(action, "No message provided")
+        webhook = await notification_webhook_for(rt.db, rt.organization_id, channel)
+        if not webhook:
+            return _awaiting(action, f"{channel} webhook for this organisation (Settings > Notifications)",
+                             {"channel": channel})
+        payload: dict[str, Any] = {"text": message}
+        if channel == "slack" and params.get("channel_name"):
+            payload["channel"] = params["channel_name"]
+        ok, info = await _post_json(webhook, payload)
+        details = {"channel": channel, "message_preview": message[:100], "response": info}
+        if not ok:
+            return _fail(action, f"{channel} webhook delivery failed: {info}", details)
+        return _ok(action, {**details, "sent": True})
+
+    # ------------------------------------------------------------------
+    # Integrations
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    async def _org_integration(installation_id: str) -> Any:
+        from sqlalchemy.orm import selectinload
+
+        from src.integrations.models import InstalledIntegration
+
+        rt = current_runtime()
+        assert rt is not None
+        q = (
+            select(InstalledIntegration)
+            .options(selectinload(InstalledIntegration.connector))
+            .where(InstalledIntegration.id == installation_id, InstalledIntegration.organization_id == rt.organization_id)
+        )
+        return (await rt.db.execute(q)).scalar_one_or_none()
+
+    @staticmethod
+    async def _run_integration(action: str, installation_id: str, action_name: str, input_data: dict) -> dict:
+        from src.integrations.engine import ActionExecutor
+
+        rt = current_runtime()
+        assert rt is not None
+        integ = await PlaybookAction._org_integration(installation_id)
+        if integ is None:
+            return _fail(action, f"Installed integration {installation_id} not found in this organisation")
+        if integ.status != "active":
+            return _fail(action, f"Integration {integ.display_name} is {integ.status}, not active")
+        execution = await ActionExecutor().execute_action(
+            installation_id=integ.id, action_name=action_name, input_data=input_data,
+            triggered_by="playbook", playbook_run_id=rt.execution_id,
+        )
+        details = {"installation_id": integ.id, "integration": integ.display_name, "action_name": action_name,
+                   "integration_execution_id": execution.get("execution_id"), "output": execution.get("output_data")}
+        await PlaybookAction._audit(rt, f"playbook_{action}", integ.id, details,
+                                    success=execution.get("status") == "success", error=execution.get("error_message"))
+        if execution.get("status") != "success":
+            return _fail(action, execution.get("error_message") or "integration action failed", details)
+        output = execution.get("output_data")
+        if isinstance(output, dict) and (output.get("error") or output.get("result") == "error"):
+            return _fail(action, str(output.get("error") or f"integration returned HTTP {output.get('status_code')}"), details)
+        return _ok(action, details)
+
+    @staticmethod
+    async def _audit(rt: StepRuntime, audit_action: str, resource_id: Optional[str], details: dict,
+                     *, success: bool, error: Optional[str] = None) -> None:
+        from src.models.audit import AuditLog
+
+        rt.db.add(AuditLog(
+            user_id=rt.actor_user_id, organization_id=rt.organization_id, action=audit_action,
+            resource_type="playbook_execution", resource_id=rt.execution_id,
+            description=f"{audit_action} by {rt.actor} (resource {resource_id})"[:4000],
+            new_value=json.dumps({**details, "actor": rt.actor}, default=str)[:20000],
+            success=success, error_message=error,
+        ))
+        await rt.db.flush()
+
+    @staticmethod
+    async def _integration_action(params: dict, context: dict) -> dict:
+        if current_runtime() is None:
+            return _no_runtime("integration_action")
+        installation_id = params.get("installation_id")
+        action_name = params.get("action_name")
+        if not installation_id or not action_name:
+            return _fail("integration_action", "installation_id and action_name are required")
+        input_data = params.get("input_data") or {}
+        if not isinstance(input_data, dict):
+            return _fail("integration_action", "input_data must be an object")
+        return await PlaybookAction._run_integration("integration_action", str(installation_id), str(action_name), input_data)
 
     @staticmethod
     async def _http_request(params: dict, context: dict) -> dict:
-        """Make HTTP request to external service"""
-        import httpx
-
-        method = params.get("method", "GET").upper()
-        url = params.get("url", "")
-        headers = params.get("headers", {})
-        body = params.get("body", None)
-        timeout = min(params.get("timeout_seconds", 30), 120)
-
-        url = PlaybookAction._substitute_vars(url, context)
-
-        logger.info(f"Making {method} request to {url}")
-
+        if current_runtime() is None:
+            return _no_runtime("http_request")
+        installation_id = params.get("installation_id")
+        url = PlaybookAction._substitute_vars(str(params.get("url") or ""), context)
+        if not installation_id:
+            return _fail("http_request", "http_request requires installation_id: outbound HTTP goes through an installed "
+                                         "integration and is confined to its base URL")
         if not url:
-            return {
-                "success": False,
-                "action": "http_request",
-                "error": "No URL provided",
-                "details": {"method": method, "url": url},
-            }
+            return _fail("http_request", "No URL provided")
+        input_data = {
+            "url": url, "method": str(params.get("method") or "GET").upper(),
+            "headers": params.get("headers") or {}, "body": params.get("body") or {},
+            "params": params.get("params") or {}, "timeout": min(int(params.get("timeout_seconds") or 30), 120),
+        }
+        return await PlaybookAction._run_integration("http_request", str(installation_id), "http_request", input_data)
 
-        try:
-            async with httpx.AsyncClient() as client:
-                response = await client.request(
-                    method=method,
-                    url=url,
-                    json=body if body else None,
-                    headers=headers,
-                    timeout=timeout,
-                )
+    @staticmethod
+    async def _create_ticket(params: dict, context: dict) -> dict:
+        from sqlalchemy.orm import selectinload
 
-            response_body = response.text[:4096] if response.text else ""
+        from src.integrations.models import InstalledIntegration
 
-            return {
-                "success": 200 <= response.status_code < 400,
-                "action": "http_request",
-                "details": {
-                    "method": method,
-                    "url": url,
-                    "status_code": response.status_code,
-                    "response_body": response_body,
-                    "response_headers": dict(response.headers),
-                },
-            }
-        except httpx.TimeoutException:
-            logger.error(f"HTTP request to {url} timed out")
-            return {
-                "success": False,
-                "action": "http_request",
-                "error": f"Request timed out after {timeout} seconds",
-                "details": {"method": method, "url": url},
-            }
-        except Exception as e:
-            logger.error(f"HTTP request failed: {e}")
-            return {
-                "success": False,
-                "action": "http_request",
-                "error": str(e),
-                "details": {"method": method, "url": url},
-            }
+        rt = current_runtime()
+        if rt is None:
+            return _no_runtime("create_ticket")
+        wanted = str(params.get("system") or "").lower()
+        if wanted and wanted not in ("jira", "servicenow"):
+            return _fail("create_ticket", f"Unsupported ticketing system {wanted!r} (jira or servicenow)")
+        title = PlaybookAction._substitute_vars(str(params.get("title") or "Security Incident"), context)
+        description = PlaybookAction._substitute_vars(str(params.get("description") or ""), context)
+        q = (
+            select(InstalledIntegration)
+            .options(selectinload(InstalledIntegration.connector))
+            .where(InstalledIntegration.organization_id == rt.organization_id, InstalledIntegration.status == "active")
+        )
+        candidates = [
+            i for i in (await rt.db.execute(q)).scalars().all()
+            if i.connector is not None and i.connector.name in ((wanted,) if wanted else ("jira", "servicenow"))
+        ]
+        if not candidates:
+            return _awaiting("create_ticket", f"an active {wanted or 'Jira or ServiceNow'} integration for this organisation",
+                             {"title": title})
+        integ = candidates[0]
+        if integ.connector.name == "jira":
+            project = params.get("project")
+            if not project:
+                return _fail("create_ticket", "Jira tickets need the 'project' parameter (project key)")
+            input_data = {"project": project, "summary": title, "description": description,
+                          "issue_type": params.get("issue_type", "Task"),
+                          "priority": str(params.get("priority", "Medium")).capitalize()}
+            return await PlaybookAction._run_integration("create_ticket", integ.id, "create_issue", input_data)
+        input_data = {"data": {"short_description": title, "description": description}}
+        return await PlaybookAction._run_integration("create_ticket", integ.id, "create_incident", input_data)
+
+    # ------------------------------------------------------------------
+    # Enrichment
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    async def _local_intel(value: str) -> list[dict[str, Any]]:
+        from src.intel.models import ThreatIndicator
+
+        rt = current_runtime()
+        assert rt is not None
+        rows = (await rt.db.execute(
+            select(ThreatIndicator).where(
+                ThreatIndicator.organization_id == rt.organization_id,
+                ThreatIndicator.value == value,
+                ThreatIndicator.is_active == True,  # noqa: E712
+            ).limit(20)
+        )).scalars().all()
+        return [
+            {"id": r.id, "type": r.indicator_type, "confidence": r.confidence, "severity": r.severity,
+             "source": r.source, "tags": r.tags}
+            for r in rows
+        ]
+
+    @staticmethod
+    async def _enrich_value(action: str, value: str, ioc_type: str, providers: Optional[list[str]]) -> dict:
+        from src.integrations.manager import threat_intel_manager
+
+        if current_runtime() is None:
+            return _no_runtime(action)
+        if not value:
+            return _fail(action, "No indicator value provided")
+        local = await PlaybookAction._local_intel(value)
+        configured = threat_intel_manager.get_configured_providers()
+        external: Optional[dict[str, Any]] = None
+        if configured:
+            lookup = {
+                "ip": threat_intel_manager.enrich_ip,
+                "domain": threat_intel_manager.enrich_domain,
+                "hash": threat_intel_manager.enrich_hash,
+            }.get(ioc_type)
+            if lookup is None:
+                return _fail(action, f"Unsupported indicator type {ioc_type!r} (ip, domain or hash)")
+            try:
+                external = await lookup(value, providers)
+            except Exception as exc:  # provider transport errors fail the step
+                return _fail(action, f"threat-intel lookup failed: {exc}")
+        details = {"value": value, "type": ioc_type, "local_indicators": local,
+                   "providers_configured": configured, "external": external}
+        if external is None and not local:
+            return _awaiting(action, "a threat-intel provider API key (VirusTotal, AbuseIPDB, Shodan or GreyNoise)", details)
+        return _ok(action, details)
+
+    @staticmethod
+    async def _enrich(params: dict, context: dict) -> dict:
+        value = PlaybookAction._substitute_vars(str(params.get("value") or ""), context)
+        return await PlaybookAction._enrich_value("enrich", value, str(params.get("type") or "ip").lower(), params.get("providers"))
+
+    @staticmethod
+    async def _enrich_ip(params: dict, context: dict) -> dict:
+        value = PlaybookAction._substitute_vars(str(params.get("ip") or context.get("source_ip") or ""), context)
+        return await PlaybookAction._enrich_value("enrich_ip", value, "ip", params.get("providers"))
+
+    @staticmethod
+    async def _enrich_domain(params: dict, context: dict) -> dict:
+        value = PlaybookAction._substitute_vars(str(params.get("domain") or context.get("domain") or ""), context)
+        return await PlaybookAction._enrich_value("enrich_domain", value, "domain", params.get("providers"))
+
+    @staticmethod
+    async def _enrich_hash(params: dict, context: dict) -> dict:
+        value = PlaybookAction._substitute_vars(str(params.get("hash") or context.get("file_hash") or ""), context)
+        return await PlaybookAction._enrich_value("enrich_hash", value, "hash", params.get("providers"))
+
+    # ------------------------------------------------------------------
+    # Case work (tenant scoped)
+    # ------------------------------------------------------------------
 
     @staticmethod
     async def _update_alert(params: dict, context: dict) -> dict:
-        """Update alert status/fields"""
-        alert_id = params.get("alert_id", context.get("alert_id", ""))
-        updates = params.get("updates", {})
+        from src.models.alert import Alert
 
-        logger.info(f"Updating alert {alert_id} with {updates}")
-
+        rt = current_runtime()
+        if rt is None:
+            return _no_runtime("update_alert")
+        alert_id = params.get("alert_id") or context.get("alert_id")
+        updates = params.get("updates")
+        if not isinstance(updates, dict):
+            updates = {k: v for k, v in params.items() if k != "alert_id"}
+        allowed = {"status", "priority", "assigned_to", "severity", "resolution_notes"}
+        filtered = {k: v for k, v in updates.items() if k in allowed}
         if not alert_id:
-            return {
-                "success": False,
-                "action": "update_alert",
-                "error": "No alert_id provided",
-                "details": {"updates": updates},
-            }
-
-        ALLOWED_FIELDS = {"status", "priority", "assigned_to", "severity", "resolution_notes"}
-        filtered_updates = {k: v for k, v in updates.items() if k in ALLOWED_FIELDS}
-
-        try:
-            from src.core.database import async_session_factory
-            from src.models.alert import Alert
-
-            async with async_session_factory() as session:
-                result = await session.execute(
-                    select(Alert).where(Alert.id == alert_id)
-                )
-                alert = result.scalar_one_or_none()
-
-                if not alert:
-                    return {
-                        "success": False,
-                        "action": "update_alert",
-                        "error": f"Alert {alert_id} not found",
-                        "details": {"alert_id": alert_id, "updates": filtered_updates},
-                    }
-
-                for field, value in filtered_updates.items():
-                    setattr(alert, field, value)
-
-                # If status changed to resolved, set resolved_at
-                if filtered_updates.get("status") == "resolved":
-                    alert.resolved_at = datetime.now(timezone.utc).isoformat()
-
-                await session.flush()
-                await session.commit()
-                logger.info(f"Successfully updated alert {alert_id}: {filtered_updates}")
-
-        except Exception as e:
-            logger.error(f"Failed to update alert {alert_id}: {e}")
-            return {
-                "success": False,
-                "action": "update_alert",
-                "error": str(e),
-                "details": {"alert_id": alert_id, "updates": filtered_updates},
-            }
-
-        return {
-            "success": True,
-            "action": "update_alert",
-            "details": {"alert_id": alert_id, "updates": filtered_updates},
-        }
+            return _fail("update_alert", "No alert_id provided", {"updates": filtered})
+        alert = (await rt.db.execute(
+            select(Alert).where(Alert.id == alert_id, Alert.organization_id == rt.organization_id)
+        )).scalar_one_or_none()
+        if alert is None:
+            return _fail("update_alert", f"Alert {alert_id} not found in this organisation")
+        for field_name, value in filtered.items():
+            setattr(alert, field_name, value)
+        if filtered.get("status") == "resolved":
+            alert.resolved_at = datetime.now(timezone.utc).isoformat()
+        await rt.db.flush()
+        return _ok("update_alert", {"alert_id": alert_id, "updates": filtered})
 
     @staticmethod
     async def _update_incident(params: dict, context: dict) -> dict:
-        """Update incident status/fields"""
-        incident_id = params.get("incident_id", context.get("incident_id", ""))
-        updates = params.get("updates", {})
+        from src.models.incident import Incident
 
-        logger.info(f"Updating incident {incident_id} with {updates}")
-
+        rt = current_runtime()
+        if rt is None:
+            return _no_runtime("update_incident")
+        incident_id = params.get("incident_id") or context.get("incident_id")
+        updates = params.get("updates") or {}
+        allowed = {"status", "priority", "assigned_to", "severity", "resolution",
+                   "root_cause", "impact", "lessons_learned", "recommendations"}
+        filtered = {k: v for k, v in updates.items() if k in allowed}
         if not incident_id:
-            return {
-                "success": False,
-                "action": "update_incident",
-                "error": "No incident_id provided",
-                "details": {"updates": updates},
-            }
+            return _fail("update_incident", "No incident_id provided", {"updates": filtered})
+        incident = (await rt.db.execute(
+            select(Incident).where(Incident.id == incident_id, Incident.organization_id == rt.organization_id)
+        )).scalar_one_or_none()
+        if incident is None:
+            return _fail("update_incident", f"Incident {incident_id} not found in this organisation")
+        for field_name, value in filtered.items():
+            setattr(incident, field_name, value)
+        if filtered.get("status") == "closed":
+            incident.resolved_at = datetime.now(timezone.utc).isoformat()
+        await rt.db.flush()
+        return _ok("update_incident", {"incident_id": incident_id, "updates": filtered})
 
-        ALLOWED_FIELDS = {"status", "priority", "assigned_to", "severity", "resolution",
-                          "root_cause", "impact", "lessons_learned", "recommendations"}
-        filtered_updates = {k: v for k, v in updates.items() if k in ALLOWED_FIELDS}
+    @staticmethod
+    async def _create_incident(params: dict, context: dict) -> dict:
+        from src.models.incident import Incident
 
-        try:
-            from src.core.database import async_session_factory
-            from src.models.incident import Incident
-
-            async with async_session_factory() as session:
-                result = await session.execute(
-                    select(Incident).where(Incident.id == incident_id)
-                )
-                incident = result.scalar_one_or_none()
-
-                if not incident:
-                    return {
-                        "success": False,
-                        "action": "update_incident",
-                        "error": f"Incident {incident_id} not found",
-                        "details": {"incident_id": incident_id, "updates": filtered_updates},
-                    }
-
-                for field, value in filtered_updates.items():
-                    setattr(incident, field, value)
-
-                # If status changed to closed, set resolved_at
-                if filtered_updates.get("status") == "closed":
-                    incident.resolved_at = datetime.now(timezone.utc).isoformat()
-
-                await session.flush()
-                await session.commit()
-                logger.info(f"Successfully updated incident {incident_id}: {filtered_updates}")
-
-        except Exception as e:
-            logger.error(f"Failed to update incident {incident_id}: {e}")
-            return {
-                "success": False,
-                "action": "update_incident",
-                "error": str(e),
-                "details": {"incident_id": incident_id, "updates": filtered_updates},
-            }
-
-        return {
-            "success": True,
-            "action": "update_incident",
-            "details": {"incident_id": incident_id, "updates": filtered_updates},
-        }
+        rt = current_runtime()
+        if rt is None:
+            return _no_runtime("create_incident")
+        title = PlaybookAction._substitute_vars(str(params.get("title") or context.get("alert_title") or ""), context)
+        if not title:
+            return _fail("create_incident", "No incident title provided")
+        incident = Incident(
+            organization_id=rt.organization_id,
+            title=title,
+            description=PlaybookAction._substitute_vars(
+                str(params.get("description") or f"Created by playbook execution {rt.execution_id}"), context,
+            ),
+            severity=str(params.get("severity") or context.get("severity") or "medium"),
+            status="open",
+            incident_type=str(params.get("type") or params.get("incident_type") or "other"),
+        )
+        rt.db.add(incident)
+        await rt.db.flush()
+        context.setdefault("incident_id", incident.id)
+        return _ok("create_incident", {"incident_id": incident.id, "title": title, "severity": incident.severity})
 
     @staticmethod
     async def _add_comment(params: dict, context: dict) -> dict:
-        """Add comment to alert/incident — persists a real TicketComment row."""
-        target_type = params.get("target_type", "incident")
-        target_id = params.get("target_id", context.get("incident_id", context.get("alert_id", "")))
-        comment_text = params.get("comment", "")
-        comment_text = PlaybookAction._substitute_vars(comment_text, context)
+        from src.models.alert import Alert
+        from src.models.incident import Incident
+        from src.tickethub.models import TicketComment
 
+        rt = current_runtime()
+        if rt is None:
+            return _no_runtime("add_comment")
+        target_type = str(params.get("target_type") or ("incident" if context.get("incident_id") else "alert"))
+        target_id = params.get("target_id") or context.get("incident_id") or context.get("alert_id")
+        comment_text = PlaybookAction._substitute_vars(str(params.get("comment") or ""), context)
         if not target_id or not comment_text:
-            return {
-                "success": False,
-                "action": "add_comment",
-                "error": "target_id and comment are required",
-                "details": {"target_type": target_type, "target_id": target_id},
-            }
-
-        try:
-            from src.core.database import async_session_factory
-            from src.tickethub.models import TicketComment
-
-            async with async_session_factory() as session:
-                row = TicketComment(
-                    source_type=target_type,
-                    source_id=target_id,
-                    content=comment_text,
-                    author_id=context.get("user_id") or context.get("triggered_by"),
-                )
-                session.add(row)
-                await session.commit()
-                logger.info(f"Added comment {row.id} to {target_type}/{target_id}")
-
-            return {
-                "success": True,
-                "action": "add_comment",
-                "details": {
-                    "target_type": target_type,
-                    "target_id": target_id,
-                    "comment_id": row.id,
-                    "comment_preview": comment_text[:100],
-                },
-            }
-        except Exception as e:
-            logger.error(f"Failed to add comment: {e}")
-            return {
-                "success": False,
-                "action": "add_comment",
-                "error": str(e),
-                "details": {"target_type": target_type, "target_id": target_id},
-            }
+            return _fail("add_comment", "target_id and comment are required")
+        model = {"incident": Incident, "alert": Alert}.get(target_type)
+        if model is None:
+            return _fail("add_comment", f"Unsupported target_type {target_type!r} (incident or alert)")
+        found = (await rt.db.execute(
+            select(model.id).where(model.id == target_id, model.organization_id == rt.organization_id)
+        )).scalar_one_or_none()
+        if found is None:
+            return _fail("add_comment", f"{target_type} {target_id} not found in this organisation")
+        if not rt.actor_user_id:
+            return _fail("add_comment", "comments need a human author; this execution has no triggering user")
+        row = TicketComment(source_type=target_type, source_id=target_id, content=comment_text,
+                            author_id=rt.actor_user_id, organization_id=rt.organization_id)
+        rt.db.add(row)
+        await rt.db.flush()
+        return _ok("add_comment", {"target_type": target_type, "target_id": target_id, "comment_id": row.id,
+                                   "comment_preview": comment_text[:100]})
 
     @staticmethod
     async def _assign_to(params: dict, context: dict) -> dict:
-        """Assign alert/incident to user — writes real assigned_to on the DB row."""
-        target_type = params.get("target_type", "incident")
-        target_id = params.get("target_id", context.get("incident_id", context.get("alert_id", "")))
-        assignee = params.get("assignee", "")
+        from src.models.alert import Alert
+        from src.models.incident import Incident
+        from src.models.user import User
 
+        rt = current_runtime()
+        if rt is None:
+            return _no_runtime("assign_to")
+        target_type = str(params.get("target_type") or "incident")
+        target_id = params.get("target_id") or context.get("incident_id") or context.get("alert_id")
+        assignee = params.get("assignee")
         if not target_id or not assignee:
-            return {
-                "success": False,
-                "action": "assign_to",
-                "error": "target_id and assignee are required",
-                "details": {"target_type": target_type, "assignee": assignee},
-            }
+            return _fail("assign_to", "target_id and assignee are required")
+        model = {"incident": Incident, "alert": Alert}.get(target_type)
+        if model is None:
+            return _fail("assign_to", f"Unsupported target_type {target_type!r} (incident or alert)")
+        user_ok = (await rt.db.execute(
+            select(User.id).where(User.id == assignee, User.organization_id == rt.organization_id)
+        )).scalar_one_or_none()
+        if user_ok is None:
+            return _fail("assign_to", f"Assignee {assignee} is not a user of this organisation")
+        record = (await rt.db.execute(
+            select(model).where(model.id == target_id, model.organization_id == rt.organization_id)
+        )).scalar_one_or_none()
+        if record is None:
+            return _fail("assign_to", f"{target_type} {target_id} not found in this organisation")
+        record.assigned_to = assignee
+        await rt.db.flush()
+        return _ok("assign_to", {"target_type": target_type, "target_id": target_id, "assignee": assignee})
 
-        try:
-            from src.core.database import async_session_factory
-
-            async with async_session_factory() as session:
-                if target_type == "incident":
-                    from src.models.incident import Incident
-                    result = await session.execute(
-                        select(Incident).where(Incident.id == target_id)
-                    )
-                    record = result.scalar_one_or_none()
-                elif target_type == "alert":
-                    from src.models.alert import Alert
-                    result = await session.execute(
-                        select(Alert).where(Alert.id == target_id)
-                    )
-                    record = result.scalar_one_or_none()
-                else:
-                    record = None
-
-                if not record:
-                    return {
-                        "success": False,
-                        "action": "assign_to",
-                        "error": f"{target_type} {target_id} not found",
-                        "details": {"target_type": target_type, "target_id": target_id},
-                    }
-
-                record.assigned_to = assignee
-                await session.commit()
-                logger.info(f"Assigned {target_type}/{target_id} to {assignee}")
-
-            return {
-                "success": True,
-                "action": "assign_to",
-                "details": {
-                    "target_type": target_type,
-                    "target_id": target_id,
-                    "assignee": assignee,
-                },
-            }
-        except Exception as e:
-            logger.error(f"Failed to assign: {e}")
-            return {
-                "success": False,
-                "action": "assign_to",
-                "error": str(e),
-                "details": {"target_type": target_type, "assignee": assignee},
-            }
+    # ------------------------------------------------------------------
+    # Flow
+    # ------------------------------------------------------------------
 
     @staticmethod
     async def _wait(params: dict, context: dict) -> dict:
-        """Wait for specified duration"""
-        seconds = params.get("seconds", 5)
-
-        logger.info(f"Waiting {seconds} seconds")
-        await asyncio.sleep(min(seconds, 60))  # Cap at 60 seconds for safety
-        return {
-            "success": True,
-            "action": "wait",
-            "details": {"waited_seconds": seconds},
-        }
+        try:
+            seconds = max(0.0, float(params.get("seconds", 5)))
+        except (TypeError, ValueError):
+            return _fail("wait", "seconds must be a number")
+        waited = min(seconds, 60.0)  # cap for safety
+        await asyncio.sleep(waited)
+        return _ok("wait", {"waited_seconds": waited})
 
     @staticmethod
     async def _condition(params: dict, context: dict) -> dict:
-        """Evaluate condition"""
-        field = params.get("field", "")
+        field_name = params.get("field", "")
         operator = params.get("operator", "equals")
         value = params.get("value", "")
-
-        actual_value = context.get(field, "")
-
-        result = False
-        if operator == "equals":
-            result = str(actual_value) == str(value)
-        elif operator == "not_equals":
-            result = str(actual_value) != str(value)
-        elif operator == "contains":
-            result = str(value) in str(actual_value)
-        elif operator == "greater_than":
-            result = float(actual_value) > float(value)
-        elif operator == "less_than":
-            result = float(actual_value) < float(value)
-
-        return {
-            "success": True,
-            "action": "condition",
-            "details": {
-                "field": field,
-                "operator": operator,
-                "expected": value,
-                "actual": actual_value,
-                "result": result,
-            },
-            "condition_result": result,
-        }
-
-    @staticmethod
-    async def _unknown_action(params: dict, context: dict) -> dict:
-        """Handle unknown actions"""
-        return {
-            "success": False,
-            "action": "unknown",
-            "error": "Unknown action type",
-        }
+        actual_value = context.get(field_name, "")
+        try:
+            if operator == "equals":
+                result = str(actual_value) == str(value)
+            elif operator == "not_equals":
+                result = str(actual_value) != str(value)
+            elif operator == "contains":
+                result = str(value) in str(actual_value)
+            elif operator == "greater_than":
+                result = float(actual_value) > float(value)
+            elif operator == "less_than":
+                result = float(actual_value) < float(value)
+            else:
+                return _fail("condition", f"Unsupported operator {operator!r}")
+        except (TypeError, ValueError) as exc:
+            return _fail("condition", f"cannot compare {field_name!r}: {exc}")
+        out = _ok("condition", {"field": field_name, "operator": operator, "expected": value,
+                                "actual": actual_value, "result": result})
+        out["condition_result"] = result
+        return out
 
     @staticmethod
     def _substitute_vars(text: str, context: dict) -> str:
         """Substitute {{variable}} placeholders with context values"""
-        import re
 
-        def replace(match):
+        def replace(match: re.Match) -> str:
             var_name = match.group(1)
             return str(context.get(var_name, match.group(0)))
 
         return re.sub(r"\{\{(\w+)\}\}", replace, text)
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _step_status(step_result: dict[str, Any]) -> str:
+    status = step_result.get("status")
+    if status in (STEP_COMPLETED, STEP_FAILED, STEP_AWAITING_INTEGRATION, STEP_QUEUED_FOR_APPROVAL, STEP_MANUAL_REQUIRED):
+        return status
+    return STEP_COMPLETED if step_result.get("success") else STEP_FAILED
+
+
+def summarize_steps(step_results: list[dict[str, Any]]) -> dict[str, int]:
+    """Count of steps per status."""
+    summary: dict[str, int] = {}
+    for s in step_results:
+        key = s.get("status") or STEP_FAILED
+        summary[key] = summary.get(key, 0) + 1
+    return summary
 
 
 class PlaybookEngine:
@@ -887,40 +816,49 @@ class PlaybookEngine:
     def __init__(self, db: AsyncSession):
         self.db = db
 
+    async def _actor(self, execution: PlaybookExecution, org_id: str) -> tuple[str, Optional[str]]:
+        from src.models.user import User
+
+        for candidate in (execution.triggered_by_user_id, execution.triggered_by):
+            if not candidate:
+                continue
+            found = (await self.db.execute(
+                select(User.id).where(User.id == candidate, User.organization_id == org_id)
+            )).scalar_one_or_none()
+            if found:
+                return found, found
+        return f"system:playbook:{execution.id}", None
+
     async def execute(
         self,
         execution_id: str,
-        notify_callback: Optional[callable] = None,
+        notify_callback: Optional[Callable[..., Awaitable[Any]]] = None,
     ) -> PlaybookExecution:
         """Execute a playbook and update execution record"""
-        # Get execution record
-        result = await self.db.execute(
+        execution = (await self.db.execute(
             select(PlaybookExecution).where(PlaybookExecution.id == execution_id)
-        )
-        execution = result.scalar_one_or_none()
-
+        )).scalar_one_or_none()
         if not execution:
             raise ValueError(f"Execution {execution_id} not found")
 
-        # Get playbook
-        result = await self.db.execute(
+        playbook = (await self.db.execute(
             select(Playbook).where(Playbook.id == execution.playbook_id)
-        )
-        playbook = result.scalar_one_or_none()
-
+        )).scalar_one_or_none()
         if not playbook:
             raise ValueError(f"Playbook {execution.playbook_id} not found")
 
-        # Parse steps
         steps = json.loads(playbook.steps) if playbook.steps else []
+        execution.total_steps = len(steps)
         if not steps:
             execution.status = ExecutionStatus.COMPLETED.value
-            execution.completed_at = datetime.now(timezone.utc).isoformat()
+            execution.started_at = execution.started_at or _now()
+            execution.completed_at = _now()
+            execution.step_results = json.dumps([])
             await self.db.flush()
             return execution
 
         # Build context from input data and playbook variables
-        context = {}
+        context: dict[str, Any] = {}
         if execution.input_data:
             context.update(json.loads(execution.input_data))
         if playbook.variables:
@@ -931,169 +869,136 @@ class PlaybookEngine:
         scoped_org = execution.organization_id or playbook.organization_id
         if scoped_org:
             context["organization_id"] = scoped_org
+            execution.organization_id = scoped_org
         else:
             context.pop("organization_id", None)
+        context["playbook_execution_id"] = execution.id
 
-        # Start execution
         execution.status = ExecutionStatus.RUNNING.value
-        execution.started_at = datetime.now(timezone.utc).isoformat()
+        execution.started_at = _now()
         execution.current_step = 0
         await self.db.flush()
 
         if notify_callback:
             await notify_callback("execution_started", {
-                "execution_id": execution_id,
-                "playbook_id": playbook.id,
-                "playbook_name": playbook.name,
+                "execution_id": execution_id, "playbook_id": playbook.id, "playbook_name": playbook.name,
             })
 
-        step_results = []
+        if not scoped_org:
+            execution.status = ExecutionStatus.FAILED.value
+            execution.completed_at = _now()
+            execution.error_message = "Playbook execution has no organisation; refusing to run steps without a tenant scope"
+            execution.step_results = json.dumps([])
+            await self.db.flush()
+            return execution
 
+        actor, actor_user_id = await self._actor(execution, scoped_org)
+        runtime = StepRuntime(db=self.db, organization_id=scoped_org, execution_id=execution.id,
+                              actor=actor, actor_user_id=actor_user_id)
+        token = _RUNTIME.set(runtime)
+        step_results: list[dict[str, Any]] = []
+        failure: Optional[str] = None
         try:
             i = 0
+            guard = 0
+            max_iterations = max(len(steps) * 10, 50)
             while i < len(steps):
-                step = steps[i]
-
-                # Respect jump directive from a prior condition step
-                jump_target = context.pop("_condition_jump_to", None)
-                if jump_target is not None and isinstance(jump_target, int):
-                    i = jump_target
-                    if i >= len(steps):
-                        break
-                    step = steps[i]
-
+                guard += 1
+                if guard > max_iterations:
+                    failure = f"Execution aborted after {max_iterations} step iterations (condition loop)"
+                    break
+                step = steps[i] if isinstance(steps[i], dict) else {}
                 execution.current_step = i + 1
                 await self.db.flush()
 
-                step_name = step.get("name", f"Step {i + 1}")
+                step_name = step.get("name") or f"Step {i + 1}"
                 action = step.get("action", "")
-                parameters = step.get("parameters", {})
-                timeout = step.get("timeout_seconds", 300)
-                continue_on_error = step.get("continue_on_error", False)
+                parameters = step.get("parameters") or {}
+                timeout = step.get("timeout_seconds") or 300
+                continue_on_error = bool(step.get("continue_on_error", False))
 
-                logger.info(f"Executing step {i + 1}/{len(steps)}: {step_name} ({action})")
-
+                logger.info("playbook_step_started", execution_id=execution_id, step=i + 1, action=action)
                 if notify_callback:
                     await notify_callback("step_started", {
-                        "execution_id": execution_id,
-                        "step_number": i + 1,
-                        "step_name": step_name,
-                        "action": action,
+                        "execution_id": execution_id, "step_number": i + 1, "step_name": step_name, "action": action,
                     })
 
+                started = _now()
                 try:
-                    # Execute with timeout
                     step_result = await asyncio.wait_for(
-                        PlaybookAction.execute(action, parameters, context),
-                        timeout=timeout,
+                        PlaybookAction.execute(action, parameters, context), timeout=timeout,
                     )
-
-                    step_results.append({
-                        "step": i + 1,
-                        "name": step_name,
-                        "action": action,
-                        "result": step_result,
-                        "executed_at": datetime.now(timezone.utc).isoformat(),
-                    })
-
-                    # Update context with step results
-                    if step_result.get("success"):
-                        context[f"step_{i + 1}_result"] = step_result.get("details", {})
-
-                    # Condition branching: if the step was a condition evaluation,
-                    # check for on_success / on_failure jump targets. A target of
-                    # "skip" means skip the next step; an int means jump to that
-                    # step index (0-based). The jump is implemented by fast-forwarding
-                    # the iterator — we break out of the current step, slice the
-                    # remaining steps, and re-enter the loop.
-                    if action == "condition":
-                        condition_result = step_result.get("condition_result", False)
-                        branch_key = "on_success" if condition_result else "on_failure"
-                        branch_target = step.get(branch_key)
-                        if branch_target == "skip":
-                            # Skip the next step by consuming it
-                            context["_condition_skip_next"] = True
-                        elif isinstance(branch_target, int) and 0 <= branch_target < len(steps):
-                            # Jump: we can't easily re-index a for-loop in Python, so
-                            # we record the jump target and the outer loop will respect it.
-                            context["_condition_jump_to"] = branch_target
-
-                    # Respect skip directive from a prior condition step
-                    if context.pop("_condition_skip_next", False):
-                        continue
-
-                    if notify_callback:
-                        await notify_callback("step_completed", {
-                            "execution_id": execution_id,
-                            "step_number": i + 1,
-                            "step_name": step_name,
-                            "success": step_result.get("success", False),
-                        })
-
+                    if not isinstance(step_result, dict):
+                        step_result = _fail(action, "step handler returned no result")
                 except asyncio.TimeoutError:
-                    error_msg = f"Step {step_name} timed out after {timeout}s"
-                    logger.error(error_msg)
+                    step_result = _fail(action, f"Step {step_name} timed out after {timeout}s")
+                except Exception as exc:  # a handler crash is a failed step, never a silent success
+                    logger.error("playbook_step_crashed", execution_id=execution_id, action=action, error=str(exc))
+                    step_result = _fail(action, str(exc))
 
-                    step_results.append({
-                        "step": i + 1,
-                        "name": step_name,
-                        "action": action,
-                        "error": error_msg,
-                        "executed_at": datetime.now(timezone.utc).isoformat(),
+                status = _step_status(step_result)
+                record = {
+                    "step": i + 1,
+                    "name": step_name,
+                    "action": action,
+                    "status": status,
+                    "started_at": started,
+                    "finished_at": _now(),
+                    "executed_at": started,
+                    "result": step_result,
+                    "error": step_result.get("error"),
+                    "missing_dependency": step_result.get("missing_dependency"),
+                }
+                step_results.append(record)
+                execution.step_results = json.dumps(step_results, default=str)
+
+                if status == STEP_COMPLETED:
+                    context[f"step_{i + 1}_result"] = step_result.get("details", {})
+
+                if notify_callback:
+                    await notify_callback("step_completed", {
+                        "execution_id": execution_id, "step_number": i + 1, "step_name": step_name,
+                        "status": status, "success": status == STEP_COMPLETED,
                     })
 
-                    if not continue_on_error:
-                        raise Exception(error_msg)
+                if status == STEP_FAILED and not continue_on_error:
+                    failure = f"Step {i + 1} ({step_name}) failed: {step_result.get('error') or 'no detail'}"
+                    break
 
-                except Exception as e:
-                    error_msg = f"Step {step_name} failed: {str(e)}"
-                    logger.error(error_msg)
+                next_i = i + 1
+                if action == "condition" and status == STEP_COMPLETED:
+                    branch = step.get("on_success" if step_result.get("condition_result") else "on_failure")
+                    if branch == "skip":
+                        next_i = i + 2
+                    elif isinstance(branch, int) and not isinstance(branch, bool) and 0 <= branch < len(steps):
+                        next_i = branch
+                i = next_i
+        finally:
+            _RUNTIME.reset(token)
 
-                    step_results.append({
-                        "step": i + 1,
-                        "name": step_name,
-                        "action": action,
-                        "error": str(e),
-                        "executed_at": datetime.now(timezone.utc).isoformat(),
-                    })
-
-                    if not continue_on_error:
-                        raise
-
-                i += 1
-
-            # All steps completed successfully
-            execution.status = ExecutionStatus.COMPLETED.value
-            execution.completed_at = datetime.now(timezone.utc).isoformat()
-            execution.step_results = json.dumps(step_results)
-            execution.output_data = json.dumps(context)
-
-            logger.info(f"Playbook execution {execution_id} completed successfully")
-
-            if notify_callback:
-                await notify_callback("execution_completed", {
-                    "execution_id": execution_id,
-                    "playbook_id": playbook.id,
-                    "status": "completed",
-                })
-
-        except Exception as e:
-            # Execution failed
+        execution.completed_at = _now()
+        execution.step_results = json.dumps(step_results, default=str)
+        summary = summarize_steps(step_results)
+        context["step_summary"] = summary
+        execution.output_data = json.dumps(context, default=str)
+        if failure:
             execution.status = ExecutionStatus.FAILED.value
-            execution.completed_at = datetime.now(timezone.utc).isoformat()
-            execution.error_message = str(e)
+            execution.error_message = failure
             execution.error_step = execution.current_step
-            execution.step_results = json.dumps(step_results)
-
-            logger.error(f"Playbook execution {execution_id} failed: {e}")
-
+            logger.error("playbook_execution_failed", execution_id=execution_id, error=failure)
             if notify_callback:
                 await notify_callback("execution_failed", {
-                    "execution_id": execution_id,
-                    "playbook_id": playbook.id,
-                    "error": str(e),
+                    "execution_id": execution_id, "playbook_id": playbook.id, "error": failure,
                     "failed_step": execution.current_step,
                 })
-
+        else:
+            all_done = all(s["status"] == STEP_COMPLETED for s in step_results)
+            execution.status = ExecutionStatus.COMPLETED.value if all_done else RUN_PARTIAL
+            logger.info("playbook_execution_finished", execution_id=execution_id, status=execution.status, steps=summary)
+            if notify_callback:
+                await notify_callback("execution_completed", {
+                    "execution_id": execution_id, "playbook_id": playbook.id, "status": execution.status,
+                    "step_summary": summary,
+                })
         await self.db.flush()
         return execution

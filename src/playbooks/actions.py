@@ -1,4 +1,12 @@
-"""Playbook actions - the building blocks of automation"""
+"""Playbook action library (class-based).
+
+The classic engine (``src.services.playbook_engine``) is the runtime; this
+module keeps the class-based actions some callers and tests use. Actions that
+write tenant data (update_alert, create_incident) delegate to the engine's
+step handlers and therefore only run inside a playbook execution.
+
+``run_script`` was removed: it ran arbitrary executables on the API host.
+"""
 
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
@@ -175,7 +183,7 @@ class SendNotificationAction(PlaybookAction):
 
 
 class UpdateAlertAction(PlaybookAction):
-    """Update alert status or fields"""
+    """Update alert status or fields (tenant scoped, via the engine handler)"""
 
     name = "update_alert"
     description = "Update an alert's status or other fields"
@@ -185,50 +193,13 @@ class UpdateAlertAction(PlaybookAction):
         parameters: dict[str, Any],
         context: dict[str, Any],
     ) -> dict[str, Any]:
-        alert_id = parameters.get("alert_id") or context.get("alert_id")
-        if not alert_id:
-            return {"success": False, "error": "No alert ID provided"}
+        from src.services.playbook_engine import PlaybookAction as EngineActions
 
-        updates = {
-            k: v for k, v in parameters.items()
-            if k in ["status", "severity", "assigned_to", "resolution_notes"]
-        }
-
-        try:
-            import asyncio
-            from src.core.database import async_session_factory
-            from src.models.alert import Alert
-            from sqlalchemy import select
-
-            async def _update():
-                async with async_session_factory() as db:
-                    result = await db.execute(select(Alert).where(Alert.id == alert_id))
-                    alert = result.scalars().first()
-                    if alert:
-                        for key, value in updates.items():
-                            if hasattr(alert, key):
-                                setattr(alert, key, value)
-                        await db.commit()
-                        return True
-                    return False
-
-            loop = asyncio.new_event_loop()
-            updated = loop.run_until_complete(_update())
-            loop.close()
-            logger.info(f"Updated alert {alert_id}: {updated}")
-        except Exception as e:
-            logger.error(f"Failed to update alert {alert_id}: {e}")
-            updated = False
-
-        return {
-            "success": updated,
-            "alert_id": alert_id,
-            "updates": updates,
-        }
+        return await EngineActions.execute("update_alert", parameters, context)
 
 
 class CreateIncidentAction(PlaybookAction):
-    """Create a new incident"""
+    """Create a new incident in the execution's organisation (via the engine handler)"""
 
     name = "create_incident"
     description = "Create a new incident from an alert"
@@ -238,43 +209,9 @@ class CreateIncidentAction(PlaybookAction):
         parameters: dict[str, Any],
         context: dict[str, Any],
     ) -> dict[str, Any]:
-        title = parameters.get("title") or context.get("alert_title", "New Incident")
-        severity = parameters.get("severity") or context.get("severity", "medium")
+        from src.services.playbook_engine import PlaybookAction as EngineActions
 
-        try:
-            import asyncio, uuid
-            from src.core.database import async_session_factory
-            from src.models.incident import Incident
-
-            async def _create():
-                async with async_session_factory() as db:
-                    incident = Incident(
-                        id=str(uuid.uuid4()),
-                        title=title,
-                        description=parameters.get("description", f"Auto-created from playbook. Alert: {context.get('alert_id', 'N/A')}"),
-                        severity=severity,
-                        status="open",
-                        incident_type=parameters.get("type", "other"),
-                    )
-                    db.add(incident)
-                    await db.commit()
-                    return incident.id
-
-            loop = asyncio.new_event_loop()
-            incident_id = loop.run_until_complete(_create())
-            loop.close()
-            logger.info(f"Created incident {incident_id}: {title}")
-        except Exception as e:
-            logger.error(f"Failed to create incident: {e}")
-            incident_id = None
-
-        return {
-            "success": incident_id is not None,
-            "incident_created": incident_id is not None,
-            "incident_id": incident_id,
-            "title": title,
-            "severity": severity,
-        }
+        return await EngineActions.execute("create_incident", parameters, context)
 
 
 class ExecuteIntegrationAction(PlaybookAction):
@@ -294,6 +231,13 @@ class ExecuteIntegrationAction(PlaybookAction):
 
         if not installation_id or not action_name:
             return {"success": False, "error": "installation_id and action_name are required"}
+
+        from src.services.playbook_engine import PlaybookAction as EngineActions, current_runtime
+
+        if current_runtime() is not None:
+            # Inside an execution: the engine handler checks the integration
+            # belongs to the execution's organisation and audits the call.
+            return await EngineActions.execute("integration_action", parameters, context)
 
         try:
             executor = ActionExecutor()
@@ -461,53 +405,6 @@ class VirusTotalEnrichAndNotifyAction(PlaybookAction):
         return ", ".join(summary_parts) if summary_parts else "no detailed results"
 
 
-class RunScriptAction(PlaybookAction):
-    """Execute a custom script or command"""
-
-    name = "run_script"
-    description = "Execute a predefined script"
-
-    async def execute(
-        self,
-        parameters: dict[str, Any],
-        context: dict[str, Any],
-    ) -> dict[str, Any]:
-        script_name = parameters.get("script_name")
-        script_args = parameters.get("arguments", {})
-
-        if not script_name:
-            return {"success": False, "error": "No script name provided"}
-
-        import subprocess
-        try:
-            cmd = [script_name] + [str(v) for v in script_args.values()] if script_args else [script_name]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=60, shell=False)
-            logger.info(f"Script {script_name} completed with return code {result.returncode}")
-            output = result.stdout[:2000] if result.stdout else ""
-            error = result.stderr[:500] if result.stderr else ""
-        except subprocess.TimeoutExpired:
-            output = ""
-            error = "Script timed out after 60 seconds"
-            result = type("R", (), {"returncode": -1})()
-        except FileNotFoundError:
-            output = ""
-            error = f"Script not found: {script_name}"
-            result = type("R", (), {"returncode": -1})()
-        except Exception as e:
-            output = ""
-            error = str(e)
-            result = type("R", (), {"returncode": -1})()
-
-        return {
-            "success": result.returncode == 0,
-            "script": script_name,
-            "arguments": script_args,
-            "return_code": result.returncode,
-            "output": output,
-            "error": error,
-        }
-
-
 class ConditionalAction(PlaybookAction):
     """Evaluate a condition and branch execution"""
 
@@ -590,7 +487,6 @@ ACTION_REGISTRY: dict[str, type[PlaybookAction]] = {
     "send_notification": SendNotificationAction,
     "update_alert": UpdateAlertAction,
     "create_incident": CreateIncidentAction,
-    "run_script": RunScriptAction,
     "conditional": ConditionalAction,
     "wait": WaitAction,
     "execute_integration_action": ExecuteIntegrationAction,

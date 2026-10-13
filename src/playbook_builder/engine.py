@@ -8,7 +8,10 @@ from datetime import datetime, timezone
 from typing import Any, Callable, Optional
 from uuid import uuid4
 
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from src.core.logging import get_logger
+from src.core.utils import safe_json_loads
 from src.playbook_builder.models import (
     EdgeType,
     ErrorHandler,
@@ -377,90 +380,240 @@ class PlaybookDesigner:
         return playbook
 
 
-class PlaybookExecutionEngine:
-    """Executes playbooks"""
+#: Node types the engine cannot execute yet, with the reason shown to the user.
+NOT_IMPLEMENTED_NODE_TYPES: dict[str, str] = {
+    NodeType.HUMAN_APPROVAL.value: (
+        "human_approval nodes are not implemented: visual runs cannot pause for approval. High-blast "
+        "containment already waits in the endpoint-agent approval queue."
+    ),
+    NodeType.SUBPLAYBOOK.value: "subplaybook nodes are not implemented",
+    NodeType.LOOP.value: "loop nodes are not implemented",
+    NodeType.PARALLEL.value: "parallel nodes are not implemented",
+    NodeType.ERROR_HANDLER.value: "error_handler nodes are not implemented; use on_error and failure edges",
+}
 
-    def __init__(self):
-        """Initialize execution engine"""
+#: ``action`` node ``action_type`` values executed through the classic step
+#: handlers (src.services.playbook_engine), plus the builder-only agent_command.
+ACTION_NODE_TYPES: frozenset[str] = frozenset({
+    "block_ip", "isolate_host", "disable_user", "quarantine_file", "create_ticket",
+    "integration_action", "http_request", "update_alert", "update_incident", "create_incident",
+    "add_comment", "assign_to", "agent_command",
+})
+
+ENRICHMENT_TYPES: frozenset[str] = frozenset({"ip", "domain", "hash"})
+
+NODE_COMPLETED = NodeExecutionStatus.COMPLETED.value
+NODE_FAILED = NodeExecutionStatus.FAILED.value
+NODE_AWAITING_INTEGRATION = "awaiting_integration"
+NODE_QUEUED_FOR_APPROVAL = "queued_for_approval"
+NODE_MANUAL_REQUIRED = "manual_required"
+NODE_NOT_IMPLEMENTED = "not_implemented"
+NODE_FORBIDDEN = "forbidden_privileged_node"
+
+#: Visual run status when it finished without errors but some node did not
+#: complete (awaiting an integration / approval). Never reported as completed.
+RUN_PARTIAL = "partial"
+
+MAX_NODE_STEPS = 200
+MAX_DELAY_SECONDS = 60
+
+
+class PlaybookExecutionEngine:
+    """Executes visual playbooks node by node.
+
+    Side-effecting nodes run through the same code paths as classic playbook
+    steps (``src.services.playbook_engine.run_step_in_runtime``): containment
+    via ``src.services.containment``, integrations via ``ActionExecutor``,
+    notifications via the tenant's own settings. Node types that cannot run
+    are reported by :meth:`unsupported_nodes` (the API answers 501 before a
+    run starts) and fail the node if they are reached anyway.
+    """
+
+    def __init__(
+        self,
+        db: Optional[AsyncSession] = None,
+        *,
+        actor: Optional[str] = None,
+        actor_user_id: Optional[str] = None,
+    ):
+        """``db`` is the session node side effects and node executions are written to."""
+        self.db = db
+        self.actor = actor
+        self.actor_user_id = actor_user_id
         self.node_executors = self._init_node_executors()
 
     def _init_node_executors(self) -> dict[str, Callable]:
         """Initialize node executor functions"""
         return {
+            NodeType.TRIGGER.value: self._trigger_executor,
             NodeType.ACTION.value: self._action_executor,
             NodeType.CONDITION.value: self._condition_executor,
             NodeType.TRANSFORM.value: self._transform_executor,
             NodeType.DELAY.value: self._delay_executor,
-            NodeType.HUMAN_APPROVAL.value: self._human_approval_executor,
             NodeType.ENRICHMENT.value: self._enrichment_executor,
             NodeType.NOTIFICATION.value: self._notification_executor,
-            NodeType.SUBPLAYBOOK.value: self._subplaybook_executor,
             NodeType.VARIABLE_SET.value: self._variable_set_executor,
             NodeType.API_CALL.value: self._api_call_executor,
-            NodeType.TRIGGER.value: self._trigger_executor,
         }
+
+    # ------------------------------------------------------------------
+    # Static executability check
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _config(node: PlaybookNode) -> dict:
+        try:
+            config = json.loads(node.config) if node.config else {}
+        except (TypeError, json.JSONDecodeError):
+            return {"__invalid__": True}
+        if config is None:
+            return {}
+        return config if isinstance(config, dict) else {"__invalid__": True}
+
+    def node_problem(self, node: PlaybookNode) -> Optional[str]:
+        """Why ``node`` cannot execute, or ``None`` when it can."""
+        if node.node_type in NOT_IMPLEMENTED_NODE_TYPES:
+            return NOT_IMPLEMENTED_NODE_TYPES[node.node_type]
+        if node.node_type not in self.node_executors:
+            return f"unknown node type {node.node_type!r}"
+        config = self._config(node)
+        if config.get("__invalid__"):
+            return "node config is not a JSON object"
+        if node.node_type == NodeType.ACTION.value:
+            action_type = config.get("action_type")
+            if not action_type:
+                return "action node has no action_type configured"
+            if action_type not in ACTION_NODE_TYPES:
+                return f"action_type {action_type!r} is not supported (supported: {sorted(ACTION_NODE_TYPES)})"
+        elif node.node_type == NodeType.CONDITION.value:
+            if not config.get("expression"):
+                return "condition node has no expression"
+        elif node.node_type == NodeType.ENRICHMENT.value:
+            if str(config.get("enrichment_type") or "").lower() not in ENRICHMENT_TYPES:
+                return f"enrichment_type must be one of {sorted(ENRICHMENT_TYPES)}"
+        elif node.node_type == NodeType.NOTIFICATION.value:
+            if str(config.get("channel") or "").lower() not in ("email", "slack", "teams"):
+                return "notification channel must be email, slack or teams"
+            if not config.get("message"):
+                return "notification node has no message"
+        elif node.node_type == NodeType.API_CALL.value:
+            if not config.get("installation_id") or not config.get("url"):
+                return "api_call needs installation_id (an installed integration) and url"
+        elif node.node_type == NodeType.VARIABLE_SET.value:
+            if not config.get("variable_name"):
+                return "variable_set node has no variable_name"
+        return None
+
+    def node_is_privileged(self, node: PlaybookNode) -> bool:
+        """True when ``node`` can change something outside PySOAR (admin-only to run).
+
+        Classified by capability and fail closed: api_call (outbound HTTP),
+        agent_command, containment and any integration action that is not on
+        the read-only allowlist. An unparseable action node is privileged.
+        """
+        from src.services.playbook_engine import is_privileged_step
+
+        if node.node_type == NodeType.API_CALL.value:
+            return True
+        if node.node_type != NodeType.ACTION.value:
+            return False
+        config = self._config(node)
+        if config.get("__invalid__"):
+            return True
+        params = config.get("params") if isinstance(config.get("params"), dict) else {}
+        return is_privileged_step(str(config.get("action_type") or ""), params)
+
+    def privileged_nodes(self, playbook: VisualPlaybook) -> list[str]:
+        """node_ids of every privileged node in ``playbook``."""
+        return [n.node_id for n in playbook.nodes if self.node_is_privileged(n)]
+
+    def unsupported_nodes(self, playbook: VisualPlaybook) -> list[dict[str, str]]:
+        """Every node that cannot execute, with the reason (empty when the playbook can run)."""
+        problems = []
+        for node in playbook.nodes:
+            reason = self.node_problem(node)
+            if reason:
+                problems.append({"node_id": node.node_id, "node_type": node.node_type, "reason": reason})
+        return problems
+
+    # ------------------------------------------------------------------
+    # Run
+    # ------------------------------------------------------------------
+
+    def _runtime(self, execution: VisualPlaybookExecution) -> Any:
+        from src.services.playbook_engine import StepRuntime
+
+        if self.db is None:
+            raise RuntimeError("this node needs a database session (PlaybookExecutionEngine(db))")
+        return StepRuntime(
+            db=self.db,
+            organization_id=execution.organization_id,
+            execution_id=execution.id,
+            actor=self.actor or f"system:playbook:{execution.id}",
+            actor_user_id=self.actor_user_id,
+        )
 
     async def execute_playbook(
         self,
         playbook: VisualPlaybook,
         trigger_event: Optional[dict] = None,
         variables: Optional[dict] = None,
+        execution: Optional[VisualPlaybookExecution] = None,
     ) -> VisualPlaybookExecution:
-        """Execute a playbook"""
-        execution = VisualPlaybookExecution(
-            playbook_id=playbook.id,
-            organization_id=playbook.organization_id,
-            trigger_event=json.dumps(trigger_event) if trigger_event else None,
-            status=ExecutionStatus.RUNNING.value,
-            started_at=datetime.now(timezone.utc).isoformat(),
-            variables=json.dumps(variables or {}),
-        )
+        """Run ``playbook``; updates (or creates) ``execution`` and persists node executions."""
+        started = datetime.now(timezone.utc)
+        if execution is None:
+            execution = VisualPlaybookExecution(
+                playbook_id=playbook.id,
+                organization_id=playbook.organization_id,
+                trigger_event=json.dumps(trigger_event) if trigger_event else None,
+                variables=json.dumps(variables or {}),
+            )
+            if self.db is not None:
+                self.db.add(execution)
+                await self.db.flush()
+        execution.status = ExecutionStatus.RUNNING.value
+        execution.started_at = started.isoformat()
+        runtime_vars: dict[str, Any] = {**(trigger_event or {}), **(variables or {})}
+        runtime_vars["trigger_event"] = trigger_event or {}
+        node_statuses: list[str] = []
+        execution_path: list[str] = []
+        failure: Optional[str] = None
 
-        try:
-            # Find trigger node
-            trigger_nodes = [n for n in playbook.nodes if n.node_type == NodeType.TRIGGER.value]
-            if not trigger_nodes:
-                execution.status = ExecutionStatus.FAILED.value
-                execution.error_message = "No trigger node found"
-                return execution
+        trigger_nodes = [n for n in playbook.nodes if n.node_type == NodeType.TRIGGER.value]
+        if not trigger_nodes:
+            failure = "No trigger node found"
+        current: Optional[PlaybookNode] = trigger_nodes[0] if trigger_nodes else None
+        steps = 0
+        while current is not None and failure is None:
+            steps += 1
+            if steps > MAX_NODE_STEPS:
+                failure = f"Execution aborted after {MAX_NODE_STEPS} node steps (cycle?)"
+                break
+            execution.current_node_id = current.node_id
+            node_exec, branch = await self.execute_node(current, execution, runtime_vars)
+            execution_path.append(current.node_id)
+            node_statuses.append(node_exec.status)
+            runtime_vars[current.node_id] = safe_json_loads(node_exec.output_data, {}) or {}
+            failed = node_exec.status in (NODE_FAILED, NODE_NOT_IMPLEMENTED)
+            if failed and current.on_error != ErrorHandler.CONTINUE.value:
+                failure = f"Node {current.node_id} ({current.display_name}) {node_exec.status}: {node_exec.error_message}"
+                break
+            current = self._get_next_node(playbook, current, node_exec.status, runtime_vars, branch)
 
-            # Start execution from trigger
-            trigger_node = trigger_nodes[0]
-            execution_path = [trigger_node.node_id]
-
-            current_node = trigger_node
-            runtime_vars = variables or {}
-
-            while current_node:
-                # Execute current node
-                node_exec = await self.execute_node(
-                    current_node, execution, runtime_vars
-                )
-
-                if node_exec.status == NodeExecutionStatus.FAILED.value:
-                    if current_node.on_error == ErrorHandler.STOP.value:
-                        execution.status = ExecutionStatus.FAILED.value
-                        execution.error_message = node_exec.error_message
-                        break
-
-                execution_path.append(current_node.node_id)
-
-                # Find next node based on edges
-                next_node = self._get_next_node(
-                    playbook, current_node, node_exec.status, runtime_vars
-                )
-
-                current_node = next_node
-
-            execution.status = ExecutionStatus.COMPLETED.value
-            execution.completed_at = datetime.now(timezone.utc).isoformat()
-            execution.execution_path = json.dumps(execution_path)
-
-        except Exception as e:
+        completed = datetime.now(timezone.utc)
+        execution.completed_at = completed.isoformat()
+        execution.duration_ms = int((completed - started).total_seconds() * 1000)
+        execution.execution_path = json.dumps(execution_path)
+        if failure:
             execution.status = ExecutionStatus.FAILED.value
-            execution.error_message = str(e)
-            logger.error(f"Playbook execution failed: {e}")
-
+            execution.error_message = failure
+        elif all(s == NODE_COMPLETED for s in node_statuses):
+            execution.status = ExecutionStatus.COMPLETED.value
+        else:
+            execution.status = RUN_PARTIAL
+        if self.db is not None:
+            await self.db.flush()
         return execution
 
     async def execute_node(
@@ -468,182 +621,231 @@ class PlaybookExecutionEngine:
         node: PlaybookNode,
         execution: VisualPlaybookExecution,
         variables: dict,
-    ) -> PlaybookNodeExecution:
-        """Execute a single node"""
+    ) -> tuple[PlaybookNodeExecution, Optional[bool]]:
+        """Execute one node; returns its persisted execution row and a condition branch."""
+        started = datetime.now(timezone.utc)
+        config = self._config(node)
         node_exec = PlaybookNodeExecution(
             execution_id=execution.id,
             organization_id=execution.organization_id,
             node_id=node.node_id,
             status=NodeExecutionStatus.RUNNING.value,
-            started_at=datetime.now(timezone.utc).isoformat(),
+            started_at=started.isoformat(),
+            input_data=json.dumps({k: v for k, v in config.items() if k != "__invalid__"}, default=str),
         )
+        branch: Optional[bool] = None
+        problem = self.node_problem(node)
+        if problem:
+            status, output, error = NODE_NOT_IMPLEMENTED, {}, problem
+        else:
+            try:
+                status, output, error = await asyncio.wait_for(
+                    self.node_executors[node.node_type](config, variables, execution),
+                    timeout=max(1, int(node.timeout_seconds or 300)),
+                )
+                if node.node_type == NodeType.CONDITION.value:
+                    branch = bool(output.get("result"))
+            except asyncio.TimeoutError:
+                status, output, error = NODE_FAILED, {}, f"node timed out after {node.timeout_seconds}s"
+            except Exception as exc:  # a crashing node is a failed node, never a silent success
+                logger.error("visual_playbook_node_failed", node_id=node.node_id, error=str(exc))
+                status, output, error = NODE_FAILED, {}, str(exc)
+        finished = datetime.now(timezone.utc)
+        node_exec.status = status
+        node_exec.output_data = json.dumps(output, default=str)
+        node_exec.error_message = error
+        node_exec.completed_at = finished.isoformat()
+        node_exec.duration_ms = int((finished - started).total_seconds() * 1000)
+        if self.db is not None:
+            self.db.add(node_exec)
+            await self.db.flush()
+        return node_exec, branch
 
+    # ------------------------------------------------------------------
+    # Node executors: (config, variables, execution) -> (status, output, error)
+    # ------------------------------------------------------------------
+
+    def _resolve(self, value: Any, variables: dict) -> Any:
+        if isinstance(value, str) and value.startswith("$."):
+            return self._get_json_path(variables, value)
+        if isinstance(value, dict):
+            return {k: self._resolve(v, variables) for k, v in value.items()}
+        return value
+
+    async def _classic_step(self, action: str, params: dict, variables: dict, execution: VisualPlaybookExecution) -> tuple:
+        from src.services.playbook_engine import run_step_in_runtime
+
+        context = {k: v for k, v in variables.items() if isinstance(v, (str, int, float, bool))}
+        context["organization_id"] = execution.organization_id
+        context["playbook_execution_id"] = execution.id
+        result = await run_step_in_runtime(self._runtime(execution), action, self._resolve(params, variables), context)
+        status = result.get("status") or (NODE_COMPLETED if result.get("success") else NODE_FAILED)
+        if status not in (
+            NODE_COMPLETED, NODE_FAILED, NODE_AWAITING_INTEGRATION, NODE_QUEUED_FOR_APPROVAL, NODE_MANUAL_REQUIRED,
+        ):
+            status = NODE_FAILED
+        error = result.get("error") or (result.get("missing_dependency") if status == NODE_AWAITING_INTEGRATION else None)
+        return status, result, error
+
+    async def _trigger_executor(self, config: dict, variables: dict, execution: VisualPlaybookExecution) -> tuple:
+        return NODE_COMPLETED, {"triggered": True, "trigger_event": variables.get("trigger_event", {})}, None
+
+    async def _action_executor(self, config: dict, variables: dict, execution: VisualPlaybookExecution) -> tuple:
+        action_type = config["action_type"]
+        params = config.get("params") or {}
+        if action_type == "agent_command":
+            return await self._agent_command(params, variables, execution)
+        return await self._classic_step(action_type, params, variables, execution)
+
+    async def _agent_command(self, params: dict, variables: dict, execution: VisualPlaybookExecution) -> tuple:
+        """Queue an allowlisted command on one of the organisation's enrolled agents (no approval override)."""
+        from sqlalchemy import select
+
+        from src.agents.models import EndpointAgent
+        from src.agents.service import AgentService, AgentServiceError
+        from src.models.audit import AuditLog
+
+        if self.db is None:
+            raise RuntimeError("agent_command needs a database session")
+        params = self._resolve(params, variables)
+        agent_id, action = params.get("agent_id"), params.get("action")
+        if not agent_id or not action:
+            return NODE_FAILED, {}, "agent_command needs agent_id and action"
+        agent = (await self.db.execute(
+            select(EndpointAgent).where(EndpointAgent.id == agent_id, EndpointAgent.organization_id == execution.organization_id)
+        )).scalar_one_or_none()
+        if agent is None:
+            return NODE_FAILED, {}, f"endpoint agent {agent_id} not found in this organisation"
         try:
-            executor = self.node_executors.get(node.node_type)
-            if not executor:
-                raise ValueError(f"Unknown node type: {node.node_type}")
+            cmd = await AgentService(self.db).issue_command(
+                agent=agent, action=str(action), payload=params.get("payload") or {}, issued_by=self.actor_user_id,
+            )
+        except AgentServiceError as exc:
+            status, output, error = NODE_FAILED, {"agent_id": agent.id}, str(exc)
+        else:
+            status = NODE_QUEUED_FOR_APPROVAL if cmd.status == "awaiting_approval" else NODE_COMPLETED
+            output, error = {"agent_id": agent.id, "command_id": cmd.id, "command_status": cmd.status}, None
+        self.db.add(AuditLog(
+            user_id=self.actor_user_id, organization_id=execution.organization_id, action="playbook_agent_command",
+            resource_type="visual_playbook_execution", resource_id=execution.id,
+            description=f"agent_command {action} on {agent.hostname}: {status}",
+            new_value=json.dumps({**output, "action": action, "actor": self.actor or f"system:playbook:{execution.id}"}),
+            success=status != NODE_FAILED, error_message=error,
+        ))
+        await self.db.flush()
+        return status, output, error
 
-            config = json.loads(node.config) if node.config else {}
-            result = await executor(config, variables)
-
-            node_exec.output_data = json.dumps(result)
-            node_exec.status = NodeExecutionStatus.COMPLETED.value
-
-        except Exception as e:
-            node_exec.status = NodeExecutionStatus.FAILED.value
-            node_exec.error_message = str(e)
-            logger.error(f"Node execution failed: {e}")
-
-        node_exec.completed_at = datetime.now(timezone.utc).isoformat()
-        execution.node_executions.append(node_exec)
-
-        return node_exec
-
-    async def _action_executor(self, config: dict, variables: dict) -> dict:
-        """Execute action node"""
-        action_type = config.get("action_type")
-        params = config.get("params", {})
-        logger.info(f"Executing action: {action_type}")
-        return {"action": action_type, "result": "success"}
-
-    async def _condition_executor(self, config: dict, variables: dict) -> dict:
-        """Execute condition node"""
-        expression = config.get("expression")
+    async def _condition_executor(self, config: dict, variables: dict, execution: VisualPlaybookExecution) -> tuple:
+        expression = config["expression"]
         result = self.evaluate_condition(expression, variables)
-        return {"condition": expression, "result": result}
+        return NODE_COMPLETED, {"condition": expression, "result": result}, None
 
-    async def _transform_executor(self, config: dict, variables: dict) -> dict:
-        """Execute transform node"""
-        mapping = config.get("mapping", {})
-        transformed = {}
-        for key, path in mapping.items():
-            transformed[key] = self._get_json_path(variables, path)
-        return transformed
+    async def _transform_executor(self, config: dict, variables: dict, execution: VisualPlaybookExecution) -> tuple:
+        mapping = config.get("mapping", {}) or {}
+        transformed = {key: self._get_json_path(variables, path) for key, path in mapping.items()}
+        variables.update(transformed)
+        return NODE_COMPLETED, transformed, None
 
-    async def _delay_executor(self, config: dict, variables: dict) -> dict:
-        """Execute delay node"""
-        duration_seconds = config.get("duration_seconds", 1)
-        await asyncio.sleep(duration_seconds)
-        return {"delayed": True, "seconds": duration_seconds}
+    async def _delay_executor(self, config: dict, variables: dict, execution: VisualPlaybookExecution) -> tuple:
+        try:
+            seconds = max(0.0, min(float(config.get("duration_seconds", 1)), MAX_DELAY_SECONDS))
+        except (TypeError, ValueError):
+            return NODE_FAILED, {}, "duration_seconds must be a number"
+        await asyncio.sleep(seconds)
+        return NODE_COMPLETED, {"delayed_seconds": seconds}, None
 
-    async def _human_approval_executor(self, config: dict, variables: dict) -> dict:
-        """Execute human approval node"""
-        message = config.get("message")
-        logger.info(f"Awaiting approval: {message}")
-        return {"approval_status": "pending"}
+    async def _enrichment_executor(self, config: dict, variables: dict, execution: VisualPlaybookExecution) -> tuple:
+        kind = str(config["enrichment_type"]).lower()
+        value = self._resolve(config.get("value"), variables)
+        if value is None and config.get("value_path"):
+            value = self._get_json_path(variables, str(config["value_path"]))
+        return await self._classic_step("enrich", {"value": str(value or ""), "type": kind}, variables, execution)
 
-    async def _enrichment_executor(self, config: dict, variables: dict) -> dict:
-        """Execute enrichment node"""
-        enrichment_type = config.get("enrichment_type")
-        return {"enrichment": enrichment_type, "data": {}}
+    async def _notification_executor(self, config: dict, variables: dict, execution: VisualPlaybookExecution) -> tuple:
+        params = {k: v for k, v in config.items() if k in ("channel", "message", "recipients", "subject", "channel_name")}
+        return await self._classic_step("notify", params, variables, execution)
 
-    async def _notification_executor(self, config: dict, variables: dict) -> dict:
-        """Execute notification node"""
-        channel = config.get("channel")  # slack, teams, email, pagerduty
-        message = config.get("message")
-        logger.info(f"Sending notification to {channel}: {message}")
-        return {"notification": channel, "sent": True}
-
-    async def _subplaybook_executor(self, config: dict, variables: dict) -> dict:
-        """Execute subplaybook node"""
-        subplaybook_id = config.get("playbook_id")
-        logger.info(f"Executing subplaybook: {subplaybook_id}")
-        return {"subplaybook": subplaybook_id, "status": "executed"}
-
-    async def _variable_set_executor(self, config: dict, variables: dict) -> dict:
-        """Execute variable set node"""
-        var_name = config.get("variable_name")
-        var_value = config.get("variable_value")
+    async def _variable_set_executor(self, config: dict, variables: dict, execution: VisualPlaybookExecution) -> tuple:
+        var_name = config["variable_name"]
+        var_value = self._resolve(config.get("variable_value"), variables)
         variables[var_name] = var_value
-        return {"variable": var_name, "value": var_value}
+        return NODE_COMPLETED, {"variable": var_name, "value": var_value}, None
 
-    async def _api_call_executor(self, config: dict, variables: dict) -> dict:
-        """Execute API call node"""
-        url = config.get("url")
-        method = config.get("method", "GET")
-        logger.info(f"Making API call: {method} {url}")
-        return {"api_call": url, "method": method, "status": 200}
-
-    async def _trigger_executor(self, config: dict, variables: dict) -> dict:
-        """Execute trigger node"""
-        return {"triggered": True}
+    async def _api_call_executor(self, config: dict, variables: dict, execution: VisualPlaybookExecution) -> tuple:
+        params = {k: v for k, v in config.items() if k in ("installation_id", "url", "method", "headers", "body", "params", "timeout_seconds")}
+        return await self._classic_step("http_request", params, variables, execution)
 
     def evaluate_condition(self, expression: str, variables: dict) -> bool:
-        """Evaluate a condition expression"""
-        if not expression:
-            return True
+        """Evaluate a condition expression (AND / OR / NOT and comparisons).
 
-        # Simple expression parser for AND/OR/NOT/comparisons
+        An expression without a recognised comparison is False, never True.
+        """
+        if not expression:
+            return False
+
         expression = expression.strip()
 
-        # Handle NOT
         if expression.startswith("NOT "):
             return not self.evaluate_condition(expression[4:], variables)
 
-        # Handle OR
         if " OR " in expression:
             parts = expression.split(" OR ")
             return any(self.evaluate_condition(p.strip(), variables) for p in parts)
 
-        # Handle AND
         if " AND " in expression:
             parts = expression.split(" AND ")
             return all(self.evaluate_condition(p.strip(), variables) for p in parts)
 
-        # Handle comparisons
-        for op in ["==", "!=", ">=", "<=", ">", "<", "contains", "matches"]:
+        for op in ["==", "!=", ">=", "<=", ">", "<", " contains ", " matches "]:
             if op in expression:
                 parts = expression.split(op)
                 if len(parts) == 2:
                     left = self._resolve_value(parts[0].strip(), variables)
                     right = self._resolve_value(parts[1].strip(), variables)
-
-                    if op == "==":
-                        return left == right
-                    elif op == "!=":
-                        return left != right
-                    elif op == ">=":
-                        return left >= right
-                    elif op == "<=":
-                        return left <= right
-                    elif op == ">":
-                        return left > right
-                    elif op == "<":
-                        return left < right
-                    elif op == "contains":
+                    try:
+                        if op == "==":
+                            return left == right
+                        if op == "!=":
+                            return left != right
+                        if op == ">=":
+                            return left >= right
+                        if op == "<=":
+                            return left <= right
+                        if op == ">":
+                            return left > right
+                        if op == "<":
+                            return left < right
+                    except TypeError:
+                        return False
+                    if op == " contains ":
                         return str(right) in str(left)
-                    elif op == "matches":
+                    if op == " matches ":
                         return bool(re.search(str(right), str(left)))
 
-        return True
+        return False
 
     def _resolve_value(self, value_str: str, variables: dict) -> Any:
         """Resolve a value string to actual value"""
         value_str = value_str.strip()
 
-        # JSON path reference
         if value_str.startswith("$."):
             return self._get_json_path(variables, value_str)
 
-        # Variable reference
         if value_str in variables:
             return variables[value_str]
 
-        # Try to parse as JSON/number/boolean
         try:
             return json.loads(value_str)
         except (json.JSONDecodeError, ValueError):
-            return value_str
+            return value_str.strip("'\"")
 
     def _get_json_path(self, data: dict, path: str) -> Any:
         """Get value from JSON path"""
         if path.startswith("$."):
             path = path[2:]
 
-        parts = path.split(".")
-        current = data
-
-        for part in parts:
+        current: Any = data
+        for part in path.split("."):
             if isinstance(current, dict) and part in current:
                 current = current[part]
             else:
@@ -657,38 +859,115 @@ class PlaybookExecutionEngine:
         current_node: PlaybookNode,
         node_status: str,
         variables: dict,
+        branch: Optional[bool] = None,
     ) -> Optional[PlaybookNode]:
-        """Determine next node to execute"""
-        # Find outgoing edges
-        outgoing_edges = [
-            e for e in playbook.edges if e.source_node_id == current_node.node_id
-        ]
-
-        # Sort by priority
-        outgoing_edges.sort(key=lambda e: e.priority, reverse=True)
-
+        """Next node: success edges after a completed node (or a true condition),
+        failure edges after a failed node (or a false condition), always edges either way."""
+        outgoing_edges = sorted(
+            (e for e in playbook.edges if e.source_node_id == current_node.node_id),
+            key=lambda e: e.priority, reverse=True,
+        )
+        if branch is not None:
+            took_success = branch
+        else:
+            took_success = node_status != NODE_FAILED and node_status != NODE_NOT_IMPLEMENTED
         for edge in outgoing_edges:
-            # Check edge type match
-            if edge.edge_type == EdgeType.SUCCESS.value and node_status != NodeExecutionStatus.COMPLETED.value:
+            if edge.edge_type in (EdgeType.SUCCESS.value, EdgeType.CONDITIONAL.value) and not took_success:
                 continue
-            if edge.edge_type == EdgeType.FAILURE.value and node_status != NodeExecutionStatus.FAILED.value:
+            if edge.edge_type in (EdgeType.FAILURE.value, EdgeType.ERROR.value) and took_success:
                 continue
-
-            # Check condition if present
-            if edge.condition_expression:
-                if not self.evaluate_condition(edge.condition_expression, variables):
-                    continue
-
-            # Find target node
-            return next(
-                (n for n in playbook.nodes if n.node_id == edge.target_node_id), None
-            )
-
+            if edge.edge_type == EdgeType.TIMEOUT.value:
+                continue
+            if edge.condition_expression and not self.evaluate_condition(edge.condition_expression, variables):
+                continue
+            return next((n for n in playbook.nodes if n.node_id == edge.target_node_id), None)
         return None
 
 
+async def run_visual_execution(
+    db: AsyncSession, execution_id: str,
+) -> VisualPlaybookExecution:
+    """Drive one persisted VisualPlaybookExecution through the engine (worker and tests)."""
+    from sqlalchemy import select
+    from sqlalchemy.orm import selectinload
+
+    from src.models.user import User
+
+    execution = (await db.execute(
+        select(VisualPlaybookExecution).where(VisualPlaybookExecution.id == execution_id)
+    )).scalar_one_or_none()
+    if execution is None:
+        raise ValueError(f"Visual playbook execution {execution_id} not found")
+    playbook = (await db.execute(
+        select(VisualPlaybook)
+        .options(selectinload(VisualPlaybook.nodes), selectinload(VisualPlaybook.edges))
+        .where(VisualPlaybook.id == execution.playbook_id, VisualPlaybook.organization_id == execution.organization_id)
+        .execution_options(populate_existing=True)  # the graph as stored now, not a cached copy
+    )).scalar_one_or_none()
+    if playbook is None:
+        execution.status = ExecutionStatus.FAILED.value
+        execution.error_message = "playbook not found in the execution's organisation"
+        execution.completed_at = datetime.now(timezone.utc).isoformat()
+        await db.flush()
+        return execution
+
+    actor_user_id = None
+    actor_is_admin = False
+    if execution.triggered_by:
+        row = (await db.execute(
+            select(User.id, User.role, User.is_superuser)
+            .where(User.id == execution.triggered_by, User.organization_id == execution.organization_id)
+        )).first()
+        if row is not None:
+            actor_user_id = row.id
+            actor_is_admin = bool(row.is_superuser) or row.role == "admin"
+    engine = PlaybookExecutionEngine(db, actor=actor_user_id, actor_user_id=actor_user_id)
+
+    # Re-check privilege at run time against the role recorded at dispatch
+    # (and the user's current role): a playbook edited after dispatch, or a
+    # run with no admin behind it, never reaches a privileged node.
+    privileged = engine.privileged_nodes(playbook)
+    if privileged and not (execution.triggered_by_role == "admin" and actor_is_admin):
+        now = datetime.now(timezone.utc).isoformat()
+        reason = (
+            f"forbidden_privileged_node: node(s) {', '.join(privileged)} need an admin; "
+            f"run triggered with role {execution.triggered_by_role or 'none'}"
+        )
+        for node_id in privileged:
+            db.add(PlaybookNodeExecution(
+                execution_id=execution.id, organization_id=execution.organization_id, node_id=node_id,
+                status=NODE_FORBIDDEN, started_at=now, completed_at=now, duration_ms=0,
+                error_message="forbidden_privileged_node", output_data=json.dumps({"error": "forbidden_privileged_node"}),
+            ))
+        execution.status = ExecutionStatus.FAILED.value
+        execution.error_message = reason
+        execution.started_at = execution.started_at or now
+        execution.completed_at = now
+        execution.duration_ms = 0
+        execution.execution_path = json.dumps([])
+        await db.flush()
+        logger.warning("visual_playbook_privileged_node_refused", execution_id=execution.id, nodes=privileged)
+        return execution
+
+    await engine.execute_playbook(
+        playbook,
+        trigger_event=safe_json_loads(execution.trigger_event, None),
+        variables=safe_json_loads(execution.variables, None),
+        execution=execution,
+    )
+    playbook.execution_count = (playbook.execution_count or 0) + 1
+    playbook.last_executed = execution.completed_at
+    await db.flush()
+    return execution
+
+
 class TemplateLibrary:
-    """Built-in playbook templates"""
+    """Built-in playbook templates.
+
+    Only templates whose every node is configured and executable ship here.
+    The 13 name-only templates (ransomware_ir, brute_force_response, ...) had
+    zero nodes and were removed rather than shown as if they did something.
+    """
 
     @staticmethod
     def get_templates() -> dict[str, dict]:
@@ -696,27 +975,17 @@ class TemplateLibrary:
         return {
             "phishing_response": TemplateLibrary.phishing_response_template(),
             "malware_triage": TemplateLibrary.malware_triage_template(),
-            "ransomware_ir": TemplateLibrary.ransomware_ir_template(),
-            "brute_force_response": TemplateLibrary.brute_force_response_template(),
-            "vulnerability_remediation": TemplateLibrary.vulnerability_remediation_template(),
-            "compliance_check": TemplateLibrary.compliance_check_template(),
-            "threat_intel_enrichment": TemplateLibrary.threat_intel_enrichment_template(),
-            "user_access_review": TemplateLibrary.user_access_review_template(),
-            "account_lockout": TemplateLibrary.account_lockout_template(),
-            "dlp_violation": TemplateLibrary.dlp_violation_template(),
-            "cloud_misconfiguration": TemplateLibrary.cloud_misconfiguration_template(),
-            "insider_threat": TemplateLibrary.insider_threat_template(),
-            "data_breach_notification": TemplateLibrary.data_breach_notification_template(),
-            "patch_deployment": TemplateLibrary.patch_deployment_template(),
-            "privilege_escalation": TemplateLibrary.privilege_escalation_template(),
         }
 
     @staticmethod
     def phishing_response_template() -> dict:
-        """Phishing response workflow template"""
+        """Phishing response: enrich the sender domain, then tell the SOC on Slack."""
         return {
             "name": "Phishing Response",
-            "description": "Automated response to phishing emails",
+            "description": (
+                "Enrich the reported sender domain (trigger field sender_domain) with threat intel "
+                "and post the result to the organisation's Slack webhook."
+            ),
             "category": "incident_response",
             "trigger_type": "alert",
             "nodes": [
@@ -730,231 +999,56 @@ class TemplateLibrary:
                 {
                     "node_id": "enrich_1",
                     "node_type": "enrichment",
-                    "display_name": "Enrich Email",
+                    "display_name": "Enrich Sender Domain",
                     "position_x": 100,
                     "position_y": 150,
-                    "config": {"enrichment_type": "email_analysis"},
-                },
-                {
-                    "node_id": "condition_1",
-                    "node_type": "condition",
-                    "display_name": "Is Malicious",
-                    "position_x": 100,
-                    "position_y": 250,
-                },
-                {
-                    "node_id": "action_1",
-                    "node_type": "action",
-                    "display_name": "Quarantine Email",
-                    "position_x": 250,
-                    "position_y": 350,
+                    "config": {"enrichment_type": "domain", "value_path": "$.sender_domain"},
                 },
                 {
                     "node_id": "notify_1",
                     "node_type": "notification",
                     "display_name": "Notify SOC",
-                    "position_x": 250,
-                    "position_y": 450,
-                    "config": {"channel": "slack"},
+                    "position_x": 100,
+                    "position_y": 250,
+                    "config": {
+                        "channel": "slack",
+                        "message": "Phishing report: sender domain {{sender_domain}} enriched; review the run for details.",
+                    },
                 },
             ],
             "edges": [
-                {
-                    "source_node_id": "trigger_1",
-                    "target_node_id": "enrich_1",
-                    "edge_type": "success",
-                },
-                {
-                    "source_node_id": "enrich_1",
-                    "target_node_id": "condition_1",
-                    "edge_type": "success",
-                },
-                {
-                    "source_node_id": "condition_1",
-                    "target_node_id": "action_1",
-                    "edge_type": "success",
-                },
-                {
-                    "source_node_id": "action_1",
-                    "target_node_id": "notify_1",
-                    "edge_type": "success",
-                },
+                {"source_node_id": "trigger_1", "target_node_id": "enrich_1", "edge_type": "success"},
+                {"source_node_id": "enrich_1", "target_node_id": "notify_1", "edge_type": "success"},
             ],
         }
 
     @staticmethod
     def malware_triage_template() -> dict:
-        """Malware triage workflow"""
+        """Malware triage: enrich the file hash, then email the team."""
         return {
             "name": "Malware Triage",
-            "description": "Triage and analyze malware samples",
+            "description": (
+                "Look up the alert's file hash (trigger field file_hash) in threat intel and email "
+                "the address in trigger field notify_email."
+            ),
             "category": "threat_hunting",
             "trigger_type": "alert",
             "nodes": [
                 {"node_id": "t1", "node_type": "trigger", "display_name": "Malware Alert", "position_x": 0, "position_y": 0},
-                {"node_id": "a1", "node_type": "enrichment", "display_name": "Sandbox Detonate", "position_x": 0, "position_y": 100, "config": {"enrichment_type": "sandbox"}},
-                {"node_id": "a2", "node_type": "enrichment", "display_name": "VirusTotal Lookup", "position_x": 0, "position_y": 200, "config": {"enrichment_type": "virustotal"}},
-                {"node_id": "n1", "node_type": "notification", "display_name": "Alert Team", "position_x": 0, "position_y": 300, "config": {"channel": "email"}},
+                {
+                    "node_id": "a1", "node_type": "enrichment", "display_name": "Hash Lookup", "position_x": 0, "position_y": 100,
+                    "config": {"enrichment_type": "hash", "value_path": "$.file_hash"},
+                },
+                {
+                    "node_id": "n1", "node_type": "notification", "display_name": "Alert Team", "position_x": 0, "position_y": 200,
+                    "config": {
+                        "channel": "email", "recipients": "$.notify_email", "subject": "Malware triage: {{file_hash}}",
+                        "message": "Threat-intel lookup finished for {{file_hash}}; review the run for details.",
+                    },
+                },
             ],
             "edges": [
                 {"source_node_id": "t1", "target_node_id": "a1", "edge_type": "success"},
-                {"source_node_id": "a1", "target_node_id": "a2", "edge_type": "success"},
-                {"source_node_id": "a2", "target_node_id": "n1", "edge_type": "success"},
+                {"source_node_id": "a1", "target_node_id": "n1", "edge_type": "success"},
             ],
-        }
-
-    @staticmethod
-    def ransomware_ir_template() -> dict:
-        """Ransomware incident response"""
-        return {
-            "name": "Ransomware IR",
-            "description": "Ransomware incident response workflow",
-            "category": "incident_response",
-            "trigger_type": "alert",
-            "nodes": [],
-            "edges": [],
-        }
-
-    @staticmethod
-    def brute_force_response_template() -> dict:
-        """Brute force attack response"""
-        return {
-            "name": "Brute Force Response",
-            "description": "Automatic response to brute force attacks",
-            "category": "incident_response",
-            "trigger_type": "threshold",
-            "nodes": [],
-            "edges": [],
-        }
-
-    @staticmethod
-    def vulnerability_remediation_template() -> dict:
-        """Vulnerability remediation workflow"""
-        return {
-            "name": "Vulnerability Remediation",
-            "description": "Remediate discovered vulnerabilities",
-            "category": "remediation",
-            "trigger_type": "alert",
-            "nodes": [],
-            "edges": [],
-        }
-
-    @staticmethod
-    def compliance_check_template() -> dict:
-        """Compliance check workflow"""
-        return {
-            "name": "Compliance Check",
-            "description": "Automated compliance verification",
-            "category": "compliance",
-            "trigger_type": "schedule",
-            "nodes": [],
-            "edges": [],
-        }
-
-    @staticmethod
-    def threat_intel_enrichment_template() -> dict:
-        """Threat intelligence enrichment"""
-        return {
-            "name": "Threat Intel Enrichment",
-            "description": "Enrich alerts with threat intelligence",
-            "category": "enrichment",
-            "trigger_type": "alert",
-            "nodes": [],
-            "edges": [],
-        }
-
-    @staticmethod
-    def user_access_review_template() -> dict:
-        """User access review workflow"""
-        return {
-            "name": "User Access Review",
-            "description": "Review and audit user access",
-            "category": "compliance",
-            "trigger_type": "schedule",
-            "nodes": [],
-            "edges": [],
-        }
-
-    @staticmethod
-    def account_lockout_template() -> dict:
-        """Account lockout response"""
-        return {
-            "name": "Account Lockout",
-            "description": "Handle suspicious account lockouts",
-            "category": "incident_response",
-            "trigger_type": "alert",
-            "nodes": [],
-            "edges": [],
-        }
-
-    @staticmethod
-    def dlp_violation_template() -> dict:
-        """DLP violation response"""
-        return {
-            "name": "DLP Violation",
-            "description": "Respond to data loss prevention violations",
-            "category": "incident_response",
-            "trigger_type": "alert",
-            "nodes": [],
-            "edges": [],
-        }
-
-    @staticmethod
-    def cloud_misconfiguration_template() -> dict:
-        """Cloud misconfiguration remediation"""
-        return {
-            "name": "Cloud Misconfiguration",
-            "description": "Detect and remediate cloud misconfigurations",
-            "category": "remediation",
-            "trigger_type": "alert",
-            "nodes": [],
-            "edges": [],
-        }
-
-    @staticmethod
-    def insider_threat_template() -> dict:
-        """Insider threat response"""
-        return {
-            "name": "Insider Threat",
-            "description": "Insider threat detection and response",
-            "category": "incident_response",
-            "trigger_type": "alert",
-            "nodes": [],
-            "edges": [],
-        }
-
-    @staticmethod
-    def data_breach_notification_template() -> dict:
-        """Data breach notification workflow"""
-        return {
-            "name": "Data Breach Notification",
-            "description": "Handle data breach notifications",
-            "category": "notification",
-            "trigger_type": "alert",
-            "nodes": [],
-            "edges": [],
-        }
-
-    @staticmethod
-    def patch_deployment_template() -> dict:
-        """Patch deployment workflow"""
-        return {
-            "name": "Patch Deployment",
-            "description": "Automated patch deployment",
-            "category": "remediation",
-            "trigger_type": "schedule",
-            "nodes": [],
-            "edges": [],
-        }
-
-    @staticmethod
-    def privilege_escalation_template() -> dict:
-        """Privilege escalation response"""
-        return {
-            "name": "Privilege Escalation",
-            "description": "Detect and respond to privilege escalation",
-            "category": "incident_response",
-            "trigger_type": "alert",
-            "nodes": [],
-            "edges": [],
         }
