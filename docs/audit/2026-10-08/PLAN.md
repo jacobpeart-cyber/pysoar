@@ -21,6 +21,12 @@ Residuals carried into wave 1: the four default WebSocket channels still broadca
 
 Gate: full suite green, contract diff zero missing, every mutating route has a role test, tenant-isolation suite extended to each router.
 
+**Status, 2026-10-12: landed.** Kit `2bfbd39` (mandatory `OrganizationId`, migration 023, audit rows stamped, Celery include list, tenancy fixtures); fixtures `918aa7a`; detection `21c744d`; posture `9c1ecde`; core SOC `cc38185`; platform `1d121a6`; frontend `19eb02c`; transcript redaction performance `63015df`. 25 `tests/unit/test_tenancy_*.py` files; contract diff 0 missing; style debt 6829 against the 6974 baseline.
+
+Decisions taken while landing it, for JP to confirm or reverse: agent action approve and rollback are admin-only (analysts could approve write-tier proposals before); viewers cannot run agent tools directly; OT active discovery is disabled until `OT_DISCOVERY_ALLOWED_CIDRS` is set, and even then confined to the tenant's zones with loopback, link-local and cloud-metadata ranges refused; a NULL `organization_id` on indicators and SIEM rules means a platform row (read-only for tenants); SIEM data-source configuration is admin-only.
+
+Residuals carried into wave 2: `device_trust_profiles.device_id` is globally unique (per-tenant uniqueness needs a migration), so compliance overrides no longer create profiles; case child tables (notes, tasks, attachments, timeline) are scoped only through the parent incident; `itdr.py` still builds its agent context without an explicit organisation; the ATT&CK sync and the hunting template catalogue are platform-wide by design; the `Authorization: Bearer` redaction covers the header form only.
+
 ## Wave 2: core SOC made real
 
 * Classic playbooks: containment steps call the endpoint agents or installed integrations (block IP, isolate host, disable user through the configured identity provider) or report `awaiting_integration`; failed steps fail the run; executions carry the organisation; `run_script` removed or sandboxed to admin with audit.
