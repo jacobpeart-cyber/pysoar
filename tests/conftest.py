@@ -192,8 +192,22 @@ async def client(db_session: AsyncSession, redis_mock: AsyncMock) -> AsyncGenera
 
 
 @pytest_asyncio.fixture
-async def test_user(db_session: AsyncSession) -> User:
-    """Create a test user"""
+async def test_organization(db_session: AsyncSession):
+    """The tenant that ``test_user`` and ``admin_user`` belong to.
+
+    Wave 1 made tenant scoping mandatory (403 ``organization_required`` for
+    org-less callers), so the legacy fixtures carry an organisation. Tests
+    that need an org-less caller use ``orgless_headers`` from
+    tests/helpers/tenancy.py.
+    """
+    from tests.helpers.tenancy import make_organization
+
+    return await make_organization(db_session, "Test Org")
+
+
+@pytest_asyncio.fixture
+async def test_user(db_session: AsyncSession, test_organization) -> User:
+    """Create a test user (analyst in ``test_organization``)"""
     user = User(
         email="test@example.com",
         hashed_password=get_password_hash("testpassword123"),
@@ -201,6 +215,7 @@ async def test_user(db_session: AsyncSession) -> User:
         role="analyst",
         is_active=True,
         is_superuser=False,
+        organization_id=test_organization.id,
     )
     db_session.add(user)
     await db_session.commit()
@@ -209,7 +224,7 @@ async def test_user(db_session: AsyncSession) -> User:
 
 
 @pytest_asyncio.fixture
-async def admin_user(db_session: AsyncSession) -> User:
+async def admin_user(db_session: AsyncSession, test_organization) -> User:
     """Create an admin test user"""
     user = User(
         email="admin@example.com",
@@ -218,6 +233,7 @@ async def admin_user(db_session: AsyncSession) -> User:
         role="admin",
         is_active=True,
         is_superuser=True,
+        organization_id=test_organization.id,
     )
     db_session.add(user)
     await db_session.commit()
@@ -358,6 +374,8 @@ async def cleanup(db_session: AsyncSession):
 # assertion is imported where used: `from tests.helpers.tenancy import assert_tenant_isolated`.
 from tests.helpers.tenancy import (  # noqa: E402,F401
     org_a,
+    orgless_headers,
+    orgless_user,
     org_a_admin,
     org_a_admin_headers,
     org_a_headers,

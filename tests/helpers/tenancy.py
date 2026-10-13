@@ -163,5 +163,16 @@ async def org_b_headers(org_b_user: User) -> dict[str, str]:
 
 
 @pytest_asyncio.fixture
+async def orgless_user(db_session: AsyncSession) -> User:
+    """An authenticated analyst with no organisation (expects 403 organization_required)."""
+    return await make_user(db_session, role="analyst", organization_id=None, label="orgless")
+
+
+@pytest_asyncio.fixture
+async def orgless_headers(orgless_user: User) -> dict[str, str]:
+    return bearer(orgless_user)
+
+
+@pytest_asyncio.fixture
 async def superuser_headers(platform_superuser: User) -> dict[str, str]:
     return bearer(platform_superuser)
