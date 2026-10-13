@@ -560,6 +560,37 @@ def cleanup_expired_blocks(organization_id: str) -> dict:
         }
 
 
+#: Starter policies (installed disabled + approval-required). Their action
+#: types are registry keys (src/remediation/actions.py); GET
+#: /remediation/policies/builtin serves this list.
+BUILTIN_POLICY_SPECS: list[dict[str, Any]] = [
+    {
+        "name": "Block Malicious IPs",
+        "description": "Block IPs matched by threat intel on every IR-enrolled endpoint agent",
+        "policy_type": "auto_block",
+        "trigger_type": "threat_intel_match",
+        "trigger_conditions": {"severity": {"operator": "in", "value": ["high", "critical"]}},
+        "actions": [{"type": "firewall_block", "parameters": {}}],
+    },
+    {
+        "name": "Isolate Compromised Hosts",
+        "description": "Isolate hosts with confirmed malware",
+        "policy_type": "auto_isolate",
+        "trigger_type": "alert_severity",
+        "trigger_conditions": {"severity": "critical"},
+        "actions": [{"type": "host_isolate", "parameters": {}}],
+    },
+    {
+        "name": "Disable Compromised Accounts",
+        "description": "Disable accounts with impossible travel (local accounts via the host's agent)",
+        "policy_type": "auto_disable",
+        "trigger_type": "ueba_risk",
+        "trigger_conditions": {"risk_score": {"operator": "greater_than", "value": 80}},
+        "actions": [{"type": "account_disable", "parameters": {}}],
+    },
+]
+
+
 @shared_task()
 def register_builtin_policies(organization_id: str) -> dict:
     """
@@ -576,32 +607,7 @@ def register_builtin_policies(organization_id: str) -> dict:
         "organization_id": organization_id,
     })
 
-    builtin_specs = [
-        {
-            "name": "Block Malicious IPs",
-            "description": "Auto-block IPs matched by threat intel",
-            "policy_type": "auto_block",
-            "trigger_type": "threat_intel_match",
-            "trigger_conditions": {"severity": {"operator": "in", "value": ["high", "critical"]}},
-            "actions": [{"type": "firewall_block", "parameters": {"duration_hours": 24}}],
-        },
-        {
-            "name": "Isolate Compromised Hosts",
-            "description": "Isolate hosts with confirmed malware",
-            "policy_type": "auto_isolate",
-            "trigger_type": "alert_severity",
-            "trigger_conditions": {"severity": "critical"},
-            "actions": [{"type": "host_isolate", "parameters": {}}],
-        },
-        {
-            "name": "Disable Compromised Accounts",
-            "description": "Disable accounts with impossible travel",
-            "policy_type": "auto_disable",
-            "trigger_type": "ueba_risk",
-            "trigger_conditions": {"risk_score": {"operator": "greater_than", "value": 80}},
-            "actions": [{"type": "account_disable", "parameters": {"action": "disable"}}],
-        },
-    ]
+    builtin_specs = BUILTIN_POLICY_SPECS
 
     async def _run() -> dict:
         from src.models.user import User
@@ -628,7 +634,8 @@ def register_builtin_policies(organization_id: str) -> dict:
             skipped: list[str] = []
             for spec in builtin_specs:
                 exists_stmt = select(func.count()).select_from(RemediationPolicy).where(
-                    RemediationPolicy.name == spec["name"]
+                    RemediationPolicy.name == spec["name"],
+                    RemediationPolicy.organization_id == organization_id,
                 )
                 if ((await session.execute(exists_stmt)).scalar() or 0) > 0:
                     skipped.append(spec["name"])

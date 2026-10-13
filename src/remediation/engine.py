@@ -12,7 +12,7 @@ Responsible for:
 import asyncio
 import json
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, ClassVar
 from uuid import uuid4
 
 import httpx
@@ -27,6 +27,14 @@ from src.models.asset import Asset, AssetStatus
 from src.models.user import User
 from src.tickethub.models import TicketActivity
 from src.vulnmgmt.models import Vulnerability, VulnerabilityInstance, VulnerabilityStatus
+from src.remediation.actions import (
+    is_containment_step,
+    resolve_action,
+    revert_step,
+    run_action,
+    step_key,
+    summarize_steps,
+)
 from src.remediation.models import (
     RemediationPolicy,
     RemediationAction,
@@ -232,6 +240,50 @@ class RemediationEngine:
         await self._run_actions(execution.id)
         return execution
 
+    async def execute_manual(
+        self,
+        *,
+        action_type: str,
+        target_entity: str,
+        target_type: str,
+        parameters: dict,
+        requires_approval: bool,
+        initiated_by: str,
+        organization_id: str,
+    ) -> RemediationExecution:
+        """Create and (unless approval is required) run a policy-less remediation.
+
+        ``action_type`` must be a registry key (the caller validates it). With
+        ``requires_approval`` the execution waits for a second admin
+        (``approve_execution``); otherwise it runs now.
+        """
+        execution = RemediationExecution(
+            id=str(uuid4()),
+            policy_id=None,
+            trigger_source="manual",
+            trigger_details={"parameters": parameters, "initiated_by": initiated_by},
+            target_entity=target_entity,
+            target_type=target_type or "unknown",
+            actions_planned=[{"type": action_type, "parameters": parameters}],
+            actions_completed=[],
+            status="pending",
+            created_by=initiated_by,
+            organization_id=organization_id,
+        )
+        self.db.add(execution)
+        await self.db.flush()
+        if requires_approval:
+            execution.status = "awaiting_approval"
+            execution.approval_status = "pending"
+            await self.db.commit()
+            return execution
+        execution.approval_status = "auto_approved"
+        execution.approved_at = utc_now()
+        execution.status = "approved"
+        await self.db.commit()
+        await self._run_actions(execution.id)
+        return execution
+
     async def _run_actions(self, execution_id: str) -> dict:
         """
         Execute all actions in an execution sequentially.
@@ -252,7 +304,27 @@ class RemediationEngine:
         execution.started_at = utc_now()
         await self.db.commit()
 
-        logger.info(f"Starting remediation actions", extra={
+        # A human approver (separation of duties is enforced at the route)
+        # authorises the high-blast agent commands this run issues; auto-
+        # approved and policy-less runs leave them in the agent approval queue.
+        approval_override = execution.approval_status == "approved" and bool(execution.approved_by)
+        # No human clicked anything for a policy-triggered auto-approved run
+        # (trigger task or approval-timeout auto-approval): containment must
+        # not actuate unattended. Manual, quick-action and playbook runs are
+        # policy-less and human-initiated; approved runs had a human approver.
+        unattended = execution.approval_status == "auto_approved" and execution.policy_id is not None
+        actor = str(execution.approved_by or execution.created_by or f"system:remediation:{execution_id}")
+        context = {
+            "execution_id": execution_id,
+            "trigger_data": execution.trigger_details,
+            "organization_id": execution.organization_id,
+            "initiated_by": execution.approved_by or execution.created_by,
+            "actor": actor,
+            "approval_override": approval_override,
+            "unattended": unattended,
+        }
+
+        logger.info("Starting remediation actions", extra={
             "execution_id": execution_id,
             "action_count": len(execution.actions_planned),
         })
@@ -266,10 +338,7 @@ class RemediationEngine:
                 result = await self._execute_single_action(
                     action_def,
                     execution.target_entity,
-                    {
-                        "execution_id": execution_id,
-                        "trigger_data": execution.trigger_details,
-                    }
+                    context,
                 )
 
                 # Bounded retry: re-invoke the executor with a small
@@ -290,10 +359,7 @@ class RemediationEngine:
                         result = await self._execute_single_action(
                             action_def,
                             execution.target_entity,
-                            {
-                                "execution_id": execution_id,
-                                "trigger_data": execution.trigger_details,
-                            }
+                            context,
                         )
                         attempts += 1
                     result["attempts"] = attempts
@@ -324,8 +390,11 @@ class RemediationEngine:
                 error_result = {
                     "action_type": action_def.get("type"),
                     "success": False,
+                    "status": "failed",
+                    "result": "failed",
                     "error": str(e),
                     "timestamp": utc_now().isoformat(),
+                    "finished_at": utc_now().isoformat(),
                 }
                 results.append(error_result)
                 execution.actions_completed = [*(execution.actions_completed or []), error_result]
@@ -334,10 +403,14 @@ class RemediationEngine:
 
             await self.db.commit()
 
-        # Determine overall result
-        all_success = all(r.get("success", False) for r in results)
-        execution.overall_result = "success" if all_success else "partial_success" if results else "failure"
-        execution.status = "completed"
+        # Honest outcome: a failed step fails the run, and steps that could
+        # not act (detection_only / awaiting_integration) never count as success.
+        status, overall, error_message = summarize_steps(results)
+        all_success = overall == "success"
+        execution.overall_result = overall
+        execution.status = status
+        if error_message:
+            execution.error_message = error_message
         execution.completed_at = utc_now()
 
         # Update policy metrics
@@ -377,7 +450,34 @@ class RemediationEngine:
         Returns:
             Result dictionary with success flag and details
         """
-        action_type = action_def.get("type")
+        action_type = step_key(action_def)
+        started_at = utc_now().isoformat()
+        if resolve_action(action_type) is not None:
+            return await run_action(
+                self.db,
+                context.get("organization_id"),
+                action_type,
+                target,
+                action_def.get("parameters") or {},
+                actor=context.get("actor") or f"system:remediation:{context.get('execution_id')}",
+                reason=f"remediation execution {context.get('execution_id')}",
+                execution_ref=context.get("execution_id"),
+                approval_override=bool(context.get("approval_override")),
+                trigger_data=context.get("trigger_data") or {},
+                unattended=bool(context.get("unattended")),
+            )
+        if action_type in self.UNEXECUTABLE_ACTIONS:
+            return {
+                "action_type": action_type,
+                "target": target,
+                "success": False,
+                "status": "failed",
+                "result": "failed",
+                "error": f"not executable: {self.UNEXECUTABLE_ACTIONS[action_type]}",
+                "started_at": started_at,
+                "finished_at": utc_now().isoformat(),
+                "timestamp": utc_now(),
+            }
         executor = self.executors.get(action_type)
 
         if not executor:
@@ -385,7 +485,11 @@ class RemediationEngine:
             return {
                 "action_type": action_type,
                 "success": False,
+                "status": "failed",
+                "result": "failed",
                 "error": f"Unknown action type: {action_type}",
+                "started_at": started_at,
+                "finished_at": utc_now().isoformat(),
                 "timestamp": utc_now(),
             }
 
@@ -395,11 +499,17 @@ class RemediationEngine:
                 parameters=action_def.get("parameters", {}),
                 context=context,
             )
+            succeeded = bool(result.get("success", False))
             return {
                 "action_type": action_type,
                 "target": target,
-                "success": result.get("success", False),
+                "success": succeeded,
+                "status": "executed" if succeeded else "failed",
+                "result": "executed" if succeeded else "failed",
+                "error": None if succeeded else result.get("error"),
                 "details": result,
+                "started_at": started_at,
+                "finished_at": utc_now().isoformat(),
                 "timestamp": utc_now(),
             }
         except asyncio.TimeoutError:
@@ -408,9 +518,30 @@ class RemediationEngine:
                 "action_type": action_type,
                 "target": target,
                 "success": False,
+                "status": "failed",
+                "result": "failed",
                 "error": "Action timeout",
+                "started_at": started_at,
+                "finished_at": utc_now().isoformat(),
                 "timestamp": utc_now(),
             }
+
+    # Executor keys kept for old policy rows but no longer executable: each
+    # used to report success without doing the work it names (or sent
+    # outbound HTTP outside the integration engine). The registry in
+    # src/remediation/actions.py lists what can run.
+    UNEXECUTABLE_ACTIONS: ClassVar[dict[str, str]] = {
+        "script": "no sandboxed script runner exists; scripts were only logged",
+        "webhook": "outbound HTTP must go through an installed integration (src/integrations/engine.py)",
+        "patch_deploy": "no patch deployment integration exists; it only marked vulnerabilities patched",
+        "dns_sinkhole": "no DNS / firewall enforcement point exists; it only registered an IOC",
+        "email_quarantine": "no mail-gateway integration exists; it only logged a notification",
+        "ticket_create": "use a TicketHub or integration action; it only logged a notification",
+        "account_lock": "PySOAR login accounts are not containment targets; no identity-provider connector exists",
+        "password_reset": "PySOAR login accounts are not containment targets; no identity-provider connector exists",
+        "session_terminate": "PySOAR login accounts are not containment targets; no identity-provider connector exists",
+        "token_revoke": "PySOAR login accounts are not containment targets; no identity-provider connector exists",
+    }
 
     # Action types that have no automated inverse in this platform.
     # Each maps to the honest reason we report instead of a fake success.
@@ -424,7 +555,7 @@ class RemediationEngine:
         "script": "queued script side effects are outside PySOAR's control",
     }
 
-    async def rollback_execution(self, execution_id: str) -> dict:
+    async def rollback_execution(self, execution_id: str, actor: str | None = None) -> dict:
         """
         Rollback a completed execution by actually reversing each
         completed action, in reverse order.
@@ -482,9 +613,18 @@ class RemediationEngine:
                 continue
 
             try:
-                outcome = await self._rollback_single_action(
-                    action_type, action_result, execution
-                )
+                if is_containment_step(action_result):
+                    outcome = await revert_step(
+                        self.db,
+                        execution.organization_id,
+                        action_result,
+                        actor=actor or f"system:remediation:{execution_id}",
+                        execution_ref=execution_id,
+                    )
+                else:
+                    outcome = await self._rollback_single_action(
+                        action_type, action_result, execution
+                    )
             except Exception as e:
                 logger.error(f"Rollback action error", extra={
                     "execution_id": execution_id,
@@ -634,11 +774,14 @@ class RemediationEngine:
             asset_id = details.get("asset_id")
             if asset_id:
                 asset = await self.db.get(Asset, asset_id)
+                if asset is not None and asset.organization_id != execution.organization_id:
+                    asset = None
             if asset is None and target:
                 stmt = select(Asset).where(
+                    Asset.organization_id == execution.organization_id,
                     (Asset.hostname == target)
                     | (Asset.name == target)
-                    | (Asset.ip_address == target)
+                    | (Asset.ip_address == target),
                 )
                 asset = (await self.db.execute(stmt)).scalars().first()
             if asset is None:
@@ -684,8 +827,13 @@ class RemediationEngine:
             user_id = details.get("user_id")
             if user_id:
                 user = await self.db.get(User, user_id)
+                if user is not None and user.organization_id != execution.organization_id:
+                    user = None
             if user is None and target:
-                stmt = select(User).where(User.email == target)
+                stmt = select(User).where(
+                    User.email == target,
+                    User.organization_id == execution.organization_id,
+                )
                 user = (await self.db.execute(stmt)).scalars().first()
             if user is None:
                 return {
@@ -840,9 +988,9 @@ class RemediationEngine:
         self,
         execution_id: str,
         approver_id: str,
-    ) -> None:
+    ) -> dict:
         """
-        Approve a pending remediation execution.
+        Approve a pending remediation execution and run its planned actions.
 
         Args:
             execution_id: RemediationExecution ID
@@ -867,7 +1015,7 @@ class RemediationEngine:
         })
 
         # Proceed to action execution
-        await self._run_actions(execution_id)
+        return await self._run_actions(execution_id)
 
     async def reject_execution(
         self,

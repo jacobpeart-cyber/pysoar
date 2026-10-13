@@ -13,51 +13,63 @@ Provides full CRUD and operational endpoints for:
 
 import json
 from datetime import datetime, timedelta
-from typing import Optional, List, Tuple
+from typing import Any, List, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, status
 from pydantic import BaseModel as PydanticBaseModel
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_, desc
+from sqlalchemy import desc, func, select
+from sqlalchemy.orm import selectinload
 
 from src.api.deps import CurrentUser, DatabaseSession, OrganizationId, require_role
-from src.core.database import get_db
 from src.core.logging import get_logger
 from src.models.audit import AuditLog
 from src.models.base import utc_now
 from src.models.user import UserRole
+from src.remediation.actions import (
+    UnknownActionError,
+    is_containment_step,
+    list_actions as registry_actions,
+    normalize_actions,
+    resolve_action,
+    run_action,
+    step_is_reversible,
+    step_key,
+    summarize_steps,
+)
+from src.remediation.engine import RemediationEngine
 from src.remediation.models import (
-    RemediationPolicy,
     RemediationAction,
     RemediationExecution,
     RemediationPlaybook,
-    RemediationIntegration,
+    RemediationPolicy,
 )
-from src.remediation.engine import RemediationEngine
 from src.schemas.remediation import (
-    RemediationPolicyCreate,
-    RemediationPolicyUpdate,
-    RemediationPolicyResponse,
-    RemediationActionCreate,
-    RemediationActionResponse,
-    RemediationExecutionResponse,
-    ExecutionProgressResponse,
     ApprovalRequest,
     ApprovalResponse,
-    RejectionRequest,
+    EffectivenessMetrics,
+    ExecutionActionResult,
+    ExecutionProgressResponse,
+    IntegrationTestResult,
     ManualRemediationRequest,
     QuickBlockIPRequest,
-    QuickIsolateHostRequest,
     QuickDisableAccountRequest,
+    QuickIsolateHostRequest,
     QuickQuarantineFileRequest,
-    RemediationPlaybookCreate,
-    RemediationPlaybookResponse,
+    RejectionRequest,
+    RemediationActionCreate,
+    RemediationActionResponse,
+    RemediationActionSpecResponse,
+    RemediationDashboardStats,
+    RemediationExecutionResponse,
     RemediationIntegrationCreate,
     RemediationIntegrationResponse,
-    IntegrationTestResult,
-    RemediationDashboardStats,
+    RemediationIntegrationUpdate,
+    RemediationPlaybookCreate,
+    RemediationPlaybookResponse,
+    RemediationPolicyCreate,
+    RemediationPolicyResponse,
+    RemediationPolicyUpdate,
     RemediationTimelineResponse,
-    EffectivenessMetrics,
 )
 
 logger = get_logger(__name__)
@@ -68,6 +80,22 @@ _ANALYST_WRITE = [Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
 #: Configuration (policies, actions, playbooks, integrations), containment
 #: (quick actions, playbook runs, rollback) and approvals: admins only.
 _ADMIN_WRITE = [Depends(require_role([UserRole.ADMIN]))]
+
+
+def _validated_actions(actions: list) -> list[dict]:
+    """Policy actions normalised to registry keys, or 400 ``unknown_action``."""
+    try:
+        return normalize_actions(actions)
+    except UnknownActionError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": "unknown_action",
+                "detail": str(exc),
+                "unknown": exc.unknown,
+                "allowed": [a["key"] for a in registry_actions()],
+            },
+        ) from exc
 
 
 # ============================================================================
@@ -94,7 +122,7 @@ async def create_policy(
         policy_type=request.policy_type,
         trigger_type=request.trigger_type,
         trigger_conditions=request.trigger_conditions,
-        actions=request.actions,
+        actions=_validated_actions(request.actions),
         is_enabled=request.is_enabled,
         requires_approval=request.requires_approval,
         approval_timeout_minutes=request.approval_timeout_minutes,
@@ -123,21 +151,26 @@ async def list_policies(
     db: DatabaseSession = None,
     policy_type: Optional[str] = Query(None),
     trigger_type: Optional[str] = Query(None),
-    enabled_only: bool = Query(default=True),
+    enabled_only: bool = Query(default=False),
+    policy_type_alias: Optional[str] = Query(None, alias="type", description="Alias of policy_type"),
+    enabled: Optional[bool] = Query(None, description="Filter on is_enabled (true or false)"),
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, ge=1, le=500),
     current_user: CurrentUser = None,
 ):
-    """List remediation policies with optional filtering."""
+    """List remediation policies, disabled ones included unless filtered out."""
     query = select(RemediationPolicy)
     query = query.where(RemediationPolicy.organization_id == org_id)
 
+    policy_type = policy_type or policy_type_alias
     if policy_type:
         query = query.where(RemediationPolicy.policy_type == policy_type)
     if trigger_type:
         query = query.where(RemediationPolicy.trigger_type == trigger_type)
-    if enabled_only:
-        query = query.where(RemediationPolicy.is_enabled == True)
+    if enabled is not None:
+        query = query.where(RemediationPolicy.is_enabled.is_(enabled))
+    elif enabled_only:
+        query = query.where(RemediationPolicy.is_enabled.is_(True))
 
     query = query.order_by(desc(RemediationPolicy.priority)).offset(skip).limit(limit)
     result = await db.execute(query)
@@ -149,26 +182,11 @@ async def list_builtin_policies(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
 ):
-    """List built-in remediation policies."""
-    return {
-        "builtin_policies": [
-            {
-                "name": "Block Malicious IPs",
-                "description": "Auto-block IPs matched by threat intel",
-                "policy_type": "auto_block",
-            },
-            {
-                "name": "Isolate Compromised Hosts",
-                "description": "Isolate hosts with confirmed malware",
-                "policy_type": "auto_isolate",
-            },
-            {
-                "name": "Disable Compromised Accounts",
-                "description": "Disable accounts with impossible travel",
-                "policy_type": "auto_disable",
-            },
-        ]
-    }
+    """The starter policies ``register_builtin_policies`` installs (disabled,
+    approval required). Same list the Celery task uses."""
+    from src.remediation.tasks import BUILTIN_POLICY_SPECS
+
+    return {"builtin_policies": [dict(spec) for spec in BUILTIN_POLICY_SPECS]}
 
 
 @router.get("/policies/{policy_id}", response_model=RemediationPolicyResponse)
@@ -199,6 +217,8 @@ async def update_policy(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
     update_data = request.model_dump(exclude_unset=True)
+    if update_data.get("actions") is not None:
+        update_data["actions"] = _validated_actions(update_data["actions"])
     for key, value in update_data.items():
         setattr(policy, key, value)
     policy.updated_at = utc_now()
@@ -256,26 +276,18 @@ async def test_policy(
 # Actions
 # ============================================================================
 
-@router.get("/actions", response_model=List[RemediationActionResponse])
+@router.get("/actions", response_model=List[RemediationActionSpecResponse])
 async def list_actions(
     org_id: OrganizationId,
-    db: DatabaseSession = None,
-    action_type: Optional[str] = Query(None),
-    skip: int = Query(default=0, ge=0),
-    limit: int = Query(default=50, ge=1, le=500),
+    action_type: Optional[str] = Query(None, description="A registry key or alias"),
     current_user: CurrentUser = None,
 ):
-    """List available remediation actions."""
-    query = select(RemediationAction).where(
-        RemediationAction.organization_id == org_id
-    )
-
+    """The action registry: every key a policy, playbook step or manual
+    remediation may use, with its parameters, approval and reversibility."""
     if action_type:
-        query = query.where(RemediationAction.action_type == action_type)
-
-    query = query.offset(skip).limit(limit)
-    result = await db.execute(query)
-    return result.scalars().all()
+        spec = resolve_action(action_type)
+        return [spec.to_dict()] if spec else []
+    return registry_actions()
 
 
 @router.post("/actions", response_model=RemediationActionResponse, status_code=status.HTTP_201_CREATED, dependencies=_ADMIN_WRITE)
@@ -356,12 +368,14 @@ async def list_executions(
     db: DatabaseSession = None,
     status: Optional[str] = Query(None),
     trigger_source: Optional[str] = Query(None),
+    trigger: Optional[str] = Query(None, description="Alias of trigger_source"),
     days: int = Query(default=7, ge=1, le=90),
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, ge=1, le=500),
     current_user: CurrentUser = None,
 ):
-    """List remediation executions."""
+    """List remediation executions created in the last ``days`` days."""
+    trigger_source = trigger_source or trigger
     query = select(RemediationExecution)
     query = query.where(RemediationExecution.organization_id == org_id)
 
@@ -389,16 +403,17 @@ async def get_pending_approvals(
         RemediationExecution.approval_status == "pending",
     )
     query = query.where(RemediationExecution.organization_id == org_id)
+    query = query.order_by(desc(RemediationExecution.created_at))
     result = await db.execute(query)
     pending = result.scalars().all()
 
     return {
         "count": len(pending),
-        "executions": pending,
+        "executions": [RemediationExecutionResponse.model_validate(e) for e in pending],
     }
 
 
-@router.get("/quick-actions")
+@router.get("/quick-actions", response_model=List[RemediationExecutionResponse])
 async def list_quick_actions(
     org_id: OrganizationId,
     db: DatabaseSession = None,
@@ -494,13 +509,20 @@ async def approve_execution(
 
     # The approver is the authenticated caller, never a client-supplied id
     # (the page used to send approver_id: "" against an FK to users.id).
+    # The planned actions run now through the action registry (containment
+    # service / agent queue); each records its own honest status.
     engine = RemediationEngine(db)
-    await engine.approve_execution(execution_id, str(current_user.id))
+    run = await engine.approve_execution(execution_id, str(current_user.id))
+    await db.refresh(execution)
 
     return ApprovalResponse(
         execution_id=execution_id,
-        approval_status="approved",
-        approved_at=utc_now(),
+        approval_status=execution.approval_status or "approved",
+        approved_at=execution.approved_at,
+        status=execution.status,
+        overall_result=execution.overall_result,
+        error_message=execution.error_message,
+        action_results=[ExecutionActionResult.model_validate(r) for r in (run or {}).get("results", [])],
     )
 
 
@@ -553,7 +575,7 @@ async def reject_execution(
 # flow).
 # ----------------------------------------------------------------------------
 
-_MANUAL_LIFECYCLE_ALLOWED = ("awaiting_manual", "awaiting_integration", "queued")
+_MANUAL_LIFECYCLE_ALLOWED = ("awaiting_manual", "awaiting_integration", "detection_only", "manual_required", "queued")
 _MANUAL_LIFECYCLE_FORBIDDEN = (
     "completed", "failed", "approved", "rejected", "awaiting_approval"
 )
@@ -744,6 +766,21 @@ async def mark_execution_failed(
     }
 
 
+#: Legacy engine action types with a real inverse in
+#: ``RemediationEngine._rollback_single_action`` (rows written before the
+#: action registry recorded revert handles).
+_LEGACY_REVERSIBLE = frozenset({
+    "firewall_block", "dns_sinkhole", "host_isolate", "account_disable", "account_lock",
+    "password_reset", "session_terminate", "token_revoke", "file_quarantine", "patch_deploy",
+})
+
+
+def _step_rollback_possible(step: dict) -> bool:
+    if is_containment_step(step):
+        return step_is_reversible(step)
+    return bool(step.get("success")) and step.get("action_type") in _LEGACY_REVERSIBLE
+
+
 @router.post("/executions/{execution_id}/rollback", dependencies=_ADMIN_WRITE)
 async def rollback_execution(
     execution_id: str,
@@ -751,13 +788,42 @@ async def rollback_execution(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
 ):
-    """Rollback a completed execution."""
+    """Reverse an execution's actions.
+
+    Only actions that actuated and recorded a revert handle (or a legacy
+    engine action with a real inverse) are reversed. When none qualifies the
+    route answers 409 ``not_reversible`` and nothing is attempted.
+    """
     execution = await db.get(RemediationExecution, execution_id)
     if not execution or execution.organization_id != org_id:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    if execution.status == "rolled_back":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"error": "already_rolled_back", "detail": "this execution was already rolled back"},
+        )
+
+    steps = [s for s in (execution.actions_completed or []) if isinstance(s, dict)]
+    reversible = [s for s in steps if _step_rollback_possible(s)]
+    if not reversible:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "error": "not_reversible",
+                "detail": "no action of this execution actuated with a stored revert handle; nothing was changed",
+                "actions": [
+                    {
+                        "action_type": s.get("action_type"),
+                        "status": s.get("status") or s.get("result"),
+                        "reversible": bool(s.get("reversible")),
+                    }
+                    for s in steps
+                ],
+            },
+        )
 
     engine = RemediationEngine(db)
-    result = await engine.rollback_execution(execution_id)
+    result = await engine.rollback_execution(execution_id, actor=str(current_user.id))
 
     return {
         "execution_id": execution_id,
@@ -796,246 +862,160 @@ async def execute_manual_remediation(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
 ):
-    """Trigger manual remediation without a policy: not implemented.
+    """Run one registry action against a target without a policy.
 
-    The engine only runs policy-backed executions (``policy_id=None`` used to
-    raise a ValueError and 500). Use the quick actions or a policy instead.
+    ``action_type`` must be a registry key (``GET /remediation/actions``),
+    else 400 ``unknown_action``. With ``requires_approval`` the execution
+    waits for a second admin (``/executions/{id}/approve``); otherwise it
+    runs now and the response carries the per-action result.
     """
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail={
-            "error": "not_implemented",
-            "detail": "policy-less manual remediation is not supported; use a quick action "
-            "(/remediation/block-ip, /isolate-host, /disable-account, /quarantine-file) or a policy",
-        },
+    spec = resolve_action(request.action_type)
+    if spec is None:
+        _validated_actions([{"type": request.action_type}])
+    if not (request.target_entity or "").strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "missing_target", "detail": "target_entity is required"},
+        )
+    engine = RemediationEngine(db)
+    execution = await engine.execute_manual(
+        action_type=spec.key,
+        target_entity=request.target_entity.strip(),
+        target_type=request.target_type or spec.target_type,
+        parameters=request.parameters or {},
+        requires_approval=request.requires_approval,
+        initiated_by=str(current_user.id),
+        organization_id=org_id,
     )
+    await db.refresh(execution)
+    return {
+        "execution_id": execution.id,
+        "action_type": spec.key,
+        "target": execution.target_entity,
+        "status": execution.status,
+        "approval_status": execution.approval_status,
+        "overall_result": execution.overall_result,
+        "error_message": execution.error_message,
+        "action_results": [
+            ExecutionActionResult.model_validate(r).model_dump(mode="json")
+            for r in (execution.actions_completed or [])
+        ],
+    }
 
 
 # ============================================================================
 # Quick Actions
 # ============================================================================
 #
-# Each of the four quick actions below used to ``return {"status":
-# "queued"}`` without touching the database, the integration layer, or
-# an endpoint agent — analysts clicked "Block IP" and nothing happened.
-# They now:
+# Each quick action creates a RemediationExecution row and runs ONE registry
+# action through ``src.remediation.actions.run_action``, the same path
+# policies, approvals, manual remediations and remediation playbooks use:
 #
-#   1. Write a RemediationExecution row so the Executions tab and
-#      dashboard stats reflect the action.
-#   2. If a matching integration (firewall / EDR / identity) is
-#      installed and active, dispatch the action through its HTTP
-#      API and mark the execution ``completed`` on 2xx, ``failed``
-#      on anything else — with the error surfaced. No silent
-#      green-checkmarks.
-#   3. If no integration is installed, fall back to an IR-capable
-#      endpoint agent (local pysoar agent). On high-blast actions
-#      this still goes through the agent's own approval gate.
-#   4. If neither path exists, the execution lands as
-#      ``awaiting_integration`` (no firewall/EDR/etc installed)
-#      or ``awaiting_manual`` (legacy), carrying a ``metadata.reason``
-#      so the UI can render an honest "staged, nothing dispatched".
-#   5. block-ip also writes a ThreatIndicator IOC so the IOC remains
-#      available to any eventual downstream firewall that gets
-#      installed later.
-
-# Connector IDs that are capable of executing each remediation verb.
-# ``connector_id`` in ``InstalledIntegration`` references
-# ``integration_connectors.id`` (seeded from ``BUILTIN_CONNECTORS``).
-_FIREWALL_CONNECTORS = (
-    "palo_alto_ngfw", "paloalto", "fortinet",
-    "cisco_asa", "cisco_firepower", "checkpoint", "generic_firewall",
-)
-_EDR_CONNECTORS = (
-    "crowdstrike", "sentinelone", "carbon_black", "carbonblack",
-    "microsoft_defender", "defender", "cortex_xdr",
-)
-_IDENTITY_CONNECTORS = (
-    "okta", "azure_ad", "active_directory", "entra", "entra_id",
-    "jumpcloud", "onelogin",
-)
+#   * containment goes through ``src.services.containment`` (endpoint agent
+#     command queue, or an executable integration such as CrowdStrike), which
+#     writes the AuditLog row;
+#   * the response carries the service's honest status: ``executed``,
+#     ``queued_for_approval`` (the agent command waits in
+#     /agents/commands/{id}/approve), ``detection_only`` or
+#     ``awaiting_integration`` (nothing actuated; ``missing_dependency`` says
+#     what is missing), or ``failed``;
+#   * reversible results store a revert handle so
+#     ``/executions/{id}/rollback`` can undo exactly what was issued.
 
 
-async def _find_active_integration(
+async def _run_quick_action(
     db,
-    connector_ids: tuple,
-    org_id: str,
-):
-    """Look up the first active ``InstalledIntegration`` whose
-    ``connector_id`` matches any of ``connector_ids`` (case-insensitive)
-    for this tenant. Returns None if none installed so callers can
-    downgrade to awaiting_integration / agent dispatch."""
-    from src.integrations.models import InstalledIntegration, IntegrationStatus
-
-    normalized = tuple(c.lower() for c in connector_ids)
-    q = select(InstalledIntegration).where(
-        InstalledIntegration.status == IntegrationStatus.ACTIVE.value
-    )
-    q = q.where(InstalledIntegration.organization_id == org_id)
-
-    rows = list((await db.execute(q)).scalars().all())
-    for row in rows:
-        if (row.connector_id or "").lower() in normalized:
-            return row
-    return None
-
-
-async def _dispatch_via_integration(
-    integration,
     *,
-    action: str,
-    payload: dict,
-) -> Tuple[bool, str, dict]:
-    """Execute the remediation action through the installed integration.
-
-    Returns ``(success, detail, raw_response)``. Does not swallow
-    errors: on timeout / connection error / 4xx / 5xx returns
-    ``success=False`` with a human-readable ``detail`` so the caller
-    can surface the real reason.
-
-    The dispatch is a POST to
-    ``<endpoint>/<connector-specific-path>`` with Bearer / API-Key
-    auth depending on what credentials the integration has stored.
-    """
-    import httpx
-
-    # RemediationIntegration stores connection info in `endpoint_url`
-    # and credentials in `auth_config`. The previous code referenced
-    # nonexistent `config_encrypted`/`auth_credentials_encrypted`
-    # columns (those live on InstalledIntegration) so every remediation
-    # dispatch silently fell through to the "base_url not configured"
-    # branch regardless of what the admin had saved.
-    try:
-        config = dict(integration.auth_config) if integration.auth_config else {}
-    except Exception:
-        config = {}
-    credentials = config  # auth_config holds both endpoint metadata and creds
-    endpoint_url = (
-        integration.endpoint_url
-        or config.get("endpoint_url")
-        or config.get("base_url")
-        or config.get("url")
-        or ""
-    )
-    base_url = endpoint_url.rstrip("/") if endpoint_url else ""
-    if not base_url:
-        integration_label = integration.vendor or integration.integration_type or "integration"
-        return False, f"{integration_label} base_url not configured", {}
-
-    api_key = credentials.get("api_key") or credentials.get("token")
-    bearer = credentials.get("bearer_token") or credentials.get("access_token")
-    headers: dict[str, str] = {"Content-Type": "application/json"}
-    if bearer:
-        headers["Authorization"] = f"Bearer {bearer}"
-    elif api_key:
-        # Most vendors accept either Authorization: Bearer or x-api-key
-        headers["Authorization"] = f"Bearer {api_key}"
-        headers["x-api-key"] = api_key
-
-    # Connector-specific URL suffix. We default to a POST of the
-    # payload to <base>/remediation/<action> because every vendor
-    # in our shortlist exposes a JSON endpoint, and that is the
-    # shape our generic_firewall / generic_edr connectors expect.
-    connector = ((integration.vendor or integration.integration_type or "integration") or "").lower()
-    suffix_map = {
-        "crowdstrike": f"/devices/entities/devices-actions/v2?action_name={action}",
-        "sentinelone": f"/web/api/v2.1/agents/actions/{action}",
-        "carbon_black": f"/appservices/v6/actions/{action}",
-        "carbonblack": f"/appservices/v6/actions/{action}",
-        "microsoft_defender": f"/api/machines/{action}",
-        "defender": f"/api/machines/{action}",
-        "cortex_xdr": f"/public_api/v1/endpoints/{action}",
-        "palo_alto_ngfw": "/api/?type=op",
-        "paloalto": "/api/?type=op",
-        "fortinet": "/api/v2/cmdb/firewall/address",
-        "cisco_asa": "/api/objects/networkobjects",
-        "cisco_firepower": "/api/fmc_config/v1/domain/policy",
-        "checkpoint": "/web_api/add-host",
-        "okta": f"/api/v1/users/{payload.get('username','')}/lifecycle/{'deactivate' if action=='disable_account' else action}",
-        "azure_ad": f"/v1.0/users/{payload.get('username','')}",
-        "active_directory": f"/users/{payload.get('username','')}/disable",
-        "entra": f"/v1.0/users/{payload.get('username','')}",
-        "entra_id": f"/v1.0/users/{payload.get('username','')}",
-    }
-    url = f"{base_url}{suffix_map.get(connector, f'/remediation/{action}')}"
-
-    timeout = httpx.Timeout(15.0, connect=5.0)
-    try:
-        async with httpx.AsyncClient(
-            timeout=timeout,
-            verify=config.get("verify_tls", True),
-        ) as client:
-            resp = await client.post(url, headers=headers, json=payload)
-    except httpx.TimeoutException:
-        return False, f"{connector}: request timed out after 15s", {}
-    except httpx.HTTPError as exc:
-        return False, f"{connector}: HTTP error: {exc}", {}
-
-    try:
-        body = resp.json()
-    except Exception:
-        body = {"raw_text": (resp.text or "")[:2000]}
-
-    if 200 <= resp.status_code < 300:
-        return True, f"{connector} accepted {action} (HTTP {resp.status_code})", body
-    if resp.status_code in (401, 403):
-        return False, f"{connector}: authentication rejected (HTTP {resp.status_code})", body
-    return False, f"{connector}: dispatch failed (HTTP {resp.status_code})", body
-
-
-async def _find_ir_agent(db, hostname: Optional[str], org_id: str):
-    """Find the caller's active IR-capable agent on ``hostname``.
-
-    Returns None when no hostname is given (never an arbitrary agent in the
-    org) or nothing matches, so callers fall back to a manual path."""
-    from src.agents.models import EndpointAgent
-    from src.agents.capabilities import AgentCapability
-
-    if not (hostname or "").strip():
-        return None
-    q = select(EndpointAgent).where(
-        EndpointAgent.status == "active",
-        EndpointAgent.hostname == hostname,
-        EndpointAgent.organization_id == org_id,
-    )
-
-    rows = list((await db.execute(q)).scalars().all())
-    for a in rows:
-        if AgentCapability.LIVE_RESPONSE.value in (a.capabilities or []):
-            return a
-    return None
-
-
-async def _write_execution(
-    *,
-    db,
     current_user,
     org_id: str,
-    target_entity: str,
+    action_key: str,
+    target: str,
     target_type: str,
-    action_type: str,
+    parameters: dict,
     trigger_details: dict,
-    agent_command_id: Optional[str] = None,
-    status_value: str = "running",
-) -> RemediationExecution:
-    """Create a RemediationExecution row for a quick action."""
+    reason: str,
+) -> tuple[RemediationExecution, dict]:
+    """Create the execution row, run the action, and record the honest outcome."""
     execution = RemediationExecution(
         policy_id=None,
         trigger_source="manual_quick_action",
         trigger_details=trigger_details,
-        status=status_value,
-        target_entity=target_entity,
+        status="running",
+        started_at=utc_now(),
+        target_entity=target,
         target_type=target_type,
-        actions_planned=[{"action_type": action_type, "target": target_entity}],
+        actions_planned=[{"type": action_key, "parameters": parameters}],
         actions_completed=[],
-        started_at=utc_now() if status_value == "running" else None,
-        created_by=str(current_user.id) if current_user else None,
+        created_by=str(current_user.id),
         organization_id=org_id,
-        metrics={"agent_command_id": agent_command_id} if agent_command_id else {},
+        metrics={},
     )
     db.add(execution)
     await db.flush()
-    await db.refresh(execution)
-    return execution
+
+    step = await run_action(
+        db, org_id, action_key, target, parameters,
+        actor=str(current_user.id), reason=reason, execution_ref=execution.id,
+        trigger_data=trigger_details,
+    )
+    run_status, overall, error_message = summarize_steps([step])
+    execution.actions_completed = [step]
+    execution.status = run_status
+    execution.overall_result = overall
+    execution.error_message = error_message or (step.get("error") if not step.get("success") else None)
+    execution.current_action_index = 1
+    details = step.get("details") or {}
+    execution.metrics = {
+        "dispatch_method": step.get("status"),
+        "containment_status": step.get("status"),
+        "agent_command_id": details.get("command_id"),
+        "integration": details.get("integration"),
+        "missing_dependency": step.get("missing_dependency"),
+        "audit_log_id": step.get("audit_log_id"),
+        "reason": step.get("detail"),
+    }
+    if run_status in ("completed", "failed"):
+        execution.completed_at = utc_now()
+    await db.flush()
+    return execution, step
+
+
+def _quick_response(execution: RemediationExecution, step: dict, *, action: str, target: str, **extra: Any) -> dict:
+    """Quick-action response: the historic keys plus the containment outcome."""
+    details = step.get("details") or {}
+    return {
+        "execution_id": execution.id,
+        "action": action,
+        "target": target,
+        "status": execution.status,
+        "dispatch_method": step.get("status"),
+        "integration_id": extra.pop("integration_id", None),
+        "agent_command_id": details.get("command_id"),
+        "error_message": execution.error_message,
+        "containment_status": step.get("status"),
+        "detail": step.get("detail"),
+        "missing_dependency": step.get("missing_dependency"),
+        "reversible": bool(step.get("reversible")),
+        "audit_log_id": step.get("audit_log_id"),
+        "result": ExecutionActionResult.model_validate(step).model_dump(mode="json"),
+        **extra,
+    }
+
+
+async def _integration_id_for(db, org_id: str, connector_name: Optional[str]) -> Optional[str]:
+    if not connector_name:
+        return None
+    from src.integrations.models import InstalledIntegration, IntegrationConnector
+
+    row = (await db.execute(
+        select(InstalledIntegration.id)
+        .join(IntegrationConnector, IntegrationConnector.id == InstalledIntegration.connector_id)
+        .where(
+            InstalledIntegration.organization_id == org_id,
+            func.lower(IntegrationConnector.name) == connector_name.lower(),
+        ),
+    )).scalars().first()
+    return row
 
 
 @router.post("/block-ip", dependencies=_ADMIN_WRITE)
@@ -1045,132 +1025,59 @@ async def quick_block_ip(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
 ):
-    """Quick action: block an attacker IP.
+    """Quick action: block an IP on every IR-enrolled endpoint agent.
 
-    Always writes a ThreatIndicator IOC so the block is staged for
-    any future firewall integration. Then:
-      * If a firewall integration is installed and active, dispatch
-        the block via its HTTP API and mark ``completed`` only on 2xx.
-        On failure, mark ``failed`` with ``error_message``.
-      * If no firewall is installed, mark ``awaiting_integration`` so
-        the UI can tell the operator this was staged, not dispatched.
+    Also registers the IP as an active detection IOC for ``duration_hours``
+    (the agent firewall rules stay until the execution is rolled back; a
+    rollback deactivates the IOC too).
     """
-    logger.info("Quick block IP", extra={"ip": request.ip, "duration_hours": request.duration_hours})
+    import ipaddress
 
-    # Write ThreatIndicator IOC — that's what a firewall block really is
+    ip = (request.ip or "").strip()
     try:
-        from src.intel.models import ThreatIndicator
-        ioc = ThreatIndicator(
-            indicator_type="ip",
-            value=request.ip,
-            severity="high",
-            confidence=95,
-            source="remediation_quick_action",
-            tags=["auto_block", f"ttl_hours_{request.duration_hours}"],
-            is_active=True,
-            organization_id=org_id,
-        )
-        db.add(ioc)
-        await db.flush()
-        ioc_id = ioc.id
-    except Exception as exc:  # noqa: BLE001
-        logger.error(f"Failed to create ThreatIndicator for block-ip: {exc}")
-        ioc_id = None
+        ipaddress.ip_address(ip)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "invalid_ip", "detail": f"{ip!r} is not an IP address"},
+        ) from exc
 
-    # Is there a firewall integration we can actually dispatch through?
-    integration = await _find_active_integration(db, _FIREWALL_CONNECTORS, org_id)
+    from src.intel.models import ThreatIndicator
 
-    dispatch_method: str
-    integration_id: Optional[str] = None
-    status_value: str
-    overall_result: str
-    error_message: Optional[str] = None
-    integration_detail: Optional[str] = None
-    response_body: dict = {}
-
-    if integration is not None:
-        integration_id = integration.id
-        dispatch_method = "integration"
-        success, integration_detail, response_body = await _dispatch_via_integration(
-            integration,
-            action="block_ip",
-            payload={
-                "ip": request.ip,
-                "duration_hours": request.duration_hours,
-                "reason": request.reason or "quick action",
-                "ioc_id": ioc_id,
-            },
-        )
-        if success:
-            status_value = "completed"
-            overall_result = "success"
-        else:
-            status_value = "failed"
-            overall_result = "failure"
-            error_message = integration_detail
-    else:
-        dispatch_method = "awaiting_integration"
-        status_value = "awaiting_integration"
-        overall_result = "pending"
-
-    execution = await _write_execution(
-        db=db,
-        current_user=current_user,
-        org_id=org_id,
-        target_entity=request.ip,
-        target_type="ip",
-        action_type="firewall_block",
-        trigger_details={
-            "ip": request.ip,
-            "duration_hours": request.duration_hours,
-            "ioc_id": ioc_id,
-            "reason": request.reason or "quick action",
-            "dispatch_method": dispatch_method,
-            "integration_id": integration_id,
-            "integration_detail": integration_detail,
-        },
-        status_value=status_value,
+    now = utc_now()
+    ioc = ThreatIndicator(
+        indicator_type="ip",
+        value=ip,
+        severity="high",
+        confidence=95,
+        source="remediation_quick_action",
+        tags=["auto_block", f"ttl_hours_{request.duration_hours}"],
+        is_active=True,
+        first_seen=now,
+        last_seen=now,
+        expires_at=now + timedelta(hours=request.duration_hours),
+        organization_id=org_id,
     )
-    execution.actions_completed = [{
-        "action_type": "firewall_block",
-        "target": request.ip,
-        "result": overall_result,
-        "ioc_id": ioc_id,
-        "dispatch_method": dispatch_method,
-        "integration_id": integration_id,
-        "detail": integration_detail,
-    }]
-    execution.overall_result = overall_result
-    execution.error_message = error_message
-    # Capture the truth on the execution row's metrics blob too —
-    # that's what the UI tooltips read.
-    metrics = dict(execution.metrics or {})
-    metrics.update({
-        "dispatch_method": dispatch_method,
-        "integration_id": integration_id,
-        "integration_detail": integration_detail,
-        "response": response_body,
-        "reason": (
-            "no_firewall_integration_installed"
-            if dispatch_method == "awaiting_integration" else None
-        ),
-    })
-    execution.metrics = metrics
-    if status_value in ("completed", "failed"):
-        execution.completed_at = utc_now()
+    db.add(ioc)
     await db.flush()
 
-    return {
-        "execution_id": execution.id,
-        "action": "block_ip",
-        "target": request.ip,
-        "duration_hours": request.duration_hours,
-        "status": execution.status,
-        "ioc_id": ioc_id,
-        "dispatch_method": dispatch_method,
-        "integration_id": integration_id,
-        "error_message": error_message,
-    }
+    execution, step = await _run_quick_action(
+        db, current_user=current_user, org_id=org_id, action_key="firewall_block", target=ip,
+        target_type="ip", parameters={},
+        trigger_details={
+            "ip": ip, "duration_hours": request.duration_hours, "ioc_id": ioc.id,
+            "reason": request.reason or "quick action",
+        },
+        reason=request.reason or "quick action: block IP",
+    )
+    # The IOC is part of what a rollback reverses.
+    step = {**step, "ioc_id": ioc.id}
+    execution.actions_completed = [step]
+    await db.flush()
+    return _quick_response(
+        execution, step, action="block_ip", target=ip,
+        duration_hours=request.duration_hours, ioc_id=ioc.id,
+    )
 
 
 @router.post("/isolate-host", dependencies=_ADMIN_WRITE)
@@ -1180,121 +1087,21 @@ async def quick_isolate_host(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
 ):
-    """Quick action: isolate a host.
-
-    Prefers a native EDR integration (CrowdStrike / SentinelOne /
-    Defender / Carbon Black). Falls back to the pysoar endpoint
-    agent if one is enrolled. If neither is available, lands as
-    ``awaiting_integration`` with an honest metadata.reason.
-    """
-    from src.agents.capabilities import AgentAction
-    from src.agents.service import AgentService
-
-    logger.info("Quick isolate host", extra={"hostname": request.hostname})
-
-    integration = await _find_active_integration(db, _EDR_CONNECTORS, org_id)
-
-    dispatch_method: str
-    integration_id: Optional[str] = None
-    agent_command_id: Optional[str] = None
-    status_value: str
-    error_message: Optional[str] = None
-    integration_detail: Optional[str] = None
-    overall_result: str
-    response_body: dict = {}
-    reason_tag: Optional[str] = None
-
-    if integration is not None:
-        integration_id = integration.id
-        dispatch_method = "integration"
-        success, integration_detail, response_body = await _dispatch_via_integration(
-            integration,
-            action="isolate_host",
-            payload={
-                "hostname": request.hostname,
-                "reason": request.reason or "quick action",
-            },
+    """Quick action: isolate a host via its endpoint agent, else CrowdStrike Falcon."""
+    hostname = (request.hostname or "").strip()
+    if not hostname:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "missing_target", "detail": "hostname is required"},
         )
-        if success:
-            status_value = "completed"
-            overall_result = "success"
-        else:
-            status_value = "failed"
-            overall_result = "failure"
-            error_message = integration_detail
-    else:
-        # No EDR integration — try local agent next.
-        agent = await _find_ir_agent(db, request.hostname, org_id)
-        if agent is not None:
-            try:
-                svc = AgentService(db)
-                cmd = await svc.issue_command(
-                    agent=agent,
-                    action=AgentAction.ISOLATE_HOST.value,
-                    payload={"reason": request.reason or "manual quick action"},
-                    issued_by=str(current_user.id),
-                )
-                agent_command_id = cmd.id
-                status_value = "awaiting_approval"
-                dispatch_method = "integration"
-                integration_detail = f"dispatched via pysoar agent {agent.id}"
-                overall_result = "pending"
-            except Exception as exc:  # noqa: BLE001
-                logger.error(f"AgentService.issue_command failed for isolate_host: {exc}")
-                dispatch_method = "awaiting_integration"
-                status_value = "awaiting_integration"
-                error_message = f"agent dispatch failed: {exc}"
-                overall_result = "pending"
-                reason_tag = "agent_dispatch_failed"
-        else:
-            dispatch_method = "awaiting_integration"
-            status_value = "awaiting_integration"
-            overall_result = "pending"
-            reason_tag = "no_edr_integration_installed"
-
-    execution = await _write_execution(
-        db=db,
-        current_user=current_user,
-        org_id=org_id,
-        target_entity=request.hostname,
-        target_type="host",
-        action_type="host_isolate",
-        trigger_details={
-            "hostname": request.hostname,
-            "reason": request.reason,
-            "dispatch_method": dispatch_method,
-            "integration_id": integration_id,
-            "agent_command_id": agent_command_id,
-        },
-        agent_command_id=agent_command_id,
-        status_value=status_value,
+    execution, step = await _run_quick_action(
+        db, current_user=current_user, org_id=org_id, action_key="host_isolate", target=hostname,
+        target_type="host", parameters={},
+        trigger_details={"hostname": hostname, "reason": request.reason},
+        reason=request.reason or "quick action: isolate host",
     )
-    execution.overall_result = overall_result
-    execution.error_message = error_message
-    metrics = dict(execution.metrics or {})
-    metrics.update({
-        "dispatch_method": dispatch_method,
-        "integration_id": integration_id,
-        "integration_detail": integration_detail,
-        "agent_command_id": agent_command_id,
-        "response": response_body,
-        "reason": reason_tag,
-    })
-    execution.metrics = metrics
-    if status_value in ("completed", "failed"):
-        execution.completed_at = utc_now()
-    await db.flush()
-
-    return {
-        "execution_id": execution.id,
-        "action": "isolate_host",
-        "target": request.hostname,
-        "status": execution.status,
-        "dispatch_method": dispatch_method,
-        "integration_id": integration_id,
-        "agent_command_id": agent_command_id,
-        "error_message": error_message,
-    }
+    integration_id = await _integration_id_for(db, org_id, (step.get("details") or {}).get("integration"))
+    return _quick_response(execution, step, action="isolate_host", target=hostname, integration_id=integration_id)
 
 
 @router.post("/disable-account", dependencies=_ADMIN_WRITE)
@@ -1304,124 +1111,26 @@ async def quick_disable_account(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
 ):
-    """Quick action: disable a user account.
+    """Quick action: disable a local account through the agent on ``hostname``.
 
-    Prefers an identity-provider integration (Okta / Azure AD /
-    Entra / AD). Falls back to the pysoar endpoint agent if one is
-    enrolled on the target host. Otherwise lands as
-    ``awaiting_integration`` so the UI can tell the operator this
-    was staged, not dispatched.
+    Directory accounts need an identity-provider connector PySOAR does not
+    implement: the result is ``awaiting_integration`` (one is installed) or
+    ``detection_only``. Not reversible.
     """
-    from src.agents.capabilities import AgentAction
-    from src.agents.service import AgentService
-
-    logger.info("Quick disable account", extra={"username": request.username})
-
-    integration = await _find_active_integration(db, _IDENTITY_CONNECTORS, org_id)
-
-    dispatch_method: str
-    integration_id: Optional[str] = None
-    agent_command_id: Optional[str] = None
-    status_value: str
-    error_message: Optional[str] = None
-    integration_detail: Optional[str] = None
-    overall_result: str
-    response_body: dict = {}
-    reason_tag: Optional[str] = None
-
-    if integration is not None:
-        integration_id = integration.id
-        dispatch_method = "integration"
-        success, integration_detail, response_body = await _dispatch_via_integration(
-            integration,
-            action="disable_account",
-            payload={
-                "username": request.username,
-                "reason": request.reason or "quick action",
-            },
+    username = (request.username or "").strip()
+    if not username:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "missing_target", "detail": "username is required"},
         )
-        if success:
-            status_value = "completed"
-            overall_result = "success"
-        else:
-            status_value = "failed"
-            overall_result = "failure"
-            error_message = integration_detail
-    else:
-        agent = await _find_ir_agent(db, getattr(request, "hostname", None), org_id)
-        if agent is not None:
-            try:
-                svc = AgentService(db)
-                cmd = await svc.issue_command(
-                    agent=agent,
-                    action=AgentAction.DISABLE_ACCOUNT.value,
-                    payload={
-                        "username": request.username,
-                        "reason": request.reason or "manual quick action",
-                    },
-                    issued_by=str(current_user.id),
-                )
-                agent_command_id = cmd.id
-                status_value = "awaiting_approval"
-                dispatch_method = "integration"
-                integration_detail = f"dispatched via pysoar agent {agent.id}"
-                overall_result = "pending"
-            except Exception as exc:  # noqa: BLE001
-                logger.error(f"AgentService.issue_command failed for disable_account: {exc}")
-                dispatch_method = "awaiting_integration"
-                status_value = "awaiting_integration"
-                error_message = f"agent dispatch failed: {exc}"
-                overall_result = "pending"
-                reason_tag = "agent_dispatch_failed"
-        else:
-            dispatch_method = "awaiting_integration"
-            status_value = "awaiting_integration"
-            overall_result = "pending"
-            reason_tag = "no_identity_integration_installed"
-
-    execution = await _write_execution(
-        db=db,
-        current_user=current_user,
-        org_id=org_id,
-        target_entity=request.username,
-        target_type="user",
-        action_type="account_disable",
-        trigger_details={
-            "username": request.username,
-            "reason": getattr(request, "reason", None),
-            "dispatch_method": dispatch_method,
-            "integration_id": integration_id,
-            "agent_command_id": agent_command_id,
-        },
-        agent_command_id=agent_command_id,
-        status_value=status_value,
+    hostname = (request.hostname or "").strip() or None
+    execution, step = await _run_quick_action(
+        db, current_user=current_user, org_id=org_id, action_key="account_disable", target=username,
+        target_type="user", parameters={"hostname": hostname} if hostname else {},
+        trigger_details={"username": username, "hostname": hostname, "reason": request.reason},
+        reason=request.reason or "quick action: disable account",
     )
-    execution.overall_result = overall_result
-    execution.error_message = error_message
-    metrics = dict(execution.metrics or {})
-    metrics.update({
-        "dispatch_method": dispatch_method,
-        "integration_id": integration_id,
-        "integration_detail": integration_detail,
-        "agent_command_id": agent_command_id,
-        "response": response_body,
-        "reason": reason_tag,
-    })
-    execution.metrics = metrics
-    if status_value in ("completed", "failed"):
-        execution.completed_at = utc_now()
-    await db.flush()
-
-    return {
-        "execution_id": execution.id,
-        "action": "disable_account",
-        "target": request.username,
-        "status": execution.status,
-        "dispatch_method": dispatch_method,
-        "integration_id": integration_id,
-        "agent_command_id": agent_command_id,
-        "error_message": error_message,
-    }
+    return _quick_response(execution, step, action="disable_account", target=username, hostname=hostname)
 
 
 @router.post("/quarantine-file", dependencies=_ADMIN_WRITE)
@@ -1431,70 +1140,26 @@ async def quick_quarantine_file(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
 ):
-    """Quick action: quarantine a file on a specific host.
-
-    Requires a hostname so we can route the action to the right IR
-    agent. Quarantine is a high-blast action → awaiting_approval.
-    """
-    from src.agents.capabilities import AgentAction
-    from src.agents.service import AgentService
-
-    if not (request.hostname or "").strip() or not (request.file_path or "").strip():
-        # Without a hostname _find_ir_agent skips its host filter and would
-        # route the quarantine to an arbitrary agent in the org.
+    """Quick action: quarantine a file on a named host through its endpoint agent."""
+    hostname = (request.hostname or "").strip()
+    file_path = (request.file_path or "").strip()
+    if not hostname or not file_path:
+        # Never route a quarantine to an arbitrary agent.
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="hostname and file_path are required",
         )
-
-    logger.info("Quick quarantine file", extra={
-        "file_path": request.file_path,
-        "hostname": request.hostname,
-    })
-
-    agent = await _find_ir_agent(db, request.hostname, org_id)
-    agent_command_id: Optional[str] = None
-    status_value = "awaiting_manual"
-
-    if agent is not None:
-        try:
-            svc = AgentService(db)
-            cmd = await svc.issue_command(
-                agent=agent,
-                action=AgentAction.QUARANTINE_FILE.value,
-                payload={"path": request.file_path},
-                issued_by=str(current_user.id),
-            )
-            agent_command_id = cmd.id
-            status_value = "awaiting_approval"
-        except Exception as exc:  # noqa: BLE001
-            logger.error(f"AgentService.issue_command failed for quarantine_file: {exc}")
-
-    execution = await _write_execution(
-        db=db,
-        current_user=current_user,
-        org_id=org_id,
-        target_entity=request.file_path,
-        target_type="file",
-        action_type="file_quarantine",
-        trigger_details={
-            "file_path": request.file_path,
-            "hostname": request.hostname,
-            "agent_id": agent.id if agent else None,
-        },
-        agent_command_id=agent_command_id,
-        status_value=status_value,
+    execution, step = await _run_quick_action(
+        db, current_user=current_user, org_id=org_id, action_key="file_quarantine", target=hostname,
+        target_type="host", parameters={"file_path": file_path},
+        trigger_details={"file_path": file_path, "hostname": hostname, "reason": request.reason},
+        reason=request.reason or "quick action: quarantine file",
     )
-
-    return {
-        "execution_id": execution.id,
-        "action": "quarantine_file",
-        "target": request.file_path,
-        "hostname": request.hostname,
-        "status": status_value,
-        "agent_command_id": agent_command_id,
-        "agent_available": agent is not None,
-    }
+    details = step.get("details") or {}
+    return _quick_response(
+        execution, step, action="quarantine_file", target=file_path, hostname=hostname,
+        agent_available=bool(details.get("agent_id")),
+    )
 
 
 # ============================================================================
@@ -1598,14 +1263,13 @@ async def execute_playbook(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
 ):
-    """Execute a playbook against a real target and persist the run.
+    """Run a remediation playbook's steps against a target.
 
-    Previously returned ``{"status": "queued"}`` with no execution row
-    ever written. The playbook appeared to run but no side effect was
-    captured, no actions dispatched, no audit trail. This now creates
-    a ``RemediationExecution`` for the playbook's action set, fans out
-    to ``_execute_remediation_action`` for each step, and records
-    ``actions_completed`` / ``actions_failed`` on the row.
+    Each step's action key (``action_type`` / ``type`` / ``action_id``) must
+    be a registry key; the steps run in order through the same runner as
+    policies and quick actions (``RemediationEngine._run_actions``), and the
+    execution row records every step's honest status. A failed step fails
+    the run; steps that could not act never count as success.
     """
     playbook = await db.get(RemediationPlaybook, playbook_id)
     if not playbook or playbook.organization_id != org_id:
@@ -1621,158 +1285,83 @@ async def execute_playbook(
         or trigger_data.get("target")
         or trigger_data.get("ip_address")
         or trigger_data.get("hostname")
-        or "unspecified"
-    )
-    target_type = str(trigger_data.get("target_type") or "host")
+        or "",
+    ).strip()
+    if not target_entity:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "missing_target", "detail": "trigger_data.target_entity is required"},
+        )
 
+    planned: list[dict] = []
+    for step in playbook.steps or []:
+        params = {}
+        if isinstance(step, dict):
+            params = step.get("parameters") or step.get("params") or step.get("action_config") or {}
+        planned.append({
+            "type": step_key(step) or "",
+            "parameters": params if isinstance(params, dict) else {},
+            "on_failure": (step.get("on_failure") if isinstance(step, dict) else None) or "continue",
+        })
+    if not planned:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "empty_playbook", "detail": "playbook has no steps"},
+        )
+
+    # The admin running the playbook is the authorisation; high-blast agent
+    # commands still wait in the agent approval queue (no override).
     execution = RemediationExecution(
         policy_id=None,
         trigger_source=str(trigger_data.get("trigger_source") or "manual"),
         trigger_id=trigger_data.get("trigger_id"),
         trigger_details={"playbook_id": playbook_id, **(trigger_data or {})},
-        status="running",
-        started_at=utc_now(),
+        status="approved",
+        approval_status="auto_approved",
+        approved_at=utc_now(),
         target_entity=target_entity,
-        target_type=target_type,
-        actions_planned=list(playbook.steps or []),
+        target_type=str(trigger_data.get("target_type") or "host"),
+        actions_planned=planned,
         actions_completed=[],
         current_action_index=0,
-        metrics={},
+        metrics={"playbook_id": playbook_id},
         created_by=str(current_user.id),
         organization_id=org_id,
     )
     db.add(execution)
-    await db.flush()
+    await db.commit()
 
-    # Map playbook step types to an integration_type we look up on the
-    # RemediationIntegration table. Action types we can't map fall
-    # through to 'awaiting_integration' so the execution row carries
-    # honest state.
-    _ACTION_TO_INT_TYPE: dict[str, str] = {
-        "auto_block": "firewall",
-        "block_ip": "firewall",
-        "block_domain": "firewall",
-        "auto_isolate": "edr",
-        "isolate_host": "edr",
-        "auto_quarantine": "edr",
-        "quarantine_file": "edr",
-        "auto_disable": "idp",
-        "disable_account": "idp",
-        "reset_password": "idp",
-        "revoke_token": "idp",
-    }
+    engine = RemediationEngine(db)
+    run = await engine._run_actions(execution.id)
+    await db.refresh(execution)
+    results = run.get("results", [])
 
-    async def _pick_integration(action_key: str):
-        int_type = _ACTION_TO_INT_TYPE.get(action_key)
-        if not int_type:
-            return None
-        from src.remediation.models import RemediationIntegration
-        res = await db.execute(
-            select(RemediationIntegration).where(
-                RemediationIntegration.integration_type == int_type,
-                RemediationIntegration.is_enabled == True,
-                RemediationIntegration.organization_id == org_id,
-            ).limit(1)
-        )
-        return res.scalars().first()
-
-    actions_completed: list[dict] = []
-    actions_failed: list[dict] = []
-    actions_awaiting: list[dict] = []
-    for idx, step in enumerate(playbook.steps or []):
-        if not isinstance(step, dict):
-            actions_failed.append({"index": idx, "error": "malformed step", "step": step})
-            continue
-        step_type = str(step.get("action_type") or step.get("type") or playbook.playbook_type or "custom")
-        params = step.get("params") or step.get("action_config") or {}
-        try:
-            integration = await _pick_integration(step_type)
-            if integration is None:
-                actions_awaiting.append({
-                    "index": idx,
-                    "action": step_type,
-                    "status": "awaiting_integration",
-                    "details": f"No enabled integration installed for action type '{step_type}'.",
-                })
-            else:
-                success, detail, response_body = await _dispatch_via_integration(
-                    integration,
-                    action=step_type,
-                    payload={"target": target_entity, "target_type": target_type, **params},
-                )
-                (actions_completed if success else actions_failed).append({
-                    "index": idx,
-                    "action": step_type,
-                    "status": "success" if success else "failed",
-                    "integration": integration.name,
-                    "detail": detail,
-                    "response": response_body,
-                })
-        except Exception as exc:  # noqa: BLE001
-            logger.error(f"Playbook step {idx} failed: {exc}", exc_info=True)
-            actions_failed.append({
-                "index": idx,
-                "action": step_type,
-                "error": str(exc),
-            })
-        execution.current_action_index = idx + 1
-
-    execution.actions_completed = actions_completed
-    metrics: dict = {}
-    if actions_failed:
-        metrics["actions_failed"] = actions_failed
-    if actions_awaiting:
-        metrics["actions_awaiting_integration"] = actions_awaiting
-    execution.metrics = metrics
-    execution.completed_at = utc_now()
-    if actions_failed and actions_completed:
-        execution.status = "completed"
-        execution.overall_result = "partial_success"
-    elif actions_awaiting and actions_completed and not actions_failed:
-        # Some steps ran, the rest have nothing to dispatch through.
-        execution.status = "completed"
-        execution.overall_result = "partial_success"
-    elif actions_awaiting and not actions_failed:
-        # Nothing ran: every step lacks an enabled integration. Never "success".
-        execution.status = "awaiting_integration"
-        execution.overall_result = "pending"
-        execution.completed_at = None
-    elif not actions_completed and not actions_failed:
-        execution.status = "failed"
-        execution.overall_result = "failure"
-        execution.error_message = "playbook has no executable steps"
-    elif actions_failed:
-        execution.status = "failed"
-        execution.overall_result = "failure"
-        execution.error_message = "; ".join(
-            f"{a.get('action', '?')}: {a.get('error', '?')}" for a in actions_failed
-        )[:2000]
-    else:
-        execution.status = "completed"
-        execution.overall_result = "success"
-
-    # Playbook-level metrics so the Playbooks tab shows honest counters.
-    try:
-        if execution.overall_result == "success":
-            playbook.success_count = (playbook.success_count or 0) + 1
-        elif execution.overall_result == "failure":
-            playbook.failure_count = (playbook.failure_count or 0) + 1
-        playbook.last_executed_at = utc_now()
-    except Exception:  # noqa: BLE001
-        pass
-
-    await db.flush()
+    if execution.overall_result == "success":
+        playbook.success_count = (playbook.success_count or 0) + 1
+    elif execution.overall_result in ("failure", "partial_success"):
+        playbook.failure_count = (playbook.failure_count or 0) + 1
+    playbook.last_executed_at = utc_now()
+    await db.commit()
     await db.refresh(execution)
 
+    succeeded = [r for r in results if r.get("success")]
+    awaiting = [
+        r for r in results
+        if not r.get("success") and r.get("status") in ("awaiting_integration", "detection_only", "manual_required")
+    ]
+    failed = [r for r in results if r not in succeeded and r not in awaiting]
     return {
         "playbook_id": playbook_id,
         "execution_id": execution.id,
         "status": execution.status,
         "overall_result": execution.overall_result,
-        "actions_completed": len(actions_completed),
-        "actions_failed": len(actions_failed),
-        "actions_awaiting_integration": len(actions_awaiting),
-        "error": "awaiting_integration" if execution.status == "awaiting_integration" else None,
+        "actions_completed": len(succeeded),
+        "actions_failed": len(failed),
+        "actions_awaiting_integration": len(awaiting),
+        "error": execution.error_message or (
+            execution.status if execution.status in ("awaiting_integration", "detection_only", "manual_required") else None
+        ),
+        "action_results": [ExecutionActionResult.model_validate(r).model_dump(mode="json") for r in results],
         "started_at": execution.started_at.isoformat() if execution.started_at else None,
         "completed_at": execution.completed_at.isoformat() if execution.completed_at else None,
     }
@@ -1781,23 +1370,124 @@ async def execute_playbook(
 # ============================================================================
 # Integrations
 # ============================================================================
+#
+# The Remediation page shows the organisation's InstalledIntegration rows
+# (the table /integrations/install writes and the containment service
+# dispatches through), with their real ids. The legacy
+# remediation_integrations table is no longer read or written here.
+
+#: containment action -> registry key (for the per-integration action lists).
+_CONTAINMENT_TO_REGISTRY = {
+    "block_ip": "firewall_block",
+    "isolate_host": "host_isolate",
+    "quarantine_file": "file_quarantine",
+    "disable_user": "account_disable",
+}
+
+
+def _integration_action_lists(connector_name: str, category: str) -> tuple[list[str], list[str]]:
+    """(registry keys this connector executes, keys its category could serve but has no implementation for)."""
+    from src.services import containment
+
+    executable = getattr(containment, "_EXECUTABLE_CONNECTORS", {}) or {}
+    categories = getattr(containment, "_CATEGORY_FOR_ACTION", {}) or {}
+    can: list[str] = []
+    awaiting: list[str] = []
+    for action, key in _CONTAINMENT_TO_REGISTRY.items():
+        if connector_name in executable.get(action, ()):
+            can.append(key)
+        elif category in categories.get(action, ()):
+            awaiting.append(key)
+    return can, awaiting
+
+
+def _parse_ts(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime) or value is None:
+        return value
+    try:
+        return datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+
+
+def _integration_response(integ) -> RemediationIntegrationResponse:
+    """InstalledIntegration -> page shape. Credentials are never returned."""
+    connector = integ.connector
+    connector_name = ((connector.name if connector is not None else None) or integ.connector_id or "").lower()
+    category = str(getattr(connector, "category", "") or "").lower()
+    try:
+        config = json.loads(integ.config_encrypted or "{}")
+    except (TypeError, ValueError):
+        config = {}
+    if not isinstance(config, dict):
+        config = {}
+    try:
+        supported = json.loads(getattr(connector, "supported_actions", None) or "[]")
+    except (TypeError, ValueError):
+        supported = []
+    can, awaiting = _integration_action_lists(connector_name, category)
+    return RemediationIntegrationResponse(
+        id=integ.id,
+        name=integ.display_name,
+        display_name=integ.display_name,
+        connector_id=integ.connector_id,
+        connector_name=connector_name,
+        integration_type=category,
+        category=category,
+        vendor=getattr(connector, "vendor", None),
+        endpoint_url=config.get("base_url") or config.get("url") or config.get("host"),
+        auth_type=str(getattr(connector, "auth_type", "") or ""),
+        auth_config={},
+        capabilities=[str(a) for a in supported] if isinstance(supported, list) else [],
+        remediation_actions=can,
+        awaiting_actions=awaiting,
+        status=integ.status,
+        is_connected=integ.health_status == "healthy",
+        last_health_check=_parse_ts(integ.last_health_check),
+        health_status=integ.health_status or "",
+        error_message=integ.error_message,
+        created_at=integ.created_at,
+        updated_at=integ.updated_at,
+        organization_id=integ.organization_id,
+    )
+
+
+async def _installed_integration_or_404(db, integration_id: str, org_id: str):
+    from src.integrations.models import InstalledIntegration
+
+    integ = (await db.execute(
+        select(InstalledIntegration)
+        .options(selectinload(InstalledIntegration.connector))
+        .where(InstalledIntegration.id == integration_id, InstalledIntegration.organization_id == org_id),
+    )).scalar_one_or_none()
+    if integ is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    return integ
+
 
 @router.get("/integrations", response_model=List[RemediationIntegrationResponse])
 async def list_integrations(
     org_id: OrganizationId,
     db: DatabaseSession = None,
-    integration_type: Optional[str] = Query(None),
+    integration_type: Optional[str] = Query(None, description="Connector category, e.g. edr, firewall"),
+    remediation_only: bool = Query(default=False, description="Only connectors that can serve a remediation action"),
     current_user: CurrentUser = None,
 ):
-    """List remediation integrations."""
-    query = select(RemediationIntegration)
-    query = query.where(RemediationIntegration.organization_id == org_id)
+    """The organisation's installed integrations with their real ids."""
+    from src.integrations.models import InstalledIntegration
 
+    rows = (await db.execute(
+        select(InstalledIntegration)
+        .options(selectinload(InstalledIntegration.connector))
+        .where(InstalledIntegration.organization_id == org_id)
+        .order_by(InstalledIntegration.created_at.desc()),
+    )).scalars().all()
+    items = [_integration_response(r) for r in rows]
     if integration_type:
-        query = query.where(RemediationIntegration.integration_type == integration_type)
-
-    result = await db.execute(query)
-    return result.scalars().all()
+        items = [i for i in items if i.category == integration_type.lower()]
+    if remediation_only:
+        items = [i for i in items if i.remediation_actions or i.awaiting_actions]
+    return items
 
 
 @router.post("/integrations", response_model=RemediationIntegrationResponse, status_code=status.HTTP_201_CREATED, dependencies=_ADMIN_WRITE)
@@ -1807,45 +1497,104 @@ async def create_integration(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
 ):
-    """Add a remediation integration."""
-    integration = RemediationIntegration(
-        name=request.name,
-        integration_type=request.integration_type,
-        vendor=request.vendor,
-        endpoint_url=request.endpoint_url,
-        auth_type=request.auth_type,
-        auth_config=request.auth_config,
-        capabilities=request.capabilities,
-        rate_limit=request.rate_limit,
-        tags=request.tags,
+    """Install a connector for this organisation (same row /integrations/install writes).
+
+    The installation starts in the connector's ``configuring`` status, like
+    /integrations/install; enable it with /integrations/installed/{id}/enable.
+    """
+    from src.core.secrets import _encrypt_secret_json
+    from src.integrations.models import InstalledIntegration, IntegrationConnector
+
+    connector = (await db.execute(
+        select(IntegrationConnector).where(
+            (IntegrationConnector.id == request.connector_id) | (IntegrationConnector.name == request.connector_id),
+        ),
+    )).scalars().first()
+    if connector is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "unknown_connector", "detail": f"connector {request.connector_id!r} is not in the catalogue"},
+        )
+    existing = (await db.execute(
+        select(InstalledIntegration.id).where(
+            InstalledIntegration.organization_id == org_id,
+            InstalledIntegration.connector_id == connector.id,
+        ),
+    )).scalars().first()
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"error": "already_installed", "detail": "Connector already installed", "integration_id": existing},
+        )
+
+    config = dict(request.config or {})
+    if request.endpoint_url and not config.get("base_url"):
+        config["base_url"] = request.endpoint_url
+    credentials = dict(request.credentials or request.auth_config or {})
+    integ = InstalledIntegration(
         organization_id=org_id,
+        connector_id=connector.id,
+        display_name=request.display_name or request.name or connector.display_name,
+        config_encrypted=json.dumps(config),
+        auth_credentials_encrypted=_encrypt_secret_json(credentials),
     )
-    db.add(integration)
+    db.add(integ)
+    await db.flush()
+    db.add(AuditLog(
+        user_id=str(current_user.id),
+        organization_id=org_id,
+        action="remediation.integration.install",
+        resource_type="installed_integration",
+        resource_id=integ.id,
+        description=f"Installed connector {connector.name} as {integ.display_name}",
+        new_value=json.dumps({"connector": connector.name, "config_keys": sorted(config)}),
+        success=True,
+    ))
     await db.commit()
-    await db.refresh(integration)
-    return integration
+    return _integration_response(await _installed_integration_or_404(db, integ.id, org_id))
 
 
 @router.put("/integrations/{integration_id}", response_model=RemediationIntegrationResponse, dependencies=_ADMIN_WRITE)
 async def update_integration(
     integration_id: str,
-    request: RemediationIntegrationCreate,
+    request: RemediationIntegrationUpdate,
     org_id: OrganizationId,
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
 ):
-    """Update an integration."""
-    integration = await db.get(RemediationIntegration, integration_id)
-    if not integration or integration.organization_id != org_id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    """Update an installed integration's name, config or credentials."""
+    from src.core.secrets import _encrypt_secret_json
 
-    for key, value in request.model_dump(exclude_unset=True).items():
-        setattr(integration, key, value)
-    integration.updated_at = utc_now()
-
+    integ = await _installed_integration_or_404(db, integration_id, org_id)
+    name = request.display_name or request.name
+    if name:
+        integ.display_name = name
+    if request.config is not None or request.endpoint_url:
+        try:
+            config = json.loads(integ.config_encrypted or "{}")
+        except (TypeError, ValueError):
+            config = {}
+        if request.config is not None:
+            config = dict(request.config)
+        if request.endpoint_url:
+            config["base_url"] = request.endpoint_url
+        integ.config_encrypted = json.dumps(config)
+    credentials = request.credentials if request.credentials is not None else request.auth_config
+    if credentials:
+        integ.auth_credentials_encrypted = _encrypt_secret_json(credentials)
+    db.add(AuditLog(
+        user_id=str(current_user.id),
+        organization_id=org_id,
+        action="remediation.integration.update",
+        resource_type="installed_integration",
+        resource_id=integ.id,
+        description=f"Updated integration {integ.display_name}",
+        new_value=json.dumps({"name_changed": bool(name), "config_changed": request.config is not None,
+                              "credentials_changed": bool(credentials)}),
+        success=True,
+    ))
     await db.commit()
-    await db.refresh(integration)
-    return integration
+    return _integration_response(await _installed_integration_or_404(db, integration_id, org_id))
 
 
 @router.post("/integrations/{integration_id}/test", response_model=IntegrationTestResult, dependencies=_ANALYST_WRITE)
@@ -1855,20 +1604,54 @@ async def test_integration(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
 ):
-    """Test integration connectivity: not implemented.
+    """Probe the installed integration's API for real and store the verdict.
 
-    It used to report success without making any network call.
+    Uses the integration engine's per-connector probe; a configured base URL
+    must pass the engine's outbound-target guard first. Connectors without a
+    probe report ``unknown`` (never ``healthy``).
     """
-    integration = await db.get(RemediationIntegration, integration_id)
-    if not integration or integration.organization_id != org_id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
+    from src.core.secrets import _decrypt_secret_json
+    from src.integrations.engine import (
+        ActionExecutor,
+        ConnectorRegistry,
+        IntegrationManager,
+        OutboundTargetRefused,
+    )
 
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail={
-            "error": "not_implemented",
-            "detail": "remediation integration connectivity tests are not implemented; no call was made",
-        },
+    integ = await _installed_integration_or_404(db, integration_id, org_id)
+    connector_name = ((integ.connector.name if integ.connector is not None else None) or integ.connector_id or "").lower()
+    try:
+        config = json.loads(integ.config_encrypted or "{}")
+    except (TypeError, ValueError):
+        config = {}
+    if not isinstance(config, dict):
+        config = {}
+    credentials = _decrypt_secret_json(integ.auth_credentials_encrypted) or {}
+
+    base_url = config.get("base_url") or config.get("url")
+    health: str
+    message: Optional[str]
+    try:
+        if base_url:
+            await ActionExecutor()._resolve_generic_target("/", config)
+        health, message = await IntegrationManager(ConnectorRegistry())._probe_connector(
+            connector_name, config, credentials,
+        )
+    except OutboundTargetRefused as exc:
+        health, message = "unhealthy", f"outbound target refused: {exc}"
+
+    now = utc_now()
+    integ.health_status = health
+    integ.last_health_check = now.isoformat()
+    integ.error_message = message if health != "healthy" else None
+    await db.commit()
+    return IntegrationTestResult(
+        integration_id=integ.id,
+        success=health == "healthy",
+        status=health,
+        message=message or "connection healthy",
+        details={"connector": connector_name, "base_url": base_url},
+        tested_at=now,
     )
 
 
@@ -1879,16 +1662,15 @@ async def get_integration_health(
     db: DatabaseSession = None,
     current_user: CurrentUser = None,
 ):
-    """Check integration health status."""
-    integration = await db.get(RemediationIntegration, integration_id)
-    if not integration or integration.organization_id != org_id:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
-
+    """The stored verdict of the last connectivity probe."""
+    integ = await _installed_integration_or_404(db, integration_id, org_id)
     return {
         "integration_id": integration_id,
-        "is_connected": integration.is_connected,
-        "health_status": integration.health_status,
-        "last_health_check": integration.last_health_check,
+        "is_connected": integ.health_status == "healthy",
+        "health_status": integ.health_status,
+        "last_health_check": integ.last_health_check,
+        "error_message": integ.error_message,
+        "status": integ.status,
     }
 
 
@@ -1916,7 +1698,6 @@ async def get_dashboard_stats(
     total = len(executions)
     successful = sum(1 for e in executions if e.overall_result == "success")
     failed = sum(1 for e in executions if e.overall_result == "failure")
-    pending = sum(1 for e in executions if e.status in ["pending", "awaiting_approval"])
 
     # --- Real aggregates (previously hardcoded []) ---
 
@@ -1940,10 +1721,10 @@ async def get_dashboard_stats(
             bucket = action_type_counts.setdefault(
                 at, {"count": 0, "success": 0, "failure": 0}
             )
-            result = (a or {}).get("result", "").lower()
-            if result in ("success", "ioc_created"):
+            outcome = str((a or {}).get("status") or (a or {}).get("result") or "").lower()
+            if (a or {}).get("success") is True or outcome in ("success", "ioc_created", "executed", "queued_for_approval"):
                 bucket["success"] += 1
-            elif result in ("failure", "failed", "error"):
+            elif (a or {}).get("success") is False or outcome in ("failure", "failed", "error"):
                 bucket["failure"] += 1
     actions_by_type = [
         ActionTypeStats(
@@ -2024,6 +1805,41 @@ async def get_dashboard_stats(
     ]
     avg_exec_minutes = round(sum(durations) / len(durations), 2) if durations else 0.0
 
+    # Per-day series for the "Execution Timeline" chart (UTC dates, oldest first).
+    day_buckets: dict[str, dict[str, int]] = {}
+    for offset in range(days - 1, -1, -1):
+        day = (utc_now() - timedelta(days=offset)).date().isoformat()
+        day_buckets[day] = {"total": 0, "success": 0, "failure": 0}
+    for e in executions:
+        if not e.created_at:
+            continue
+        bucket = day_buckets.get(e.created_at.date().isoformat())
+        if bucket is None:
+            continue
+        bucket["total"] += 1
+        if e.overall_result == "success":
+            bucket["success"] += 1
+        elif e.overall_result == "failure":
+            bucket["failure"] += 1
+    execution_by_day = [{"date": d, **v} for d, v in day_buckets.items()]
+
+    # Actions recorded today (UTC): every step result of executions created today.
+    today = utc_now().date()
+    actions_today = sum(
+        len(e.actions_completed or [])
+        for e in executions
+        if e.created_at and e.created_at.date() == today
+    )
+    active_policies = (await db.execute(
+        select(func.count()).select_from(RemediationPolicy).where(
+            RemediationPolicy.organization_id == org_id,
+            RemediationPolicy.is_enabled.is_(True),
+        ),
+    )).scalar() or 0
+    newest = sorted(
+        (e for e in executions if e.created_at), key=lambda e: e.created_at, reverse=True,
+    )[:10]
+
     return RemediationDashboardStats(
         period_start=cutoff,
         period_end=utc_now(),
@@ -2039,6 +1855,10 @@ async def get_dashboard_stats(
         top_policies=top_policies,
         top_targets=top_targets,
         execution_by_hour=execution_by_hour,
+        active_policies=active_policies,
+        actions_today=actions_today,
+        execution_by_day=execution_by_day,
+        recent_executions=[RemediationExecutionResponse.model_validate(e) for e in newest],
     )
 
 
@@ -2103,15 +1923,52 @@ async def get_effectiveness_metrics(
     days: int = Query(default=7, ge=1, le=90),
     current_user: CurrentUser = None,
 ):
-    """Remediation effectiveness: not implemented.
+    """Remediation effectiveness computed from this organisation's execution rows.
 
-    It used to return hardcoded zeros. No verification of remediation
-    outcomes is recorded yet, so there is nothing honest to report.
+    An execution is *effective* when every action actuated (overall_result
+    ``success``) and it was not rolled back; *ineffective* when it ended in
+    ``failure`` or ``partial_success``. Executions still pending (approval,
+    awaiting integration, detection only) are counted separately and not
+    rated. ``rollbacks_recommended`` counts partial runs that left a
+    reversible action in place. No post-remediation re-check is performed
+    (``verification_method`` = ``execution_outcome``).
     """
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail={
-            "error": "not_implemented",
-            "detail": "remediation effectiveness verification is not recorded yet",
-        },
+    cutoff = utc_now() - timedelta(days=days)
+    executions = (await db.execute(
+        select(RemediationExecution).where(
+            RemediationExecution.organization_id == org_id,
+            RemediationExecution.created_at >= cutoff,
+        ),
+    )).scalars().all()
+
+    rated = [e for e in executions if e.overall_result in ("success", "failure", "partial_success")]
+    effective = [e for e in rated if e.overall_result == "success" and e.status != "rolled_back"]
+    ineffective = [e for e in rated if e.overall_result in ("failure", "partial_success")]
+    pending = [e for e in executions if e not in rated]
+    durations = [
+        (e.completed_at - e.created_at).total_seconds() / 60.0
+        for e in effective
+        if e.completed_at and e.created_at and e.completed_at >= e.created_at
+    ]
+    rollbacks_recommended = sum(
+        1 for e in executions
+        if e.overall_result == "partial_success"
+        and e.status != "rolled_back"
+        and not e.rollback_status
+        and any(isinstance(s, dict) and _step_rollback_possible(s) for s in (e.actions_completed or []))
+    )
+    rollbacks_executed = sum(1 for e in executions if e.rollback_status in ("completed", "partial"))
+
+    return EffectivenessMetrics(
+        organization_id=org_id,
+        period=f"last_{days}_days",
+        total_executions=len(executions),
+        pending_count=len(pending),
+        executions_verified=len(rated),
+        effective_count=len(effective),
+        ineffective_count=len(ineffective),
+        effectiveness_rate=round(len(effective) / len(rated) * 100, 2) if rated else 0.0,
+        avg_time_to_effectiveness=round(sum(durations) / len(durations), 2) if durations else None,
+        rollbacks_recommended=rollbacks_recommended,
+        rollbacks_executed=rollbacks_executed,
     )

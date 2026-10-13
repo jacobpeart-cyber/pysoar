@@ -6,10 +6,9 @@ validation, and API contract definitions.
 """
 
 from datetime import datetime
-from uuid import UUID
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 # ============================================================================
@@ -110,6 +109,40 @@ class RemediationActionResponse(RemediationActionBase):
     model_config = ConfigDict(from_attributes=True)
 
 
+class ActionParameterSpec(BaseModel):
+    """One parameter a registry action accepts."""
+    name: str
+    type: str
+    required: bool = False
+    description: str = ""
+
+
+class RemediationActionSpecResponse(BaseModel):
+    """A remediation action the engine can execute (``GET /remediation/actions``).
+
+    ``key`` is what a policy action's ``type`` must be (aliases are accepted
+    on write and stored as the key). ``path`` says how it actuates:
+    ``containment`` (agent command queue / executable integration),
+    ``agent_command`` or ``notification``. ``requires_approval`` means the
+    underlying agent command waits in the agent approval queue unless the
+    remediation run was approved by a second admin.
+    """
+    key: str
+    label: str
+    description: str = ""
+    target_type: str = ""
+    path: str = ""
+    parameters: list[ActionParameterSpec] = Field(default_factory=list)
+    requires_approval: bool = False
+    reversible: bool = False
+    risk_level: str = "high"
+    aliases: list[str] = Field(default_factory=list)
+    # Same values under the RemediationAction row names.
+    action_type: str = ""
+    name: str = ""
+    is_reversible: bool = False
+
+
 # ============================================================================
 # RemediationExecution Schemas
 # ============================================================================
@@ -126,15 +159,52 @@ class RemediationExecutionBase(BaseModel):
 
 
 class ExecutionActionResult(BaseModel):
-    """Single action execution result."""
+    """Single action execution result.
+
+    ``status`` is the honest per-step state: ``executed``,
+    ``queued_for_approval`` (a real agent command waits in the agent approval
+    queue), ``detection_only`` / ``awaiting_integration`` (nothing actuated;
+    ``missing_dependency`` names what is missing) or ``failed``. ``success``
+    is True only when a real command or integration call was issued.
+    ``reversible`` is True only when a revert handle was stored (``revert``).
+    """
     action_type: str = ""
+    requested_type: Optional[str] = None
     target: Optional[str] = None
     result: Optional[str] = None
+    status: Optional[str] = None
+    path: Optional[str] = None
     success: bool = False
+    detail: Optional[str] = None
     details: dict = Field(default_factory=dict)
     error: Optional[str] = None
+    missing_dependency: Optional[str] = None
+    reversible: bool = False
+    revert: Optional[dict] = None
+    audit_log_id: Optional[str] = None
+    started_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
     timestamp: Optional[datetime] = None
     ioc_id: Optional[str] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_legacy(cls, data: Any) -> Any:
+        """Older rows store ``action``/``name`` instead of ``action_type`` and a
+        string ``details``; read them instead of failing the whole list."""
+        if not isinstance(data, dict):
+            return data
+        data = dict(data)
+        if not data.get("action_type"):
+            data["action_type"] = str(data.get("action") or data.get("name") or data.get("type") or "")
+        details = data.get("details")
+        if details is not None and not isinstance(details, dict):
+            data["details"] = {"message": str(details)}
+        for key in ("error", "detail", "result", "status"):
+            value = data.get(key)
+            if value is not None and not isinstance(value, str):
+                data[key] = str(value)
+        return data
 
 
 class ExecutionProgressResponse(BaseModel):
@@ -192,10 +262,14 @@ class ApprovalRequest(BaseModel):
 
 
 class ApprovalResponse(BaseModel):
-    """Approval response."""
+    """Approval response, with the outcome of the planned actions it ran."""
     execution_id: str = ""
     approval_status: str = ""
     approved_at: Optional[datetime] = None
+    status: Optional[str] = None
+    overall_result: Optional[str] = None
+    error_message: Optional[str] = None
+    action_results: list[ExecutionActionResult] = Field(default_factory=list)
 
 
 class RejectionRequest(BaseModel):
@@ -217,10 +291,22 @@ class ManualRemediationRequest(BaseModel):
 
 
 class QuickBlockIPRequest(BaseModel):
-    """Quick: block an IP."""
+    """Quick: block an IP.
+
+    ``duration_hours`` sets the expiry of the detection IOC only; agent
+    firewall rules stay until the execution is rolled back. ``duration`` is
+    accepted as an alias.
+    """
     ip: str = ""
     duration_hours: int = Field(default=24, ge=1, le=365*24)
     reason: Optional[str] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _duration_alias(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "duration_hours" not in data and data.get("duration") is not None:
+            data = {**data, "duration_hours": data["duration"]}
+        return data
 
 
 class QuickIsolateHostRequest(BaseModel):
@@ -230,8 +316,13 @@ class QuickIsolateHostRequest(BaseModel):
 
 
 class QuickDisableAccountRequest(BaseModel):
-    """Quick: disable an account."""
+    """Quick: disable an account.
+
+    ``hostname`` selects the endpoint agent that disables a local account;
+    without it (or an identity-provider connector) nothing can be actuated.
+    """
     username: str = ""
+    hostname: Optional[str] = None
     reason: Optional[str] = None
 
 
@@ -306,28 +397,80 @@ class RemediationIntegrationBase(BaseModel):
     tags: list[str] = Field(default_factory=list)
 
 
-class RemediationIntegrationCreate(RemediationIntegrationBase):
-    """Create request."""
-    pass
+class RemediationIntegrationCreate(BaseModel):
+    """Install a connector as an InstalledIntegration (the table the list reads).
+
+    ``connector_id`` is the connector name from ``GET /integrations/connectors``.
+    ``endpoint_url`` / ``auth_config`` are accepted for the old form and stored
+    as ``config.base_url`` / ``credentials``. Credentials are encrypted at rest
+    and never returned.
+    """
+    connector_id: str = Field(..., min_length=1, max_length=255)
+    display_name: Optional[str] = Field(default=None, max_length=255)
+    name: Optional[str] = Field(default=None, max_length=255)
+    config: dict = Field(default_factory=dict)
+    credentials: dict = Field(default_factory=dict)
+    endpoint_url: Optional[str] = None
+    auth_config: dict = Field(default_factory=dict)
 
 
-class RemediationIntegrationResponse(RemediationIntegrationBase):
-    """Response with metadata."""
+class RemediationIntegrationUpdate(BaseModel):
+    """Partial update of an installed integration (credentials replace, never returned)."""
+    display_name: Optional[str] = Field(default=None, max_length=255)
+    name: Optional[str] = Field(default=None, max_length=255)
+    config: Optional[dict] = None
+    credentials: Optional[dict] = None
+    endpoint_url: Optional[str] = None
+    auth_config: Optional[dict] = None
+
+
+class RemediationIntegrationResponse(BaseModel):
+    """An installed integration as the Remediation page shows it.
+
+    ``id`` is the InstalledIntegration id (use it with
+    ``/remediation/integrations/{id}/test`` or ``/integrations/installed/{id}/*``).
+    ``remediation_actions`` lists the registry action keys this connector can
+    execute today; ``awaiting_actions`` the ones its category could serve but
+    PySOAR has no connector implementation for (they report
+    ``awaiting_integration``). ``auth_config`` is always empty: credentials
+    are never returned.
+    """
     id: str = ""
-    created_at: Optional[datetime] = None
-    updated_at: Optional[datetime] = None
+    name: str = ""
+    display_name: str = ""
+    connector_id: str = ""
+    connector_name: str = ""
+    integration_type: str = ""
+    category: str = ""
+    vendor: Optional[str] = None
+    endpoint_url: Optional[str] = None
+    auth_type: str = ""
+    auth_config: dict = Field(default_factory=dict)
+    capabilities: list[str] = Field(default_factory=list)
+    remediation_actions: list[str] = Field(default_factory=list)
+    awaiting_actions: list[str] = Field(default_factory=list)
+    rate_limit: Optional[int] = None
+    tags: list[str] = Field(default_factory=list)
+    status: str = ""
     is_connected: bool = False
     last_health_check: Optional[datetime] = None
     health_status: str = ""
+    error_message: Optional[str] = None
+    source: str = "installed_integration"
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
     organization_id: str = ""
-
-    model_config = ConfigDict(from_attributes=True)
 
 
 class IntegrationTestResult(BaseModel):
-    """Result of integration test."""
+    """Result of a real connectivity probe.
+
+    ``status`` is the probe's health verdict (healthy / degraded / unhealthy /
+    unknown); ``success`` is True only for ``healthy``.
+    """
     integration_id: str = ""
     success: bool = False
+    status: str = ""
     message: str = ""
     details: dict = Field(default_factory=dict)
     tested_at: datetime
@@ -370,6 +513,10 @@ class RemediationDashboardStats(BaseModel):
     top_policies: list[PolicyStats]
     top_targets: list[dict]
     execution_by_hour: list[dict]
+    active_policies: int = 0
+    actions_today: int = 0
+    execution_by_day: list[dict] = Field(default_factory=list)
+    recent_executions: list[RemediationExecutionResponse] = Field(default_factory=list)
 
 
 class TimelineEvent(BaseModel):
@@ -392,9 +539,17 @@ class RemediationTimelineResponse(BaseModel):
 
 
 class EffectivenessMetrics(BaseModel):
-    """Remediation effectiveness metrics."""
+    """Remediation effectiveness computed from RemediationExecution outcomes.
+
+    ``verification_method`` is ``execution_outcome``: an execution counts as
+    effective when every action actuated and it was not rolled back. No
+    post-remediation re-check (re-scan, re-detection) is performed.
+    """
     organization_id: str = ""
     period: str = ""
+    verification_method: str = "execution_outcome"
+    total_executions: int = 0
+    pending_count: int = 0
     executions_verified: int = 0
     effective_count: int = 0
     ineffective_count: int = 0

@@ -494,7 +494,10 @@ class TestRetryPolicy:
         assert result["retries_exhausted"] is True
 
         await db_session.refresh(execution)
-        assert execution.overall_result == "partial_success"
+        # Wave 2: a failed step fails the run (it used to read "partial_success"
+        # although nothing succeeded).
+        assert execution.overall_result == "failure"
+        assert execution.status == "failed"
 
 
 class TestRateLimitWindow:
