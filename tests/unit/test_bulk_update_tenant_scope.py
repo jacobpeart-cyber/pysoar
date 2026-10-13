@@ -78,7 +78,8 @@ async def _api_vuln(db_session, org: str) -> str:
 
 @pytest.mark.asyncio
 async def test_ot_alert_bulk_action_ignores_other_tenant_ids(client, db_session):
-    _, headers_a = await _org_user(db_session, email="ot-bulk@bulkorg-a.io", org=ORG_A)
+    # OT bulk actions are admin only (wave 1).
+    _, headers_a = await _org_user(db_session, email="ot-bulk@bulkorg-a.io", org=ORG_A, role="admin")
     own_id = await _ot_alert(db_session, ORG_A)
     foreign_id = await _ot_alert(db_session, ORG_B)
 

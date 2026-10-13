@@ -123,9 +123,10 @@ def security_assessment(self, endpoint_id: str, org_id: str):
 
         async def _assess():
             async with AsyncSessionLocal() as db:
-                # Fetch endpoint
+                # Fetch endpoint (tenant-scoped: never assess another org's endpoint)
                 stmt = select(APIEndpointInventory).where(
-                    APIEndpointInventory.id == endpoint_id
+                    APIEndpointInventory.id == endpoint_id,
+                    APIEndpointInventory.organization_id == org_id,
                 )
                 result = await db.execute(stmt)
                 endpoint = result.scalar_one_or_none()

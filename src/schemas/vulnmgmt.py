@@ -364,6 +364,11 @@ class KEVComplianceReport(BaseModel):
 class DashboardMetrics(BaseModel):
     """Overall dashboard metrics"""
 
+    # Catalog counts (org-scoped ``vulnerabilities`` rows) for the page's cards.
+    total_vulnerabilities: int = 0
+    critical_vulnerabilities: int = 0
+    # None until at least one instance has been patched or mitigated.
+    mttr_days: Optional[float] = None
     risk_matrix: RiskMatrix
     sla_compliance: SLAComplianceMetrics
     patch_compliance: PatchComplianceMetrics

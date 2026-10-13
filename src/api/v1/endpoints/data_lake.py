@@ -13,15 +13,15 @@ route to tenant users again requires rewriting the guard on a real SQL parser
 import json
 import math
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Annotated, Optional
 
-from fastapi import APIRouter, Body, Path, HTTPException, Query, status
+from fastapi import Depends, APIRouter, Body, Path, HTTPException, Query, status
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import CurrentUser, DatabaseSession
+from src.api.deps import CurrentUser, DatabaseSession, OrganizationId, require_role
+from src.models.user import User, UserRole
 from src.core.logging import get_logger
-from src.services.automation import AutomationService
 from src.data_lake.models import (
     DataPartition,
     DataPipeline,
@@ -59,16 +59,26 @@ from src.schemas.data_lake import (
     UnifiedDataModelUpdate,
 )
 from src.data_lake.engine import (
-    DataCatalog,
-    DataIngestionEngine,
     PipelineOrchestrator,
-    QueryEngine,
     StorageManager,
 )
 
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/data-lake", tags=["Data Lake"])
+
+# Wave 1 role gates: viewers read only; analysts for operational writes;
+# admins for configuration and actions against live systems.
+AnalystUser = Annotated[User, Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
+AdminRoleUser = Annotated[User, Depends(require_role([UserRole.ADMIN]))]
+
+
+def _not_implemented(detail: str) -> HTTPException:
+    """Honest 501 for data-lake operations PySOAR does not actually perform."""
+    return HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail={"error": "not_implemented", "detail": detail},
+    )
 
 
 # ==================== BUILT-IN DATA SOURCES ====================
@@ -200,14 +210,12 @@ BUILTIN_DATA_SOURCES: list[dict] = [
 BUILTIN_SOURCE_NAMES = {s["name"] for s in BUILTIN_DATA_SOURCES}
 
 
-async def _ensure_builtin_sources(db: AsyncSession, org_id: Optional[str]) -> None:
+async def _ensure_builtin_sources(db: AsyncSession, org_id: str) -> None:
     """Upsert a DataSource row per BUILTIN_DATA_SOURCES entry for this org
     and refresh live row count + last-event timestamp from the underlying
     table. Safe to call on every /sources list — runs in O(builtins) and
     skips updates when the table doesn't exist or the org has no rows.
     """
-    if not org_id:
-        return
     from sqlalchemy import text as sa_text
 
     existing = (await db.execute(
@@ -278,7 +286,7 @@ async def _ensure_builtin_sources(db: AsyncSession, org_id: Optional[str]) -> No
 # (SIEM cloud poll, ITDR sweep, supply-chain sweep, STIG fleet sweep,
 # threat-intel poll, agentic auto-triage) instead of a blank table.
 
-def _builtin_celery_pipelines(org_id: Optional[str]) -> list[dict]:
+def _builtin_celery_pipelines(org_id: str) -> list[dict]:
     """Reflect the live celery_app.beat_schedule into pipeline cards."""
     try:
         from src.workers.celery_app import celery_app
@@ -286,7 +294,6 @@ def _builtin_celery_pipelines(org_id: Optional[str]) -> list[dict]:
     except Exception:  # noqa: BLE001
         return []
 
-    now = datetime.now(timezone.utc).isoformat()
     out = []
     for name, cfg in schedule.items():
         task = cfg.get("task", "")
@@ -323,14 +330,16 @@ def _builtin_celery_pipelines(org_id: Optional[str]) -> list[dict]:
             "transform_rules": [],
             "schedule_cron": cadence,
             "status": "active",
-            "last_run": now,
+            # Beat entries carry no run history here: last_run and the
+            # counters are unknown (None), not "now" / 0.
+            "last_run": None,
             "next_run": None,
-            "avg_processing_time_ms": 0,
-            "records_processed_total": 0,
-            "error_count": 0,
+            "avg_processing_time_ms": None,
+            "records_processed_total": None,
+            "error_count": None,
             "last_error": None,
-            "created_at": now,
-            "updated_at": now,
+            "created_at": None,
+            "updated_at": None,
             "builtin": True,
         })
     return out
@@ -342,13 +351,14 @@ def _builtin_celery_pipelines(org_id: Optional[str]) -> list[dict]:
 @router.post("/sources", response_model=DataSourceResponse, status_code=status.HTTP_201_CREATED)
 async def create_data_source(
     source_in: DataSourceCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AdminRoleUser = None,
     db: DatabaseSession = None,
 ):
     """Create new data source"""
     try:
         source = DataSource(
-            organization_id=getattr(current_user, "organization_id", None),
+            organization_id=org_id,
             name=source_in.name,
             description=source_in.description,
             source_type=source_in.source_type,
@@ -371,7 +381,7 @@ async def create_data_source(
 
 @router.get("/sources", response_model=DataSourceListResponse)
 async def list_data_sources(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -388,7 +398,6 @@ async def list_data_sources(
     shell for a brand-new org even though the platform is actively
     ingesting logs.
     """
-    org_id = getattr(current_user, "organization_id", None)
     await _ensure_builtin_sources(db, org_id)
 
     query = select(DataSource).where(
@@ -429,7 +438,7 @@ async def list_data_sources(
 
 @router.get("/sources/{source_id}", response_model=DataSourceResponse)
 async def get_data_source(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     source_id: str = Path(...),
 ):
@@ -437,7 +446,7 @@ async def get_data_source(
     result = await db.execute(
         select(DataSource).where(
             (DataSource.id == source_id)
-            & (DataSource.organization_id == getattr(current_user, "organization_id", None))
+            & (DataSource.organization_id == org_id)
         )
     )
     source = result.scalar_one_or_none()
@@ -449,7 +458,8 @@ async def get_data_source(
 @router.patch("/sources/{source_id}", response_model=DataSourceResponse)
 async def update_data_source(
     source_in: DataSourceUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AdminRoleUser = None,
     db: DatabaseSession = None,
     source_id: str = Path(...),
 ):
@@ -457,7 +467,7 @@ async def update_data_source(
     result = await db.execute(
         select(DataSource).where(
             (DataSource.id == source_id)
-            & (DataSource.organization_id == getattr(current_user, "organization_id", None))
+            & (DataSource.organization_id == org_id)
         )
     )
     source = result.scalar_one_or_none()
@@ -478,7 +488,8 @@ async def update_data_source(
 
 @router.post("/sources/{source_id}/start")
 async def start_data_source_ingestion(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AdminRoleUser = None,
     db: DatabaseSession = None,
     source_id: str = Path(...),
 ):
@@ -486,30 +497,26 @@ async def start_data_source_ingestion(
     result = await db.execute(
         select(DataSource).where(
             (DataSource.id == source_id)
-            & (DataSource.organization_id == getattr(current_user, "organization_id", None))
+            & (DataSource.organization_id == org_id)
         )
     )
     source = result.scalar_one_or_none()
     if not source:
         raise HTTPException(status_code=404, detail="Data source not found")
 
-    try:
-        engine = DataIngestionEngine()
-        start_result = engine.start_ingestion(source_id)
-
-        source.status = "active"
-        source.last_event_received = datetime.now(timezone.utc).isoformat()
-        await db.commit()
-
-        return start_result
-    except Exception as e:
-        await db.rollback()
-        raise HTTPException(status_code=400, detail="Operation failed. Please try again or contact support.")
+    # Not implemented: no ingestion worker exists for registered sources (the
+    # in-memory DataIngestionEngine registry was always empty, so this
+    # always 400'd and would have stamped a fabricated last_event_received).
+    raise _not_implemented(
+        "Starting ingestion is not implemented: no connector ingests registered "
+        "data sources. Built-in sources are fed by the platform itself."
+    )
 
 
 @router.post("/sources/{source_id}/stop")
 async def stop_data_source_ingestion(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AdminRoleUser = None,
     db: DatabaseSession = None,
     source_id: str = Path(...),
 ):
@@ -517,24 +524,17 @@ async def stop_data_source_ingestion(
     result = await db.execute(
         select(DataSource).where(
             (DataSource.id == source_id)
-            & (DataSource.organization_id == getattr(current_user, "organization_id", None))
+            & (DataSource.organization_id == org_id)
         )
     )
     source = result.scalar_one_or_none()
     if not source:
         raise HTTPException(status_code=404, detail="Data source not found")
 
-    try:
-        engine = DataIngestionEngine()
-        stop_result = engine.stop_ingestion(source_id)
-
-        source.status = "paused"
-        await db.commit()
-
-        return stop_result
-    except Exception as e:
-        await db.rollback()
-        raise HTTPException(status_code=400, detail="Operation failed. Please try again or contact support.")
+    raise _not_implemented(
+        "Stopping ingestion is not implemented: no connector ingests registered "
+        "data sources, so there is nothing to stop."
+    )
 
 
 # ==================== DATA PARTITION ENDPOINTS ====================
@@ -543,13 +543,26 @@ async def stop_data_source_ingestion(
 @router.post("/partitions", response_model=DataPartitionResponse, status_code=status.HTTP_201_CREATED)
 async def create_partition(
     partition_in: DataPartitionCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AdminRoleUser = None,
     db: DatabaseSession = None,
 ):
     """Create new data partition"""
+    if partition_in.source_id:
+        owned = await db.execute(
+            select(DataSource.id).where(
+                DataSource.id == partition_in.source_id,
+                DataSource.organization_id == org_id,
+            )
+        )
+        if owned.scalar_one_or_none() is None:
+            raise HTTPException(
+                status_code=422,
+                detail={"field": "source_id", "detail": "Unknown data source"},
+            )
     try:
         partition = DataPartition(
-            organization_id=getattr(current_user, "organization_id", None),
+            organization_id=org_id,
             source_id=partition_in.source_id,
             partition_key=partition_in.partition_key,
             time_range_start=partition_in.time_range_start,
@@ -570,7 +583,7 @@ async def create_partition(
 
 @router.get("/partitions", response_model=DataPartitionListResponse)
 async def list_partitions(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -579,7 +592,7 @@ async def list_partitions(
 ):
     """List data partitions with filtering"""
     query = select(DataPartition).where(
-        DataPartition.organization_id == getattr(current_user, "organization_id", None)
+        DataPartition.organization_id == org_id
     )
 
     if source_id:
@@ -612,7 +625,7 @@ async def list_partitions(
 
 @router.get("/partitions/daily/{table}")
 async def get_daily_partitions(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     table: str = Path(..., description="Whitelisted table name (e.g. log_entries)"),
     days: int = Query(30, ge=1, le=365),
@@ -628,7 +641,6 @@ async def get_daily_partitions(
     from sqlalchemy import text as sa_text
     if table not in DATA_LAKE_READABLE_TABLES:
         raise HTTPException(status_code=400, detail=f"Unknown table '{table}'")
-    org_id = getattr(current_user, "organization_id", None)
 
     # Introspect whether the table has organization_id.
     has_org = (await db.execute(
@@ -641,13 +653,15 @@ async def get_daily_partitions(
     )).scalar() is not None
 
     where_org = "WHERE organization_id = :org_id AND created_at >= NOW() - :days * INTERVAL '1 day'"
-    where_no_org = "WHERE created_at >= NOW() - :days * INTERVAL '1 day'"
-    params = {"days": days}
-    if has_org and org_id:
-        params["org_id"] = org_id
-        where = where_org
-    else:
-        where = where_no_org
+    if not has_org:
+        # Counting a table with no organization_id column would report every
+        # tenant's rows to the caller.
+        raise HTTPException(
+            status_code=400,
+            detail=f"Table '{table}' is not tenant-scoped; per-tenant partitions are unavailable",
+        )
+    params = {"days": days, "org_id": org_id}
+    where = where_org
 
     try:
         rows = (await db.execute(
@@ -675,12 +689,10 @@ async def get_daily_partitions(
             sa_text("SELECT pg_total_relation_size(quote_ident(:t))"),
             {"t": table},
         )).scalar() or 0
+        # All-tenant row count: the table's bytes are shared by every org, so
+        # bytes-per-row must divide by every row, not just the caller's.
         total_rows_row = (await db.execute(
-            sa_text(
-                f"SELECT COUNT(*) FROM {table}"
-                + (" WHERE organization_id = :org_id" if has_org and org_id else "")
-            ),
-            {"org_id": org_id} if has_org and org_id else {},
+            sa_text(f"SELECT COUNT(*) FROM {table}")
         )).scalar() or 0
         total_rows = int(total_rows_row)
     except Exception:  # noqa: BLE001
@@ -723,7 +735,8 @@ async def get_daily_partitions(
 @router.patch("/partitions/{partition_id}", response_model=DataPartitionResponse)
 async def update_partition(
     partition_in: DataPartitionUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AdminRoleUser = None,
     db: DatabaseSession = None,
     partition_id: str = Path(...),
 ):
@@ -731,7 +744,7 @@ async def update_partition(
     result = await db.execute(
         select(DataPartition).where(
             (DataPartition.id == partition_id)
-            & (DataPartition.organization_id == getattr(current_user, "organization_id", None))
+            & (DataPartition.organization_id == org_id)
         )
     )
     partition = result.scalar_one_or_none()
@@ -756,13 +769,14 @@ async def update_partition(
 @router.post("/pipelines", response_model=DataPipelineResponse, status_code=status.HTTP_201_CREATED)
 async def create_pipeline(
     pipeline_in: DataPipelineCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AdminRoleUser = None,
     db: DatabaseSession = None,
 ):
     """Create new data pipeline"""
     try:
         pipeline = DataPipeline(
-            organization_id=getattr(current_user, "organization_id", None),
+            organization_id=org_id,
             name=pipeline_in.name,
             description=pipeline_in.description,
             pipeline_type=pipeline_in.pipeline_type,
@@ -782,7 +796,7 @@ async def create_pipeline(
 
 @router.get("/pipelines")
 async def list_pipelines(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -796,7 +810,7 @@ async def list_pipelines(
     include_builtins=false to see only the org's own DataPipeline rows.
     """
     query = select(DataPipeline).where(
-        DataPipeline.organization_id == getattr(current_user, "organization_id", None)
+        DataPipeline.organization_id == org_id
     )
 
     if pipeline_type:
@@ -846,7 +860,7 @@ async def list_pipelines(
 
     merged = custom_items
     if include_builtins:
-        builtins = _builtin_celery_pipelines(getattr(current_user, "organization_id", None))
+        builtins = _builtin_celery_pipelines(org_id)
         # Apply the same filters the caller passed.
         if pipeline_type:
             builtins = [b for b in builtins if b["pipeline_type"] == pipeline_type]
@@ -866,7 +880,8 @@ async def list_pipelines(
 @router.patch("/pipelines/{pipeline_id}", response_model=DataPipelineResponse)
 async def update_pipeline(
     pipeline_in: DataPipelineUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AdminRoleUser = None,
     db: DatabaseSession = None,
     pipeline_id: str = Path(...),
 ):
@@ -874,7 +889,7 @@ async def update_pipeline(
     result = await db.execute(
         select(DataPipeline).where(
             (DataPipeline.id == pipeline_id)
-            & (DataPipeline.organization_id == getattr(current_user, "organization_id", None))
+            & (DataPipeline.organization_id == org_id)
         )
     )
     pipeline = result.scalar_one_or_none()
@@ -901,13 +916,14 @@ async def update_pipeline(
 @router.post("/models", response_model=UnifiedDataModelResponse, status_code=status.HTTP_201_CREATED)
 async def create_unified_model(
     model_in: UnifiedDataModelCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AdminRoleUser = None,
     db: DatabaseSession = None,
 ):
     """Create unified data model"""
     try:
         model = UnifiedDataModel(
-            organization_id=getattr(current_user, "organization_id", None),
+            organization_id=org_id,
             name=model_in.name,
             description=model_in.description,
             entity_type=model_in.entity_type,
@@ -927,7 +943,7 @@ async def create_unified_model(
 
 @router.get("/models", response_model=UnifiedDataModelListResponse)
 async def list_unified_models(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -936,7 +952,7 @@ async def list_unified_models(
 ):
     """List unified data models"""
     query = select(UnifiedDataModel).where(
-        UnifiedDataModel.organization_id == getattr(current_user, "organization_id", None)
+        UnifiedDataModel.organization_id == org_id
     )
 
     if entity_type:
@@ -971,7 +987,8 @@ async def list_unified_models(
 @router.patch("/models/{model_id}", response_model=UnifiedDataModelResponse)
 async def update_unified_model(
     model_in: UnifiedDataModelUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AdminRoleUser = None,
     db: DatabaseSession = None,
     model_id: str = Path(...),
 ):
@@ -979,7 +996,7 @@ async def update_unified_model(
     result = await db.execute(
         select(UnifiedDataModel).where(
             (UnifiedDataModel.id == model_id)
-            & (UnifiedDataModel.organization_id == getattr(current_user, "organization_id", None))
+            & (UnifiedDataModel.organization_id == org_id)
         )
     )
     model = result.scalar_one_or_none()
@@ -1006,67 +1023,32 @@ async def update_unified_model(
 @router.post("/queries", response_model=QueryJobResponse, status_code=status.HTTP_201_CREATED)
 async def submit_query(
     query_in: QueryJobCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    current_user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
-    """Submit a query job"""
-    try:
-        job = QueryJob(
-            organization_id=getattr(current_user, "organization_id", None),
-            query_text=query_in.query_text,
-            query_language=query_in.query_language,
-            data_sources_queried=query_in.data_sources_queried,
-            time_range_start=query_in.time_range_start,
-            time_range_end=query_in.time_range_end,
-            submitted_by=current_user.id,
-            status="queued",
-        )
-        db.add(job)
-        await db.commit()
-        await db.refresh(job)
+    """Submit a query job.
 
-        # Execute query asynchronously
-        engine = QueryEngine()
-        try:
-            result = engine.execute_query(
-                job.id,
-                query_in.query_text,
-                query_in.query_language,
-                query_in.data_sources_queried,
-            )
-            job.status = result.get("status")
-            job.records_scanned = result.get("records_scanned", 0)
-            job.records_returned = result.get("records_returned", 0)
-            job.execution_time_ms = result.get("execution_time_ms", 0)
-            job.result_location = result.get("result_location")
-            job.cached = result.get("cached", False)
-            await db.commit()
-            await db.refresh(job)
-        except Exception:
-            pass
-
-        try:
-            org_id = getattr(current_user, "organization_id", None)
-            source_name = (query_in.data_sources_queried or ["unknown"])[0] if query_in.data_sources_queried else "unknown"
-            automation = AutomationService(db)
-            await automation.on_data_lake_anomaly(
-                data_source=str(source_name),
-                anomaly_description=f"Query {job.id} executed ({job.records_scanned or 0} records scanned)",
-                severity="medium",
-                organization_id=org_id,
-            )
-        except Exception as automation_exc:
-            logger.warning(f"Automation on_data_lake_anomaly failed: {automation_exc}")
-
-        return job
-    except Exception as e:
-        await db.rollback()
-        raise HTTPException(status_code=400, detail="Operation failed. Please try again or contact support.")
+    Not implemented: the QueryEngine never ran the query text. It summed
+    partition metadata across every tenant (no org filter), marked the job
+    ``completed`` and fired a data-lake "anomaly" automation for each query.
+    Saved-query history is written by ``POST /data-lake/query``.
+    """
+    logger.info(
+        "data_lake_query_job_not_implemented",
+        organization_id=org_id,
+        user_id=str(current_user.id),
+        query_language=query_in.query_language,
+    )
+    raise _not_implemented(
+        "Queued query jobs are not implemented: nothing executes them. Use "
+        "POST /data-lake/query (catalog filter) instead."
+    )
 
 
 @router.get("/queries", response_model=QueryJobListResponse)
 async def list_queries(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -1074,7 +1056,7 @@ async def list_queries(
 ):
     """List query jobs"""
     query = select(QueryJob).where(
-        QueryJob.organization_id == getattr(current_user, "organization_id", None)
+        QueryJob.organization_id == org_id
     )
 
     if status:
@@ -1104,7 +1086,7 @@ async def list_queries(
 
 @router.get("/queries/{query_id}", response_model=QueryJobResponse)
 async def get_query(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     query_id: str = Path(...),
 ):
@@ -1112,7 +1094,7 @@ async def get_query(
     result = await db.execute(
         select(QueryJob).where(
             (QueryJob.id == query_id)
-            & (QueryJob.organization_id == getattr(current_user, "organization_id", None))
+            & (QueryJob.organization_id == org_id)
         )
     )
     job = result.scalar_one_or_none()
@@ -1123,21 +1105,29 @@ async def get_query(
 
 @router.post("/queries/{query_id}/estimate-cost")
 async def estimate_query_cost(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
     query_id: str = Path(...),
     data_scanned_gb: int = Query(..., ge=1),
 ):
-    """Estimate query execution cost"""
-    try:
-        engine = QueryEngine()
-        cost = engine.estimate_cost(
-            data_scanned_gb=data_scanned_gb,
-            query_complexity="medium",
+    """Estimate query execution cost.
+
+    Not implemented: the estimate was hardcoded BigQuery $/TB pricing for a
+    Postgres store. The job is looked up (tenant-scoped, 404 otherwise) and
+    the route then refuses honestly.
+    """
+    job = (await db.execute(
+        select(QueryJob.id).where(
+            QueryJob.id == query_id, QueryJob.organization_id == org_id
         )
-        return cost
-    except Exception as e:
-        raise HTTPException(status_code=400, detail="Operation failed. Please try again or contact support.")
+    )).scalar_one_or_none()
+    if job is None:
+        raise HTTPException(status_code=404, detail="Query job not found")
+    raise _not_implemented(
+        f"Cost estimation for {data_scanned_gb} GB is not implemented: the data "
+        "lake is Postgres and has no per-scan pricing."
+    )
 
 
 # ==================== DATA CATALOG ENDPOINTS ====================
@@ -1145,7 +1135,7 @@ async def estimate_query_cost(
 
 @router.get("/catalog")
 async def list_catalog(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Real data catalog — introspects Postgres for every whitelisted
@@ -1155,7 +1145,6 @@ async def list_catalog(
     writing a query against the lake.
     """
     from sqlalchemy import text as sa_text
-    org_id = getattr(current_user, "organization_id", None)
 
     entries: list[dict] = []
 
@@ -1188,19 +1177,18 @@ async def list_catalog(
 
         # Tenant-scoped row count.
         org_scoped = any(c["name"] == "organization_id" for c in columns)
-        try:
-            if org_scoped and org_id:
+        # Tables without organization_id get no count: a global COUNT would
+        # report every tenant's rows to the caller.
+        row_count: Optional[int] = None
+        if org_scoped:
+            try:
                 rc = (await db.execute(
                     sa_text(f"SELECT COUNT(*) FROM {table} WHERE organization_id = :org_id"),
                     {"org_id": org_id},
                 )).scalar()
-            else:
-                rc = (await db.execute(
-                    sa_text(f"SELECT COUNT(*) FROM {table}"),
-                )).scalar()
-            row_count = int(rc or 0)
-        except Exception:  # noqa: BLE001
-            row_count = 0
+                row_count = int(rc or 0)
+            except Exception:  # noqa: BLE001
+                row_count = 0
 
         # Table bytes via pg_total_relation_size.
         try:
@@ -1214,14 +1202,16 @@ async def list_catalog(
         # Last event timestamp.
         last_event = None
         for ts_col in ("created_at", "detected_at", "timestamp"):
+            if not org_scoped:
+                break
             if any(c["name"] == ts_col for c in columns):
                 try:
                     last = (await db.execute(
                         sa_text(
-                            f"SELECT MAX({ts_col}) FROM {table}"
-                            + (" WHERE organization_id = :org_id" if org_scoped and org_id else "")
+                            f"SELECT MAX({ts_col}) FROM {table} "
+                            "WHERE organization_id = :org_id"
                         ),
-                        {"org_id": org_id} if org_scoped and org_id else {},
+                        {"org_id": org_id},
                     )).scalar()
                     if last is not None:
                         last_event = last.isoformat() if hasattr(last, "isoformat") else str(last)
@@ -1360,7 +1350,7 @@ DATA_LAKE_READABLE_TABLES: dict[str, list[str]] = {
 }
 
 
-def _build_tenant_scoped_sql(raw_sql: str, org_id: Optional[str]) -> str:
+def _build_tenant_scoped_sql(raw_sql: str, org_id: str) -> str:
     """Validate a SQL SELECT against the whitelist and inject org scoping.
 
     The executor only allows a narrow subset of SQL:
@@ -1423,7 +1413,7 @@ def _build_tenant_scoped_sql(raw_sql: str, org_id: Optional[str]) -> str:
     # belt-and-suspenders guard: callers with their own WHERE clause
     # already get filtered, and callers without one still get filtered.
     primary_table = from_matches[0].lower()
-    if org_id is not None and primary_table in DATA_LAKE_READABLE_TABLES:
+    if primary_table in DATA_LAKE_READABLE_TABLES:
         where_idx = upper.find(" WHERE ")
         tenant_clause = f"{primary_table}.organization_id = :__pysoar_org_id"
         if where_idx >= 0:
@@ -1446,8 +1436,9 @@ def _build_tenant_scoped_sql(raw_sql: str, org_id: Optional[str]) -> str:
 
 @router.post("/query")
 async def run_catalog_filter_query(
+    org_id: OrganizationId,
+    current_user: CurrentUser,
     payload: dict = Body(...),
-    current_user: CurrentUser = None,
     db: DatabaseSession = None,
 ):
     """Execute a read-only SQL query against the data-lake whitelist.
@@ -1468,7 +1459,6 @@ async def run_catalog_filter_query(
     catalog metadata response. This keeps older frontends that filter the
     partition catalog working.
     """
-    org_id = getattr(current_user, "organization_id", None)
 
     # --- Real SQL execution path ---
     raw_sql: Optional[str] = None
@@ -1515,7 +1505,7 @@ async def run_catalog_filter_query(
         try:
             result = await db.execute(
                 sa_text(safe_sql),
-                {"__pysoar_org_id": org_id} if org_id is not None else {},
+                {"__pysoar_org_id": org_id},
             )
             col_names = list(result.keys())
             rows_raw = result.mappings().all()
@@ -1586,7 +1576,7 @@ async def run_catalog_filter_query(
             "execution_time_ms": elapsed_ms,
             "job_id": job_id,
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "tenant_scoped": org_id is not None,
+            "tenant_scoped": True,
         }
 
     # --- Legacy catalog filter path (no SQL provided) ---
@@ -1692,21 +1682,23 @@ async def run_catalog_filter_query(
 
 @router.get("/catalog/datasets")
 async def search_datasets(
-    current_user: CurrentUser = None,
+    _org_id: OrganizationId,
     search: str = Query(..., min_length=1),
 ):
-    """Search datasets in data catalog"""
-    try:
-        catalog = DataCatalog()
-        results = catalog.search_datasets(search)
-        return {"results": results, "count": len(results)}
-    except Exception as e:
-        raise HTTPException(status_code=400, detail="Operation failed. Please try again or contact support.")
+    """Search datasets in data catalog.
+
+    Not implemented: this searched a fresh in-memory ``DataCatalog`` on every
+    call, so it always returned no results. ``GET /data-lake/catalog`` is the
+    real (tenant-scoped) catalog.
+    """
+    raise _not_implemented(
+        f"Dataset search for {search!r} is not implemented; use GET /data-lake/catalog."
+    )
 
 
 @router.get("/catalog/lineage/{dataset_id}")
 async def get_data_lineage(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     dataset_id: str = Path(...),
 ):
@@ -1719,7 +1711,6 @@ async def get_data_lineage(
                     this id AND every DataPartition rooted at this source
     Tenant-scoped via organization_id on every query.
     """
-    org_id = getattr(current_user, "organization_id", None)
 
     # Try resolving as a DataSource first
     src = (
@@ -1815,7 +1806,7 @@ async def get_data_lineage(
 
 @router.get("/catalog/quality/{dataset_id}")
 async def get_data_quality(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     dataset_id: str = Path(...),
 ):
@@ -1829,7 +1820,6 @@ async def get_data_quality(
         - time coverage: earliest and latest time_range
     Raises 404 if the dataset is not a DataSource belonging to the caller's org.
     """
-    org_id = getattr(current_user, "organization_id", None)
 
     src = (
         await db.execute(
@@ -1916,11 +1906,10 @@ async def get_data_quality(
 
 @router.get("/dashboard/metrics")
 async def get_dashboard_metrics(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get unified dashboard metrics (real counts from DB, not hardcoded lies)."""
-    org_id = getattr(current_user, "organization_id", None)
     now = datetime.now(timezone.utc)
     window_24h = now - timedelta(hours=24)
 
@@ -2006,7 +1995,7 @@ async def get_dashboard_metrics(
 
 @router.get("/dashboard/storage-breakdown")
 async def get_storage_breakdown(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Real storage usage broken down by hot/warm/cold tier and by source.
@@ -2023,7 +2012,6 @@ async def get_storage_breakdown(
     includes anything the org registered manually via DataPartition rows.
     """
     from sqlalchemy import text as sa_text
-    org_id = getattr(current_user, "organization_id", None)
 
     # Real per-table byte count + tier breakdown via age bucketing.
     tiers = {"hot": 0, "warm": 0, "cold": 0, "archived": 0}
@@ -2032,10 +2020,11 @@ async def get_storage_breakdown(
 
     for table, _cols in DATA_LAKE_READABLE_TABLES.items():
         try:
-            row = (await db.execute(
-                sa_text(f"SELECT pg_total_relation_size(quote_ident(:t))"),
-                {"t": table},
-            )).scalar()
+            async with db.begin_nested():
+                row = (await db.execute(
+                    sa_text(f"SELECT pg_total_relation_size(quote_ident(:t))"),
+                    {"t": table},
+                )).scalar()
             table_bytes = int(row or 0)
         except Exception:  # noqa: BLE001
             continue
@@ -2044,23 +2033,29 @@ async def get_storage_breakdown(
             continue
 
         # Tenant-scoped age bucket counts.
-        where_org = "WHERE organization_id = :org_id" if org_id else ""
-        params = {"org_id": org_id} if org_id else {}
+        where_org = "WHERE organization_id = :org_id"
+        params = {"org_id": org_id}
         try:
-            bucket_row = (await db.execute(
-                sa_text(
-                    f"""
-                    SELECT
-                      COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days') AS hot,
-                      COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days' AND created_at < NOW() - INTERVAL '7 days') AS warm,
-                      COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '365 days' AND created_at < NOW() - INTERVAL '30 days') AS cold,
-                      COUNT(*) FILTER (WHERE created_at < NOW() - INTERVAL '365 days') AS archived,
-                      COUNT(*) AS total
-                    FROM {table} {where_org}
-                    """
-                ),
-                params,
-            )).first()
+            async with db.begin_nested():
+                bucket_row = (await db.execute(
+                    sa_text(
+                        f"""
+                        SELECT
+                          COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days') AS hot,
+                          COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days' AND created_at < NOW() - INTERVAL '7 days') AS warm,
+                          COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '365 days' AND created_at < NOW() - INTERVAL '30 days') AS cold,
+                          COUNT(*) FILTER (WHERE created_at < NOW() - INTERVAL '365 days') AS archived,
+                          COUNT(*) AS total
+                        FROM {table} {where_org}
+                        """
+                    ),
+                    params,
+                )).first()
+                # All-tenant row count: the table's bytes are shared by every
+                # org, so the caller is attributed only its share of them.
+                table_rows = (await db.execute(
+                    sa_text(f"SELECT COUNT(*) FROM {table}")
+                )).scalar()
         except Exception:  # noqa: BLE001
             continue
 
@@ -2068,10 +2063,11 @@ async def get_storage_breakdown(
             continue
         hot, warm, cold, archived, total_rows = bucket_row
         total_rows = int(total_rows or 0)
-        if total_rows == 0:
+        table_rows = int(table_rows or 0)
+        if total_rows == 0 or table_rows == 0:
             continue
         # Estimate per-bucket bytes proportional to row counts.
-        def _b(n, _table_bytes=table_bytes, _total_rows=total_rows):
+        def _b(n, _table_bytes=table_bytes, _total_rows=table_rows):
             # Defaults bind the loop's values; a bare closure would see the
             # last iteration's table_bytes/total_rows if called late.
             return int(_table_bytes * (int(n or 0) / _total_rows))
@@ -2094,12 +2090,13 @@ async def get_storage_breakdown(
     # Fold in any user-registered DataPartition rows so explicit archival
     # work still counts.
     try:
-        part_tier = await db.execute(
-            select(DataPartition.storage_tier, func.coalesce(func.sum(DataPartition.size_bytes), 0))
-            .where(DataPartition.organization_id == org_id)
-            .group_by(DataPartition.storage_tier)
-        )
-        for tier, bytes_ in part_tier.all():
+        async with db.begin_nested():
+            part_tier = (await db.execute(
+                select(DataPartition.storage_tier, func.coalesce(func.sum(DataPartition.size_bytes), 0))
+                .where(DataPartition.organization_id == org_id)
+                .group_by(DataPartition.storage_tier)
+            )).all()
+        for tier, bytes_ in part_tier:
             key = (tier or "hot").lower()
             if key in tiers:
                 tiers[key] += int(bytes_ or 0)
@@ -2118,7 +2115,7 @@ async def get_storage_breakdown(
 
 @router.get("/dashboard/pipeline-status")
 async def get_pipeline_status(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     include_builtins: bool = Query(
         True, description="Count live Celery beat pipelines as active"
@@ -2143,7 +2140,6 @@ async def get_pipeline_status(
         history model, so this honestly reflects the last run per
         pipeline and is an empty list when nothing has ever run.
     """
-    org_id = getattr(current_user, "organization_id", None)
 
     # Status counts in one org-scoped GROUP BY.
     status_rows = (await db.execute(
@@ -2216,7 +2212,7 @@ async def get_pipeline_status(
 
 @router.get("/dashboard/ingestion-trend")
 async def get_ingestion_trend(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     hours: int = Query(24, ge=1, le=168, description="Trailing window size in hours"),
 ):
@@ -2233,7 +2229,6 @@ async def get_ingestion_trend(
     """
     from sqlalchemy import text as sa_text
 
-    org_id = getattr(current_user, "organization_id", None)
     now = datetime.now(timezone.utc)
     window_start = (now - timedelta(hours=hours - 1)).replace(
         minute=0, second=0, microsecond=0
@@ -2255,32 +2250,31 @@ async def get_ingestion_trend(
 
     buckets: dict[str, int] = {}
     by_source: dict[str, int] = {}
-    if org_id is not None:
-        for spec in BUILTIN_DATA_SOURCES:
-            table = spec["table"]
-            if table not in DATA_LAKE_READABLE_TABLES:
+    for spec in BUILTIN_DATA_SOURCES:
+        table = spec["table"]
+        if table not in DATA_LAKE_READABLE_TABLES:
+            continue
+        try:
+            rows = (await db.execute(
+                sa_text(
+                    f"SELECT {bucket_expr} AS bucket, COUNT(*) "
+                    f"FROM {table} "
+                    f"WHERE organization_id = :org_id AND created_at >= :cutoff "
+                    f"GROUP BY 1"
+                ),
+                {"org_id": org_id, "cutoff": cutoff},
+            )).all()
+        except Exception:  # noqa: BLE001 — missing table/column: skip, never leak
+            await db.rollback()
+            continue
+        source_total = 0
+        for bucket, cnt in rows:
+            if bucket is None:
                 continue
-            try:
-                rows = (await db.execute(
-                    sa_text(
-                        f"SELECT {bucket_expr} AS bucket, COUNT(*) "
-                        f"FROM {table} "
-                        f"WHERE organization_id = :org_id AND created_at >= :cutoff "
-                        f"GROUP BY 1"
-                    ),
-                    {"org_id": org_id, "cutoff": cutoff},
-                )).all()
-            except Exception:  # noqa: BLE001 — missing table/column: skip, never leak
-                await db.rollback()
-                continue
-            source_total = 0
-            for bucket, cnt in rows:
-                if bucket is None:
-                    continue
-                buckets[str(bucket)] = buckets.get(str(bucket), 0) + int(cnt or 0)
-                source_total += int(cnt or 0)
-            if source_total:
-                by_source[spec["name"]] = source_total
+            buckets[str(bucket)] = buckets.get(str(bucket), 0) + int(cnt or 0)
+            source_total += int(cnt or 0)
+        if source_total:
+            by_source[spec["name"]] = source_total
 
     total_events = sum(buckets.values())
     points: list[dict] = []

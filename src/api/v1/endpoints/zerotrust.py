@@ -2,12 +2,12 @@
 
 import json
 from datetime import datetime, timezone
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request, status
 from sqlalchemy import and_, desc, func, select
 
-from src.api.deps import CurrentUser, DatabaseSession, require_role
+from src.api.deps import DatabaseSession, OrganizationId, require_role
 from src.core.logging import get_logger
 from src.core.utils import safe_json_loads
 from src.models.user import User, UserRole
@@ -48,6 +48,47 @@ from src.zerotrust.models import (
 logger = get_logger(__name__)
 router = APIRouter(prefix="/zerotrust", tags=["Zero Trust"])
 
+# Wave 1 role gates: viewers read only; analysts for operational writes;
+# admins for configuration and actions against live systems.
+AnalystUser = Annotated[User, Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
+AdminRoleUser = Annotated[User, Depends(require_role([UserRole.ADMIN]))]
+
+
+async def _get_segment_or_404(db: DatabaseSession, segment_id: str, org_id: str) -> MicroSegment:
+    """Load a micro-segment in the caller's tenant, or 404."""
+    result = await db.execute(
+        select(MicroSegment).where(
+            and_(
+                MicroSegment.id == segment_id,
+                MicroSegment.organization_id == org_id,
+            ),
+        ),
+    )
+    segment = result.scalar_one_or_none()
+    if not segment:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Segment not found")
+    return segment
+
+
+async def _require_segment_field(db: DatabaseSession, segment_id: str | None, org_id: str) -> None:
+    """422 naming ``microsegment_id`` when it is not a segment of this tenant."""
+    if not segment_id:
+        return
+    result = await db.execute(
+        select(MicroSegment.id).where(
+            and_(
+                MicroSegment.id == segment_id,
+                MicroSegment.organization_id == org_id,
+            ),
+        ),
+    )
+    if result.scalar_one_or_none() is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"error": "invalid_field", "field": "microsegment_id",
+                    "detail": "microsegment_id is not a segment of this organisation"},
+        )
+
 
 # ============================================================================
 # ACCESS CONTROL ENDPOINTS
@@ -58,10 +99,11 @@ router = APIRouter(prefix="/zerotrust", tags=["Zero Trust"])
 async def evaluate_access_request(
     request: AccessRequestSchema,
     raw_request: Request,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     # Analyst or above: an evaluation records an AccessDecision and can fire
     # violation automation, so viewers may not run one.
-    current_user: User = Depends(require_role([UserRole.ADMIN, UserRole.ANALYST])),
+    _user: User = Depends(require_role([UserRole.ADMIN, UserRole.ANALYST])),
 ) -> AccessDecisionResponse:
     """Evaluate access request and return decision (Policy Decision Point)
 
@@ -75,7 +117,6 @@ async def evaluate_access_request(
     )
 
     try:
-        org_id = getattr(current_user, "organization_id", None)
         pdp = PolicyDecisionPoint(db, org_id)
 
         # This endpoint is a what-if evaluation of a principal/resource pair.
@@ -135,33 +176,39 @@ async def evaluate_access_request(
             created_at=decision.created_at,
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         import traceback
         logger.error("api_error_evaluate_access", error=str(e), traceback=traceback.format_exc()[-1500:])
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Error evaluating access request",
-        )
+        ) from e
 
 
 @router.post("/evaluate-access", response_model=AccessDecisionResponse)
 async def evaluate_access_alias(
     request: AccessRequestSchema,
     raw_request: Request,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     # Analyst or above: an evaluation records an AccessDecision and can fire
     # violation automation, so viewers may not run one.
     current_user: User = Depends(require_role([UserRole.ADMIN, UserRole.ANALYST])),
 ) -> AccessDecisionResponse:
     """Alias for /evaluate — evaluate access request and return decision"""
-    return await evaluate_access_request(request, raw_request, db, current_user)
+    return await evaluate_access_request(
+        request, raw_request, org_id, db=db, _user=current_user
+    )
 
 
 @router.post("/continuous-eval/{session_id}", response_model=AccessDecisionResponse)
 async def continuous_session_evaluation(
     session_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ) -> AccessDecisionResponse:
     """Re-evaluate active session for risk changes
 
@@ -171,7 +218,6 @@ async def continuous_session_evaluation(
     logger.info("api_continuous_evaluation", session_id=session_id)
 
     try:
-        org_id = getattr(current_user, "organization_id", None)
         pdp = PolicyDecisionPoint(db, org_id)
 
         new_decision = await pdp.continuous_evaluation(session_id)
@@ -200,13 +246,13 @@ async def continuous_session_evaluation(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Error evaluating session",
-        )
+        ) from e
 
 
 @router.get("/decisions", response_model=None)
 async def list_access_decisions(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
     decision_filter: str = Query(None, description="allow, deny, challenge, step_up, isolate"),
@@ -214,7 +260,6 @@ async def list_access_decisions(
     """List access decisions (audit trail)"""
     logger.info("api_list_access_decisions", skip=skip, limit=limit)
 
-    org_id = getattr(current_user, "organization_id", None)
 
     query = select(AccessDecision).where(
         AccessDecision.organization_id == org_id,
@@ -263,13 +308,13 @@ async def list_access_decisions(
 @router.post("/policies", response_model=ZeroTrustPolicyResponse)
 async def create_policy(
     policy: ZeroTrustPolicyCreate,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AdminRoleUser = None,
 ) -> ZeroTrustPolicyResponse:
-    """Create a new Zero Trust policy"""
+    """Create a new Zero Trust policy (admin: access-policy configuration)"""
     logger.info("api_create_policy", name=policy.name, type=policy.policy_type)
-
-    org_id = getattr(current_user, "organization_id", None)
+    await _require_segment_field(db, policy.microsegment_id, org_id)
 
     db_policy = ZeroTrustPolicy(
         name=policy.name,
@@ -301,14 +346,13 @@ async def create_policy(
 
 @router.get("/policies", response_model=None)
 async def list_policies(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
     enabled_only: bool = Query(True),
 ) -> dict[str, Any]:
     """List Zero Trust policies"""
-    org_id = getattr(current_user, "organization_id", None)
 
     query = select(ZeroTrustPolicy).where(
         ZeroTrustPolicy.organization_id == org_id,
@@ -342,11 +386,10 @@ async def list_policies(
 @router.get("/policies/{policy_id}", response_model=ZeroTrustPolicyResponse)
 async def get_policy(
     policy_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ) -> ZeroTrustPolicyResponse:
     """Get policy details"""
-    org_id = getattr(current_user, "organization_id", None)
     result = await db.execute(
         select(ZeroTrustPolicy).where(
             and_(
@@ -369,11 +412,11 @@ async def get_policy(
 async def update_policy(
     policy_id: str,
     policy_update: ZeroTrustPolicyUpdate,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AdminRoleUser = None,
 ) -> ZeroTrustPolicyResponse:
-    """Update Zero Trust policy"""
-    org_id = getattr(current_user, "organization_id", None)
+    """Update Zero Trust policy (admin: access-policy configuration)"""
     result = await db.execute(
         select(ZeroTrustPolicy).where(
             and_(
@@ -391,6 +434,7 @@ async def update_policy(
 
     # Update fields
     update_data = policy_update.dict(exclude_unset=True)
+    await _require_segment_field(db, update_data.get("microsegment_id"), org_id)
     for key, value in update_data.items():
         if value is not None:
             if key in ["conditions", "actions", "allowed_locations", "blocked_locations", "time_restrictions", "tags"]:
@@ -408,11 +452,11 @@ async def update_policy(
 @router.delete("/policies/{policy_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_policy(
     policy_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AdminRoleUser = None,
 ) -> None:
-    """Delete Zero Trust policy"""
-    org_id = getattr(current_user, "organization_id", None)
+    """Delete Zero Trust policy (admin: access-policy configuration)"""
     result = await db.execute(
         select(ZeroTrustPolicy).where(
             and_(
@@ -436,11 +480,11 @@ async def delete_policy(
 async def test_policy(
     policy_id: str,
     test_request: AccessRequestSchema,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ) -> dict[str, Any]:
     """Test policy against sample access request"""
-    org_id = getattr(current_user, "organization_id", None)
     result = await db.execute(
         select(ZeroTrustPolicy).where(
             and_(
@@ -481,11 +525,10 @@ async def test_policy(
 
 @router.get("/device-stats", response_model=None)
 async def get_device_stats(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ) -> dict[str, Any]:
     """Get aggregate device trust stats"""
-    org_id = getattr(current_user, "organization_id", None)
 
     total_result = await db.execute(
         select(func.count(DeviceTrustProfile.id)).where(
@@ -545,9 +588,10 @@ async def get_device_stats(
 
 @router.post("/assess-devices", response_model=None)
 async def assess_all_devices(
+    org_id: OrganizationId,
     payload: dict = Body(default_factory=dict),
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ) -> dict[str, Any]:
     """Trigger assessment of devices.
 
@@ -557,7 +601,6 @@ async def assess_all_devices(
     actually kicked off a full org-wide assessment — misleading and
     potentially expensive.
     """
-    org_id = getattr(current_user, "organization_id", None)
     assessor = DeviceTrustAssessor(db, org_id)
 
     requested_ids = payload.get("device_ids") if isinstance(payload, dict) else None
@@ -590,14 +633,13 @@ async def assess_all_devices(
 
 @router.get("/devices", response_model=None)
 async def list_devices(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
     trust_level: str = Query(None, description="trusted, conditional, untrusted, blocked"),
 ) -> dict[str, Any]:
     """List devices with trust scores"""
-    org_id = getattr(current_user, "organization_id", None)
 
     query = select(DeviceTrustProfile).where(
         DeviceTrustProfile.organization_id == org_id,
@@ -641,11 +683,10 @@ async def list_devices(
 
 @router.get("/devices/non-compliant", response_model=None)
 async def list_non_compliant_devices(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ) -> dict[str, Any]:
     """Get devices below compliance threshold"""
-    org_id = getattr(current_user, "organization_id", None)
     assessor = DeviceTrustAssessor(db, org_id)
     non_compliant = await assessor.get_non_compliant_devices()
 
@@ -667,11 +708,10 @@ async def list_non_compliant_devices(
 @router.get("/devices/{device_id}", response_model=DeviceTrustProfileResponse)
 async def get_device(
     device_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ) -> DeviceTrustProfileResponse:
     """Get device trust details"""
-    org_id = getattr(current_user, "organization_id", None)
     result = await db.execute(
         select(DeviceTrustProfile).where(
             and_(
@@ -693,14 +733,19 @@ async def get_device(
 @router.post("/devices/{device_id}/assess", response_model=DeviceTrustProfileResponse)
 async def assess_device(
     device_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ) -> DeviceTrustProfileResponse:
     """Assess device compliance and trust score"""
-    org_id = getattr(current_user, "organization_id", None)
     assessor = DeviceTrustAssessor(db, org_id)
 
-    device = await assessor.assess_device(device_id)
+    try:
+        device = await assessor.assess_device(device_id)
+    except LookupError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Device not found",
+        ) from None
 
     return DeviceTrustProfileResponse.model_validate(device)
 
@@ -709,15 +754,20 @@ async def assess_device(
 async def update_device_compliance(
     device_id: str,
     compliance: DeviceComplianceUpdate,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AdminRoleUser = None,
 ) -> DeviceTrustProfileResponse:
-    """Update device compliance data"""
-    org_id = getattr(current_user, "organization_id", None)
+    """Override device compliance data (admin only: it feeds the PDP device check)"""
     assessor = DeviceTrustAssessor(db, org_id)
 
     compliance_data = compliance.dict(exclude_unset=True, exclude_none=True)
-    device = await assessor.update_device_compliance(device_id, compliance_data)
+    try:
+        device = await assessor.update_device_compliance(device_id, compliance_data)
+    except LookupError:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Device not found",
+        ) from None
 
     return DeviceTrustProfileResponse.model_validate(device)
 
@@ -730,11 +780,11 @@ async def update_device_compliance(
 @router.post("/segments", response_model=MicroSegmentResponse)
 async def create_segment(
     segment: MicroSegmentCreate,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AdminRoleUser = None,
 ) -> MicroSegmentResponse:
-    """Create a new micro-segment"""
-    org_id = getattr(current_user, "organization_id", None)
+    """Create a new micro-segment (admin: network-policy configuration)"""
     engine = MicroSegmentationEngine(db, org_id)
 
     seg = await engine.create_segment(
@@ -748,13 +798,12 @@ async def create_segment(
 
 @router.get("/segments", response_model=None)
 async def list_segments(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
 ) -> dict[str, Any]:
     """List micro-segments"""
-    org_id = getattr(current_user, "organization_id", None)
 
     query = select(MicroSegment).where(
         MicroSegment.organization_id == org_id,
@@ -785,11 +834,10 @@ async def list_segments(
 @router.get("/segments/{segment_id}", response_model=MicroSegmentResponse)
 async def get_segment(
     segment_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ) -> MicroSegmentResponse:
     """Get segment details"""
-    org_id = getattr(current_user, "organization_id", None)
     result = await db.execute(
         select(MicroSegment).where(
             and_(
@@ -812,11 +860,11 @@ async def get_segment(
 async def update_segment(
     segment_id: str,
     segment_update: MicroSegmentUpdate,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AdminRoleUser = None,
 ) -> MicroSegmentResponse:
-    """Update micro-segment"""
-    org_id = getattr(current_user, "organization_id", None)
+    """Update micro-segment (admin: network-policy configuration)"""
     result = await db.execute(
         select(MicroSegment).where(
             and_(
@@ -851,11 +899,11 @@ async def update_segment(
 @router.delete("/segments/{segment_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_segment(
     segment_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AdminRoleUser = None,
 ) -> None:
-    """Delete micro-segment"""
-    org_id = getattr(current_user, "organization_id", None)
+    """Delete micro-segment (admin: network-policy configuration)"""
     result = await db.execute(
         select(MicroSegment).where(
             and_(
@@ -879,11 +927,15 @@ async def delete_segment(
 async def evaluate_segment_traffic(
     segment_id: str,
     traffic: SegmentTrafficRequest,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ) -> SegmentTrafficResponse:
-    """Evaluate if traffic is allowed within segment"""
-    org_id = getattr(current_user, "organization_id", None)
+    """Evaluate if traffic is allowed within segment
+
+    Read-only computation over this tenant's segments (persists nothing), so
+    viewers may run it.
+    """
+    await _get_segment_or_404(db, segment_id, org_id)
     engine = MicroSegmentationEngine(db, org_id)
 
     result = await engine.evaluate_traffic(
@@ -899,11 +951,11 @@ async def evaluate_segment_traffic(
 @router.get("/segments/{segment_id}/violations", response_model=None)
 async def get_segment_violations(
     segment_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ) -> dict[str, Any]:
     """Get policy violations for segment"""
-    org_id = getattr(current_user, "organization_id", None)
+    await _get_segment_or_404(db, segment_id, org_id)
     engine = MicroSegmentationEngine(db, org_id)
 
     violations = await engine.get_segment_violations(segment_id)
@@ -913,11 +965,10 @@ async def get_segment_violations(
 
 @router.get("/topology", response_model=None)
 async def get_segment_topology(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ) -> dict[str, Any]:
     """Get network topology visualization"""
-    org_id = getattr(current_user, "organization_id", None)
     engine = MicroSegmentationEngine(db, org_id)
 
     return await engine.visualize_segments()
@@ -931,11 +982,11 @@ async def get_segment_topology(
 @router.post("/verify", response_model=IdentityVerificationResponse)
 async def initiate_verification(
     verification: IdentityVerificationCreate,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ) -> IdentityVerificationResponse:
     """Initiate identity verification"""
-    org_id = getattr(current_user, "organization_id", None)
     auth_engine = ContinuousAuthEngine(db, org_id)
 
     v = await auth_engine.initiate_verification(
@@ -954,27 +1005,40 @@ async def initiate_verification(
 @router.post("/step-up/{session_id}", response_model=None)
 async def step_up_authentication(
     session_id: str,
-    db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     required_level: str = Query(..., description="mfa, biometric, password"),
 ) -> dict[str, Any]:
-    """Initiate step-up authentication"""
-    org_id = getattr(current_user, "organization_id", None)
-    auth_engine = ContinuousAuthEngine(db, org_id)
+    """Initiate step-up authentication (not implemented).
 
-    return await auth_engine.step_up_authentication(session_id, required_level)
+    This used to return ``challenge_<session_id>`` as if a challenge had been
+    issued; no challenge was ever sent to the user and nothing could verify a
+    response. It now says so instead of faking success.
+    """
+    logger.info(
+        "api_step_up_not_implemented",
+        organization_id=org_id,
+        session_id=session_id,
+        required_level=required_level,
+    )
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail={
+            "error": "not_implemented",
+            "detail": "step-up authentication challenges are not issued yet; no challenge was sent",
+        },
+    )
 
 
 @router.get("/verifications", response_model=None)
 async def list_verifications(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
     user_id: str = Query(None),
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
 ) -> dict[str, Any]:
     """Get verification history"""
-    org_id = getattr(current_user, "organization_id", None)
 
     query = select(IdentityVerification).where(
         IdentityVerification.organization_id == org_id,
@@ -1014,11 +1078,10 @@ async def list_verifications(
 
 @router.get("/maturity", response_model=ZeroTrustMaturityResponse)
 async def get_maturity_score(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ) -> ZeroTrustMaturityResponse:
     """Get Zero Trust maturity score and assessment"""
-    org_id = getattr(current_user, "organization_id", None)
     scorer = ZeroTrustScorer(db, org_id)
 
     maturity = await scorer.calculate_maturity_score()
@@ -1034,11 +1097,10 @@ async def get_maturity_score(
 
 @router.get("/maturity/pillars", response_model=None)
 async def get_maturity_pillars(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ) -> dict[str, Any]:
     """Get per-pillar maturity breakdown"""
-    org_id = getattr(current_user, "organization_id", None)
     scorer = ZeroTrustScorer(db, org_id)
 
     maturity = await scorer.calculate_maturity_score()
@@ -1048,11 +1110,10 @@ async def get_maturity_pillars(
 
 @router.get("/recommendations", response_model=None)
 async def get_recommendations(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ) -> dict[str, Any]:
     """Get improvement recommendations"""
-    org_id = getattr(current_user, "organization_id", None)
     scorer = ZeroTrustScorer(db, org_id)
 
     maturity = await scorer.calculate_maturity_score()
@@ -1070,13 +1131,12 @@ async def get_recommendations(
 
 @router.get("/dashboard", response_model=ZeroTrustDashboardStats)
 async def get_dashboard_stats(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ) -> ZeroTrustDashboardStats:
     """Get Zero Trust dashboard statistics"""
     logger.info("api_get_dashboard_stats")
 
-    org_id = getattr(current_user, "organization_id", None)
 
     # Get policy stats
     policy_result = await db.execute(

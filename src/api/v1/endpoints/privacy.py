@@ -7,10 +7,11 @@ Handles GDPR, CCPA, LGPD, PIPA, PDPA, and HIPAA compliance automation.
 """
 
 from datetime import datetime, timedelta
-from typing import List, Optional, Dict, Any
+from typing import Annotated, List, Optional, Dict, Any
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query
-from src.api.deps import CurrentUser, DatabaseSession
+from src.api.deps import CurrentUser, DatabaseSession, OrganizationId, require_role
+from src.models.user import User, UserRole
 from sqlalchemy import select, and_, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -68,6 +69,49 @@ logger = get_logger(__name__)
 
 router = APIRouter(prefix="/privacy", tags=["privacy"])
 
+# Wave 1 role gates: viewers read only; analysts for operational writes;
+# admins for configuration and actions against live systems.
+AnalystUser = Annotated[User, Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
+AdminRoleUser = Annotated[User, Depends(require_role([UserRole.ADMIN]))]
+
+
+async def _get_dsr_or_404(db: AsyncSession, request_id: str, org_id: str) -> DataSubjectRequest:
+    """Load a DSR inside the caller's organisation or raise 404."""
+    result = await db.execute(
+        select(DataSubjectRequest).where(
+            DataSubjectRequest.id == request_id,
+            DataSubjectRequest.organization_id == org_id,
+        )
+    )
+    dsr = result.scalar_one_or_none()
+    if dsr is None:
+        raise HTTPException(status_code=404, detail="DSR not found")
+    return dsr
+
+
+async def _get_pia_or_404(
+    db: AsyncSession, assessment_id: str, org_id: str
+) -> PrivacyImpactAssessment:
+    """Load a PIA inside the caller's organisation or raise 404."""
+    result = await db.execute(
+        select(PrivacyImpactAssessment).where(
+            PrivacyImpactAssessment.id == assessment_id,
+            PrivacyImpactAssessment.organization_id == org_id,
+        )
+    )
+    pia = result.scalar_one_or_none()
+    if pia is None:
+        raise HTTPException(status_code=404, detail="PIA not found")
+    return pia
+
+
+def _not_implemented(detail: str) -> HTTPException:
+    """Honest 501 for workflow steps PySOAR does not actually perform."""
+    return HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail={"error": "not_implemented", "detail": detail},
+    )
+
 
 # ============================================================================
 # DATA SUBJECT REQUEST (DSR) ENDPOINTS
@@ -77,8 +121,9 @@ router = APIRouter(prefix="/privacy", tags=["privacy"])
 @router.post("/dsr/requests", response_model=DataSubjectRequestResponse, status_code=201)
 async def create_dsr(
     dsr: DataSubjectRequestCreate,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ):
     """
     Create new Data Subject Request.
@@ -96,7 +141,7 @@ async def create_dsr(
     - automated_decision: Right to human review (GDPR Article 22)
     """
     try:
-        processor = DSRProcessor(db, getattr(current_user, "organization_id", None))
+        processor = DSRProcessor(db, org_id)
         request = await processor.receive_request(
             request_type=dsr.request_type.value,
             regulation=dsr.regulation.value,
@@ -107,7 +152,6 @@ async def create_dsr(
         await db.commit()
 
         try:
-            org_id = getattr(current_user, "organization_id", None)
             automation = AutomationService(db)
             await automation.on_privacy_dsr_created(
                 dsr_id=request.id,
@@ -130,11 +174,11 @@ async def create_dsr(
 
 @router.get("/dsr/requests", response_model=DataSubjectRequestListResponse)
 async def list_dsrs(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
-    status: Optional[str] = None,
+    status_filter: Optional[str] = Query(None, alias="status"),
     regulation: Optional[str] = None,
 ):
     """
@@ -147,19 +191,17 @@ async def list_dsrs(
     """
     try:
         stmt = select(DataSubjectRequest).where(
-            DataSubjectRequest.organization_id == getattr(current_user, "organization_id", None)
+            DataSubjectRequest.organization_id == org_id
         )
 
-        if status:
-            stmt = stmt.where(DataSubjectRequest.status == status)
+        if status_filter:
+            stmt = stmt.where(DataSubjectRequest.status == status_filter)
 
         if regulation:
             stmt = stmt.where(DataSubjectRequest.regulation == regulation)
 
-        # Count total
-        count_stmt = select(func.count()).select_from(DataSubjectRequest).where(
-            DataSubjectRequest.organization_id == getattr(current_user, "organization_id", None)
-        )
+        # Count total (with the same filters as the page)
+        count_stmt = select(func.count()).select_from(stmt.subquery())
         count_result = await db.execute(count_stmt)
         total = count_result.scalar()
 
@@ -185,15 +227,15 @@ async def list_dsrs(
 @router.get("/dsr/requests/{request_id}", response_model=DataSubjectRequestResponse)
 async def get_dsr(
     request_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
     """Get Data Subject Request by ID."""
     try:
         stmt = select(DataSubjectRequest).where(
             and_(
                 DataSubjectRequest.id == request_id,
-                DataSubjectRequest.organization_id == getattr(current_user, "organization_id", None),
+                DataSubjectRequest.organization_id == org_id,
             )
         )
         result = await db.execute(stmt)
@@ -219,15 +261,16 @@ async def get_dsr(
 async def update_dsr(
     request_id: str,
     dsr_update: DataSubjectRequestUpdate,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ):
     """Update Data Subject Request status or notes."""
     try:
         stmt = select(DataSubjectRequest).where(
             and_(
                 DataSubjectRequest.id == request_id,
-                DataSubjectRequest.organization_id == getattr(current_user, "organization_id", None),
+                DataSubjectRequest.organization_id == org_id,
             )
         )
         result = await db.execute(stmt)
@@ -260,82 +303,74 @@ async def update_dsr(
 @router.post("/dsr/requests/{request_id}/verify-identity")
 async def verify_dsr_identity(
     request_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     verification_method: str = Query(..., description="email, phone, document"),
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ):
-    """Verify Data Subject identity."""
-    try:
-        processor = DSRProcessor(db, getattr(current_user, "organization_id", None))
-        success = await processor.verify_identity(request_id, verification_method)
+    """Verify Data Subject identity.
 
-        if not success:
-            raise HTTPException(status_code=404, detail="DSR not found")
-
-        await db.commit()
-        return {"status": "verified", "method": verification_method}
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Failed to verify identity: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Operation failed. Please try again or contact support."
-        )
+    Not implemented: no email, phone or document verification is performed,
+    yet this used to mark the DSR ``identity_verified``. An analyst who has
+    verified the subject out of band records that through PATCH
+    ``/dsr/requests/{id}`` (status + processing_notes).
+    """
+    await _get_dsr_or_404(db, request_id, org_id)
+    raise _not_implemented(
+        f"Identity verification via {verification_method!r} is not implemented; "
+        "record an out-of-band verification with PATCH /privacy/dsr/requests/{id}."
+    )
 
 
 @router.post("/dsr/requests/{request_id}/search-systems")
 async def search_data_systems(
     request_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     systems: List[str] = Query(...),
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ):
-    """Search data systems for subject data."""
-    try:
-        processor = DSRProcessor(db, getattr(current_user, "organization_id", None))
-        results = await processor.search_data_systems(request_id, systems)
+    """Search data systems for subject data.
 
-        await db.commit()
-        return results
-
-    except Exception as e:
-        logger.error(f"Failed to search systems: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Operation failed. Please try again or contact support."
-        )
+    Not implemented: no connector queries the named systems; this used to
+    report caller-supplied systems as "searched".
+    """
+    await _get_dsr_or_404(db, request_id, org_id)
+    raise _not_implemented(
+        f"Searching {len(systems)} external data system(s) for subject data is not "
+        "implemented: no data-system connectors exist."
+    )
 
 
 @router.post("/dsr/requests/{request_id}/compile-data")
 async def compile_data_package(
     request_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     format_type: str = Query("json", description="json, csv, xml"),
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ):
-    """Compile data package for portability/access requests."""
-    try:
-        processor = DSRProcessor(db, getattr(current_user, "organization_id", None))
-        package = await processor.compile_data_package(request_id, format_type)
+    """Compile data package for portability/access requests.
 
-        await db.commit()
-        return package
-
-    except Exception as e:
-        logger.error(f"Failed to compile data: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Operation failed. Please try again or contact support."
-        )
+    Not implemented: the "package" used to hold category labels, not the
+    subject's data.
+    """
+    await _get_dsr_or_404(db, request_id, org_id)
+    raise _not_implemented(
+        f"Compiling a {format_type!r} data package is not implemented: subject data "
+        "is not collected from any system."
+    )
 
 
 @router.post("/dsr/requests/{request_id}/deadline-alerts")
 async def get_deadline_alerts(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ) -> List[DSRDeadlineAlert]:
     """Get DSR deadline compliance alerts."""
     try:
-        processor = DSRProcessor(db, getattr(current_user, "organization_id", None))
+        processor = DSRProcessor(db, org_id)
         alerts = await processor.track_deadline_compliance()
         return alerts
 
@@ -354,8 +389,9 @@ async def get_deadline_alerts(
 @router.post("/pia/assessments", response_model=PrivacyImpactAssessmentResponse, status_code=201)
 async def create_pia(
     pia: PrivacyImpactAssessmentCreate,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ):
     """
     Create Privacy Impact Assessment (DPIA/PIA).
@@ -367,7 +403,7 @@ async def create_pia(
     - legitimate_interest: Legitimate Interest Assessment (Article 6(1)(f))
     """
     try:
-        engine = PIAEngine(db, getattr(current_user, "organization_id", None))
+        engine = PIAEngine(db, org_id)
         assessment = await engine.create_assessment(
             name=pia.name,
             project_name=pia.project_name,
@@ -385,20 +421,20 @@ async def create_pia(
 
 @router.get("/pia/assessments", response_model=List[PrivacyImpactAssessmentResponse])
 async def list_pias(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
-    status: Optional[str] = None,
+    status_filter: Optional[str] = Query(None, alias="status"),
 ):
     """List Privacy Impact Assessments."""
     try:
         stmt = select(PrivacyImpactAssessment).where(
-            PrivacyImpactAssessment.organization_id == getattr(current_user, "organization_id", None)
+            PrivacyImpactAssessment.organization_id == org_id
         )
 
-        if status:
-            stmt = stmt.where(PrivacyImpactAssessment.status == status)
+        if status_filter:
+            stmt = stmt.where(PrivacyImpactAssessment.status == status_filter)
 
         stmt = stmt.offset((page - 1) * size).limit(size).order_by(
             PrivacyImpactAssessment.created_at.desc()
@@ -419,15 +455,15 @@ async def list_pias(
 @router.get("/pia/assessments/{assessment_id}", response_model=PrivacyImpactAssessmentResponse)
 async def get_pia(
     assessment_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
     """Get Privacy Impact Assessment by ID."""
     try:
         stmt = select(PrivacyImpactAssessment).where(
             and_(
                 PrivacyImpactAssessment.id == assessment_id,
-                PrivacyImpactAssessment.organization_id == getattr(current_user, "organization_id", None),
+                PrivacyImpactAssessment.organization_id == org_id,
             )
         )
         result = await db.execute(stmt)
@@ -450,14 +486,16 @@ async def get_pia(
 @router.post("/pia/assessments/{assessment_id}/assess-risks")
 async def assess_pia_risks(
     assessment_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     data_subjects_count: int = Query(..., ge=0),
     processing_scope: str = Query(...),
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ):
     """Assess risks to data subjects."""
+    await _get_pia_or_404(db, assessment_id, org_id)
     try:
-        engine = PIAEngine(db, getattr(current_user, "organization_id", None))
+        engine = PIAEngine(db, org_id)
         assessment = await engine.assess_risks(
             assessment_id, data_subjects_count, processing_scope
         )
@@ -475,33 +513,31 @@ async def assess_pia_risks(
 @router.post("/pia/assessments/{assessment_id}/mitigations")
 async def recommend_mitigations(
     assessment_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ):
-    """Get recommended mitigations for PIA."""
-    try:
-        engine = PIAEngine(db, getattr(current_user, "organization_id", None))
-        mitigations = await engine.recommend_mitigations(assessment_id)
+    """Get recommended mitigations for PIA.
 
-        await db.commit()
-        return {"mitigations": mitigations}
-
-    except Exception as e:
-        logger.error(f"Failed to get mitigations: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail="Operation failed. Please try again or contact support."
-        )
+    Not implemented: this used to write the same boilerplate mitigation list
+    into every PIA, which then lowered its risk score.
+    """
+    await _get_pia_or_404(db, assessment_id, org_id)
+    raise _not_implemented(
+        "Assessment-specific mitigation recommendations are not implemented."
+    )
 
 
 @router.post("/pia/assessments/{assessment_id}/submit-dpo-review")
 async def submit_pia_for_dpo_review(
     assessment_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ):
     """Submit PIA for Data Protection Officer review."""
     try:
-        engine = PIAEngine(db, getattr(current_user, "organization_id", None))
+        engine = PIAEngine(db, org_id)
         success = await engine.submit_for_dpo_review(assessment_id)
 
         if not success:
@@ -527,8 +563,9 @@ async def submit_pia_for_dpo_review(
 @router.post("/consent/records", response_model=ConsentRecordResponse, status_code=201)
 async def create_consent_record(
     consent: ConsentRecordCreate,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ):
     """
     Record explicit consent per GDPR Article 7.
@@ -542,7 +579,7 @@ async def create_consent_record(
     - legitimate_interest: Legitimate interests (Article 6(1)(f))
     """
     try:
-        manager = ConsentManager(db, getattr(current_user, "organization_id", None))
+        manager = ConsentManager(db, org_id)
         record = await manager.record_consent(
             subject_id=consent.subject_id,
             purpose=consent.purpose,
@@ -563,14 +600,14 @@ async def create_consent_record(
 @router.get("/consent/records/{subject_id}", response_model=List[ConsentRecordResponse])
 async def get_consent_records(
     subject_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
     """Get all consent records for a data subject."""
     try:
         stmt = select(ConsentRecord).where(
             and_(
-                ConsentRecord.organization_id == getattr(current_user, "organization_id", None),
+                ConsentRecord.organization_id == org_id,
                 ConsentRecord.subject_id == subject_id,
             )
         )
@@ -588,12 +625,13 @@ async def get_consent_records(
 @router.post("/consent/records/{record_id}/withdraw")
 async def withdraw_consent(
     record_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ):
     """Withdraw previously given consent (GDPR Article 7(3))."""
     try:
-        manager = ConsentManager(db, getattr(current_user, "organization_id", None))
+        manager = ConsentManager(db, org_id)
         success = await manager.withdraw_consent(record_id)
 
         if not success:
@@ -623,15 +661,16 @@ async def withdraw_consent(
 )
 async def create_processing_record(
     record: DataProcessingRecordCreate,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AdminRoleUser = None,
 ):
     """
     Create Record of Processing Activities (ROPA) per GDPR Article 30.
     Required for all organizations processing personal data.
     """
     try:
-        governance = DataGovernance(db, getattr(current_user, "organization_id", None))
+        governance = DataGovernance(db, org_id)
         processing_record = await governance.create_processing_record(
             name=record.name,
             purpose=record.purpose,
@@ -652,15 +691,15 @@ async def create_processing_record(
     "/ropa/processing-records", response_model=List[DataProcessingRecordResponse]
 )
 async def list_processing_records(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
 ):
     """List Record of Processing Activities."""
     try:
         stmt = select(DataProcessingRecord).where(
-            DataProcessingRecord.organization_id == getattr(current_user, "organization_id", None)
+            DataProcessingRecord.organization_id == org_id
         )
 
         stmt = stmt.offset((page - 1) * size).limit(size).order_by(
@@ -681,12 +720,13 @@ async def list_processing_records(
 
 @router.post("/ropa/retention-violations", response_model=List[RetentionViolation])
 async def get_retention_violations(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ):
     """Check for data retention compliance violations."""
     try:
-        governance = DataGovernance(db, getattr(current_user, "organization_id", None))
+        governance = DataGovernance(db, org_id)
         violations = await governance.check_retention_compliance()
         return violations
 
@@ -699,12 +739,12 @@ async def get_retention_violations(
 
 @router.get("/ropa/generate-ropa")
 async def generate_ropa(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
     """Generate complete ROPA document per GDPR Article 30."""
     try:
-        governance = DataGovernance(db, getattr(current_user, "organization_id", None))
+        governance = DataGovernance(db, org_id)
         ropa = await governance.generate_ropa()
         return {"document": ropa, "generated_at": datetime.utcnow().isoformat()}
 
@@ -725,8 +765,9 @@ async def generate_ropa(
 )
 async def report_privacy_incident(
     incident: PrivacyIncidentCreate,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ):
     """
     Report privacy incident (data breach, processing violation, etc.).
@@ -735,7 +776,7 @@ async def report_privacy_incident(
     notification workflows, as well as CCPA § 1798.82 requirements.
     """
     try:
-        incident_mgr = PrivacyIncidentManager(db, getattr(current_user, "organization_id", None))
+        incident_mgr = PrivacyIncidentManager(db, org_id)
         privacy_incident = await incident_mgr.report_incident(
             title=incident.title,
             description=incident.description,
@@ -748,7 +789,7 @@ async def report_privacy_incident(
         # Trigger escalation task (non-blocking — if Celery/Redis unavailable, save still works)
         try:
             from src.privacy.tasks import privacy_incident_escalation
-            privacy_incident_escalation.delay(privacy_incident.id, getattr(current_user, "organization_id", None))
+            privacy_incident_escalation.delay(privacy_incident.id, org_id)
         except Exception:
             logger.warning("Could not dispatch escalation task — Celery/Redis may be unavailable")
 
@@ -764,20 +805,20 @@ async def report_privacy_incident(
 
 @router.get("/incidents/reports", response_model=List[PrivacyIncidentResponse])
 async def list_incidents(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
-    status: Optional[str] = None,
+    status_filter: Optional[str] = Query(None, alias="status"),
 ):
     """List privacy incidents."""
     try:
         stmt = select(PrivacyIncident).where(
-            PrivacyIncident.organization_id == getattr(current_user, "organization_id", None)
+            PrivacyIncident.organization_id == org_id
         )
 
-        if status:
-            stmt = stmt.where(PrivacyIncident.status == status)
+        if status_filter:
+            stmt = stmt.where(PrivacyIncident.status == status_filter)
 
         stmt = stmt.offset((page - 1) * size).limit(size).order_by(
             PrivacyIncident.created_at.desc()
@@ -800,15 +841,15 @@ async def list_incidents(
 )
 async def get_incident(
     incident_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
     """Get privacy incident by ID."""
     try:
         stmt = select(PrivacyIncident).where(
             and_(
                 PrivacyIncident.id == incident_id,
-                PrivacyIncident.organization_id == getattr(current_user, "organization_id", None),
+                PrivacyIncident.organization_id == org_id,
             )
         )
         result = await db.execute(stmt)
@@ -831,17 +872,22 @@ async def get_incident(
 @router.post("/incidents/reports/{incident_id}/notification-deadlines")
 async def get_notification_deadlines(
     incident_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ):
     """Get regulatory notification deadlines for incident."""
     try:
-        incident_mgr = PrivacyIncidentManager(db, getattr(current_user, "organization_id", None))
+        incident_mgr = PrivacyIncidentManager(db, org_id)
         deadlines = await incident_mgr.calculate_notification_deadlines(incident_id)
+        if not deadlines:
+            raise HTTPException(status_code=404, detail="Incident not found")
 
         await db.commit()
         return deadlines
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to get deadlines: {str(e)}")
         raise HTTPException(
@@ -852,12 +898,13 @@ async def get_notification_deadlines(
 @router.post("/incidents/reports/{incident_id}/mark-notified")
 async def mark_incident_notified(
     incident_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ):
     """Mark notifications as sent."""
     try:
-        incident_mgr = PrivacyIncidentManager(db, getattr(current_user, "organization_id", None))
+        incident_mgr = PrivacyIncidentManager(db, org_id)
         success = await incident_mgr.track_notifications(incident_id)
 
         if not success:
@@ -882,20 +929,20 @@ async def mark_incident_notified(
 
 @router.get("/dashboard/stats", response_model=PrivacyDashboardStats)
 async def get_privacy_stats(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
     """Get privacy module dashboard statistics."""
     try:
         # Count DSRs
         dsr_stmt = select(func.count()).select_from(DataSubjectRequest).where(
-            DataSubjectRequest.organization_id == getattr(current_user, "organization_id", None)
+            DataSubjectRequest.organization_id == org_id
         )
         total_dsrs = (await db.execute(dsr_stmt)).scalar() or 0
 
         pending_dsr_stmt = select(func.count()).select_from(DataSubjectRequest).where(
             and_(
-                DataSubjectRequest.organization_id == getattr(current_user, "organization_id", None),
+                DataSubjectRequest.organization_id == org_id,
                 DataSubjectRequest.status != DSRStatus.COMPLETED.value,
             )
         )
@@ -903,23 +950,22 @@ async def get_privacy_stats(
 
         # Count PIAs
         pia_stmt = select(func.count()).select_from(PrivacyImpactAssessment).where(
-            PrivacyImpactAssessment.organization_id == getattr(current_user, "organization_id", None)
+            PrivacyImpactAssessment.organization_id == org_id
         )
         active_pias = (await db.execute(pia_stmt)).scalar() or 0
 
         # Count Consents
         consent_stmt = select(func.count()).select_from(ConsentRecord).where(
-            ConsentRecord.organization_id == getattr(current_user, "organization_id", None)
+            ConsentRecord.organization_id == org_id
         )
         total_consents = (await db.execute(consent_stmt)).scalar() or 0
 
         # Count Incidents
         incident_stmt = select(func.count()).select_from(PrivacyIncident).where(
-            PrivacyIncident.organization_id == getattr(current_user, "organization_id", None)
+            PrivacyIncident.organization_id == org_id
         )
         total_incidents = (await db.execute(incident_stmt)).scalar() or 0
 
-        org_id = getattr(current_user, "organization_id", None)
 
         # PIAs requiring review
         pias_review_stmt = select(func.count()).select_from(PrivacyImpactAssessment).where(
@@ -1020,11 +1066,12 @@ async def get_privacy_stats(
 
 @router.post("/monitoring/trigger-dsr-deadline-check")
 async def trigger_dsr_deadline_check(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
 ):
     """Manually trigger DSR deadline monitoring task."""
     try:
-        dsr_deadline_monitor.delay(getattr(current_user, "organization_id", None))
+        dsr_deadline_monitor.delay(org_id)
         return {"status": "monitoring_triggered"}
 
     except Exception as e:
@@ -1036,11 +1083,12 @@ async def trigger_dsr_deadline_check(
 
 @router.post("/monitoring/trigger-retention-check")
 async def trigger_retention_check(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
 ):
     """Manually trigger retention enforcement task."""
     try:
-        retention_enforcement.delay(getattr(current_user, "organization_id", None))
+        retention_enforcement.delay(org_id)
         return {"status": "retention_check_triggered"}
 
     except Exception as e:
@@ -1052,11 +1100,12 @@ async def trigger_retention_check(
 
 @router.post("/monitoring/trigger-consent-expiry-check")
 async def trigger_consent_check(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
 ):
     """Manually trigger consent expiry check task."""
     try:
-        consent_expiry_check.delay(getattr(current_user, "organization_id", None))
+        consent_expiry_check.delay(org_id)
         return {"status": "consent_check_triggered"}
 
     except Exception as e:
@@ -1068,11 +1117,12 @@ async def trigger_consent_check(
 
 @router.post("/monitoring/trigger-pia-review-reminder")
 async def trigger_pia_reminder(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
 ):
     """Manually trigger PIA review reminder task."""
     try:
-        pia_review_reminder.delay(getattr(current_user, "organization_id", None))
+        pia_review_reminder.delay(org_id)
         return {"status": "pia_reminder_triggered"}
 
     except Exception as e:

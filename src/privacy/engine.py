@@ -1291,11 +1291,16 @@ class PrivacyIncidentManager:
         if not incident:
             return {}
 
-        now = datetime.now(timezone.utc)
+        # Anchor on when the incident was recorded, not on "now": anchoring on
+        # now() moved every deadline forward each time it was recalculated.
+        anchor = incident.created_at or datetime.now(timezone.utc)
+        if anchor.tzinfo is None:
+            anchor = anchor.replace(tzinfo=timezone.utc)
         deadlines = {
-            "gdpr_authority": (now + timedelta(hours=72)).isoformat(),
-            "ccpa_subjects": (now + timedelta(days=30)).isoformat(),
-            "hipaa": (now + timedelta(days=60)).isoformat(),
+            "anchored_to_reported_at": anchor.isoformat(),
+            "gdpr_authority": (anchor + timedelta(hours=72)).isoformat(),
+            "ccpa_subjects": (anchor + timedelta(days=30)).isoformat(),
+            "hipaa": (anchor + timedelta(days=60)).isoformat(),
         }
 
         incident.notification_deadline = deadlines["gdpr_authority"]

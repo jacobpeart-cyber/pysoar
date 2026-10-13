@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Body, 
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_, func
 
-from src.api.deps import CurrentUser, DatabaseSession, get_current_active_user, require_role
+from src.api.deps import CurrentUser, DatabaseSession, get_current_active_user, require_role, OrganizationId
 from src.core.database import get_db
 from src.core.logging import get_logger
 from src.models.user import User, UserRole
@@ -50,6 +50,11 @@ logger = get_logger(__name__)
 
 router = APIRouter(prefix="/audit-evidence", tags=["audit-evidence"])
 
+# Wave 1 role gates: viewers read only; analysts for operational writes;
+# admins for configuration and actions against live systems.
+AnalystUser = Annotated[User, Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
+AdminRoleUser = Annotated[User, Depends(require_role([UserRole.ADMIN]))]
+
 # The only directory compliance evidence files are written to (by
 # POST /audit-evidence/evidence/upload, under <root>/<org>/<control>/) and
 # therefore the only directory the download route will serve from. Before
@@ -80,9 +85,6 @@ def local_evidence_path(location: str, org_id: Optional[str]) -> str:
     return real
 
 
-# Writing audit events by hand is an analyst action; viewers may only read.
-AuditWriter = Annotated[User, Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
-
 
 # ============================================================================
 # Audit Trail Endpoints
@@ -93,7 +95,8 @@ AuditWriter = Annotated[User, Depends(require_role([UserRole.ADMIN, UserRole.ANA
 async def log_audit_event(
     request: AuditLogRequest,
     http_request: Request,
-    current_user: AuditWriter,
+    current_user: AnalystUser,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Log an audit event as the calling user.
@@ -115,7 +118,7 @@ async def log_audit_event(
         )
     client = getattr(http_request, "client", None)
     try:
-        audit_logger = AuditLogger(db, getattr(current_user, "organization_id", None))
+        audit_logger = AuditLogger(db, org_id)
         trail = await audit_logger.log_event(
             event_type=request.event_type,
             action=request.action,
@@ -142,12 +145,12 @@ async def log_audit_event(
 @router.post("/audit/search", response_model=list[AuditTrailResponse])
 async def search_audit_trail(
     request: AuditSearchRequest,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
-    """Search audit trail with filters"""
+    """Search audit trail with filters (read-only: viewers allowed)."""
     try:
-        audit_logger = AuditLogger(db, getattr(current_user, "organization_id", None))
+        audit_logger = AuditLogger(db, org_id)
 
         filters = {}
         if request.event_type:
@@ -174,14 +177,14 @@ async def search_audit_trail(
 
 @router.get("/audit/export", response_model=None)
 async def export_audit_trail(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
     format: str = Query("json", pattern="^(json|csv|xml)$"),
     days: int = Query(30, ge=1, le=365),
 ):
     """Export audit trail"""
     try:
-        audit_logger = AuditLogger(db, getattr(current_user, "organization_id", None))
+        audit_logger = AuditLogger(db, org_id)
 
         date_from = datetime.now(timezone.utc) - timedelta(days=days)
         date_to = datetime.now(timezone.utc)
@@ -206,13 +209,13 @@ async def export_audit_trail(
 
 @router.get("/audit/suspicious-activity", response_model=list[dict])
 async def detect_suspicious_activity(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     actor_id: str = Query(...),
-    current_user: CurrentUser = None,
 ):
     """Detect suspicious activity for actor"""
     try:
-        audit_logger = AuditLogger(db, getattr(current_user, "organization_id", None))
+        audit_logger = AuditLogger(db, org_id)
         activities = await audit_logger.detect_suspicious_activity(actor_id)
         return activities
     except Exception as e:
@@ -227,13 +230,14 @@ async def detect_suspicious_activity(
 
 @router.post("/evidence/upload", response_model=None)
 async def upload_evidence_file(
+    org_id: OrganizationId,
     file: UploadFile = File(...),
     control_id: str = Form(...),
     title: str = Form(...),
     evidence_type: str = Form("document"),
     description: str = Form(""),
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
 ):
     """Upload a real evidence artifact for a specific compliance control.
 
@@ -249,7 +253,6 @@ async def upload_evidence_file(
 
     from src.compliance.models import ComplianceControl, ComplianceEvidence
 
-    org_id = getattr(current_user, "organization_id", None)
 
     # Verify control exists and belongs to the caller's org
     ctrl_result = await db.execute(
@@ -332,8 +335,8 @@ async def upload_evidence_file(
 @router.get("/evidence/{evidence_id}/download")
 async def download_evidence_file(
     evidence_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
     """Stream a previously uploaded evidence artifact back to the caller.
 
@@ -343,7 +346,6 @@ async def download_evidence_file(
     from fastapi.responses import FileResponse, RedirectResponse
     from src.compliance.models import ComplianceEvidence
 
-    org_id = getattr(current_user, "organization_id", None)
     result = await db.execute(
         select(ComplianceEvidence).where(
             and_(
@@ -383,8 +385,8 @@ async def download_evidence_file(
 
 @router.get("/reports/monthly")
 async def download_monthly_report(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
     """Generate and stream a monthly FedRAMP ConMon report as a JSON download.
 
@@ -399,7 +401,7 @@ async def download_monthly_report(
     from fastapi.responses import StreamingResponse
 
     try:
-        monitor = ContinuousMonitor(db, getattr(current_user, "organization_id", None))
+        monitor = ContinuousMonitor(db, org_id)
         conmon = await monitor.generate_conmon_report()
     except Exception as exc:
         logger.error(f"Monthly report generation failed: {exc}")
@@ -419,7 +421,7 @@ async def download_monthly_report(
             "end": now.isoformat(),
             "days": 30,
         },
-        "organization_id": getattr(current_user, "organization_id", None),
+        "organization_id": org_id,
         "conmon_report": conmon.model_dump() if hasattr(conmon, "model_dump") else conmon,
     }
 
@@ -435,19 +437,22 @@ async def download_monthly_report(
 
 @router.post("/evidence/collect", response_model=None)
 async def collect_evidence(
+    org_id: OrganizationId,
     request: dict = Body(...),
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ):
     """Collect evidence based on rule"""
     try:
-        collector = EvidenceCollector(db, getattr(current_user, "organization_id", None))
+        collector = EvidenceCollector(db, org_id)
         result = await collector.collect_evidence(request.get("rule_id"))
         return {
             "status": "success",
             "evidence": result,
             "collected_at": datetime.now(timezone.utc).isoformat(),
         }
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
     except Exception as e:
         logger.error(f"Error collecting evidence: {str(e)}")
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
@@ -455,12 +460,13 @@ async def collect_evidence(
 
 @router.post("/evidence/collect-all", response_model=None)
 async def collect_all_automated_evidence(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ):
     """Collect evidence from all enabled automated rules"""
     try:
-        collector = EvidenceCollector(db, getattr(current_user, "organization_id", None))
+        collector = EvidenceCollector(db, org_id)
         results = await collector.collect_all_automated()
         return {
             "status": "completed",
@@ -474,19 +480,31 @@ async def collect_all_automated_evidence(
 
 @router.post("/evidence/verify", response_model=None)
 async def verify_evidence_integrity(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     evidence_id: str = Query(...),
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ):
-    """Verify evidence integrity"""
+    """Re-hash an evidence file and compare it with the hash recorded at upload.
+
+    ``integrity_valid`` is true/false when the file was re-hashed and null
+    with ``status: "unverifiable"`` when no hash or no local file exists.
+    """
     try:
-        collector = EvidenceCollector(db, getattr(current_user, "organization_id", None))
-        is_valid = await collector.verify_evidence_integrity(evidence_id)
+        collector = EvidenceCollector(db, org_id)
+        result = await collector.verify_evidence_integrity(
+            evidence_id,
+            resolve_local_path=lambda location: local_evidence_path(location, org_id),
+        )
         return {
             "evidence_id": evidence_id,
-            "integrity_valid": is_valid,
+            **result,
             "verified_at": datetime.now(timezone.utc).isoformat(),
         }
+    except HTTPException:
+        raise
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail="Evidence not found") from e
     except Exception as e:
         logger.error(f"Error verifying evidence: {str(e)}")
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
@@ -495,8 +513,9 @@ async def verify_evidence_integrity(
 @router.delete("/evidence/{evidence_id}", status_code=204)
 async def delete_evidence_item(
     evidence_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
 ):
     """Delete a ComplianceEvidence row.
 
@@ -507,7 +526,6 @@ async def delete_evidence_item(
     """
     from src.compliance.models import ComplianceEvidence
 
-    org_id = getattr(current_user, "organization_id", None)
     result = await db.execute(
         select(ComplianceEvidence).where(
             and_(
@@ -553,10 +571,11 @@ async def delete_evidence_item(
 @router.post("/evidence/{evidence_id}/approve", status_code=200)
 async def approve_evidence_item(
     evidence_id: str,
+    org_id: OrganizationId,
+    current_user: AdminRoleUser,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
-    """Mark a ComplianceEvidence row as approved.
+    """Mark a ComplianceEvidence row as approved (admin only).
 
     Frontend "Approve" button hit this route and 404'd the same way
     the delete button did. Now sets review_status=approved, records
@@ -564,7 +583,6 @@ async def approve_evidence_item(
     """
     from src.compliance.models import ComplianceEvidence
 
-    org_id = getattr(current_user, "organization_id", None)
     result = await db.execute(
         select(ComplianceEvidence).where(
             and_(
@@ -613,8 +631,8 @@ async def approve_evidence_item(
 
 @router.get("/evidence/list", response_model=list[dict])
 async def list_evidence_items(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
     evidence_type: Optional[str] = None,
     status_filter: Optional[str] = Query(None, alias="status"),
     skip: int = Query(0, ge=0),
@@ -628,7 +646,6 @@ async def list_evidence_items(
     try:
         from src.compliance.models import ComplianceEvidence, ComplianceControl
 
-        org_id = getattr(current_user, "organization_id", None)
         query = select(ComplianceEvidence).where(
             ComplianceEvidence.organization_id == org_id
         )
@@ -687,8 +704,9 @@ async def list_evidence_items(
 @router.post("/packages/create", response_model=EvidencePackageResponse)
 async def create_evidence_package(
     request: EvidencePackageCreateRequest,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ):
     """Create evidence package"""
     try:
@@ -700,7 +718,7 @@ async def create_evidence_package(
             assessor=request.assessor,
             due_date=request.due_date,
             extra_metadata=request.metadata or {},
-            organization_id=getattr(current_user, "organization_id", None),
+            organization_id=org_id,
         )
         db.add(package)
         await db.commit()
@@ -712,8 +730,8 @@ async def create_evidence_package(
 
 @router.get("/packages", response_model=list[EvidencePackageResponse])
 async def list_evidence_packages(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
     status: Optional[str] = None,
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
@@ -721,7 +739,7 @@ async def list_evidence_packages(
     """List evidence packages"""
     try:
         query = select(EvidencePackage).where(
-            EvidencePackage.organization_id == getattr(current_user, "organization_id", None)
+            EvidencePackage.organization_id == org_id
         )
         if status:
             query = query.where(EvidencePackage.status == status)
@@ -736,14 +754,14 @@ async def list_evidence_packages(
 @router.get("/packages/{package_id}", response_model=EvidencePackageResponse)
 async def get_evidence_package(
     package_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
     """Get evidence package details"""
     try:
         query = select(EvidencePackage).where(
             (EvidencePackage.id == package_id)
-            & (EvidencePackage.organization_id == getattr(current_user, "organization_id", None))
+            & (EvidencePackage.organization_id == org_id)
         )
         package = await db.scalar(query)
         if not package:
@@ -759,14 +777,17 @@ async def get_evidence_package(
 @router.post("/packages/{package_id}/package", response_model=None)
 async def package_evidence(
     package_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ):
     """Package evidence for submission"""
     try:
-        collector = EvidenceCollector(db, getattr(current_user, "organization_id", None))
+        collector = EvidenceCollector(db, org_id)
         result = await collector.package_evidence(package_id)
         return result
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail="Package not found") from e
     except Exception as e:
         logger.error(f"Error packaging evidence: {str(e)}")
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
@@ -775,13 +796,17 @@ async def package_evidence(
 @router.post("/packages/{package_id}/submit", response_model=None)
 async def submit_evidence_package(
     package_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ):
     """Submit evidence package to assessor"""
     try:
         # Update package status to submitted
-        query = select(EvidencePackage).where(EvidencePackage.id == package_id)
+        query = select(EvidencePackage).where(
+            EvidencePackage.id == package_id,
+            EvidencePackage.organization_id == org_id,
+        )
         package = await db.scalar(query)
         if not package:
             raise HTTPException(status_code=404, detail="Package not found")
@@ -806,14 +831,16 @@ async def submit_evidence_package(
 @router.get("/packages/{package_id}/report", response_model=None)
 async def get_evidence_report(
     package_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
     """Get evidence report for package"""
     try:
-        collector = EvidenceCollector(db, getattr(current_user, "organization_id", None))
+        collector = EvidenceCollector(db, org_id)
         result = await collector.generate_evidence_report(package_id)
         return result
+    except LookupError as e:
+        raise HTTPException(status_code=404, detail="Package not found") from e
     except Exception as e:
         logger.error(f"Error generating evidence report: {str(e)}")
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
@@ -826,12 +853,13 @@ async def get_evidence_report(
 
 @router.post("/conmon/run-cycle", response_model=ConMonReportResponse)
 async def run_conmon_cycle(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ):
     """Run FedRAMP ConMon cycle"""
     try:
-        monitor = ContinuousMonitor(db, getattr(current_user, "organization_id", None))
+        monitor = ContinuousMonitor(db, org_id)
         report = await monitor.generate_conmon_report()
         return report
     except Exception as e:
@@ -841,12 +869,13 @@ async def run_conmon_cycle(
 
 @router.post("/conmon/run", response_model=None)
 async def run_conmon_alias(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ):
     """Alias for /conmon/run-cycle used by the frontend ConMon button."""
     try:
-        monitor = ContinuousMonitor(db, getattr(current_user, "organization_id", None))
+        monitor = ContinuousMonitor(db, org_id)
         report = await monitor.generate_conmon_report()
         return {"ok": True, "report": report}
     except Exception as e:
@@ -856,12 +885,12 @@ async def run_conmon_alias(
 
 @router.get("/conmon/report", response_model=ConMonReportResponse)
 async def get_conmon_report(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
     """Get latest ConMon report"""
     try:
-        monitor = ContinuousMonitor(db, getattr(current_user, "organization_id", None))
+        monitor = ContinuousMonitor(db, org_id)
         report = await monitor.generate_conmon_report()
         return report
     except Exception as e:
@@ -871,8 +900,8 @@ async def get_conmon_report(
 
 @router.get("/conmon/status", response_model=None)
 async def get_conmon_status(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
     """Get ConMon status per control check.
 
@@ -881,7 +910,7 @@ async def get_conmon_status(
     lastRun, status, compliance_percentage, details}.
     """
     try:
-        monitor = ContinuousMonitor(db, getattr(current_user, "organization_id", None))
+        monitor = ContinuousMonitor(db, org_id)
         cycle = await monitor.run_conmon_cycle()
         now_iso = datetime.now(timezone.utc).isoformat()
 
@@ -919,13 +948,13 @@ async def get_conmon_status(
 
 @router.get("/readiness/check", response_model=AuditReadinessResponse)
 async def check_audit_readiness(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     framework: str = Query(..., description="Compliance framework"),
-    current_user: CurrentUser = None,
 ):
     """Check audit readiness for framework"""
     try:
-        checker = AuditReadinessChecker(db, getattr(current_user, "organization_id", None))
+        checker = AuditReadinessChecker(db, org_id)
         result = await checker.check_readiness(framework)
         return result
     except Exception as e:
@@ -935,9 +964,9 @@ async def check_audit_readiness(
 
 @router.get("/readiness/coverage", response_model=EvidenceCoverageResponse)
 async def check_evidence_coverage(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     framework_id: str = Query(...),
-    current_user: CurrentUser = None,
 ):
     """Check evidence coverage for framework.
 
@@ -953,7 +982,6 @@ async def check_evidence_coverage(
     framework (191 controls for FedRAMP Moderate) can't fan out 191
     alerts in one API hit.
     """
-    org_id = getattr(current_user, "organization_id", None)
     try:
         checker = AuditReadinessChecker(db, org_id)
         result = await checker.check_evidence_coverage(framework_id)
@@ -1005,13 +1033,13 @@ async def check_evidence_coverage(
 
 @router.get("/readiness/freshness", response_model=EvidenceFreshnessResponse)
 async def check_evidence_freshness(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     framework_id: str = Query(...),
-    current_user: CurrentUser = None,
 ):
     """Check evidence freshness for framework"""
     try:
-        checker = AuditReadinessChecker(db, getattr(current_user, "organization_id", None))
+        checker = AuditReadinessChecker(db, org_id)
         result = await checker.check_evidence_freshness(framework_id)
         return result
     except Exception as e:
@@ -1021,13 +1049,13 @@ async def check_evidence_freshness(
 
 @router.get("/readiness/assessor-package", response_model=AssessorPackageResponse)
 async def generate_assessor_package(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     framework_id: str = Query(...),
-    current_user: CurrentUser = None,
 ):
     """Generate package for external assessors"""
     try:
-        checker = AuditReadinessChecker(db, getattr(current_user, "organization_id", None))
+        checker = AuditReadinessChecker(db, org_id)
         result = await checker.generate_assessor_package(framework_id)
         return result
     except Exception as e:
@@ -1043,10 +1071,11 @@ async def generate_assessor_package(
 @router.post("/rules/create", response_model=AutomatedEvidenceRuleResponse)
 async def create_evidence_rule(
     request: AutomatedRuleCreateRequest,
+    org_id: OrganizationId,
+    _user: AdminRoleUser,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
-    """Create automated evidence collection rule"""
+    """Create automated evidence collection rule (configuration: admin only)."""
     try:
         rule = AutomatedEvidenceRule(
             name=request.name,
@@ -1056,7 +1085,7 @@ async def create_evidence_rule(
             collection_config=request.collection_config,
             schedule=request.schedule,
             is_enabled=request.is_enabled,
-            organization_id=getattr(current_user, "organization_id", None),
+            organization_id=org_id,
         )
         db.add(rule)
         await db.commit()
@@ -1068,8 +1097,8 @@ async def create_evidence_rule(
 
 @router.get("/rules", response_model=list[AutomatedEvidenceRuleResponse])
 async def list_evidence_rules(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
 ):
@@ -1077,7 +1106,7 @@ async def list_evidence_rules(
     try:
         query = (
             select(AutomatedEvidenceRule)
-            .where(AutomatedEvidenceRule.organization_id == getattr(current_user, "organization_id", None))
+            .where(AutomatedEvidenceRule.organization_id == org_id)
             .offset(skip)
             .limit(limit)
         )
@@ -1095,8 +1124,8 @@ async def list_evidence_rules(
 
 @router.get("/dashboard/stats", response_model=AuditDashboardStats)
 async def get_audit_dashboard_stats(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
     """Get audit and evidence dashboard statistics.
 
@@ -1107,7 +1136,6 @@ async def get_audit_dashboard_stats(
     """
     from src.compliance.models import ComplianceEvidence
 
-    org_id = getattr(current_user, "organization_id", None)
 
     try:
         # Count audit entries
@@ -1192,7 +1220,7 @@ async def get_audit_dashboard_stats(
             logger.warning(f"suspicious activity detection failed: {exc}")
 
         return AuditDashboardStats(
-            organization_id=org_id or "",
+            organization_id=org_id,
             total_audit_entries=len(audit_list),
             audit_entries_this_month=month_audits,
             event_types_breakdown=event_types_breakdown,

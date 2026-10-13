@@ -6,18 +6,18 @@ REST API for FAIR analysis, risk management, control effectiveness, and BIA asse
 import json
 import math
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Annotated, Optional
 
-from fastapi import APIRouter, Body, HTTPException, Query, status
+from fastapi import Depends, APIRouter, Body, HTTPException, Query, status
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import CurrentUser, DatabaseSession
+from src.api.deps import DatabaseSession, OrganizationId, require_role
+from src.models.user import User, UserRole
 from src.core.logging import get_logger
 from src.services.automation import AutomationService
 from src.core.utils import safe_json_loads
 from src.risk_quant.engine import (
-    BIAEngine,
     ControlEffectivenessAnalyzer,
     FAIREngine,
     RiskAggregator,
@@ -30,22 +30,17 @@ from src.risk_quant.models import (
     RiskScenario,
 )
 from src.risk_quant.tasks import (
-    control_effectiveness_audit,
     run_fair_simulation,
-    risk_appetite_check,
 )
 from src.schemas.risk_quant import (
     BusinessImpactAssessmentCreate,
     BusinessImpactAssessmentListResponse,
     BusinessImpactAssessmentResponse,
     BusinessImpactAssessmentUpdate,
-    ComparisonResponse,
-    ControlRecommendationResponse,
     ControlROIResponse,
     FAIRAnalysisCreate,
     FAIRAnalysisListResponse,
     FAIRAnalysisResponse,
-    FAIRAnalysisUpdate,
     FAIRResultsResponse,
     RiskControlCreate,
     RiskControlListResponse,
@@ -67,15 +62,19 @@ logger = get_logger(__name__)
 
 router = APIRouter(prefix="/risk-quantification", tags=["Risk Quantification"])
 
+# Wave 1 role gates: viewers read only; analysts for operational writes;
+# admins for configuration and actions against live systems.
+AnalystUser = Annotated[User, Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
+AdminRoleUser = Annotated[User, Depends(require_role([UserRole.ADMIN]))]
+
 
 # Helper Functions
 async def get_risk_scenario_or_404(
-    db: AsyncSession, scenario_id: str, org_id: Optional[str] = None
+    db: AsyncSession, scenario_id: str, org_id: str
 ) -> RiskScenario:
     """Get RiskScenario by ID or raise 404"""
     stmt = select(RiskScenario).where(RiskScenario.id == scenario_id)
-    if org_id is not None:
-        stmt = stmt.where(RiskScenario.organization_id == org_id)
+    stmt = stmt.where(RiskScenario.organization_id == org_id)
     result = await db.execute(stmt)
     scenario = result.scalar_one_or_none()
     if not scenario:
@@ -87,12 +86,11 @@ async def get_risk_scenario_or_404(
 
 
 async def get_fair_analysis_or_404(
-    db: AsyncSession, analysis_id: str, org_id: Optional[str] = None
+    db: AsyncSession, analysis_id: str, org_id: str
 ) -> FAIRAnalysis:
     """Get FAIRAnalysis by ID or raise 404"""
     stmt = select(FAIRAnalysis).where(FAIRAnalysis.id == analysis_id)
-    if org_id is not None:
-        stmt = stmt.where(FAIRAnalysis.organization_id == org_id)
+    stmt = stmt.where(FAIRAnalysis.organization_id == org_id)
     result = await db.execute(stmt)
     analysis = result.scalar_one_or_none()
     if not analysis:
@@ -104,12 +102,11 @@ async def get_fair_analysis_or_404(
 
 
 async def get_risk_register_or_404(
-    db: AsyncSession, register_id: str, org_id: Optional[str] = None
+    db: AsyncSession, register_id: str, org_id: str
 ) -> RiskRegister:
     """Get RiskRegister by ID or raise 404"""
     stmt = select(RiskRegister).where(RiskRegister.id == register_id)
-    if org_id is not None:
-        stmt = stmt.where(RiskRegister.organization_id == org_id)
+    stmt = stmt.where(RiskRegister.organization_id == org_id)
     result = await db.execute(stmt)
     register = result.scalar_one_or_none()
     if not register:
@@ -121,12 +118,11 @@ async def get_risk_register_or_404(
 
 
 async def get_risk_control_or_404(
-    db: AsyncSession, control_id: str, org_id: Optional[str] = None
+    db: AsyncSession, control_id: str, org_id: str
 ) -> RiskControl:
     """Get RiskControl by ID or raise 404"""
     stmt = select(RiskControl).where(RiskControl.id == control_id)
-    if org_id is not None:
-        stmt = stmt.where(RiskControl.organization_id == org_id)
+    stmt = stmt.where(RiskControl.organization_id == org_id)
     result = await db.execute(stmt)
     control = result.scalar_one_or_none()
     if not control:
@@ -140,12 +136,11 @@ async def get_risk_control_or_404(
 async def get_bia_or_404(
     db: AsyncSession,
     bia_id: str,
-    org_id: Optional[str] = None,
+    org_id: str,
 ) -> BusinessImpactAssessment:
     """Get BusinessImpactAssessment by ID or raise 404"""
     stmt = select(BusinessImpactAssessment).where(BusinessImpactAssessment.id == bia_id)
-    if org_id is not None:
-        stmt = stmt.where(BusinessImpactAssessment.organization_id == org_id)
+    stmt = stmt.where(BusinessImpactAssessment.organization_id == org_id)
     result = await db.execute(stmt)
     bia = result.scalar_one_or_none()
     if not bia:
@@ -162,7 +157,7 @@ async def get_bia_or_404(
     response_model=RiskScenarioListResponse,
 )
 async def list_risk_scenarios(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -172,7 +167,7 @@ async def list_risk_scenarios(
 ):
     """List risk scenarios with filtering and pagination"""
     query = select(RiskScenario).where(
-        RiskScenario.organization_id == getattr(current_user, "organization_id", None)
+        RiskScenario.organization_id == org_id
     )
 
     if search:
@@ -218,12 +213,13 @@ async def list_risk_scenarios(
 )
 async def create_risk_scenario(
     scenario_data: RiskScenarioCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    current_user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Create a new risk scenario"""
     scenario = RiskScenario(
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         name=scenario_data.name,
         description=scenario_data.description,
         asset_id=scenario_data.asset_id,
@@ -243,7 +239,6 @@ async def create_risk_scenario(
     await db.refresh(scenario)
 
     try:
-        org_id = getattr(current_user, "organization_id", None)
         automation = AutomationService(db)
         await automation.on_risk_scenario_high_loss(
             scenario_name=scenario.name,
@@ -259,12 +254,12 @@ async def create_risk_scenario(
 @router.get("/scenarios/{scenario_id}", response_model=RiskScenarioResponse)
 async def get_risk_scenario(
     scenario_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get a risk scenario by ID"""
     scenario = await get_risk_scenario_or_404(
-        db, scenario_id, getattr(current_user, "organization_id", None)
+        db, scenario_id, org_id
     )
     return RiskScenarioResponse.model_validate(scenario)
 
@@ -273,12 +268,13 @@ async def get_risk_scenario(
 async def update_risk_scenario(
     scenario_id: str,
     scenario_data: RiskScenarioUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Update a risk scenario"""
     scenario = await get_risk_scenario_or_404(
-        db, scenario_id, getattr(current_user, "organization_id", None)
+        db, scenario_id, org_id
     )
 
     update_data = scenario_data.model_dump(exclude_unset=True, exclude_none=True)
@@ -294,12 +290,13 @@ async def update_risk_scenario(
 @router.delete("/scenarios/{scenario_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_risk_scenario(
     scenario_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Delete a risk scenario"""
     scenario = await get_risk_scenario_or_404(
-        db, scenario_id, getattr(current_user, "organization_id", None)
+        db, scenario_id, org_id
     )
     await db.delete(scenario)
     await db.flush()
@@ -308,7 +305,7 @@ async def delete_risk_scenario(
 # FAIR Analysis Endpoints
 @router.get("/fair-analyses", response_model=FAIRAnalysisListResponse)
 async def list_fair_analyses(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -316,7 +313,7 @@ async def list_fair_analyses(
 ):
     """List FAIR analyses"""
     query = select(FAIRAnalysis).where(
-        FAIRAnalysis.organization_id == getattr(current_user, "organization_id", None)
+        FAIRAnalysis.organization_id == org_id
     )
 
     if scenario_id:
@@ -351,17 +348,18 @@ async def list_fair_analyses(
 )
 async def create_fair_analysis(
     analysis_data: FAIRAnalysisCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Create a new FAIR analysis"""
-    # Verify scenario exists
-    scenario = await get_risk_scenario_or_404(
-        db, analysis_data.scenario_id, getattr(current_user, "organization_id", None)
+    # Verify scenario exists in this tenant
+    await get_risk_scenario_or_404(
+        db, analysis_data.scenario_id, org_id
     )
 
     analysis = FAIRAnalysis(
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         scenario_id=analysis_data.scenario_id,
         tef_min=analysis_data.tef_min,
         tef_mode=analysis_data.tef_mode,
@@ -393,7 +391,7 @@ async def create_fair_analysis(
     await db.refresh(analysis)
 
     # Queue simulation task
-    run_fair_simulation.delay(analysis.id, getattr(current_user, "organization_id", None))
+    run_fair_simulation.delay(analysis.id, org_id)
 
     return FAIRAnalysisResponse.model_validate(analysis)
 
@@ -401,12 +399,12 @@ async def create_fair_analysis(
 @router.get("/fair-analyses/{analysis_id}", response_model=FAIRAnalysisResponse)
 async def get_fair_analysis(
     analysis_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get a FAIR analysis by ID"""
     analysis = await get_fair_analysis_or_404(
-        db, analysis_id, getattr(current_user, "organization_id", None)
+        db, analysis_id, org_id
     )
     return FAIRAnalysisResponse.model_validate(analysis)
 
@@ -417,12 +415,13 @@ async def get_fair_analysis(
 )
 async def run_fair_simulation_endpoint(
     analysis_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Run FAIR Monte Carlo simulation"""
     analysis = await get_fair_analysis_or_404(
-        db, analysis_id, getattr(current_user, "organization_id", None)
+        db, analysis_id, org_id
     )
 
     # Prepare analysis data
@@ -481,12 +480,12 @@ async def run_fair_simulation_endpoint(
 )
 async def get_loss_exceedance_curve(
     analysis_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get loss exceedance curve for FAIR analysis"""
     analysis = await get_fair_analysis_or_404(
-        db, analysis_id, getattr(current_user, "organization_id", None)
+        db, analysis_id, org_id
     )
 
     if not analysis.loss_exceedance_curve:
@@ -501,7 +500,7 @@ async def get_loss_exceedance_curve(
 # Risk Register Endpoints
 @router.get("/risk-registers", response_model=RiskRegisterListResponse)
 async def list_risk_registers(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -510,7 +509,7 @@ async def list_risk_registers(
 ):
     """List risk registers"""
     query = select(RiskRegister).where(
-        RiskRegister.organization_id == getattr(current_user, "organization_id", None)
+        RiskRegister.organization_id == org_id
     )
 
     if category:
@@ -548,12 +547,13 @@ async def list_risk_registers(
 )
 async def create_risk_register(
     register_data: RiskRegisterCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Create a new risk register entry"""
     register = RiskRegister(
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         name=register_data.name,
         description=register_data.description,
         risk_category=register_data.risk_category,
@@ -582,12 +582,12 @@ async def create_risk_register(
 @router.get("/risk-registers/{register_id}", response_model=RiskRegisterResponse)
 async def get_risk_register(
     register_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get a risk register entry by ID"""
     register = await get_risk_register_or_404(
-        db, register_id, getattr(current_user, "organization_id", None)
+        db, register_id, org_id
     )
     return RiskRegisterResponse.model_validate(register)
 
@@ -596,12 +596,13 @@ async def get_risk_register(
 async def update_risk_register(
     register_id: str,
     register_data: RiskRegisterUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Update a risk register entry"""
     register = await get_risk_register_or_404(
-        db, register_id, getattr(current_user, "organization_id", None)
+        db, register_id, org_id
     )
 
     update_data = register_data.model_dump(exclude_unset=True, exclude_none=True)
@@ -623,12 +624,13 @@ async def update_risk_register(
 @router.delete("/risk-registers/{register_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_risk_register(
     register_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Delete a risk register entry"""
     register = await get_risk_register_or_404(
-        db, register_id, getattr(current_user, "organization_id", None)
+        db, register_id, org_id
     )
     await db.delete(register)
     await db.flush()
@@ -637,7 +639,7 @@ async def delete_risk_register(
 # Risk Control Endpoints
 @router.get("/controls", response_model=RiskControlListResponse)
 async def list_risk_controls(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -646,7 +648,7 @@ async def list_risk_controls(
 ):
     """List risk controls"""
     query = select(RiskControl).where(
-        RiskControl.organization_id == getattr(current_user, "organization_id", None)
+        RiskControl.organization_id == org_id
     )
 
     if control_type:
@@ -684,12 +686,31 @@ async def list_risk_controls(
 )
 async def create_risk_control(
     control_data: RiskControlCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Create a new risk control"""
+    if control_data.risk_register_id:
+        register_result = await db.execute(
+            select(RiskRegister.id).where(
+                and_(
+                    RiskRegister.id == control_data.risk_register_id,
+                    RiskRegister.organization_id == org_id,
+                )
+            )
+        )
+        if register_result.scalar_one_or_none() is None:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "error": "invalid_field",
+                    "field": "risk_register_id",
+                    "detail": "risk_register_id is not a risk register of this organisation",
+                },
+            )
     control = RiskControl(
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         risk_register_id=control_data.risk_register_id,
         control_name=control_data.control_name,
         control_type=control_data.control_type,
@@ -711,12 +732,12 @@ async def create_risk_control(
 @router.get("/controls/{control_id}", response_model=RiskControlResponse)
 async def get_risk_control(
     control_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get a risk control by ID"""
     control = await get_risk_control_or_404(
-        db, control_id, getattr(current_user, "organization_id", None)
+        db, control_id, org_id
     )
     return RiskControlResponse.model_validate(control)
 
@@ -725,12 +746,13 @@ async def get_risk_control(
 async def update_risk_control(
     control_id: str,
     control_data: RiskControlUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Update a risk control"""
     control = await get_risk_control_or_404(
-        db, control_id, getattr(current_user, "organization_id", None)
+        db, control_id, org_id
     )
 
     update_data = control_data.model_dump(exclude_unset=True, exclude_none=True)
@@ -747,12 +769,13 @@ async def update_risk_control(
 @router.delete("/controls/{control_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_risk_control(
     control_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Delete a risk control"""
     control = await get_risk_control_or_404(
-        db, control_id, getattr(current_user, "organization_id", None)
+        db, control_id, org_id
     )
     await db.delete(control)
     await db.flush()
@@ -761,11 +784,11 @@ async def delete_risk_control(
 @router.post("/controls/{control_id}/audit", response_model=ControlROIResponse)
 async def audit_control_effectiveness(
     control_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Audit control effectiveness and calculate ROI"""
-    org_id = getattr(current_user, "organization_id", None)
     control = await get_risk_control_or_404(db, control_id, org_id)
     register = await get_risk_register_or_404(db, control.risk_register_id, org_id)
 
@@ -801,7 +824,7 @@ async def audit_control_effectiveness(
 # Business Impact Assessment Endpoints
 @router.get("/bias", response_model=BusinessImpactAssessmentListResponse)
 async def list_bias(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -809,7 +832,7 @@ async def list_bias(
 ):
     """List Business Impact Assessments"""
     query = select(BusinessImpactAssessment).where(
-        BusinessImpactAssessment.organization_id == getattr(current_user, "organization_id", None)
+        BusinessImpactAssessment.organization_id == org_id
     )
 
     if criticality:
@@ -844,12 +867,13 @@ async def list_bias(
 )
 async def create_bia(
     bia_data: BusinessImpactAssessmentCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Create a new Business Impact Assessment"""
     bia = BusinessImpactAssessment(
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         asset_name=bia_data.asset_name,
         asset_type=bia_data.asset_type,
         business_unit=bia_data.business_unit,
@@ -876,12 +900,12 @@ async def create_bia(
 @router.get("/bias/{bia_id}", response_model=BusinessImpactAssessmentResponse)
 async def get_bia(
     bia_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get a BIA by ID"""
     bia = await get_bia_or_404(
-        db, bia_id, getattr(current_user, "organization_id", None)
+        db, bia_id, org_id
     )
     return BusinessImpactAssessmentResponse.model_validate(bia)
 
@@ -890,12 +914,13 @@ async def get_bia(
 async def update_bia(
     bia_id: str,
     bia_data: BusinessImpactAssessmentUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Update a BIA"""
     bia = await get_bia_or_404(
-        db, bia_id, getattr(current_user, "organization_id", None)
+        db, bia_id, org_id
     )
 
     update_data = bia_data.model_dump(exclude_unset=True, exclude_none=True)
@@ -915,12 +940,13 @@ async def update_bia(
 @router.delete("/bias/{bia_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_bia(
     bia_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Delete a BIA"""
     bia = await get_bia_or_404(
-        db, bia_id, getattr(current_user, "organization_id", None)
+        db, bia_id, org_id
     )
     await db.delete(bia)
     await db.flush()
@@ -929,13 +955,13 @@ async def delete_bia(
 # Dashboard Endpoints
 @router.get("/dashboard", response_model=RiskDashboardResponse)
 async def get_risk_dashboard(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get organizational risk dashboard"""
     # Query all risks for organization
     query = select(RiskRegister).where(
-        RiskRegister.organization_id == getattr(current_user, "organization_id", None)
+        RiskRegister.organization_id == org_id
     )
     result = await db.execute(query)
     registers = list(result.scalars().all())
@@ -992,7 +1018,7 @@ async def get_risk_dashboard(
 
 @router.get("/heatmap", response_model=RiskHeatmapResponse)
 async def get_risk_heatmap(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get risk heatmap (impact vs likelihood)"""
@@ -1000,7 +1026,7 @@ async def get_risk_heatmap(
 
     # Query all risks
     query = select(RiskRegister).where(
-        RiskRegister.organization_id == getattr(current_user, "organization_id", None)
+        RiskRegister.organization_id == org_id
     )
     result = await db.execute(query)
     registers = list(result.scalars().all())
@@ -1032,69 +1058,55 @@ async def get_risk_heatmap(
 
 @router.post("/analyze")
 async def analyze_scenarios(
+    org_id: OrganizationId,
     request: dict = Body(...),
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Run FAIR simulations for one or more scenarios.
 
-    Accepts ``{"scenario_ids": ["...", "..."]}``. Runs the real
-    Monte Carlo FAIR simulation for each scenario (10k iterations
-    by default) and returns aggregate ALE statistics. If
-    scenario_ids is empty, runs across every FAIRAnalysis row for
-    the caller's org.
+    Accepts ``{"scenario_ids": ["...", "..."]}``. Runs the Monte Carlo FAIR
+    simulation over each scenario's most recent analyst-authored
+    FAIRAnalysis (``POST /fair-analyses``) and returns aggregate ALE
+    statistics. If scenario_ids is empty, runs across every FAIRAnalysis row
+    for the caller's org.
+
+    A scenario with no FAIRAnalysis is NOT simulated: this route used to
+    invent PERT inputs from the asset value and save them as an ordinary
+    analysis, so every ALE on the page came from made-up defaults. Such
+    scenarios are now listed under ``skipped`` with ``reason`` =
+    ``no_fair_inputs``.
     """
-    org_id = getattr(current_user, "organization_id", None)
     scenario_ids = request.get("scenario_ids") or []
-    iterations = int(request.get("iterations") or 10000)
+    if not isinstance(scenario_ids, list) or not all(isinstance(x, str) for x in scenario_ids):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"error": "invalid_field", "field": "scenario_ids",
+                    "detail": "scenario_ids must be a list of scenario id strings"},
+        )
+    raw_iterations = request.get("iterations", 10000)
+    if raw_iterations is None:
+        raw_iterations = 10000
+    # ``0`` is malformed, not "use the default": do not coerce it away.
+    if isinstance(raw_iterations, bool) or not isinstance(raw_iterations, int):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"error": "invalid_field", "field": "iterations",
+                    "detail": "iterations must be an integer"},
+        )
+    iterations = raw_iterations
+    if not 1 <= iterations <= 100000:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"error": "invalid_field", "field": "iterations",
+                    "detail": "iterations must be between 1 and 100000"},
+        )
+    skipped: list[dict] = []
+    failed: list[dict] = []
 
     engine = FAIREngine()
     ale_samples: list[list[float]] = []
     per_scenario: list[dict] = []
-
-    def _default_fair_inputs_from_scenario(scenario: RiskScenario) -> dict:
-        """Derive sensible FAIR PERT inputs from a RiskScenario.
-
-        The Scenario captures asset value + confidence + threat actor;
-        from those we pick a TEF/vuln/loss envelope. Real deployments
-        customize these via the FAIRAnalysisCreate form, but the
-        Analyze button needs to produce real numbers even when no
-        FAIR row has been authored yet.
-        """
-        asset_value = max(1.0, float(scenario.asset_value_usd or 10000.0))
-        # Confidence level narrows or widens the uncertainty bands
-        confidence = max(0.05, min(0.95, float(scenario.confidence_level or 0.5)))
-        spread = 1.0 - confidence  # higher confidence -> tighter bands
-
-        # Threat event frequency: default 1/year mode, envelope widens on low confidence
-        tef_mode = 1.0
-        tef_min = max(0.05, tef_mode * (1 - spread))
-        tef_max = tef_mode * (1 + 3 * spread)
-
-        # Vulnerability (how often a threat event becomes a loss event)
-        vuln_mode = 0.3
-        vuln_min = max(0.01, vuln_mode * (1 - spread))
-        vuln_max = min(0.99, vuln_mode * (1 + spread))
-
-        # Primary loss centered on the asset value, widen with spread
-        pl_mode = asset_value * 0.25
-        pl_min = pl_mode * 0.5
-        pl_max = pl_mode * (1 + 2 * spread)
-
-        sl_mode = asset_value * 0.1
-        sl_min = sl_mode * 0.25
-        sl_max = sl_mode * (1 + 2 * spread)
-
-        return dict(
-            tef_min=tef_min, tef_mode=tef_mode, tef_max=tef_max,
-            vuln_min=vuln_min, vuln_mode=vuln_mode, vuln_max=vuln_max,
-            tcap_min=0.3, tcap_mode=0.5, tcap_max=0.8,
-            rs_min=0.3, rs_mode=0.5, rs_max=0.8,
-            lm_min=pl_min, lm_mode=pl_mode, lm_max=pl_max,
-            primary_loss_min=pl_min, primary_loss_mode=pl_mode, primary_loss_max=pl_max,
-            secondary_loss_min=sl_min, secondary_loss_mode=sl_mode, secondary_loss_max=sl_max,
-            secondary_loss_event_frequency=0.3,
-        )
 
     # Helper: run sim + persist for a given FAIRAnalysis row
     async def _simulate_and_record(analysis: FAIRAnalysis) -> None:
@@ -1136,61 +1148,51 @@ async def analyze_scenarios(
         analysis.loss_exceedance_curve = json.dumps(result.loss_exceedance_curve)
         analysis.completed_at = datetime.now(timezone.utc)
 
-    # Determine target scenario set. If scenario_ids given, process each
-    # scenario (creating a default FAIRAnalysis row if none exists). If
-    # no scenario_ids given, process every existing FAIRAnalysis row
-    # for the org.
+    # Determine target scenario set. If scenario_ids given, simulate each
+    # scenario's latest FAIRAnalysis (several may exist; the most recent
+    # wins instead of scalar_one_or_none raising a 500). If no scenario_ids
+    # given, process every existing FAIRAnalysis row for the org.
     if scenario_ids:
+        targets: list[FAIRAnalysis] = []
         for sid in scenario_ids:
-            # Look up an existing analysis for this scenario
             fa_res = await db.execute(
-                select(FAIRAnalysis).where(
+                select(FAIRAnalysis)
+                .where(
                     and_(
                         FAIRAnalysis.organization_id == org_id,
                         FAIRAnalysis.scenario_id == sid,
                     )
                 )
+                .order_by(FAIRAnalysis.created_at.desc())
+                .limit(1)
             )
             analysis = fa_res.scalar_one_or_none()
-            if analysis is None:
-                # Derive inputs from the RiskScenario so the Analyze
-                # action actually produces real numbers
-                scen_res = await db.execute(
-                    select(RiskScenario).where(
-                        and_(
-                            RiskScenario.organization_id == org_id,
-                            RiskScenario.id == sid,
-                        )
+            if analysis is not None:
+                targets.append(analysis)
+                continue
+            scen_res = await db.execute(
+                select(RiskScenario.id).where(
+                    and_(
+                        RiskScenario.organization_id == org_id,
+                        RiskScenario.id == sid,
                     )
                 )
-                scenario = scen_res.scalar_one_or_none()
-                if scenario is None:
-                    logger.warning(f"Skipping unknown scenario {sid}")
-                    continue
-                defaults = _default_fair_inputs_from_scenario(scenario)
-                analysis = FAIRAnalysis(
-                    organization_id=org_id,
-                    scenario_id=sid,
-                    simulation_iterations=iterations,
-                    **defaults,
-                )
-                db.add(analysis)
-                await db.flush()
-                await db.refresh(analysis)
-            try:
-                await _simulate_and_record(analysis)
-            except Exception as exc:  # noqa: BLE001
-                logger.error(f"FAIR analyze failed for {analysis.id}: {exc}")
+            )
+            reason = "no_fair_inputs" if scen_res.scalar_one_or_none() else "scenario_not_found"
+            skipped.append({"scenario_id": sid, "reason": reason})
     else:
         fa_query = select(FAIRAnalysis).where(
             FAIRAnalysis.organization_id == org_id
         )
-        analyses = list((await db.execute(fa_query)).scalars().all())
-        for analysis in analyses:
-            try:
-                await _simulate_and_record(analysis)
-            except Exception as exc:  # noqa: BLE001
-                logger.error(f"FAIR analyze failed for {analysis.id}: {exc}")
+        targets = list((await db.execute(fa_query)).scalars().all())
+
+    for analysis in targets:
+        try:
+            await _simulate_and_record(analysis)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("fair_analyze_failed", analysis_id=analysis.id, error=str(exc))
+            failed.append({"analysis_id": analysis.id, "scenario_id": analysis.scenario_id,
+                           "error": "simulation_failed"})
 
     await db.flush()
 
@@ -1201,8 +1203,10 @@ async def analyze_scenarios(
     total_mean = sum(s["ale_mean"] for s in per_scenario)
 
     return {
-        "status": "completed",
+        "status": "completed" if per_scenario else "nothing_analyzed",
         "scenarios_analyzed": len(per_scenario),
+        "skipped": skipped,
+        "failed": failed,
         "total_ale_mean": round(total_mean, 2),
         "portfolio_var_95": round(portfolio_var_95, 2),
         "per_scenario": per_scenario,
@@ -1212,7 +1216,7 @@ async def analyze_scenarios(
 
 @router.get("/loss-exceedance")
 async def get_loss_exceedance_portfolio(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Return the aggregate loss exceedance curve for the organization.
@@ -1225,7 +1229,6 @@ async def get_loss_exceedance_portfolio(
     analysis's curve onto a shared probability grid, and returns the
     result.
     """
-    org_id = getattr(current_user, "organization_id", None)
 
     fa_query = select(FAIRAnalysis).where(
         and_(

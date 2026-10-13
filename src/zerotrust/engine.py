@@ -269,7 +269,12 @@ class PolicyDecisionPoint:
         # Query last decision for this session
         result = await self.db.execute(
             select(AccessDecision)
-            .where(AccessDecision.session_id == session_id)
+            .where(
+                and_(
+                    AccessDecision.session_id == session_id,
+                    AccessDecision.organization_id == self.organization_id,
+                ),
+            )
             .order_by(desc(AccessDecision.created_at))
             .limit(1),
         )
@@ -695,12 +700,11 @@ class DeviceTrustAssessor:
         device = result.scalar_one_or_none()
 
         if not device:
-            logger.warning("device_not_found_creating", device_id=device_id)
-            device = DeviceTrustProfile(
-                device_id=device_id,
-                device_type="unknown",
-                organization_id=self.organization_id,
-            )
+            # Assessing an unknown id used to create a phantom "blocked"
+            # device in this tenant. Profiles are created by agent telemetry
+            # (update_device_compliance); an assessment never invents one.
+            logger.warning("device_not_found", device_id=device_id)
+            raise LookupError(f"device {device_id} not found")
 
         # Calculate trust score based on compliance
         compliance_status = json.loads(device.compliance_status or "{}")
@@ -777,18 +781,12 @@ class DeviceTrustAssessor:
         device = result.scalar_one_or_none()
 
         if not device:
-            # First-time posture heartbeat for this device — create the
-            # profile rather than raise, so Zero Trust coverage is
-            # automatic the moment an agent enrolls (no manual step).
-            device = DeviceTrustProfile(
-                device_id=device_id,
-                device_type="managed",
-                organization_id=self.organization_id,
-                compliance_status=json.dumps({}),
-                trust_score=0.0,
-                trust_level="unknown",
-            )
-            self.db.add(device)
+            # Compliance is an override of an existing profile. Creating one
+            # here let a caller register a device_id that another tenant
+            # already owns (the column is globally unique) and surfaced as a
+            # 500; unknown devices are a 404 for this tenant instead.
+            logger.warning("device_not_found", device_id=device_id)
+            raise LookupError(f"device {device_id} not found")
 
         # Update compliance status
         current_status = json.loads(device.compliance_status or "{}")
@@ -1440,13 +1438,19 @@ class ZeroTrustScorer:
                 from src.siem.models import DetectionRule, LogEntry, RuleStatus
                 rules_q = await self.db.execute(
                     select(func.count(DetectionRule.id)).where(
-                        DetectionRule.status == RuleStatus.ACTIVE.value,
+                        and_(
+                            DetectionRule.status == RuleStatus.ACTIVE.value,
+                            DetectionRule.organization_id == self.organization_id,
+                        ),
                     ),
                 )
                 active_rules = rules_q.scalar() or 0
                 logs_q = await self.db.execute(
                     select(func.count(LogEntry.id)).where(
-                        LogEntry.created_at >= _dt.utcnow() - _td(hours=24),
+                        and_(
+                            LogEntry.created_at >= _dt.utcnow() - _td(hours=24),
+                            LogEntry.organization_id == self.organization_id,
+                        ),
                     ),
                 )
                 log_count_24h = logs_q.scalar() or 0
@@ -1486,7 +1490,10 @@ class ZeroTrustScorer:
                 from src.models.playbook import Playbook
                 pb_q = await self.db.execute(
                     select(func.count(Playbook.id)).where(
-                        Playbook.is_enabled == True,  # noqa: E712
+                        and_(
+                            Playbook.is_enabled == True,  # noqa: E712
+                            Playbook.organization_id == self.organization_id,
+                        ),
                     ),
                 )
                 enabled_playbooks = pb_q.scalar() or 0

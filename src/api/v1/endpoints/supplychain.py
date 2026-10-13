@@ -7,33 +7,26 @@ vendor management, and compliance validation.
 import json
 import math
 from datetime import datetime
-from typing import Optional
+from typing import Annotated, Optional
 
-from fastapi import APIRouter, Path, HTTPException, Query, UploadFile, File, status
+from fastapi import Depends, APIRouter, Path, HTTPException, Query, UploadFile, File, status
+from pydantic import BaseModel, Field
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import CurrentUser, DatabaseSession
+from src.api.deps import DatabaseSession, OrganizationId, require_role
+from src.models.user import User, UserRole
 from src.core.logging import get_logger
-from src.models.organization import Organization
-from src.services.automation import AutomationService
 from src.core.utils import safe_json_loads
 
 logger = get_logger(__name__)
 from src.schemas.supplychain import (
-    CISAComplianceReport,
     ComponentDependencyTree,
     ComponentVulnerabilityLookup,
-    ComplianceAudit,
-    ComplianceValidationResult,
     DashboardOverview,
     LicenseBreakdown,
-    RiskAssessmentResult,
     RiskyComponentSummary,
-    SBOMComponentCreate,
-    SBOMComponentResponse,
     SBOMComparisonRequest,
-    SBOMComparisonResponse,
     SBOMCreate,
     SBOMExportRequest,
     SBOMImportRequest,
@@ -46,22 +39,18 @@ from src.schemas.supplychain import (
     SoftwareComponentUpdate,
     SupplyChainRiskCreate,
     SupplyChainRiskListResponse,
-    SupplyChainRiskReport,
     SupplyChainRiskResponse,
     SupplyChainRiskUpdate,
     VendorAssessmentCreate,
     VendorAssessmentListResponse,
     VendorAssessmentResponse,
     VendorAssessmentUpdate,
-    VendorRiskReport,
     VendorScoreSummary,
 )
 from src.supplychain.engine import (
     CISASBOMCompliance,
-    DependencyScanner,
     SBOMGenerator,
     SupplyChainRiskAnalyzer,
-    VendorRiskManager,
 )
 from src.supplychain.models import (
     SBOM,
@@ -73,13 +62,30 @@ from src.supplychain.models import (
 
 router = APIRouter(prefix="/supplychain", tags=["Supply Chain"])
 
+# Wave 1 role gates: viewers read only; analysts for operational writes;
+# admins for configuration and actions against live systems.
+AnalystUser = Annotated[User, Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
+AdminRoleUser = Annotated[User, Depends(require_role([UserRole.ADMIN]))]
+
 
 # Helper functions
 
 
-async def get_sbom_or_404(db: AsyncSession, sbom_id: str) -> SBOM:
-    """Get SBOM by ID or raise 404"""
-    result = await db.execute(select(SBOM).where(SBOM.id == sbom_id))
+class SBOMValidationRequest(BaseModel):
+    """Body for ``POST /compliance/validate-sbom``."""
+
+    sbom_id: str = Field(..., min_length=1, description="SBOM to validate")
+
+
+# Helper functions take the caller's organisation and 404 on any id outside
+# it (they used to 403, which confirmed that another tenant's id exists).
+
+
+async def get_sbom_or_404(db: AsyncSession, sbom_id: str, org_id: str) -> SBOM:
+    """Get an SBOM in ``org_id`` by ID or raise 404"""
+    result = await db.execute(
+        select(SBOM).where(SBOM.id == sbom_id, SBOM.organization_id == org_id),
+    )
     sbom = result.scalar_one_or_none()
     if not sbom:
         raise HTTPException(
@@ -89,10 +95,15 @@ async def get_sbom_or_404(db: AsyncSession, sbom_id: str) -> SBOM:
     return sbom
 
 
-async def get_component_or_404(db: AsyncSession, component_id: str) -> SoftwareComponent:
-    """Get component by ID or raise 404"""
+async def get_component_or_404(
+    db: AsyncSession, component_id: str, org_id: str,
+) -> SoftwareComponent:
+    """Get a component in ``org_id`` by ID or raise 404"""
     result = await db.execute(
-        select(SoftwareComponent).where(SoftwareComponent.id == component_id)
+        select(SoftwareComponent).where(
+            SoftwareComponent.id == component_id,
+            SoftwareComponent.organization_id == org_id,
+        ),
     )
     component = result.scalar_one_or_none()
     if not component:
@@ -103,10 +114,13 @@ async def get_component_or_404(db: AsyncSession, component_id: str) -> SoftwareC
     return component
 
 
-async def get_risk_or_404(db: AsyncSession, risk_id: str) -> SupplyChainRisk:
-    """Get supply chain risk by ID or raise 404"""
+async def get_risk_or_404(db: AsyncSession, risk_id: str, org_id: str) -> SupplyChainRisk:
+    """Get a supply chain risk in ``org_id`` by ID or raise 404"""
     result = await db.execute(
-        select(SupplyChainRisk).where(SupplyChainRisk.id == risk_id)
+        select(SupplyChainRisk).where(
+            SupplyChainRisk.id == risk_id,
+            SupplyChainRisk.organization_id == org_id,
+        ),
     )
     risk = result.scalar_one_or_none()
     if not risk:
@@ -117,10 +131,13 @@ async def get_risk_or_404(db: AsyncSession, risk_id: str) -> SupplyChainRisk:
     return risk
 
 
-async def get_vendor_or_404(db: AsyncSession, vendor_id: str) -> VendorAssessment:
-    """Get vendor assessment by ID or raise 404"""
+async def get_vendor_or_404(db: AsyncSession, vendor_id: str, org_id: str) -> VendorAssessment:
+    """Get a vendor assessment in ``org_id`` by ID or raise 404"""
     result = await db.execute(
-        select(VendorAssessment).where(VendorAssessment.id == vendor_id)
+        select(VendorAssessment).where(
+            VendorAssessment.id == vendor_id,
+            VendorAssessment.organization_id == org_id,
+        ),
     )
     vendor = result.scalar_one_or_none()
     if not vendor:
@@ -136,20 +153,28 @@ async def get_vendor_or_404(db: AsyncSession, vendor_id: str) -> VendorAssessmen
 
 @router.post("/sboms/generate", response_model=SBOMResponse)
 async def generate_sbom(
-    sbom_create: SBOMCreate,
-    current_user: CurrentUser = None,
-    db: DatabaseSession = None,
+    _sbom_create: SBOMCreate,
+    _org_id: OrganizationId,
+    _user: AnalystUser = None,
 ):
-    """Generate new SBOM for application"""
-    sbom = SBOM(
-        organization_id=getattr(current_user, "organization_id", None),
-        **sbom_create.model_dump(),
-        last_generated=datetime.utcnow(),
+    """Generate an SBOM for an application: not implemented.
+
+    There is no build or dependency scanner behind this route. It used to
+    report success after inserting an empty SBOM header (no components, no
+    content). It now returns 501 and writes nothing; import a real SBOM
+    through ``POST /sboms/upload`` or ``POST /sboms/import`` instead.
+    """
+    raise HTTPException(
+        status_code=501,
+        detail={
+            "error": "not_implemented",
+            "detail": (
+                "SBOM generation needs a dependency scanner, which is not "
+                "configured. Nothing was created. Upload an SPDX or CycloneDX "
+                "SBOM with POST /supplychain/sboms/upload instead."
+            ),
+        },
     )
-    db.add(sbom)
-    await db.commit()
-    await db.refresh(sbom)
-    return sbom
 
 
 async def _persist_sbom_with_components(
@@ -193,20 +218,25 @@ async def _persist_sbom_with_components(
             continue
         purl = c.get("purl")
         cpe = c.get("cpe")
-        # Dedupe by purl first (primary identifier), then (name, version) within the org.
+        # Dedupe by purl first (primary identifier), then (name, version),
+        # both within the org: another tenant's component must never be
+        # linked into this tenant's SBOM (it would then appear in exports).
         existing = None
         if purl:
             existing = (await db.execute(
-                select(SoftwareComponent).where(SoftwareComponent.purl == purl)
-            )).scalar_one_or_none()
+                select(SoftwareComponent).where(
+                    SoftwareComponent.organization_id == organization_id,
+                    SoftwareComponent.purl == purl,
+                ),
+            )).scalars().first()
         if existing is None:
             existing = (await db.execute(
                 select(SoftwareComponent).where(
                     SoftwareComponent.organization_id == organization_id,
                     SoftwareComponent.name == str(name)[:500],
                     SoftwareComponent.version == str(version)[:100],
-                )
-            )).scalar_one_or_none()
+                ),
+            )).scalars().first()
         if existing is None:
             existing = SoftwareComponent(
                 organization_id=organization_id,
@@ -294,7 +324,8 @@ def _extract_sha256(c: dict) -> Optional[str]:
 @router.post("/sboms/import", response_model=SBOMResponse)
 async def import_sbom(
     import_request: SBOMImportRequest,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Import SBOM from inline content (JSON-stringified).
@@ -316,7 +347,7 @@ async def import_sbom(
 
     return await _persist_sbom_with_components(
         db,
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         sbom_format=import_request.sbom_format,
         sbom_content=import_request.sbom_content,
         parsed=parsed,
@@ -326,9 +357,10 @@ async def import_sbom(
 
 @router.post("/sboms/upload", response_model=SBOMResponse)
 async def upload_sbom(
+    org_id: OrganizationId,
     file: UploadFile = File(..., description="SPDX or CycloneDX SBOM (.json/.spdx.json/.cdx.json)"),
     application_name: Optional[str] = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Upload an SBOM file (SPDX JSON or CycloneDX JSON) via multipart.
@@ -376,7 +408,7 @@ async def upload_sbom(
 
     return await _persist_sbom_with_components(
         db,
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         sbom_format=sbom_format,
         sbom_content=content,
         parsed=parsed,
@@ -387,7 +419,8 @@ async def upload_sbom(
 @router.post("/sboms/{sbom_id}/export")
 async def export_sbom(
     export_request: SBOMExportRequest,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
     sbom_id: str = Path(...),
 ):
@@ -403,16 +436,16 @@ async def export_sbom(
     from fastapi.responses import StreamingResponse
     import io
 
-    sbom = await get_sbom_or_404(db, sbom_id)
-
-    if sbom.organization_id != getattr(current_user, "organization_id", None):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    sbom = await get_sbom_or_404(db, sbom_id, org_id)
 
     # Load the real component list (tenant-scoped via SBOM ownership check above)
     comp_result = await db.execute(
         select(SoftwareComponent, SBOMComponent.relationship_type)
         .join(SBOMComponent, SBOMComponent.component_id == SoftwareComponent.id)
-        .where(SBOMComponent.sbom_id == sbom_id)
+        .where(
+            SBOMComponent.sbom_id == sbom_id,
+            SoftwareComponent.organization_id == org_id,
+        ),
     )
     rows = comp_result.all()
 
@@ -482,7 +515,7 @@ async def export_sbom(
 
 @router.get("/sboms", response_model=SBOMListResponse)
 async def list_sboms(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -491,7 +524,7 @@ async def list_sboms(
     sort_order: str = "desc",
 ):
     """List SBOMs with pagination and filtering"""
-    query = select(SBOM).where(SBOM.organization_id == getattr(current_user, "organization_id", None))
+    query = select(SBOM).where(SBOM.organization_id == org_id)
 
     if search:
         search_filter = f"%{search}%"
@@ -500,8 +533,8 @@ async def list_sboms(
             | (SBOM.application_name.ilike(search_filter))
         )
 
-    # Count total
-    total_result = await db.execute(select(func.count()).select_from(SBOM))
+    # Count total (of the filtered, org-scoped query)
+    total_result = await db.execute(select(func.count()).select_from(query.subquery()))
     total = total_result.scalar()
 
     # Order and pagination
@@ -529,15 +562,12 @@ async def list_sboms(
 
 @router.get("/sboms/{sbom_id}", response_model=SBOMResponse)
 async def get_sbom(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     sbom_id: str = Path(...),
 ):
     """Get SBOM details"""
-    sbom = await get_sbom_or_404(db, sbom_id)
-
-    if sbom.organization_id != getattr(current_user, "organization_id", None):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    sbom = await get_sbom_or_404(db, sbom_id, org_id)
 
     return sbom
 
@@ -545,15 +575,13 @@ async def get_sbom(
 @router.patch("/sboms/{sbom_id}", response_model=SBOMResponse)
 async def update_sbom(
     sbom_update: SBOMUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
     sbom_id: str = Path(...),
 ):
     """Update SBOM"""
-    sbom = await get_sbom_or_404(db, sbom_id)
-
-    if sbom.organization_id != getattr(current_user, "organization_id", None):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    sbom = await get_sbom_or_404(db, sbom_id, org_id)
 
     update_data = sbom_update.model_dump(exclude_unset=True)
     for field, value in update_data.items():
@@ -567,23 +595,26 @@ async def update_sbom(
 @router.post("/sboms/compare")
 async def compare_sboms(
     comparison_request: SBOMComparisonRequest,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
-    """Compare two SBOM versions"""
-    sbom1 = await get_sbom_or_404(db, comparison_request.sbom_id_1)
-    sbom2 = await get_sbom_or_404(db, comparison_request.sbom_id_2)
+    """Compare two SBOM versions: not implemented.
 
-    if sbom1.organization_id != getattr(current_user, "organization_id", None) or sbom2.organization_id != getattr(current_user, "organization_id", None):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    The diff was never computed: the route always answered with empty
+    added/removed/updated lists, which reads as "identical". Both ids are
+    still checked against the caller's organisation (404 otherwise), then it
+    returns 501.
+    """
+    await get_sbom_or_404(db, comparison_request.sbom_id_1, org_id)
+    await get_sbom_or_404(db, comparison_request.sbom_id_2, org_id)
 
-    return SBOMComparisonResponse(
-        sbom_1=sbom1,
-        sbom_2=sbom2,
-        components_added=[],
-        components_removed=[],
-        components_updated=[],
-        risk_score_change=sbom2.vulnerability_risk_score - sbom1.vulnerability_risk_score,
+    raise HTTPException(
+        status_code=501,
+        detail={
+            "error": "not_implemented",
+            "detail": "SBOM comparison is not implemented; no diff was computed.",
+        },
     )
 
 
@@ -593,37 +624,32 @@ async def compare_sboms(
 @router.post("/components", response_model=SoftwareComponentResponse)
 async def create_component(
     component_create: SoftwareComponentCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
-    """Create software component"""
+    """Create software component.
+
+    A manual add no longer fires the supply-chain vulnerability automation:
+    it used to raise a HIGH alert with an empty CVE for every component,
+    although nothing had looked the component up.
+    """
+    if component_create.parent_component_id:
+        await get_component_or_404(db, component_create.parent_component_id, org_id)
     component = SoftwareComponent(
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         **component_create.model_dump(),
     )
     db.add(component)
     await db.commit()
     await db.refresh(component)
 
-    try:
-        org_id = getattr(current_user, "organization_id", None)
-        automation = AutomationService(db)
-        await automation.on_supply_chain_vuln(
-            vendor_name=getattr(component, "vendor", None) or "",
-            component_name=component.name,
-            cve_id=getattr(component, "cve_id", None) or "",
-            severity="high",
-            organization_id=org_id,
-        )
-    except Exception as automation_exc:
-        logger.warning(f"Automation on_supply_chain_vuln failed: {automation_exc}")
-
     return component
 
 
 @router.get("/components", response_model=SoftwareComponentListResponse)
 async def list_components(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -633,7 +659,7 @@ async def list_components(
 ):
     """List software components"""
     query = select(SoftwareComponent).where(
-        SoftwareComponent.organization_id == getattr(current_user, "organization_id", None)
+        SoftwareComponent.organization_id == org_id
     )
 
     if search:
@@ -649,7 +675,7 @@ async def list_components(
     if min_risk_score is not None:
         query = query.where(SoftwareComponent.risk_score >= min_risk_score)
 
-    total_result = await db.execute(select(func.count()).select_from(SoftwareComponent))
+    total_result = await db.execute(select(func.count()).select_from(query.subquery()))
     total = total_result.scalar()
 
     query = query.order_by(SoftwareComponent.created_at.desc())
@@ -671,15 +697,12 @@ async def list_components(
 
 @router.get("/components/{component_id}", response_model=SoftwareComponentResponse)
 async def get_component(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     component_id: str = Path(...),
 ):
     """Get component details"""
-    component = await get_component_or_404(db, component_id)
-
-    if component.organization_id != getattr(current_user, "organization_id", None):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    component = await get_component_or_404(db, component_id, org_id)
 
     return component
 
@@ -687,15 +710,13 @@ async def get_component(
 @router.patch("/components/{component_id}", response_model=SoftwareComponentResponse)
 async def update_component(
     component_update: SoftwareComponentUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
     component_id: str = Path(...),
 ):
     """Update component"""
-    component = await get_component_or_404(db, component_id)
-
-    if component.organization_id != getattr(current_user, "organization_id", None):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    component = await get_component_or_404(db, component_id, org_id)
 
     update_data = component_update.model_dump(exclude_unset=True)
     for field, value in update_data.items():
@@ -708,34 +729,42 @@ async def update_component(
 
 @router.get("/components/{component_id}/dependency-tree")
 async def get_component_dependency_tree(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     component_id: str = Path(...),
 ):
-    """Get component dependency tree"""
-    component = await get_component_or_404(db, component_id)
+    """Get component dependency tree.
 
-    if component.organization_id != getattr(current_user, "organization_id", None):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    Children are loaded with explicit org-scoped queries: touching the lazy
+    ``child_components`` relationship in async code raised MissingGreenlet.
+    A visited set stops parent cycles.
+    """
+    component = await get_component_or_404(db, component_id, org_id)
 
-    # Build tree recursively
-    async def build_tree(comp: SoftwareComponent) -> dict:
-        deps = []
-        for child in comp.child_components:
-            deps.append(await build_tree(child))
+    visited: set[str] = set()
 
-        return {
-            "component": comp,
-            "dependencies": deps,
-        }
+    async def build_tree(comp: SoftwareComponent) -> ComponentDependencyTree:
+        visited.add(comp.id)
+        children = (await db.execute(
+            select(SoftwareComponent).where(
+                SoftwareComponent.parent_component_id == comp.id,
+                SoftwareComponent.organization_id == org_id,
+            ),
+        )).scalars().all()
+        deps = [
+            await build_tree(child) for child in children if child.id not in visited
+        ]
+        return ComponentDependencyTree(
+            component=SoftwareComponentResponse.model_validate(comp),
+            dependencies=deps,
+        )
 
-    tree = await build_tree(component)
-    return tree
+    return await build_tree(component)
 
 
 @router.get("/components/{component_id}/vulnerabilities")
 async def get_component_vulnerabilities(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     component_id: str = Path(...),
 ):
@@ -754,14 +783,12 @@ async def get_component_vulnerabilities(
     """
     from src.vulnmgmt.models import Vulnerability, VulnerabilitySeverity
 
-    component = await get_component_or_404(db, component_id)
-
-    if component.organization_id != getattr(current_user, "organization_id", None):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    component = await get_component_or_404(db, component_id, org_id)
 
     result = await db.execute(
         select(SupplyChainRisk).where(
             (SupplyChainRisk.component_id == component_id)
+            & (SupplyChainRisk.organization_id == org_id)
             & (SupplyChainRisk.risk_type == "known_vulnerability")
         )
     )
@@ -778,7 +805,6 @@ async def get_component_vulnerabilities(
     # Resolve highest real severity from the Vulnerability table (tenant-scoped)
     highest: Optional[str] = None
     if unique_cves:
-        org_id = getattr(current_user, "organization_id", None)
         sev_result = await db.execute(
             select(Vulnerability.severity).where(
                 and_(
@@ -813,12 +839,15 @@ async def get_component_vulnerabilities(
 @router.post("/risks", response_model=SupplyChainRiskResponse)
 async def create_risk(
     risk_create: SupplyChainRiskCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Create supply chain risk record"""
+    if risk_create.component_id:
+        await get_component_or_404(db, risk_create.component_id, org_id)
     risk = SupplyChainRisk(
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         detected_date=datetime.utcnow(),
         **risk_create.model_dump(),
     )
@@ -830,7 +859,7 @@ async def create_risk(
 
 @router.get("/risks", response_model=SupplyChainRiskListResponse)
 async def list_risks(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -840,7 +869,7 @@ async def list_risks(
 ):
     """List supply chain risks"""
     query = select(SupplyChainRisk).where(
-        SupplyChainRisk.organization_id == getattr(current_user, "organization_id", None)
+        SupplyChainRisk.organization_id == org_id
     )
 
     if risk_type:
@@ -852,7 +881,7 @@ async def list_risks(
     if status:
         query = query.where(SupplyChainRisk.status == status)
 
-    total_result = await db.execute(select(func.count()).select_from(SupplyChainRisk))
+    total_result = await db.execute(select(func.count()).select_from(query.subquery()))
     total = total_result.scalar()
 
     query = query.order_by(SupplyChainRisk.created_at.desc())
@@ -874,15 +903,12 @@ async def list_risks(
 
 @router.get("/risks/{risk_id}", response_model=SupplyChainRiskResponse)
 async def get_risk(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     risk_id: str = Path(...),
 ):
     """Get risk details"""
-    risk = await get_risk_or_404(db, risk_id)
-
-    if risk.organization_id != getattr(current_user, "organization_id", None):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    risk = await get_risk_or_404(db, risk_id, org_id)
 
     return risk
 
@@ -890,15 +916,13 @@ async def get_risk(
 @router.patch("/risks/{risk_id}", response_model=SupplyChainRiskResponse)
 async def update_risk(
     risk_update: SupplyChainRiskUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
     risk_id: str = Path(...),
 ):
     """Update risk status and remediation"""
-    risk = await get_risk_or_404(db, risk_id)
-
-    if risk.organization_id != getattr(current_user, "organization_id", None):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    risk = await get_risk_or_404(db, risk_id, org_id)
 
     update_data = risk_update.model_dump(exclude_unset=True)
     for field, value in update_data.items():
@@ -915,12 +939,13 @@ async def update_risk(
 @router.post("/vendors", response_model=VendorAssessmentResponse)
 async def create_vendor(
     vendor_create: VendorAssessmentCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Create vendor assessment"""
     vendor = VendorAssessment(
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         assessment_date=datetime.utcnow(),
         **vendor_create.model_dump(),
     )
@@ -932,7 +957,7 @@ async def create_vendor(
 
 @router.get("/vendors", response_model=VendorAssessmentListResponse)
 async def list_vendors(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -941,7 +966,7 @@ async def list_vendors(
 ):
     """List vendor assessments"""
     query = select(VendorAssessment).where(
-        VendorAssessment.organization_id == getattr(current_user, "organization_id", None)
+        VendorAssessment.organization_id == org_id
     )
 
     if search:
@@ -951,7 +976,7 @@ async def list_vendors(
     if risk_tier:
         query = query.where(VendorAssessment.risk_tier == risk_tier)
 
-    total_result = await db.execute(select(func.count()).select_from(VendorAssessment))
+    total_result = await db.execute(select(func.count()).select_from(query.subquery()))
     total = total_result.scalar()
 
     query = query.order_by(VendorAssessment.created_at.desc())
@@ -973,15 +998,12 @@ async def list_vendors(
 
 @router.get("/vendors/{vendor_id}", response_model=VendorAssessmentResponse)
 async def get_vendor(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     vendor_id: str = Path(...),
 ):
     """Get vendor assessment"""
-    vendor = await get_vendor_or_404(db, vendor_id)
-
-    if vendor.organization_id != getattr(current_user, "organization_id", None):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    vendor = await get_vendor_or_404(db, vendor_id, org_id)
 
     return vendor
 
@@ -989,15 +1011,13 @@ async def get_vendor(
 @router.patch("/vendors/{vendor_id}", response_model=VendorAssessmentResponse)
 async def update_vendor(
     vendor_update: VendorAssessmentUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
     vendor_id: str = Path(...),
 ):
     """Update vendor assessment"""
-    vendor = await get_vendor_or_404(db, vendor_id)
-
-    if vendor.organization_id != getattr(current_user, "organization_id", None):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    vendor = await get_vendor_or_404(db, vendor_id, org_id)
 
     update_data = vendor_update.model_dump(exclude_unset=True)
     for field, value in update_data.items():
@@ -1013,15 +1033,26 @@ async def update_vendor(
 
 @router.post("/compliance/validate-sbom")
 async def validate_sbom_compliance(
-    current_user: CurrentUser = None,
+    request: SBOMValidationRequest,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    sbom_id: str = Path(...),
 ):
-    """Validate SBOM compliance with CISA guidelines"""
-    sbom = await get_sbom_or_404(db, sbom_id)
+    """Validate SBOM compliance with CISA and NTIA minimum elements.
 
-    if sbom.organization_id != getattr(current_user, "organization_id", None):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    Body: ``{"sbom_id": "<id>"}``. It used to declare ``sbom_id`` as a path
+    parameter on a route with no path segment, so every call was a 422. It is
+    a read-only check (nothing is persisted), so viewers may call it.
+    """
+    sbom = await get_sbom_or_404(db, request.sbom_id, org_id)
+
+    component_rows = (await db.execute(
+        select(SoftwareComponent.name, SoftwareComponent.version)
+        .join(SBOMComponent, SBOMComponent.component_id == SoftwareComponent.id)
+        .where(
+            SBOMComponent.sbom_id == sbom.id,
+            SoftwareComponent.organization_id == org_id,
+        ),
+    )).all()
 
     compliance = CISASBOMCompliance()
 
@@ -1031,6 +1062,8 @@ async def validate_sbom_compliance(
         "version": sbom.application_version,
         "created_by_tool": sbom.created_by_tool,
         "created_at": sbom.created_at,
+        "sbom_format": sbom.sbom_format,
+        "components": [{"name": n, "version": v} for n, v in component_rows],
     }
 
     return compliance.generate_compliance_report(sbom_data)
@@ -1038,7 +1071,7 @@ async def validate_sbom_compliance(
 
 @router.get("/compliance/license-audit")
 async def license_audit(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Audit license compliance across organization.
@@ -1059,7 +1092,7 @@ async def license_audit(
     """
     result = await db.execute(
         select(SoftwareComponent).where(
-            SoftwareComponent.organization_id == getattr(current_user, "organization_id", None)
+            SoftwareComponent.organization_id == org_id
         )
     )
     components = result.scalars().all()
@@ -1120,25 +1153,25 @@ async def license_audit(
 
 @router.get("/dashboard/overview")
 async def dashboard_overview(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get supply chain security dashboard overview"""
     sbom_result = await db.execute(
-        select(func.count()).select_from(SBOM).where(SBOM.organization_id == getattr(current_user, "organization_id", None))
+        select(func.count()).select_from(SBOM).where(SBOM.organization_id == org_id)
     )
     total_sboms = sbom_result.scalar() or 0
 
     component_result = await db.execute(
         select(func.count()).select_from(SoftwareComponent).where(
-            SoftwareComponent.organization_id == getattr(current_user, "organization_id", None)
+            SoftwareComponent.organization_id == org_id
         )
     )
     total_components = component_result.scalar() or 0
 
     vuln_result = await db.execute(
         select(func.count()).select_from(SoftwareComponent).where(
-            (SoftwareComponent.organization_id == getattr(current_user, "organization_id", None))
+            (SoftwareComponent.organization_id == org_id)
             & (SoftwareComponent.known_vulnerabilities_count > 0)
         )
     )
@@ -1146,7 +1179,7 @@ async def dashboard_overview(
 
     critical_result = await db.execute(
         select(func.count()).select_from(SupplyChainRisk).where(
-            (SupplyChainRisk.organization_id == getattr(current_user, "organization_id", None))
+            (SupplyChainRisk.organization_id == org_id)
             & (SupplyChainRisk.severity == "critical")
             & (SupplyChainRisk.status == "open")
         )
@@ -1155,7 +1188,7 @@ async def dashboard_overview(
 
     high_result = await db.execute(
         select(func.count()).select_from(SupplyChainRisk).where(
-            (SupplyChainRisk.organization_id == getattr(current_user, "organization_id", None))
+            (SupplyChainRisk.organization_id == org_id)
             & (SupplyChainRisk.severity == "high")
             & (SupplyChainRisk.status == "open")
         )
@@ -1164,14 +1197,14 @@ async def dashboard_overview(
 
     vendor_result = await db.execute(
         select(func.count()).select_from(VendorAssessment).where(
-            VendorAssessment.organization_id == getattr(current_user, "organization_id", None)
+            VendorAssessment.organization_id == org_id
         )
     )
     total_vendors = vendor_result.scalar() or 0
 
     vendor_critical_result = await db.execute(
         select(func.count()).select_from(VendorAssessment).where(
-            (VendorAssessment.organization_id == getattr(current_user, "organization_id", None))
+            (VendorAssessment.organization_id == org_id)
             & (VendorAssessment.risk_tier == "critical")
         )
     )
@@ -1181,14 +1214,14 @@ async def dashboard_overview(
     # would have been the first thing an auditor noticed)
     avg_comp_result = await db.execute(
         select(func.avg(SoftwareComponent.risk_score)).where(
-            SoftwareComponent.organization_id == getattr(current_user, "organization_id", None)
+            SoftwareComponent.organization_id == org_id
         )
     )
     avg_component_risk = float(avg_comp_result.scalar() or 0.0)
 
     avg_vendor_result = await db.execute(
         select(func.avg(VendorAssessment.security_score)).where(
-            VendorAssessment.organization_id == getattr(current_user, "organization_id", None)
+            VendorAssessment.organization_id == org_id
         )
     )
     avg_vendor_score = float(avg_vendor_result.scalar() or 0.0)
@@ -1208,14 +1241,14 @@ async def dashboard_overview(
 
 @router.get("/dashboard/top-risky-components")
 async def get_top_risky_components(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     limit: int = Query(10, ge=1, le=50),
 ):
     """Get top risky components by risk score"""
     result = await db.execute(
         select(SoftwareComponent)
-        .where(SoftwareComponent.organization_id == getattr(current_user, "organization_id", None))
+        .where(SoftwareComponent.organization_id == org_id)
         .order_by(SoftwareComponent.risk_score.desc())
         .limit(limit)
     )
@@ -1226,6 +1259,7 @@ async def get_top_risky_components(
         risk_result = await db.execute(
             select(SupplyChainRisk).where(
                 (SupplyChainRisk.component_id == comp.id)
+                & (SupplyChainRisk.organization_id == org_id)
                 & (SupplyChainRisk.status == "open")
             )
         )
@@ -1251,12 +1285,12 @@ async def get_top_risky_components(
 
 @router.get("/dashboard/vendor-scores")
 async def get_vendor_scores(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get vendor risk scores"""
     result = await db.execute(
-        select(VendorAssessment).where(VendorAssessment.organization_id == getattr(current_user, "organization_id", None))
+        select(VendorAssessment).where(VendorAssessment.organization_id == org_id)
     )
     vendors = result.scalars().all()
 

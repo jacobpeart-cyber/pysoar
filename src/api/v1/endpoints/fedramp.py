@@ -7,12 +7,13 @@ evidence tracking.
 """
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import CurrentUser, DatabaseSession, get_current_active_user
+from src.api.deps import CurrentUser, DatabaseSession, get_current_active_user, OrganizationId, require_role
+from src.models.user import User, UserRole
 from src.core.database import get_db
 from src.core.logging import get_logger
 from src.fedramp.controls import (
@@ -28,6 +29,11 @@ logger = get_logger(__name__)
 
 router = APIRouter(prefix="/fedramp", tags=["fedramp"])
 
+# Wave 1 role gates: viewers read only; analysts for operational writes;
+# admins for configuration and actions against live systems.
+AnalystUser = Annotated[User, Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
+AdminRoleUser = Annotated[User, Depends(require_role([UserRole.ADMIN]))]
+
 _generator = FedRAMPGenerator()
 
 
@@ -38,8 +44,8 @@ _generator = FedRAMPGenerator()
 
 @router.get("/controls")
 async def list_fedramp_controls(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
     family: Optional[str] = Query(
         None, description="Filter by family code (e.g. AC, AU, IR)"
     ),
@@ -61,7 +67,7 @@ async def list_fedramp_controls(
     """
     try:
         controls = await _generator.get_control_implementation_status(
-            db, organization_id=getattr(current_user, "organization_id", None)
+            db, organization_id=org_id
         )
 
         # Apply filters
@@ -105,8 +111,8 @@ async def list_fedramp_controls(
 
 @router.get("/readiness")
 async def fedramp_readiness(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ) -> Dict[str, Any]:
     """FedRAMP readiness score with gap analysis and recommendations.
 
@@ -116,7 +122,7 @@ async def fedramp_readiness(
     """
     try:
         controls = await _generator.get_control_implementation_status(
-            db, organization_id=getattr(current_user, "organization_id", None)
+            db, organization_id=org_id
         )
         report = _generator.generate_readiness_report(controls)
         return report
@@ -135,8 +141,8 @@ async def fedramp_readiness(
 
 @router.get("/ssp/generate")
 async def generate_ssp(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
     org_name: str = Query("PySOAR Inc.", description="Organization name"),
     system_name: str = Query("PySOAR", description="System name"),
 ) -> Dict[str, Any]:
@@ -147,7 +153,7 @@ async def generate_ssp(
     """
     try:
         controls = await _generator.get_control_implementation_status(
-            db, organization_id=getattr(current_user, "organization_id", None)
+            db, organization_id=org_id
         )
         ssp = _generator.generate_ssp(org_name, system_name, controls)
         return ssp
@@ -161,8 +167,8 @@ async def generate_ssp(
 
 @router.get("/ssp/export")
 async def export_ssp(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
     org_name: str = Query("PySOAR Inc.", description="Organization name"),
     system_name: str = Query("PySOAR", description="System name"),
     format: str = Query("json", description="Export format: json"),
@@ -174,7 +180,7 @@ async def export_ssp(
     """
     try:
         controls = await _generator.get_control_implementation_status(
-            db, organization_id=getattr(current_user, "organization_id", None)
+            db, organization_id=org_id
         )
         ssp = _generator.generate_ssp(org_name, system_name, controls)
 
@@ -204,8 +210,8 @@ async def export_ssp(
 
 @router.get("/irp/generate")
 async def generate_irp(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
     org_name: str = Query("PySOAR Inc.", description="Organization name"),
     system_name: str = Query("PySOAR", description="System name"),
 ) -> Dict[str, Any]:
@@ -217,7 +223,7 @@ async def generate_irp(
     """
     try:
         controls = await _generator.get_control_implementation_status(
-            db, organization_id=getattr(current_user, "organization_id", None)
+            db, organization_id=org_id
         )
         doc = _generator.generate_irp(org_name, system_name, controls)
         return doc
@@ -231,15 +237,15 @@ async def generate_irp(
 
 @router.get("/cmp/generate")
 async def generate_cmp(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
     org_name: str = Query("PySOAR Inc.", description="Organization name"),
     system_name: str = Query("PySOAR", description="System name"),
 ) -> Dict[str, Any]:
     """Generate a FedRAMP Configuration Management Plan (CM control family)."""
     try:
         controls = await _generator.get_control_implementation_status(
-            db, organization_id=getattr(current_user, "organization_id", None)
+            db, organization_id=org_id
         )
         doc = _generator.generate_cmp(org_name, system_name, controls)
         return doc
@@ -253,15 +259,15 @@ async def generate_cmp(
 
 @router.get("/conmon-plan/generate")
 async def generate_conmon_plan(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
     org_name: str = Query("PySOAR Inc.", description="Organization name"),
     system_name: str = Query("PySOAR", description="System name"),
 ) -> Dict[str, Any]:
     """Generate a FedRAMP Continuous Monitoring Plan (CA and SI control families)."""
     try:
         controls = await _generator.get_control_implementation_status(
-            db, organization_id=getattr(current_user, "organization_id", None)
+            db, organization_id=org_id
         )
         doc = _generator.generate_conmon_plan(org_name, system_name, controls)
         return doc
@@ -280,8 +286,8 @@ async def generate_conmon_plan(
 
 @router.get("/poam/report")
 async def poam_report(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
     severity: Optional[str] = Query(None, description="Filter by severity"),
     status_filter: Optional[str] = Query(
         None, alias="status", description="Filter by status"
@@ -294,53 +300,43 @@ async def poam_report(
     overdue items.
     """
     try:
+        from sqlalchemy import select as sa_select
+
+        from src.compliance.models import POAM, ComplianceControl
+
+        # POAM has no severity/control_id/responsible_party columns: severity is
+        # risk_level, the control code comes from the referenced control row,
+        # the owner is assigned_to. A ``severity`` filter used to call the
+        # missing POAM.severity, raise, and be swallowed into an empty report.
+        stmt = (
+            sa_select(POAM, ComplianceControl.control_id)
+            .outerjoin(
+                ComplianceControl,
+                (ComplianceControl.id == POAM.control_id_ref)
+                & (ComplianceControl.organization_id == org_id),
+            )
+            .where(POAM.organization_id == org_id)
+        )
+        if severity:
+            stmt = stmt.where(POAM.risk_level == severity)
+        if status_filter:
+            stmt = stmt.where(POAM.status == status_filter)
+
         poams: List[Dict[str, Any]] = []
-
-        # Attempt to load POA&M records from the database
-        try:
-            from src.compliance.models import POAM
-
-            if db and hasattr(db, "execute"):
-                from sqlalchemy import select as sa_select
-
-                org_id = getattr(current_user, "organization_id", None)
-                stmt = sa_select(POAM)
-                if hasattr(POAM, "organization_id"):
-                    stmt = stmt.where(POAM.organization_id == org_id)
-                if severity:
-                    stmt = stmt.where(POAM.severity == severity)
-                if status_filter:
-                    stmt = stmt.where(POAM.status == status_filter)
-
-                result = await db.scalars(stmt)
-                rows = result.all()
-
-                for row in rows:
-                    poams.append({
-                        "poam_id": str(getattr(row, "id", "")),
-                        "control_id": getattr(row, "control_id", ""),
-                        "weakness_description": getattr(
-                            row, "weakness_description", ""
-                        ),
-                        "severity": getattr(row, "severity", "low"),
-                        "status": getattr(row, "status", "open"),
-                        "scheduled_completion_date": str(
-                            getattr(row, "scheduled_completion_date", "")
-                        ),
-                        "milestones": getattr(row, "milestones", []),
-                        "responsible_party": getattr(
-                            row, "responsible_party", ""
-                        ),
-                        "resources_required": getattr(
-                            row, "resources_required", ""
-                        ),
-                        "vendor_dependency": getattr(
-                            row, "vendor_dependency", False
-                        ),
-                        "comments": getattr(row, "comments", ""),
-                    })
-        except Exception:
-            logger.warning("Could not load POA&M records from database")
+        for row, control_code in (await db.execute(stmt)).all():
+            poams.append({
+                "poam_id": str(row.id),
+                "control_id": control_code or "",
+                "weakness_description": row.weakness_description or row.weakness_name or "",
+                "severity": row.risk_level or "",
+                "status": row.status or "open",
+                "scheduled_completion_date": row.scheduled_completion_date,
+                "milestones": row.milestones or [],
+                "responsible_party": row.assigned_to or "",
+                "resources_required": row.resources_required or "",
+                "vendor_dependency": bool(row.vendor_dependencies),
+                "comments": row.comments or [],
+            })
 
         report = _generator.generate_poam_report(poams)
         return report
@@ -359,8 +355,8 @@ async def poam_report(
 
 @router.get("/evidence/status")
 async def evidence_status(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ) -> Dict[str, Any]:
     """Evidence collection status per control family.
 
@@ -370,7 +366,7 @@ async def evidence_status(
     """
     try:
         controls = await _generator.get_control_implementation_status(
-            db, organization_id=getattr(current_user, "organization_id", None)
+            db, organization_id=org_id
         )
 
         family_evidence: Dict[str, Dict[str, Any]] = {}
@@ -430,8 +426,9 @@ async def evidence_status(
 @router.post("/controls/{control_id}/update")
 async def update_control_status(
     control_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AdminRoleUser = None,
     implementation_status: str = Query(
         ...,
         description="New status: implemented, partially_implemented, planned, alternative, not_applicable",
@@ -441,10 +438,13 @@ async def update_control_status(
     ),
     assessor_notes: Optional[str] = Query(None, description="Assessor notes"),
 ) -> Dict[str, Any]:
-    """Update the implementation status for a specific FedRAMP control.
+    """Update the implementation status for a specific FedRAMP control (admin only).
 
     Validates that the control ID exists in the Moderate baseline and
-    persists the updated status to the compliance controls table.
+    persists the status (and narrative, as ``implementation_details``) to the
+    caller's row in ``compliance_controls`` under their FedRAMP framework.
+    404 ``control_not_tracked`` when the organisation has no such row;
+    501 for ``assessor_notes``, which has no storage column.
     """
     # Validate control exists in baseline
     if control_id not in CONTROLS_BY_ID:
@@ -456,67 +456,75 @@ async def update_control_status(
     valid_statuses = FedRAMPGenerator.IMPLEMENTATION_STATUSES
     if implementation_status not in valid_statuses:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid status. Must be one of: {valid_statuses}",
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "invalid_implementation_status",
+                "field": "implementation_status",
+                "detail": f"Must be one of: {valid_statuses}",
+            },
         )
+
+    if assessor_notes is not None:
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail={
+                "error": "not_implemented",
+                "detail": "assessor_notes cannot be stored: compliance_controls has no assessor-notes column",
+            },
+        )
+
+    from sqlalchemy import select as sa_select
+
+    from src.compliance.engine import FEDRAMP_SHORT_NAME_PREFIX
+    from src.compliance.models import ComplianceControl, ComplianceFramework
 
     try:
         baseline_ctrl = CONTROLS_BY_ID[control_id]
 
-        # Attempt to persist to database
-        persisted = False
-        try:
-            from src.compliance.models import ComplianceControl
-
-            if db and hasattr(db, "execute"):
-                from sqlalchemy import select as sa_select
-
-                org_id = getattr(current_user, "organization_id", None)
-                stmt = sa_select(ComplianceControl).where(
-                    ComplianceControl.control_id == control_id,
-                    ComplianceControl.framework == "FedRAMP",
+        rows = (
+            await db.execute(
+                sa_select(ComplianceControl, ComplianceFramework.short_name)
+                .join(
+                    ComplianceFramework,
+                    ComplianceControl.framework_id == ComplianceFramework.id,
                 )
-                if hasattr(ComplianceControl, "organization_id"):
-                    stmt = stmt.where(
-                        ComplianceControl.organization_id == org_id
-                    )
-                result = await db.scalars(stmt)
-                existing = result.first()
-
-                if existing:
-                    existing.status = implementation_status
-                    if implementation_narrative is not None:
-                        existing.implementation_narrative = implementation_narrative
-                    if assessor_notes is not None:
-                        existing.assessor_notes = assessor_notes
-                    existing.last_assessed = datetime.utcnow()
-                else:
-                    new_ctrl = ComplianceControl(
-                        control_id=control_id,
-                        framework="FedRAMP",
-                        status=implementation_status,
-                        title=baseline_ctrl["title"],
-                        description=baseline_ctrl["description"],
-                        family=baseline_ctrl["family"],
-                    )
-                    if hasattr(ComplianceControl, "organization_id"):
-                        new_ctrl.organization_id = org_id
-                    if implementation_narrative is not None:
-                        new_ctrl.implementation_narrative = implementation_narrative
-                    if assessor_notes is not None:
-                        new_ctrl.assessor_notes = assessor_notes
-                    db.add(new_ctrl)
-
-                await db.commit()
-                persisted = True
-        except Exception as db_exc:
-            logger.warning(
-                f"Could not persist control update to database: {db_exc}"
+                .where(
+                    ComplianceControl.control_id == control_id,
+                    ComplianceControl.organization_id == org_id,
+                    ComplianceFramework.organization_id == org_id,
+                    ComplianceFramework.short_name.like(f"{FEDRAMP_SHORT_NAME_PREFIX}%"),
+                )
             )
+        ).all()
+        if not rows:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={
+                    "error": "control_not_tracked",
+                    "detail": (
+                        f"Your organization has no FedRAMP control record for {control_id}; "
+                        "enable the FedRAMP Moderate framework first"
+                    ),
+                },
+            )
+        # Prefer the Moderate framework when several FedRAMP baselines exist.
+        rows.sort(key=lambda r: r[1] != "fedramp_moderate")
+        existing = rows[0][0]
+
+        existing.status = implementation_status
+        if implementation_narrative is not None:
+            existing.implementation_details = implementation_narrative
+        await db.commit()
+        persisted = True
+        logger.info(
+            "fedramp_control_status_updated",
+            control_id=control_id,
+            organization_id=org_id,
+            implementation_status=implementation_status,
+        )
 
         if implementation_status in ("planned", "partially_implemented", "alternative"):
             try:
-                org_id = getattr(current_user, "organization_id", None)
                 automation = AutomationService(db)
                 await automation.on_fedramp_evidence_gap(
                     control_id=control_id,

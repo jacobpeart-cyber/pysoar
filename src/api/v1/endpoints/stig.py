@@ -8,19 +8,26 @@ SCAP operations, and compliance dashboard.
 import os
 import tempfile
 from pathlib import Path
-from typing import Optional
+from typing import Annotated, Optional
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Body, UploadFile, File, Path as FPath
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, desc
 
-from src.api.deps import CurrentUser, DatabaseSession, get_current_active_user
+from src.api.deps import CurrentUser, DatabaseSession, get_current_active_user, OrganizationId, require_role
+from src.models.user import User, UserRole
 from src.core.database import get_db
 from src.core.logging import get_logger
-from src.stig.engine import STIGScanner, STIGRemediator, STIGLibrary, SCAPEngine
+from src.stig.engine import (
+    BenchmarkOwnershipConflict,
+    SCAPEngine,
+    STIGLibrary,
+    STIGNotFoundError,
+    STIGRemediator,
+    STIGScanner,
+)
 from src.stig.models import STIGBenchmark, STIGRule, STIGScanResult, SCAPProfile
-from src.services.automation import AutomationService
 from src.schemas.stig import (
     STIGBenchmarkResponse,
     STIGRuleResponse,
@@ -45,6 +52,25 @@ logger = get_logger(__name__)
 
 router = APIRouter(prefix="/stig", tags=["stig"])
 
+# Wave 1 role gates: viewers read only; analysts for operational writes;
+# admins for configuration and actions against live systems.
+AnalystUser = Annotated[User, Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
+AdminRoleUser = Annotated[User, Depends(require_role([UserRole.ADMIN]))]
+
+
+def _benchmark_conflict(exc: BenchmarkOwnershipConflict) -> HTTPException:
+    """409 for an XCCDF benchmark id another organisation already holds."""
+    return HTTPException(
+        status_code=409,
+        detail={
+            "error": "benchmark_id_conflict",
+            "detail": (
+                f"{exc}. Benchmark ids are unique platform-wide until the schema "
+                "allows one row per organisation; this import was not applied."
+            ),
+        },
+    )
+
 
 # ============================================================================
 # Benchmark Endpoints
@@ -53,8 +79,8 @@ router = APIRouter(prefix="/stig", tags=["stig"])
 
 @router.get("/benchmarks", response_model=list[BenchmarkListResponse])
 async def list_benchmarks(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
 ):
@@ -62,7 +88,7 @@ async def list_benchmarks(
     try:
         stmt = (
             select(STIGBenchmark)
-            .where(STIGBenchmark.organization_id == getattr(current_user, "organization_id", None))
+            .where(STIGBenchmark.organization_id == org_id)
             .offset(skip)
             .limit(limit)
         )
@@ -76,14 +102,18 @@ async def list_benchmarks(
 @router.get("/benchmarks/{benchmark_id}", response_model=STIGBenchmarkResponse)
 async def get_benchmark(
     benchmark_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
-    """Get STIG benchmark details"""
+    """Get STIG benchmark details (by row id or XCCDF benchmark id)."""
     try:
+        from sqlalchemy import or_
         stmt = select(STIGBenchmark).where(
-            (STIGBenchmark.benchmark_id == benchmark_id)
-            & (STIGBenchmark.organization_id == getattr(current_user, "organization_id", None))
+            or_(
+                STIGBenchmark.id == benchmark_id,
+                STIGBenchmark.benchmark_id == benchmark_id,
+            ),
+            STIGBenchmark.organization_id == org_id,
         )
         benchmark = await db.scalar(stmt)
         if not benchmark:
@@ -99,8 +129,8 @@ async def get_benchmark(
 @router.get("/benchmarks/{benchmark_id}/rules", response_model=list[STIGRuleResponse])
 async def list_benchmark_rules(
     benchmark_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
     severity: Optional[str] = None,
     skip: int = Query(0, ge=0),
     limit: int = Query(50, ge=1, le=500),
@@ -115,7 +145,6 @@ async def list_benchmark_rules(
     """
     try:
         from sqlalchemy import or_
-        org_id = getattr(current_user, "organization_id", None)
         stmt = select(STIGBenchmark).where(
             or_(
                 STIGBenchmark.id == benchmark_id,
@@ -129,7 +158,7 @@ async def list_benchmark_rules(
 
         query = select(STIGRule).where(
             (STIGRule.benchmark_id_ref == benchmark.id)
-            & (STIGRule.organization_id == getattr(current_user, "organization_id", None))
+            & (STIGRule.organization_id == org_id)
         )
 
         if severity:
@@ -147,14 +176,14 @@ async def list_benchmark_rules(
 
 @router.get("/rules/search", response_model=list[RuleSearchResponse])
 async def search_rules(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     q: str = Query(..., min_length=1),
-    current_user: CurrentUser = None,
 ):
     """Search STIG rules by keyword, ID, or content"""
     try:
         library = STIGLibrary(db)
-        results = await library.search_rules(q, getattr(current_user, "organization_id", None))
+        results = await library.search_rules(q, org_id)
         return results
     except Exception as e:
         logger.error(f"Error searching rules: {str(e)}")
@@ -164,14 +193,14 @@ async def search_rules(
 @router.get("/rules/{rule_id}", response_model=STIGRuleResponse)
 async def get_rule(
     rule_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
     """Get STIG rule details"""
     try:
         stmt = select(STIGRule).where(
             (STIGRule.rule_id == rule_id)
-            & (STIGRule.organization_id == getattr(current_user, "organization_id", None))
+            & (STIGRule.organization_id == org_id)
         )
         rule = await db.scalar(stmt)
         if not rule:
@@ -189,59 +218,55 @@ async def get_rule(
 # ============================================================================
 
 
-@router.post("/scans/launch", response_model=None)
+@router.post("/scans/launch", response_model=None, status_code=202)
 async def launch_scan(
     request: ScanRequest,
+    org_id: OrganizationId,
+    _user: AdminRoleUser,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
-    """Launch STIG benchmark scan against target host"""
+    """Register a STIG scan of a host (admin only: it targets a live host).
+
+    Returns 202 with ``status: "pending_results"``. No checks are executed
+    in-process; results are recorded when the oscap ARF for the host is
+    posted to ``POST /stig/scans/{scan_id}/arf``. (Before 2026-10-08 this
+    stored every scan as completed at 100% compliance.)
+    """
     try:
         scanner = STIGScanner(db)
-        result = await scanner.scan_host(
+        return await scanner.scan_host(
             host=request.host,
             benchmark_id=request.benchmark_id,
+            org_id=org_id,
             scan_type=request.scan_type,
             target_ip=request.target_ip,
         )
-
-        try:
-            org_id = getattr(current_user, "organization_id", None)
-            failed_count = 0
-            if isinstance(result, dict):
-                failed_count = result.get("failed", 0) or result.get("failures", 0) or 0
-            if failed_count:
-                automation = AutomationService(db)
-                await automation.on_stig_finding(
-                    benchmark=request.benchmark_id,
-                    finding_title=f"STIG scan failures on {request.host}",
-                    severity="high",
-                    organization_id=org_id,
-                )
-        except Exception as automation_exc:
-            logger.warning(f"Automation on_stig_finding failed: {automation_exc}")
-
-        return result
+    except STIGNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
     except Exception as e:
         logger.error(f"Error launching scan: {str(e)}")
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
 
 
-@router.post("/scans/fleet", response_model=list[dict])
+@router.post("/scans/fleet", response_model=list[dict], status_code=202)
 async def launch_fleet_scan(
     request: ScanFleetRequest,
+    org_id: OrganizationId,
+    _user: AdminRoleUser,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
-    """Launch STIG scans against multiple hosts"""
+    """Register STIG scans for several hosts (admin only; each is
+    ``pending_results`` until its ARF is ingested, see /scans/launch)."""
     try:
         scanner = STIGScanner(db)
-        results = await scanner.scan_fleet(
+        return await scanner.scan_fleet(
             hosts=request.hosts,
             benchmark_id=request.benchmark_id,
+            org_id=org_id,
             scan_type=request.scan_type,
         )
-        return results
+    except STIGNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
     except Exception as e:
         logger.error(f"Error launching fleet scan: {str(e)}")
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
@@ -249,8 +274,8 @@ async def launch_fleet_scan(
 
 @router.get("/scans", response_model=list[STIGScanResultResponse])
 async def list_scans(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
     benchmark_id: Optional[str] = None,
     target_host: Optional[str] = None,
     status: Optional[str] = None,
@@ -260,12 +285,13 @@ async def list_scans(
     """List STIG scan results"""
     try:
         query = select(STIGScanResult).where(
-            STIGScanResult.organization_id == getattr(current_user, "organization_id", None)
+            STIGScanResult.organization_id == org_id
         )
 
         if benchmark_id:
             stmt = select(STIGBenchmark.id).where(
-                STIGBenchmark.benchmark_id == benchmark_id
+                STIGBenchmark.benchmark_id == benchmark_id,
+                STIGBenchmark.organization_id == org_id,
             )
             bid = await db.scalar(stmt)
             if bid:
@@ -288,14 +314,14 @@ async def list_scans(
 @router.get("/scans/{scan_id}", response_model=STIGScanResultResponse)
 async def get_scan(
     scan_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
     """Get STIG scan result details"""
     try:
         stmt = select(STIGScanResult).where(
             (STIGScanResult.id == scan_id)
-            & (STIGScanResult.organization_id == getattr(current_user, "organization_id", None))
+            & (STIGScanResult.organization_id == org_id)
         )
         scan = await db.scalar(stmt)
         if not scan:
@@ -311,14 +337,15 @@ async def get_scan(
 @router.post("/scans/compare", response_model=ScanComparisonResponse)
 async def compare_scans(
     request: ScanComparisonRequest,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
-    """Compare two STIG scan baselines"""
+    """Compare two STIG scan baselines (read-only computation: viewers allowed)."""
     try:
         scanner = STIGScanner(db)
-        result = await scanner.get_scan_comparison(request.scan_id_1, request.scan_id_2)
-        return result
+        return await scanner.get_scan_comparison(request.scan_id_1, request.scan_id_2, org_id)
+    except STIGNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
     except Exception as e:
         logger.error(f"Error comparing scans: {str(e)}")
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
@@ -332,17 +359,20 @@ async def compare_scans(
 @router.post("/remediate/auto", response_model=RemediationResponse)
 async def auto_remediate(
     request: RemediationRequest,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ):
     """Auto-remediate STIG findings"""
     try:
         remediator = STIGRemediator(db)
-        result = await remediator.auto_remediate(
+        return await remediator.auto_remediate(
             scan_result_id=request.scan_result_id,
+            org_id=org_id,
             categories=request.categories,
         )
-        return result
+    except STIGNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
     except Exception as e:
         logger.error(f"Error remediating findings: {str(e)}")
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
@@ -350,9 +380,10 @@ async def auto_remediate(
 
 @router.post("/remediate/script", response_model=RemediationScriptResponse)
 async def generate_remediation_script(
+    org_id: OrganizationId,
     request: dict = Body(...),
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ):
     """Generate remediation script for findings"""
     try:
@@ -360,6 +391,7 @@ async def generate_remediation_script(
         script = await remediator.generate_remediation_script(
             findings=request.get("findings", {}),
             platform=request.get("platform", "linux"),
+            org_id=org_id,
         )
         return RemediationScriptResponse(
             platform=request.get("platform", "linux"),
@@ -408,8 +440,9 @@ def _stig_content_path(content_path: Optional[str]) -> str:
 @router.post("/scap/import", response_model=SCAPProfileResponse)
 async def import_scap_content(
     request: SCAPImportRequest,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ):
     """Import SCAP content (XCCDF, OVAL) from a file already under the STIG
     content directory (see POST /stig/scap/upload)."""
@@ -418,9 +451,11 @@ async def import_scap_content(
         engine = SCAPEngine(db)
         result = await engine.import_scap_content(
             xccdf_path=xccdf_path,
-            org_id=getattr(current_user, "organization_id", None),
+            org_id=org_id,
         )
         return result
+    except BenchmarkOwnershipConflict as e:
+        raise _benchmark_conflict(e) from e
     except Exception as e:
         logger.error(f"Error importing SCAP content: {str(e)}")
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
@@ -428,9 +463,10 @@ async def import_scap_content(
 
 @router.post("/scap/upload")
 async def upload_scap_content(
+    org_id: OrganizationId,
     file: UploadFile = File(..., description="XCCDF XML file (DISA STIG content)"),
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ):
     """Upload an XCCDF STIG file and import it.
 
@@ -440,10 +476,6 @@ async def upload_scap_content(
     """
     if not file.filename or not file.filename.lower().endswith((".xml", ".xccdf", ".xccdf.xml")):
         raise HTTPException(status_code=400, detail="File must have .xml, .xccdf, or .xccdf.xml extension")
-
-    org_id = getattr(current_user, "organization_id", None)
-    if not org_id:
-        raise HTTPException(status_code=401, detail="Authentication required")
 
     Path(STIG_CONTENT_DIR).mkdir(parents=True, exist_ok=True)
     # Use a UUID prefix to avoid filename collisions between orgs uploading
@@ -459,6 +491,8 @@ async def upload_scap_content(
     engine = SCAPEngine(db)
     try:
         result = await engine.import_scap_content(xccdf_path=str(dest), org_id=org_id)
+    except BenchmarkOwnershipConflict as e:
+        raise _benchmark_conflict(e) from e
     except Exception as e:
         logger.error("SCAP upload import failed", error=str(e))
         # Leave the uploaded file on disk for forensics even when import fails.
@@ -470,10 +504,11 @@ async def upload_scap_content(
 
 @router.post("/scans/{scan_id}/arf")
 async def ingest_arf_result(
+    org_id: OrganizationId,
     scan_id: str = FPath(..., description="STIGScanResult UUID"),
     file: UploadFile = File(..., description="oscap-generated ARF XML"),
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ):
     """Ingest an oscap ARF (Asset Reporting Format) report into an existing
     scan record. Parses <rule-result> elements and updates findings +
@@ -485,7 +520,10 @@ async def ingest_arf_result(
         raise HTTPException(status_code=400, detail="ARF file is empty")
 
     scanner = STIGScanner(db)
-    result = await scanner.ingest_arf_result(scan_id=scan_id, arf_xml=arf_bytes)
+    try:
+        result = await scanner.ingest_arf_result(scan_id=scan_id, arf_xml=arf_bytes, org_id=org_id)
+    except STIGNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
     if result.get("status") == "error":
         raise HTTPException(status_code=400, detail=result.get("error") or "ARF ingestion failed")
     return result
@@ -493,18 +531,25 @@ async def ingest_arf_result(
 
 @router.post("/scap/scan", response_model=None)
 async def run_scap_scan(
+    org_id: OrganizationId,
+    _user: AdminRoleUser,
     request: dict = Body(...),
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
-    """Run SCAP scan using profile"""
+    """SCAP profile evaluation (admin only: names a live target).
+
+    Nothing is executed against the target; the result's status is
+    ``not_executed`` and its counts come from imported rule defaults.
+    """
     try:
         engine = SCAPEngine(db)
-        result = await engine.run_scap_scan(
+        return await engine.run_scap_scan(
             profile_id=request.get("profile_id"),
             target=request.get("target"),
+            org_id=org_id,
         )
-        return result
+    except STIGNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
     except Exception as e:
         logger.error(f"Error running SCAP scan: {str(e)}")
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
@@ -514,7 +559,7 @@ async def run_scap_scan(
 async def validate_oval(
     request: OVALValidationRequest,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ):
     """Validate OVAL (Open Vulnerability and Assessment Language) definitions"""
     try:
@@ -529,14 +574,15 @@ async def validate_oval(
 @router.post("/scap/arf-report", response_model=None)
 async def generate_arf_report(
     request: ARFReportRequest,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
-    """Generate Assessment Results Format (ARF) report"""
+    """Generate Assessment Results Format (ARF) report (read-only: viewers allowed)."""
     try:
         engine = SCAPEngine(db)
-        result = await engine.generate_arf_report(request.scan_id)
-        return result
+        return await engine.generate_arf_report(request.scan_id, org_id)
+    except STIGNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
     except Exception as e:
         logger.error(f"Error generating ARF report: {str(e)}")
         raise HTTPException(status_code=500, detail="Operation failed. Please try again or contact support.")
@@ -544,8 +590,8 @@ async def generate_arf_report(
 
 @router.get("/scap/profiles", response_model=list[SCAPProfileResponse])
 async def list_scap_profiles(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
 ):
@@ -553,7 +599,7 @@ async def list_scap_profiles(
     try:
         query = (
             select(SCAPProfile)
-            .where(SCAPProfile.organization_id == getattr(current_user, "organization_id", None))
+            .where(SCAPProfile.organization_id == org_id)
             .offset(skip)
             .limit(limit)
         )
@@ -571,8 +617,8 @@ async def list_scap_profiles(
 
 @router.get("/dashboard/stats", response_model=STIGDashboardStats)
 async def get_stig_stats(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
     """Get STIG compliance dashboard statistics.
 
@@ -583,7 +629,6 @@ async def get_stig_stats(
     schema historically, so the UI always showed zeros even when real
     scans existed.
     """
-    org_id = getattr(current_user, "organization_id", None)
 
     try:
         # Count benchmarks
@@ -603,10 +648,12 @@ async def get_stig_stats(
         scan_list = list(await db.scalars(scan_query))
         total_scans = len(scan_list)
 
-        # Calculate averages and totals
+        # Average only scans with real results: pending_results / failed
+        # scans executed no checks and carry no compliance score.
+        scored = [s for s in scan_list if s.status == "completed"]
         avg_compliance = (
-            sum(s.compliance_percentage for s in scan_list) / total_scans
-            if total_scans > 0
+            sum(s.compliance_percentage or 0.0 for s in scored) / len(scored)
+            if scored
             else 0.0
         )
         # STIG CAT I = High, CAT II = Medium, CAT III = Low
@@ -623,7 +670,7 @@ async def get_stig_stats(
         # --- compliance_by_benchmark (real aggregate) ---
         compliance_by_benchmark: list[dict] = []
         benchmark_scan_buckets: dict[str, list[float]] = {}
-        for s in scan_list:
+        for s in scored:
             if s.benchmark_id_ref:
                 benchmark_scan_buckets.setdefault(s.benchmark_id_ref, []).append(
                     float(s.compliance_percentage or 0)
@@ -683,7 +730,7 @@ async def get_stig_stats(
                     compliance_trend = "declining"
 
         return STIGDashboardStats(
-            organization_id=org_id or "",
+            organization_id=org_id,
             total_benchmarks=total_benchmarks,
             total_scans=total_scans,
             average_compliance=round(avg_compliance, 1),
@@ -693,7 +740,12 @@ async def get_stig_stats(
             low_findings=0,
             last_scan_date=last_scan_date,
             scans_this_month=len(
-                [s for s in scan_list if s.created_at and s.created_at.month == datetime.utcnow().month]
+                [
+                    s for s in scan_list
+                    if s.created_at
+                    and (s.created_at.year, s.created_at.month)
+                    == (datetime.utcnow().year, datetime.utcnow().month)
+                ]
             ),
             compliance_trend=compliance_trend,
             compliance_by_benchmark=compliance_by_benchmark,

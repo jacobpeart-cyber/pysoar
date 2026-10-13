@@ -8,7 +8,7 @@ continuous monitoring, and audit readiness checking.
 import hashlib
 import json
 from datetime import datetime, timezone, timedelta
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from collections import defaultdict
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -492,12 +492,13 @@ class EvidenceCollector:
 
         try:
             stmt = select(AutomatedEvidenceRule).where(
-                AutomatedEvidenceRule.id == rule_id
+                AutomatedEvidenceRule.id == rule_id,
+                AutomatedEvidenceRule.organization_id == self.org_id,
             )
             rule = await self.session.scalar(stmt)
 
             if not rule:
-                raise ValueError(f"Rule {rule_id} not found")
+                raise LookupError(f"Rule {rule_id} not found")
 
             if rule.collection_method == "api_query":
                 evidence = await self._collect_from_api(rule.collection_config)
@@ -515,7 +516,10 @@ class EvidenceCollector:
             # Update last collected timestamp
             stmt = (
                 update(AutomatedEvidenceRule)
-                .where(AutomatedEvidenceRule.id == rule_id)
+                .where(
+                    AutomatedEvidenceRule.id == rule_id,
+                    AutomatedEvidenceRule.organization_id == self.org_id,
+                )
                 .values(last_collected_at=datetime.now(timezone.utc))
             )
             await self.session.execute(stmt)
@@ -566,11 +570,14 @@ class EvidenceCollector:
         logger.info(f"Packaging evidence for {package_id}")
 
         try:
-            stmt = select(EvidencePackage).where(EvidencePackage.id == package_id)
+            stmt = select(EvidencePackage).where(
+                EvidencePackage.id == package_id,
+                EvidencePackage.organization_id == self.org_id,
+            )
             package = await self.session.scalar(stmt)
 
             if not package:
-                raise ValueError(f"Package {package_id} not found")
+                raise LookupError(f"Package {package_id} not found")
 
             # Calculate package hash
             package_content = {
@@ -585,7 +592,10 @@ class EvidenceCollector:
             # Update package
             stmt = (
                 update(EvidencePackage)
-                .where(EvidencePackage.id == package_id)
+                .where(
+                    EvidencePackage.id == package_id,
+                    EvidencePackage.organization_id == self.org_id,
+                )
                 .values(
                     package_hash=package_hash,
                     status="review",
@@ -601,7 +611,7 @@ class EvidenceCollector:
                 "name": package.name,
                 "status": "review",
                 "package_hash": package_hash,
-                "evidence_count": len(package.evidence_items),
+                "evidence_count": len(package.evidence_items or {}),
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
 
@@ -609,36 +619,77 @@ class EvidenceCollector:
             logger.error(f"Evidence packaging failed: {str(e)}")
             raise
 
-    async def verify_evidence_integrity(self, evidence_id: str) -> bool:
+    async def verify_evidence_integrity(
+        self,
+        evidence_id: str,
+        resolve_local_path: Optional[Callable[[str], str]] = None,
+    ) -> dict[str, Any]:
         """
-        Verify evidence integrity via hash
+        Re-hash a stored ComplianceEvidence file and compare it with the
+        hash recorded at upload.
+
+        Before 2026-10-08 this read ``self.db`` (AttributeError, so it always
+        answered False), looked up AutomatedEvidenceRule instead of evidence,
+        and answered True when no hash was stored.
 
         Args:
-            evidence_id: Evidence ID
+            evidence_id: ComplianceEvidence id (must belong to this org)
+            resolve_local_path: maps the stored path to a safe local path
+                (raises if it lies outside the org's evidence root)
 
         Returns:
-            True if hash matches, False otherwise
+            ``{"status": "verified" | "mismatch" | "unverifiable",
+            "integrity_valid": True | False | None, "reason": ...}``
+
+        Raises:
+            LookupError: the evidence is not in this organisation.
         """
-        try:
-            from src.audit_evidence.models import AutomatedEvidenceRule
-            stmt = select(AutomatedEvidenceRule).where(AutomatedEvidenceRule.id == evidence_id)
-            result = await self.db.execute(stmt)
-            evidence = result.scalar_one_or_none()
-            if not evidence:
-                logger.warning(f"Evidence {evidence_id} not found for integrity check")
-                return False
-            # If evidence has a stored hash, verify it hasn't been tampered
-            stored_hash = getattr(evidence, "evidence_hash", None)
-            if stored_hash:
-                import hashlib
-                content = str(getattr(evidence, "evidence_data", "") or "")
-                computed_hash = hashlib.sha256(content.encode()).hexdigest()
-                return computed_hash == stored_hash
-            # No hash stored — integrity cannot be verified but not failed
-            return True
-        except Exception as e:
-            logger.error(f"Evidence integrity check failed: {e}")
-            return False
+        import os
+
+        from src.compliance.models import ComplianceEvidence
+
+        evidence = await self.session.scalar(
+            select(ComplianceEvidence).where(
+                ComplianceEvidence.id == evidence_id,
+                ComplianceEvidence.organization_id == self.org_id,
+            )
+        )
+        if evidence is None:
+            raise LookupError(f"Evidence {evidence_id} not found")
+
+        def _unverifiable(reason: str) -> dict[str, Any]:
+            return {"status": "unverifiable", "integrity_valid": None, "reason": reason}
+
+        stored_hash = (evidence.file_hash or "").strip().lower()
+        location = evidence.file_path or ""
+        if not stored_hash:
+            return _unverifiable("no hash was recorded for this evidence")
+        if not location:
+            return _unverifiable("no file is stored for this evidence")
+        if "://" in location:
+            return _unverifiable("remote evidence objects are not re-hashed by the platform")
+        algorithms = {128: hashlib.sha512, 64: hashlib.sha256}
+        algorithm = algorithms.get(len(stored_hash))
+        if algorithm is None:
+            return _unverifiable("the recorded hash is not a SHA-256 or SHA-512 digest")
+
+        path = resolve_local_path(location) if resolve_local_path else location
+        if not os.path.isfile(path):
+            return {
+                "status": "mismatch",
+                "integrity_valid": False,
+                "reason": "the evidence file is missing from storage",
+            }
+        hasher = algorithm()
+        with open(path, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                hasher.update(chunk)
+        matches = hasher.hexdigest() == stored_hash
+        return {
+            "status": "verified" if matches else "mismatch",
+            "integrity_valid": matches,
+            "reason": None if matches else "the file's hash differs from the hash recorded at upload",
+        }
 
     async def generate_evidence_report(self, package_id: str) -> dict[str, Any]:
         """
@@ -650,11 +701,14 @@ class EvidenceCollector:
         Returns:
             Evidence report
         """
-        stmt = select(EvidencePackage).where(EvidencePackage.id == package_id)
+        stmt = select(EvidencePackage).where(
+            EvidencePackage.id == package_id,
+            EvidencePackage.organization_id == self.org_id,
+        )
         package = await self.session.scalar(stmt)
 
         if not package:
-            raise ValueError(f"Package {package_id} not found")
+            raise LookupError(f"Package {package_id} not found")
 
         return {
             "package_id": package_id,
@@ -664,7 +718,7 @@ class EvidenceCollector:
             "assessor": package.assessor,
             "due_date": package.due_date.isoformat() if package.due_date else None,
             "submitted_at": package.submitted_at.isoformat() if package.submitted_at else None,
-            "evidence_count": len(package.evidence_items),
+            "evidence_count": len(package.evidence_items or {}),
             "control_mappings": package.control_mappings,
             "package_hash": package.package_hash,
             "metadata": package.extra_metadata,
@@ -847,8 +901,10 @@ class ContinuousMonitor:
         now = datetime.now(timezone.utc)
         cutoff_30d = now - timedelta(days=30)
 
-        # Incident does not have organization_id — scope only by time window.
-        stmt = select(Incident).where(Incident.created_at >= cutoff_30d)
+        stmt = select(Incident).where(
+            Incident.organization_id == self.org_id,
+            Incident.created_at >= cutoff_30d,
+        )
         incidents = list((await self.session.scalars(stmt)).all())
         incidents_this_month = len(incidents)
 
@@ -929,6 +985,17 @@ class ContinuousMonitor:
         logger.info("Generating ConMon monthly report")
 
         cycle_results = await self.run_conmon_cycle()
+        # Derived from the checks (was hardcoded "compliant" before 2026-10-08).
+        check_statuses = [
+            check.get("status")
+            for check in cycle_results.values()
+            if isinstance(check, dict)
+        ]
+        overall_status = (
+            "compliant"
+            if check_statuses and all(s in ("compliant", "on_track") for s in check_statuses)
+            else "non_compliant"
+        )
 
         return {
             "report_type": "FedRAMP ConMon Monthly",
@@ -936,7 +1003,7 @@ class ContinuousMonitor:
                 "start": (datetime.now(timezone.utc) - timedelta(days=30)).isoformat(),
                 "end": datetime.now(timezone.utc).isoformat(),
             },
-            "overall_status": "compliant",
+            "overall_status": overall_status,
             "checks": cycle_results,
             "generated_at": datetime.now(timezone.utc).isoformat(),
         }

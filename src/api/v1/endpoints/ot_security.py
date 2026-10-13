@@ -5,17 +5,18 @@ API routes for OT asset management, threat monitoring, zone administration,
 incident coordination, and compliance reporting.
 """
 
-import json
 import math
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from ipaddress import ip_network
+from typing import Annotated, Optional
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import Depends, APIRouter, HTTPException, Query, status
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import CurrentUser, DatabaseSession
-from src.core.database import async_session_factory
+from src.api.deps import DatabaseSession, OrganizationId, require_role
+from src.models.user import User, UserRole
+from src.core.config import settings
 from src.core.logging import get_logger
 from src.services.automation import AutomationService
 from src.ot_security.models import (
@@ -25,7 +26,9 @@ from src.ot_security.models import (
     OTIncident,
     OTPolicyRule,
 )
+from src.ot_security.netguard import check_discovery_target, internal_network_reason, parse_cidrs
 from src.ot_security.engine import (
+    MAX_DISCOVERY_PREFIX,
     OTMonitor,
     PurdueModelEnforcer,
     SafetyManager,
@@ -56,8 +59,6 @@ from src.schemas.ot_security import (
     OTDashboardResponse,
     ComplianceReportResponse,
     OTRiskAssessmentResponse,
-    AlertSeverity,
-    AlertStatus,
     AssetInventoryStats,
     AlertStats,
     ComplianceScores,
@@ -67,13 +68,16 @@ from src.schemas.ot_security import (
 logger = get_logger(__name__)
 router = APIRouter(prefix="/ot_security", tags=["OT Security"])
 
+# Wave 1 role gates: viewers read only; analysts for operational writes;
+# admins for configuration and actions against live systems.
+AnalystUser = Annotated[User, Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
+AdminRoleUser = Annotated[User, Depends(require_role([UserRole.ADMIN]))]
+
 
 # Helper functions (tenant-scoped)
-async def get_asset_or_404(db: AsyncSession, asset_id: str, org_id: Optional[str] = None) -> OTAsset:
+async def get_asset_or_404(db: AsyncSession, asset_id: str, org_id: str) -> OTAsset:
     """Get OT asset by ID or raise 404 (tenant-scoped)"""
-    stmt = select(OTAsset).where(OTAsset.id == asset_id)
-    if org_id is not None:
-        stmt = stmt.where(OTAsset.organization_id == org_id)
+    stmt = select(OTAsset).where(OTAsset.id == asset_id, OTAsset.organization_id == org_id)
     result = await db.execute(stmt)
     asset = result.scalar_one_or_none()
     if not asset:
@@ -84,11 +88,9 @@ async def get_asset_or_404(db: AsyncSession, asset_id: str, org_id: Optional[str
     return asset
 
 
-async def get_alert_or_404(db: AsyncSession, alert_id: str, org_id: Optional[str] = None) -> OTAlert:
+async def get_alert_or_404(db: AsyncSession, alert_id: str, org_id: str) -> OTAlert:
     """Get OT alert by ID or raise 404 (tenant-scoped)"""
-    stmt = select(OTAlert).where(OTAlert.id == alert_id)
-    if org_id is not None:
-        stmt = stmt.where(OTAlert.organization_id == org_id)
+    stmt = select(OTAlert).where(OTAlert.id == alert_id, OTAlert.organization_id == org_id)
     result = await db.execute(stmt)
     alert = result.scalar_one_or_none()
     if not alert:
@@ -99,11 +101,9 @@ async def get_alert_or_404(db: AsyncSession, alert_id: str, org_id: Optional[str
     return alert
 
 
-async def get_zone_or_404(db: AsyncSession, zone_id: str, org_id: Optional[str] = None) -> OTZone:
+async def get_zone_or_404(db: AsyncSession, zone_id: str, org_id: str) -> OTZone:
     """Get OT zone by ID or raise 404 (tenant-scoped)"""
-    stmt = select(OTZone).where(OTZone.id == zone_id)
-    if org_id is not None:
-        stmt = stmt.where(OTZone.organization_id == org_id)
+    stmt = select(OTZone).where(OTZone.id == zone_id, OTZone.organization_id == org_id)
     result = await db.execute(stmt)
     zone = result.scalar_one_or_none()
     if not zone:
@@ -114,11 +114,9 @@ async def get_zone_or_404(db: AsyncSession, zone_id: str, org_id: Optional[str] 
     return zone
 
 
-async def get_incident_or_404(db: AsyncSession, incident_id: str, org_id: Optional[str] = None) -> OTIncident:
+async def get_incident_or_404(db: AsyncSession, incident_id: str, org_id: str) -> OTIncident:
     """Get OT incident by ID or raise 404 (tenant-scoped)"""
-    stmt = select(OTIncident).where(OTIncident.id == incident_id)
-    if org_id is not None:
-        stmt = stmt.where(OTIncident.organization_id == org_id)
+    stmt = select(OTIncident).where(OTIncident.id == incident_id, OTIncident.organization_id == org_id)
     result = await db.execute(stmt)
     incident = result.scalar_one_or_none()
     if not incident:
@@ -129,11 +127,9 @@ async def get_incident_or_404(db: AsyncSession, incident_id: str, org_id: Option
     return incident
 
 
-async def get_policy_or_404(db: AsyncSession, policy_id: str, org_id: Optional[str] = None) -> OTPolicyRule:
+async def get_policy_or_404(db: AsyncSession, policy_id: str, org_id: str) -> OTPolicyRule:
     """Get OT policy rule by ID or raise 404 (tenant-scoped)"""
-    stmt = select(OTPolicyRule).where(OTPolicyRule.id == policy_id)
-    if org_id is not None:
-        stmt = stmt.where(OTPolicyRule.organization_id == org_id)
+    stmt = select(OTPolicyRule).where(OTPolicyRule.id == policy_id, OTPolicyRule.organization_id == org_id)
     result = await db.execute(stmt)
     policy = result.scalar_one_or_none()
     if not policy:
@@ -149,7 +145,7 @@ async def get_policy_or_404(db: AsyncSession, policy_id: str, org_id: Optional[s
 
 @router.get("/assets", response_model=OTAssetListResponse)
 async def list_assets(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -160,7 +156,7 @@ async def list_assets(
     search: Optional[str] = None,
 ):
     """List OT assets with filtering and pagination"""
-    query = select(OTAsset).where(OTAsset.organization_id == getattr(current_user, "organization_id", None))
+    query = select(OTAsset).where(OTAsset.organization_id == org_id)
 
     if asset_type:
         query = query.where(OTAsset.asset_type == asset_type)
@@ -205,12 +201,13 @@ async def list_assets(
 @router.post("/assets", response_model=OTAssetResponse, status_code=status.HTTP_201_CREATED)
 async def create_asset(
     asset_data: OTAssetCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Create a new OT asset"""
     asset = OTAsset(
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         name=asset_data.name,
         asset_type=asset_data.asset_type,
         vendor=asset_data.vendor,
@@ -234,9 +231,9 @@ async def create_asset(
 
 
 @router.get("/assets/{asset_id}", response_model=OTAssetResponse)
-async def get_asset(asset_id: str, current_user: CurrentUser = None, db: DatabaseSession = None):
+async def get_asset(asset_id: str, org_id: OrganizationId, db: DatabaseSession = None):
     """Get OT asset by ID"""
-    asset = await get_asset_or_404(db, asset_id, getattr(current_user, "organization_id", None))
+    asset = await get_asset_or_404(db, asset_id, org_id)
     return OTAssetResponse.model_validate(asset)
 
 
@@ -244,11 +241,12 @@ async def get_asset(asset_id: str, current_user: CurrentUser = None, db: Databas
 async def update_asset(
     asset_id: str,
     asset_data: OTAssetUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Update OT asset"""
-    asset = await get_asset_or_404(db, asset_id, getattr(current_user, "organization_id", None))
+    asset = await get_asset_or_404(db, asset_id, org_id)
 
     update_data = asset_data.model_dump(exclude_unset=True)
     for key, value in update_data.items():
@@ -261,71 +259,144 @@ async def update_asset(
 
 
 @router.delete("/assets/{asset_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_asset(asset_id: str, current_user: CurrentUser = None, db: DatabaseSession = None):
+async def delete_asset(
+    asset_id: str, org_id: OrganizationId, _user: AnalystUser = None, db: DatabaseSession = None
+):
     """Delete OT asset"""
-    asset = await get_asset_or_404(db, asset_id, getattr(current_user, "organization_id", None))
+    asset = await get_asset_or_404(db, asset_id, org_id)
     await db.delete(asset)
     await db.commit()
+
+
+
+def _validate_zone_cidr(raw: Optional[str]) -> Optional[str]:
+    """Normalise a zone CIDR; 400 when unparseable or a platform-internal range."""
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return ""
+    try:
+        net = ip_network(text, strict=False)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": "invalid_zone_cidr", "field": "network_cidr", "detail": f"{raw}: {exc}"},
+        ) from exc
+    reason = internal_network_reason(net)
+    if reason:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": "zone_cidr_refused",
+                "field": "network_cidr",
+                "detail": f"{net} is a {reason} range and cannot be an OT zone",
+            },
+        )
+    return str(net)
+
+
+async def enforce_discovery_targets(db: AsyncSession, org_id: str, nets) -> None:
+    """Refuse (403) any discovery target outside the platform allowlist, outside
+    the tenant's OT zones, or inside a loopback/link-local/metadata range.
+    Fails closed when the platform allowlist is empty or the tenant has no zone."""
+    allowlist = parse_cidrs(settings.ot_discovery_allowed_cidrs)
+    zone_cidrs = (
+        await db.execute(select(OTZone.network_cidr).where(OTZone.organization_id == org_id))
+    ).scalars().all()
+    zones = parse_cidrs(zone_cidrs)
+    for net in nets:
+        refusal = check_discovery_target(net, allowlist, zones)
+        if refusal is not None:
+            logger.warning("ot_discover_refused", organization_id=org_id, cidr=str(net), error=refusal.error)
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail={"error": refusal.error, "detail": refusal.detail},
+            )
 
 
 @router.post("/assets/{asset_id}/discover")
 async def discover_asset_networks(
     asset_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    current_user: AdminRoleUser = None,
     db: DatabaseSession = None,
-    org_id: Optional[str] = Query(None),
     network_ranges: list[str] = Query([]),
 ):
-    """Discover neighbouring OT devices on the provided network ranges.
+    """Actively probe OT ports on the given network ranges (live-network scan).
 
-    Previously this handler instantiated ``OTMonitor(org_id)`` and
-    returned ``{"status": "discovery_queued"}`` without calling any
-    method on the monitor — nothing was queued, nothing was scanned.
-    Now invokes ``OTMonitor.discover_assets`` when it exists and falls
-    back to an honest ``awaiting_network_scanner`` status when the
-    monitor has no discovery backend configured, so the UI knows
-    whether a real scan ran.
+    Admin only: the TCP sweep runs from the API host's network. Each range
+    is passed to ``OTMonitor.discover_assets(network_range)`` (one CIDR per
+    call). With no ``network_ranges`` the asset's own address is probed. When
+    the organization has OT zones configured, every range must lie inside one
+    of their ``network_cidr`` networks AND inside the platform allowlist
+    ``OT_DISCOVERY_ALLOWED_CIDRS`` (same rule as ``/ot-security/discover``);
+    loopback, link-local and metadata ranges are always refused.
     """
-    effective_org = org_id or getattr(current_user, "organization_id", None)
-    asset = await get_asset_or_404(db, asset_id, effective_org)
+    asset = await get_asset_or_404(db, asset_id, org_id)
 
-    monitor = OTMonitor(effective_org)
-    discovered: list[dict] = []
-    status_label = "awaiting_network_scanner"
-    error_message: Optional[str] = None
-
-    discover_fn = getattr(monitor, "discover_assets", None) or getattr(monitor, "scan", None)
-    if discover_fn is not None:
+    ranges = list(network_ranges) or ([f"{asset.ip_address}/32"] if asset.ip_address else [])
+    if not ranges:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "network_ranges_required",
+                "field": "network_ranges",
+                "detail": "the asset has no ip_address; pass at least one network_ranges CIDR",
+            },
+        )
+    nets = []
+    for raw in ranges:
         try:
-            result = discover_fn(
-                network_ranges=network_ranges or [asset.ip_address] if asset.ip_address else network_ranges,
-                seed_asset=asset,
+            net = ip_network(str(raw).strip(), strict=False)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={"error": "invalid_cidr", "field": "network_ranges", "detail": f"{raw}: {exc}"},
+            ) from exc
+        if net.prefixlen < MAX_DISCOVERY_PREFIX:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "error": "cidr_too_large",
+                    "field": "network_ranges",
+                    "detail": f"{raw} exceeds the /{MAX_DISCOVERY_PREFIX} safety cap",
+                },
             )
-            if hasattr(result, "__await__"):
-                result = await result  # type: ignore[assignment]
-            if isinstance(result, dict):
-                discovered = list(result.get("assets") or result.get("discovered") or [])
-            elif isinstance(result, list):
-                discovered = result
-            status_label = "completed"
-        except TypeError:
-            # Method exists but has a different signature — fall back
-            # to invoking with no kwargs rather than silently failing.
-            try:
-                result = discover_fn()
-                if hasattr(result, "__await__"):
-                    result = await result  # type: ignore[assignment]
-                discovered = list(result or [])
-                status_label = "completed"
-            except Exception as exc:  # noqa: BLE001
-                error_message = str(exc)[:500]
+        nets.append(net)
+
+    await enforce_discovery_targets(db, org_id, nets)
+
+    logger.info(
+        "ot_asset_discover_requested",
+        user_id=str(getattr(current_user, "id", "")),
+        organization_id=org_id,
+        asset_id=asset_id,
+        ranges=[str(n) for n in nets],
+    )
+
+    monitor = OTMonitor(org_id)
+    discovered: list[dict] = []
+    status_label = "completed"
+    error_message: Optional[str] = None
+    for net in nets:
+        try:
+            result = await monitor.discover_assets(str(net))
         except Exception as exc:  # noqa: BLE001
+            logger.error("ot_asset_discover_failed", organization_id=org_id, cidr=str(net), error=str(exc))
+            status_label = "failed"
             error_message = str(exc)[:500]
+            break
+        if result and isinstance(result[0], dict) and result[0].get("status") in {"skipped", "rejected"}:
+            status_label = str(result[0]["status"])
+            error_message = result[0].get("reason")
+            break
+        discovered.extend(result)
 
     return {
         "asset_id": asset_id,
         "status": status_label,
-        "network_ranges": network_ranges,
+        "network_ranges": [str(n) for n in nets],
         "discovered_count": len(discovered),
         "discovered": discovered[:50],
         "error": error_message,
@@ -333,9 +404,9 @@ async def discover_asset_networks(
 
 
 @router.get("/assets/{asset_id}/status")
-async def get_asset_status(asset_id: str, current_user: CurrentUser = None, db: DatabaseSession = None):
+async def get_asset_status(asset_id: str, org_id: OrganizationId, db: DatabaseSession = None):
     """Get current status of OT asset"""
-    asset = await get_asset_or_404(db, asset_id, getattr(current_user, "organization_id", None))
+    asset = await get_asset_or_404(db, asset_id, org_id)
 
     return {
         "asset_id": asset.id,
@@ -349,12 +420,10 @@ async def get_asset_status(asset_id: str, current_user: CurrentUser = None, db: 
 
 
 @router.get("/assets/{asset_id}/risk_assessment")
-async def get_asset_risk_assessment(
-    asset_id: str, current_user: CurrentUser = None, db: DatabaseSession = None
-):
+async def get_asset_risk_assessment(asset_id: str, org_id: OrganizationId, db: DatabaseSession = None):
     """Get risk assessment for OT asset"""
-    asset = await get_asset_or_404(db, asset_id, getattr(current_user, "organization_id", None))
-    assessor = OTVulnerabilityAssessor(getattr(current_user, "organization_id", None))
+    asset = await get_asset_or_404(db, asset_id, org_id)
+    assessor = OTVulnerabilityAssessor(org_id)
 
     vulns = await assessor.check_known_vulnerabilities(asset.to_dict())
     risk_score = await assessor.calculate_ot_risk_score(asset.to_dict(), vulns)
@@ -370,10 +439,10 @@ async def get_asset_risk_assessment(
 
 
 @router.post("/assets/{asset_id}/firmware_check")
-async def check_asset_firmware(asset_id: str, current_user: CurrentUser = None, db: DatabaseSession = None):
+async def check_asset_firmware(asset_id: str, org_id: OrganizationId, db: DatabaseSession = None):
     """Check firmware version and vulnerabilities"""
-    asset = await get_asset_or_404(db, asset_id, getattr(current_user, "organization_id", None))
-    assessor = OTVulnerabilityAssessor(getattr(current_user, "organization_id", None))
+    asset = await get_asset_or_404(db, asset_id, org_id)
+    assessor = OTVulnerabilityAssessor(org_id)
 
     vulns = await assessor.scan_firmware_versions([asset.to_dict()])
 
@@ -390,7 +459,7 @@ async def check_asset_firmware(asset_id: str, current_user: CurrentUser = None, 
 
 @router.get("/alerts", response_model=OTAlertListResponse)
 async def list_alerts(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -400,7 +469,7 @@ async def list_alerts(
     asset_id: Optional[str] = None,
 ):
     """List OT alerts with filtering and pagination"""
-    query = select(OTAlert).where(OTAlert.organization_id == getattr(current_user, "organization_id", None))
+    query = select(OTAlert).where(OTAlert.organization_id == org_id)
 
     if alert_type:
         query = query.where(OTAlert.alert_type == alert_type)
@@ -437,12 +506,31 @@ async def list_alerts(
 @router.post("/alerts", response_model=OTAlertResponse, status_code=status.HTTP_201_CREATED)
 async def create_alert(
     alert_data: OTAlertCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Create a new OT alert"""
+    # asset_id is a NOT NULL FK: it must name an asset of the caller's org
+    # (an empty or foreign id used to become an IntegrityError 500).
+    owned_asset = None
+    if alert_data.asset_id:
+        owned_asset = (
+            await db.execute(
+                select(OTAsset.id).where(OTAsset.id == alert_data.asset_id, OTAsset.organization_id == org_id)
+            )
+        ).scalar_one_or_none()
+    if owned_asset is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "invalid_asset_id",
+                "field": "asset_id",
+                "detail": "asset_id must name an OT asset in your organization",
+            },
+        )
     alert = OTAlert(
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         asset_id=alert_data.asset_id,
         alert_type=alert_data.alert_type,
         severity=alert_data.severity,
@@ -461,7 +549,6 @@ async def create_alert(
 
     # Trigger automation rules
     try:
-        org_id = getattr(current_user, "organization_id", None)
         automation = AutomationService(db)
         await automation.on_ot_security_alert(
             asset_name=alert_data.asset_id,
@@ -476,9 +563,9 @@ async def create_alert(
 
 
 @router.get("/alerts/{alert_id}", response_model=OTAlertResponse)
-async def get_alert(alert_id: str, current_user: CurrentUser = None, db: DatabaseSession = None):
+async def get_alert(alert_id: str, org_id: OrganizationId, db: DatabaseSession = None):
     """Get OT alert by ID"""
-    alert = await get_alert_or_404(db, alert_id, getattr(current_user, "organization_id", None))
+    alert = await get_alert_or_404(db, alert_id, org_id)
     return OTAlertResponse.model_validate(alert)
 
 
@@ -486,11 +573,12 @@ async def get_alert(alert_id: str, current_user: CurrentUser = None, db: Databas
 async def update_alert(
     alert_id: str,
     alert_data: OTAlertUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Update OT alert status"""
-    alert = await get_alert_or_404(db, alert_id, getattr(current_user, "organization_id", None))
+    alert = await get_alert_or_404(db, alert_id, org_id)
 
     update_data = alert_data.model_dump(exclude_unset=True)
     for key, value in update_data.items():
@@ -503,9 +591,11 @@ async def update_alert(
 
 
 @router.post("/alerts/{alert_id}/investigate")
-async def investigate_alert(alert_id: str, current_user: CurrentUser = None, db: DatabaseSession = None):
+async def investigate_alert(
+    alert_id: str, org_id: OrganizationId, _user: AnalystUser = None, db: DatabaseSession = None
+):
     """Start investigation of OT alert"""
-    alert = await get_alert_or_404(db, alert_id, getattr(current_user, "organization_id", None))
+    alert = await get_alert_or_404(db, alert_id, org_id)
     alert.status = "investigating"
 
     await db.commit()
@@ -517,12 +607,13 @@ async def investigate_alert(alert_id: str, current_user: CurrentUser = None, db:
 @router.post("/alerts/{alert_id}/respond")
 async def respond_to_alert(
     alert_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
     response_action: str = Query(...),
 ):
     """Record response action to alert"""
-    alert = await get_alert_or_404(db, alert_id, getattr(current_user, "organization_id", None))
+    alert = await get_alert_or_404(db, alert_id, org_id)
     alert.response_action = response_action
     alert.status = "contained"
 
@@ -534,7 +625,8 @@ async def respond_to_alert(
 
 @router.post("/alerts/bulk_action")
 async def bulk_alert_action(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    current_user: AdminRoleUser = None,
     db: DatabaseSession = None,
     alert_ids: list = Query(...),
     action: str = Query(...),
@@ -542,9 +634,13 @@ async def bulk_alert_action(
     """Perform bulk action on alerts in the caller's organization.
 
     Ids that do not exist in the caller's organization are not touched and
-    are returned in ``ignored_ids``.
+    are returned in ``ignored_ids``. Admin only (OT bulk action).
     """
-    org_id = getattr(current_user, "organization_id", None)
+    if action not in {"resolve", "dismiss"}:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"error": "invalid_action", "field": "action", "detail": "action must be 'resolve' or 'dismiss'"},
+        )
     result = await db.execute(
         select(OTAlert).where(OTAlert.id.in_(alert_ids), OTAlert.organization_id == org_id)
     )
@@ -580,14 +676,14 @@ async def bulk_alert_action(
 
 @router.get("/zones", response_model=OTZoneListResponse)
 async def list_zones(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     purdue_level: Optional[str] = None,
 ):
     """List OT security zones"""
-    query = select(OTZone).where(OTZone.organization_id == getattr(current_user, "organization_id", None))
+    query = select(OTZone).where(OTZone.organization_id == org_id)
 
     if purdue_level:
         query = query.where(OTZone.purdue_level == purdue_level)
@@ -615,16 +711,17 @@ async def list_zones(
 @router.post("/zones", response_model=OTZoneResponse, status_code=status.HTTP_201_CREATED)
 async def create_zone(
     zone_data: OTZoneCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Create a new OT security zone"""
     zone = OTZone(
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         name=zone_data.name,
         description=zone_data.description,
         purdue_level=zone_data.purdue_level,
-        network_cidr=zone_data.network_cidr,
+        network_cidr=_validate_zone_cidr(zone_data.network_cidr),
         allowed_protocols=zone_data.allowed_protocols or [],
         allowed_communications=zone_data.allowed_communications or [],
     )
@@ -637,9 +734,9 @@ async def create_zone(
 
 
 @router.get("/zones/{zone_id}", response_model=OTZoneResponse)
-async def get_zone(zone_id: str, current_user: CurrentUser = None, db: DatabaseSession = None):
+async def get_zone(zone_id: str, org_id: OrganizationId, db: DatabaseSession = None):
     """Get OT zone by ID"""
-    zone = await get_zone_or_404(db, zone_id, getattr(current_user, "organization_id", None))
+    zone = await get_zone_or_404(db, zone_id, org_id)
     return OTZoneResponse.model_validate(zone)
 
 
@@ -647,14 +744,17 @@ async def get_zone(zone_id: str, current_user: CurrentUser = None, db: DatabaseS
 async def update_zone(
     zone_id: str,
     zone_data: OTZoneUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Update OT zone"""
-    zone = await get_zone_or_404(db, zone_id, getattr(current_user, "organization_id", None))
+    zone = await get_zone_or_404(db, zone_id, org_id)
 
     update_data = zone_data.model_dump(exclude_unset=True)
     for key, value in update_data.items():
+        if key == "network_cidr":
+            value = _validate_zone_cidr(value)
         setattr(zone, key, value)
 
     await db.commit()
@@ -664,18 +764,20 @@ async def update_zone(
 
 
 @router.delete("/zones/{zone_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_zone(zone_id: str, current_user: CurrentUser = None, db: DatabaseSession = None):
+async def delete_zone(
+    zone_id: str, org_id: OrganizationId, _user: AnalystUser = None, db: DatabaseSession = None
+):
     """Delete OT zone"""
-    zone = await get_zone_or_404(db, zone_id, getattr(current_user, "organization_id", None))
+    zone = await get_zone_or_404(db, zone_id, org_id)
     await db.delete(zone)
     await db.commit()
 
 
 @router.post("/zones/{zone_id}/compliance_check")
-async def check_zone_compliance(zone_id: str, current_user: CurrentUser = None, db: DatabaseSession = None):
+async def check_zone_compliance(zone_id: str, org_id: OrganizationId, db: DatabaseSession = None):
     """Check zone compliance with Purdue model"""
-    zone = await get_zone_or_404(db, zone_id, getattr(current_user, "organization_id", None))
-    enforcer = PurdueModelEnforcer(getattr(current_user, "organization_id", None))
+    zone = await get_zone_or_404(db, zone_id, org_id)
+    enforcer = PurdueModelEnforcer(org_id)
 
     report = await enforcer.generate_zone_compliance_report([zone.to_dict()])
 
@@ -683,11 +785,9 @@ async def check_zone_compliance(zone_id: str, current_user: CurrentUser = None, 
 
 
 @router.get("/zones/{zone_id}/communication_matrix")
-async def get_zone_communication_matrix(
-    zone_id: str, current_user: CurrentUser = None, db: DatabaseSession = None
-):
+async def get_zone_communication_matrix(zone_id: str, org_id: OrganizationId, db: DatabaseSession = None):
     """Get zone-to-zone communication policy matrix"""
-    zone = await get_zone_or_404(db, zone_id, getattr(current_user, "organization_id", None))
+    zone = await get_zone_or_404(db, zone_id, org_id)
 
     return {
         "zone_id": zone.id,
@@ -698,20 +798,26 @@ async def get_zone_communication_matrix(
 
 
 @router.post("/zones/{zone_id}/segmentation_audit")
-async def audit_zone_segmentation(zone_id: str, current_user: CurrentUser = None, db: DatabaseSession = None):
-    """Audit network segmentation for zone"""
-    zone = await get_zone_or_404(db, zone_id, getattr(current_user, "organization_id", None))
+async def audit_zone_segmentation(
+    zone_id: str, org_id: OrganizationId, _user: AdminRoleUser = None, db: DatabaseSession = None
+):
+    """Audit network segmentation for zone: not implemented.
 
-    zone.last_audit = datetime.now(timezone.utc)
-    zone.segmentation_verified = True
-
-    await db.commit()
-
-    return {
-        "zone_id": zone.id,
-        "audit_timestamp": zone.last_audit,
-        "segmentation_verified": zone.segmentation_verified,
-    }
+    This used to stamp ``segmentation_verified=True`` without auditing
+    anything, which drove the UI's "Verified" badge. No firewall/flow data
+    source exists yet, so it now returns an honest 501 and changes nothing.
+    """
+    await get_zone_or_404(db, zone_id, org_id)
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail={
+            "error": "not_implemented",
+            "detail": (
+                "Segmentation auditing is not implemented: no firewall or flow data source is "
+                "connected, so the zone's segmentation cannot be verified. Nothing was changed."
+            ),
+        },
+    )
 
 
 # ===== OT INCIDENTS =====
@@ -719,7 +825,7 @@ async def audit_zone_segmentation(zone_id: str, current_user: CurrentUser = None
 
 @router.get("/incidents", response_model=OTIncidentListResponse)
 async def list_incidents(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -728,7 +834,7 @@ async def list_incidents(
     incident_type: Optional[str] = None,
 ):
     """List OT incidents"""
-    query = select(OTIncident).where(OTIncident.organization_id == getattr(current_user, "organization_id", None))
+    query = select(OTIncident).where(OTIncident.organization_id == org_id)
 
     if status:
         query = query.where(OTIncident.status == status)
@@ -762,12 +868,13 @@ async def list_incidents(
 @router.post("/incidents", response_model=OTIncidentResponse, status_code=status.HTTP_201_CREATED)
 async def create_incident(
     incident_data: OTIncidentCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Create a new OT incident"""
     incident = OTIncident(
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         title=incident_data.title,
         description=incident_data.description,
         incident_type=incident_data.incident_type,
@@ -784,9 +891,9 @@ async def create_incident(
 
 
 @router.get("/incidents/{incident_id}", response_model=OTIncidentResponse)
-async def get_incident(incident_id: str, current_user: CurrentUser = None, db: DatabaseSession = None):
+async def get_incident(incident_id: str, org_id: OrganizationId, db: DatabaseSession = None):
     """Get OT incident by ID"""
-    incident = await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
+    incident = await get_incident_or_404(db, incident_id, org_id)
     return OTIncidentResponse.model_validate(incident)
 
 
@@ -794,11 +901,12 @@ async def get_incident(incident_id: str, current_user: CurrentUser = None, db: D
 async def update_incident(
     incident_id: str,
     incident_data: OTIncidentUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Update OT incident"""
-    incident = await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
+    incident = await get_incident_or_404(db, incident_id, org_id)
 
     update_data = incident_data.model_dump(exclude_unset=True)
     for key, value in update_data.items():
@@ -813,12 +921,13 @@ async def update_incident(
 @router.post("/incidents/{incident_id}/containment_strategy")
 async def set_containment_strategy(
     incident_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
     strategy: str = Query(...),
 ):
     """Set containment strategy for incident"""
-    incident = await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
+    incident = await get_incident_or_404(db, incident_id, org_id)
     incident.containment_strategy = strategy
     incident.status = "containing"
 
@@ -829,30 +938,41 @@ async def set_containment_strategy(
 
 @router.post("/incidents/{incident_id}/safe_shutdown")
 async def initiate_safe_shutdown(
-    incident_id: str, current_user: CurrentUser = None, db: DatabaseSession = None
+    incident_id: str, org_id: OrganizationId, current_user: AdminRoleUser = None, db: DatabaseSession = None
 ):
-    """Initiate safe shutdown procedure for incident"""
-    incident = await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
+    """Initiate safe shutdown for an incident: not implemented.
 
-    safety_mgr = SafetyManager(getattr(current_user, "organization_id", None))
-    shutdown_plan = await safety_mgr.initiate_safe_shutdown(
-        incident_id, incident.affected_zones
+    This used to return a fixed step template with status "initiated" and set
+    ``safe_shutdown_initiated=True`` although no PLC/SIS command was sent. No
+    OT control integration exists, so it now returns an honest 501 and leaves
+    the incident unchanged.
+    """
+    await get_incident_or_404(db, incident_id, org_id)
+    logger.warning(
+        "ot_safe_shutdown_not_implemented",
+        user_id=str(getattr(current_user, "id", "")),
+        organization_id=org_id,
+        incident_id=incident_id,
     )
-
-    incident.safe_shutdown_initiated = True
-    await db.commit()
-
-    return shutdown_plan
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail={
+            "error": "not_implemented",
+            "detail": (
+                "Safe shutdown is not implemented: no PLC/SIS control integration is connected, so "
+                "no shutdown command was sent and the incident was not marked as shut down. "
+                "Follow the site's manual safe-shutdown procedure."
+            ),
+        },
+    )
 
 
 @router.get("/incidents/{incident_id}/post_incident")
-async def get_post_incident_report(
-    incident_id: str, current_user: CurrentUser = None, db: DatabaseSession = None
-):
+async def get_post_incident_report(incident_id: str, org_id: OrganizationId, db: DatabaseSession = None):
     """Generate post-incident report"""
-    incident = await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
+    incident = await get_incident_or_404(db, incident_id, org_id)
 
-    safety_mgr = SafetyManager(getattr(current_user, "organization_id", None))
+    safety_mgr = SafetyManager(org_id)
     report = await safety_mgr.generate_safety_incident_report(incident.to_dict())
 
     return report
@@ -863,7 +983,7 @@ async def get_post_incident_report(
 
 @router.get("/policies", response_model=OTPolicyListResponse)
 async def list_policies(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -871,7 +991,7 @@ async def list_policies(
     enabled_only: bool = False,
 ):
     """List OT policy rules"""
-    query = select(OTPolicyRule).where(OTPolicyRule.organization_id == getattr(current_user, "organization_id", None))
+    query = select(OTPolicyRule).where(OTPolicyRule.organization_id == org_id)
 
     if rule_type:
         query = query.where(OTPolicyRule.rule_type == rule_type)
@@ -902,12 +1022,13 @@ async def list_policies(
 @router.post("/policies", response_model=OTPolicyRuleResponse, status_code=status.HTTP_201_CREATED)
 async def create_policy(
     policy_data: OTPolicyRuleCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AdminRoleUser = None,
     db: DatabaseSession = None,
 ):
     """Create a new OT policy rule"""
     policy = OTPolicyRule(
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         name=policy_data.name,
         description=policy_data.description,
         rule_type=policy_data.rule_type,
@@ -924,9 +1045,9 @@ async def create_policy(
 
 
 @router.get("/policies/{policy_id}", response_model=OTPolicyRuleResponse)
-async def get_policy(policy_id: str, current_user: CurrentUser = None, db: DatabaseSession = None):
+async def get_policy(policy_id: str, org_id: OrganizationId, db: DatabaseSession = None):
     """Get OT policy rule by ID"""
-    policy = await get_policy_or_404(db, policy_id, getattr(current_user, "organization_id", None))
+    policy = await get_policy_or_404(db, policy_id, org_id)
     return OTPolicyRuleResponse.model_validate(policy)
 
 
@@ -934,11 +1055,12 @@ async def get_policy(policy_id: str, current_user: CurrentUser = None, db: Datab
 async def update_policy(
     policy_id: str,
     policy_data: OTPolicyRuleUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AdminRoleUser = None,
     db: DatabaseSession = None,
 ):
     """Update OT policy rule"""
-    policy = await get_policy_or_404(db, policy_id, getattr(current_user, "organization_id", None))
+    policy = await get_policy_or_404(db, policy_id, org_id)
 
     update_data = policy_data.model_dump(exclude_unset=True)
     for key, value in update_data.items():
@@ -951,17 +1073,21 @@ async def update_policy(
 
 
 @router.delete("/policies/{policy_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_policy(policy_id: str, current_user: CurrentUser = None, db: DatabaseSession = None):
+async def delete_policy(
+    policy_id: str, org_id: OrganizationId, _user: AdminRoleUser = None, db: DatabaseSession = None
+):
     """Delete OT policy rule"""
-    policy = await get_policy_or_404(db, policy_id, getattr(current_user, "organization_id", None))
+    policy = await get_policy_or_404(db, policy_id, org_id)
     await db.delete(policy)
     await db.commit()
 
 
 @router.post("/policies/{policy_id}/enable")
-async def enable_policy(policy_id: str, current_user: CurrentUser = None, db: DatabaseSession = None):
+async def enable_policy(
+    policy_id: str, org_id: OrganizationId, _user: AdminRoleUser = None, db: DatabaseSession = None
+):
     """Enable OT policy rule"""
-    policy = await get_policy_or_404(db, policy_id, getattr(current_user, "organization_id", None))
+    policy = await get_policy_or_404(db, policy_id, org_id)
     policy.enabled = True
 
     await db.commit()
@@ -970,9 +1096,11 @@ async def enable_policy(policy_id: str, current_user: CurrentUser = None, db: Da
 
 
 @router.post("/policies/{policy_id}/disable")
-async def disable_policy(policy_id: str, current_user: CurrentUser = None, db: DatabaseSession = None):
+async def disable_policy(
+    policy_id: str, org_id: OrganizationId, _user: AdminRoleUser = None, db: DatabaseSession = None
+):
     """Disable OT policy rule"""
-    policy = await get_policy_or_404(db, policy_id, getattr(current_user, "organization_id", None))
+    policy = await get_policy_or_404(db, policy_id, org_id)
     policy.enabled = False
 
     await db.commit()
@@ -983,12 +1111,12 @@ async def disable_policy(policy_id: str, current_user: CurrentUser = None, db: D
 @router.get("/policies/{policy_id}/violation_history")
 async def get_policy_violation_history(
     policy_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     limit: int = Query(10, ge=1, le=100),
 ):
     """Get policy violation history"""
-    policy = await get_policy_or_404(db, policy_id, getattr(current_user, "organization_id", None))
+    policy = await get_policy_or_404(db, policy_id, org_id)
 
     return {
         "policy_id": policy.id,
@@ -1002,9 +1130,8 @@ async def get_policy_violation_history(
 
 
 @router.get("/dashboard", response_model=OTDashboardResponse)
-async def get_ot_dashboard(current_user: CurrentUser = None, db: DatabaseSession = None):
+async def get_ot_dashboard(org_id: OrganizationId, db: DatabaseSession = None):
     """Get OT security dashboard"""
-    org_id = getattr(current_user, "organization_id", None)
     now = datetime.now(timezone.utc)
     window_24h = now - timedelta(hours=24)
 
@@ -1112,9 +1239,8 @@ _PURDUE_LEVEL_NUMERIC = {
 
 
 @router.get("/purdue-map")
-async def get_purdue_map(current_user: CurrentUser = None, db: DatabaseSession = None):
+async def get_purdue_map(org_id: OrganizationId, db: DatabaseSession = None):
     """Return asset devices grouped by numeric Purdue level for the visualization tab."""
-    org_id = getattr(current_user, "organization_id", None)
 
     result = await db.execute(
         select(OTAsset).where(OTAsset.organization_id == org_id)
@@ -1162,9 +1288,8 @@ async def get_purdue_map(current_user: CurrentUser = None, db: DatabaseSession =
 
 
 @router.get("/compliance/report", response_model=ComplianceReportResponse)
-async def get_compliance_report(current_user: CurrentUser = None, db: DatabaseSession = None):
+async def get_compliance_report(org_id: OrganizationId, db: DatabaseSession = None):
     """Get comprehensive ICS compliance report"""
-    org_id = getattr(current_user, "organization_id", None)
 
     # Fetch assets and zones
     assets_result = await db.execute(
@@ -1195,9 +1320,8 @@ async def get_compliance_report(current_user: CurrentUser = None, db: DatabaseSe
 
 
 @router.get("/risk_assessment", response_model=OTRiskAssessmentResponse)
-async def get_risk_assessment(current_user: CurrentUser = None, db: DatabaseSession = None):
+async def get_risk_assessment(org_id: OrganizationId, db: DatabaseSession = None):
     """Get OT risk assessment report"""
-    org_id = getattr(current_user, "organization_id", None)
 
     # Fetch assets
     assets_result = await db.execute(

@@ -8,7 +8,6 @@ No random/simulated data.
 
 import json
 import yaml
-import hashlib
 from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional, Tuple
 from enum import Enum
@@ -47,12 +46,17 @@ class ImageScanner:
     async def scan_image(
         self, registry: str, repository: str, tag: str, digest: str,
         db: Optional[AsyncSession] = None,
+        organization_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Report known vulnerabilities for an image from the DB.
 
         No scanner backend is configured, so this does not discover new
         vulnerabilities — it surfaces ImageVulnerability rows already
         recorded for this image (e.g. by a future real-scanner integration).
+
+        The DB lookup is tenant-scoped: only rows owned by ``organization_id``
+        are read. Without an organisation the lookup is skipped (fail closed)
+        rather than reading every tenant's vulnerabilities.
         """
         logger.info(f"Reporting known vulnerabilities for {registry}/{repository}:{tag}")
 
@@ -61,7 +65,7 @@ class ImageScanner:
         vulnerabilities: List[Dict[str, Any]] = []
 
         # Pull any existing vulnerabilities from the DB
-        if db is not None:
+        if db is not None and organization_id:
             try:
                 stmt = (
                     select(ImageVulnerability)
@@ -69,6 +73,8 @@ class ImageScanner:
                     .where(
                         ContainerImage.repository == repository,
                         ContainerImage.tag == tag,
+                        ContainerImage.organization_id == organization_id,
+                        ImageVulnerability.organization_id == organization_id,
                     )
                 )
                 result = await db.execute(stmt)
@@ -146,22 +152,29 @@ class ImageScanner:
     async def verify_image_signature(
         self, image: ContainerImage,
     ) -> Dict[str, Any]:
-        """Verify signature using the actual DB record fields."""
+        """Report the recorded signature state; no verification is performed.
+
+        PySOAR has no cosign/notary integration and does not contact the
+        registry, so nothing is verified here. The previous version echoed the
+        stored booleans as if they were a verification result and fabricated a
+        ``key_id`` from a hash of the digest. Now the response says plainly
+        that no verifier ran and only repeats what is recorded on the row.
+        """
         ref = f"{image.registry}/{image.repository}:{image.tag}"
         return {
+            "status": "no_verifier_backend",
+            "verification_performed": False,
+            "message": (
+                "No image-signature verifier (e.g. cosign or notary) is "
+                "configured; the signature was not checked. The fields below "
+                "repeat the values recorded on the image."
+            ),
             "image": ref,
             "is_signed": bool(image.is_signed),
             "signature_verified": bool(image.signature_verified),
-            "signature_tool": "cosign" if image.is_signed else None,
-            "key_id": (
-                hashlib.sha256(
-                    (image.digest_sha256 or ref).encode()
-                ).hexdigest()[:16]
-                if image.is_signed else None
-            ),
-            "verification_timestamp": (
-                datetime.now(timezone.utc) if image.signature_verified else None
-            ),
+            "signature_tool": None,
+            "key_id": None,
+            "verification_timestamp": None,
         }
 
     async def check_image_provenance(self, image: ContainerImage) -> Dict[str, Any]:

@@ -42,6 +42,19 @@ async def _org_user(db_session, *, email: str, org: str = ORG, role: str = "anal
     return user, {"Authorization": f"Bearer {create_access_token(subject=user.id)}"}
 
 
+async def _seed_ac3(db_session, org: str = ORG) -> ComplianceControl:
+    """AC-3 must exist in the tenant: evidence control references are validated now."""
+    framework = ComplianceFramework(name="NIST 800-53", short_name="nist_800_53", version="5", authority="NIST", organization_id=org)
+    db_session.add(framework)
+    await db_session.flush()
+    control = ComplianceControl(
+        framework_id=framework.id, control_id="AC-3", control_family="AC", title="Access Enforcement", organization_id=org,
+    )
+    db_session.add(control)
+    await db_session.commit()
+    return control
+
+
 def _row(file_path: Optional[str], org: str = ORG) -> ComplianceEvidence:
     return ComplianceEvidence(
         control_id_ref="AC-3",
@@ -56,6 +69,7 @@ def _row(file_path: Optional[str], org: str = ORG) -> ComplianceEvidence:
 @pytest.mark.asyncio
 async def test_local_paths_cannot_be_registered(client, db_session):
     _, headers = await _org_user(db_session, email="cev1@cev-org.io")
+    await _seed_ac3(db_session)
     for bad in ("/opt/pysoar/.env", r"C:\Windows\win.ini", "../../etc/passwd", "file:///etc/passwd", "http://evil.example/x"):
         resp = await client.post(
             "/api/v1/compliance/evidence",
@@ -72,6 +86,7 @@ async def test_local_paths_cannot_be_registered(client, db_session):
 @pytest.mark.asyncio
 async def test_object_urls_and_no_path_are_accepted(client, db_session):
     _, headers = await _org_user(db_session, email="cev2@cev-org.io")
+    await _seed_ac3(db_session)
     resp = await client.post(
         "/api/v1/compliance/evidence",
         headers=headers,

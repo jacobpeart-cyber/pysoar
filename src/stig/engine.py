@@ -21,6 +21,22 @@ from src.stig.models import STIGBenchmark, STIGRule, STIGScanResult, SCAPProfile
 logger = get_logger(__name__)
 
 
+class STIGNotFoundError(LookupError):
+    """A benchmark, rule, scan or profile does not exist in the caller's
+    organisation (another tenant's rows are reported the same way)."""
+
+
+class BenchmarkOwnershipConflict(ValueError):
+    """The XCCDF benchmark id is already registered by another organisation.
+
+    ``stig_benchmarks.benchmark_id`` is globally unique in the current
+    schema, so a second tenant cannot hold its own row for the same DISA
+    benchmark until that constraint becomes (organization_id, benchmark_id).
+    Before wave 1 the import silently re-used (and rewrote) the other
+    tenant's row.
+    """
+
+
 class STIGScanner:
     """
     STIG Benchmark Scanner
@@ -52,6 +68,7 @@ class STIGScanner:
         self,
         scan_id: str,
         arf_xml: bytes,
+        org_id: str,
     ) -> dict[str, Any]:
         """
         Parse an oscap-generated ARF (Asset Reporting Format) XML document
@@ -62,10 +79,14 @@ class STIGScanner:
         a <result> child holding pass / fail / notapplicable / etc. We
         translate those into finding statuses and recompute compliance.
         """
-        from src.stig.models import STIGRule, STIGScanResult
-        scan = await self.session.get(STIGScanResult, scan_id)
+        scan = await self.session.scalar(
+            select(STIGScanResult).where(
+                STIGScanResult.id == scan_id,
+                STIGScanResult.organization_id == org_id,
+            )
+        )
         if scan is None:
-            return {"status": "error", "error": f"Scan {scan_id} not found"}
+            raise STIGNotFoundError(f"Scan {scan_id} not found")
 
         try:
             root = ET.fromstring(arf_xml)
@@ -78,7 +99,10 @@ class STIGScanner:
         # Index rules for this benchmark by stig_id and rule_id so we can
         # resolve idrefs whether ARF uses the SV- or V- number.
         rules = list(await self.session.scalars(
-            select(STIGRule).where(STIGRule.benchmark_id_ref == scan.benchmark_id_ref)
+            select(STIGRule).where(
+                STIGRule.benchmark_id_ref == scan.benchmark_id_ref,
+                STIGRule.organization_id == org_id,
+            )
         ))
         by_stig_id = {r.stig_id: r for r in rules if r.stig_id}
         by_rule_id = {r.rule_id: r for r in rules if r.rule_id}
@@ -157,209 +181,120 @@ class STIGScanner:
         self,
         host: str,
         benchmark_id: str,
+        org_id: str,
         scan_type: str = "automated",
         target_ip: Optional[str] = None,
     ) -> dict[str, Any]:
         """
-        Scan single host against STIG benchmark
+        Register a STIG scan of ``host`` against one of the caller's benchmarks.
+
+        Federal-honesty policy: this in-process path does NOT touch the host
+        and executes no checks. Before 2026-10-08 it marked every rule
+        ``not_reviewed`` and then counted ``not_reviewed`` as compliant, so
+        every scan was stored as ``completed`` at 100%. It now stores the
+        scan as ``pending_results`` (0 checks executed, every rule
+        not reviewed, no compliance score claimed). Results arrive when the
+        endpoint agent runs oscap and the ARF is posted to
+        ``POST /stig/scans/{scan_id}/arf`` (or via the Celery
+        ``run_stig_scan`` agent path).
 
         Args:
             host: Hostname or target identifier
-            benchmark_id: STIG benchmark ID to scan against
+            benchmark_id: STIGBenchmark row id or XCCDF benchmark id
+            org_id: Caller's organisation; the benchmark must belong to it
             scan_type: "manual", "scap", "automated", "hybrid"
             target_ip: IP address of target (optional)
 
-        Returns:
-            Scan result with findings and compliance metrics
+        Raises:
+            STIGNotFoundError: the benchmark is not in ``org_id``.
         """
-        logger.info(f"Starting STIG scan on {host} for {benchmark_id}")
+        from sqlalchemy import func, or_
 
-        # Initialize so the except branch can safely reference it even
-        # if the benchmark lookup fails before scan_result is assigned.
-        scan_result = None
+        logger.info("stig_scan_registered", host=host, benchmark_id=benchmark_id, org_id=org_id)
 
-        try:
-            # Accept either the STIGBenchmark row UUID (what the UI
-            # holds after an upload) OR the XCCDF benchmark_id string
-            # (what the doc itself declares). Fail open on UUID lookup
-            # misses so the string match still has a chance.
-            from sqlalchemy import or_
-            stmt = select(STIGBenchmark).where(
+        # Accept either the STIGBenchmark row UUID (what the UI holds after
+        # an upload) or the XCCDF benchmark_id string, inside the tenant only.
+        benchmark = await self.session.scalar(
+            select(STIGBenchmark).where(
                 or_(
                     STIGBenchmark.id == benchmark_id,
                     STIGBenchmark.benchmark_id == benchmark_id,
+                ),
+                STIGBenchmark.organization_id == org_id,
+            )
+        )
+        if not benchmark:
+            raise STIGNotFoundError(f"Benchmark {benchmark_id} not found")
+
+        rule_count = int(
+            await self.session.scalar(
+                select(func.count(STIGRule.id)).where(
+                    STIGRule.benchmark_id_ref == benchmark.id,
+                    STIGRule.organization_id == org_id,
                 )
             )
-            benchmark = await self.session.scalar(stmt)
-            if not benchmark:
-                raise ValueError(f"Benchmark {benchmark_id} not found")
+            or 0
+        )
 
-            # Create scan result record
-            scan_result = STIGScanResult(
-                benchmark_id_ref=benchmark.id,
-                target_host=host,
-                target_ip=target_ip,
-                scan_type=scan_type,
-                status="running",
-                started_at=datetime.now(timezone.utc),
-                organization_id=benchmark.organization_id,
-            )
-            self.session.add(scan_result)
-            await self.session.flush()
+        scan_result = STIGScanResult(
+            benchmark_id_ref=benchmark.id,
+            target_host=host,
+            target_ip=target_ip,
+            scan_type=scan_type,
+            status="pending_results",
+            started_at=datetime.now(timezone.utc),
+            total_checks=rule_count,
+            open_findings=0,
+            not_a_finding=0,
+            not_applicable=0,
+            not_reviewed=rule_count,
+            compliance_percentage=0.0,
+            cat1_open=0,
+            cat2_open=0,
+            cat3_open=0,
+            findings={},
+            organization_id=org_id,
+        )
+        self.session.add(scan_result)
+        await self.session.commit()
+        await self.session.refresh(scan_result)
 
-            # Get all rules for benchmark
-            stmt = select(STIGRule).where(
-                STIGRule.benchmark_id_ref == benchmark.id
-            )
-            rules = list(await self.session.scalars(stmt))
-
-            # Execute checks
-            findings = {}
-            open_count = 0
-            naf_count = 0
-            na_count = 0
-            nr_count = 0
-            cat1_open = 0
-            cat2_open = 0
-            cat3_open = 0
-
-            for rule in rules:
-                result = await self._execute_check(rule, host, scan_type)
-                findings[rule.rule_id] = result
-
-                if result["status"] == "open":
-                    open_count += 1
-                    if rule.severity == "high":
-                        cat1_open += 1
-                    elif rule.severity == "medium":
-                        cat2_open += 1
-                    else:
-                        cat3_open += 1
-                elif result["status"] == "not_a_finding":
-                    naf_count += 1
-                elif result["status"] == "not_applicable":
-                    na_count += 1
-                else:
-                    nr_count += 1
-
-            # Calculate compliance percentage
-            reviewable = len(rules) - na_count
-            if reviewable > 0:
-                compliance_pct = ((naf_count + nr_count) / reviewable) * 100
-            else:
-                compliance_pct = 100.0
-
-            # Update scan result
-            stmt = (
-                update(STIGScanResult)
-                .where(STIGScanResult.id == scan_result.id)
-                .values(
-                    status="completed",
-                    completed_at=datetime.now(timezone.utc),
-                    total_checks=len(rules),
-                    open_findings=open_count,
-                    not_a_finding=naf_count,
-                    not_applicable=na_count,
-                    not_reviewed=nr_count,
-                    compliance_percentage=compliance_pct,
-                    cat1_open=cat1_open,
-                    cat2_open=cat2_open,
-                    cat3_open=cat3_open,
-                    findings=findings,
-                )
-            )
-            await self.session.execute(stmt)
-            await self.session.commit()
-
-            logger.info(
-                f"STIG scan completed for {host}: {compliance_pct:.1f}% compliant"
-            )
-            return {
-                "scan_id": scan_result.id,
-                "host": host,
-                "benchmark": benchmark_id,
-                "compliance_percentage": compliance_pct,
-                "total_checks": len(rules),
-                "open_findings": open_count,
-                "not_a_finding": naf_count,
-                "not_applicable": na_count,
-                "not_reviewed": nr_count,
-                "cat1_open": cat1_open,
-                "cat2_open": cat2_open,
-                "cat3_open": cat3_open,
-                "status": "completed",
-            }
-
-        except Exception as e:
-            logger.error(f"STIG scan failed for {host}: {str(e)}")
-            if scan_result:
-                stmt = (
-                    update(STIGScanResult)
-                    .where(STIGScanResult.id == scan_result.id)
-                    .values(status="failed")
-                )
-                await self.session.execute(stmt)
-                await self.session.commit()
-            raise
+        return {
+            "scan_id": scan_result.id,
+            "host": host,
+            "benchmark": benchmark_id,
+            "status": "pending_results",
+            "checks_executed": 0,
+            "total_checks": rule_count,
+            "not_reviewed": rule_count,
+            "compliance_percentage": None,
+            "note": (
+                "No checks were executed: the platform does not scan hosts "
+                "in-process. Run oscap on the host (or through an enrolled "
+                f"endpoint agent) and POST the ARF to /stig/scans/{scan_result.id}/arf "
+                "to record results."
+            ),
+        }
 
     async def scan_fleet(
         self,
         hosts: list[str],
         benchmark_id: str,
+        org_id: str,
         scan_type: str = "automated",
     ) -> list[dict[str, Any]]:
         """
-        Scan multiple hosts against STIG benchmark
-
-        Args:
-            hosts: List of hostnames/IPs to scan
-            benchmark_id: STIG benchmark ID
-            scan_type: Scan execution type
-
-        Returns:
-            List of scan results
+        Register STIG scans for several hosts (see ``scan_host``: each scan is
+        stored as ``pending_results``; nothing is executed in-process).
         """
         results = []
         for host in hosts:
-            result = await self.scan_host(host, benchmark_id, scan_type)
+            result = await self.scan_host(host, benchmark_id, org_id, scan_type)
             results.append(result)
         return results
 
-    async def _execute_check(
-        self, rule: STIGRule, host: str, scan_type: str
-    ) -> dict[str, Any]:
-        """
-        Execute a single STIG rule check.
-
-        Federal-honesty policy: this in-process scanner does NOT touch
-        remote hosts. Real scans are dispatched through
-        src.stig.tasks.run_stig_scan → endpoint agent → oscap, and the
-        results are ingested via POST /stig/scans/{id}/arf.
-
-        The synchronous path returns status="not_reviewed" for every
-        rule, so an auditor reading a scan result can tell the check
-        was not executed. Previously this code copied the last scan's
-        status and labelled it a fresh result — that was a lie; we've
-        removed it.
-        """
-        if scan_type in ("scap", "automated"):
-            evidence = (
-                f"Rule {rule.rule_id} requires live scanner execution. "
-                "Dispatch via Celery run_stig_scan with an enrolled endpoint "
-                "agent, then POST the ARF result to /stig/scans/{scan_id}/arf."
-            )
-        else:
-            evidence = f"Manual review required for rule {rule.rule_id} on {host}"
-
-        return {
-            "rule_id": rule.rule_id,
-            "status": "not_reviewed",
-            "evidence": evidence,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-
     async def get_scan_comparison(
-        self, scan_id_1: str, scan_id_2: str
+        self, scan_id_1: str, scan_id_2: str, org_id: str
     ) -> dict[str, Any]:
         """
         Compare two STIG scan results
@@ -371,14 +306,18 @@ class STIGScanner:
         Returns:
             Comparison showing improvements, regressions, and delta metrics
         """
-        stmt1 = select(STIGScanResult).where(STIGScanResult.id == scan_id_1)
+        stmt1 = select(STIGScanResult).where(
+            STIGScanResult.id == scan_id_1, STIGScanResult.organization_id == org_id
+        )
         scan1 = await self.session.scalar(stmt1)
 
-        stmt2 = select(STIGScanResult).where(STIGScanResult.id == scan_id_2)
+        stmt2 = select(STIGScanResult).where(
+            STIGScanResult.id == scan_id_2, STIGScanResult.organization_id == org_id
+        )
         scan2 = await self.session.scalar(stmt2)
 
         if not scan1 or not scan2:
-            raise ValueError("One or both scans not found")
+            raise STIGNotFoundError("One or both scans not found")
 
         # Calculate deltas
         compliance_delta = scan2.compliance_percentage - scan1.compliance_percentage
@@ -433,7 +372,7 @@ class STIGRemediator:
         self.session = session
 
     async def auto_remediate(
-        self, scan_result_id: str, categories: list[str] = None
+        self, scan_result_id: str, org_id: str, categories: Optional[list[str]] = None
     ) -> dict[str, Any]:
         """
         Auto-remediate STIG findings from scan result
@@ -451,14 +390,18 @@ class STIGRemediator:
         logger.info(f"Starting auto-remediation for scan {scan_result_id}")
 
         try:
-            stmt = select(STIGScanResult).where(STIGScanResult.id == scan_result_id)
+            stmt = select(STIGScanResult).where(
+                STIGScanResult.id == scan_result_id,
+                STIGScanResult.organization_id == org_id,
+            )
             scan = await self.session.scalar(stmt)
             if not scan:
-                raise ValueError(f"Scan {scan_result_id} not found")
+                raise STIGNotFoundError(f"Scan {scan_result_id} not found")
 
             # Get affected rules
             stmt = select(STIGRule).where(
                 (STIGRule.benchmark_id_ref == scan.benchmark_id_ref)
+                & (STIGRule.organization_id == org_id)
                 & (STIGRule.severity.in_(categories))
             )
             rules = await self.session.scalars(stmt)
@@ -475,7 +418,7 @@ class STIGRemediator:
             actions = []
 
             for rule in rules:
-                if rule.rule_id in scan.findings:
+                if rule.rule_id in (scan.findings or {}):
                     finding = scan.findings[rule.rule_id]
                     if finding.get("status") == "open":
                         result = await self._apply_fix(rule, scan.target_host)
@@ -496,7 +439,7 @@ class STIGRemediator:
             return {
                 "scan_id": scan_result_id,
                 "host": scan.target_host,
-                "total_findings": len(scan.findings),
+                "total_findings": len(scan.findings or {}),
                 # `remediated` kept for UI compatibility — represents
                 # rules whose fix_text was logged to the ticket activity
                 # and is ready for an orchestrator to dispatch.
@@ -518,7 +461,7 @@ class STIGRemediator:
             raise
 
     async def generate_remediation_script(
-        self, findings: dict[str, Any], platform: str
+        self, findings: dict[str, Any], platform: str, org_id: str
     ) -> str:
         """
         Generate platform-specific remediation script.
@@ -565,7 +508,9 @@ class STIGRemediator:
         # Load all rules in one query rather than N individual lookups
         rules_by_id: dict[str, STIGRule] = {}
         if rule_ids:
-            stmt = select(STIGRule).where(STIGRule.rule_id.in_(rule_ids))
+            stmt = select(STIGRule).where(
+                STIGRule.rule_id.in_(rule_ids), STIGRule.organization_id == org_id
+            )
             result = await self.session.scalars(stmt)
             for r in result:
                 rules_by_id[r.rule_id] = r
@@ -881,14 +826,17 @@ class STIGLibrary:
         logger.info(f"Loading rules for benchmark {benchmark_id}")
 
         stmt = select(STIGBenchmark).where(
-            STIGBenchmark.benchmark_id == benchmark_id
+            STIGBenchmark.benchmark_id == benchmark_id,
+            STIGBenchmark.organization_id == org_id,
         )
         benchmark = await self.session.scalar(stmt)
 
         if not benchmark:
-            raise ValueError(f"Benchmark {benchmark_id} not found")
+            raise STIGNotFoundError(f"Benchmark {benchmark_id} not found")
 
-        rule_stmt = select(STIGRule).where(STIGRule.benchmark_id_ref == benchmark.id)
+        rule_stmt = select(STIGRule).where(
+            STIGRule.benchmark_id_ref == benchmark.id, STIGRule.organization_id == org_id
+        )
         rules = list(await self.session.scalars(rule_stmt))
         count = len(rules)
 
@@ -947,7 +895,7 @@ class SCAPEngine:
         """Initialize SCAP engine with database session"""
         self.session = session
 
-    async def run_scap_scan(self, profile_id: str, target: str) -> dict[str, Any]:
+    async def run_scap_scan(self, profile_id: str, target: str, org_id: str) -> dict[str, Any]:
         """
         Run SCAP scan using a stored profile.
 
@@ -959,11 +907,13 @@ class SCAPEngine:
         logger.info(f"Running SCAP scan on {target} with profile {profile_id}")
 
         try:
-            stmt = select(SCAPProfile).where(SCAPProfile.id == profile_id)
+            stmt = select(SCAPProfile).where(
+                SCAPProfile.id == profile_id, SCAPProfile.organization_id == org_id
+            )
             profile = await self.session.scalar(stmt)
 
             if not profile:
-                raise ValueError(f"Profile {profile_id} not found")
+                raise STIGNotFoundError(f"Profile {profile_id} not found")
 
             # Locate the STIG benchmark this profile is associated with (by
             # matching the profile's organization_id and platform_applicable).
@@ -975,7 +925,9 @@ class SCAPEngine:
             rules: list[STIGRule] = []
             matched_benchmark: Optional[STIGBenchmark] = None
             for bench in benchmarks:
-                rule_stmt = select(STIGRule).where(STIGRule.benchmark_id_ref == bench.id)
+                rule_stmt = select(STIGRule).where(
+                    STIGRule.benchmark_id_ref == bench.id, STIGRule.organization_id == org_id
+                )
                 bench_rules = list(await self.session.scalars(rule_stmt))
                 if bench_rules:
                     matched_benchmark = bench
@@ -1033,7 +985,8 @@ class SCAPEngine:
                 "checks_failed": failed,
                 "checks_notapplicable": not_applicable,
                 "checks_notchecked": not_checked,
-                "status": "completed",
+                # Not "completed": nothing ran against the target (2026-10-08 audit).
+                "status": "not_executed",
                 "note": (
                     "Metrics are derived from imported STIGRule default_status "
                     "fields, not from a live oscap execution."
@@ -1213,6 +1166,11 @@ class SCAPEngine:
         existing = (await self.session.execute(
             sa_select(STIGBenchmark).where(STIGBenchmark.benchmark_id == benchmark_id)
         )).scalar_one_or_none()
+        if existing is not None and existing.organization_id != org_id:
+            # Never rewrite another tenant's benchmark row (pre-wave-1 did).
+            raise BenchmarkOwnershipConflict(
+                f"Benchmark id {benchmark_id!r} is already registered on this platform"
+            )
 
         if existing is not None:
             benchmark = existing
@@ -1392,7 +1350,7 @@ class SCAPEngine:
                 "timestamp": datetime.now(timezone.utc).isoformat(),
             }
 
-    async def generate_arf_report(self, scan_id: str) -> dict[str, Any]:
+    async def generate_arf_report(self, scan_id: str, org_id: str) -> dict[str, Any]:
         """
         Generate Assessment Results Format (ARF) report
 
@@ -1405,11 +1363,13 @@ class SCAPEngine:
         logger.info(f"Generating ARF report for scan {scan_id}")
 
         try:
-            stmt = select(STIGScanResult).where(STIGScanResult.id == scan_id)
+            stmt = select(STIGScanResult).where(
+                STIGScanResult.id == scan_id, STIGScanResult.organization_id == org_id
+            )
             scan = await self.session.scalar(stmt)
 
             if not scan:
-                raise ValueError(f"Scan {scan_id} not found")
+                raise STIGNotFoundError(f"Scan {scan_id} not found")
 
             report = {
                 "scan_id": scan_id,

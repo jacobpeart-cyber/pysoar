@@ -27,6 +27,14 @@ class FedRAMPGenerator:
         "not_applicable",
     ]
 
+    #: Status reported for a baseline control the tenant has no
+    #: ``compliance_controls`` row for. It used to be reported as "planned",
+    #: which claimed a plan nobody recorded.
+    NOT_ASSESSED = "not_assessed"
+
+    #: Stored statuses that count as a gap in the readiness report.
+    GAP_STATUSES = ("planned", "partially_implemented", "not_implemented", "non_compliant")
+
     # ------------------------------------------------------------------ SSP
     def generate_ssp(
         self,
@@ -67,7 +75,7 @@ class FedRAMPGenerator:
                         "title": c.get("title", ""),
                         "description": c.get("description", ""),
                         "implementation_status": c.get(
-                            "implementation_status", "planned"
+                            "implementation_status", self.NOT_ASSESSED
                         ),
                         "pysoar_mapping": c.get("pysoar_mapping", ""),
                         "implementation_narrative": c.get(
@@ -236,7 +244,7 @@ class FedRAMPGenerator:
         Args:
             controls_data: List of control dicts, each optionally containing
                 an ``implementation_status`` key.  Defaults to the full
-                moderate baseline (all treated as *planned*).
+                moderate baseline (all reported as *not_assessed*).
 
         Returns:
             Dict with readiness score, per-family breakdown, gap analysis,
@@ -247,12 +255,13 @@ class FedRAMPGenerator:
 
         total = len(controls_data)
         status_counts: Dict[str, int] = {s: 0 for s in self.IMPLEMENTATION_STATUSES}
+        status_counts[self.NOT_ASSESSED] = 0
 
         family_stats: Dict[str, Dict[str, Any]] = {}
         gaps: List[Dict[str, str]] = []
 
         for ctrl in controls_data:
-            st = ctrl.get("implementation_status", "planned")
+            st = ctrl.get("implementation_status", self.NOT_ASSESSED)
             status_counts[st] = status_counts.get(st, 0) + 1
 
             fam = ctrl.get("family", "Unknown")
@@ -262,7 +271,7 @@ class FedRAMPGenerator:
 
             if st == "implemented":
                 family_stats[fam]["implemented"] += 1
-            elif st in ("planned", "partially_implemented"):
+            elif st in self.GAP_STATUSES:
                 gap_entry = {
                     "control_id": ctrl["id"],
                     "title": ctrl.get("title", ""),
@@ -291,6 +300,14 @@ class FedRAMPGenerator:
                 round((stats["implemented"] / t) * 100, 2) if t else 0.0
             )
 
+        not_assessed = status_counts.get(self.NOT_ASSESSED, 0)
+        if total and not_assessed == total:
+            assessment_status = "not_assessed"
+        elif not_assessed:
+            assessment_status = "partially_assessed"
+        else:
+            assessment_status = "assessed"
+
         # Sort gaps by priority (P1 first)
         priority_order = {"P1": 0, "P2": 1, "P3": 2}
         gaps.sort(key=lambda g: priority_order.get(g.get("priority", "P3"), 3))
@@ -299,6 +316,13 @@ class FedRAMPGenerator:
             "report_title": "FedRAMP Moderate Readiness Assessment",
             "generated_at": datetime.utcnow().isoformat() + "Z",
             "overall_readiness_score": readiness_score,
+            "assessment_status": assessment_status,
+            "not_assessed_controls": not_assessed,
+            "assessment_basis": (
+                "Computed from this organization's FedRAMP control records "
+                "(compliance_controls). Baseline controls without a record are "
+                "reported as not_assessed and count as not implemented in the score."
+            ),
             "total_controls": total,
             "status_breakdown": status_counts,
             "family_readiness": family_stats,
@@ -309,6 +333,9 @@ class FedRAMPGenerator:
                 "p3_gaps": sum(1 for g in gaps if g["priority"] == "P3"),
                 "gaps": gaps,
             },
+            # Generic preparation checklist, identical for every tenant; it is
+            # not derived from the gaps above and is labelled as such.
+            "recommendations_basis": "generic_checklist",
             "recommendations": [
                 {
                     "priority": "Critical",
@@ -439,57 +466,105 @@ class FedRAMPGenerator:
 
         Args:
             db: An async SQLAlchemy session.
-            organization_id: Tenant id. Queries filter by this when provided.
+            organization_id: Tenant id. Every query filters by it.
 
         Returns:
             List of control dicts enriched with their persisted
             implementation status and evidence references.
         """
-        persisted: Dict[str, Dict[str, Any]] = {}
-        try:
-            from src.compliance.models import ComplianceControl  # noqa: F811
-            from sqlalchemy import select as sa_select
+        from sqlalchemy import select as sa_select
 
-            stmt = sa_select(ComplianceControl).where(
-                ComplianceControl.framework == "FedRAMP"
-            )
-            if organization_id is not None and hasattr(
-                ComplianceControl, "organization_id"
-            ):
-                stmt = stmt.where(
-                    ComplianceControl.organization_id == organization_id
+        from src.compliance.engine import FEDRAMP_SHORT_NAME_PREFIX
+        from src.compliance.models import (
+            ComplianceControl,
+            ComplianceEvidence,
+            ComplianceFramework,
+        )
+
+        # ComplianceControl has no ``framework`` column: controls belong to a
+        # framework through framework_id. Seeded FedRAMP frameworks are named
+        # fedramp_moderate (fedramp_low/high possible), so match the prefix and
+        # prefer the Moderate framework when a tenant has several.
+        rows = (
+            await db.execute(
+                sa_select(ComplianceControl, ComplianceFramework.short_name)
+                .join(
+                    ComplianceFramework,
+                    ComplianceControl.framework_id == ComplianceFramework.id,
                 )
-
-            result = await db.scalars(stmt)
-            rows = result.all()
-
-            for row in rows:
-                persisted[row.control_id] = {
-                    "implementation_status": getattr(row, "status", "planned"),
-                    "evidence_artifacts": getattr(row, "evidence_artifacts", []),
-                    "last_assessed": str(getattr(row, "last_assessed", "")),
-                    "assessor_notes": getattr(row, "assessor_notes", ""),
-                }
-        except Exception as exc:
-            # Fall back to empty mapping — log so the failure isn't silent
-            import logging
-            logging.getLogger(__name__).warning(
-                f"FedRAMP generator DB query failed: {exc}"
+                .where(
+                    ComplianceFramework.organization_id == organization_id,
+                    ComplianceControl.organization_id == organization_id,
+                    ComplianceFramework.short_name.like(f"{FEDRAMP_SHORT_NAME_PREFIX}%"),
+                )
             )
-            persisted = {}
+        ).all()
+
+        chosen: Dict[str, Any] = {}
+        chosen_framework: Dict[str, str] = {}
+        for control_row, short_name in rows:
+            current = chosen_framework.get(control_row.control_id)
+            if current is None or (
+                short_name == "fedramp_moderate" and current != "fedramp_moderate"
+            ):
+                chosen[control_row.control_id] = control_row
+                chosen_framework[control_row.control_id] = short_name
+
+        # Evidence: rows in compliance_evidence for these controls (tenant
+        # scoped), plus any ids recorded on the control itself.
+        evidence_by_control: Dict[str, List[Dict[str, Any]]] = {}
+        control_pks = [c.id for c in chosen.values()]
+        if control_pks:
+            evidence_rows = (
+                await db.execute(
+                    sa_select(ComplianceEvidence).where(
+                        ComplianceEvidence.organization_id == organization_id,
+                        ComplianceEvidence.control_id_ref.in_(control_pks),
+                        ComplianceEvidence.is_valid.is_(True),
+                    )
+                )
+            ).scalars().all()
+            for ev in evidence_rows:
+                evidence_by_control.setdefault(ev.control_id_ref, []).append({
+                    "id": ev.id,
+                    "title": ev.title,
+                    "evidence_type": ev.evidence_type,
+                    "review_status": ev.review_status,
+                    "collected_at": ev.collected_at.isoformat() if ev.collected_at else None,
+                })
+
+        persisted: Dict[str, Dict[str, Any]] = {}
+        for code, row in chosen.items():
+            artifacts = list(evidence_by_control.get(row.id, []))
+            known = {a["id"] for a in artifacts}
+            artifacts.extend(
+                {"id": ev_id} for ev_id in (row.evidence_ids or []) if ev_id not in known
+            )
+            record: Dict[str, Any] = {
+                "implementation_status": row.status or self.NOT_ASSESSED,
+                "evidence_artifacts": artifacts,
+                "last_assessed": row.last_assessed_at.isoformat() if row.last_assessed_at else "",
+                # No assessor-notes column exists; the key is kept for the
+                # response shape and is always empty.
+                "assessor_notes": "",
+                "control_record_id": row.id,
+            }
+            if row.implementation_details:
+                record["implementation_narrative"] = row.implementation_details
+            persisted[code] = record
 
         enriched: List[Dict[str, Any]] = []
         for ctrl in FEDRAMP_MODERATE_CONTROLS:
             entry = dict(ctrl)
-            db_record = persisted.get(ctrl["id"], {})
-            entry["implementation_status"] = db_record.get(
-                "implementation_status", "planned"
-            )
-            entry["evidence_artifacts"] = db_record.get(
-                "evidence_artifacts", []
-            )
-            entry["last_assessed"] = db_record.get("last_assessed", "")
-            entry["assessor_notes"] = db_record.get("assessor_notes", "")
+            db_record = persisted.get(ctrl["id"])
+            if db_record is None:
+                entry["implementation_status"] = self.NOT_ASSESSED
+                entry["evidence_artifacts"] = []
+                entry["last_assessed"] = ""
+                entry["assessor_notes"] = ""
+                entry["control_record_id"] = None
+            else:
+                entry.update(db_record)
             enriched.append(entry)
 
         return enriched
@@ -508,7 +583,7 @@ class FedRAMPGenerator:
                 "title": c.get("title", ""),
                 "description": c.get("description", ""),
                 "family": c.get("family", ""),
-                "implementation_status": c.get("implementation_status", "planned"),
+                "implementation_status": c.get("implementation_status", self.NOT_ASSESSED),
                 "pysoar_mapping": c.get("pysoar_mapping", ""),
                 "responsible_role": c.get("responsible_role", "System Administrator"),
                 "evidence_artifacts": c.get("evidence_artifacts", []),

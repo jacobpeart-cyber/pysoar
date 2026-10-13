@@ -3,13 +3,14 @@
 import json
 import math
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Annotated, Optional
 
-from fastapi import APIRouter, Body, Path, HTTPException, Query, status
+from fastapi import Depends, APIRouter, Body, Path, HTTPException, Query, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import CurrentUser, DatabaseSession
+from src.api.deps import CurrentUser, DatabaseSession, OrganizationId, require_role
+from src.models.user import User, UserRole
 from src.core.logging import get_logger
 from src.models.organization import Organization
 from src.services.automation import AutomationService
@@ -71,6 +72,11 @@ from src.schemas.threat_modeling import (
 
 router = APIRouter(prefix="/threat-modeling", tags=["Threat Modeling"])
 
+# Wave 1 role gates: viewers read only; analysts for operational writes;
+# admins for configuration and actions against live systems.
+AnalystUser = Annotated[User, Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
+AdminRoleUser = Annotated[User, Depends(require_role([UserRole.ADMIN]))]
+
 
 async def get_threat_model_or_404(
     model_id: str,
@@ -97,14 +103,16 @@ async def get_component_or_404(
     component_id: str,
     org_id: str,
     db: AsyncSession,
+    model_id: Optional[str] = None,
 ) -> ThreatModelComponent:
-    """Get component or raise 404"""
-    result = await db.execute(
-        select(ThreatModelComponent).where(
-            (ThreatModelComponent.id == component_id)
-            & (ThreatModelComponent.organization_id == org_id)
-        )
+    """Get a component in ``org_id`` (and in ``model_id`` when given) or 404"""
+    query = select(ThreatModelComponent).where(
+        (ThreatModelComponent.id == component_id)
+        & (ThreatModelComponent.organization_id == org_id)
     )
+    if model_id is not None:
+        query = query.where(ThreatModelComponent.model_id == model_id)
+    result = await db.execute(query)
     component = result.scalar_one_or_none()
     if not component:
         raise HTTPException(
@@ -118,14 +126,16 @@ async def get_threat_or_404(
     threat_id: str,
     org_id: str,
     db: AsyncSession,
+    model_id: Optional[str] = None,
 ) -> IdentifiedThreat:
-    """Get threat or raise 404"""
-    result = await db.execute(
-        select(IdentifiedThreat).where(
-            (IdentifiedThreat.id == threat_id)
-            & (IdentifiedThreat.organization_id == org_id)
-        )
+    """Get a threat in ``org_id`` (and in ``model_id`` when given) or 404"""
+    query = select(IdentifiedThreat).where(
+        (IdentifiedThreat.id == threat_id)
+        & (IdentifiedThreat.organization_id == org_id)
     )
+    if model_id is not None:
+        query = query.where(IdentifiedThreat.model_id == model_id)
+    result = await db.execute(query)
     threat = result.scalar_one_or_none()
     if not threat:
         raise HTTPException(
@@ -140,12 +150,13 @@ async def get_threat_or_404(
 @router.post("", response_model=ThreatModelResponse, status_code=status.HTTP_201_CREATED)
 async def create_threat_model(
     data: ThreatModelCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    current_user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Create new threat model"""
     model = ThreatModel(
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         name=data.name,
         description=data.description,
         application_name=data.application_name,
@@ -164,7 +175,7 @@ async def create_threat_model(
 
 @router.get("", response_model=ThreatModelListResponse)
 async def list_threat_models(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -176,7 +187,7 @@ async def list_threat_models(
 ):
     """List threat models with filtering and pagination"""
     query = select(ThreatModel).where(
-        ThreatModel.organization_id == getattr(current_user, "organization_id", None)
+        ThreatModel.organization_id == org_id
     )
 
     if search:
@@ -223,7 +234,7 @@ async def list_threat_models(
 
 @router.get("/models", response_model=ThreatModelListResponse)
 async def list_threat_models_alias(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -232,7 +243,7 @@ async def list_threat_models_alias(
     `/threat-modeling/models`. Must be declared before `/{model_id}` so
     FastAPI doesn't treat the literal string "models" as a UUID."""
     return await list_threat_models(
-        current_user=current_user, db=db, page=page, size=size,
+        org_id=org_id, db=db, page=page, size=size,
         search=None, status=None, methodology=None,
         sort_by="created_at", sort_order="desc",
     )
@@ -240,24 +251,25 @@ async def list_threat_models_alias(
 
 @router.get("/{model_id}", response_model=ThreatModelResponse)
 async def get_threat_model(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     model_id: str = Path(...),
 ):
     """Get threat model by ID"""
-    model = await get_threat_model_or_404(model_id, getattr(current_user, "organization_id", None), db)
+    model = await get_threat_model_or_404(model_id, org_id, db)
     return model
 
 
 @router.put("/{model_id}", response_model=ThreatModelResponse)
 async def update_threat_model(
     data: ThreatModelUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
     model_id: str = Path(...),
 ):
     """Update threat model"""
-    model = await get_threat_model_or_404(model_id, getattr(current_user, "organization_id", None), db)
+    model = await get_threat_model_or_404(model_id, org_id, db)
 
     for key, value in data.dict(exclude_unset=True).items():
         setattr(model, key, value)
@@ -269,12 +281,13 @@ async def update_threat_model(
 
 @router.delete("/{model_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_threat_model(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
     model_id: str = Path(...),
 ):
     """Delete threat model"""
-    model = await get_threat_model_or_404(model_id, getattr(current_user, "organization_id", None), db)
+    model = await get_threat_model_or_404(model_id, org_id, db)
     await db.delete(model)
     await db.commit()
 
@@ -284,15 +297,16 @@ async def delete_threat_model(
 @router.post("/{model_id}/components", response_model=ComponentResponse)
 async def create_component(
     data: ComponentCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
     model_id: str = Path(...),
 ):
     """Create component in threat model"""
-    model = await get_threat_model_or_404(model_id, getattr(current_user, "organization_id", None), db)
+    model = await get_threat_model_or_404(model_id, org_id, db)
 
     component = ThreatModelComponent(
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         model_id=model_id,
         component_type=data.component_type,
         name=data.name,
@@ -311,16 +325,17 @@ async def create_component(
 
 @router.get("/{model_id}/components", response_model=list[ComponentResponse])
 async def list_components(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     model_id: str = Path(...),
 ):
     """List components in threat model"""
-    model = await get_threat_model_or_404(model_id, getattr(current_user, "organization_id", None), db)
+    model = await get_threat_model_or_404(model_id, org_id, db)
 
     result = await db.execute(
         select(ThreatModelComponent).where(
-            ThreatModelComponent.model_id == model_id
+            ThreatModelComponent.model_id == model_id,
+            ThreatModelComponent.organization_id == org_id,
         )
     )
     return result.scalars().all()
@@ -329,13 +344,14 @@ async def list_components(
 @router.put("/{model_id}/components/{component_id}", response_model=ComponentResponse)
 async def update_component(
     data: ComponentUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
     model_id: str = Path(...),
     component_id: str = Path(...),
 ):
     """Update component"""
-    component = await get_component_or_404(component_id, getattr(current_user, "organization_id", None), db)
+    component = await get_component_or_404(component_id, org_id, db, model_id)
 
     for key, value in data.dict(exclude_unset=True).items():
         setattr(component, key, value)
@@ -347,13 +363,14 @@ async def update_component(
 
 @router.delete("/{model_id}/components/{component_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_component(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
     model_id: str = Path(...),
     component_id: str = Path(...),
 ):
     """Delete component"""
-    component = await get_component_or_404(component_id, getattr(current_user, "organization_id", None), db)
+    component = await get_component_or_404(component_id, org_id, db, model_id)
     await db.delete(component)
     await db.commit()
 
@@ -363,19 +380,22 @@ async def delete_component(
 @router.post("/{model_id}/threats", response_model=ThreatResponse)
 async def create_threat(
     data: ThreatCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
     model_id: str = Path(...),
 ):
     """Create identified threat"""
-    model = await get_threat_model_or_404(model_id, getattr(current_user, "organization_id", None), db)
+    model = await get_threat_model_or_404(model_id, org_id, db)
+    if data.component_id:
+        await get_component_or_404(data.component_id, org_id, db, model_id)
 
     # Calculate risk score
     analyzer = STRIDEAnalyzer()
     risk_score = analyzer.calculate_risk_score(data.likelihood, data.impact)
 
     threat = IdentifiedThreat(
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         model_id=model_id,
         component_id=data.component_id,
         stride_category=data.stride_category,
@@ -401,7 +421,6 @@ async def create_threat(
     await db.commit()
 
     try:
-        org_id = getattr(current_user, "organization_id", None)
         risk_level = "high" if (threat.risk_score or 0) > 15 else ("medium" if (threat.risk_score or 0) > 8 else "low")
         automation = AutomationService(db)
         await automation.on_threat_model_risk(
@@ -419,7 +438,7 @@ async def create_threat(
 
 @router.get("/{model_id}/threats", response_model=ThreatListResponse)
 async def list_threats(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     model_id: str = Path(...),
     page: int = Query(1, ge=1),
@@ -431,10 +450,11 @@ async def list_threats(
     sort_order: str = "desc",
 ):
     """List threats in model"""
-    model = await get_threat_model_or_404(model_id, getattr(current_user, "organization_id", None), db)
+    model = await get_threat_model_or_404(model_id, org_id, db)
 
     query = select(IdentifiedThreat).where(
-        IdentifiedThreat.model_id == model_id
+        IdentifiedThreat.model_id == model_id,
+        IdentifiedThreat.organization_id == org_id,
     )
 
     if stride_category:
@@ -474,26 +494,27 @@ async def list_threats(
 
 @router.get("/{model_id}/threats/{threat_id}", response_model=ThreatResponse)
 async def get_threat(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     model_id: str = Path(...),
     threat_id: str = Path(...),
 ):
     """Get threat by ID"""
-    threat = await get_threat_or_404(threat_id, getattr(current_user, "organization_id", None), db)
+    threat = await get_threat_or_404(threat_id, org_id, db, model_id)
     return threat
 
 
 @router.put("/{model_id}/threats/{threat_id}", response_model=ThreatResponse)
 async def update_threat(
     data: ThreatUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
     model_id: str = Path(...),
     threat_id: str = Path(...),
 ):
     """Update threat"""
-    threat = await get_threat_or_404(threat_id, getattr(current_user, "organization_id", None), db)
+    threat = await get_threat_or_404(threat_id, org_id, db, model_id)
 
     for key, value in data.dict(exclude_unset=True).items():
         setattr(threat, key, value)
@@ -513,18 +534,19 @@ async def update_threat(
 
 @router.delete("/{model_id}/threats/{threat_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_threat(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
     model_id: str = Path(...),
     threat_id: str = Path(...),
 ):
     """Delete threat"""
-    threat = await get_threat_or_404(threat_id, getattr(current_user, "organization_id", None), db)
+    threat = await get_threat_or_404(threat_id, org_id, db, model_id)
     await db.delete(threat)
     await db.commit()
 
     # Update model threat count
-    model = await get_threat_model_or_404(model_id, getattr(current_user, "organization_id", None), db)
+    model = await get_threat_model_or_404(model_id, org_id, db)
     model.threats_count = max(0, (model.threats_count or 0) - 1)
     await db.commit()
 
@@ -534,16 +556,17 @@ async def delete_threat(
 @router.post("/{model_id}/threats/{threat_id}/mitigations", response_model=MitigationResponse)
 async def create_mitigation(
     data: MitigationCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
     model_id: str = Path(...),
     threat_id: str = Path(...),
 ):
     """Create mitigation for threat"""
-    threat = await get_threat_or_404(threat_id, getattr(current_user, "organization_id", None), db)
+    threat = await get_threat_or_404(threat_id, org_id, db, model_id)
 
     mitigation = ThreatMitigation(
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         threat_id=threat_id,
         mitigation_type=data.mitigation_type,
         title=data.title,
@@ -561,7 +584,7 @@ async def create_mitigation(
     await db.refresh(mitigation)
 
     # Update model mitigation count
-    model = await get_threat_model_or_404(model_id, getattr(current_user, "organization_id", None), db)
+    model = await get_threat_model_or_404(model_id, org_id, db)
     model.mitigations_count = (model.mitigations_count or 0) + 1
     await db.commit()
 
@@ -570,7 +593,7 @@ async def create_mitigation(
 
 @router.get("/{model_id}/threats/{threat_id}/mitigations", response_model=MitigationListResponse)
 async def list_mitigations(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     model_id: str = Path(...),
     threat_id: str = Path(...),
@@ -578,10 +601,11 @@ async def list_mitigations(
     size: int = Query(20, ge=1, le=100),
 ):
     """List mitigations for threat"""
-    threat = await get_threat_or_404(threat_id, getattr(current_user, "organization_id", None), db)
+    threat = await get_threat_or_404(threat_id, org_id, db, model_id)
 
     query = select(ThreatMitigation).where(
-        ThreatMitigation.threat_id == threat_id
+        ThreatMitigation.threat_id == threat_id,
+        ThreatMitigation.organization_id == org_id,
     )
 
     count_result = await db.execute(
@@ -609,17 +633,20 @@ async def list_mitigations(
 @router.put("/{model_id}/threats/{threat_id}/mitigations/{mitigation_id}", response_model=MitigationResponse)
 async def update_mitigation(
     data: MitigationUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
     model_id: str = Path(...),
     threat_id: str = Path(...),
     mitigation_id: str = Path(...),
 ):
     """Update mitigation"""
+    await get_threat_or_404(threat_id, org_id, db, model_id)
     result = await db.execute(
         select(ThreatMitigation).where(
             (ThreatMitigation.id == mitigation_id)
-            & (ThreatMitigation.organization_id == getattr(current_user, "organization_id", None))
+            & (ThreatMitigation.threat_id == threat_id)
+            & (ThreatMitigation.organization_id == org_id)
         )
     )
     mitigation = result.scalar_one_or_none()
@@ -641,18 +668,20 @@ async def update_mitigation(
 
 @router.post("/{model_id}/analyze/stride", response_model=STRIDEAnalysisResponse)
 async def run_stride_analysis(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
     model_id: str = Path(...),
     request: STRIDEAnalysisRequest = Body(default_factory=STRIDEAnalysisRequest),
 ):
     """Run STRIDE analysis on threat model"""
-    model = await get_threat_model_or_404(model_id, getattr(current_user, "organization_id", None), db)
+    model = await get_threat_model_or_404(model_id, org_id, db)
 
     analyzer = STRIDEAnalyzer()
     components_result = await db.execute(
         select(ThreatModelComponent).where(
-            ThreatModelComponent.model_id == model_id
+            ThreatModelComponent.model_id == model_id,
+            ThreatModelComponent.organization_id == org_id,
         )
     )
     components = components_result.scalars().all()
@@ -667,7 +696,7 @@ async def run_stride_analysis(
                 threat_data["likelihood"], threat_data["impact"]
             )
             threat_record = IdentifiedThreat(
-                organization_id=getattr(current_user, "organization_id", None),
+                organization_id=org_id,
                 model_id=model_id,
                 component_id=threat_data.get("component_id"),
                 stride_category=threat_data.get("category"),
@@ -702,25 +731,28 @@ async def run_stride_analysis(
 
 @router.post("/{model_id}/analyze/pasta", response_model=PASTAAnalysisResponse)
 async def run_pasta_analysis(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
     model_id: str = Path(...),
     request: PASTAAnalysisRequest = Body(default_factory=PASTAAnalysisRequest),
 ):
     """Run PASTA analysis on threat model"""
-    model = await get_threat_model_or_404(model_id, getattr(current_user, "organization_id", None), db)
+    model = await get_threat_model_or_404(model_id, org_id, db)
 
     pasta = PASTAEngine()
     components_result = await db.execute(
         select(ThreatModelComponent).where(
-            ThreatModelComponent.model_id == model_id
+            ThreatModelComponent.model_id == model_id,
+            ThreatModelComponent.organization_id == org_id,
         )
     )
     components = components_result.scalars().all()
 
     threats_result = await db.execute(
         select(IdentifiedThreat).where(
-            IdentifiedThreat.model_id == model_id
+            IdentifiedThreat.model_id == model_id,
+            IdentifiedThreat.organization_id == org_id,
         )
     )
     threats = threats_result.scalars().all()
@@ -743,24 +775,27 @@ async def run_pasta_analysis(
 
 @router.post("/{model_id}/validate", response_model=ValidationResponse)
 async def validate_model(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
     model_id: str = Path(...),
     request: ValidationRequest = Body(default_factory=ValidationRequest),
 ):
     """Validate threat model completeness"""
-    model = await get_threat_model_or_404(model_id, getattr(current_user, "organization_id", None), db)
+    model = await get_threat_model_or_404(model_id, org_id, db)
 
     components_result = await db.execute(
         select(ThreatModelComponent).where(
-            ThreatModelComponent.model_id == model_id
+            ThreatModelComponent.model_id == model_id,
+            ThreatModelComponent.organization_id == org_id,
         )
     )
     components = components_result.scalars().all()
 
     threats_result = await db.execute(
         select(IdentifiedThreat).where(
-            IdentifiedThreat.model_id == model_id
+            IdentifiedThreat.model_id == model_id,
+            IdentifiedThreat.organization_id == org_id,
         )
     )
     threats = threats_result.scalars().all()
@@ -782,13 +817,13 @@ async def validate_model(
 
 @router.get("/{model_id}/mitigations/recommendations/{threat_id}", response_model=RecommendationResponse)
 async def get_mitigation_recommendations(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     model_id: str = Path(...),
     threat_id: str = Path(...),
 ):
     """Get recommended mitigations for threat"""
-    threat = await get_threat_or_404(threat_id, getattr(current_user, "organization_id", None), db)
+    threat = await get_threat_or_404(threat_id, org_id, db, model_id)
 
     recommender = MitigationRecommender()
     recommendations = recommender.recommend_mitigations(threat)
@@ -808,23 +843,25 @@ async def get_mitigation_recommendations(
 
 @router.get("/{model_id}/dashboard", response_model=ThreatModelDashboard)
 async def get_dashboard(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     model_id: str = Path(...),
 ):
     """Get threat modeling dashboard data"""
-    model = await get_threat_model_or_404(model_id, getattr(current_user, "organization_id", None), db)
+    model = await get_threat_model_or_404(model_id, org_id, db)
 
     threats_result = await db.execute(
         select(IdentifiedThreat).where(
-            IdentifiedThreat.model_id == model_id
+            IdentifiedThreat.model_id == model_id,
+            IdentifiedThreat.organization_id == org_id,
         )
     )
     threats = threats_result.scalars().all()
 
     mitigations_result = await db.execute(
         select(ThreatMitigation).where(
-            ThreatMitigation.threat_id.in_([t.id for t in threats])
+            ThreatMitigation.threat_id.in_([t.id for t in threats]),
+            ThreatMitigation.organization_id == org_id,
         )
     )
     mitigations = mitigations_result.scalars().all()

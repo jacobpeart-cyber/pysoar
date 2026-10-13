@@ -3,13 +3,15 @@
 import math
 import uuid
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Annotated, Optional
 
-from fastapi import APIRouter, HTTPException, Query, status, UploadFile, File
+from fastapi import Depends, APIRouter, HTTPException, Query, status
 from sqlalchemy import select, func, and_, or_, desc
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import CurrentUser, DatabaseSession, get_current_active_user, get_db
+from src.api.deps import DatabaseSession, OrganizationId, require_role
+from src.core.logging import get_logger
+from src.models.user import User, UserRole
 from src.exposure.models import (
     ExposureAsset,
     ExposureVulnerability as Vulnerability,
@@ -67,7 +69,14 @@ from src.schemas.exposure import (
     ScannerImportResult,
 )
 
+logger = get_logger(__name__)
+
 router = APIRouter(prefix="/exposure", tags=["Exposure Management"])
+
+# Wave 1 role gates: viewers read only; analysts for operational writes;
+# admins for configuration and actions against live systems.
+AnalystUser = Annotated[User, Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
+AdminRoleUser = Annotated[User, Depends(require_role([UserRole.ADMIN]))]
 
 
 # ============================================================================
@@ -189,6 +198,24 @@ async def get_attack_surface_or_404(db: AsyncSession, surface_id: str, organizat
     return surface
 
 
+async def _require_ids_in_org(
+    db: AsyncSession, model: type, ids: list[str], organization_id: str, field: str,
+) -> None:
+    """422 naming ``field`` unless every id in ``ids`` is a row of ``model`` in the org."""
+    wanted = set(ids or [])
+    if not wanted:
+        return
+    found = await db.execute(
+        select(model.id).where(model.id.in_(wanted), model.organization_id == organization_id),
+    )
+    missing = wanted - {row[0] for row in found.all()}
+    if missing:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"field": field, "error": "unknown_ids", "ids": sorted(missing)},
+        )
+
+
 # ============================================================================
 # EXPOSURE ASSETS ENDPOINTS
 # ============================================================================
@@ -197,7 +224,8 @@ async def get_attack_surface_or_404(db: AsyncSession, surface_id: str, organizat
 @router.post("/assets", response_model=ExposureAssetResponse, status_code=status.HTTP_201_CREATED)
 async def create_asset(
     asset_data: ExposureAssetCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Create a new exposure asset"""
@@ -223,7 +251,7 @@ async def create_asset(
         tags=asset_data.tags,
         network_zone=asset_data.network_zone,
         extra_metadata=asset_data.extra_metadata or {},
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
     )
 
     db.add(asset)
@@ -235,7 +263,7 @@ async def create_asset(
 
 @router.get("/assets", response_model=ExposureAssetListResponse)
 async def list_assets(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=500),
@@ -248,10 +276,8 @@ async def list_assets(
     max_risk_score: Optional[float] = Query(None, le=100.0),
 ):
     """List exposure assets with filtering and pagination"""
-    org_id = getattr(current_user, "organization_id", None)
     query = select(ExposureAsset)
-    if org_id is not None:
-        query = query.where(ExposureAsset.organization_id == org_id)
+    query = query.where(ExposureAsset.organization_id == org_id)
 
     if search:
         search_filter = f"%{search}%"
@@ -307,11 +333,11 @@ async def list_assets(
 @router.get("/assets/{asset_id}", response_model=ExposureAssetResponse)
 async def get_asset(
     asset_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get a specific exposure asset with details and vulnerabilities"""
-    asset = await get_asset_or_404(db, asset_id, getattr(current_user, "organization_id", None))
+    asset = await get_asset_or_404(db, asset_id, org_id)
     return asset
 
 
@@ -319,11 +345,12 @@ async def get_asset(
 async def update_asset(
     asset_id: str,
     asset_data: ExposureAssetUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Update an exposure asset"""
-    asset = await get_asset_or_404(db, asset_id, getattr(current_user, "organization_id", None))
+    asset = await get_asset_or_404(db, asset_id, org_id)
 
     update_data = asset_data.model_dump(exclude_unset=True, exclude_none=True)
 
@@ -339,11 +366,12 @@ async def update_asset(
 @router.delete("/assets/{asset_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def deactivate_asset(
     asset_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Deactivate an exposure asset"""
-    asset = await get_asset_or_404(db, asset_id, getattr(current_user, "organization_id", None))
+    asset = await get_asset_or_404(db, asset_id, org_id)
     asset.is_active = False
     await db.flush()
 
@@ -351,76 +379,64 @@ async def deactivate_asset(
 @router.post("/assets/discover", response_model=DiscoveryResult)
 async def trigger_asset_discovery(
     discovery_request: AssetDiscoveryRequest,
-    current_user: CurrentUser = None,
-    db: DatabaseSession = None,
+    org_id: OrganizationId,
+    _user: AdminRoleUser = None,
 ):
-    """Trigger asset discovery scan (network, cloud, AD, DNS)"""
-    scan = ExposureScan(
-        id=str(uuid.uuid4()),
-        scan_type="discovery",
-        scan_name=f"Discovery scan - {datetime.now(timezone.utc).isoformat()}",
-        status="running",
-        target_assets=[],
-        scanner="builtin",
-        initiated_by=current_user.id,
-        organization_id=getattr(current_user, "organization_id", None),
-    )
-    db.add(scan)
-    await db.flush()
-    await db.refresh(scan)
+    """Trigger asset discovery scan (network, cloud, AD, DNS).
 
-    return {
-        "scan_id": scan.id,
-        "discovered_assets": 0,
-        "new_assets": 0,
-        "updated_assets": 0,
-        "status": "running",
-    }
+    Admin-only (it would touch live networks). No on-demand discovery engine
+    exists: this used to insert a scan stuck at "running" and report zeros.
+    It now says so. Assets are still discovered from SIEM logs by the
+    scheduled ``run_asset_discovery`` task.
+    """
+    logger.info(
+        "exposure_discovery_not_implemented",
+        organization_id=org_id,
+        scan_type=discovery_request.scan_type,
+    )
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail={
+            "error": "not_implemented",
+            "detail": (
+                "On-demand asset discovery is not implemented; no scan was started. "
+                "Assets are discovered from ingested SIEM logs on a schedule, "
+                "or can be added via POST /exposure/assets or a scanner import."
+            ),
+        },
+    )
 
 
 @router.post("/assets/import", response_model=BulkImportResult)
 async def import_assets(
     import_data: BulkAssetImportRequest,
-    current_user: CurrentUser = None,
-    db: DatabaseSession = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
 ):
-    """Bulk import assets from CSV or JSON"""
-    imported = 0
-    failed = 0
-    errors = []
+    """Bulk import assets from CSV or JSON.
 
-    for item in import_data.assets if hasattr(import_data, "assets") else []:
-        try:
-            asset = ExposureAsset(
-                id=str(uuid.uuid4()),
-                hostname=getattr(item, "hostname", None),
-                ip_address=getattr(item, "ip_address", None),
-                asset_type=getattr(item, "asset_type", "server"),
-                environment=getattr(item, "environment", "production"),
-                criticality=getattr(item, "criticality", "medium"),
-                organization_id=getattr(current_user, "organization_id", None),
-            )
-            db.add(asset)
-            imported += 1
-        except Exception as e:
-            failed += 1
-            errors.append(str(e))
-
-    if imported > 0:
-        await db.flush()
-
-    return {
-        "imported": imported,
-        "failed": failed,
-        "errors": errors,
-        "skipped": 0,
-    }
+    Not implemented: the handler used to iterate a field the request schema
+    does not have and report a successful import of 0 assets. Nothing is
+    parsed or written.
+    """
+    logger.info("exposure_asset_import_not_implemented", organization_id=org_id, format=import_data.format)
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail={
+            "error": "not_implemented",
+            "detail": (
+                "Bulk asset import is not implemented; nothing was imported. "
+                "Create assets with POST /exposure/assets or import scanner results "
+                "with POST /exposure/scans/import."
+            ),
+        },
+    )
 
 
 @router.get("/assets/{asset_id}/vulnerabilities", response_model=AssetVulnerabilityListResponse)
 async def get_asset_vulnerabilities(
     asset_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=500),
@@ -428,16 +444,19 @@ async def get_asset_vulnerabilities(
     severity: Optional[str] = None,
 ):
     """Get vulnerabilities affecting a specific asset"""
-    org_id = getattr(current_user, "organization_id", None)
     await get_asset_or_404(db, asset_id, org_id)
 
     conditions = [AssetVulnerability.asset_id == asset_id]
-    if org_id is not None:
-        conditions.append(AssetVulnerability.organization_id == org_id)
+    conditions.append(AssetVulnerability.organization_id == org_id)
     query = select(AssetVulnerability).where(and_(*conditions))
 
     if status:
         query = query.where(AssetVulnerability.status == status)
+
+    if severity:
+        query = query.join(
+            Vulnerability, AssetVulnerability.vulnerability_id == Vulnerability.id
+        ).where(Vulnerability.severity == severity, Vulnerability.organization_id == org_id)
 
     # Get total count
     count_result = await db.execute(
@@ -468,7 +487,8 @@ async def get_asset_vulnerabilities(
 @router.post("/vulnerabilities", response_model=VulnerabilityResponse, status_code=status.HTTP_201_CREATED)
 async def create_vulnerability(
     vuln_data: VulnerabilityCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Create a new vulnerability record"""
@@ -490,7 +510,7 @@ async def create_vulnerability(
         references=vuln_data.references,
         mitre_techniques=vuln_data.mitre_techniques,
         tags=vuln_data.tags,
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
     )
 
     db.add(vuln)
@@ -502,7 +522,7 @@ async def create_vulnerability(
 
 @router.get("/vulnerabilities", response_model=VulnerabilityListResponse)
 async def list_vulnerabilities(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=500),
@@ -513,10 +533,8 @@ async def list_vulnerabilities(
     exploited_in_wild: Optional[bool] = None,
 ):
     """List vulnerabilities with filtering"""
-    org_id = getattr(current_user, "organization_id", None)
     query = select(Vulnerability)
-    if org_id is not None:
-        query = query.where(Vulnerability.organization_id == org_id)
+    query = query.where(Vulnerability.organization_id == org_id)
 
     if search:
         search_filter = f"%{search}%"
@@ -563,7 +581,7 @@ async def list_vulnerabilities(
 
 @router.get("/vulnerabilities/kev")
 async def get_cisa_kev_list_early(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """CISA Known Exploited Vulnerabilities list.
@@ -573,10 +591,10 @@ async def get_cisa_kev_list_early(
     route comes first, the literal path 'kev' is captured as a vuln_id
     and the endpoint 404s with "Vulnerability not found".
     """
-    org_id = getattr(current_user, "organization_id", None)
-    query = select(Vulnerability).where(Vulnerability.is_exploited_in_wild == True)  # noqa: E712
-    if org_id is not None:
-        query = query.where(Vulnerability.organization_id == org_id)
+    query = select(Vulnerability).where(
+        Vulnerability.is_exploited_in_wild == True,  # noqa: E712
+        Vulnerability.organization_id == org_id,
+    )
     result = await db.execute(query)
     kev_vulns = list(result.scalars().all())
 
@@ -587,10 +605,12 @@ async def get_cisa_kev_list_early(
                 "cve_id": v.cve_id,
                 "title": v.title,
                 "severity": v.severity,
-                "cvss_score": v.cvss_score,
+                # The model stores CVSS v3 only; the key name is kept for the page.
+                "cvss_score": v.cvss_v3_score,
                 "is_exploited_in_wild": v.is_exploited_in_wild,
-                "kev_date_added": v.kev_date_added.isoformat() if getattr(v, "kev_date_added", None) else None,
-                "published_date": v.published_date.isoformat() if getattr(v, "published_date", None) else None,
+                # No KEV feed populates a date-added column; say so instead of guessing.
+                "kev_date_added": None,
+                "published_date": v.published_at.isoformat() if v.published_at else None,
                 "description": v.description,
             }
             for v in kev_vulns
@@ -603,11 +623,11 @@ async def get_cisa_kev_list_early(
 @router.get("/vulnerabilities/{vuln_id}", response_model=VulnerabilityResponse)
 async def get_vulnerability(
     vuln_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get a specific vulnerability with affected assets"""
-    vuln = await get_vulnerability_or_404(db, vuln_id, getattr(current_user, "organization_id", None))
+    vuln = await get_vulnerability_or_404(db, vuln_id, org_id)
     return vuln
 
 
@@ -615,11 +635,12 @@ async def get_vulnerability(
 async def update_vulnerability(
     vuln_id: str,
     vuln_data: VulnerabilityUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Update vulnerability information"""
-    vuln = await get_vulnerability_or_404(db, vuln_id, getattr(current_user, "organization_id", None))
+    vuln = await get_vulnerability_or_404(db, vuln_id, org_id)
 
     update_data = vuln_data.model_dump(exclude_unset=True, exclude_none=True)
     for key, value in update_data.items():
@@ -634,11 +655,29 @@ async def update_vulnerability(
 @router.delete("/vulnerabilities/{vuln_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_vulnerability(
     vuln_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
-    """Delete a vulnerability record"""
-    vuln = await get_vulnerability_or_404(db, vuln_id, getattr(current_user, "organization_id", None))
+    """Delete a vulnerability record.
+
+    Refused with 409 while asset links reference it: the asset_vulnerabilities
+    foreign key has no cascade, so the delete used to fail as a 500.
+    """
+    vuln = await get_vulnerability_or_404(db, vuln_id, org_id)
+    linked = (
+        await db.execute(
+            select(func.count(AssetVulnerability.id)).where(
+                AssetVulnerability.vulnerability_id == vuln.id,
+                AssetVulnerability.organization_id == org_id,
+            )
+        )
+    ).scalar() or 0
+    if linked:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Vulnerability is linked to {linked} asset(s); remove those links first",
+        )
     await db.delete(vuln)
     await db.flush()
 
@@ -650,17 +689,20 @@ async def delete_vulnerability(
 @router.post("/vulnerabilities/search", response_model=VulnerabilityListResponse)
 async def advanced_vulnerability_search(
     search_request: ExposureSearchRequest,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=500),
 ):
-    """Advanced vulnerability search with complex filtering"""
+    """Advanced vulnerability search with complex filtering.
+
+    Read-only (persists nothing), so any member of the tenant may run it.
+    """
     query = select(Vulnerability).where(
-        Vulnerability.organization_id == getattr(current_user, "organization_id", None)
+        Vulnerability.organization_id == org_id
     )
 
-    if hasattr(search_request, "query") and search_request.query:
+    if search_request.query:
         search_filter = f"%{search_request.query}%"
         query = query.where(
             or_(
@@ -670,11 +712,11 @@ async def advanced_vulnerability_search(
             )
         )
 
-    if hasattr(search_request, "severity") and search_request.severity:
+    if search_request.severity:
         query = query.where(Vulnerability.severity.in_(search_request.severity))
 
-    if hasattr(search_request, "has_exploit") and search_request.has_exploit is not None:
-        query = query.where(Vulnerability.exploit_available == search_request.has_exploit)
+    if search_request.has_exploits is not None:
+        query = query.where(Vulnerability.exploit_available == search_request.has_exploits)
 
     # Get total count
     count_result = await db.execute(
@@ -705,10 +747,13 @@ async def advanced_vulnerability_search(
 @router.post("/asset-vulns", response_model=AssetVulnerabilityResponse, status_code=status.HTTP_201_CREATED)
 async def create_asset_vulnerability(
     mapping_data: AssetVulnerabilityCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
-    """Create asset-vulnerability mapping"""
+    """Create asset-vulnerability mapping (both ends must be in the caller's org)."""
+    await get_asset_or_404(db, mapping_data.asset_id, org_id)
+    await get_vulnerability_or_404(db, mapping_data.vulnerability_id, org_id)
     mapping = AssetVulnerability(
         id=str(uuid.uuid4()),
         asset_id=mapping_data.asset_id,
@@ -719,7 +764,7 @@ async def create_asset_vulnerability(
         remediation_notes=mapping_data.remediation_notes,
         compensating_controls=mapping_data.compensating_controls if hasattr(mapping_data, "compensating_controls") else [],
         detected_by=mapping_data.detected_by,
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
     )
 
     db.add(mapping)
@@ -733,11 +778,12 @@ async def create_asset_vulnerability(
 async def update_asset_vulnerability(
     mapping_id: str,
     mapping_data: AssetVulnerabilityUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Update asset-vulnerability status (open, remediated, accepted, false-positive)"""
-    mapping = await get_asset_vulnerability_or_404(db, mapping_id, getattr(current_user, "organization_id", None))
+    mapping = await get_asset_vulnerability_or_404(db, mapping_id, org_id)
 
     update_data = mapping_data.model_dump(exclude_unset=True, exclude_none=True)
     for key, value in update_data.items():
@@ -752,12 +798,13 @@ async def update_asset_vulnerability(
 @router.post("/asset-vulns/{mapping_id}/remediate", response_model=AssetVulnerabilityResponse)
 async def mark_as_remediated(
     mapping_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
     remediation_notes: Optional[str] = Query(None),
 ):
     """Mark asset-vulnerability as remediated"""
-    mapping = await get_asset_vulnerability_or_404(db, mapping_id, getattr(current_user, "organization_id", None))
+    mapping = await get_asset_vulnerability_or_404(db, mapping_id, org_id)
 
     mapping.status = "remediated"
     mapping.remediated_at = datetime.now(timezone.utc)
@@ -772,7 +819,7 @@ async def mark_as_remediated(
 
 @router.get("/asset-vulns/prioritized", response_model=AssetVulnerabilityListResponse)
 async def get_prioritized_remediation_list(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=500),
@@ -782,10 +829,20 @@ async def get_prioritized_remediation_list(
     """Get prioritized list of asset-vulnerabilities for remediation"""
     query = select(AssetVulnerability).where(
         and_(
-            AssetVulnerability.organization_id == getattr(current_user, "organization_id", None),
+            AssetVulnerability.organization_id == org_id,
             AssetVulnerability.status == "open",
         )
     )
+
+    if criticality:
+        query = query.join(ExposureAsset, AssetVulnerability.asset_id == ExposureAsset.id).where(
+            ExposureAsset.criticality == criticality, ExposureAsset.organization_id == org_id,
+        )
+
+    if severity:
+        query = query.join(Vulnerability, AssetVulnerability.vulnerability_id == Vulnerability.id).where(
+            Vulnerability.severity == severity, Vulnerability.organization_id == org_id,
+        )
 
     # Get total count
     count_result = await db.execute(
@@ -817,32 +874,37 @@ async def get_prioritized_remediation_list(
 @router.post("/scans", response_model=ExposureScanResponse, status_code=status.HTTP_201_CREATED)
 async def launch_scan(
     scan_data: ExposureScanCreate,
-    current_user: CurrentUser = None,
-    db: DatabaseSession = None,
+    org_id: OrganizationId,
+    _user: AdminRoleUser = None,
 ):
-    """Launch a new exposure scan"""
-    scan = ExposureScan(
-        id=str(uuid.uuid4()),
+    """Launch a new exposure scan.
+
+    Admin-only (scans touch live hosts). No scanner integration exists: this
+    used to insert a "pending" scan that a task later marked "completed"
+    without scanning anything. It now refuses honestly and records nothing.
+    """
+    logger.info(
+        "exposure_scan_launch_not_implemented",
+        organization_id=org_id,
         scan_type=scan_data.scan_type,
-        scan_name=scan_data.scan_name,
-        target_assets=scan_data.target_assets,
         scanner=scan_data.scanner,
-        scan_profile=scan_data.scan_profile,
-        status="pending",
-        initiated_by=current_user.id,
-        organization_id=getattr(current_user, "organization_id", None),
     )
-
-    db.add(scan)
-    await db.flush()
-    await db.refresh(scan)
-
-    return scan
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail={
+            "error": "not_implemented",
+            "detail": (
+                "Launching scans is not implemented (no scanner integration); no scan was "
+                "started. Run the scan in your scanner and import the results with "
+                "POST /exposure/scans/import."
+            ),
+        },
+    )
 
 
 @router.get("/scans", response_model=ExposureScanListResponse)
 async def list_scans(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=500),
@@ -851,10 +913,8 @@ async def list_scans(
     date_from: Optional[str] = Query(None),
 ):
     """List exposure scans with filtering"""
-    org_id = getattr(current_user, "organization_id", None)
     query = select(ExposureScan)
-    if org_id is not None:
-        query = query.where(ExposureScan.organization_id == org_id)
+    query = query.where(ExposureScan.organization_id == org_id)
 
     if scan_type:
         query = query.where(ExposureScan.scan_type == scan_type)
@@ -889,22 +949,23 @@ async def list_scans(
 @router.get("/scans/{scan_id}", response_model=ExposureScanResponse)
 async def get_scan(
     scan_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get scan results and details"""
-    scan = await get_scan_or_404(db, scan_id, getattr(current_user, "organization_id", None))
+    scan = await get_scan_or_404(db, scan_id, org_id)
     return scan
 
 
 @router.post("/scans/{scan_id}/cancel", response_model=ExposureScanResponse)
 async def cancel_scan(
     scan_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Cancel a running scan"""
-    scan = await get_scan_or_404(db, scan_id, getattr(current_user, "organization_id", None))
+    scan = await get_scan_or_404(db, scan_id, org_id)
 
     if scan.status not in ("pending", "running"):
         raise HTTPException(
@@ -922,7 +983,8 @@ async def cancel_scan(
 @router.post("/scans/import", response_model=ScannerImportResult)
 async def import_scan_results(
     import_data: ExternalScannerImportRequest,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    current_user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Import results from external scanners (Nessus, Qualys, Tenable.io,
@@ -937,7 +999,6 @@ async def import_scan_results(
     from src.exposure.scan_parser import parse_scan_data, ingest_findings
 
     import_id = str(uuid.uuid4())
-    org_id = getattr(current_user, "organization_id", None)
 
     scan = ExposureScan(
         id=import_id,
@@ -960,7 +1021,7 @@ async def import_scan_results(
     assets_updated = 0
     ingest_errors: list[str] = []
 
-    if findings and org_id:
+    if findings:
         vulnerabilities_imported, assets_updated, ingest_errors = await ingest_findings(
             db=db,
             findings=findings,
@@ -994,20 +1055,19 @@ async def import_scan_results(
 @router.post("/tickets", response_model=RemediationTicketResponse, status_code=status.HTTP_201_CREATED)
 async def create_remediation_ticket(
     ticket_data: RemediationTicketCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
-    """Create a remediation ticket"""
-    org_id = getattr(current_user, "organization_id", None)
-    if not org_id:
-        # Find first org from organization_members or organizations table
-        from src.models.organization import Organization
-        org_result = await db.execute(select(Organization).limit(1))
-        org = org_result.scalars().first()
-        org_id = org.id if org else None
+    """Create a remediation ticket in the caller's organisation.
 
-    if not org_id:
-        raise HTTPException(status_code=400, detail="No organization found. Create an organization first.")
+    Linked asset-vulnerability and asset ids must belong to the same
+    organisation (422 naming the field otherwise).
+    """
+    await _require_ids_in_org(
+        db, AssetVulnerability, ticket_data.asset_vulnerabilities, org_id, "asset_vulnerabilities",
+    )
+    await _require_ids_in_org(db, ExposureAsset, ticket_data.affected_assets, org_id, "affected_assets")
 
     ticket = RemediationTicket(
         id=str(uuid.uuid4()),
@@ -1035,7 +1095,7 @@ async def create_remediation_ticket(
 
 @router.get("/tickets", response_model=RemediationTicketListResponse)
 async def list_remediation_tickets(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=500),
@@ -1045,10 +1105,8 @@ async def list_remediation_tickets(
     overdue_only: Optional[bool] = False,
 ):
     """List remediation tickets with filtering"""
-    org_id = getattr(current_user, "organization_id", None)
     query = select(RemediationTicket)
-    if org_id is not None:
-        query = query.where(RemediationTicket.organization_id == org_id)
+    query = query.where(RemediationTicket.organization_id == org_id)
 
     if status:
         query = query.where(RemediationTicket.status == status)
@@ -1088,77 +1146,20 @@ async def list_remediation_tickets(
     }
 
 
-@router.get("/tickets/{ticket_id}", response_model=RemediationTicketResponse)
-async def get_remediation_ticket(
-    ticket_id: str,
-    current_user: CurrentUser = None,
-    db: DatabaseSession = None,
-):
-    """Get a specific remediation ticket"""
-    ticket = await get_ticket_or_404(db, ticket_id, getattr(current_user, "organization_id", None))
-    return ticket
-
-
-@router.put("/tickets/{ticket_id}", response_model=RemediationTicketResponse)
-async def update_remediation_ticket(
-    ticket_id: str,
-    ticket_data: RemediationTicketUpdate,
-    current_user: CurrentUser = None,
-    db: DatabaseSession = None,
-):
-    """Update a remediation ticket"""
-    ticket = await get_ticket_or_404(db, ticket_id, getattr(current_user, "organization_id", None))
-
-    update_data = ticket_data.model_dump(exclude_unset=True, exclude_none=True)
-    for key, value in update_data.items():
-        setattr(ticket, key, value)
-
-    await db.flush()
-    await db.refresh(ticket)
-
-    return ticket
-
-
-@router.post("/tickets/{ticket_id}/verify", response_model=RemediationVerificationResult)
-async def verify_remediation(
-    ticket_id: str,
-    verification_data: RemediationVerificationRequest,
-    current_user: CurrentUser = None,
-    db: DatabaseSession = None,
-):
-    """Verify remediation completion"""
-    ticket = await get_ticket_or_404(db, ticket_id, getattr(current_user, "organization_id", None))
-
-    now = datetime.now(timezone.utc)
-    ticket.verification_status = "verified"
-    ticket.verified_at = now
-    ticket.verified_by = current_user.id
-    ticket.status = "closed"
-    ticket.resolved_at = now
-
-    await db.flush()
-    await db.refresh(ticket)
-
-    return {
-        "ticket_id": ticket_id,
-        "verified": True,
-        "verification_date": now.isoformat(),
-        "verified_by": current_user.id,
-        "notes": verification_data.verification_notes if hasattr(verification_data, "verification_notes") else None,
-    }
-
-
 @router.get("/tickets/overdue", response_model=RemediationTicketListResponse)
 async def get_overdue_tickets(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=500),
 ):
-    """Get overdue remediation tickets"""
+    """Get overdue remediation tickets.
+
+    Registered before ``/tickets/{ticket_id}`` so "overdue" is not captured as an id.
+    """
     query = select(RemediationTicket).where(
         and_(
-            RemediationTicket.organization_id == getattr(current_user, "organization_id", None),
+            RemediationTicket.organization_id == org_id,
             RemediationTicket.due_date < datetime.now(timezone.utc),
             RemediationTicket.status.notin_(["closed", "verification"]),
         )
@@ -1185,6 +1186,72 @@ async def get_overdue_tickets(
     }
 
 
+@router.get("/tickets/{ticket_id}", response_model=RemediationTicketResponse)
+async def get_remediation_ticket(
+    ticket_id: str,
+    org_id: OrganizationId,
+    db: DatabaseSession = None,
+):
+    """Get a specific remediation ticket"""
+    ticket = await get_ticket_or_404(db, ticket_id, org_id)
+    return ticket
+
+
+@router.put("/tickets/{ticket_id}", response_model=RemediationTicketResponse)
+async def update_remediation_ticket(
+    ticket_id: str,
+    ticket_data: RemediationTicketUpdate,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
+    db: DatabaseSession = None,
+):
+    """Update a remediation ticket"""
+    ticket = await get_ticket_or_404(db, ticket_id, org_id)
+
+    update_data = ticket_data.model_dump(exclude_unset=True, exclude_none=True)
+    for key, value in update_data.items():
+        setattr(ticket, key, value)
+
+    await db.flush()
+    await db.refresh(ticket)
+
+    return ticket
+
+
+@router.post("/tickets/{ticket_id}/verify", response_model=RemediationVerificationResult)
+async def verify_remediation(
+    ticket_id: str,
+    verification_data: RemediationVerificationRequest,
+    org_id: OrganizationId,
+    current_user: AnalystUser = None,
+    db: DatabaseSession = None,
+):
+    """Record an analyst's verification of remediation and close the ticket.
+
+    This is record-keeping: the platform performs no rescan or technical
+    check. ``verified_by`` names the analyst who attested to the fix.
+    """
+    ticket = await get_ticket_or_404(db, ticket_id, org_id)
+
+    now = datetime.now(timezone.utc)
+    ticket.verification_status = "verified"
+    ticket.verified_at = now
+    ticket.verified_by = current_user.id
+    ticket.status = "closed"
+    ticket.resolved_at = now
+
+    await db.flush()
+    await db.refresh(ticket)
+
+    return {
+        "ticket_id": ticket_id,
+        "verified": True,
+        "verification_date": now.isoformat(),
+        "verified_by": current_user.id,
+        "notes": verification_data.verification_notes if hasattr(verification_data, "verification_notes") else None,
+    }
+
+
 # ============================================================================
 # ATTACK SURFACE ENDPOINTS
 # ============================================================================
@@ -1193,7 +1260,8 @@ async def get_overdue_tickets(
 @router.post("/attack-surface", response_model=AttackSurfaceResponse, status_code=status.HTTP_201_CREATED)
 async def define_attack_surface(
     surface_data: AttackSurfaceCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Define an attack surface"""
@@ -1202,7 +1270,7 @@ async def define_attack_surface(
         name=surface_data.name,
         surface_type=surface_data.surface_type,
         description=surface_data.description,
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
     )
 
     db.add(surface)
@@ -1214,17 +1282,15 @@ async def define_attack_surface(
 
 @router.get("/attack-surface", response_model=AttackSurfaceListResponse)
 async def list_attack_surfaces(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=500),
     surface_type: Optional[str] = None,
 ):
     """List attack surfaces"""
-    org_id = getattr(current_user, "organization_id", None)
     query = select(AttackSurface)
-    if org_id is not None:
-        query = query.where(AttackSurface.organization_id == org_id)
+    query = query.where(AttackSurface.organization_id == org_id)
 
     if surface_type:
         query = query.where(AttackSurface.surface_type == surface_type)
@@ -1253,11 +1319,11 @@ async def list_attack_surfaces(
 @router.get("/attack-surface/{surface_id}", response_model=AttackSurfaceResponse)
 async def get_attack_surface(
     surface_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get attack surface details and composition"""
-    surface = await get_attack_surface_or_404(db, surface_id, getattr(current_user, "organization_id", None))
+    surface = await get_attack_surface_or_404(db, surface_id, org_id)
     return surface
 
 
@@ -1265,11 +1331,12 @@ async def get_attack_surface(
 async def update_attack_surface(
     surface_id: str,
     surface_data: AttackSurfaceUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Update attack surface"""
-    surface = await get_attack_surface_or_404(db, surface_id, getattr(current_user, "organization_id", None))
+    surface = await get_attack_surface_or_404(db, surface_id, org_id)
 
     update_data = surface_data.model_dump(exclude_unset=True, exclude_none=True)
     for key, value in update_data.items():
@@ -1283,7 +1350,8 @@ async def update_attack_surface(
 
 @router.post("/attack-surface/assess", response_model=AssessmentResult)
 async def trigger_assessment(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
     surface_id: str = Query(...),
 ):
@@ -1298,7 +1366,6 @@ async def trigger_assessment(
     risk score to the surface row, and stamps last_assessed_at so the
     Attack Surface card reflects the click.
     """
-    org_id = getattr(current_user, "organization_id", None)
     surface = await get_attack_surface_or_404(db, surface_id, org_id)
 
     # Decide asset filter based on surface_type. 'external' / 'internet'
@@ -1328,6 +1395,7 @@ async def trigger_assessment(
         open_res = await db.execute(
             select(func.count(AssetVulnerability.id)).where(
                 and_(
+                    AssetVulnerability.organization_id == org_id,
                     AssetVulnerability.asset_id.in_(surface_asset_ids),
                     AssetVulnerability.status == "open",
                 )
@@ -1343,6 +1411,7 @@ async def trigger_assessment(
             )
             .where(
                 and_(
+                    AssetVulnerability.organization_id == org_id,
                     AssetVulnerability.asset_id.in_(surface_asset_ids),
                     AssetVulnerability.status == "open",
                 )
@@ -1365,6 +1434,7 @@ async def trigger_assessment(
             )
             .where(
                 and_(
+                    AssetVulnerability.organization_id == org_id,
                     AssetVulnerability.asset_id.in_(surface_asset_ids),
                     AssetVulnerability.status == "open",
                 )
@@ -1430,30 +1500,26 @@ async def trigger_assessment(
 
 @router.get("/dashboard", response_model=ExposureDashboardStats)
 async def get_dashboard_statistics(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get exposure management dashboard statistics"""
-    org_id = getattr(current_user, "organization_id", None)
 
     # Total and active assets
-    asset_conditions = [ExposureAsset.organization_id == org_id] if org_id is not None else []
     total_assets_result = await db.execute(
-        select(func.count(ExposureAsset.id)).where(*asset_conditions) if asset_conditions else select(func.count(ExposureAsset.id))
+        select(func.count(ExposureAsset.id)).where(ExposureAsset.organization_id == org_id)
     )
     total_assets = total_assets_result.scalar() or 0
 
     active_conditions = [ExposureAsset.is_active == True]
-    if org_id is not None:
-        active_conditions.append(ExposureAsset.organization_id == org_id)
+    active_conditions.append(ExposureAsset.organization_id == org_id)
     active_assets_result = await db.execute(
         select(func.count(ExposureAsset.id)).where(and_(*active_conditions))
     )
     active_assets = active_assets_result.scalar() or 0
 
     inet_conditions = [ExposureAsset.is_internet_facing == True]
-    if org_id is not None:
-        inet_conditions.append(ExposureAsset.organization_id == org_id)
+    inet_conditions.append(ExposureAsset.organization_id == org_id)
     internet_facing_result = await db.execute(
         select(func.count(ExposureAsset.id)).where(and_(*inet_conditions))
     )
@@ -1461,14 +1527,12 @@ async def get_dashboard_statistics(
 
     # Vulnerability counts by severity
     vuln_query = select(func.count(Vulnerability.id))
-    if org_id is not None:
-        vuln_query = vuln_query.where(Vulnerability.organization_id == org_id)
+    vuln_query = vuln_query.where(Vulnerability.organization_id == org_id)
     total_vulns_result = await db.execute(vuln_query)
     total_vulnerabilities = total_vulns_result.scalar() or 0
 
     sev_query = select(Vulnerability.severity, func.count(Vulnerability.id))
-    if org_id is not None:
-        sev_query = sev_query.where(Vulnerability.organization_id == org_id)
+    sev_query = sev_query.where(Vulnerability.organization_id == org_id)
     severity_result = await db.execute(sev_query.group_by(Vulnerability.severity))
     severity_counts = dict(severity_result.all())
 
@@ -1477,8 +1541,7 @@ async def get_dashboard_statistics(
         RemediationTicket.due_date < datetime.now(timezone.utc),
         RemediationTicket.status.notin_(["closed", "verification"]),
     ]
-    if org_id is not None:
-        overdue_conditions.append(RemediationTicket.organization_id == org_id)
+    overdue_conditions.append(RemediationTicket.organization_id == org_id)
     overdue_result = await db.execute(
         select(func.count(RemediationTicket.id)).where(and_(*overdue_conditions))
     )
@@ -1486,22 +1549,19 @@ async def get_dashboard_statistics(
 
     # Assets by criticality
     crit_query = select(ExposureAsset.criticality, func.count(ExposureAsset.id))
-    if org_id is not None:
-        crit_query = crit_query.where(ExposureAsset.organization_id == org_id)
+    crit_query = crit_query.where(ExposureAsset.organization_id == org_id)
     criticality_result = await db.execute(crit_query.group_by(ExposureAsset.criticality))
     assets_by_criticality = dict(criticality_result.all())
 
     # Vulns by status
     vs_query = select(AssetVulnerability.status, func.count(AssetVulnerability.id))
-    if org_id is not None:
-        vs_query = vs_query.where(AssetVulnerability.organization_id == org_id)
+    vs_query = vs_query.where(AssetVulnerability.organization_id == org_id)
     vuln_status_result = await db.execute(vs_query.group_by(AssetVulnerability.status))
     vulns_by_status = dict(vuln_status_result.all())
 
     # --- REAL MTTR: average (resolved_at - created_at) over closed tickets ---
     mttr_query = select(RemediationTicket.created_at, RemediationTicket.resolved_at)
-    if org_id is not None:
-        mttr_query = mttr_query.where(RemediationTicket.organization_id == org_id)
+    mttr_query = mttr_query.where(RemediationTicket.organization_id == org_id)
     mttr_query = mttr_query.where(
         RemediationTicket.status == "closed",
         RemediationTicket.resolved_at.is_not(None),
@@ -1530,8 +1590,7 @@ async def get_dashboard_statistics(
 
     # --- REAL TOP VULNERABLE ASSETS: top 10 by risk_score ---
     top_query = select(ExposureAsset).order_by(ExposureAsset.risk_score.desc()).limit(10)
-    if org_id is not None:
-        top_query = top_query.where(ExposureAsset.organization_id == org_id)
+    top_query = top_query.where(ExposureAsset.organization_id == org_id)
     top_result = await db.execute(top_query)
     top_vulnerable_assets = [
         {
@@ -1552,8 +1611,7 @@ async def get_dashboard_statistics(
         func.date_trunc("day", Vulnerability.created_at).label("day"),
         func.count(Vulnerability.id),
     ).where(Vulnerability.created_at >= thirty_days_ago)
-    if org_id is not None:
-        trend_query = trend_query.where(Vulnerability.organization_id == org_id)
+    trend_query = trend_query.where(Vulnerability.organization_id == org_id)
     trend_query = trend_query.group_by("day").order_by("day")
     trend_result = await db.execute(trend_query)
     trend_by_day = {row[0].date().isoformat(): int(row[1]) for row in trend_result.all()}
@@ -1576,8 +1634,7 @@ async def get_dashboard_statistics(
             ComplianceFramework.total_controls,
             ComplianceFramework.implemented_controls,
         ).where(ComplianceFramework.is_enabled == True)
-        if org_id is not None:
-            fw_query = fw_query.where(ComplianceFramework.organization_id == org_id)
+        fw_query = fw_query.where(ComplianceFramework.organization_id == org_id)
         fw_result = await db.execute(fw_query)
         for short, score, total, implemented in fw_result.all():
             compliance_summary[short or "unknown"] = {
@@ -1611,7 +1668,7 @@ async def get_dashboard_statistics(
 
 @router.get("/risk-matrix", response_model=RiskMatrix)
 async def get_risk_matrix(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Build a real criticality×severity risk matrix.
@@ -1621,12 +1678,10 @@ async def get_risk_matrix(
     The resulting 4×5 grid (low/medium/high/critical × info/low/medium/high/critical)
     is what the frontend risk heatmap renders.
     """
-    org_id = getattr(current_user, "organization_id", None)
 
     # Total open exposures
     total_conditions = [AssetVulnerability.status == "open"]
-    if org_id is not None:
-        total_conditions.append(AssetVulnerability.organization_id == org_id)
+    total_conditions.append(AssetVulnerability.organization_id == org_id)
     total_result = await db.execute(
         select(func.count(AssetVulnerability.id)).where(and_(*total_conditions))
     )
@@ -1651,8 +1706,7 @@ async def get_risk_matrix(
         .where(AssetVulnerability.status == "open")
         .group_by(ExposureAsset.criticality, Vulnerability.severity)
     )
-    if org_id is not None:
-        matrix_query = matrix_query.where(AssetVulnerability.organization_id == org_id)
+    matrix_query = matrix_query.where(AssetVulnerability.organization_id == org_id)
     matrix_result = await db.execute(matrix_query)
 
     # Initialize the grid so cells with zero exposures render as 0 (not missing)
@@ -1673,7 +1727,7 @@ async def get_risk_matrix(
 
 @router.get("/compliance", response_model=ComplianceSummary)
 async def get_compliance_status(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Compliance status summary for the exposure dashboard.
@@ -1683,7 +1737,6 @@ async def get_compliance_status(
     overall compliance score. Frontend consumes this to render the
     Compliance tab list of frameworks.
     """
-    org_id = getattr(current_user, "organization_id", None)
 
     frameworks_data: dict = {}
     total_checks = 0
@@ -1695,8 +1748,7 @@ async def get_compliance_status(
         from src.compliance.models import ComplianceFramework, ComplianceControl
 
         fw_query = select(ComplianceFramework).where(ComplianceFramework.is_enabled == True)  # noqa: E712
-        if org_id is not None:
-            fw_query = fw_query.where(ComplianceFramework.organization_id == org_id)
+        fw_query = fw_query.where(ComplianceFramework.organization_id == org_id)
         fw_result = await db.execute(fw_query)
         frameworks = list(fw_result.scalars().all())
 
@@ -1746,8 +1798,7 @@ async def get_compliance_status(
     # Fall back to asset-count if no frameworks exist (fresh install)
     if total_checks == 0:
         asset_q = select(func.count(ExposureAsset.id))
-        if org_id is not None:
-            asset_q = asset_q.where(ExposureAsset.organization_id == org_id)
+        asset_q = asset_q.where(ExposureAsset.organization_id == org_id)
         total_checks = (await db.execute(asset_q)).scalar() or 0
 
     overall_score = round(sum(overall_scores) / len(overall_scores), 1) if overall_scores else 0.0
@@ -1763,13 +1814,15 @@ async def get_compliance_status(
 
 @router.post("/report", response_model=ExposureReport)
 async def generate_exposure_report(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     title: str = Query(...),
     include_recommendations: bool = Query(True),
 ):
-    """Generate exposure management report"""
-    org_id = getattr(current_user, "organization_id", None)
+    """Generate exposure management report.
+
+    Read-only (persists nothing), so any member of the tenant may run it.
+    """
 
     # Gather statistics
     total_assets_result = await db.execute(
@@ -1821,18 +1874,22 @@ async def generate_exposure_report(
             func.avg(
                 func.extract(
                     "epoch",
-                    RemediationTicket.completed_at - RemediationTicket.created_at,
+                    RemediationTicket.resolved_at - RemediationTicket.created_at,
                 )
             )
         ).where(
             and_(
                 RemediationTicket.organization_id == org_id,
-                RemediationTicket.completed_at.is_not(None),
+                RemediationTicket.status == "closed",
+                RemediationTicket.resolved_at.is_not(None),
             )
         )
     )
     mttr_seconds = mttr_result.scalar()
-    mean_time_to_remediate_days = round(float(mttr_seconds) / 86400.0, 2) if mttr_seconds else 0.0
+    # Unknown (None) until a ticket has been closed, not "0 days".
+    mean_time_to_remediate_days = (
+        round(float(mttr_seconds) / 86400.0, 2) if mttr_seconds is not None else None
+    )
 
     # Composite risk score weighted by severity. Critical=25, High=10,
     # Medium=3, Low=1 — keeps overall_risk_score bounded roughly 0..100.
@@ -1849,7 +1906,7 @@ async def generate_exposure_report(
     top_assets_res = await db.execute(
         select(
             ExposureAsset.id,
-            ExposureAsset.name,
+            ExposureAsset.ip_address,
             ExposureAsset.hostname,
             func.count(AssetVulnerability.id).label("open_count"),
         )
@@ -1860,14 +1917,15 @@ async def generate_exposure_report(
                 AssetVulnerability.status == "open",
             )
         )
-        .group_by(ExposureAsset.id, ExposureAsset.name, ExposureAsset.hostname)
+        .group_by(ExposureAsset.id, ExposureAsset.ip_address, ExposureAsset.hostname)
         .order_by(func.count(AssetVulnerability.id).desc())
         .limit(5)
     )
     top_vulnerable_assets = [
         {
             "asset_id": row[0],
-            "asset_name": row[1],
+            # Assets have no name column: hostname, else IP.
+            "asset_name": row[2] or row[1],
             "hostname": row[2],
             "open_vulnerabilities": row[3],
         }
@@ -1894,7 +1952,7 @@ async def generate_exposure_report(
             recommendations.append(
                 f"{overdue_tickets} remediation ticket(s) are overdue — escalate to ticket owners."
             )
-        if mean_time_to_remediate_days > 30:
+        if mean_time_to_remediate_days is not None and mean_time_to_remediate_days > 30:
             recommendations.append(
                 f"MTTR is {mean_time_to_remediate_days} days — consider SLA tightening or adding remediation automation."
             )
@@ -1939,7 +1997,11 @@ async def generate_exposure_report(
             f"Exposure report: {total_assets} assets ({internet_facing_assets} internet-facing), "
             f"{total_vulnerabilities} vulnerabilities ({severity_counts.get('critical', 0)} critical, "
             f"{severity_counts.get('high', 0)} high). Overall risk score: {overall_risk_score}/100. "
-            f"MTTR: {mean_time_to_remediate_days} days."
+            + (
+                f"MTTR: {mean_time_to_remediate_days} days."
+                if mean_time_to_remediate_days is not None
+                else "MTTR: unknown (no closed tickets)."
+            )
         ),
         "statistics": statistics,
         "top_findings": top_findings,

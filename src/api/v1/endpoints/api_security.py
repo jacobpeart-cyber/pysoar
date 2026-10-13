@@ -1,23 +1,20 @@
 """API Security Governance endpoints"""
 
 import asyncio
-import json
 import math
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List
+from typing import Annotated, Optional, List
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status, Body
-from sqlalchemy import func, select, and_, or_
+from sqlalchemy import func, select, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import CurrentUser, DatabaseSession, require_role
-from src.core.database import async_session_factory
+from src.api.deps import DatabaseSession, require_role, OrganizationId
 from src.core.logging import get_logger
 from src.core.url_validator import validate_url
 from src.services.automation import AutomationService
 
 logger = get_logger(__name__)
-from src.models.alert import Alert
 from src.models.user import User, UserRole
 from src.api_security.models import (
     APIEndpointInventory,
@@ -27,9 +24,7 @@ from src.api_security.models import (
     APIComplianceCheck,
 )
 from src.api_security.tasks import (
-    api_discovery_scan,
     security_assessment,
-    anomaly_baseline_update,
     compliance_check,
     shadow_api_detection,
 )
@@ -57,12 +52,15 @@ from src.schemas.api_security import (
     APIComplianceCheckListResponse,
     APISummaryStats,
     APISecurityDashboardResponse,
-    APIDiscoveryResultsResponse,
-    APIScanResultResponse,
     APIComplianceReportResponse,
 )
 
 router = APIRouter(prefix="/api-security", tags=["API Security"])
+
+# Wave 1 role gates: viewers read only; analysts for operational writes;
+# admins for configuration and actions against live systems.
+AnalystUser = Annotated[User, Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
+AdminRoleUser = Annotated[User, Depends(require_role([UserRole.ADMIN]))]
 
 
 # ============================================================================
@@ -70,7 +68,30 @@ router = APIRouter(prefix="/api-security", tags=["API Security"])
 # ============================================================================
 
 
-async def get_endpoint_or_404(db: AsyncSession, endpoint_id: str, org_id: Optional[str]) -> APIEndpointInventory:
+async def require_own_endpoint_field(db: AsyncSession, endpoint_id: str, org_id: str) -> None:
+    """422 naming ``endpoint_id`` when a supplied id is not an endpoint of this tenant."""
+    if not endpoint_id:
+        return
+    result = await db.execute(
+        select(APIEndpointInventory.id).where(
+            and_(
+                APIEndpointInventory.id == endpoint_id,
+                APIEndpointInventory.organization_id == org_id,
+            )
+        )
+    )
+    if result.scalar_one_or_none() is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "error": "invalid_field",
+                "field": "endpoint_id",
+                "detail": "endpoint_id is not an API endpoint of this organisation",
+            },
+        )
+
+
+async def get_endpoint_or_404(db: AsyncSession, endpoint_id: str, org_id: str) -> APIEndpointInventory:
     """Get endpoint by ID or raise 404 (tenant-scoped)"""
     result = await db.execute(
         select(APIEndpointInventory).where(
@@ -91,7 +112,7 @@ async def get_endpoint_or_404(db: AsyncSession, endpoint_id: str, org_id: Option
 
 @router.get("/endpoints", response_model=APIEndpointInventoryListResponse)
 async def list_endpoints(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -106,7 +127,6 @@ async def list_endpoints(
     sort_order: str = "desc",
 ):
     """List API endpoints with filtering and pagination"""
-    org_id = getattr(current_user, "organization_id", None)
     query = select(APIEndpointInventory).where(APIEndpointInventory.organization_id == org_id)
 
     # Apply filters
@@ -160,13 +180,14 @@ async def list_endpoints(
 @router.post("/endpoints", response_model=APIEndpointInventoryResponse, status_code=status.HTTP_201_CREATED)
 async def create_endpoint(
     endpoint_data: APIEndpointInventoryCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Create a new API endpoint"""
     endpoint = APIEndpointInventory(
         **endpoint_data.model_dump(),
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
     )
     db.add(endpoint)
     await db.commit()
@@ -177,11 +198,11 @@ async def create_endpoint(
 @router.get("/endpoints/{endpoint_id}", response_model=APIEndpointInventoryResponse)
 async def get_endpoint(
     endpoint_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get endpoint by ID"""
-    endpoint = await get_endpoint_or_404(db, endpoint_id, getattr(current_user, "organization_id", None))
+    endpoint = await get_endpoint_or_404(db, endpoint_id, org_id)
     return APIEndpointInventoryResponse.model_validate(endpoint)
 
 
@@ -189,11 +210,12 @@ async def get_endpoint(
 async def update_endpoint(
     endpoint_id: str,
     endpoint_data: APIEndpointInventoryUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Update an API endpoint"""
-    endpoint = await get_endpoint_or_404(db, endpoint_id, getattr(current_user, "organization_id", None))
+    endpoint = await get_endpoint_or_404(db, endpoint_id, org_id)
 
     update_data = endpoint_data.model_dump(exclude_unset=True)
     for field, value in update_data.items():
@@ -207,11 +229,12 @@ async def update_endpoint(
 @router.delete("/endpoints/{endpoint_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_endpoint(
     endpoint_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Delete an API endpoint"""
-    endpoint = await get_endpoint_or_404(db, endpoint_id, getattr(current_user, "organization_id", None))
+    endpoint = await get_endpoint_or_404(db, endpoint_id, org_id)
     await db.delete(endpoint)
     await db.commit()
 
@@ -221,7 +244,7 @@ async def delete_endpoint(
 # ============================================================================
 
 
-async def get_vulnerability_or_404(db: AsyncSession, vuln_id: str, org_id: Optional[str]) -> APIVulnerability:
+async def get_vulnerability_or_404(db: AsyncSession, vuln_id: str, org_id: str) -> APIVulnerability:
     """Get vulnerability by ID or raise 404 (tenant-scoped)"""
     result = await db.execute(
         select(APIVulnerability).where(
@@ -239,7 +262,7 @@ async def get_vulnerability_or_404(db: AsyncSession, vuln_id: str, org_id: Optio
 
 @router.get("/vulnerabilities", response_model=APIVulnerabilityListResponse)
 async def list_vulnerabilities(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -251,7 +274,6 @@ async def list_vulnerabilities(
     sort_order: str = "desc",
 ):
     """List API vulnerabilities with filtering and pagination"""
-    org_id = getattr(current_user, "organization_id", None)
     query = select(APIVulnerability).where(APIVulnerability.organization_id == org_id)
 
     # Apply filters
@@ -299,20 +321,21 @@ async def list_vulnerabilities(
 @router.post("/vulnerabilities", response_model=APIVulnerabilityResponse, status_code=status.HTTP_201_CREATED)
 async def create_vulnerability(
     vuln_data: APIVulnerabilityCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Create a new vulnerability"""
+    await require_own_endpoint_field(db, vuln_data.endpoint_id, org_id)
     vuln = APIVulnerability(
         **vuln_data.model_dump(),
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
     )
     db.add(vuln)
     await db.commit()
     await db.refresh(vuln)
 
     try:
-        org_id = getattr(current_user, "organization_id", None)
         automation = AutomationService(db)
         await automation.on_api_security_threat(
             api_endpoint=getattr(vuln, "endpoint", None) or getattr(vuln, "endpoint_id", None) or "",
@@ -329,11 +352,11 @@ async def create_vulnerability(
 @router.get("/vulnerabilities/{vuln_id}", response_model=APIVulnerabilityResponse)
 async def get_vulnerability(
     vuln_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get vulnerability by ID"""
-    vuln = await get_vulnerability_or_404(db, vuln_id, getattr(current_user, "organization_id", None))
+    vuln = await get_vulnerability_or_404(db, vuln_id, org_id)
     return APIVulnerabilityResponse.model_validate(vuln)
 
 
@@ -341,11 +364,12 @@ async def get_vulnerability(
 async def update_vulnerability(
     vuln_id: str,
     vuln_data: APIVulnerabilityUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Update a vulnerability"""
-    vuln = await get_vulnerability_or_404(db, vuln_id, getattr(current_user, "organization_id", None))
+    vuln = await get_vulnerability_or_404(db, vuln_id, org_id)
 
     update_data = vuln_data.model_dump(exclude_unset=True)
     for field, value in update_data.items():
@@ -359,7 +383,8 @@ async def update_vulnerability(
 @router.post("/vulnerabilities/bulk-update")
 async def bulk_update_vulnerabilities(
     bulk_data: APIVulnerabilityBulkUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    current_user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Bulk update vulnerabilities in the caller's organization.
@@ -367,7 +392,6 @@ async def bulk_update_vulnerabilities(
     Ids that do not exist in the caller's organization are not touched and
     are returned in ``ignored_ids``.
     """
-    org_id = getattr(current_user, "organization_id", None)
     result = await db.execute(
         select(APIVulnerability).where(
             APIVulnerability.id.in_(bulk_data.vulnerability_ids),
@@ -400,7 +424,7 @@ async def bulk_update_vulnerabilities(
 # ============================================================================
 
 
-async def get_policy_or_404(db: AsyncSession, policy_id: str, org_id: Optional[str]) -> APISecurityPolicy:
+async def get_policy_or_404(db: AsyncSession, policy_id: str, org_id: str) -> APISecurityPolicy:
     """Get policy by ID or raise 404 (tenant-scoped)"""
     result = await db.execute(
         select(APISecurityPolicy).where(
@@ -418,7 +442,7 @@ async def get_policy_or_404(db: AsyncSession, policy_id: str, org_id: Optional[s
 
 @router.get("/policies", response_model=APISecurityPolicyListResponse)
 async def list_policies(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -428,7 +452,6 @@ async def list_policies(
     sort_order: str = "desc",
 ):
     """List API security policies"""
-    org_id = getattr(current_user, "organization_id", None)
     query = select(APISecurityPolicy).where(APISecurityPolicy.organization_id == org_id)
 
     # Apply filters
@@ -472,13 +495,14 @@ async def list_policies(
 @router.post("/policies", response_model=APISecurityPolicyResponse, status_code=status.HTTP_201_CREATED)
 async def create_policy(
     policy_data: APISecurityPolicyCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AdminRoleUser = None,
     db: DatabaseSession = None,
 ):
     """Create a new security policy"""
     policy = APISecurityPolicy(
         **policy_data.model_dump(),
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
     )
     db.add(policy)
     await db.commit()
@@ -489,11 +513,11 @@ async def create_policy(
 @router.get("/policies/{policy_id}", response_model=APISecurityPolicyResponse)
 async def get_policy(
     policy_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get policy by ID"""
-    policy = await get_policy_or_404(db, policy_id, getattr(current_user, "organization_id", None))
+    policy = await get_policy_or_404(db, policy_id, org_id)
     return APISecurityPolicyResponse.model_validate(policy)
 
 
@@ -501,11 +525,12 @@ async def get_policy(
 async def update_policy(
     policy_id: str,
     policy_data: APISecurityPolicyUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AdminRoleUser = None,
     db: DatabaseSession = None,
 ):
     """Update a security policy"""
-    policy = await get_policy_or_404(db, policy_id, getattr(current_user, "organization_id", None))
+    policy = await get_policy_or_404(db, policy_id, org_id)
 
     update_data = policy_data.model_dump(exclude_unset=True)
     for field, value in update_data.items():
@@ -519,11 +544,12 @@ async def update_policy(
 @router.delete("/policies/{policy_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_policy(
     policy_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AdminRoleUser = None,
     db: DatabaseSession = None,
 ):
     """Delete a security policy"""
-    policy = await get_policy_or_404(db, policy_id, getattr(current_user, "organization_id", None))
+    policy = await get_policy_or_404(db, policy_id, org_id)
     await db.delete(policy)
     await db.commit()
 
@@ -533,7 +559,7 @@ async def delete_policy(
 # ============================================================================
 
 
-async def get_anomaly_or_404(db: AsyncSession, anomaly_id: str, org_id: Optional[str]) -> APIAnomalyDetection:
+async def get_anomaly_or_404(db: AsyncSession, anomaly_id: str, org_id: str) -> APIAnomalyDetection:
     """Get anomaly by ID or raise 404 (tenant-scoped)"""
     result = await db.execute(
         select(APIAnomalyDetection).where(
@@ -551,7 +577,7 @@ async def get_anomaly_or_404(db: AsyncSession, anomaly_id: str, org_id: Optional
 
 @router.get("/anomalies", response_model=APIAnomalyDetectionListResponse)
 async def list_anomalies(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -563,7 +589,6 @@ async def list_anomalies(
     sort_order: str = "desc",
 ):
     """List anomalies with filtering and pagination"""
-    org_id = getattr(current_user, "organization_id", None)
     query = select(APIAnomalyDetection).where(APIAnomalyDetection.organization_id == org_id)
 
     # Apply filters
@@ -611,13 +636,15 @@ async def list_anomalies(
 @router.post("/anomalies", response_model=APIAnomalyDetectionResponse, status_code=status.HTTP_201_CREATED)
 async def create_anomaly(
     anomaly_data: APIAnomalyDetectionCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Create a new anomaly detection record"""
+    await require_own_endpoint_field(db, anomaly_data.endpoint_id, org_id)
     anomaly = APIAnomalyDetection(
         **anomaly_data.model_dump(),
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
     )
     db.add(anomaly)
     await db.commit()
@@ -628,11 +655,11 @@ async def create_anomaly(
 @router.get("/anomalies/{anomaly_id}", response_model=APIAnomalyDetectionResponse)
 async def get_anomaly(
     anomaly_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get anomaly by ID"""
-    anomaly = await get_anomaly_or_404(db, anomaly_id, getattr(current_user, "organization_id", None))
+    anomaly = await get_anomaly_or_404(db, anomaly_id, org_id)
     return APIAnomalyDetectionResponse.model_validate(anomaly)
 
 
@@ -640,11 +667,12 @@ async def get_anomaly(
 async def update_anomaly(
     anomaly_id: str,
     anomaly_data: APIAnomalyDetectionUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Update an anomaly detection record"""
-    anomaly = await get_anomaly_or_404(db, anomaly_id, getattr(current_user, "organization_id", None))
+    anomaly = await get_anomaly_or_404(db, anomaly_id, org_id)
 
     update_data = anomaly_data.model_dump(exclude_unset=True)
     for field, value in update_data.items():
@@ -660,7 +688,7 @@ async def update_anomaly(
 # ============================================================================
 
 
-async def get_compliance_check_or_404(db: AsyncSession, check_id: str, org_id: Optional[str]) -> APIComplianceCheck:
+async def get_compliance_check_or_404(db: AsyncSession, check_id: str, org_id: str) -> APIComplianceCheck:
     """Get compliance check by ID or raise 404 (tenant-scoped)"""
     result = await db.execute(
         select(APIComplianceCheck).where(
@@ -678,7 +706,7 @@ async def get_compliance_check_or_404(db: AsyncSession, check_id: str, org_id: O
 
 @router.get("/compliance-checks", response_model=APIComplianceCheckListResponse)
 async def list_compliance_checks(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -689,7 +717,6 @@ async def list_compliance_checks(
     sort_order: str = "desc",
 ):
     """List compliance checks with filtering and pagination"""
-    org_id = getattr(current_user, "organization_id", None)
     query = select(APIComplianceCheck).where(APIComplianceCheck.organization_id == org_id)
 
     # Apply filters
@@ -735,13 +762,15 @@ async def list_compliance_checks(
 @router.post("/compliance-checks", response_model=APIComplianceCheckResponse, status_code=status.HTTP_201_CREATED)
 async def create_compliance_check(
     check_data: APIComplianceCheckCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Create a new compliance check"""
+    await require_own_endpoint_field(db, check_data.endpoint_id, org_id)
     check = APIComplianceCheck(
         **check_data.model_dump(),
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
     )
     db.add(check)
     await db.commit()
@@ -752,11 +781,11 @@ async def create_compliance_check(
 @router.get("/compliance-checks/{check_id}", response_model=APIComplianceCheckResponse)
 async def get_compliance_check(
     check_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get compliance check by ID"""
-    check = await get_compliance_check_or_404(db, check_id, getattr(current_user, "organization_id", None))
+    check = await get_compliance_check_or_404(db, check_id, org_id)
     return APIComplianceCheckResponse.model_validate(check)
 
 
@@ -764,11 +793,12 @@ async def get_compliance_check(
 async def update_compliance_check(
     check_id: str,
     check_data: APIComplianceCheckUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Update a compliance check"""
-    check = await get_compliance_check_or_404(db, check_id, getattr(current_user, "organization_id", None))
+    check = await get_compliance_check_or_404(db, check_id, org_id)
 
     update_data = check_data.model_dump(exclude_unset=True)
     for field, value in update_data.items():
@@ -786,12 +816,11 @@ async def update_compliance_check(
 
 @router.get("/dashboard", response_model=APISecurityDashboardResponse)
 async def get_dashboard(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get API security dashboard"""
     from datetime import timedelta as _timedelta
-    org_id = getattr(current_user, "organization_id", None)
 
     # Total endpoints
     endpoints_result = await db.execute(
@@ -958,7 +987,7 @@ async def get_dashboard(
 
 @router.get("/dashboard/risk-trend")
 async def get_risk_trend(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     days: int = Query(30, ge=1, le=90, description="Trailing window size in days"),
 ):
@@ -971,7 +1000,6 @@ async def get_risk_trend(
     when no findings exist in the window so the UI renders an honest
     empty state instead of a fabricated line.
     """
-    org_id = getattr(current_user, "organization_id", None)
     now = datetime.now(timezone.utc)
     window_start = (now - timedelta(days=days - 1)).replace(
         hour=0, minute=0, second=0, microsecond=0
@@ -1021,51 +1049,66 @@ async def get_risk_trend(
 # ============================================================================
 
 
-@router.post("/scan/discover", response_model=APIDiscoveryResultsResponse)
+@router.post("/scan/discover")
 async def trigger_api_discovery(
-    current_user: CurrentUser = None,
-    db: DatabaseSession = None,
-    background_tasks: BackgroundTasks = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     traffic_logs: Optional[List[dict]] = Body(None),
 ):
-    """Trigger API discovery scan from traffic"""
-    background_tasks.add_task(
-        api_discovery_scan,
-        getattr(current_user, "organization_id", None),
-        traffic_logs or [],
+    """Trigger API discovery scan from traffic (not implemented).
+
+    This used to queue an in-memory discovery whose results were thrown away
+    and answer ``scan_queued`` with hardcoded zero counts. Nothing was
+    discovered or saved, so it now says so. ``POST /scan/shadows`` persists
+    shadow APIs found in posted traffic logs.
+    """
+    logger.info(
+        "api_security_discovery_not_implemented",
+        organization_id=org_id,
+        traffic_log_count=len(traffic_logs or []),
     )
-    return APIDiscoveryResultsResponse(
-        new_endpoints_count=0,
-        shadow_apis_count=0,
-        zombie_apis_count=0,
-        total_discovered=0,
-        discovery_summary={"status": "scan_queued"},
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail={
+            "error": "not_implemented",
+            "detail": "API discovery results are not persisted yet; nothing was scanned. "
+            "Use POST /api-security/scan/shadows to record shadow APIs from traffic logs.",
+        },
     )
 
 
-@router.post("/scan/security/{endpoint_id}", response_model=APIScanResultResponse)
-async def trigger_security_scan(endpoint_id: str, current_user: CurrentUser = None, db: DatabaseSession = None, background_tasks: BackgroundTasks = None):
-    """Trigger security assessment for endpoint"""
+@router.post("/scan/security/{endpoint_id}")
+async def trigger_security_scan(
+    endpoint_id: str,
+    org_id: OrganizationId,
+    _user: AdminRoleUser = None,
+    db: DatabaseSession = None,
+    background_tasks: BackgroundTasks = None,
+) -> dict[str, str]:
+    """Queue a security assessment of an endpoint in the caller's organization.
+
+    Scans against live APIs are admin-only. The endpoint must belong to the
+    caller's tenant (404 otherwise). The response no longer reports zero
+    findings as if the scan had run: it only says the scan was queued; the
+    findings appear under ``GET /vulnerabilities`` when it finishes.
+    """
+    await get_endpoint_or_404(db, endpoint_id, org_id)
     background_tasks.add_task(
         security_assessment,
         endpoint_id,
-        getattr(current_user, "organization_id", None),
+        org_id,
     )
-    return APIScanResultResponse(
-        endpoint_id=endpoint_id,
-        vulnerabilities_found=0,
-        critical_count=0,
-        high_count=0,
-        medium_count=0,
-        low_count=0,
-        scan_timestamp=datetime.now(timezone.utc),
-        remediation_guidance="Scan in progress",
-    )
+    return {
+        "status": "security_scan_queued",
+        "endpoint_id": endpoint_id,
+        "detail": "findings are written to /api-security/vulnerabilities when the scan completes",
+    }
 
 
 @router.post("/scan/compliance/{endpoint_id}")
 async def trigger_compliance_check(
     endpoint_id: str,
+    org_id: OrganizationId,
     current_user: User = Depends(require_role([UserRole.ADMIN])),
     db: DatabaseSession = None,
     background_tasks: BackgroundTasks = None,
@@ -1076,7 +1119,6 @@ async def trigger_compliance_check(
     admin-only, limited to the caller's own inventory, and refused for
     private / loopback / link-local targets.
     """
-    org_id = getattr(current_user, "organization_id", None)
     endpoint = await get_endpoint_or_404(db, endpoint_id, org_id)
     base_url = (endpoint.base_url or "").strip()
     if base_url:
@@ -1103,7 +1145,8 @@ async def trigger_compliance_check(
 
 @router.post("/scan/shadows")
 async def trigger_shadow_api_detection(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
     background_tasks: BackgroundTasks = None,
     traffic_logs: Optional[List[dict]] = Body(None),
@@ -1111,7 +1154,7 @@ async def trigger_shadow_api_detection(
     """Trigger shadow API detection"""
     background_tasks.add_task(
         shadow_api_detection,
-        getattr(current_user, "organization_id", None),
+        org_id,
         traffic_logs or [],
     )
     return {"status": "shadow_api_detection_queued"}
@@ -1124,48 +1167,58 @@ async def trigger_shadow_api_detection(
 
 @router.get("/reports/compliance", response_model=APIComplianceReportResponse)
 async def get_compliance_report(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
-    """Get comprehensive compliance report"""
-    # Total checks
+    """Get the compliance report for the caller's organization."""
+    in_org = APIComplianceCheck.organization_id == org_id
+
     total_result = await db.execute(
-        select(func.count()).select_from(APIComplianceCheck)
+        select(func.count()).select_from(APIComplianceCheck).where(in_org)
     )
     total_checks = total_result.scalar() or 0
 
-    # Passed checks
     passed_result = await db.execute(
         select(func.count()).select_from(APIComplianceCheck).where(
-            APIComplianceCheck.passed == True
+            and_(in_org, APIComplianceCheck.passed == True)  # noqa: E712
         )
     )
     passed_checks = passed_result.scalar() or 0
-
-    # Failed checks
     failed_checks = total_checks - passed_checks
-
     pass_rate = (passed_checks / total_checks * 100) if total_checks > 0 else 0
 
-    # By check type
-    by_type_result = await db.execute(
-        select(APIComplianceCheck.check_type, func.count(APIComplianceCheck.id))
-        .group_by(APIComplianceCheck.check_type)
-    )
-    by_type_data = dict(by_type_result.all())
+    endpoints_checked = (
+        await db.execute(
+            select(func.count(func.distinct(APIComplianceCheck.endpoint_id))).where(in_org)
+        )
+    ).scalar() or 0
+    total_endpoints = (
+        await db.execute(
+            select(func.count()).select_from(APIEndpointInventory).where(
+                APIEndpointInventory.organization_id == org_id
+            )
+        )
+    ).scalar() or 0
 
-    by_type = {
-        check_type: {
-            "total": count,
-            "passed": 0,
-            "failed": 0,
-        }
-        for check_type, count in by_type_data.items()
-    }
+    # By check type (pass/fail used to be hardcoded 0)
+    by_type_result = await db.execute(
+        select(
+            APIComplianceCheck.check_type,
+            APIComplianceCheck.passed,
+            func.count(APIComplianceCheck.id),
+        )
+        .where(in_org)
+        .group_by(APIComplianceCheck.check_type, APIComplianceCheck.passed)
+    )
+    by_type: dict[str, dict[str, int]] = {}
+    for check_type, passed, count in by_type_result.all():
+        bucket = by_type.setdefault(check_type, {"total": 0, "passed": 0, "failed": 0})
+        bucket["total"] += count
+        bucket["passed" if passed else "failed"] += count
 
     return APIComplianceReportResponse(
-        total_endpoints=total_checks,
-        endpoints_checked=total_checks,
+        total_endpoints=total_endpoints,
+        endpoints_checked=endpoints_checked,
         checks_passed=passed_checks,
         checks_failed=failed_checks,
         pass_rate=pass_rate,

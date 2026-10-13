@@ -3,13 +3,14 @@
 import json
 import math
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Annotated, Optional
 
-from fastapi import APIRouter, Path, HTTPException, Query, status
+from fastapi import Depends, APIRouter, Path, HTTPException, Query, status
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import CurrentUser, DatabaseSession
+from src.api.deps import CurrentUser, DatabaseSession, OrganizationId, require_role
+from src.models.user import User, UserRole
 from src.core.database import async_session_factory
 from src.core.logging import get_logger
 from src.services.automation import AutomationService
@@ -64,6 +65,11 @@ logger = get_logger(__name__)
 
 router = APIRouter(prefix="/vulnmgmt", tags=["Vulnerability Management"])
 
+# Wave 1 role gates: viewers read only; analysts for operational writes;
+# admins for configuration and actions against live systems.
+AnalystUser = Annotated[User, Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
+AdminRoleUser = Annotated[User, Depends(require_role([UserRole.ADMIN]))]
+
 
 async def get_or_404(db: AsyncSession, model: type, item_id: str, org_id: str) -> any:
     """Get model instance or raise 404"""
@@ -87,7 +93,7 @@ async def get_or_404(db: AsyncSession, model: type, item_id: str, org_id: str) -
 # Vulnerability Database Endpoints
 @router.get("/vulnerabilities", response_model=VulnerabilityListResponse)
 async def list_vulnerabilities(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -99,7 +105,6 @@ async def list_vulnerabilities(
     sort_order: str = "desc",
 ):
     """List vulnerabilities with filtering and pagination"""
-    org_id = getattr(current_user, "organization_id", None)
 
     query = select(Vulnerability).where(Vulnerability.organization_id == org_id)
 
@@ -148,11 +153,12 @@ async def list_vulnerabilities(
 @router.post("/vulnerabilities", response_model=VulnerabilityResponse, status_code=status.HTTP_201_CREATED)
 async def create_vulnerability(
     vuln_data: VulnerabilityCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Create a vulnerability record"""
-    vuln_data.organization_id = getattr(current_user, "organization_id", None)
+    vuln_data.organization_id = org_id
 
     vuln = Vulnerability(**vuln_data.dict())
     db.add(vuln)
@@ -161,7 +167,6 @@ async def create_vulnerability(
 
     # Trigger automation for new vulnerability
     try:
-        org_id = getattr(current_user, "organization_id", None)
         automation = AutomationService(db)
         await automation.on_vulnerability_found(
             cve_id=vuln.cve_id,
@@ -178,24 +183,25 @@ async def create_vulnerability(
 
 @router.get("/vulnerabilities/{vuln_id}", response_model=VulnerabilityResponse)
 async def get_vulnerability(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     vuln_id: str = Path(...),
 ):
     """Get vulnerability by ID"""
-    vuln = await get_or_404(db, Vulnerability, vuln_id, getattr(current_user, "organization_id", None))
+    vuln = await get_or_404(db, Vulnerability, vuln_id, org_id)
     return VulnerabilityResponse.model_validate(vuln)
 
 
 @router.put("/vulnerabilities/{vuln_id}", response_model=VulnerabilityResponse)
 async def update_vulnerability(
     vuln_data: VulnerabilityUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
     vuln_id: str = Path(...),
 ):
     """Update a vulnerability"""
-    vuln = await get_or_404(db, Vulnerability, vuln_id, getattr(current_user, "organization_id", None))
+    vuln = await get_or_404(db, Vulnerability, vuln_id, org_id)
 
     update_data = vuln_data.dict(exclude_unset=True)
     for key, value in update_data.items():
@@ -209,7 +215,8 @@ async def update_vulnerability(
 @router.post("/vulnerabilities/import-scan", response_model=None)
 async def import_scan_results(
     scan_request: ScanImportRequest,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Import vulnerability scan results.
@@ -223,7 +230,6 @@ async def import_scan_results(
     critical CVEs created DB rows (or before Page 18, not even that)
     without ever notifying anyone.
     """
-    org_id = getattr(current_user, "organization_id", None)
 
     try:
         scanner = VulnerabilityScanner(org_id)
@@ -284,11 +290,11 @@ async def import_scan_results(
 @router.post("/vulnerabilities/sync-kev")
 async def sync_kev(
     kev_data: dict,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Sync CISA Known Exploited Vulnerabilities"""
-    org_id = getattr(current_user, "organization_id", None)
 
     try:
         monitor = KEVMonitor(org_id)
@@ -314,11 +320,12 @@ async def sync_kev(
 # Vulnerability Instance Endpoints
 @router.get("/instances", response_model=VulnerabilityInstanceListResponse)
 async def list_instances(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     asset_id: Optional[str] = None,
+    vulnerability_id: Optional[str] = None,
     severity: Optional[str] = None,
     status: Optional[str] = None,
     assigned_to: Optional[str] = None,
@@ -327,7 +334,6 @@ async def list_instances(
     sort_order: str = "desc",
 ):
     """List vulnerability instances with filtering"""
-    org_id = getattr(current_user, "organization_id", None)
 
     query = select(VulnerabilityInstance).where(
         VulnerabilityInstance.organization_id == org_id
@@ -336,6 +342,9 @@ async def list_instances(
     # Apply filters
     if asset_id:
         query = query.where(VulnerabilityInstance.asset_id == asset_id)
+
+    if vulnerability_id:
+        query = query.where(VulnerabilityInstance.vulnerability_id == vulnerability_id)
 
     if status:
         query = query.where(VulnerabilityInstance.status == status)
@@ -380,11 +389,13 @@ async def list_instances(
 @router.post("/instances", response_model=VulnerabilityInstanceResponse, status_code=status.HTTP_201_CREATED)
 async def create_instance(
     instance_data: VulnerabilityInstanceCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
-    """Create vulnerability instance"""
-    instance_data.organization_id = getattr(current_user, "organization_id", None)
+    """Create vulnerability instance (its vulnerability must be in the caller's org)."""
+    instance_data.organization_id = org_id
+    await get_or_404(db, Vulnerability, instance_data.vulnerability_id, org_id)
 
     instance = VulnerabilityInstance(**instance_data.dict())
     db.add(instance)
@@ -396,13 +407,13 @@ async def create_instance(
 
 @router.get("/instances/{instance_id}", response_model=VulnerabilityInstanceResponse)
 async def get_instance(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     instance_id: str = Path(...),
 ):
     """Get vulnerability instance by ID"""
     instance = await get_or_404(
-        db, VulnerabilityInstance, instance_id, getattr(current_user, "organization_id", None)
+        db, VulnerabilityInstance, instance_id, org_id
     )
     return VulnerabilityInstanceResponse.model_validate(instance)
 
@@ -410,13 +421,14 @@ async def get_instance(
 @router.put("/instances/{instance_id}", response_model=VulnerabilityInstanceResponse)
 async def update_instance(
     instance_data: VulnerabilityInstanceUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
     instance_id: str = Path(...),
 ):
     """Update vulnerability instance"""
     instance = await get_or_404(
-        db, VulnerabilityInstance, instance_id, getattr(current_user, "organization_id", None)
+        db, VulnerabilityInstance, instance_id, org_id
     )
 
     update_data = instance_data.dict(exclude_unset=True)
@@ -431,11 +443,11 @@ async def update_instance(
 @router.post("/instances/bulk-action")
 async def bulk_action_instances(
     action_request: BulkAction,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Perform bulk action on vulnerability instances"""
-    org_id = getattr(current_user, "organization_id", None)
 
     result = await db.execute(
         select(VulnerabilityInstance).where(
@@ -469,14 +481,13 @@ async def bulk_action_instances(
 # Scan Profile Endpoints
 @router.get("/scan-profiles", response_model=ScanProfileListResponse)
 async def list_scan_profiles(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     enabled_only: bool = False,
 ):
     """List scan profiles"""
-    org_id = getattr(current_user, "organization_id", None)
 
     query = select(ScanProfile).where(ScanProfile.organization_id == org_id)
 
@@ -504,11 +515,12 @@ async def list_scan_profiles(
 @router.post("/scan-profiles", response_model=ScanProfileResponse, status_code=status.HTTP_201_CREATED)
 async def create_scan_profile(
     profile_data: ScanProfileCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AdminRoleUser = None,
     db: DatabaseSession = None,
 ):
     """Create scan profile"""
-    profile_data.organization_id = getattr(current_user, "organization_id", None)
+    profile_data.organization_id = org_id
 
     profile = ScanProfile(**profile_data.dict())
     db.add(profile)
@@ -521,13 +533,14 @@ async def create_scan_profile(
 @router.put("/scan-profiles/{profile_id}", response_model=ScanProfileResponse)
 async def update_scan_profile(
     profile_data: ScanProfileUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AdminRoleUser = None,
     db: DatabaseSession = None,
     profile_id: str = Path(...),
 ):
     """Update scan profile"""
     profile = await get_or_404(
-        db, ScanProfile, profile_id, getattr(current_user, "organization_id", None)
+        db, ScanProfile, profile_id, org_id
     )
 
     update_data = profile_data.dict(exclude_unset=True)
@@ -542,14 +555,13 @@ async def update_scan_profile(
 # Patch Operation Endpoints
 @router.get("/patch-operations", response_model=PatchOperationListResponse)
 async def list_patch_operations(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
     status: Optional[str] = None,
 ):
     """List patch operations"""
-    org_id = getattr(current_user, "organization_id", None)
 
     query = select(PatchOperation).where(PatchOperation.organization_id == org_id)
 
@@ -577,11 +589,11 @@ async def list_patch_operations(
 @router.post("/patch-operations/create-plan")
 async def create_patch_plan(
     plan_request: PatchPlanRequest,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Create patch deployment plan"""
-    org_id = getattr(current_user, "organization_id", None)
 
     # Get instances
     result = await db.execute(
@@ -609,35 +621,22 @@ async def create_patch_plan(
 @router.post("/patch-operations/{patch_id}/schedule")
 async def schedule_patch(
     schedule_request: PatchDeploymentRequest,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
     patch_id: str = Path(...),
 ):
-    """Schedule patch deployment and dispatch to agent when possible.
+    """Record the planned deployment date of a patch operation.
 
-    After scheduling the operation, look up the affected asset's
-    hostname via the VulnerabilityInstance -> Asset chain and, if an
-    IR-capable agent is enrolled for that host, queue a
-    ``run_atomic_test`` command on the Agent Platform referencing
-    the patch's fix. ``run_atomic_test`` is the closest existing
-    agent action for a shell remediation — the operator can later
-    wire a dedicated ``run_patch_script`` action if the Agent
-    Platform gains one. High-blast actions go through the standard
-    awaiting_approval gate so a second analyst signs off before the
-    command actually runs on the host.
+    Record-keeping only. There is no patch deployment integration: the old
+    handler queued an agent command that merely echoed "scheduled" on the
+    host while reporting a dispatch. Nothing is sent to hosts now, and the
+    response says so (``deployment_dispatched: false``).
     """
-    from src.agents.capabilities import AgentAction, AgentCapability
-    from src.agents.models import EndpointAgent
-    from src.agents.service import AgentService
-    from src.vulnmgmt.models import VulnerabilityInstance
-    from src.models.asset import Asset
-
-    org_id = getattr(current_user, "organization_id", None)
-
     patch = await get_or_404(db, PatchOperation, patch_id, org_id)
 
     orchestrator = PatchOrchestrator(org_id)
-    success = await orchestrator.schedule_deployment(db, patch_id, schedule_request.deployment_date)
+    success = await orchestrator.schedule_deployment(db, patch.id, schedule_request.deployment_date)
 
     if not success:
         raise HTTPException(
@@ -645,114 +644,65 @@ async def schedule_patch(
             detail="Failed to schedule patch",
         )
 
-    # Find the target host for this patch and dispatch via agent
-    agent_command_id: Optional[str] = None
-    try:
-        instance_result = await db.execute(
-            select(VulnerabilityInstance).where(
-                VulnerabilityInstance.id == patch.vulnerability_instance_id
-            )
-        )
-        instance = instance_result.scalar_one_or_none()
-        if instance and instance.asset_id:
-            asset_result = await db.execute(
-                select(Asset).where(Asset.id == instance.asset_id)
-            )
-            asset = asset_result.scalar_one_or_none()
-            hostname = asset.hostname if asset else None
-
-            if hostname:
-                agent_q = select(EndpointAgent).where(
-                    and_(
-                        EndpointAgent.hostname == hostname,
-                        EndpointAgent.status == "active",
-                    )
-                )
-                if org_id:
-                    agent_q = agent_q.where(EndpointAgent.organization_id == org_id)
-
-                agents = list((await db.execute(agent_q)).scalars().all())
-                ir_agent = next(
-                    (
-                        a
-                        for a in agents
-                        if AgentCapability.LIVE_RESPONSE.value in (a.capabilities or [])
-                    ),
-                    None,
-                )
-                if ir_agent is not None:
-                    svc = AgentService(db)
-                    cmd = await svc.issue_command(
-                        agent=ir_agent,
-                        action=AgentAction.RUN_ATOMIC_TEST.value,
-                        payload={
-                            "command": (
-                                f"echo '[pysoar] patch operation {patch_id} "
-                                f"scheduled for {schedule_request.deployment_date}'"
-                            ),
-                            "executor": "sh",
-                            "patch_operation_id": patch_id,
-                        },
-                        issued_by=str(current_user.id) if current_user else None,
-                    )
-                    agent_command_id = cmd.id
-                    # Record the linkage in the patch operation's notes
-                    existing_notes = patch.deployment_notes or ""
-                    patch.deployment_notes = (
-                        existing_notes + f"\nagent_command_id={cmd.id}"
-                    ).strip()
-                    await db.flush()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(f"Agent dispatch failed for patch {patch_id}: {exc}")
-
     await db.refresh(patch)
-    response = PatchOperationResponse.model_validate(patch)
-    # Attach the agent_command_id to the response for frontend convenience
-    try:
-        response_dict = response.model_dump()
-        response_dict["agent_command_id"] = agent_command_id
-        return response_dict
-    except Exception:  # noqa: BLE001
-        return response
+    response_dict = PatchOperationResponse.model_validate(patch).model_dump()
+    response_dict["agent_command_id"] = None
+    response_dict["deployment_dispatched"] = False
+    response_dict["detail"] = (
+        "Deployment date recorded. No patch was pushed to any host: "
+        "automated patch deployment is not implemented."
+    )
+    return response_dict
 
 
 @router.post("/patch-operations/{patch_id}/verify")
 async def verify_patch(
     verification_request: PatchVerificationRequest,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
     patch_id: str = Path(...),
 ):
-    """Verify patch deployment"""
-    org_id = getattr(current_user, "organization_id", None)
+    """Record the caller's verification result for a patch deployment.
+
+    Record-keeping: the status follows the submitted ``passed`` flag; the
+    platform does not re-check the host.
+    """
+    patch = await get_or_404(db, PatchOperation, patch_id, org_id)
 
     orchestrator = PatchOrchestrator(org_id)
     success = await orchestrator.verify_patch(
         db,
-        patch_id,
+        patch.id,
         verification_request.verification_results,
     )
 
-    patch = await get_or_404(db, PatchOperation, patch_id, org_id)
+    await db.refresh(patch)
     return {
         "success": success,
         "patch_id": patch_id,
         "status": patch.deployment_status,
+        "recorded_only": True,
     }
 
 
 @router.post("/patch-operations/{patch_id}/rollback")
 async def rollback_patch(
     rollback_request: PatchRollbackRequest,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
     patch_id: str = Path(...),
 ):
-    """Rollback patch deployment"""
-    org_id = getattr(current_user, "organization_id", None)
+    """Record a rollback of a patch deployment.
+
+    Record-keeping: marks the operation rolled back with the reason; nothing
+    is executed on hosts.
+    """
+    patch = await get_or_404(db, PatchOperation, patch_id, org_id)
 
     orchestrator = PatchOrchestrator(org_id)
-    success = await orchestrator.rollback_patch(db, patch_id, rollback_request.reason)
+    success = await orchestrator.rollback_patch(db, patch.id, rollback_request.reason)
 
     if not success:
         raise HTTPException(
@@ -760,18 +710,19 @@ async def rollback_patch(
             detail="Failed to rollback patch",
         )
 
-    patch = await get_or_404(db, PatchOperation, patch_id, org_id)
+    await db.refresh(patch)
     return {
         "success": success,
         "patch_id": patch_id,
         "status": patch.deployment_status,
+        "recorded_only": True,
     }
 
 
 # Exception and Risk Acceptance Endpoints
 @router.get("/exceptions")
 async def list_exceptions(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(50, ge=1, le=200),
@@ -784,10 +735,7 @@ async def list_exceptions(
     size, pages}``. Tenant-scoped on ``organization_id`` so one org can
     never see another org's exceptions.
     """
-    org_id = getattr(current_user, "organization_id", None)
-    query = select(VulnerabilityException)
-    if org_id is not None and hasattr(VulnerabilityException, "organization_id"):
-        query = query.where(VulnerabilityException.organization_id == org_id)
+    query = select(VulnerabilityException).where(VulnerabilityException.organization_id == org_id)
     if status and hasattr(VulnerabilityException, "status"):
         query = query.where(VulnerabilityException.status == status)
 
@@ -813,11 +761,13 @@ async def list_exceptions(
 @router.post("/exceptions", response_model=VulnerabilityExceptionResponse, status_code=status.HTTP_201_CREATED)
 async def create_exception(
     exception_data: VulnerabilityExceptionCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Create vulnerability exception"""
-    exception_data.organization_id = getattr(current_user, "organization_id", None)
+    exception_data.organization_id = org_id
+    await get_or_404(db, VulnerabilityInstance, exception_data.vulnerability_instance_id, org_id)
 
     exception = VulnerabilityException(**exception_data.dict())
     db.add(exception)
@@ -830,13 +780,14 @@ async def create_exception(
 @router.put("/exceptions/{exception_id}", response_model=VulnerabilityExceptionResponse)
 async def update_exception(
     exception_data: VulnerabilityExceptionUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
     exception_id: str = Path(...),
 ):
     """Update vulnerability exception"""
     exception = await get_or_404(
-        db, VulnerabilityException, exception_id, getattr(current_user, "organization_id", None)
+        db, VulnerabilityException, exception_id, org_id
     )
 
     update_data = exception_data.dict(exclude_unset=True)
@@ -851,7 +802,7 @@ async def update_exception(
 # Dashboard and Reporting Endpoints
 @router.get("/dashboard", response_model=DashboardMetrics)
 async def get_dashboard(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get vulnerability management dashboard metrics.
@@ -863,7 +814,6 @@ async def get_dashboard(
 
     All three are now computed from real data.
     """
-    org_id = getattr(current_user, "organization_id", None)
 
     prioritizer = RiskPrioritizer(org_id)
     orchestrator = PatchOrchestrator(org_id)
@@ -887,6 +837,36 @@ async def get_dashboard(
     )
     top_vulns = result.scalars().all()
 
+    # Catalog counts for the summary cards (org-scoped).
+    total_vulnerabilities = (
+        await db.execute(
+            select(func.count()).select_from(Vulnerability).where(Vulnerability.organization_id == org_id)
+        )
+    ).scalar() or 0
+    critical_vulnerabilities = (
+        await db.execute(
+            select(func.count())
+            .select_from(Vulnerability)
+            .where(and_(Vulnerability.organization_id == org_id, Vulnerability.severity == "critical"))
+        )
+    ).scalar() or 0
+
+    # MTTR only exists once something has been remediated; with nothing
+    # remediated it is unknown (None), not 0 days.
+    remediated_count = (
+        await db.execute(
+            select(func.count())
+            .select_from(VulnerabilityInstance)
+            .where(
+                and_(
+                    VulnerabilityInstance.organization_id == org_id,
+                    VulnerabilityInstance.status.in_(["patched", "mitigated"]),
+                )
+            )
+        )
+    ).scalar() or 0
+    mttr_days = await lifecycle.track_mean_time_to_remediate(db) if remediated_count else None
+
     # --- Real patch_compliance_percentage ---
     total_ops = patch_report.get("total_operations", 0) or 0
     patched_ops = (patch_report.get("verified", 0) or 0) + (patch_report.get("deployed", 0) or 0)
@@ -902,6 +882,9 @@ async def get_dashboard(
     kev_patched = int(kev_compliance.get("compliant", 0) or 0)
 
     return DashboardMetrics(
+        total_vulnerabilities=total_vulnerabilities,
+        critical_vulnerabilities=critical_vulnerabilities,
+        mttr_days=mttr_days,
         risk_matrix=RiskMatrix(severity_x_exploitability=risk_matrix_counts),
         sla_compliance=SLAComplianceMetrics(
             total=sla_compliance["total"],
@@ -931,11 +914,10 @@ async def get_dashboard(
 
 @router.get("/report/executive")
 async def get_executive_report(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get executive summary report"""
-    org_id = getattr(current_user, "organization_id", None)
 
     lifecycle = VulnerabilityLifecycle(org_id)
     report = await lifecycle.generate_executive_report(db)
@@ -945,11 +927,10 @@ async def get_executive_report(
 
 @router.get("/report/kev-compliance")
 async def get_kev_compliance_report(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get BOD 22-01 KEV compliance report"""
-    org_id = getattr(current_user, "organization_id", None)
 
     kev_monitor = KEVMonitor(org_id)
     report = await kev_monitor.generate_bod_22_01_report(db)

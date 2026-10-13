@@ -432,7 +432,8 @@ class RiskPrioritizer:
         for instance in instances:
             result = await db.execute(
                 select(Vulnerability).where(
-                    Vulnerability.id == instance.vulnerability_id
+                    Vulnerability.id == instance.vulnerability_id,
+                    Vulnerability.organization_id == self.organization_id,
                 )
             )
             vuln = result.scalar_one_or_none()

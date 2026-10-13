@@ -25,7 +25,12 @@ from src.core.logging import get_logger
 
 logger = get_logger(__name__)
 
+#: Seeded FedRAMP frameworks use ``fedramp_moderate`` (and could use
+#: ``fedramp_low`` / ``fedramp_high``); match on the prefix, never on "fedramp".
+FEDRAMP_SHORT_NAME_PREFIX = "fedramp"
+
 __all__ = [
+    "FEDRAMP_SHORT_NAME_PREFIX",
     "BuiltinFrameworks",
     "CISAComplianceManager",
     "CMMCManager",
@@ -68,7 +73,12 @@ class ComplianceEngine:
             Assessment results with control status, score, and findings
         """
         framework = (
-            await self.db.execute(select(ComplianceFramework).where(ComplianceFramework.id == framework_id))
+            await self.db.execute(
+                select(ComplianceFramework).where(
+                    ComplianceFramework.id == framework_id,
+                    ComplianceFramework.organization_id == self.org_id,
+                ),
+            )
         ).scalar_one_or_none()
         if not framework:
             raise ValueError(f"Framework {framework_id} not found")
@@ -209,7 +219,12 @@ class ComplianceEngine:
         markdown rendering is produced by ``ssp_to_markdown(ssp_doc)``.
         """
         framework = (
-            await self.db.execute(select(ComplianceFramework).where(ComplianceFramework.id == framework_id))
+            await self.db.execute(
+                select(ComplianceFramework).where(
+                    ComplianceFramework.id == framework_id,
+                    ComplianceFramework.organization_id == self.org_id,
+                ),
+            )
         ).scalar_one_or_none()
         if not framework:
             raise ValueError(f"Framework {framework_id} not found")
@@ -671,7 +686,7 @@ class FedRAMPManager:
         """
         stmt = select(ComplianceFramework).where(
             and_(
-                ComplianceFramework.short_name == "fedramp",
+                ComplianceFramework.short_name.like(f"{FEDRAMP_SHORT_NAME_PREFIX}%"),
                 ComplianceFramework.certification_level.ilike(f"%{baseline}%"),
                 ComplianceFramework.organization_id == self.org_id,
             ),
@@ -697,7 +712,7 @@ class FedRAMPManager:
         """
         stmt = select(ComplianceFramework).where(
             and_(
-                ComplianceFramework.short_name == "fedramp",
+                ComplianceFramework.short_name.like(f"{FEDRAMP_SHORT_NAME_PREFIX}%"),
                 ComplianceFramework.certification_level.ilike(f"%{baseline}%"),
                 ComplianceFramework.organization_id == self.org_id,
             ),
@@ -723,7 +738,7 @@ class FedRAMPManager:
         """
         stmt = select(ComplianceFramework).where(
             and_(
-                ComplianceFramework.short_name == "fedramp",
+                ComplianceFramework.short_name.like(f"{FEDRAMP_SHORT_NAME_PREFIX}%"),
                 ComplianceFramework.organization_id == self.org_id,
             ),
         )
@@ -751,7 +766,7 @@ class FedRAMPManager:
         """
         stmt = select(ComplianceFramework).where(
             and_(
-                ComplianceFramework.short_name == "fedramp",
+                ComplianceFramework.short_name.like(f"{FEDRAMP_SHORT_NAME_PREFIX}%"),
                 ComplianceFramework.certification_level.ilike(f"%{baseline}%"),
                 ComplianceFramework.organization_id == self.org_id,
             ),
@@ -903,7 +918,9 @@ class NISTManager:
             "completion_percentage": ((implemented / len(controls) * 100) if controls else 0),
         }
 
-    async def automated_control_check(self, control_id: str) -> Dict[str, Any]:
+    async def automated_control_check(
+        self, control_id: str, framework_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         Run automated check for a specific control.
 
@@ -912,9 +929,16 @@ class NISTManager:
         Returns:
             Automated check result
         """
-        stmt = select(ComplianceControl).where(ComplianceControl.control_id == control_id)
+        # A control code (AC-2) is seeded once per framework for every tenant,
+        # so the lookup is scoped to the tenant and, when given, the framework.
+        stmt = select(ComplianceControl).where(
+            ComplianceControl.control_id == control_id,
+            ComplianceControl.organization_id == self.org_id,
+        )
+        if framework_id is not None:
+            stmt = stmt.where(ComplianceControl.framework_id == framework_id)
         result = await self.db.execute(stmt)
-        control = result.scalar_one_or_none()
+        control = result.scalars().first()
 
         if not control:
             return {"error": f"Control {control_id} not found"}
@@ -1529,11 +1553,14 @@ class CISAComplianceManager:
         Returns:
             KEV patching status
         """
+        # No KEV-vs-inventory comparison runs here; report that honestly
+        # instead of the constant "compliant" this used to return.
         return {
             "bod_id": "BOD 22-01",
             "title": "Binding Operational Directive 22-01: Reducing the Significant Risk of Known Exploited Vulnerabilities",
             "required_patching_deadline": "30 days from publication",
-            "compliance_status": "compliant",
+            "compliance_status": "not_assessed",
+            "detail": "KEV patch compliance is not computed by the compliance engine",
         }
 
     async def check_ed_compliance(self, directive_id: str) -> Dict[str, Any]:

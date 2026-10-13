@@ -7,13 +7,14 @@ classification, and incident response.
 
 import json
 import math
-from typing import Any, Optional
+from typing import Annotated, Any, Optional
 
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import Depends, APIRouter, HTTPException, Query, status
 from sqlalchemy import and_, case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src.api.deps import CurrentUser, DatabaseSession
+from src.api.deps import CurrentUser, DatabaseSession, OrganizationId, require_role
+from src.models.user import User, UserRole
 from src.core.logging import get_logger
 from src.dlp.models import (
     DLPIncident,
@@ -74,6 +75,11 @@ logger = get_logger(__name__)
 
 router = APIRouter(prefix="/dlp", tags=["DLP"])
 
+# Wave 1 role gates: viewers read only; analysts for operational writes;
+# admins for configuration and actions against live systems.
+AnalystUser = Annotated[User, Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
+AdminRoleUser = Annotated[User, Depends(require_role([UserRole.ADMIN]))]
+
 # Engines and tools
 dlp_engine = DLPEngine()
 classifier = DataClassifier()
@@ -85,12 +91,12 @@ assessor = BreachAssessor()
 # Helper functions
 
 async def get_policy_or_404(
-    db: AsyncSession, policy_id: str, org_id: Optional[str] = None
+    db: AsyncSession, policy_id: str, org_id: str
 ) -> DLPPolicy:
     """Get policy by ID or raise 404"""
-    stmt = select(DLPPolicy).where(DLPPolicy.id == policy_id)
-    if org_id is not None:
-        stmt = stmt.where(DLPPolicy.organization_id == org_id)
+    stmt = select(DLPPolicy).where(
+        DLPPolicy.id == policy_id, DLPPolicy.organization_id == org_id
+    )
     result = await db.execute(stmt)
     policy = result.scalar_one_or_none()
     if not policy:
@@ -99,12 +105,12 @@ async def get_policy_or_404(
 
 
 async def get_violation_or_404(
-    db: AsyncSession, violation_id: str, org_id: Optional[str] = None
+    db: AsyncSession, violation_id: str, org_id: str
 ) -> DLPViolation:
     """Get violation by ID or raise 404"""
-    stmt = select(DLPViolation).where(DLPViolation.id == violation_id)
-    if org_id is not None:
-        stmt = stmt.where(DLPViolation.organization_id == org_id)
+    stmt = select(DLPViolation).where(
+        DLPViolation.id == violation_id, DLPViolation.organization_id == org_id
+    )
     result = await db.execute(stmt)
     violation = result.scalar_one_or_none()
     if not violation:
@@ -113,12 +119,12 @@ async def get_violation_or_404(
 
 
 async def get_classification_or_404(
-    db: AsyncSession, class_id: str, org_id: Optional[str] = None
+    db: AsyncSession, class_id: str, org_id: str
 ) -> DataClassification:
     """Get classification by ID or raise 404"""
-    stmt = select(DataClassification).where(DataClassification.id == class_id)
-    if org_id is not None:
-        stmt = stmt.where(DataClassification.organization_id == org_id)
+    stmt = select(DataClassification).where(
+        DataClassification.id == class_id, DataClassification.organization_id == org_id
+    )
     result = await db.execute(stmt)
     classification = result.scalar_one_or_none()
     if not classification:
@@ -130,12 +136,12 @@ async def get_classification_or_404(
 
 
 async def get_incident_or_404(
-    db: AsyncSession, incident_id: str, org_id: Optional[str] = None
+    db: AsyncSession, incident_id: str, org_id: str
 ) -> DLPIncident:
     """Get incident by ID or raise 404"""
-    stmt = select(DLPIncident).where(DLPIncident.id == incident_id)
-    if org_id is not None:
-        stmt = stmt.where(DLPIncident.organization_id == org_id)
+    stmt = select(DLPIncident).where(
+        DLPIncident.id == incident_id, DLPIncident.organization_id == org_id
+    )
     result = await db.execute(stmt)
     incident = result.scalar_one_or_none()
     if not incident:
@@ -160,12 +166,13 @@ def convert_json_fields(model_obj):
 @router.post("/policies", response_model=DLPPolicyResponse, status_code=status.HTTP_201_CREATED)
 async def create_policy(
     policy_data: DLPPolicyCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AdminRoleUser = None,
     db: DatabaseSession = None,
 ):
     """Create a new DLP policy"""
     policy = DLPPolicy(
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         name=policy_data.name,
         description=policy_data.description,
         policy_type=policy_data.policy_type,
@@ -191,7 +198,7 @@ async def create_policy(
 
 @router.get("/policies", response_model=DLPPolicyListResponse)
 async def list_policies(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -200,7 +207,7 @@ async def list_policies(
     search: Optional[str] = None,
 ):
     """List DLP policies"""
-    query = select(DLPPolicy).where(DLPPolicy.organization_id == getattr(current_user, "organization_id", None))
+    query = select(DLPPolicy).where(DLPPolicy.organization_id == org_id)
 
     if enabled is not None:
         query = query.where(DLPPolicy.enabled == enabled)
@@ -231,11 +238,11 @@ async def list_policies(
 @router.get("/policies/{policy_id}", response_model=DLPPolicyResponse)
 async def get_policy(
     policy_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get DLP policy by ID"""
-    policy = await get_policy_or_404(db, policy_id, getattr(current_user, "organization_id", None))
+    policy = await get_policy_or_404(db, policy_id, org_id)
     return convert_json_fields(policy)
 
 
@@ -243,11 +250,12 @@ async def get_policy(
 async def update_policy(
     policy_id: str,
     policy_data: DLPPolicyUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AdminRoleUser = None,
     db: DatabaseSession = None,
 ):
     """Update a DLP policy"""
-    policy = await get_policy_or_404(db, policy_id, getattr(current_user, "organization_id", None))
+    policy = await get_policy_or_404(db, policy_id, org_id)
 
     update_data = policy_data.model_dump(exclude_unset=True, exclude_none=True)
 
@@ -269,11 +277,12 @@ async def update_policy(
 @router.delete("/policies/{policy_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_policy(
     policy_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AdminRoleUser = None,
     db: DatabaseSession = None,
 ):
     """Delete a DLP policy"""
-    policy = await get_policy_or_404(db, policy_id, getattr(current_user, "organization_id", None))
+    policy = await get_policy_or_404(db, policy_id, org_id)
     await db.delete(policy)
     await db.flush()
 
@@ -281,11 +290,12 @@ async def delete_policy(
 @router.post("/policies/{policy_id}/enable", response_model=DLPPolicyResponse)
 async def enable_policy(
     policy_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AdminRoleUser = None,
     db: DatabaseSession = None,
 ):
     """Enable a DLP policy"""
-    policy = await get_policy_or_404(db, policy_id, getattr(current_user, "organization_id", None))
+    policy = await get_policy_or_404(db, policy_id, org_id)
     policy.enabled = True
     await db.flush()
     await db.refresh(policy)
@@ -295,11 +305,12 @@ async def enable_policy(
 @router.post("/policies/{policy_id}/disable", response_model=DLPPolicyResponse)
 async def disable_policy(
     policy_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AdminRoleUser = None,
     db: DatabaseSession = None,
 ):
     """Disable a DLP policy"""
-    policy = await get_policy_or_404(db, policy_id, getattr(current_user, "organization_id", None))
+    policy = await get_policy_or_404(db, policy_id, org_id)
     policy.enabled = False
     await db.flush()
     await db.refresh(policy)
@@ -310,11 +321,12 @@ async def disable_policy(
 async def test_policy(
     policy_id: str,
     test_request: DLPPolicyTestRequest,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Test a policy against sample data"""
-    policy = await get_policy_or_404(db, policy_id, getattr(current_user, "organization_id", None))
+    policy = await get_policy_or_404(db, policy_id, org_id)
 
     # Evaluate content
     evaluation = dlp_engine.evaluate_content(
@@ -338,12 +350,15 @@ async def test_policy(
 @router.post("/violations", response_model=DLPViolationResponse, status_code=status.HTTP_201_CREATED)
 async def create_violation(
     violation_data: DLPViolationCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Create a DLP violation record"""
+    if violation_data.policy_id:
+        await get_policy_or_404(db, violation_data.policy_id, org_id)
     violation = DLPViolation(
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         policy_id=violation_data.policy_id,
         violation_type=violation_data.violation_type,
         severity=violation_data.severity,
@@ -371,7 +386,7 @@ async def create_violation(
 
 @router.get("/violations", response_model=DLPViolationListResponse)
 async def list_violations(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -381,7 +396,7 @@ async def list_violations(
     search: Optional[str] = None,
 ):
     """List DLP violations"""
-    query = select(DLPViolation).where(DLPViolation.organization_id == getattr(current_user, "organization_id", None))
+    query = select(DLPViolation).where(DLPViolation.organization_id == org_id)
 
     if status_filter:
         query = query.where(DLPViolation.status == status_filter)
@@ -418,11 +433,11 @@ async def list_violations(
 @router.get("/violations/{violation_id}", response_model=DLPViolationResponse)
 async def get_violation(
     violation_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get a DLP violation by ID"""
-    violation = await get_violation_or_404(db, violation_id, getattr(current_user, "organization_id", None))
+    violation = await get_violation_or_404(db, violation_id, org_id)
     return convert_json_fields(violation)
 
 
@@ -430,11 +445,12 @@ async def get_violation(
 async def investigate_violation(
     violation_id: str,
     investigation: DLPViolationResolveRequest,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    current_user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Investigate and resolve a violation"""
-    violation = await get_violation_or_404(db, violation_id, getattr(current_user, "organization_id", None))
+    violation = await get_violation_or_404(db, violation_id, org_id)
 
     violation.status = investigation.status
     violation.justification = investigation.justification
@@ -449,14 +465,15 @@ async def investigate_violation(
 @router.post("/violations/bulk-action", response_model=DLPViolationBulkActionResponse)
 async def bulk_action_violations(
     bulk_request: DLPViolationBulkActionRequest,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    current_user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Perform bulk actions on violations"""
     result = await db.execute(
         select(DLPViolation).where(
             DLPViolation.id.in_(bulk_request.violation_ids),
-            DLPViolation.organization_id == getattr(current_user, "organization_id", None),
+            DLPViolation.organization_id == org_id,
         )
     )
     violations = result.scalars().all()
@@ -495,12 +512,13 @@ async def bulk_action_violations(
 @router.post("/classifications", response_model=DataClassificationResponse, status_code=status.HTTP_201_CREATED)
 async def create_classification(
     classification_data: DataClassificationCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AdminRoleUser = None,
     db: DatabaseSession = None,
 ):
     """Create a data classification level"""
     classification = DataClassification(
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         name=classification_data.name,
         classification_level=classification_data.classification_level,
         description=classification_data.description,
@@ -527,7 +545,7 @@ async def create_classification(
 
 @router.get("/classifications", response_model=DataClassificationListResponse)
 async def list_classifications(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -535,7 +553,7 @@ async def list_classifications(
 ):
     """List data classifications"""
     query = select(DataClassification).where(
-        DataClassification.organization_id == getattr(current_user, "organization_id", None)
+        DataClassification.organization_id == org_id
     )
 
     if level:
@@ -560,11 +578,11 @@ async def list_classifications(
 @router.get("/classifications/{classification_id}", response_model=DataClassificationResponse)
 async def get_classification(
     classification_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get a data classification by ID"""
-    classification = await get_classification_or_404(db, classification_id, getattr(current_user, "organization_id", None))
+    classification = await get_classification_or_404(db, classification_id, org_id)
     return convert_json_fields(classification)
 
 
@@ -572,11 +590,12 @@ async def get_classification(
 async def update_classification(
     classification_id: str,
     classification_data: DataClassificationUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AdminRoleUser = None,
     db: DatabaseSession = None,
 ):
     """Update a data classification"""
-    classification = await get_classification_or_404(db, classification_id, getattr(current_user, "organization_id", None))
+    classification = await get_classification_or_404(db, classification_id, org_id)
 
     update_data = classification_data.model_dump(exclude_unset=True, exclude_none=True)
 
@@ -600,7 +619,7 @@ async def update_classification(
 @router.post("/classifications/classify-document", response_model=DocumentClassificationResponse)
 async def classify_document(
     request: DocumentClassificationRequest,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Classify a document by content and metadata"""
@@ -628,11 +647,11 @@ async def classify_document(
 )
 async def get_handling_requirements(
     classification_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get data handling requirements for a classification"""
-    classification = await get_classification_or_404(db, classification_id, getattr(current_user, "organization_id", None))
+    classification = await get_classification_or_404(db, classification_id, org_id)
 
     requirements = classifier.get_handling_requirements(classification.classification_level)
 
@@ -651,28 +670,35 @@ async def get_handling_requirements(
 @router.post("/discovery/scan", response_model=SensitiveDataDiscoveryResponse, status_code=status.HTTP_201_CREATED)
 async def trigger_discovery_scan(
     scan_request: DiscoveryScanTriggerRequest,
-    current_user: CurrentUser = None,
-    db: DatabaseSession = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
 ):
-    """Trigger a sensitive data discovery scan"""
-    scan = SensitiveDataDiscovery(
-        organization_id=getattr(current_user, "organization_id", None),
-        scan_id=f"scan_{getattr(current_user, 'organization_id', None)}_{int(__import__('time').time())}",
+    """Trigger a sensitive data discovery scan.
+
+    Not implemented: no discovery scanner (agent or connector) exists to
+    process a scan, so this used to insert a ``pending`` row that nothing
+    ever picked up. Refuse honestly instead of faking a queued scan.
+    """
+    logger.info(
+        "dlp_discovery_scan_not_implemented",
+        organization_id=org_id,
         scan_type=scan_request.scan_type,
-        target=scan_request.target,
-        status="pending",
     )
-
-    db.add(scan)
-    await db.flush()
-    await db.refresh(scan)
-
-    return convert_json_fields(scan)
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail={
+            "error": "not_implemented",
+            "detail": (
+                "Sensitive data discovery scans are not implemented: no DLP agent "
+                "or storage connector exists to run them."
+            ),
+        },
+    )
 
 
 @router.get("/discovery/scans", response_model=DiscoveryScanListResponse)
 async def list_discovery_scans(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -681,7 +707,7 @@ async def list_discovery_scans(
 ):
     """List sensitive data discovery scans"""
     query = select(SensitiveDataDiscovery).where(
-        SensitiveDataDiscovery.organization_id == getattr(current_user, "organization_id", None)
+        SensitiveDataDiscovery.organization_id == org_id
     )
 
     if scan_type:
@@ -709,14 +735,14 @@ async def list_discovery_scans(
 @router.get("/discovery/scans/{scan_id}", response_model=SensitiveDataDiscoveryResponse)
 async def get_discovery_scan(
     scan_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get discovery scan results"""
     result = await db.execute(
         select(SensitiveDataDiscovery).where(
             SensitiveDataDiscovery.id == scan_id,
-            SensitiveDataDiscovery.organization_id == getattr(current_user, "organization_id", None),
+            SensitiveDataDiscovery.organization_id == org_id,
         )
     )
     scan = result.scalar_one_or_none()
@@ -728,11 +754,11 @@ async def get_discovery_scan(
 
 @router.get("/discovery/data-map", response_model=DataMapResponse)
 async def get_data_map(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get data map showing where sensitive data lives"""
-    data_map = scanner.generate_data_map(getattr(current_user, "organization_id", None))
+    data_map = scanner.generate_data_map(org_id)
     return DataMapResponse(**data_map)
 
 
@@ -753,12 +779,29 @@ async def get_data_lineage(
 @router.post("/incidents", response_model=DLPIncidentResponse, status_code=status.HTTP_201_CREATED)
 async def create_incident(
     incident_data: DLPIncidentCreate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    current_user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Create a DLP incident"""
+    if incident_data.violation_ids:
+        owned = await db.execute(
+            select(DLPViolation.id).where(
+                DLPViolation.id.in_(incident_data.violation_ids),
+                DLPViolation.organization_id == org_id,
+            )
+        )
+        missing = set(incident_data.violation_ids) - set(owned.scalars().all())
+        if missing:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail={
+                    "field": "violation_ids",
+                    "detail": f"Unknown violation ids: {sorted(missing)}",
+                },
+            )
     incident = DLPIncident(
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
         violation_ids=json.dumps(incident_data.violation_ids)
         if incident_data.violation_ids
         else None,
@@ -779,7 +822,6 @@ async def create_incident(
 
     # Fire automation for DLP violation/incident
     try:
-        org_id = getattr(current_user, "organization_id", None)
         # Look up the policy name from linked violations if available
         policy_name = incident.incident_title or "Unknown Policy"
         if incident_data.violation_ids:
@@ -819,7 +861,7 @@ async def create_incident(
 
 @router.get("/incidents", response_model=DLPIncidentListResponse)
 async def list_incidents(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     page: int = Query(1, ge=1),
     size: int = Query(20, ge=1, le=100),
@@ -827,7 +869,7 @@ async def list_incidents(
     severity: Optional[str] = None,
 ):
     """List DLP incidents"""
-    query = select(DLPIncident).where(DLPIncident.organization_id == getattr(current_user, "organization_id", None))
+    query = select(DLPIncident).where(DLPIncident.organization_id == org_id)
 
     if status_filter:
         query = query.where(DLPIncident.status == status_filter)
@@ -854,11 +896,11 @@ async def list_incidents(
 @router.get("/incidents/{incident_id}", response_model=DLPIncidentResponse)
 async def get_incident(
     incident_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get a DLP incident by ID"""
-    incident = await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
+    incident = await get_incident_or_404(db, incident_id, org_id)
     return convert_json_fields(incident)
 
 
@@ -866,11 +908,12 @@ async def get_incident(
 async def update_incident(
     incident_id: str,
     incident_data: DLPIncidentUpdate,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Update a DLP incident"""
-    incident = await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
+    incident = await get_incident_or_404(db, incident_id, org_id)
 
     update_data = incident_data.model_dump(exclude_unset=True, exclude_none=True)
 
@@ -891,11 +934,12 @@ async def update_incident(
 async def assess_breach(
     incident_id: str,
     assessment_request: BreachAssessmentRequest,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
+    _user: AnalystUser = None,
     db: DatabaseSession = None,
 ):
     """Assess breach incident and determine regulatory obligations"""
-    incident = await get_incident_or_404(db, incident_id, getattr(current_user, "organization_id", None))
+    incident = await get_incident_or_404(db, incident_id, org_id)
 
     assessment = assessor.assess_breach(
         {
@@ -937,19 +981,27 @@ async def assess_breach(
 )
 async def get_notification_tracking(
     incident_id: str,
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    notified_count: int = Query(0, ge=0),
-    total_required: int = Query(0, ge=0),
 ):
-    """Get notification compliance tracking"""
-    tracking = assessor.track_notification_compliance(
-        incident_id,
-        notified_count,
-        total_required,
-    )
+    """Get notification compliance tracking.
 
-    return NotificationTrackingResponse(**tracking)
+    Not implemented: breach notifications are not recorded anywhere, so this
+    used to echo caller-supplied ``notified_count`` / ``total_required`` back
+    as "tracking". The incident is still looked up (tenant-scoped) so a
+    foreign id is a 404, then the route refuses honestly.
+    """
+    await get_incident_or_404(db, incident_id, org_id)
+    raise HTTPException(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        detail={
+            "error": "not_implemented",
+            "detail": (
+                "Breach notification delivery is not tracked: no notification "
+                "records exist for DLP incidents."
+            ),
+        },
+    )
 
 
 # ==================== DASHBOARD ====================
@@ -957,7 +1009,7 @@ async def get_notification_tracking(
 
 @router.get("/dashboard", response_model=DLPDashboardResponse)
 async def get_dlp_dashboard(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get DLP dashboard summary.
@@ -972,7 +1024,6 @@ async def get_dlp_dashboard(
     from datetime import datetime, timedelta, timezone
     from src.compliance.models import ComplianceFramework
 
-    org_id = getattr(current_user, "organization_id", None)
     now = datetime.now(timezone.utc)
     month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
 
@@ -1153,7 +1204,7 @@ async def get_dlp_dashboard(
 
 @router.get("/trends", response_model=ViolationTrendResponse)
 async def get_violation_trends(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     period: str = Query("month", pattern="^(day|week|month|year)$"),
 ):
@@ -1164,7 +1215,6 @@ async def get_violation_trends(
     """
     from datetime import datetime, timedelta, timezone
 
-    org_id = getattr(current_user, "organization_id", None)
     now = datetime.now(timezone.utc)
 
     if period == "day":
@@ -1238,7 +1288,7 @@ async def get_violation_trends(
 
 @router.get("/compliance-status", response_model=ComplianceStatusResponse)
 async def get_compliance_status(
-    current_user: CurrentUser = None,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
 ):
     """Get regulatory compliance status.
@@ -1256,7 +1306,6 @@ async def get_compliance_status(
     """
     from src.compliance.models import ComplianceFramework
 
-    org_id = getattr(current_user, "organization_id", None)
 
     # Real compliance frameworks
     fw_rows = await db.execute(

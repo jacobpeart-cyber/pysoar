@@ -349,7 +349,7 @@ async def _get_or_create_asset(
 ) -> Optional[ExposureAsset]:
     """Find an existing asset by hostname/IP or create a minimal one."""
     ident = finding.asset_hostname or finding.asset_ip or finding.asset_identifier
-    if not ident or not organization_id:
+    if not ident:
         return None
 
     # Try hostname then IP
@@ -373,14 +373,14 @@ async def _get_or_create_asset(
     if match:
         return match
 
+    # ExposureAsset has no ``name``/``is_monitored`` columns; passing them
+    # raised TypeError for every new host.
     new_asset = ExposureAsset(
-        name=ident[:255],
         asset_type="host",
         hostname=finding.asset_hostname,
         ip_address=finding.asset_ip,
         environment="unknown",
         criticality="medium",
-        is_monitored=True,
         organization_id=organization_id,
     )
     db.add(new_asset)
@@ -472,6 +472,7 @@ async def ingest_findings(
                 select(AssetVulnerability).where(
                     AssetVulnerability.asset_id == asset.id,
                     AssetVulnerability.vulnerability_id == vuln.id,
+                    AssetVulnerability.organization_id == organization_id,
                 ).limit(1)
             )
             join = res.scalars().first()

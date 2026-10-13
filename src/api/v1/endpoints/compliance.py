@@ -7,10 +7,11 @@ Supports FedRAMP, NIST, CMMC, SOC 2, HIPAA, PCI-DSS, DFARS, and CISA compliance.
 
 import json
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional, Dict, Any
+from typing import Annotated, List, Optional, Dict, Any
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query
-from src.api.deps import CurrentUser, DatabaseSession
+from src.api.deps import CurrentUser, DatabaseSession, OrganizationId, require_role
+from src.models.user import User, UserRole
 from sqlalchemy import select, and_, func, or_
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -52,6 +53,7 @@ from src.compliance.models import (
 )
 from src.tickethub.models import TicketActivity
 from src.compliance.engine import (
+    FEDRAMP_SHORT_NAME_PREFIX,
     ComplianceEngine,
     FedRAMPManager,
     NISTManager,
@@ -69,6 +71,55 @@ logger = get_logger(__name__)
 
 router = APIRouter(prefix="/compliance", tags=["compliance"])
 
+# Wave 1 role gates: viewers read only; analysts for operational writes;
+# admins for configuration and actions against live systems.
+AnalystUser = Annotated[User, Depends(require_role([UserRole.ADMIN, UserRole.ANALYST]))]
+AdminRoleUser = Annotated[User, Depends(require_role([UserRole.ADMIN]))]
+
+
+async def _resolve_tenant_control_ref(
+    db: AsyncSession, org_id: str, value: Optional[str], field: str,
+) -> str:
+    """Return the id of the caller's control that ``value`` names.
+
+    ``value`` is a control row id, or a control code (``AC-2``) when exactly
+    one of the tenant's controls carries that code. Anything else (empty,
+    another tenant's control, an ambiguous code) is a 422 naming ``field``.
+    """
+    ref = (value or "").strip()
+    if not ref:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={"error": "invalid_control_reference", "field": field,
+                    "detail": f"{field} is required"},
+        )
+    by_id = await db.execute(
+        select(ComplianceControl.id).where(
+            ComplianceControl.id == ref, ComplianceControl.organization_id == org_id,
+        )
+    )
+    control_pk = by_id.scalar_one_or_none()
+    if control_pk:
+        return control_pk
+    by_code = await db.execute(
+        select(ComplianceControl.id).where(
+            ComplianceControl.control_id == ref, ComplianceControl.organization_id == org_id,
+        ).limit(2)
+    )
+    matches = by_code.scalars().all()
+    if len(matches) == 1:
+        return matches[0]
+    reason = (
+        f"control code {ref!r} matches more than one of your controls (one per framework); "
+        "send the control's id"
+        if matches
+        else f"{ref!r} is not a control id or control code in your organization"
+    )
+    raise HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        detail={"error": "invalid_control_reference", "field": field, "detail": reason},
+    )
+
 
 # ============================================================================
 # FRAMEWORKS ENDPOINTS
@@ -77,8 +128,8 @@ router = APIRouter(prefix="/compliance", tags=["compliance"])
 
 @router.get("/frameworks", response_model=List[ComplianceFrameworkResponse])
 async def list_frameworks(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
     skip: int = Query(0, ge=0),
     limit: int = Query(20, ge=1, le=100),
     status: Optional[str] = None,
@@ -93,7 +144,7 @@ async def list_frameworks(
     - skip, limit: Pagination
     """
     stmt = select(ComplianceFramework).where(
-        ComplianceFramework.organization_id == getattr(current_user, "organization_id", None)
+        ComplianceFramework.organization_id == org_id
     )
 
     if enabled_only:
@@ -112,14 +163,14 @@ async def list_frameworks(
 @router.get("/frameworks/{framework_id}", response_model=ComplianceFrameworkResponse)
 async def get_framework(
     framework_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
     """Get framework details with control summary."""
     stmt = select(ComplianceFramework).where(
         and_(
             ComplianceFramework.id == framework_id,
-            ComplianceFramework.organization_id == getattr(current_user, "organization_id", None),
+            ComplianceFramework.organization_id == org_id,
         )
     )
     result = await db.execute(stmt)
@@ -134,8 +185,9 @@ async def get_framework(
 @router.post("/frameworks/{framework_id}/assess", response_model=FrameworkAssessmentResponse)
 async def trigger_assessment(
     framework_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ):
     """
     Trigger full compliance assessment for framework.
@@ -145,7 +197,7 @@ async def trigger_assessment(
     stmt = select(ComplianceFramework).where(
         and_(
             ComplianceFramework.id == framework_id,
-            ComplianceFramework.organization_id == getattr(current_user, "organization_id", None),
+            ComplianceFramework.organization_id == org_id,
         )
     )
     result = await db.execute(stmt)
@@ -155,10 +207,9 @@ async def trigger_assessment(
         raise HTTPException(status_code=404, detail="Framework not found")
 
     # Trigger assessment task
-    run_compliance_assessment.delay(framework_id, getattr(current_user, "organization_id", None))
+    run_compliance_assessment.delay(framework_id, org_id)
 
     # Run assessment synchronously for immediate response
-    org_id = getattr(current_user, "organization_id", None)
     engine = ComplianceEngine(db, org_id)
     assessment = await engine.assess_framework(framework_id)
 
@@ -188,8 +239,8 @@ async def trigger_assessment(
 @router.get("/frameworks/{framework_id}/gaps", response_model=ControlGapAnalysisResponse)
 async def get_control_gaps(
     framework_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
     """
     Get control implementation gaps for framework.
@@ -199,7 +250,7 @@ async def get_control_gaps(
     stmt = select(ComplianceFramework).where(
         and_(
             ComplianceFramework.id == framework_id,
-            ComplianceFramework.organization_id == getattr(current_user, "organization_id", None),
+            ComplianceFramework.organization_id == org_id,
         )
     )
     result = await db.execute(stmt)
@@ -208,7 +259,7 @@ async def get_control_gaps(
     if not framework:
         raise HTTPException(status_code=404, detail="Framework not found")
 
-    engine = ComplianceEngine(db, getattr(current_user, "organization_id", None))
+    engine = ComplianceEngine(db, org_id)
     gaps = await engine.get_control_gaps(framework_id)
 
     # Count distributions
@@ -231,21 +282,21 @@ async def get_control_gaps(
 @router.get("/frameworks/{framework_id}/ssp", response_model=SSPGenerationResponse)
 async def generate_ssp(
     framework_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
     """
     Generate a System Security Plan (SSP) for a framework.
 
-    The Control Auto-Attester runs first, populating each known NIST
-    800-53 control's implementation narrative from live platform
-    evidence. Returns the JSON SSP structure; markdown/PDF exports
-    available via /ssp/download.
+    Built from the stored control rows only. A GET does not run the
+    Control Auto-Attester (it used to, and the attester records
+    "implemented" for rules it never checks); run it explicitly through
+    POST /frameworks/{id}/attest. Markdown export via /ssp/download.
     """
     stmt = select(ComplianceFramework).where(
         and_(
             ComplianceFramework.id == framework_id,
-            ComplianceFramework.organization_id == getattr(current_user, "organization_id", None),
+            ComplianceFramework.organization_id == org_id,
         )
     )
     result = await db.execute(stmt)
@@ -254,8 +305,8 @@ async def generate_ssp(
     if not framework:
         raise HTTPException(status_code=404, detail="Framework not found")
 
-    engine = ComplianceEngine(db, getattr(current_user, "organization_id", None))
-    ssp = await engine.generate_ssp(framework_id)
+    engine = ComplianceEngine(db, org_id)
+    ssp = await engine.generate_ssp(framework_id, run_attester=False)
 
     return ssp
 
@@ -263,9 +314,9 @@ async def generate_ssp(
 @router.get("/frameworks/{framework_id}/ssp/download")
 async def download_ssp(
     framework_id: str,
+    org_id: OrganizationId,
     format: str = "markdown",
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
     """Download the SSP as a file.
 
@@ -276,7 +327,6 @@ async def download_ssp(
     from fastapi.responses import Response as _Response
     from src.compliance.engine import ssp_to_markdown
 
-    org_id = getattr(current_user, "organization_id", None)
     stmt = select(ComplianceFramework).where(
         and_(
             ComplianceFramework.id == framework_id,
@@ -288,7 +338,7 @@ async def download_ssp(
         raise HTTPException(status_code=404, detail="Framework not found")
 
     engine = ComplianceEngine(db, org_id)
-    ssp = await engine.generate_ssp(framework_id)
+    ssp = await engine.generate_ssp(framework_id, run_attester=False)
 
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d")
     base = f"ssp_{(framework.short_name or 'framework').lower().replace(' ', '_')}_{stamp}"
@@ -313,8 +363,9 @@ async def download_ssp(
 @router.post("/frameworks/{framework_id}/attest")
 async def run_auto_attestation(
     framework_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AdminRoleUser = None,
 ):
     """Run the Control Auto-Attester against this framework.
 
@@ -324,7 +375,6 @@ async def run_auto_attestation(
     """
     from src.compliance.attester import ControlAutoAttester
 
-    org_id = getattr(current_user, "organization_id", None)
     framework = await db.get(ComplianceFramework, framework_id)
     if not framework or framework.organization_id != org_id:
         raise HTTPException(status_code=404, detail="Framework not found")
@@ -336,14 +386,14 @@ async def run_auto_attestation(
 @router.get("/frameworks/{framework_id}/report")
 async def get_framework_report(
     framework_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
     """Get comprehensive framework compliance report."""
     stmt = select(ComplianceFramework).where(
         and_(
             ComplianceFramework.id == framework_id,
-            ComplianceFramework.organization_id == getattr(current_user, "organization_id", None),
+            ComplianceFramework.organization_id == org_id,
         )
     )
     result = await db.execute(stmt)
@@ -352,8 +402,8 @@ async def get_framework_report(
     if not framework:
         raise HTTPException(status_code=404, detail="Framework not found")
 
-    engine = ComplianceEngine(db, getattr(current_user, "organization_id", None))
-    ssp = await engine.generate_ssp(framework_id)
+    engine = ComplianceEngine(db, org_id)
+    ssp = await engine.generate_ssp(framework_id, run_attester=False)
     gaps = await engine.get_control_gaps(framework_id)
     poam_report = await engine.generate_poam_report(framework_id)
 
@@ -372,8 +422,9 @@ async def get_framework_report(
 @router.post("/frameworks/{framework_id}/conmon")
 async def trigger_continuous_monitoring(
     framework_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ):
     """
     Run FedRAMP Continuous Monitoring (ConMon) checks.
@@ -383,8 +434,8 @@ async def trigger_continuous_monitoring(
     stmt = select(ComplianceFramework).where(
         and_(
             ComplianceFramework.id == framework_id,
-            ComplianceFramework.organization_id == getattr(current_user, "organization_id", None),
-            ComplianceFramework.short_name == "fedramp",
+            ComplianceFramework.organization_id == org_id,
+            ComplianceFramework.short_name.like(f"{FEDRAMP_SHORT_NAME_PREFIX}%"),
         )
     )
     result = await db.execute(stmt)
@@ -394,9 +445,9 @@ async def trigger_continuous_monitoring(
         raise HTTPException(status_code=404, detail="FedRAMP framework not found")
 
     # Trigger ConMon task
-    run_continuous_monitoring.delay(getattr(current_user, "organization_id", None))
+    run_continuous_monitoring.delay(org_id)
 
-    manager = FedRAMPManager(db, getattr(current_user, "organization_id", None))
+    manager = FedRAMPManager(db, org_id)
     conmon_result = await manager.run_continuous_monitoring()
 
     return conmon_result
@@ -409,8 +460,8 @@ async def trigger_continuous_monitoring(
 
 @router.get("/controls", response_model=List[ComplianceControlResponse])
 async def list_controls(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
     framework_id: Optional[str] = None,
     family: Optional[str] = None,
     status: Optional[str] = None,
@@ -428,7 +479,7 @@ async def list_controls(
     - baseline: Filter by baseline (low, moderate, high)
     """
     stmt = select(ComplianceControl).where(
-        ComplianceControl.organization_id == getattr(current_user, "organization_id", None)
+        ComplianceControl.organization_id == org_id
     )
 
     if framework_id:
@@ -447,17 +498,54 @@ async def list_controls(
     return controls
 
 
+# Static path: must be registered before /controls/{control_id}, which
+# otherwise captures "cross-map" as a control id.
+@router.get("/controls/cross-map")
+async def cross_map_controls(
+    org_id: OrganizationId,
+    db: DatabaseSession = None,
+    source_framework_id: str = Query(...),
+    target_framework_id: str = Query(...),
+):
+    """Get cross-framework control mapping.
+
+    Verifies both frameworks belong to the caller's org before running
+    the mapping. Without this check, an authenticated user could pass
+    any framework UUID (e.g. another tenant's FedRAMP instance) and
+    read its control relationships.
+    """
+
+    for fw_id in (source_framework_id, target_framework_id):
+        check = await db.execute(
+            select(ComplianceFramework).where(
+                and_(
+                    ComplianceFramework.id == fw_id,
+                    ComplianceFramework.organization_id == org_id,
+                )
+            )
+        )
+        if check.scalar_one_or_none() is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Framework {fw_id} not found in your organization",
+            )
+
+    engine = ComplianceEngine(db, org_id)
+    mapping = await engine.cross_map_controls(source_framework_id, target_framework_id)
+    return mapping
+
+
 @router.get("/controls/{control_id}", response_model=ComplianceControlResponse)
 async def get_control(
     control_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
     """Get control details with evidence."""
     stmt = select(ComplianceControl).where(
         and_(
             ComplianceControl.id == control_id,
-            ComplianceControl.organization_id == getattr(current_user, "organization_id", None),
+            ComplianceControl.organization_id == org_id,
         )
     )
     result = await db.execute(stmt)
@@ -473,14 +561,15 @@ async def get_control(
 async def update_control(
     control_id: str,
     req: ControlStatusUpdateRequest,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    current_user: AdminRoleUser = None,
 ):
     """Update control implementation status."""
     stmt = select(ComplianceControl).where(
         and_(
             ComplianceControl.id == control_id,
-            ComplianceControl.organization_id == getattr(current_user, "organization_id", None),
+            ComplianceControl.organization_id == org_id,
         )
     )
     result = await db.execute(stmt)
@@ -527,6 +616,7 @@ async def update_control(
             existing_q = select(POAM).where(
                 and_(
                     POAM.control_id_ref == control.id,
+                    POAM.organization_id == org_id,
                     POAM.status.in_(("open", "in_progress", "delayed")),
                 )
             )
@@ -605,7 +695,6 @@ async def update_control(
     # Trigger automation if control is non-compliant or not implemented
     if req.status in ("non_compliant", "not_implemented"):
         try:
-            org_id = getattr(current_user, "organization_id", None)
             automation = AutomationService(db)
             await automation.on_compliance_failure(
                 control_id=control.control_id,
@@ -621,14 +710,15 @@ async def update_control(
 @router.post("/controls/{control_id}/assess")
 async def run_control_assessment(
     control_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ):
     """Run automated check for specific control."""
     stmt = select(ComplianceControl).where(
         and_(
             ComplianceControl.id == control_id,
-            ComplianceControl.organization_id == getattr(current_user, "organization_id", None),
+            ComplianceControl.organization_id == org_id,
         )
     )
     result = await db.execute(stmt)
@@ -637,46 +727,12 @@ async def run_control_assessment(
     if not control:
         raise HTTPException(status_code=404, detail="Control not found")
 
-    nist_mgr = NISTManager(db, getattr(current_user, "organization_id", None))
-    check_result = await nist_mgr.automated_control_check(control.control_id)
+    nist_mgr = NISTManager(db, org_id)
+    check_result = await nist_mgr.automated_control_check(
+        control.control_id, framework_id=control.framework_id,
+    )
 
     return check_result
-
-
-@router.get("/controls/cross-map")
-async def cross_map_controls(
-    db: DatabaseSession = None,
-    source_framework_id: str = Query(...),
-    target_framework_id: str = Query(...),
-    current_user: CurrentUser = None,
-):
-    """Get cross-framework control mapping.
-
-    Verifies both frameworks belong to the caller's org before running
-    the mapping. Without this check, an authenticated user could pass
-    any framework UUID (e.g. another tenant's FedRAMP instance) and
-    read its control relationships.
-    """
-    org_id = getattr(current_user, "organization_id", None)
-
-    for fw_id in (source_framework_id, target_framework_id):
-        check = await db.execute(
-            select(ComplianceFramework).where(
-                and_(
-                    ComplianceFramework.id == fw_id,
-                    ComplianceFramework.organization_id == org_id,
-                )
-            )
-        )
-        if check.scalar_one_or_none() is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Framework {fw_id} not found in your organization",
-            )
-
-    engine = ComplianceEngine(db, org_id)
-    mapping = await engine.cross_map_controls(source_framework_id, target_framework_id)
-    return mapping
 
 
 # ============================================================================
@@ -686,8 +742,8 @@ async def cross_map_controls(
 
 @router.get("/poams", response_model=List[POAMResponse])
 async def list_poams(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
     status: Optional[str] = None,
     risk_level: Optional[str] = None,
     overdue_only: bool = False,
@@ -702,7 +758,7 @@ async def list_poams(
     - risk_level: Filter by risk level
     - overdue_only: Show only overdue items
     """
-    stmt = select(POAM).where(POAM.organization_id == getattr(current_user, "organization_id", None))
+    stmt = select(POAM).where(POAM.organization_id == org_id)
 
     if status:
         stmt = stmt.where(POAM.status == status)
@@ -728,12 +784,18 @@ async def list_poams(
 @router.post("/poams", response_model=POAMResponse)
 async def create_poam(
     req: POAMCreateRequest,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ):
-    """Create new POA&M."""
+    """Create new POA&M.
+
+    ``control_id_ref`` is the control row id, or a control code that names
+    exactly one of the caller's controls; anything else is a 422.
+    """
+    control_ref = await _resolve_tenant_control_ref(db, org_id, req.control_id_ref, "control_id_ref")
     poam = POAM(
-        control_id_ref=req.control_id_ref,
+        control_id_ref=control_ref,
         weakness_name=req.weakness_name,
         weakness_description=req.weakness_description,
         weakness_source=req.weakness_source,
@@ -742,7 +804,7 @@ async def create_poam(
         resources_required=req.resources_required,
         cost_estimate=req.cost_estimate,
         assigned_to=req.assigned_to,
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
     )
     db.add(poam)
     await db.commit()
@@ -753,14 +815,14 @@ async def create_poam(
 
 @router.get("/poams/overdue")
 async def get_overdue_poams(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
     """Get overdue POA&Ms."""
     now = datetime.now(timezone.utc)
     stmt = select(POAM).where(
         and_(
-            POAM.organization_id == getattr(current_user, "organization_id", None),
+            POAM.organization_id == org_id,
             POAM.scheduled_completion_date < now,
             POAM.status != "completed",
         )
@@ -773,11 +835,11 @@ async def get_overdue_poams(
 
 @router.get("/poams/report")
 async def get_poam_report(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
     """Get POA&M summary report."""
-    stmt = select(POAM).where(POAM.organization_id == getattr(current_user, "organization_id", None))
+    stmt = select(POAM).where(POAM.organization_id == org_id)
     result = await db.execute(stmt)
     all_poams = result.scalars().all()
 
@@ -798,14 +860,14 @@ async def get_poam_report(
 @router.get("/poams/{poam_id}", response_model=POAMResponse)
 async def get_poam(
     poam_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
     """Get POA&M details."""
     stmt = select(POAM).where(
         and_(
             POAM.id == poam_id,
-            POAM.organization_id == getattr(current_user, "organization_id", None),
+            POAM.organization_id == org_id,
         )
     )
     result = await db.execute(stmt)
@@ -821,14 +883,15 @@ async def get_poam(
 async def update_poam(
     poam_id: str,
     req: POAMUpdateRequest,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ):
     """Update POA&M."""
     stmt = select(POAM).where(
         and_(
             POAM.id == poam_id,
-            POAM.organization_id == getattr(current_user, "organization_id", None),
+            POAM.organization_id == org_id,
         )
     )
     result = await db.execute(stmt)
@@ -863,8 +926,8 @@ async def update_poam(
 
 @router.get("/evidence", response_model=List[ComplianceEvidenceResponse])
 async def list_evidence(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
     control_id_ref: Optional[str] = None,
     evidence_type: Optional[str] = None,
     review_status: Optional[str] = None,
@@ -873,7 +936,7 @@ async def list_evidence(
 ):
     """List evidence with filtering."""
     stmt = select(ComplianceEvidence).where(
-        ComplianceEvidence.organization_id == getattr(current_user, "organization_id", None)
+        ComplianceEvidence.organization_id == org_id
     )
 
     if control_id_ref:
@@ -895,11 +958,12 @@ async def upload_evidence(
     control_id_ref: str,
     evidence_type: str,
     title: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
     description: Optional[str] = None,
     content: Optional[str] = None,
     file_path: Optional[str] = None,
-    current_user: CurrentUser = None,
+    current_user: AnalystUser = None,
 ):
     """Register compliance evidence.
 
@@ -919,8 +983,9 @@ async def upload_evidence(
                 ),
             },
         )
+    control_ref = await _resolve_tenant_control_ref(db, org_id, control_id_ref, "control_id_ref")
     evidence = ComplianceEvidence(
-        control_id_ref=control_id_ref,
+        control_id_ref=control_ref,
         evidence_type=evidence_type,
         title=title,
         description=description,
@@ -928,7 +993,7 @@ async def upload_evidence(
         file_path=file_path or None,
         collected_at=datetime.now(timezone.utc),
         collected_by=current_user.id,
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
     )
     db.add(evidence)
     await db.commit()
@@ -940,14 +1005,14 @@ async def upload_evidence(
 @router.get("/evidence/{evidence_id}", response_model=ComplianceEvidenceResponse)
 async def get_evidence(
     evidence_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
     """Get evidence details."""
     stmt = select(ComplianceEvidence).where(
         and_(
             ComplianceEvidence.id == evidence_id,
-            ComplianceEvidence.organization_id == getattr(current_user, "organization_id", None),
+            ComplianceEvidence.organization_id == org_id,
         )
     )
     result = await db.execute(stmt)
@@ -963,15 +1028,22 @@ async def get_evidence(
 async def review_evidence(
     evidence_id: str,
     review_status: str,
-    reviewed_by: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    current_user: AdminRoleUser = None,
+    reviewed_by: Optional[str] = Query(
+        None, description="Ignored: the reviewer is always the authenticated user.",
+    ),
 ):
-    """Review and approve evidence."""
+    """Review and approve evidence (admin only).
+
+    The recorded reviewer is the caller; a client-supplied ``reviewed_by``
+    used to be stored verbatim, which let anyone forge the approver.
+    """
     stmt = select(ComplianceEvidence).where(
         and_(
             ComplianceEvidence.id == evidence_id,
-            ComplianceEvidence.organization_id == getattr(current_user, "organization_id", None),
+            ComplianceEvidence.organization_id == org_id,
         )
     )
     result = await db.execute(stmt)
@@ -981,7 +1053,7 @@ async def review_evidence(
         raise HTTPException(status_code=404, detail="Evidence not found")
 
     evidence.review_status = review_status
-    evidence.reviewed_by = reviewed_by
+    evidence.reviewed_by = str(current_user.id)
     evidence.reviewed_at = datetime.now(timezone.utc)
 
     await db.commit()
@@ -997,13 +1069,13 @@ async def review_evidence(
 
 @router.get("/cui", response_model=List[CUIMarkingResponse])
 async def list_cui_markings(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
     active_only: bool = True,
 ):
     """List CUI markings."""
     stmt = select(CUIMarking).where(
-        CUIMarking.organization_id == getattr(current_user, "organization_id", None)
+        CUIMarking.organization_id == org_id
     )
 
     if active_only:
@@ -1018,8 +1090,9 @@ async def list_cui_markings(
 @router.post("/cui", response_model=CUIMarkingResponse)
 async def mark_cui(
     req: CUIMarkingRequest,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ):
     """Mark asset as CUI.
 
@@ -1044,7 +1117,7 @@ async def mark_cui(
         classification_authority=req.classification_authority,
         declassification_date=req.declassification_date,
         access_list=req.access_list,
-        organization_id=getattr(current_user, "organization_id", None),
+        organization_id=org_id,
     )
     db.add(marking)
     await db.commit()
@@ -1057,14 +1130,15 @@ async def mark_cui(
 async def update_cui_marking(
     marking_id: str,
     req: CUIMarkingRequest,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ):
     """Update CUI marking."""
     stmt = select(CUIMarking).where(
         and_(
             CUIMarking.id == marking_id,
-            CUIMarking.organization_id == getattr(current_user, "organization_id", None),
+            CUIMarking.organization_id == org_id,
         )
     )
     result = await db.execute(stmt)
@@ -1088,12 +1162,12 @@ async def update_cui_marking(
 
 @router.get("/cui/audit")
 async def audit_cui_handling(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
     """CUI handling compliance audit."""
     stmt = select(CUIMarking).where(
-        CUIMarking.organization_id == getattr(current_user, "organization_id", None)
+        CUIMarking.organization_id == org_id
     )
     result = await db.execute(stmt)
     markings = result.scalars().all()
@@ -1118,13 +1192,13 @@ async def audit_cui_handling(
 
 @router.get("/cisa/directives", response_model=List[CISADirectiveResponse])
 async def list_cisa_directives(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
     active_only: bool = True,
 ):
     """List CISA BODs and Emergency Directives."""
     stmt = select(CISADirective).where(
-        CISADirective.organization_id == getattr(current_user, "organization_id", None)
+        CISADirective.organization_id == org_id
     )
 
     if active_only:
@@ -1139,14 +1213,14 @@ async def list_cisa_directives(
 @router.get("/cisa/directives/{directive_id}", response_model=CISADirectiveResponse)
 async def get_cisa_directive(
     directive_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
     """Get CISA directive details."""
     stmt = select(CISADirective).where(
         and_(
             CISADirective.directive_id == directive_id,
-            CISADirective.organization_id == getattr(current_user, "organization_id", None),
+            CISADirective.organization_id == org_id,
         )
     )
     result = await db.execute(stmt)
@@ -1161,14 +1235,15 @@ async def get_cisa_directive(
 @router.post("/cisa/directives/{directive_id}/check")
 async def check_cisa_compliance(
     directive_id: str,
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
+    _user: AnalystUser = None,
 ):
-    """Check compliance with specific CISA directive."""
+    """Check compliance with specific CISA directive (row id or code such as "BOD 22-01")."""
     stmt = select(CISADirective).where(
         and_(
-            CISADirective.directive_id == directive_id,
-            CISADirective.organization_id == getattr(current_user, "organization_id", None),
+            or_(CISADirective.id == directive_id, CISADirective.directive_id == directive_id),
+            CISADirective.organization_id == org_id,
         )
     )
     result = await db.execute(stmt)
@@ -1177,12 +1252,12 @@ async def check_cisa_compliance(
     if not directive:
         raise HTTPException(status_code=404, detail="Directive not found")
 
-    manager = CISAComplianceManager(db, getattr(current_user, "organization_id", None))
+    manager = CISAComplianceManager(db, org_id)
 
     if directive.directive_type == "bod":
-        compliance = await manager.check_bod_compliance(directive_id)
+        compliance = await manager.check_bod_compliance(directive.directive_id)
     else:
-        compliance = await manager.check_ed_compliance(directive_id)
+        compliance = await manager.check_ed_compliance(directive.directive_id)
 
     return compliance
 
@@ -1194,13 +1269,13 @@ async def check_cisa_compliance(
 
 @router.get("/dashboard", response_model=ComplianceDashboardStats)
 async def get_dashboard_stats(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
 ):
     """Get compliance dashboard statistics."""
     # Frameworks
     stmt = select(ComplianceFramework).where(
-        ComplianceFramework.organization_id == getattr(current_user, "organization_id", None)
+        ComplianceFramework.organization_id == org_id
     )
     result = await db.execute(stmt)
     frameworks = result.scalars().all()
@@ -1215,14 +1290,14 @@ async def get_dashboard_stats(
 
     # Controls
     stmt = select(func.count(ComplianceControl.id)).where(
-        ComplianceControl.organization_id == getattr(current_user, "organization_id", None)
+        ComplianceControl.organization_id == org_id
     )
     result = await db.execute(stmt)
     control_count = result.scalar() or 0
 
     stmt = select(func.count(ComplianceControl.id)).where(
         and_(
-            ComplianceControl.organization_id == getattr(current_user, "organization_id", None),
+            ComplianceControl.organization_id == org_id,
             ComplianceControl.status == "implemented",
         )
     )
@@ -1233,7 +1308,7 @@ async def get_dashboard_stats(
     now = datetime.now(timezone.utc)
     stmt = select(POAM).where(
         and_(
-            POAM.organization_id == getattr(current_user, "organization_id", None),
+            POAM.organization_id == org_id,
             POAM.status != "completed",
             POAM.scheduled_completion_date < now,
         )
@@ -1243,7 +1318,7 @@ async def get_dashboard_stats(
 
     stmt = select(POAM).where(
         and_(
-            POAM.organization_id == getattr(current_user, "organization_id", None),
+            POAM.organization_id == org_id,
             POAM.status != "completed",
             POAM.scheduled_completion_date >= now,
             POAM.scheduled_completion_date <= now + timedelta(days=7),
@@ -1255,7 +1330,7 @@ async def get_dashboard_stats(
     # Assessments
     stmt = select(ComplianceAssessment).where(
         and_(
-            ComplianceAssessment.organization_id == getattr(current_user, "organization_id", None),
+            ComplianceAssessment.organization_id == org_id,
             ComplianceAssessment.status == "planned",
         )
     )
@@ -1264,7 +1339,7 @@ async def get_dashboard_stats(
 
     # CUI
     stmt = select(CUIMarking).where(
-        CUIMarking.organization_id == getattr(current_user, "organization_id", None)
+        CUIMarking.organization_id == org_id
     )
     result = await db.execute(stmt)
     cui_markings = result.scalars().all()
@@ -1274,7 +1349,7 @@ async def get_dashboard_stats(
     # CISA
     stmt = select(CISADirective).where(
         and_(
-            CISADirective.organization_id == getattr(current_user, "organization_id", None),
+            CISADirective.organization_id == org_id,
             CISADirective.status == "active",
         )
     )
@@ -1304,15 +1379,15 @@ async def get_dashboard_stats(
 
 @router.get("/score-history")
 async def get_score_history(
+    org_id: OrganizationId,
     db: DatabaseSession = None,
-    current_user: CurrentUser = None,
     framework_id: Optional[str] = None,
     days: int = Query(90, ge=1, le=365),
 ):
     """Get compliance score history and trends."""
     stmt = select(ComplianceAssessment).where(
         and_(
-            ComplianceAssessment.organization_id == getattr(current_user, "organization_id", None),
+            ComplianceAssessment.organization_id == org_id,
             ComplianceAssessment.assessment_date
             >= datetime.now(timezone.utc) - timedelta(days=days),
         )

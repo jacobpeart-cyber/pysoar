@@ -166,6 +166,9 @@ async def test_ot_discover_admin_only_and_confined_to_ot_zones(client, db_sessio
     from src.ot_security.models import OTZone
 
     monkeypatch.setenv("PYSOAR_DISABLE_NETWORK_SCAN", "1")
+    from src.core.config import settings
+
+    monkeypatch.setattr(settings, "ot_discovery_allowed_cidrs", ["10.0.0.0/8", "192.168.0.0/16"])
     _, analyst = await _org_user(db_session, email="ot-analyst@ssrforg-a.io", org=ORG_A, role="analyst")
     _, admin = await _org_user(db_session, email="ot-admin@ssrforg-a.io", org=ORG_A, role="admin")
     db_session.add(OTZone(organization_id=ORG_A, name="cell-1", purdue_level="level_1", network_cidr="10.10.0.0/16"))
@@ -186,10 +189,26 @@ async def test_ot_discover_admin_only_and_confined_to_ot_zones(client, db_sessio
 @pytest.mark.asyncio
 async def test_ot_discover_without_zones_is_admin_only_and_size_capped(client, db_session, monkeypatch):
     monkeypatch.setenv("PYSOAR_DISABLE_NETWORK_SCAN", "1")
+    from src.core.config import settings
+    from src.ot_security.models import OTZone
+
     _, admin = await _org_user(db_session, email="ot-admin-b@ssrforg-b.io", org=ORG_B, role="admin")
 
     too_big = await client.post("/api/v1/ot-security/discover", headers=admin, json={"cidr": "10.0.0.0/16"})
     assert too_big.status_code == 400
+
+    # Fail closed: no platform allowlist -> disabled; allowlist but no tenant zone -> refused.
+    monkeypatch.setattr(settings, "ot_discovery_allowed_cidrs", [])
+    disabled = await client.post("/api/v1/ot-security/discover", headers=admin, json={"cidr": "10.0.0.0/24"})
+    assert disabled.status_code == 403, disabled.text
+    assert disabled.json()["detail"]["error"] == "ot_discovery_disabled"
+    monkeypatch.setattr(settings, "ot_discovery_allowed_cidrs", ["10.0.0.0/8"])
+    no_zone = await client.post("/api/v1/ot-security/discover", headers=admin, json={"cidr": "10.0.0.0/24"})
+    assert no_zone.status_code == 403, no_zone.text
+    assert no_zone.json()["detail"]["error"] == "ot_zones_required"
+
+    db_session.add(OTZone(organization_id=ORG_B, name="cell-b", purdue_level="level_1", network_cidr="10.0.0.0/16"))
+    await db_session.commit()
     ok = await client.post("/api/v1/ot-security/discover", headers=admin, json={"cidr": "10.0.0.0/24"})
     assert ok.status_code == 200, ok.text
     assert ok.json()["status"] == "skipped"

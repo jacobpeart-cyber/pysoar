@@ -61,7 +61,10 @@ def scheduled_ingestion(
         async def _get_real_metrics():
             async with async_session_factory() as db:
                 # Get the data source
-                source_query = select(DataSource).where(DataSource.id == source_id)
+                source_query = select(DataSource).where(
+                    DataSource.id == source_id,
+                    DataSource.organization_id == organization_id,
+                )
                 result = await db.execute(source_query)
                 source = result.scalar_one_or_none()
 
@@ -78,7 +81,10 @@ def scheduled_ingestion(
                     func.count(DataPartition.id),
                     func.sum(DataPartition.record_count),
                     func.sum(DataPartition.size_bytes),
-                ).where(DataPartition.source_id == source_id)
+                ).where(
+                    DataPartition.source_id == source_id,
+                    DataPartition.organization_id == organization_id,
+                )
                 part_result = await db.execute(partition_query)
                 part_row = part_result.one()
 
@@ -329,6 +335,7 @@ def data_quality_check(
                 # Get partitions for this dataset
                 partition_query = select(DataPartition).where(
                     DataPartition.source_id == dataset_id,
+                    DataPartition.organization_id == organization_id,
                 ).order_by(DataPartition.created_at.desc()).limit(100)
                 result = await db.execute(partition_query)
                 partitions = list(result.scalars().all())

@@ -82,7 +82,10 @@ def test_dlp_policy(
     async def _run():
         async with async_session_factory() as session:
             policy = (await session.execute(
-                select(DLPPolicy).where(DLPPolicy.id == policy_id)
+                select(DLPPolicy).where(
+                    DLPPolicy.id == policy_id,
+                    DLPPolicy.organization_id == organization_id,
+                )
             )).scalar_one_or_none()
 
             if not policy:
@@ -90,7 +93,8 @@ def test_dlp_policy(
 
             violations = (await session.execute(
                 select(func.count(DLPViolation.id)).where(
-                    DLPViolation.policy_id == policy_id
+                    DLPViolation.policy_id == policy_id,
+                    DLPViolation.organization_id == organization_id,
                 )
             )).scalar() or 0
 
